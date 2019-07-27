@@ -1,0 +1,873 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>IOSchedulerSimple.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2008-2011, Ingo Weinhold, ingo_weinhold@gmx.de.</a>
+<a name="ln3"> * Copyright 2004-2010, Axel Dörfler, axeld@pinc-software.de.</a>
+<a name="ln4"> * Distributed under the terms of the MIT License.</a>
+<a name="ln5"> */</a>
+<a name="ln6"> </a>
+<a name="ln7"> </a>
+<a name="ln8">#include &quot;IOSchedulerSimple.h&quot;</a>
+<a name="ln9"> </a>
+<a name="ln10">#include &lt;unistd.h&gt;</a>
+<a name="ln11">#include &lt;stdio.h&gt;</a>
+<a name="ln12">#include &lt;stdlib.h&gt;</a>
+<a name="ln13">#include &lt;string.h&gt;</a>
+<a name="ln14"> </a>
+<a name="ln15">#include &lt;algorithm&gt;</a>
+<a name="ln16"> </a>
+<a name="ln17">#include &lt;lock.h&gt;</a>
+<a name="ln18">#include &lt;thread_types.h&gt;</a>
+<a name="ln19">#include &lt;thread.h&gt;</a>
+<a name="ln20">#include &lt;util/AutoLock.h&gt;</a>
+<a name="ln21"> </a>
+<a name="ln22">#include &quot;IOSchedulerRoster.h&quot;</a>
+<a name="ln23"> </a>
+<a name="ln24"> </a>
+<a name="ln25">//#define TRACE_IO_SCHEDULER</a>
+<a name="ln26">#ifdef TRACE_IO_SCHEDULER</a>
+<a name="ln27">#	define TRACE(x...) dprintf(x)</a>
+<a name="ln28">#else</a>
+<a name="ln29">#	define TRACE(x...) ;</a>
+<a name="ln30">#endif</a>
+<a name="ln31"> </a>
+<a name="ln32"> </a>
+<a name="ln33">// #pragma mark -</a>
+<a name="ln34"> </a>
+<a name="ln35"> </a>
+<a name="ln36">void</a>
+<a name="ln37">IORequestOwner::Dump() const</a>
+<a name="ln38">{</a>
+<a name="ln39">	kprintf(&quot;IORequestOwner at %p\n&quot;, this);</a>
+<a name="ln40">	kprintf(&quot;  team:     %&quot; B_PRId32 &quot;\n&quot;, team);</a>
+<a name="ln41">	kprintf(&quot;  thread:   %&quot; B_PRId32 &quot;\n&quot;, thread);</a>
+<a name="ln42">	kprintf(&quot;  priority: %&quot; B_PRId32 &quot;\n&quot;, priority);</a>
+<a name="ln43"> </a>
+<a name="ln44">	kprintf(&quot;  requests:&quot;);</a>
+<a name="ln45">	for (IORequestList::ConstIterator it = requests.GetIterator();</a>
+<a name="ln46">			IORequest* request = it.Next();) {</a>
+<a name="ln47">		kprintf(&quot; %p&quot;, request);</a>
+<a name="ln48">	}</a>
+<a name="ln49">	kprintf(&quot;\n&quot;);</a>
+<a name="ln50"> </a>
+<a name="ln51">	kprintf(&quot;  completed requests:&quot;);</a>
+<a name="ln52">	for (IORequestList::ConstIterator it = completed_requests.GetIterator();</a>
+<a name="ln53">			IORequest* request = it.Next();) {</a>
+<a name="ln54">		kprintf(&quot; %p&quot;, request);</a>
+<a name="ln55">	}</a>
+<a name="ln56">	kprintf(&quot;\n&quot;);</a>
+<a name="ln57"> </a>
+<a name="ln58">	kprintf(&quot;  operations:&quot;);</a>
+<a name="ln59">	for (IOOperationList::ConstIterator it = operations.GetIterator();</a>
+<a name="ln60">			IOOperation* operation = it.Next();) {</a>
+<a name="ln61">		kprintf(&quot; %p&quot;, operation);</a>
+<a name="ln62">	}</a>
+<a name="ln63">	kprintf(&quot;\n&quot;);</a>
+<a name="ln64">}</a>
+<a name="ln65"> </a>
+<a name="ln66"> </a>
+<a name="ln67">// #pragma mark -</a>
+<a name="ln68"> </a>
+<a name="ln69"> </a>
+<a name="ln70">struct IOSchedulerSimple::RequestOwnerHashDefinition {</a>
+<a name="ln71">	typedef thread_id		KeyType;</a>
+<a name="ln72">	typedef IORequestOwner	ValueType;</a>
+<a name="ln73"> </a>
+<a name="ln74">	size_t HashKey(thread_id key) const				{ return key; }</a>
+<a name="ln75">	size_t Hash(const IORequestOwner* value) const	{ return value-&gt;thread; }</a>
+<a name="ln76">	bool Compare(thread_id key, const IORequestOwner* value) const</a>
+<a name="ln77">		{ return value-&gt;thread == key; }</a>
+<a name="ln78">	IORequestOwner*&amp; GetLink(IORequestOwner* value) const</a>
+<a name="ln79">		{ return value-&gt;hash_link; }</a>
+<a name="ln80">};</a>
+<a name="ln81"> </a>
+<a name="ln82">struct IOSchedulerSimple::RequestOwnerHashTable</a>
+<a name="ln83">		: BOpenHashTable&lt;RequestOwnerHashDefinition, false&gt; {</a>
+<a name="ln84">};</a>
+<a name="ln85"> </a>
+<a name="ln86"> </a>
+<a name="ln87">IOSchedulerSimple::IOSchedulerSimple(DMAResource* resource)</a>
+<a name="ln88">	:</a>
+<a name="ln89">	IOScheduler(resource),</a>
+<a name="ln90">	fSchedulerThread(-1),</a>
+<a name="ln91">	fRequestNotifierThread(-1),</a>
+<a name="ln92">	fOperationArray(NULL),</a>
+<a name="ln93">	fAllocatedRequestOwners(NULL),</a>
+<a name="ln94">	fRequestOwners(NULL),</a>
+<a name="ln95">	fBlockSize(0),</a>
+<a name="ln96">	fPendingOperations(0),</a>
+<a name="ln97">	fTerminating(false)</a>
+<a name="ln98">{</a>
+<a name="ln99">	mutex_init(&amp;fLock, &quot;I/O scheduler&quot;);</a>
+<a name="ln100">	B_INITIALIZE_SPINLOCK(&amp;fFinisherLock);</a>
+<a name="ln101"> </a>
+<a name="ln102">	fNewRequestCondition.Init(this, &quot;I/O new request&quot;);</a>
+<a name="ln103">	fFinishedOperationCondition.Init(this, &quot;I/O finished operation&quot;);</a>
+<a name="ln104">	fFinishedRequestCondition.Init(this, &quot;I/O finished request&quot;);</a>
+<a name="ln105"> </a>
+<a name="ln106">}</a>
+<a name="ln107"> </a>
+<a name="ln108"> </a>
+<a name="ln109">IOSchedulerSimple::~IOSchedulerSimple()</a>
+<a name="ln110">{</a>
+<a name="ln111">	// shutdown threads</a>
+<a name="ln112">	MutexLocker locker(fLock);</a>
+<a name="ln113">	InterruptsSpinLocker finisherLocker(fFinisherLock);</a>
+<a name="ln114">	fTerminating = true;</a>
+<a name="ln115"> </a>
+<a name="ln116">	fNewRequestCondition.NotifyAll();</a>
+<a name="ln117">	fFinishedOperationCondition.NotifyAll();</a>
+<a name="ln118">	fFinishedRequestCondition.NotifyAll();</a>
+<a name="ln119"> </a>
+<a name="ln120">	finisherLocker.Unlock();</a>
+<a name="ln121">	locker.Unlock();</a>
+<a name="ln122"> </a>
+<a name="ln123">	if (fSchedulerThread &gt;= 0)</a>
+<a name="ln124">		wait_for_thread(fSchedulerThread, NULL);</a>
+<a name="ln125"> </a>
+<a name="ln126">	if (fRequestNotifierThread &gt;= 0)</a>
+<a name="ln127">		wait_for_thread(fRequestNotifierThread, NULL);</a>
+<a name="ln128"> </a>
+<a name="ln129">	// destroy our belongings</a>
+<a name="ln130">	mutex_lock(&amp;fLock);</a>
+<a name="ln131">	mutex_destroy(&amp;fLock);</a>
+<a name="ln132"> </a>
+<a name="ln133">	while (IOOperation* operation = fUnusedOperations.RemoveHead())</a>
+<a name="ln134">		delete operation;</a>
+<a name="ln135"> </a>
+<a name="ln136">	delete[] fOperationArray;</a>
+<a name="ln137"> </a>
+<a name="ln138">	delete fRequestOwners;</a>
+<a name="ln139">	delete[] fAllocatedRequestOwners;</a>
+<a name="ln140">}</a>
+<a name="ln141"> </a>
+<a name="ln142"> </a>
+<a name="ln143">status_t</a>
+<a name="ln144">IOSchedulerSimple::Init(const char* name)</a>
+<a name="ln145">{</a>
+<a name="ln146">	status_t error = IOScheduler::Init(name);</a>
+<a name="ln147">	if (error != B_OK)</a>
+<a name="ln148">		return error;</a>
+<a name="ln149"> </a>
+<a name="ln150">	size_t count = fDMAResource != NULL ? fDMAResource-&gt;BufferCount() : 16;</a>
+<a name="ln151">	for (size_t i = 0; i &lt; count; i++) {</a>
+<a name="ln152">		IOOperation* operation = new(std::nothrow) IOOperation;</a>
+<a name="ln153">		if (operation == NULL)</a>
+<a name="ln154">			return B_NO_MEMORY;</a>
+<a name="ln155"> </a>
+<a name="ln156">		fUnusedOperations.Add(operation);</a>
+<a name="ln157">	}</a>
+<a name="ln158"> </a>
+<a name="ln159">	fOperationArray = new(std::nothrow) IOOperation*[count];</a>
+<a name="ln160"> </a>
+<a name="ln161">	if (fDMAResource != NULL)</a>
+<a name="ln162">		fBlockSize = fDMAResource-&gt;BlockSize();</a>
+<a name="ln163">	if (fBlockSize == 0)</a>
+<a name="ln164">		fBlockSize = 512;</a>
+<a name="ln165"> </a>
+<a name="ln166">	fAllocatedRequestOwnerCount = thread_max_threads();</a>
+<a name="ln167">	fAllocatedRequestOwners</a>
+<a name="ln168">		= new(std::nothrow) IORequestOwner[fAllocatedRequestOwnerCount];</a>
+<a name="ln169">	if (fAllocatedRequestOwners == NULL)</a>
+<a name="ln170">		return B_NO_MEMORY;</a>
+<a name="ln171"> </a>
+<a name="ln172">	for (int32 i = 0; i &lt; fAllocatedRequestOwnerCount; i++) {</a>
+<a name="ln173">		IORequestOwner&amp; owner = fAllocatedRequestOwners[i];</a>
+<a name="ln174">		owner.team = -1;</a>
+<a name="ln175">		owner.thread = -1;</a>
+<a name="ln176">		owner.priority = B_IDLE_PRIORITY;</a>
+<a name="ln177">		fUnusedRequestOwners.Add(&amp;owner);</a>
+<a name="ln178">	}</a>
+<a name="ln179"> </a>
+<a name="ln180">	fRequestOwners = new(std::nothrow) RequestOwnerHashTable;</a>
+<a name="ln181">	if (fRequestOwners == NULL)</a>
+<a name="ln182">		return B_NO_MEMORY;</a>
+<a name="ln183"> </a>
+<a name="ln184">	error = fRequestOwners-&gt;Init(fAllocatedRequestOwnerCount);</a>
+<a name="ln185">	if (error != B_OK)</a>
+<a name="ln186">		return error;</a>
+<a name="ln187"> </a>
+<a name="ln188">	// TODO: Use a device speed dependent bandwidths!</a>
+<a name="ln189">	fIterationBandwidth = fBlockSize * 8192;</a>
+<a name="ln190">	fMinOwnerBandwidth = fBlockSize * 1024;</a>
+<a name="ln191">	fMaxOwnerBandwidth = fBlockSize * 4096;</a>
+<a name="ln192"> </a>
+<a name="ln193">	// start threads</a>
+<a name="ln194">	char buffer[B_OS_NAME_LENGTH];</a>
+<a name="ln195">	strlcpy(buffer, name, sizeof(buffer));</a>
+<a name="ln196">	strlcat(buffer, &quot; scheduler &quot;, sizeof(buffer));</a>
+<a name="ln197">	size_t nameLength = strlen(buffer);</a>
+<a name="ln198">	snprintf(buffer + nameLength, sizeof(buffer) - nameLength, &quot;%&quot; B_PRId32,</a>
+<a name="ln199">		fID);</a>
+<a name="ln200">	fSchedulerThread = spawn_kernel_thread(&amp;_SchedulerThread, buffer,</a>
+<a name="ln201">		B_NORMAL_PRIORITY + 2, (void *)this);</a>
+<a name="ln202">	if (fSchedulerThread &lt; B_OK)</a>
+<a name="ln203">		return fSchedulerThread;</a>
+<a name="ln204"> </a>
+<a name="ln205">	strlcpy(buffer, name, sizeof(buffer));</a>
+<a name="ln206">	strlcat(buffer, &quot; notifier &quot;, sizeof(buffer));</a>
+<a name="ln207">	nameLength = strlen(buffer);</a>
+<a name="ln208">	snprintf(buffer + nameLength, sizeof(buffer) - nameLength, &quot;%&quot; B_PRId32,</a>
+<a name="ln209">		fID);</a>
+<a name="ln210">	fRequestNotifierThread = spawn_kernel_thread(&amp;_RequestNotifierThread,</a>
+<a name="ln211">		buffer, B_NORMAL_PRIORITY + 2, (void *)this);</a>
+<a name="ln212">	if (fRequestNotifierThread &lt; B_OK)</a>
+<a name="ln213">		return fRequestNotifierThread;</a>
+<a name="ln214"> </a>
+<a name="ln215">	resume_thread(fSchedulerThread);</a>
+<a name="ln216">	resume_thread(fRequestNotifierThread);</a>
+<a name="ln217"> </a>
+<a name="ln218">	return B_OK;</a>
+<a name="ln219">}</a>
+<a name="ln220"> </a>
+<a name="ln221"> </a>
+<a name="ln222">status_t</a>
+<a name="ln223">IOSchedulerSimple::ScheduleRequest(IORequest* request)</a>
+<a name="ln224">{</a>
+<a name="ln225">	TRACE(&quot;%p-&gt;IOSchedulerSimple::ScheduleRequest(%p)\n&quot;, this, request);</a>
+<a name="ln226"> </a>
+<a name="ln227">	IOBuffer* buffer = request-&gt;Buffer();</a>
+<a name="ln228"> </a>
+<a name="ln229">	// TODO: it would be nice to be able to lock the memory later, but we can't</a>
+<a name="ln230">	// easily do it in the I/O scheduler without being able to asynchronously</a>
+<a name="ln231">	// lock memory (via another thread or a dedicated call).</a>
+<a name="ln232"> </a>
+<a name="ln233">	if (buffer-&gt;IsVirtual()) {</a>
+<a name="ln234">		status_t status = buffer-&gt;LockMemory(request-&gt;TeamID(),</a>
+<a name="ln235">			request-&gt;IsWrite());</a>
+<a name="ln236">		if (status != B_OK) {</a>
+<a name="ln237">			request-&gt;SetStatusAndNotify(status);</a>
+<a name="ln238">			return status;</a>
+<a name="ln239">		}</a>
+<a name="ln240">	}</a>
+<a name="ln241"> </a>
+<a name="ln242">	MutexLocker locker(fLock);</a>
+<a name="ln243"> </a>
+<a name="ln244">	IORequestOwner* owner = _GetRequestOwner(request-&gt;TeamID(),</a>
+<a name="ln245">		request-&gt;ThreadID(), true);</a>
+<a name="ln246">	if (owner == NULL) {</a>
+<a name="ln247">		panic(&quot;IOSchedulerSimple: Out of request owners!\n&quot;);</a>
+<a name="ln248">		locker.Unlock();</a>
+<a name="ln249">		if (buffer-&gt;IsVirtual())</a>
+<a name="ln250">			buffer-&gt;UnlockMemory(request-&gt;TeamID(), request-&gt;IsWrite());</a>
+<a name="ln251">		request-&gt;SetStatusAndNotify(B_NO_MEMORY);</a>
+<a name="ln252">		return B_NO_MEMORY;</a>
+<a name="ln253">	}</a>
+<a name="ln254"> </a>
+<a name="ln255">	bool wasActive = owner-&gt;IsActive();</a>
+<a name="ln256">	request-&gt;SetOwner(owner);</a>
+<a name="ln257">	owner-&gt;requests.Add(request);</a>
+<a name="ln258"> </a>
+<a name="ln259">	int32 priority = thread_get_io_priority(request-&gt;ThreadID());</a>
+<a name="ln260">	if (priority &gt;= 0)</a>
+<a name="ln261">		owner-&gt;priority = priority;</a>
+<a name="ln262">//dprintf(&quot;  request %p -&gt; owner %p (thread %ld, active %d)\n&quot;, request, owner, owner-&gt;thread, wasActive);</a>
+<a name="ln263"> </a>
+<a name="ln264">	if (!wasActive)</a>
+<a name="ln265">		fActiveRequestOwners.Add(owner);</a>
+<a name="ln266"> </a>
+<a name="ln267">	IOSchedulerRoster::Default()-&gt;Notify(IO_SCHEDULER_REQUEST_SCHEDULED, this,</a>
+<a name="ln268">		request);</a>
+<a name="ln269"> </a>
+<a name="ln270">	fNewRequestCondition.NotifyAll();</a>
+<a name="ln271"> </a>
+<a name="ln272">	return B_OK;</a>
+<a name="ln273">}</a>
+<a name="ln274"> </a>
+<a name="ln275"> </a>
+<a name="ln276">void</a>
+<a name="ln277">IOSchedulerSimple::AbortRequest(IORequest* request, status_t status)</a>
+<a name="ln278">{</a>
+<a name="ln279">	// TODO:...</a>
+<a name="ln280">//B_CANCELED</a>
+<a name="ln281">}</a>
+<a name="ln282"> </a>
+<a name="ln283"> </a>
+<a name="ln284">void</a>
+<a name="ln285">IOSchedulerSimple::OperationCompleted(IOOperation* operation, status_t status,</a>
+<a name="ln286">	generic_size_t transferredBytes)</a>
+<a name="ln287">{</a>
+<a name="ln288">	InterruptsSpinLocker _(fFinisherLock);</a>
+<a name="ln289"> </a>
+<a name="ln290">	// finish operation only once</a>
+<a name="ln291">	if (operation-&gt;Status() &lt;= 0)</a>
+<a name="ln292">		return;</a>
+<a name="ln293"> </a>
+<a name="ln294">	operation-&gt;SetStatus(status);</a>
+<a name="ln295"> </a>
+<a name="ln296">	// set the bytes transferred (of the net data)</a>
+<a name="ln297">	generic_size_t partialBegin</a>
+<a name="ln298">		= operation-&gt;OriginalOffset() - operation-&gt;Offset();</a>
+<a name="ln299">	operation-&gt;SetTransferredBytes(</a>
+<a name="ln300">		transferredBytes &gt; partialBegin ? transferredBytes - partialBegin : 0);</a>
+<a name="ln301"> </a>
+<a name="ln302">	fCompletedOperations.Add(operation);</a>
+<a name="ln303">	fFinishedOperationCondition.NotifyAll();</a>
+<a name="ln304">}</a>
+<a name="ln305"> </a>
+<a name="ln306"> </a>
+<a name="ln307">void</a>
+<a name="ln308">IOSchedulerSimple::Dump() const</a>
+<a name="ln309">{</a>
+<a name="ln310">	kprintf(&quot;IOSchedulerSimple at %p\n&quot;, this);</a>
+<a name="ln311">	kprintf(&quot;  DMA resource:   %p\n&quot;, fDMAResource);</a>
+<a name="ln312"> </a>
+<a name="ln313">	kprintf(&quot;  active request owners:&quot;);</a>
+<a name="ln314">	for (RequestOwnerList::ConstIterator it</a>
+<a name="ln315">				= fActiveRequestOwners.GetIterator();</a>
+<a name="ln316">			IORequestOwner* owner = it.Next();) {</a>
+<a name="ln317">		kprintf(&quot; %p&quot;, owner);</a>
+<a name="ln318">	}</a>
+<a name="ln319">	kprintf(&quot;\n&quot;);</a>
+<a name="ln320">}</a>
+<a name="ln321"> </a>
+<a name="ln322"> </a>
+<a name="ln323">/*!	Must not be called with the fLock held. */</a>
+<a name="ln324">void</a>
+<a name="ln325">IOSchedulerSimple::_Finisher()</a>
+<a name="ln326">{</a>
+<a name="ln327">	while (true) {</a>
+<a name="ln328">		InterruptsSpinLocker locker(fFinisherLock);</a>
+<a name="ln329">		IOOperation* operation = fCompletedOperations.RemoveHead();</a>
+<a name="ln330">		if (operation == NULL)</a>
+<a name="ln331">			return;</a>
+<a name="ln332"> </a>
+<a name="ln333">		locker.Unlock();</a>
+<a name="ln334"> </a>
+<a name="ln335">		TRACE(&quot;IOSchedulerSimple::_Finisher(): operation: %p\n&quot;, operation);</a>
+<a name="ln336"> </a>
+<a name="ln337">		bool operationFinished = operation-&gt;Finish();</a>
+<a name="ln338"> </a>
+<a name="ln339">		IOSchedulerRoster::Default()-&gt;Notify(IO_SCHEDULER_OPERATION_FINISHED,</a>
+<a name="ln340">			this, operation-&gt;Parent(), operation);</a>
+<a name="ln341">			// Notify for every time the operation is passed to the I/O hook,</a>
+<a name="ln342">			// not only when it is fully finished.</a>
+<a name="ln343"> </a>
+<a name="ln344">		if (!operationFinished) {</a>
+<a name="ln345">			TRACE(&quot;  operation: %p not finished yet\n&quot;, operation);</a>
+<a name="ln346">			MutexLocker _(fLock);</a>
+<a name="ln347">			operation-&gt;SetTransferredBytes(0);</a>
+<a name="ln348">			operation-&gt;Parent()-&gt;Owner()-&gt;operations.Add(operation);</a>
+<a name="ln349">			fPendingOperations--;</a>
+<a name="ln350">			continue;</a>
+<a name="ln351">		}</a>
+<a name="ln352"> </a>
+<a name="ln353">		// notify request and remove operation</a>
+<a name="ln354">		IORequest* request = operation-&gt;Parent();</a>
+<a name="ln355"> </a>
+<a name="ln356">		generic_size_t operationOffset</a>
+<a name="ln357">			= operation-&gt;OriginalOffset() - request-&gt;Offset();</a>
+<a name="ln358">		request-&gt;OperationFinished(operation, operation-&gt;Status(),</a>
+<a name="ln359">			operation-&gt;TransferredBytes() &lt; operation-&gt;OriginalLength(),</a>
+<a name="ln360">			operation-&gt;Status() == B_OK</a>
+<a name="ln361">				? operationOffset + operation-&gt;OriginalLength()</a>
+<a name="ln362">				: operationOffset);</a>
+<a name="ln363"> </a>
+<a name="ln364">		// recycle the operation</a>
+<a name="ln365">		MutexLocker _(fLock);</a>
+<a name="ln366">		if (fDMAResource != NULL)</a>
+<a name="ln367">			fDMAResource-&gt;RecycleBuffer(operation-&gt;Buffer());</a>
+<a name="ln368"> </a>
+<a name="ln369">		fPendingOperations--;</a>
+<a name="ln370">		fUnusedOperations.Add(operation);</a>
+<a name="ln371"> </a>
+<a name="ln372">		// If the request is done, we need to perform its notifications.</a>
+<a name="ln373">		if (request-&gt;IsFinished()) {</a>
+<a name="ln374">			if (request-&gt;Status() == B_OK &amp;&amp; request-&gt;RemainingBytes() &gt; 0) {</a>
+<a name="ln375">				// The request has been processed OK so far, but it isn't really</a>
+<a name="ln376">				// finished yet.</a>
+<a name="ln377">				request-&gt;SetUnfinished();</a>
+<a name="ln378">			} else {</a>
+<a name="ln379">				// Remove the request from the request owner.</a>
+<a name="ln380">				IORequestOwner* owner = request-&gt;Owner();</a>
+<a name="ln381">				owner-&gt;requests.MoveFrom(&amp;owner-&gt;completed_requests);</a>
+<a name="ln382">				owner-&gt;requests.Remove(request);</a>
+<a name="ln383">				request-&gt;SetOwner(NULL);</a>
+<a name="ln384"> </a>
+<a name="ln385">				if (!owner-&gt;IsActive()) {</a>
+<a name="ln386">					fActiveRequestOwners.Remove(owner);</a>
+<a name="ln387">					fUnusedRequestOwners.Add(owner);</a>
+<a name="ln388">				}</a>
+<a name="ln389"> </a>
+<a name="ln390">				if (request-&gt;HasCallbacks()) {</a>
+<a name="ln391">					// The request has callbacks that may take some time to</a>
+<a name="ln392">					// perform, so we hand it over to the request notifier.</a>
+<a name="ln393">					fFinishedRequests.Add(request);</a>
+<a name="ln394">					fFinishedRequestCondition.NotifyAll();</a>
+<a name="ln395">				} else {</a>
+<a name="ln396">					// No callbacks -- finish the request right now.</a>
+<a name="ln397">					IOSchedulerRoster::Default()-&gt;Notify(</a>
+<a name="ln398">						IO_SCHEDULER_REQUEST_FINISHED, this, request);</a>
+<a name="ln399">					request-&gt;NotifyFinished();</a>
+<a name="ln400">				}</a>
+<a name="ln401">			}</a>
+<a name="ln402">		}</a>
+<a name="ln403">	}</a>
+<a name="ln404">}</a>
+<a name="ln405"> </a>
+<a name="ln406"> </a>
+<a name="ln407">/*!	Called with \c fFinisherLock held.</a>
+<a name="ln408">*/</a>
+<a name="ln409">bool</a>
+<a name="ln410">IOSchedulerSimple::_FinisherWorkPending()</a>
+<a name="ln411">{</a>
+<a name="ln412">	return !fCompletedOperations.IsEmpty();</a>
+<a name="ln413">}</a>
+<a name="ln414"> </a>
+<a name="ln415"> </a>
+<a name="ln416">bool</a>
+<a name="ln417">IOSchedulerSimple::_PrepareRequestOperations(IORequest* request,</a>
+<a name="ln418">	IOOperationList&amp; operations, int32&amp; operationsPrepared, off_t quantum,</a>
+<a name="ln419">	off_t&amp; usedBandwidth)</a>
+<a name="ln420">{</a>
+<a name="ln421">//dprintf(&quot;IOSchedulerSimple::_PrepareRequestOperations(%p)\n&quot;, request);</a>
+<a name="ln422">	usedBandwidth = 0;</a>
+<a name="ln423"> </a>
+<a name="ln424">	if (fDMAResource != NULL) {</a>
+<a name="ln425">		while (quantum &gt;= (off_t)fBlockSize &amp;&amp; request-&gt;RemainingBytes() &gt; 0) {</a>
+<a name="ln426">			IOOperation* operation = fUnusedOperations.RemoveHead();</a>
+<a name="ln427">			if (operation == NULL)</a>
+<a name="ln428">				return false;</a>
+<a name="ln429"> </a>
+<a name="ln430">			status_t status = fDMAResource-&gt;TranslateNext(request, operation,</a>
+<a name="ln431">				quantum);</a>
+<a name="ln432">			if (status != B_OK) {</a>
+<a name="ln433">				operation-&gt;SetParent(NULL);</a>
+<a name="ln434">				fUnusedOperations.Add(operation);</a>
+<a name="ln435"> </a>
+<a name="ln436">				// B_BUSY means some resource (DMABuffers or</a>
+<a name="ln437">				// DMABounceBuffers) was temporarily unavailable. That's OK,</a>
+<a name="ln438">				// we'll retry later.</a>
+<a name="ln439">				if (status == B_BUSY)</a>
+<a name="ln440">					return false;</a>
+<a name="ln441"> </a>
+<a name="ln442">				AbortRequest(request, status);</a>
+<a name="ln443">				return true;</a>
+<a name="ln444">			}</a>
+<a name="ln445">//dprintf(&quot;  prepared operation %p\n&quot;, operation);</a>
+<a name="ln446"> </a>
+<a name="ln447">			off_t bandwidth = operation-&gt;Length();</a>
+<a name="ln448">			quantum -= bandwidth;</a>
+<a name="ln449">			usedBandwidth += bandwidth;</a>
+<a name="ln450"> </a>
+<a name="ln451">			operations.Add(operation);</a>
+<a name="ln452">			operationsPrepared++;</a>
+<a name="ln453">		}</a>
+<a name="ln454">	} else {</a>
+<a name="ln455">		// TODO: If the device has block size restrictions, we might need to use</a>
+<a name="ln456">		// a bounce buffer.</a>
+<a name="ln457">		IOOperation* operation = fUnusedOperations.RemoveHead();</a>
+<a name="ln458">		if (operation == NULL)</a>
+<a name="ln459">			return false;</a>
+<a name="ln460"> </a>
+<a name="ln461">		status_t status = operation-&gt;Prepare(request);</a>
+<a name="ln462">		if (status != B_OK) {</a>
+<a name="ln463">			operation-&gt;SetParent(NULL);</a>
+<a name="ln464">			fUnusedOperations.Add(operation);</a>
+<a name="ln465">			AbortRequest(request, status);</a>
+<a name="ln466">			return true;</a>
+<a name="ln467">		}</a>
+<a name="ln468"> </a>
+<a name="ln469">		operation-&gt;SetOriginalRange(request-&gt;Offset(), request-&gt;Length());</a>
+<a name="ln470">		request-&gt;Advance(request-&gt;Length());</a>
+<a name="ln471"> </a>
+<a name="ln472">		off_t bandwidth = operation-&gt;Length();</a>
+<a name="ln473">		quantum -= bandwidth;</a>
+<a name="ln474">		usedBandwidth += bandwidth;</a>
+<a name="ln475"> </a>
+<a name="ln476">		operations.Add(operation);</a>
+<a name="ln477">		operationsPrepared++;</a>
+<a name="ln478">	}</a>
+<a name="ln479"> </a>
+<a name="ln480">	return true;</a>
+<a name="ln481">}</a>
+<a name="ln482"> </a>
+<a name="ln483"> </a>
+<a name="ln484">off_t</a>
+<a name="ln485">IOSchedulerSimple::_ComputeRequestOwnerBandwidth(int32 priority) const</a>
+<a name="ln486">{</a>
+<a name="ln487">// TODO: Use a priority dependent quantum!</a>
+<a name="ln488">	return fMinOwnerBandwidth;</a>
+<a name="ln489">}</a>
+<a name="ln490"> </a>
+<a name="ln491"> </a>
+<a name="ln492">bool</a>
+<a name="ln493">IOSchedulerSimple::_NextActiveRequestOwner(IORequestOwner*&amp; owner,</a>
+<a name="ln494">	off_t&amp; quantum)</a>
+<a name="ln495">{</a>
+<a name="ln496">	while (true) {</a>
+<a name="ln497">		if (fTerminating)</a>
+<a name="ln498">			return false;</a>
+<a name="ln499"> </a>
+<a name="ln500">		if (owner != NULL)</a>
+<a name="ln501">			owner = fActiveRequestOwners.GetNext(owner);</a>
+<a name="ln502">		if (owner == NULL)</a>
+<a name="ln503">			owner = fActiveRequestOwners.Head();</a>
+<a name="ln504"> </a>
+<a name="ln505">		if (owner != NULL) {</a>
+<a name="ln506">			quantum = _ComputeRequestOwnerBandwidth(owner-&gt;priority);</a>
+<a name="ln507">			return true;</a>
+<a name="ln508">		}</a>
+<a name="ln509"> </a>
+<a name="ln510">		// Wait for new requests owners. First check whether any finisher work</a>
+<a name="ln511">		// has to be done.</a>
+<a name="ln512">		InterruptsSpinLocker finisherLocker(fFinisherLock);</a>
+<a name="ln513">		if (_FinisherWorkPending()) {</a>
+<a name="ln514">			finisherLocker.Unlock();</a>
+<a name="ln515">			mutex_unlock(&amp;fLock);</a>
+<a name="ln516">			_Finisher();</a>
+<a name="ln517">			mutex_lock(&amp;fLock);</a>
+<a name="ln518">			continue;</a>
+<a name="ln519">		}</a>
+<a name="ln520"> </a>
+<a name="ln521">		// Wait for new requests.</a>
+<a name="ln522">		ConditionVariableEntry entry;</a>
+<a name="ln523">		fNewRequestCondition.Add(&amp;entry);</a>
+<a name="ln524"> </a>
+<a name="ln525">		finisherLocker.Unlock();</a>
+<a name="ln526">		mutex_unlock(&amp;fLock);</a>
+<a name="ln527"> </a>
+<a name="ln528">		entry.Wait(B_CAN_INTERRUPT);</a>
+<a name="ln529">		_Finisher();</a>
+<a name="ln530">		mutex_lock(&amp;fLock);</a>
+<a name="ln531">	}</a>
+<a name="ln532">}</a>
+<a name="ln533"> </a>
+<a name="ln534"> </a>
+<a name="ln535">struct OperationComparator {</a>
+<a name="ln536">	inline bool operator()(const IOOperation* a, const IOOperation* b)</a>
+<a name="ln537">	{</a>
+<a name="ln538">		off_t offsetA = a-&gt;Offset();</a>
+<a name="ln539">		off_t offsetB = b-&gt;Offset();</a>
+<a name="ln540">		return offsetA &lt; offsetB</a>
+<a name="ln541">			|| (offsetA == offsetB &amp;&amp; a-&gt;Length() &gt; b-&gt;Length());</a>
+<a name="ln542">	}</a>
+<a name="ln543">};</a>
+<a name="ln544"> </a>
+<a name="ln545"> </a>
+<a name="ln546">void</a>
+<a name="ln547">IOSchedulerSimple::_SortOperations(IOOperationList&amp; operations,</a>
+<a name="ln548">	off_t&amp; lastOffset)</a>
+<a name="ln549">{</a>
+<a name="ln550">// TODO: _Scheduler() could directly add the operations to the array.</a>
+<a name="ln551">	// move operations to an array and sort it</a>
+<a name="ln552">	int32 count = 0;</a>
+<a name="ln553">	while (IOOperation* operation = operations.RemoveHead())</a>
+<a name="ln554">		fOperationArray[count++] = operation;</a>
+<a name="ln555"> </a>
+<a name="ln556">	std::sort(fOperationArray, fOperationArray + count, OperationComparator());</a>
+<a name="ln557"> </a>
+<a name="ln558">	// move the sorted operations to a temporary list we can work with</a>
+<a name="ln559">//dprintf(&quot;operations after sorting:\n&quot;);</a>
+<a name="ln560">	IOOperationList sortedOperations;</a>
+<a name="ln561">	for (int32 i = 0; i &lt; count; i++)</a>
+<a name="ln562">//{</a>
+<a name="ln563">//dprintf(&quot;  %3ld: %p: offset: %lld, length: %lu\n&quot;, i, fOperationArray[i], fOperationArray[i]-&gt;Offset(), fOperationArray[i]-&gt;Length());</a>
+<a name="ln564">		sortedOperations.Add(fOperationArray[i]);</a>
+<a name="ln565">//}</a>
+<a name="ln566"> </a>
+<a name="ln567">	// Sort the operations so that no two adjacent operations overlap. This</a>
+<a name="ln568">	// might result in several elevator runs.</a>
+<a name="ln569">	while (!sortedOperations.IsEmpty()) {</a>
+<a name="ln570">		IOOperation* operation = sortedOperations.Head();</a>
+<a name="ln571">		while (operation != NULL) {</a>
+<a name="ln572">			IOOperation* nextOperation = sortedOperations.GetNext(operation);</a>
+<a name="ln573">			if (operation-&gt;Offset() &gt;= lastOffset) {</a>
+<a name="ln574">				sortedOperations.Remove(operation);</a>
+<a name="ln575">//dprintf(&quot;  adding operation %p\n&quot;, operation);</a>
+<a name="ln576">				operations.Add(operation);</a>
+<a name="ln577">				lastOffset = operation-&gt;Offset() + operation-&gt;Length();</a>
+<a name="ln578">			}</a>
+<a name="ln579"> </a>
+<a name="ln580">			operation = nextOperation;</a>
+<a name="ln581">		}</a>
+<a name="ln582"> </a>
+<a name="ln583">		if (!sortedOperations.IsEmpty())</a>
+<a name="ln584">			lastOffset = 0;</a>
+<a name="ln585">	}</a>
+<a name="ln586">}</a>
+<a name="ln587"> </a>
+<a name="ln588"> </a>
+<a name="ln589">status_t</a>
+<a name="ln590">IOSchedulerSimple::_Scheduler()</a>
+<a name="ln591">{</a>
+<a name="ln592">	IORequestOwner marker;</a>
+<a name="ln593">	marker.thread = -1;</a>
+<a name="ln594">	{</a>
+<a name="ln595">		MutexLocker locker(fLock);</a>
+<a name="ln596">		fActiveRequestOwners.Add(&amp;marker, false);</a>
+<a name="ln597">	}</a>
+<a name="ln598"> </a>
+<a name="ln599">	off_t lastOffset = 0;</a>
+<a name="ln600"> </a>
+<a name="ln601">	IORequestOwner* owner = NULL;</a>
+<a name="ln602">	off_t quantum = 0;</a>
+<a name="ln603"> </a>
+<a name="ln604">	while (!fTerminating) {</a>
+<a name="ln605">//dprintf(&quot;IOSchedulerSimple::_Scheduler(): next iteration: request owner: %p, quantum: %lld\n&quot;, owner, quantum);</a>
+<a name="ln606">		MutexLocker locker(fLock);</a>
+<a name="ln607"> </a>
+<a name="ln608">		IOOperationList operations;</a>
+<a name="ln609">		int32 operationCount = 0;</a>
+<a name="ln610">		bool resourcesAvailable = true;</a>
+<a name="ln611">		off_t iterationBandwidth = fIterationBandwidth;</a>
+<a name="ln612"> </a>
+<a name="ln613">		if (owner == NULL) {</a>
+<a name="ln614">			owner = fActiveRequestOwners.GetPrevious(&amp;marker);</a>
+<a name="ln615">			quantum = 0;</a>
+<a name="ln616">			fActiveRequestOwners.Remove(&amp;marker);</a>
+<a name="ln617">		}</a>
+<a name="ln618"> </a>
+<a name="ln619">		if (owner == NULL || quantum &lt; (off_t)fBlockSize) {</a>
+<a name="ln620">			if (!_NextActiveRequestOwner(owner, quantum)) {</a>
+<a name="ln621">				// we've been asked to terminate</a>
+<a name="ln622">				return B_OK;</a>
+<a name="ln623">			}</a>
+<a name="ln624">		}</a>
+<a name="ln625"> </a>
+<a name="ln626">		while (resourcesAvailable &amp;&amp; iterationBandwidth &gt;= (off_t)fBlockSize) {</a>
+<a name="ln627">//dprintf(&quot;IOSchedulerSimple::_Scheduler(): request owner: %p (thread %ld)\n&quot;,</a>
+<a name="ln628">//owner, owner-&gt;thread);</a>
+<a name="ln629">			// Prepare operations for the owner.</a>
+<a name="ln630"> </a>
+<a name="ln631">			// There might still be unfinished ones.</a>
+<a name="ln632">			while (IOOperation* operation = owner-&gt;operations.RemoveHead()) {</a>
+<a name="ln633">				// TODO: We might actually grant the owner more bandwidth than</a>
+<a name="ln634">				// it deserves.</a>
+<a name="ln635">				// TODO: We should make sure that after the first read operation</a>
+<a name="ln636">				// of a partial write, no other write operation to the same</a>
+<a name="ln637">				// location is scheduled!</a>
+<a name="ln638">				operations.Add(operation);</a>
+<a name="ln639">				operationCount++;</a>
+<a name="ln640">				off_t bandwidth = operation-&gt;Length();</a>
+<a name="ln641">				quantum -= bandwidth;</a>
+<a name="ln642">				iterationBandwidth -= bandwidth;</a>
+<a name="ln643"> </a>
+<a name="ln644">				if (quantum &lt; (off_t)fBlockSize</a>
+<a name="ln645">					|| iterationBandwidth &lt; (off_t)fBlockSize) {</a>
+<a name="ln646">					break;</a>
+<a name="ln647">				}</a>
+<a name="ln648">			}</a>
+<a name="ln649"> </a>
+<a name="ln650">			while (resourcesAvailable &amp;&amp; quantum &gt;= (off_t)fBlockSize</a>
+<a name="ln651">					&amp;&amp; iterationBandwidth &gt;= (off_t)fBlockSize) {</a>
+<a name="ln652">				IORequest* request = owner-&gt;requests.Head();</a>
+<a name="ln653">				if (request == NULL) {</a>
+<a name="ln654">					resourcesAvailable = false;</a>
+<a name="ln655">if (operationCount == 0)</a>
+<a name="ln656">panic(&quot;no more requests for owner %p (thread %&quot; B_PRId32 &quot;)&quot;, owner, owner-&gt;thread);</a>
+<a name="ln657">					break;</a>
+<a name="ln658">				}</a>
+<a name="ln659"> </a>
+<a name="ln660">				off_t bandwidth = 0;</a>
+<a name="ln661">				resourcesAvailable = _PrepareRequestOperations(request,</a>
+<a name="ln662">					operations, operationCount, quantum, bandwidth);</a>
+<a name="ln663">				quantum -= bandwidth;</a>
+<a name="ln664">				iterationBandwidth -= bandwidth;</a>
+<a name="ln665">				if (request-&gt;RemainingBytes() == 0 || request-&gt;Status() &lt;= 0) {</a>
+<a name="ln666">					// If the request has been completed, move it to the</a>
+<a name="ln667">					// completed list, so we don't pick it up again.</a>
+<a name="ln668">					owner-&gt;requests.Remove(request);</a>
+<a name="ln669">					owner-&gt;completed_requests.Add(request);</a>
+<a name="ln670">				}</a>
+<a name="ln671">			}</a>
+<a name="ln672"> </a>
+<a name="ln673">			// Get the next owner.</a>
+<a name="ln674">			if (resourcesAvailable)</a>
+<a name="ln675">				_NextActiveRequestOwner(owner, quantum);</a>
+<a name="ln676">		}</a>
+<a name="ln677"> </a>
+<a name="ln678">		// If the current owner doesn't have anymore requests, we have to</a>
+<a name="ln679">		// insert our marker, since the owner will be gone in the next</a>
+<a name="ln680">		// iteration.</a>
+<a name="ln681">		if (owner-&gt;requests.IsEmpty()) {</a>
+<a name="ln682">			fActiveRequestOwners.Insert(owner, &amp;marker);</a>
+<a name="ln683">			owner = NULL;</a>
+<a name="ln684">		}</a>
+<a name="ln685"> </a>
+<a name="ln686">		if (operations.IsEmpty())</a>
+<a name="ln687">			continue;</a>
+<a name="ln688"> </a>
+<a name="ln689">		fPendingOperations = operationCount;</a>
+<a name="ln690"> </a>
+<a name="ln691">		locker.Unlock();</a>
+<a name="ln692"> </a>
+<a name="ln693">		// sort the operations</a>
+<a name="ln694">		_SortOperations(operations, lastOffset);</a>
+<a name="ln695"> </a>
+<a name="ln696">		// execute the operations</a>
+<a name="ln697">#ifdef TRACE_IO_SCHEDULER</a>
+<a name="ln698">		int32 i = 0;</a>
+<a name="ln699">#endif</a>
+<a name="ln700">		while (IOOperation* operation = operations.RemoveHead()) {</a>
+<a name="ln701">			TRACE(&quot;IOSchedulerSimple::_Scheduler(): calling callback for &quot;</a>
+<a name="ln702">				&quot;operation %ld: %p\n&quot;, i++, operation);</a>
+<a name="ln703"> </a>
+<a name="ln704">			IOSchedulerRoster::Default()-&gt;Notify(IO_SCHEDULER_OPERATION_STARTED,</a>
+<a name="ln705">				this, operation-&gt;Parent(), operation);</a>
+<a name="ln706"> </a>
+<a name="ln707">			fIOCallback(fIOCallbackData, operation);</a>
+<a name="ln708"> </a>
+<a name="ln709">			_Finisher();</a>
+<a name="ln710">		}</a>
+<a name="ln711"> </a>
+<a name="ln712">		// wait for all operations to finish</a>
+<a name="ln713">		while (!fTerminating) {</a>
+<a name="ln714">			locker.Lock();</a>
+<a name="ln715"> </a>
+<a name="ln716">			if (fPendingOperations == 0)</a>
+<a name="ln717">				break;</a>
+<a name="ln718"> </a>
+<a name="ln719">			// Before waiting first check whether any finisher work has to be</a>
+<a name="ln720">			// done.</a>
+<a name="ln721">			InterruptsSpinLocker finisherLocker(fFinisherLock);</a>
+<a name="ln722">			if (_FinisherWorkPending()) {</a>
+<a name="ln723">				finisherLocker.Unlock();</a>
+<a name="ln724">				locker.Unlock();</a>
+<a name="ln725">				_Finisher();</a>
+<a name="ln726">				continue;</a>
+<a name="ln727">			}</a>
+<a name="ln728"> </a>
+<a name="ln729">			// wait for finished operations</a>
+<a name="ln730">			ConditionVariableEntry entry;</a>
+<a name="ln731">			fFinishedOperationCondition.Add(&amp;entry);</a>
+<a name="ln732"> </a>
+<a name="ln733">			finisherLocker.Unlock();</a>
+<a name="ln734">			locker.Unlock();</a>
+<a name="ln735"> </a>
+<a name="ln736">			entry.Wait(B_CAN_INTERRUPT);</a>
+<a name="ln737">			_Finisher();</a>
+<a name="ln738">		}</a>
+<a name="ln739">	}</a>
+<a name="ln740"> </a>
+<a name="ln741">	return B_OK;</a>
+<a name="ln742">}</a>
+<a name="ln743"> </a>
+<a name="ln744"> </a>
+<a name="ln745">/*static*/ status_t</a>
+<a name="ln746">IOSchedulerSimple::_SchedulerThread(void *_self)</a>
+<a name="ln747">{</a>
+<a name="ln748">	IOSchedulerSimple *self = (IOSchedulerSimple *)_self;</a>
+<a name="ln749">	return self-&gt;_Scheduler();</a>
+<a name="ln750">}</a>
+<a name="ln751"> </a>
+<a name="ln752"> </a>
+<a name="ln753">status_t</a>
+<a name="ln754">IOSchedulerSimple::_RequestNotifier()</a>
+<a name="ln755">{</a>
+<a name="ln756">	while (true) {</a>
+<a name="ln757">		MutexLocker locker(fLock);</a>
+<a name="ln758"> </a>
+<a name="ln759">		// get a request</a>
+<a name="ln760">		IORequest* request = fFinishedRequests.RemoveHead();</a>
+<a name="ln761"> </a>
+<a name="ln762">		if (request == NULL) {</a>
+<a name="ln763">			if (fTerminating)</a>
+<a name="ln764">				return B_OK;</a>
+<a name="ln765"> </a>
+<a name="ln766">			ConditionVariableEntry entry;</a>
+<a name="ln767">			fFinishedRequestCondition.Add(&amp;entry);</a>
+<a name="ln768"> </a>
+<a name="ln769">			locker.Unlock();</a>
+<a name="ln770"> </a>
+<a name="ln771">			entry.Wait();</a>
+<a name="ln772">			continue;</a>
+<a name="ln773">		}</a>
+<a name="ln774"> </a>
+<a name="ln775">		locker.Unlock();</a>
+<a name="ln776"> </a>
+<a name="ln777">		IOSchedulerRoster::Default()-&gt;Notify(IO_SCHEDULER_REQUEST_FINISHED,</a>
+<a name="ln778">			this, request);</a>
+<a name="ln779"> </a>
+<a name="ln780">		// notify the request</a>
+<a name="ln781">		request-&gt;NotifyFinished();</a>
+<a name="ln782">	}</a>
+<a name="ln783"> </a>
+<a name="ln784">	// never can get here</a>
+<a name="ln785">	return B_OK;</a>
+<a name="ln786">}</a>
+<a name="ln787"> </a>
+<a name="ln788"> </a>
+<a name="ln789">/*static*/ status_t</a>
+<a name="ln790">IOSchedulerSimple::_RequestNotifierThread(void *_self)</a>
+<a name="ln791">{</a>
+<a name="ln792">	IOSchedulerSimple *self = (IOSchedulerSimple*)_self;</a>
+<a name="ln793">	return self-&gt;_RequestNotifier();</a>
+<a name="ln794">}</a>
+<a name="ln795"> </a>
+<a name="ln796"> </a>
+<a name="ln797">IORequestOwner*</a>
+<a name="ln798">IOSchedulerSimple::_GetRequestOwner(team_id team, thread_id thread,</a>
+<a name="ln799">	bool allocate)</a>
+<a name="ln800">{</a>
+<a name="ln801">	// lookup in table</a>
+<a name="ln802">	IORequestOwner* owner = fRequestOwners-&gt;Lookup(thread);</a>
+<a name="ln803">	if (owner != NULL &amp;&amp; !owner-&gt;IsActive())</a>
+<a name="ln804">		fUnusedRequestOwners.Remove(owner);</a>
+<a name="ln805">	if (owner != NULL || !allocate)</a>
+<a name="ln806">		return owner;</a>
+<a name="ln807"> </a>
+<a name="ln808">	// not in table -- allocate an unused one</a>
+<a name="ln809">	RequestOwnerList existingOwners;</a>
+<a name="ln810"> </a>
+<a name="ln811">	while ((owner = fUnusedRequestOwners.RemoveHead()) != NULL) {</a>
+<a name="ln812">		if (owner-&gt;thread &lt; 0 || !Thread::IsAlive(owner-&gt;thread)) {</a>
+<a name="ln813">			if (owner-&gt;thread &gt;= 0)</a>
+<a name="ln814">				fRequestOwners-&gt;RemoveUnchecked(owner);</a>
+<a name="ln815">			owner-&gt;team = team;</a>
+<a name="ln816">			owner-&gt;thread = thread;</a>
+<a name="ln817">			owner-&gt;priority = B_IDLE_PRIORITY;</a>
+<a name="ln818">			fRequestOwners-&gt;InsertUnchecked(owner);</a>
+<a name="ln819">			break;</a>
+<a name="ln820">		}</a>
+<a name="ln821"> </a>
+<a name="ln822">		existingOwners.Add(owner);</a>
+<a name="ln823">	}</a>
+<a name="ln824"> </a>
+<a name="ln825">	fUnusedRequestOwners.MoveFrom(&amp;existingOwners);</a>
+<a name="ln826">	return owner;</a>
+<a name="ln827">}</a>
+
+</code></pre>
+<div class="balloon" rel="87"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fFinisherLock, fAllocatedRequestOwnerCount, fIterationBandwidth, fMinOwnerBandwidth, fMaxOwnerBandwidth.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

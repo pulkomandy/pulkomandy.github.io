@@ -1,0 +1,257 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>BlockCache.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// BlockCache.cpp</a>
+<a name="ln2">//</a>
+<a name="ln3">// Copyright (c) 2003, Ingo Weinhold (bonefish@cs.tu-berlin.de)</a>
+<a name="ln4">//</a>
+<a name="ln5">// This program is free software; you can redistribute it and/or modify</a>
+<a name="ln6">// it under the terms of the GNU General Public License as published by</a>
+<a name="ln7">// the Free Software Foundation; either version 2 of the License, or</a>
+<a name="ln8">// (at your option) any later version.</a>
+<a name="ln9">// </a>
+<a name="ln10">// This program is distributed in the hope that it will be useful,</a>
+<a name="ln11">// but WITHOUT ANY WARRANTY; without even the implied warranty of</a>
+<a name="ln12">// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the</a>
+<a name="ln13">// GNU General Public License for more details.</a>
+<a name="ln14">// </a>
+<a name="ln15">// You should have received a copy of the GNU General Public License</a>
+<a name="ln16">// along with this program; if not, write to the Free Software</a>
+<a name="ln17">// Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA</a>
+<a name="ln18">//</a>
+<a name="ln19">// You can alternatively use *this file* under the terms of the the MIT</a>
+<a name="ln20">// license included in this package.</a>
+<a name="ln21"> </a>
+<a name="ln22">#include &quot;BlockCache.h&quot;</a>
+<a name="ln23"> </a>
+<a name="ln24">#include &lt;new&gt;</a>
+<a name="ln25"> </a>
+<a name="ln26">#include &lt;errno.h&gt;</a>
+<a name="ln27">#include &lt;fcntl.h&gt;</a>
+<a name="ln28">#include &lt;stdio.h&gt;</a>
+<a name="ln29">#include &lt;stdlib.h&gt;</a>
+<a name="ln30">#include &lt;string.h&gt;</a>
+<a name="ln31">#include &lt;unistd.h&gt;</a>
+<a name="ln32"> </a>
+<a name="ln33">#include &lt;fs_cache.h&gt;</a>
+<a name="ln34"> </a>
+<a name="ln35">#include &quot;Block.h&quot;</a>
+<a name="ln36">#include &quot;Debug.h&quot;</a>
+<a name="ln37">#include &quot;reiserfs.h&quot;</a>
+<a name="ln38"> </a>
+<a name="ln39">using std::nothrow;</a>
+<a name="ln40"> </a>
+<a name="ln41">/*!</a>
+<a name="ln42">	\class BlockCache</a>
+<a name="ln43">	\brief Implements a cache for disk blocks.</a>
+<a name="ln44"> </a>
+<a name="ln45">	The central methods are GetBlock() and PutBlock(). The former one</a>
+<a name="ln46">	requests a certain block and the latter tells the cache, that the caller</a>
+<a name="ln47">	is done with the block. When a block is unused it is either kept in</a>
+<a name="ln48">	memory until the next time it is needed or until its memory is needed</a>
+<a name="ln49">	for another block.</a>
+<a name="ln50">*/</a>
+<a name="ln51"> </a>
+<a name="ln52">// constructor</a>
+<a name="ln53">BlockCache::BlockCache()</a>
+<a name="ln54">	: fDevice(-1),</a>
+<a name="ln55">	  fBlockSize(0),</a>
+<a name="ln56">	  fBlockCount(0),</a>
+<a name="ln57">	  fLock(),</a>
+<a name="ln58">	  fBlocks(),</a>
+<a name="ln59">	  fReads(0),</a>
+<a name="ln60">	  fBlockGets(0),</a>
+<a name="ln61">	  fBlockReleases(0)</a>
+<a name="ln62">{</a>
+<a name="ln63">}</a>
+<a name="ln64"> </a>
+<a name="ln65">// destructor</a>
+<a name="ln66">BlockCache::~BlockCache()</a>
+<a name="ln67">{</a>
+<a name="ln68">	fLock.Lock();</a>
+<a name="ln69">	for (int32 i = 0; Block *block = fBlocks.ItemAt(i); i++) {</a>
+<a name="ln70">		if (block-&gt;_GetRefCount() &gt; 0) {</a>
+<a name="ln71">			INFORM((&quot;WARNING: block not put: %p (ref count: %ld)\n&quot;, block,</a>
+<a name="ln72">					block-&gt;_GetRefCount()));</a>
+<a name="ln73">		}</a>
+<a name="ln74">		delete block;</a>
+<a name="ln75">	}</a>
+<a name="ln76">	PRINT((&quot;statistics: %Ld block reads\n&quot;, fReads));</a>
+<a name="ln77">	PRINT((&quot;statistics: %Ld block gets\n&quot;, fBlockGets));</a>
+<a name="ln78">	PRINT((&quot;statistics: %Ld block releases\n&quot;, fBlockReleases));</a>
+<a name="ln79">	if (fCacheHandle)</a>
+<a name="ln80">		block_cache_delete(fCacheHandle, false);</a>
+<a name="ln81">	fLock.Unlock();</a>
+<a name="ln82">}</a>
+<a name="ln83"> </a>
+<a name="ln84">// Init</a>
+<a name="ln85">status_t</a>
+<a name="ln86">BlockCache::Init(int device, uint64 blockCount, uint32 blockSize)</a>
+<a name="ln87">{</a>
+<a name="ln88">	if (device &lt; 0 || blockSize &lt;= 0)</a>
+<a name="ln89">		return B_BAD_VALUE;</a>
+<a name="ln90"> </a>
+<a name="ln91">	fDevice = device;</a>
+<a name="ln92">	fBlockSize = blockSize;</a>
+<a name="ln93">	fBlockCount = blockCount;</a>
+<a name="ln94"> </a>
+<a name="ln95">	// init block cache</a>
+<a name="ln96">	fCacheHandle = block_cache_create(fDevice, blockCount, blockSize, true);</a>
+<a name="ln97">	if (!fCacheHandle)</a>
+<a name="ln98">		return B_ERROR;</a>
+<a name="ln99"> </a>
+<a name="ln100">	return B_OK;</a>
+<a name="ln101">}</a>
+<a name="ln102"> </a>
+<a name="ln103">// GetBlock</a>
+<a name="ln104">status_t</a>
+<a name="ln105">BlockCache::GetBlock(Block *block)</a>
+<a name="ln106">{</a>
+<a name="ln107">	status_t error = (block ? B_OK : B_BAD_VALUE);</a>
+<a name="ln108">	if (error == B_OK) {</a>
+<a name="ln109">		fLock.Lock();</a>
+<a name="ln110">		if (fBlocks.HasItem(block))</a>
+<a name="ln111">			block-&gt;_Get();</a>
+<a name="ln112">		else</a>
+<a name="ln113">			error = B_BAD_VALUE;</a>
+<a name="ln114">		fLock.Unlock();</a>
+<a name="ln115">	}</a>
+<a name="ln116">	return error;</a>
+<a name="ln117">}</a>
+<a name="ln118"> </a>
+<a name="ln119">// GetBlock</a>
+<a name="ln120">status_t</a>
+<a name="ln121">BlockCache::GetBlock(uint64 number, Block **result)</a>
+<a name="ln122">{</a>
+<a name="ln123"> </a>
+<a name="ln124">	if (!result || number &gt;= fBlockCount)</a>
+<a name="ln125">		return B_BAD_VALUE;</a>
+<a name="ln126"> </a>
+<a name="ln127">	fLock.Lock();</a>
+<a name="ln128"> </a>
+<a name="ln129">	// find the block in the cache</a>
+<a name="ln130">	status_t error = B_OK;</a>
+<a name="ln131">	Block *block = _FindBlock(number);</a>
+<a name="ln132">	if (!block) {</a>
+<a name="ln133">		// not found, read it from disk</a>
+<a name="ln134">		error = _ReadBlock(number, &amp;block);</a>
+<a name="ln135">		if (error == B_OK)</a>
+<a name="ln136">			fBlocks.AddItem(block);</a>
+<a name="ln137">	}</a>
+<a name="ln138"> </a>
+<a name="ln139">	// increase the block's reference counter</a>
+<a name="ln140">	if (error == B_OK) {</a>
+<a name="ln141">		block-&gt;_Get();</a>
+<a name="ln142">		*result = block;</a>
+<a name="ln143">	}</a>
+<a name="ln144"> </a>
+<a name="ln145">	fLock.Unlock();</a>
+<a name="ln146">	return error;</a>
+<a name="ln147">}</a>
+<a name="ln148"> </a>
+<a name="ln149">// PutBlock</a>
+<a name="ln150">void</a>
+<a name="ln151">BlockCache::PutBlock(Block *block)</a>
+<a name="ln152">{</a>
+<a name="ln153">	fLock.Lock();</a>
+<a name="ln154">	if (block &amp;&amp; fBlocks.HasItem(block)) {</a>
+<a name="ln155">		if (block-&gt;_Put()) {</a>
+<a name="ln156">			fBlocks.RemoveItem(block);</a>
+<a name="ln157">			delete block;</a>
+<a name="ln158">		}</a>
+<a name="ln159">	}</a>
+<a name="ln160">	fLock.Unlock();</a>
+<a name="ln161">}</a>
+<a name="ln162"> </a>
+<a name="ln163">// _FindBlock</a>
+<a name="ln164">Block *</a>
+<a name="ln165">BlockCache::_FindBlock(uint64 number)</a>
+<a name="ln166">{</a>
+<a name="ln167">	for (int32 i = 0; Block *block = fBlocks.ItemAt(i); i++) {</a>
+<a name="ln168">		if (block-&gt;GetNumber() == number)</a>
+<a name="ln169">			return block;</a>
+<a name="ln170">	}</a>
+<a name="ln171">	return NULL;</a>
+<a name="ln172">}</a>
+<a name="ln173"> </a>
+<a name="ln174">// _ReadBlock</a>
+<a name="ln175">status_t</a>
+<a name="ln176">BlockCache::_ReadBlock(uint64 number, Block **result)</a>
+<a name="ln177">{</a>
+<a name="ln178">	fReads++;	// statistics</a>
+<a name="ln179"> </a>
+<a name="ln180">	// get a free block and read the block data</a>
+<a name="ln181">	Block *block = new(nothrow) Block;</a>
+<a name="ln182">	if (!block)</a>
+<a name="ln183">		return B_NO_MEMORY;</a>
+<a name="ln184"> </a>
+<a name="ln185">	status_t error = block-&gt;_SetTo(this, number);</a>
+<a name="ln186"> </a>
+<a name="ln187">	// set the result / cleanup on error</a>
+<a name="ln188">	if (error == B_OK)</a>
+<a name="ln189">		*result = block;</a>
+<a name="ln190">	else if (block)</a>
+<a name="ln191">		delete block;</a>
+<a name="ln192">	return error;</a>
+<a name="ln193">}</a>
+<a name="ln194"> </a>
+<a name="ln195">// _GetBlock</a>
+<a name="ln196">void *</a>
+<a name="ln197">BlockCache::_GetBlock(off_t number) const</a>
+<a name="ln198">{</a>
+<a name="ln199">	fBlockGets++;	// statistics</a>
+<a name="ln200">	return const_cast&lt;void*&gt;(block_cache_get(fCacheHandle, number));</a>
+<a name="ln201">}</a>
+<a name="ln202"> </a>
+<a name="ln203">// _ReleaseBlock</a>
+<a name="ln204">void</a>
+<a name="ln205">BlockCache::_ReleaseBlock(off_t number, void *data) const</a>
+<a name="ln206">{</a>
+<a name="ln207">	fBlockReleases++;	// statistics</a>
+<a name="ln208">	block_cache_put(fCacheHandle, number);</a>
+<a name="ln209">}</a>
+<a name="ln210"> </a>
+
+</code></pre>
+<div class="balloon" rel="53"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fCacheHandle.</p></div>
+<div class="balloon" rel="71"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the third actual argument of the 'dprintf' function. The memsize type argument is expected.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

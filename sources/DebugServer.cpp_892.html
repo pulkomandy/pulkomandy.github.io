@@ -1,0 +1,1373 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>DebugServer.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2019, Adrien Destugues, pulkomandy@pulkomandy.tk.</a>
+<a name="ln3"> * Copyright 2011-2014, Rene Gollent, rene@gollent.com.</a>
+<a name="ln4"> * Copyright 2005-2009, Ingo Weinhold, bonefish@users.sf.net.</a>
+<a name="ln5"> * Distributed under the terms of the MIT License.</a>
+<a name="ln6"> */</a>
+<a name="ln7"> </a>
+<a name="ln8"> </a>
+<a name="ln9">#include &quot;DebugWindow.h&quot;</a>
+<a name="ln10"> </a>
+<a name="ln11">#include &lt;map&gt;</a>
+<a name="ln12"> </a>
+<a name="ln13">#include &lt;errno.h&gt;</a>
+<a name="ln14">#include &lt;fcntl.h&gt;</a>
+<a name="ln15">#include &lt;stdio.h&gt;</a>
+<a name="ln16">#include &lt;strings.h&gt;</a>
+<a name="ln17">#include &lt;unistd.h&gt;</a>
+<a name="ln18"> </a>
+<a name="ln19">#include &lt;AppMisc.h&gt;</a>
+<a name="ln20">#include &lt;AutoDeleter.h&gt;</a>
+<a name="ln21">#include &lt;Autolock.h&gt;</a>
+<a name="ln22">#include &lt;debug_support.h&gt;</a>
+<a name="ln23">#include &lt;Entry.h&gt;</a>
+<a name="ln24">#include &lt;FindDirectory.h&gt;</a>
+<a name="ln25">#include &lt;Invoker.h&gt;</a>
+<a name="ln26">#include &lt;Path.h&gt;</a>
+<a name="ln27"> </a>
+<a name="ln28">#include &lt;DriverSettings.h&gt;</a>
+<a name="ln29">#include &lt;MessengerPrivate.h&gt;</a>
+<a name="ln30">#include &lt;RegExp.h&gt;</a>
+<a name="ln31">#include &lt;RegistrarDefs.h&gt;</a>
+<a name="ln32">#include &lt;RosterPrivate.h&gt;</a>
+<a name="ln33">#include &lt;Server.h&gt;</a>
+<a name="ln34">#include &lt;StringList.h&gt;</a>
+<a name="ln35"> </a>
+<a name="ln36">#include &lt;util/DoublyLinkedList.h&gt;</a>
+<a name="ln37"> </a>
+<a name="ln38"> </a>
+<a name="ln39">static const char* kDebuggerSignature = &quot;application/x-vnd.Haiku-Debugger&quot;;</a>
+<a name="ln40">static const int32 MSG_DEBUG_THIS_TEAM = 'dbtt';</a>
+<a name="ln41"> </a>
+<a name="ln42"> </a>
+<a name="ln43">//#define TRACE_DEBUG_SERVER</a>
+<a name="ln44">#ifdef TRACE_DEBUG_SERVER</a>
+<a name="ln45">#	define TRACE(x) debug_printf x</a>
+<a name="ln46">#else</a>
+<a name="ln47">#	define TRACE(x) ;</a>
+<a name="ln48">#endif</a>
+<a name="ln49"> </a>
+<a name="ln50"> </a>
+<a name="ln51">using std::map;</a>
+<a name="ln52">using std::nothrow;</a>
+<a name="ln53"> </a>
+<a name="ln54"> </a>
+<a name="ln55">static const char *kSignature = &quot;application/x-vnd.Haiku-debug_server&quot;;</a>
+<a name="ln56"> </a>
+<a name="ln57"> </a>
+<a name="ln58">static status_t</a>
+<a name="ln59">action_for_string(const char* action, int32&amp; _action)</a>
+<a name="ln60">{</a>
+<a name="ln61">	if (strcmp(action, &quot;kill&quot;) == 0)</a>
+<a name="ln62">		_action = kActionKillTeam;</a>
+<a name="ln63">	else if (strcmp(action, &quot;debug&quot;) == 0)</a>
+<a name="ln64">		_action = kActionDebugTeam;</a>
+<a name="ln65">	else if (strcmp(action, &quot;log&quot;) == 0</a>
+<a name="ln66">		|| strcmp(action, &quot;report&quot;) == 0) {</a>
+<a name="ln67">		_action = kActionSaveReportTeam;</a>
+<a name="ln68">	} else if (strcasecmp(action, &quot;core&quot;) == 0)</a>
+<a name="ln69">		_action = kActionWriteCoreFile;</a>
+<a name="ln70">	else if (strcasecmp(action, &quot;user&quot;) == 0)</a>
+<a name="ln71">		_action = kActionPromptUser;</a>
+<a name="ln72">	else</a>
+<a name="ln73">		return B_BAD_VALUE;</a>
+<a name="ln74"> </a>
+<a name="ln75">	return B_OK;</a>
+<a name="ln76">}</a>
+<a name="ln77"> </a>
+<a name="ln78"> </a>
+<a name="ln79">static bool</a>
+<a name="ln80">match_team_name(const char* teamName, const char* parameterName)</a>
+<a name="ln81">{</a>
+<a name="ln82">	RegExp expressionMatcher;</a>
+<a name="ln83">	if (expressionMatcher.SetPattern(parameterName,</a>
+<a name="ln84">		RegExp::PATTERN_TYPE_WILDCARD)) {</a>
+<a name="ln85">		BString value = teamName;</a>
+<a name="ln86">		if (parameterName[0] != '/') {</a>
+<a name="ln87">			// the expression in question is a team name match only,</a>
+<a name="ln88">			// so we need to extract that.</a>
+<a name="ln89">			BPath path(teamName);</a>
+<a name="ln90">			if (path.InitCheck() == B_OK)</a>
+<a name="ln91">				value = path.Leaf();</a>
+<a name="ln92">		}</a>
+<a name="ln93"> </a>
+<a name="ln94">		RegExp::MatchResult match = expressionMatcher.Match(value);</a>
+<a name="ln95">		if (match.HasMatched())</a>
+<a name="ln96">			return true;</a>
+<a name="ln97">	}</a>
+<a name="ln98"> </a>
+<a name="ln99">	return false;</a>
+<a name="ln100">}</a>
+<a name="ln101"> </a>
+<a name="ln102"> </a>
+<a name="ln103">static status_t</a>
+<a name="ln104">action_for_team(const char* teamName, int32&amp; _action,</a>
+<a name="ln105">	bool&amp; _explicitActionFound)</a>
+<a name="ln106">{</a>
+<a name="ln107">	status_t error = B_OK;</a>
+<a name="ln108">	BPath path;</a>
+<a name="ln109">	error = find_directory(B_USER_SETTINGS_DIRECTORY, &amp;path);</a>
+<a name="ln110">	if (error != B_OK)</a>
+<a name="ln111">		return error;</a>
+<a name="ln112"> </a>
+<a name="ln113">	path.Append(&quot;system/debug_server/settings&quot;);</a>
+<a name="ln114">	BDriverSettings settings;</a>
+<a name="ln115">	error = settings.Load(path.Path());</a>
+<a name="ln116">	if (error != B_OK)</a>
+<a name="ln117">		return error;</a>
+<a name="ln118"> </a>
+<a name="ln119">	int32 tempAction;</a>
+<a name="ln120">	if (action_for_string(settings.GetParameterValue(&quot;default_action&quot;,</a>
+<a name="ln121">		&quot;user&quot;, &quot;user&quot;), tempAction) == B_OK) {</a>
+<a name="ln122">		_action = tempAction;</a>
+<a name="ln123">	} else</a>
+<a name="ln124">		_action = kActionPromptUser;</a>
+<a name="ln125">	_explicitActionFound = false;</a>
+<a name="ln126"> </a>
+<a name="ln127">	BDriverParameter parameter = settings.GetParameter(&quot;executable_actions&quot;);</a>
+<a name="ln128">	for (BDriverParameterIterator iterator = parameter.ParameterIterator();</a>
+<a name="ln129">		iterator.HasNext();) {</a>
+<a name="ln130">		BDriverParameter child = iterator.Next();</a>
+<a name="ln131">		if (!match_team_name(teamName, child.Name()))</a>
+<a name="ln132">			continue;</a>
+<a name="ln133"> </a>
+<a name="ln134">		if (child.CountValues() &gt; 0) {</a>
+<a name="ln135">			if (action_for_string(child.ValueAt(0), tempAction) == B_OK) {</a>
+<a name="ln136">				_action = tempAction;</a>
+<a name="ln137">				_explicitActionFound = true;</a>
+<a name="ln138">			}</a>
+<a name="ln139">		}</a>
+<a name="ln140"> </a>
+<a name="ln141">		break;</a>
+<a name="ln142">	}</a>
+<a name="ln143"> </a>
+<a name="ln144">	return B_OK;</a>
+<a name="ln145">}</a>
+<a name="ln146"> </a>
+<a name="ln147"> </a>
+<a name="ln148">static void</a>
+<a name="ln149">KillTeam(team_id team, const char *appName = NULL)</a>
+<a name="ln150">{</a>
+<a name="ln151">	// get a team info to verify the team still lives</a>
+<a name="ln152">	team_info info;</a>
+<a name="ln153">	if (!appName) {</a>
+<a name="ln154">		status_t error = get_team_info(team, &amp;info);</a>
+<a name="ln155">		if (error != B_OK) {</a>
+<a name="ln156">			debug_printf(&quot;debug_server: KillTeam(): Error getting info for &quot;</a>
+<a name="ln157">				&quot;team %&quot; B_PRId32 &quot;: %s\n&quot;, team, strerror(error));</a>
+<a name="ln158">			info.args[0] = '\0';</a>
+<a name="ln159">		}</a>
+<a name="ln160"> </a>
+<a name="ln161">		appName = info.args;</a>
+<a name="ln162">	}</a>
+<a name="ln163"> </a>
+<a name="ln164">	debug_printf(&quot;debug_server: Killing team %&quot; B_PRId32 &quot; (%s)\n&quot;, team,</a>
+<a name="ln165">		appName);</a>
+<a name="ln166"> </a>
+<a name="ln167">	kill_team(team);</a>
+<a name="ln168">}</a>
+<a name="ln169"> </a>
+<a name="ln170"> </a>
+<a name="ln171">// #pragma mark -</a>
+<a name="ln172"> </a>
+<a name="ln173"> </a>
+<a name="ln174">class DebugMessage : public DoublyLinkedListLinkImpl&lt;DebugMessage&gt; {</a>
+<a name="ln175">public:</a>
+<a name="ln176">	DebugMessage()</a>
+<a name="ln177">	{</a>
+<a name="ln178">	}</a>
+<a name="ln179"> </a>
+<a name="ln180">	void SetCode(debug_debugger_message code)		{ fCode = code; }</a>
+<a name="ln181">	debug_debugger_message Code() const				{ return fCode; }</a>
+<a name="ln182"> </a>
+<a name="ln183">	debug_debugger_message_data &amp;Data()				{ return fData; }</a>
+<a name="ln184">	const debug_debugger_message_data &amp;Data() const	{ return fData; }</a>
+<a name="ln185"> </a>
+<a name="ln186">private:</a>
+<a name="ln187">	debug_debugger_message		fCode;</a>
+<a name="ln188">	debug_debugger_message_data	fData;</a>
+<a name="ln189">};</a>
+<a name="ln190"> </a>
+<a name="ln191">typedef DoublyLinkedList&lt;DebugMessage&gt;	DebugMessageList;</a>
+<a name="ln192"> </a>
+<a name="ln193"> </a>
+<a name="ln194">class TeamDebugHandler : public BLocker {</a>
+<a name="ln195">public:</a>
+<a name="ln196">	TeamDebugHandler(team_id team);</a>
+<a name="ln197">	~TeamDebugHandler();</a>
+<a name="ln198"> </a>
+<a name="ln199">	status_t Init(port_id nubPort);</a>
+<a name="ln200"> </a>
+<a name="ln201">	team_id Team() const;</a>
+<a name="ln202"> </a>
+<a name="ln203">	status_t PushMessage(DebugMessage *message);</a>
+<a name="ln204"> </a>
+<a name="ln205">private:</a>
+<a name="ln206">	status_t _PopMessage(DebugMessage *&amp;message);</a>
+<a name="ln207"> </a>
+<a name="ln208">	thread_id _EnterDebugger(bool saveReport);</a>
+<a name="ln209">	status_t _SetupGDBArguments(BStringList &amp;arguments, bool usingConsoled);</a>
+<a name="ln210">	status_t _WriteCoreFile();</a>
+<a name="ln211">	void _KillTeam();</a>
+<a name="ln212"> </a>
+<a name="ln213">	int32 _HandleMessage(DebugMessage *message);</a>
+<a name="ln214"> </a>
+<a name="ln215">	void _LookupSymbolAddress(debug_symbol_lookup_context *lookupContext,</a>
+<a name="ln216">		const void *address, char *buffer, int32 bufferSize);</a>
+<a name="ln217">	void _PrintStackTrace(thread_id thread);</a>
+<a name="ln218">	void _NotifyAppServer(team_id team);</a>
+<a name="ln219">	void _NotifyRegistrar(team_id team, bool openAlert, bool stopShutdown);</a>
+<a name="ln220"> </a>
+<a name="ln221">	status_t _InitGUI();</a>
+<a name="ln222"> </a>
+<a name="ln223">	static status_t _HandlerThreadEntry(void *data);</a>
+<a name="ln224">	status_t _HandlerThread();</a>
+<a name="ln225"> </a>
+<a name="ln226">	bool _ExecutableNameEquals(const char *name) const;</a>
+<a name="ln227">	bool _IsAppServer() const;</a>
+<a name="ln228">	bool _IsInputServer() const;</a>
+<a name="ln229">	bool _IsRegistrar() const;</a>
+<a name="ln230">	bool _IsGUIServer() const;</a>
+<a name="ln231"> </a>
+<a name="ln232">	static const char *_LastPathComponent(const char *path);</a>
+<a name="ln233">	static team_id _FindTeam(const char *name);</a>
+<a name="ln234">	static bool _AreGUIServersAlive();</a>
+<a name="ln235"> </a>
+<a name="ln236">private:</a>
+<a name="ln237">	DebugMessageList		fMessages;</a>
+<a name="ln238">	sem_id					fMessageCountSem;</a>
+<a name="ln239">	team_id					fTeam;</a>
+<a name="ln240">	team_info				fTeamInfo;</a>
+<a name="ln241">	char					fExecutablePath[B_PATH_NAME_LENGTH];</a>
+<a name="ln242">	thread_id				fHandlerThread;</a>
+<a name="ln243">	debug_context			fDebugContext;</a>
+<a name="ln244">};</a>
+<a name="ln245"> </a>
+<a name="ln246"> </a>
+<a name="ln247">class TeamDebugHandlerRoster : public BLocker {</a>
+<a name="ln248">private:</a>
+<a name="ln249">	TeamDebugHandlerRoster()</a>
+<a name="ln250">		:</a>
+<a name="ln251">		BLocker(&quot;team debug handler roster&quot;)</a>
+<a name="ln252">	{</a>
+<a name="ln253">	}</a>
+<a name="ln254"> </a>
+<a name="ln255">public:</a>
+<a name="ln256">	static TeamDebugHandlerRoster *CreateDefault()</a>
+<a name="ln257">	{</a>
+<a name="ln258">		if (!sRoster)</a>
+<a name="ln259">			sRoster = new(nothrow) TeamDebugHandlerRoster;</a>
+<a name="ln260"> </a>
+<a name="ln261">		return sRoster;</a>
+<a name="ln262">	}</a>
+<a name="ln263"> </a>
+<a name="ln264">	static TeamDebugHandlerRoster *Default()</a>
+<a name="ln265">	{</a>
+<a name="ln266">		return sRoster;</a>
+<a name="ln267">	}</a>
+<a name="ln268"> </a>
+<a name="ln269">	bool AddHandler(TeamDebugHandler *handler)</a>
+<a name="ln270">	{</a>
+<a name="ln271">		if (!handler)</a>
+<a name="ln272">			return false;</a>
+<a name="ln273"> </a>
+<a name="ln274">		BAutolock _(this);</a>
+<a name="ln275"> </a>
+<a name="ln276">		fHandlers[handler-&gt;Team()] = handler;</a>
+<a name="ln277"> </a>
+<a name="ln278">		return true;</a>
+<a name="ln279">	}</a>
+<a name="ln280"> </a>
+<a name="ln281">	TeamDebugHandler *RemoveHandler(team_id team)</a>
+<a name="ln282">	{</a>
+<a name="ln283">		BAutolock _(this);</a>
+<a name="ln284"> </a>
+<a name="ln285">		TeamDebugHandler *handler = NULL;</a>
+<a name="ln286"> </a>
+<a name="ln287">		TeamDebugHandlerMap::iterator it = fHandlers.find(team);</a>
+<a name="ln288">		if (it != fHandlers.end()) {</a>
+<a name="ln289">			handler = it-&gt;second;</a>
+<a name="ln290">			fHandlers.erase(it);</a>
+<a name="ln291">		}</a>
+<a name="ln292"> </a>
+<a name="ln293">		return handler;</a>
+<a name="ln294">	}</a>
+<a name="ln295"> </a>
+<a name="ln296">	TeamDebugHandler *HandlerFor(team_id team)</a>
+<a name="ln297">	{</a>
+<a name="ln298">		BAutolock _(this);</a>
+<a name="ln299"> </a>
+<a name="ln300">		TeamDebugHandler *handler = NULL;</a>
+<a name="ln301"> </a>
+<a name="ln302">		TeamDebugHandlerMap::iterator it = fHandlers.find(team);</a>
+<a name="ln303">		if (it != fHandlers.end())</a>
+<a name="ln304">			handler = it-&gt;second;</a>
+<a name="ln305"> </a>
+<a name="ln306">		return handler;</a>
+<a name="ln307">	}</a>
+<a name="ln308"> </a>
+<a name="ln309">	status_t DispatchMessage(DebugMessage *message)</a>
+<a name="ln310">	{</a>
+<a name="ln311">		if (!message)</a>
+<a name="ln312">			return B_BAD_VALUE;</a>
+<a name="ln313"> </a>
+<a name="ln314">		ObjectDeleter&lt;DebugMessage&gt; messageDeleter(message);</a>
+<a name="ln315"> </a>
+<a name="ln316">		team_id team = message-&gt;Data().origin.team;</a>
+<a name="ln317"> </a>
+<a name="ln318">		// get the responsible team debug handler</a>
+<a name="ln319">		BAutolock _(this);</a>
+<a name="ln320"> </a>
+<a name="ln321">		TeamDebugHandler *handler = HandlerFor(team);</a>
+<a name="ln322">		if (!handler) {</a>
+<a name="ln323">			// no handler yet, we need to create one</a>
+<a name="ln324">			handler = new(nothrow) TeamDebugHandler(team);</a>
+<a name="ln325">			if (!handler) {</a>
+<a name="ln326">				KillTeam(team);</a>
+<a name="ln327">				return B_NO_MEMORY;</a>
+<a name="ln328">			}</a>
+<a name="ln329"> </a>
+<a name="ln330">			status_t error = handler-&gt;Init(message-&gt;Data().origin.nub_port);</a>
+<a name="ln331">			if (error != B_OK) {</a>
+<a name="ln332">				delete handler;</a>
+<a name="ln333">				KillTeam(team);</a>
+<a name="ln334">				return error;</a>
+<a name="ln335">			}</a>
+<a name="ln336"> </a>
+<a name="ln337">			if (!AddHandler(handler)) {</a>
+<a name="ln338">				delete handler;</a>
+<a name="ln339">				KillTeam(team);</a>
+<a name="ln340">				return B_NO_MEMORY;</a>
+<a name="ln341">			}</a>
+<a name="ln342">		}</a>
+<a name="ln343"> </a>
+<a name="ln344">		// hand over the message to it</a>
+<a name="ln345">		handler-&gt;PushMessage(message);</a>
+<a name="ln346">		messageDeleter.Detach();</a>
+<a name="ln347"> </a>
+<a name="ln348">		return B_OK;</a>
+<a name="ln349">	}</a>
+<a name="ln350"> </a>
+<a name="ln351">private:</a>
+<a name="ln352">	typedef map&lt;team_id, TeamDebugHandler*&gt;	TeamDebugHandlerMap;</a>
+<a name="ln353"> </a>
+<a name="ln354">	static TeamDebugHandlerRoster	*sRoster;</a>
+<a name="ln355"> </a>
+<a name="ln356">	TeamDebugHandlerMap				fHandlers;</a>
+<a name="ln357">};</a>
+<a name="ln358"> </a>
+<a name="ln359"> </a>
+<a name="ln360">TeamDebugHandlerRoster *TeamDebugHandlerRoster::sRoster = NULL;</a>
+<a name="ln361"> </a>
+<a name="ln362"> </a>
+<a name="ln363">class DebugServer : public BServer {</a>
+<a name="ln364">public:</a>
+<a name="ln365">	DebugServer(status_t &amp;error);</a>
+<a name="ln366"> </a>
+<a name="ln367">	status_t Init();</a>
+<a name="ln368"> </a>
+<a name="ln369">	virtual bool QuitRequested();</a>
+<a name="ln370"> </a>
+<a name="ln371">private:</a>
+<a name="ln372">	static status_t _ListenerEntry(void *data);</a>
+<a name="ln373">	status_t _Listener();</a>
+<a name="ln374"> </a>
+<a name="ln375">	void _DeleteTeamDebugHandler(TeamDebugHandler *handler);</a>
+<a name="ln376"> </a>
+<a name="ln377">private:</a>
+<a name="ln378">	typedef map&lt;team_id, TeamDebugHandler*&gt;	TeamDebugHandlerMap;</a>
+<a name="ln379"> </a>
+<a name="ln380">	port_id				fListenerPort;</a>
+<a name="ln381">	thread_id			fListener;</a>
+<a name="ln382">	bool				fTerminating;</a>
+<a name="ln383">};</a>
+<a name="ln384"> </a>
+<a name="ln385"> </a>
+<a name="ln386">// #pragma mark -</a>
+<a name="ln387"> </a>
+<a name="ln388"> </a>
+<a name="ln389">TeamDebugHandler::TeamDebugHandler(team_id team)</a>
+<a name="ln390">	:</a>
+<a name="ln391">	BLocker(&quot;team debug handler&quot;),</a>
+<a name="ln392">	fMessages(),</a>
+<a name="ln393">	fMessageCountSem(-1),</a>
+<a name="ln394">	fTeam(team),</a>
+<a name="ln395">	fHandlerThread(-1)</a>
+<a name="ln396">{</a>
+<a name="ln397">	fDebugContext.nub_port = -1;</a>
+<a name="ln398">	fDebugContext.reply_port = -1;</a>
+<a name="ln399"> </a>
+<a name="ln400">	fExecutablePath[0] = '\0';</a>
+<a name="ln401">}</a>
+<a name="ln402"> </a>
+<a name="ln403"> </a>
+<a name="ln404">TeamDebugHandler::~TeamDebugHandler()</a>
+<a name="ln405">{</a>
+<a name="ln406">	// delete the message count semaphore and wait for the thread to die</a>
+<a name="ln407">	if (fMessageCountSem &gt;= 0)</a>
+<a name="ln408">		delete_sem(fMessageCountSem);</a>
+<a name="ln409"> </a>
+<a name="ln410">	if (fHandlerThread &gt;= 0 &amp;&amp; find_thread(NULL) != fHandlerThread) {</a>
+<a name="ln411">		status_t result;</a>
+<a name="ln412">		wait_for_thread(fHandlerThread, &amp;result);</a>
+<a name="ln413">	}</a>
+<a name="ln414"> </a>
+<a name="ln415">	// destroy debug context</a>
+<a name="ln416">	if (fDebugContext.nub_port &gt;= 0)</a>
+<a name="ln417">		destroy_debug_context(&amp;fDebugContext);</a>
+<a name="ln418"> </a>
+<a name="ln419">	// delete the remaining messages</a>
+<a name="ln420">	while (DebugMessage *message = fMessages.Head()) {</a>
+<a name="ln421">		fMessages.Remove(message);</a>
+<a name="ln422">		delete message;</a>
+<a name="ln423">	}</a>
+<a name="ln424">}</a>
+<a name="ln425"> </a>
+<a name="ln426"> </a>
+<a name="ln427">status_t</a>
+<a name="ln428">TeamDebugHandler::Init(port_id nubPort)</a>
+<a name="ln429">{</a>
+<a name="ln430">	// get the team info for the team</a>
+<a name="ln431">	status_t error = get_team_info(fTeam, &amp;fTeamInfo);</a>
+<a name="ln432">	if (error != B_OK) {</a>
+<a name="ln433">		debug_printf(&quot;debug_server: TeamDebugHandler::Init(): Failed to get &quot;</a>
+<a name="ln434">			&quot;info for team %&quot; B_PRId32 &quot;: %s\n&quot;, fTeam, strerror(error));</a>
+<a name="ln435">		return error;</a>
+<a name="ln436">	}</a>
+<a name="ln437"> </a>
+<a name="ln438">	// get the executable path</a>
+<a name="ln439">	error = BPrivate::get_app_path(fTeam, fExecutablePath);</a>
+<a name="ln440">	if (error != B_OK) {</a>
+<a name="ln441">		debug_printf(&quot;debug_server: TeamDebugHandler::Init(): Failed to get &quot;</a>
+<a name="ln442">			&quot;executable path of team %&quot; B_PRId32 &quot;: %s\n&quot;, fTeam,</a>
+<a name="ln443">			strerror(error));</a>
+<a name="ln444"> </a>
+<a name="ln445">		fExecutablePath[0] = '\0';</a>
+<a name="ln446">	}</a>
+<a name="ln447"> </a>
+<a name="ln448">	// init a debug context for the handler</a>
+<a name="ln449">	error = init_debug_context(&amp;fDebugContext, fTeam, nubPort);</a>
+<a name="ln450">	if (error != B_OK) {</a>
+<a name="ln451">		debug_printf(&quot;debug_server: TeamDebugHandler::Init(): Failed to init &quot;</a>
+<a name="ln452">			&quot;debug context for team %&quot; B_PRId32 &quot;, port %&quot; B_PRId32 &quot;: %s\n&quot;,</a>
+<a name="ln453">			fTeam, nubPort, strerror(error));</a>
+<a name="ln454">		return error;</a>
+<a name="ln455">	}</a>
+<a name="ln456"> </a>
+<a name="ln457">	// set team flags</a>
+<a name="ln458">	debug_nub_set_team_flags message;</a>
+<a name="ln459">	message.flags = B_TEAM_DEBUG_PREVENT_EXIT;</a>
+<a name="ln460"> </a>
+<a name="ln461">	send_debug_message(&amp;fDebugContext, B_DEBUG_MESSAGE_SET_TEAM_FLAGS, &amp;message,</a>
+<a name="ln462">		sizeof(message), NULL, 0);</a>
+<a name="ln463"> </a>
+<a name="ln464">	// create the message count semaphore</a>
+<a name="ln465">	char name[B_OS_NAME_LENGTH];</a>
+<a name="ln466">	snprintf(name, sizeof(name), &quot;team %&quot; B_PRId32 &quot; message count&quot;, fTeam);</a>
+<a name="ln467">	fMessageCountSem = create_sem(0, name);</a>
+<a name="ln468">	if (fMessageCountSem &lt; 0) {</a>
+<a name="ln469">		debug_printf(&quot;debug_server: TeamDebugHandler::Init(): Failed to create &quot;</a>
+<a name="ln470">			&quot;message count semaphore: %s\n&quot;, strerror(fMessageCountSem));</a>
+<a name="ln471">		return fMessageCountSem;</a>
+<a name="ln472">	}</a>
+<a name="ln473"> </a>
+<a name="ln474">	// spawn the handler thread</a>
+<a name="ln475">	snprintf(name, sizeof(name), &quot;team %&quot; B_PRId32 &quot; handler&quot;, fTeam);</a>
+<a name="ln476">	fHandlerThread = spawn_thread(&amp;_HandlerThreadEntry, name, B_NORMAL_PRIORITY,</a>
+<a name="ln477">		this);</a>
+<a name="ln478">	if (fHandlerThread &lt; 0) {</a>
+<a name="ln479">		debug_printf(&quot;debug_server: TeamDebugHandler::Init(): Failed to spawn &quot;</a>
+<a name="ln480">			&quot;handler thread: %s\n&quot;, strerror(fHandlerThread));</a>
+<a name="ln481">		return fHandlerThread;</a>
+<a name="ln482">	}</a>
+<a name="ln483"> </a>
+<a name="ln484">	resume_thread(fHandlerThread);</a>
+<a name="ln485"> </a>
+<a name="ln486">	return B_OK;</a>
+<a name="ln487">}</a>
+<a name="ln488"> </a>
+<a name="ln489"> </a>
+<a name="ln490">team_id</a>
+<a name="ln491">TeamDebugHandler::Team() const</a>
+<a name="ln492">{</a>
+<a name="ln493">	return fTeam;</a>
+<a name="ln494">}</a>
+<a name="ln495"> </a>
+<a name="ln496"> </a>
+<a name="ln497">status_t</a>
+<a name="ln498">TeamDebugHandler::PushMessage(DebugMessage *message)</a>
+<a name="ln499">{</a>
+<a name="ln500">	BAutolock _(this);</a>
+<a name="ln501"> </a>
+<a name="ln502">	fMessages.Add(message);</a>
+<a name="ln503">	release_sem(fMessageCountSem);</a>
+<a name="ln504"> </a>
+<a name="ln505">	return B_OK;</a>
+<a name="ln506">}</a>
+<a name="ln507"> </a>
+<a name="ln508"> </a>
+<a name="ln509">status_t</a>
+<a name="ln510">TeamDebugHandler::_PopMessage(DebugMessage *&amp;message)</a>
+<a name="ln511">{</a>
+<a name="ln512">	// acquire the semaphore</a>
+<a name="ln513">	status_t error;</a>
+<a name="ln514">	do {</a>
+<a name="ln515">		error = acquire_sem(fMessageCountSem);</a>
+<a name="ln516">	} while (error == B_INTERRUPTED);</a>
+<a name="ln517"> </a>
+<a name="ln518">	if (error != B_OK)</a>
+<a name="ln519">		return error;</a>
+<a name="ln520"> </a>
+<a name="ln521">	// get the message</a>
+<a name="ln522">	BAutolock _(this);</a>
+<a name="ln523"> </a>
+<a name="ln524">	message = fMessages.Head();</a>
+<a name="ln525">	fMessages.Remove(message);</a>
+<a name="ln526"> </a>
+<a name="ln527">	return B_OK;</a>
+<a name="ln528">}</a>
+<a name="ln529"> </a>
+<a name="ln530"> </a>
+<a name="ln531">status_t</a>
+<a name="ln532">TeamDebugHandler::_SetupGDBArguments(BStringList &amp;arguments, bool usingConsoled)</a>
+<a name="ln533">{</a>
+<a name="ln534">	// prepare the argument vector</a>
+<a name="ln535">	BString teamString;</a>
+<a name="ln536">	teamString.SetToFormat(&quot;--pid=%&quot; B_PRId32, fTeam);</a>
+<a name="ln537"> </a>
+<a name="ln538">	status_t error;</a>
+<a name="ln539">	BPath terminalPath;</a>
+<a name="ln540">	if (usingConsoled) {</a>
+<a name="ln541">		error = find_directory(B_SYSTEM_BIN_DIRECTORY, &amp;terminalPath);</a>
+<a name="ln542">		if (error != B_OK) {</a>
+<a name="ln543">			debug_printf(&quot;debug_server: can't find system-bin directory: %s\n&quot;,</a>
+<a name="ln544">				strerror(error));</a>
+<a name="ln545">			return error;</a>
+<a name="ln546">		}</a>
+<a name="ln547">		error = terminalPath.Append(&quot;consoled&quot;);</a>
+<a name="ln548">		if (error != B_OK) {</a>
+<a name="ln549">			debug_printf(&quot;debug_server: can't append to system-bin path: %s\n&quot;,</a>
+<a name="ln550">				strerror(error));</a>
+<a name="ln551">			return error;</a>
+<a name="ln552">		}</a>
+<a name="ln553">	} else {</a>
+<a name="ln554">		error = find_directory(B_SYSTEM_APPS_DIRECTORY, &amp;terminalPath);</a>
+<a name="ln555">		if (error != B_OK) {</a>
+<a name="ln556">			debug_printf(&quot;debug_server: can't find system-apps directory: %s\n&quot;,</a>
+<a name="ln557">				strerror(error));</a>
+<a name="ln558">			return error;</a>
+<a name="ln559">		}</a>
+<a name="ln560">		error = terminalPath.Append(&quot;Terminal&quot;);</a>
+<a name="ln561">		if (error != B_OK) {</a>
+<a name="ln562">			debug_printf(&quot;debug_server: can't append to system-apps path: %s\n&quot;,</a>
+<a name="ln563">				strerror(error));</a>
+<a name="ln564">			return error;</a>
+<a name="ln565">		}</a>
+<a name="ln566">	}</a>
+<a name="ln567"> </a>
+<a name="ln568">	arguments.MakeEmpty();</a>
+<a name="ln569">	if (!arguments.Add(terminalPath.Path()))</a>
+<a name="ln570">		return B_NO_MEMORY;</a>
+<a name="ln571"> </a>
+<a name="ln572">	if (!usingConsoled) {</a>
+<a name="ln573">		BString windowTitle;</a>
+<a name="ln574">		windowTitle.SetToFormat(&quot;Debug of Team %&quot; B_PRId32 &quot;: %s&quot;, fTeam,</a>
+<a name="ln575">			_LastPathComponent(fExecutablePath));</a>
+<a name="ln576">		if (!arguments.Add(&quot;-t&quot;) || !arguments.Add(windowTitle))</a>
+<a name="ln577">			return B_NO_MEMORY;</a>
+<a name="ln578">	}</a>
+<a name="ln579"> </a>
+<a name="ln580">	BPath gdbPath;</a>
+<a name="ln581">	error = find_directory(B_SYSTEM_BIN_DIRECTORY, &amp;gdbPath);</a>
+<a name="ln582">	if (error != B_OK) {</a>
+<a name="ln583">		debug_printf(&quot;debug_server: can't find system-bin directory: %s\n&quot;,</a>
+<a name="ln584">			strerror(error));</a>
+<a name="ln585">		return error;</a>
+<a name="ln586">	}</a>
+<a name="ln587">	error = gdbPath.Append(&quot;gdb&quot;);</a>
+<a name="ln588">	if (error != B_OK) {</a>
+<a name="ln589">		debug_printf(&quot;debug_server: can't append to system-bin path: %s\n&quot;,</a>
+<a name="ln590">			strerror(error));</a>
+<a name="ln591">		return error;</a>
+<a name="ln592">	}</a>
+<a name="ln593">	if (!arguments.Add(gdbPath.Path()) || !arguments.Add(teamString))</a>
+<a name="ln594">		return B_NO_MEMORY;</a>
+<a name="ln595"> </a>
+<a name="ln596">	if (strlen(fExecutablePath) &gt; 0 &amp;&amp; !arguments.Add(fExecutablePath))</a>
+<a name="ln597">		return B_NO_MEMORY;</a>
+<a name="ln598"> </a>
+<a name="ln599">	return B_OK;</a>
+<a name="ln600">}</a>
+<a name="ln601"> </a>
+<a name="ln602"> </a>
+<a name="ln603">thread_id</a>
+<a name="ln604">TeamDebugHandler::_EnterDebugger(bool saveReport)</a>
+<a name="ln605">{</a>
+<a name="ln606">	TRACE((&quot;debug_server: TeamDebugHandler::_EnterDebugger(): team %&quot; B_PRId32</a>
+<a name="ln607">		&quot;\n&quot;, fTeam));</a>
+<a name="ln608"> </a>
+<a name="ln609">	// prepare a debugger handover</a>
+<a name="ln610">	TRACE((&quot;debug_server: TeamDebugHandler::_EnterDebugger(): preparing &quot;</a>
+<a name="ln611">		&quot;debugger handover for team %&quot; B_PRId32 &quot;...\n&quot;, fTeam));</a>
+<a name="ln612"> </a>
+<a name="ln613">	status_t error = send_debug_message(&amp;fDebugContext,</a>
+<a name="ln614">		B_DEBUG_MESSAGE_PREPARE_HANDOVER, NULL, 0, NULL, 0);</a>
+<a name="ln615">	if (error != B_OK) {</a>
+<a name="ln616">		debug_printf(&quot;debug_server: Failed to prepare debugger handover: %s\n&quot;,</a>
+<a name="ln617">			strerror(error));</a>
+<a name="ln618">		return error;</a>
+<a name="ln619">	}</a>
+<a name="ln620"> </a>
+<a name="ln621">	BStringList arguments;</a>
+<a name="ln622">	const char *argv[16];</a>
+<a name="ln623">	int argc = 0;</a>
+<a name="ln624"> </a>
+<a name="ln625">	bool debugInConsoled = _IsGUIServer() || !_AreGUIServersAlive();</a>
+<a name="ln626">#ifdef HANDOVER_USE_GDB</a>
+<a name="ln627"> </a>
+<a name="ln628">	error = _SetupGDBArguments(arguments, debugInConsoled);</a>
+<a name="ln629">	if (error != B_OK) {</a>
+<a name="ln630">		debug_printf(&quot;debug_server: Failed to set up gdb arguments: %s\n&quot;,</a>
+<a name="ln631">			strerror(error));</a>
+<a name="ln632">		return error;</a>
+<a name="ln633">	}</a>
+<a name="ln634"> </a>
+<a name="ln635">	// start the terminal</a>
+<a name="ln636">	TRACE((&quot;debug_server: TeamDebugHandler::_EnterDebugger(): starting  &quot;</a>
+<a name="ln637">		&quot;terminal (debugger) for team %&quot; B_PRId32 &quot;...\n&quot;, fTeam));</a>
+<a name="ln638"> </a>
+<a name="ln639">#elif defined(HANDOVER_USE_DEBUGGER)</a>
+<a name="ln640">	if (!debugInConsoled &amp;&amp; !saveReport</a>
+<a name="ln641">		&amp;&amp; be_roster-&gt;IsRunning(kDebuggerSignature)) {</a>
+<a name="ln642"> </a>
+<a name="ln643">		// for graphical handovers, check if Debugger is already running,</a>
+<a name="ln644">		// and if it is, simply send it a message to attach to the requested</a>
+<a name="ln645">		// team.</a>
+<a name="ln646">		BMessenger messenger(kDebuggerSignature);</a>
+<a name="ln647">		BMessage message(MSG_DEBUG_THIS_TEAM);</a>
+<a name="ln648">		if (message.AddInt32(&quot;team&quot;, fTeam) == B_OK</a>
+<a name="ln649">			&amp;&amp; messenger.SendMessage(&amp;message) == B_OK) {</a>
+<a name="ln650">			return 0;</a>
+<a name="ln651">		}</a>
+<a name="ln652">	}</a>
+<a name="ln653"> </a>
+<a name="ln654">	// prepare the argument vector</a>
+<a name="ln655">	BPath debuggerPath;</a>
+<a name="ln656">	if (debugInConsoled) {</a>
+<a name="ln657">		error = find_directory(B_SYSTEM_BIN_DIRECTORY, &amp;debuggerPath);</a>
+<a name="ln658">		if (error != B_OK) {</a>
+<a name="ln659">			debug_printf(&quot;debug_server: can't find system-bin directory: %s\n&quot;,</a>
+<a name="ln660">				strerror(error));</a>
+<a name="ln661">			return error;</a>
+<a name="ln662">		}</a>
+<a name="ln663">		error = debuggerPath.Append(&quot;consoled&quot;);</a>
+<a name="ln664">		if (error != B_OK) {</a>
+<a name="ln665">			debug_printf(&quot;debug_server: can't append to system-bin path: %s\n&quot;,</a>
+<a name="ln666">				strerror(error));</a>
+<a name="ln667">			return error;</a>
+<a name="ln668">		}</a>
+<a name="ln669"> </a>
+<a name="ln670">		if (!arguments.Add(debuggerPath.Path()))</a>
+<a name="ln671">			return B_NO_MEMORY;</a>
+<a name="ln672">	}</a>
+<a name="ln673"> </a>
+<a name="ln674">	error = find_directory(B_SYSTEM_APPS_DIRECTORY, &amp;debuggerPath);</a>
+<a name="ln675">	if (error != B_OK) {</a>
+<a name="ln676">		debug_printf(&quot;debug_server: can't find system-apps directory: %s\n&quot;,</a>
+<a name="ln677">			strerror(error));</a>
+<a name="ln678">		return error;</a>
+<a name="ln679">	}</a>
+<a name="ln680">	error = debuggerPath.Append(&quot;Debugger&quot;);</a>
+<a name="ln681">	if (error != B_OK) {</a>
+<a name="ln682">		debug_printf(&quot;debug_server: can't append to system-apps path: %s\n&quot;,</a>
+<a name="ln683">			strerror(error));</a>
+<a name="ln684">		return error;</a>
+<a name="ln685">	}</a>
+<a name="ln686">	if (!arguments.Add(debuggerPath.Path()))</a>
+<a name="ln687">		return B_NO_MEMORY;</a>
+<a name="ln688"> </a>
+<a name="ln689">	if (debugInConsoled &amp;&amp; !arguments.Add(&quot;--cli&quot;))</a>
+<a name="ln690">		return B_NO_MEMORY;</a>
+<a name="ln691"> </a>
+<a name="ln692">	BString debuggerParam;</a>
+<a name="ln693">	debuggerParam.SetToFormat(&quot;%&quot; B_PRId32, fTeam);</a>
+<a name="ln694">	if (saveReport) {</a>
+<a name="ln695">		if (!arguments.Add(&quot;--save-report&quot;))</a>
+<a name="ln696">			return B_NO_MEMORY;</a>
+<a name="ln697">	}</a>
+<a name="ln698">	if (!arguments.Add(&quot;--team&quot;) || !arguments.Add(debuggerParam))</a>
+<a name="ln699">		return B_NO_MEMORY;</a>
+<a name="ln700"> </a>
+<a name="ln701">	// start the debugger</a>
+<a name="ln702">	TRACE((&quot;debug_server: TeamDebugHandler::_EnterDebugger(): starting  &quot;</a>
+<a name="ln703">		&quot;%s debugger for team %&quot; B_PRId32 &quot;...\n&quot;,</a>
+<a name="ln704">			debugInConsoled ? &quot;command line&quot; : &quot;graphical&quot;, fTeam));</a>
+<a name="ln705">#endif</a>
+<a name="ln706"> </a>
+<a name="ln707">	for (int32 i = 0; i &lt; arguments.CountStrings(); i++)</a>
+<a name="ln708">		argv[argc++] = arguments.StringAt(i).String();</a>
+<a name="ln709">	argv[argc] = NULL;</a>
+<a name="ln710"> </a>
+<a name="ln711">	thread_id thread = load_image(argc, argv, (const char**)environ);</a>
+<a name="ln712">	if (thread &lt; 0) {</a>
+<a name="ln713">		debug_printf(&quot;debug_server: Failed to start debugger: %s\n&quot;,</a>
+<a name="ln714">			strerror(thread));</a>
+<a name="ln715">		return thread;</a>
+<a name="ln716">	}</a>
+<a name="ln717">	resume_thread(thread);</a>
+<a name="ln718"> </a>
+<a name="ln719">	TRACE((&quot;debug_server: TeamDebugHandler::_EnterDebugger(): debugger started &quot;</a>
+<a name="ln720">		&quot;for team %&quot; B_PRId32 &quot;: thread: %&quot; B_PRId32 &quot;\n&quot;, fTeam, thread));</a>
+<a name="ln721"> </a>
+<a name="ln722">	return thread;</a>
+<a name="ln723">}</a>
+<a name="ln724"> </a>
+<a name="ln725"> </a>
+<a name="ln726">void</a>
+<a name="ln727">TeamDebugHandler::_KillTeam()</a>
+<a name="ln728">{</a>
+<a name="ln729">	KillTeam(fTeam, fTeamInfo.args);</a>
+<a name="ln730">}</a>
+<a name="ln731"> </a>
+<a name="ln732"> </a>
+<a name="ln733">status_t</a>
+<a name="ln734">TeamDebugHandler::_WriteCoreFile()</a>
+<a name="ln735">{</a>
+<a name="ln736">	// get a usable path for the core file</a>
+<a name="ln737">	BPath directoryPath;</a>
+<a name="ln738">	status_t error = find_directory(B_DESKTOP_DIRECTORY, &amp;directoryPath);</a>
+<a name="ln739">	if (error != B_OK) {</a>
+<a name="ln740">		debug_printf(&quot;debug_server: Couldn't get desktop directory: %s\n&quot;,</a>
+<a name="ln741">			strerror(error));</a>
+<a name="ln742">		return error;</a>
+<a name="ln743">	}</a>
+<a name="ln744"> </a>
+<a name="ln745">	const char* executableName = strrchr(fExecutablePath, '/');</a>
+<a name="ln746">	if (executableName == NULL)</a>
+<a name="ln747">		executableName = fExecutablePath;</a>
+<a name="ln748">	else</a>
+<a name="ln749">		executableName++;</a>
+<a name="ln750"> </a>
+<a name="ln751">	BString fileBaseName(&quot;core-&quot;);</a>
+<a name="ln752">	fileBaseName &lt;&lt; executableName &lt;&lt; '-' &lt;&lt; fTeam;</a>
+<a name="ln753">	BPath filePath;</a>
+<a name="ln754"> </a>
+<a name="ln755">	for (int32 index = 0;; index++) {</a>
+<a name="ln756">		BString fileName(fileBaseName);</a>
+<a name="ln757">		if (index &gt; 0)</a>
+<a name="ln758">			fileName &lt;&lt; '-' &lt;&lt; index;</a>
+<a name="ln759"> </a>
+<a name="ln760">		error = filePath.SetTo(directoryPath.Path(), fileName.String());</a>
+<a name="ln761">		if (error != B_OK) {</a>
+<a name="ln762">			debug_printf(&quot;debug_server: Couldn't get core file path for team %&quot;</a>
+<a name="ln763">				B_PRId32 &quot;: %s\n&quot;, fTeam, strerror(error));</a>
+<a name="ln764">			return error;</a>
+<a name="ln765">		}</a>
+<a name="ln766"> </a>
+<a name="ln767">		struct stat st;</a>
+<a name="ln768">		if (lstat(filePath.Path(), &amp;st) != 0) {</a>
+<a name="ln769">			if (errno == B_ENTRY_NOT_FOUND)</a>
+<a name="ln770">				break;</a>
+<a name="ln771">		}</a>
+<a name="ln772"> </a>
+<a name="ln773">		if (index &gt; 1000) {</a>
+<a name="ln774">			debug_printf(&quot;debug_server: Couldn't get usable core file path for &quot;</a>
+<a name="ln775">				&quot;team %&quot; B_PRId32 &quot;\n&quot;, fTeam);</a>
+<a name="ln776">			return B_ERROR;</a>
+<a name="ln777">		}</a>
+<a name="ln778">	}</a>
+<a name="ln779"> </a>
+<a name="ln780">	debug_nub_write_core_file message;</a>
+<a name="ln781">	message.reply_port = fDebugContext.reply_port;</a>
+<a name="ln782">	strlcpy(message.path, filePath.Path(), sizeof(message.path));</a>
+<a name="ln783"> </a>
+<a name="ln784">	debug_nub_write_core_file_reply reply;</a>
+<a name="ln785"> </a>
+<a name="ln786">	error = send_debug_message(&amp;fDebugContext, B_DEBUG_WRITE_CORE_FILE,</a>
+<a name="ln787">			&amp;message, sizeof(message), &amp;reply, sizeof(reply));</a>
+<a name="ln788">	if (error == B_OK)</a>
+<a name="ln789">		error = reply.error;</a>
+<a name="ln790">	if (error != B_OK) {</a>
+<a name="ln791">		debug_printf(&quot;debug_server: Failed to write core file for team %&quot;</a>
+<a name="ln792">			B_PRId32 &quot;: %s\n&quot;, fTeam, strerror(error));</a>
+<a name="ln793">	}</a>
+<a name="ln794"> </a>
+<a name="ln795">	return error;</a>
+<a name="ln796">}</a>
+<a name="ln797"> </a>
+<a name="ln798"> </a>
+<a name="ln799">int32</a>
+<a name="ln800">TeamDebugHandler::_HandleMessage(DebugMessage *message)</a>
+<a name="ln801">{</a>
+<a name="ln802">	// This method is called only for the first message the debugger gets for</a>
+<a name="ln803">	// a team. That means only a few messages are actually possible, while</a>
+<a name="ln804">	// others wouldn't trigger the debugger in the first place. So we deal with</a>
+<a name="ln805">	// all of them the same way, by popping up an alert.</a>
+<a name="ln806">	TRACE((&quot;debug_server: TeamDebugHandler::_HandleMessage(): team %&quot; B_PRId32</a>
+<a name="ln807">		&quot;, code: %&quot; B_PRId32 &quot;\n&quot;, fTeam, (int32)message-&gt;Code()));</a>
+<a name="ln808"> </a>
+<a name="ln809">	thread_id thread = message-&gt;Data().origin.thread;</a>
+<a name="ln810"> </a>
+<a name="ln811">	// get some user-readable message</a>
+<a name="ln812">	char buffer[512];</a>
+<a name="ln813">	switch (message-&gt;Code()) {</a>
+<a name="ln814">		case B_DEBUGGER_MESSAGE_TEAM_DELETED:</a>
+<a name="ln815">			// This shouldn't happen.</a>
+<a name="ln816">			debug_printf(&quot;debug_server: Got a spurious &quot;</a>
+<a name="ln817">				&quot;B_DEBUGGER_MESSAGE_TEAM_DELETED message for team %&quot; B_PRId32</a>
+<a name="ln818">				&quot;\n&quot;, fTeam);</a>
+<a name="ln819">			return true;</a>
+<a name="ln820"> </a>
+<a name="ln821">		case B_DEBUGGER_MESSAGE_EXCEPTION_OCCURRED:</a>
+<a name="ln822">			get_debug_exception_string(</a>
+<a name="ln823">				message-&gt;Data().exception_occurred.exception, buffer,</a>
+<a name="ln824">				sizeof(buffer));</a>
+<a name="ln825">			break;</a>
+<a name="ln826"> </a>
+<a name="ln827">		case B_DEBUGGER_MESSAGE_DEBUGGER_CALL:</a>
+<a name="ln828">		{</a>
+<a name="ln829">			// get the debugger() message</a>
+<a name="ln830">			void *messageAddress = message-&gt;Data().debugger_call.message;</a>
+<a name="ln831">			char messageBuffer[128];</a>
+<a name="ln832">			status_t error = B_OK;</a>
+<a name="ln833">			ssize_t bytesRead = debug_read_string(&amp;fDebugContext,</a>
+<a name="ln834">				messageAddress, messageBuffer, sizeof(messageBuffer));</a>
+<a name="ln835">			if (bytesRead &lt; 0)</a>
+<a name="ln836">				error = bytesRead;</a>
+<a name="ln837"> </a>
+<a name="ln838">			if (error == B_OK) {</a>
+<a name="ln839">				sprintf(buffer, &quot;Debugger call: `%s'&quot;, messageBuffer);</a>
+<a name="ln840">			} else {</a>
+<a name="ln841">				snprintf(buffer, sizeof(buffer), &quot;Debugger call: %p &quot;</a>
+<a name="ln842">					&quot;(Failed to read message: %s)&quot;, messageAddress,</a>
+<a name="ln843">					strerror(error));</a>
+<a name="ln844">			}</a>
+<a name="ln845">			break;</a>
+<a name="ln846">		}</a>
+<a name="ln847"> </a>
+<a name="ln848">		default:</a>
+<a name="ln849">			get_debug_message_string(message-&gt;Code(), buffer, sizeof(buffer));</a>
+<a name="ln850">			break;</a>
+<a name="ln851">	}</a>
+<a name="ln852"> </a>
+<a name="ln853">	debug_printf(&quot;debug_server: Thread %&quot; B_PRId32 &quot; entered the debugger: %s\n&quot;,</a>
+<a name="ln854">		thread, buffer);</a>
+<a name="ln855"> </a>
+<a name="ln856">	_PrintStackTrace(thread);</a>
+<a name="ln857"> </a>
+<a name="ln858">	int32 debugAction = kActionPromptUser;</a>
+<a name="ln859">	bool explicitActionFound = false;</a>
+<a name="ln860">	if (action_for_team(fExecutablePath, debugAction, explicitActionFound)</a>
+<a name="ln861">			!= B_OK) {</a>
+<a name="ln862">		debugAction = kActionPromptUser;</a>
+<a name="ln863">		explicitActionFound = false;</a>
+<a name="ln864">	}</a>
+<a name="ln865"> </a>
+<a name="ln866">	// ask the user whether to debug or kill the team</a>
+<a name="ln867">	if (_IsGUIServer()) {</a>
+<a name="ln868">		// App server, input server, or registrar. We always debug those.</a>
+<a name="ln869">		// if not specifically overridden.</a>
+<a name="ln870">		if (!explicitActionFound)</a>
+<a name="ln871">			debugAction = kActionDebugTeam;</a>
+<a name="ln872">	} else if (debugAction == kActionPromptUser &amp;&amp; USE_GUI</a>
+<a name="ln873">		&amp;&amp; _AreGUIServersAlive() &amp;&amp; _InitGUI() == B_OK) {</a>
+<a name="ln874">		// normal app -- tell the user</a>
+<a name="ln875">		_NotifyAppServer(fTeam);</a>
+<a name="ln876">		_NotifyRegistrar(fTeam, true, false);</a>
+<a name="ln877"> </a>
+<a name="ln878">		DebugWindow *alert = new DebugWindow(fTeamInfo.args);</a>
+<a name="ln879"> </a>
+<a name="ln880">		// TODO: It would be nice if the alert would go away automatically</a>
+<a name="ln881">		// if someone else kills our teams.</a>
+<a name="ln882">		debugAction = alert-&gt;Go();</a>
+<a name="ln883">		if (debugAction &lt; 0) {</a>
+<a name="ln884">			// Happens when closed by escape key</a>
+<a name="ln885">			debugAction = kActionKillTeam;</a>
+<a name="ln886">		}</a>
+<a name="ln887">		_NotifyRegistrar(fTeam, false, debugAction != kActionKillTeam);</a>
+<a name="ln888">	}</a>
+<a name="ln889"> </a>
+<a name="ln890">	return debugAction;</a>
+<a name="ln891">}</a>
+<a name="ln892"> </a>
+<a name="ln893"> </a>
+<a name="ln894">void</a>
+<a name="ln895">TeamDebugHandler::_LookupSymbolAddress(</a>
+<a name="ln896">	debug_symbol_lookup_context *lookupContext, const void *address,</a>
+<a name="ln897">	char *buffer, int32 bufferSize)</a>
+<a name="ln898">{</a>
+<a name="ln899">	// lookup the symbol</a>
+<a name="ln900">	void *baseAddress;</a>
+<a name="ln901">	char symbolName[1024];</a>
+<a name="ln902">	char imageName[B_PATH_NAME_LENGTH];</a>
+<a name="ln903">	bool exactMatch;</a>
+<a name="ln904">	bool lookupSucceeded = false;</a>
+<a name="ln905">	if (lookupContext) {</a>
+<a name="ln906">		status_t error = debug_lookup_symbol_address(lookupContext, address,</a>
+<a name="ln907">			&amp;baseAddress, symbolName, sizeof(symbolName), imageName,</a>
+<a name="ln908">			sizeof(imageName), &amp;exactMatch);</a>
+<a name="ln909">		lookupSucceeded = (error == B_OK);</a>
+<a name="ln910">	}</a>
+<a name="ln911"> </a>
+<a name="ln912">	if (lookupSucceeded) {</a>
+<a name="ln913">		// we were able to look something up</a>
+<a name="ln914">		if (strlen(symbolName) &gt; 0) {</a>
+<a name="ln915">			// we even got a symbol</a>
+<a name="ln916">			snprintf(buffer, bufferSize, &quot;%s + %#lx%s&quot;, symbolName,</a>
+<a name="ln917">				(addr_t)address - (addr_t)baseAddress,</a>
+<a name="ln918">				(exactMatch ? &quot;&quot; : &quot; (closest symbol)&quot;));</a>
+<a name="ln919"> </a>
+<a name="ln920">		} else {</a>
+<a name="ln921">			// no symbol: image relative address</a>
+<a name="ln922">			snprintf(buffer, bufferSize, &quot;(%s + %#lx)&quot;, imageName,</a>
+<a name="ln923">				(addr_t)address - (addr_t)baseAddress);</a>
+<a name="ln924">		}</a>
+<a name="ln925"> </a>
+<a name="ln926">	} else {</a>
+<a name="ln927">		// lookup failed: find area containing the IP</a>
+<a name="ln928">		bool useAreaInfo = false;</a>
+<a name="ln929">		area_info info;</a>
+<a name="ln930">		ssize_t cookie = 0;</a>
+<a name="ln931">		while (get_next_area_info(fTeam, &amp;cookie, &amp;info) == B_OK) {</a>
+<a name="ln932">			if ((addr_t)info.address &lt;= (addr_t)address</a>
+<a name="ln933">				&amp;&amp; (addr_t)info.address + info.size &gt; (addr_t)address) {</a>
+<a name="ln934">				useAreaInfo = true;</a>
+<a name="ln935">				break;</a>
+<a name="ln936">			}</a>
+<a name="ln937">		}</a>
+<a name="ln938"> </a>
+<a name="ln939">		if (useAreaInfo) {</a>
+<a name="ln940">			snprintf(buffer, bufferSize, &quot;(%s + %#lx)&quot;, info.name,</a>
+<a name="ln941">				(addr_t)address - (addr_t)info.address);</a>
+<a name="ln942">		} else if (bufferSize &gt; 0)</a>
+<a name="ln943">			buffer[0] = '\0';</a>
+<a name="ln944">	}</a>
+<a name="ln945">}</a>
+<a name="ln946"> </a>
+<a name="ln947"> </a>
+<a name="ln948">void</a>
+<a name="ln949">TeamDebugHandler::_PrintStackTrace(thread_id thread)</a>
+<a name="ln950">{</a>
+<a name="ln951">	// print a stacktrace</a>
+<a name="ln952">	void *ip = NULL;</a>
+<a name="ln953">	void *stackFrameAddress = NULL;</a>
+<a name="ln954">	status_t error = debug_get_instruction_pointer(&amp;fDebugContext, thread, &amp;ip,</a>
+<a name="ln955">		&amp;stackFrameAddress);</a>
+<a name="ln956"> </a>
+<a name="ln957">	if (error == B_OK) {</a>
+<a name="ln958">		// create a symbol lookup context</a>
+<a name="ln959">		debug_symbol_lookup_context *lookupContext = NULL;</a>
+<a name="ln960">		error = debug_create_symbol_lookup_context(fTeam, -1, &amp;lookupContext);</a>
+<a name="ln961">		if (error != B_OK) {</a>
+<a name="ln962">			debug_printf(&quot;debug_server: Failed to create symbol lookup &quot;</a>
+<a name="ln963">				&quot;context: %s\n&quot;, strerror(error));</a>
+<a name="ln964">		}</a>
+<a name="ln965"> </a>
+<a name="ln966">		// lookup the IP</a>
+<a name="ln967">		char symbolBuffer[2048];</a>
+<a name="ln968">		_LookupSymbolAddress(lookupContext, ip, symbolBuffer,</a>
+<a name="ln969">			sizeof(symbolBuffer) - 1);</a>
+<a name="ln970"> </a>
+<a name="ln971">		debug_printf(&quot;stack trace, current PC %p  %s:\n&quot;, ip, symbolBuffer);</a>
+<a name="ln972"> </a>
+<a name="ln973">		for (int32 i = 0; i &lt; 50; i++) {</a>
+<a name="ln974">			debug_stack_frame_info stackFrameInfo;</a>
+<a name="ln975"> </a>
+<a name="ln976">			error = debug_get_stack_frame(&amp;fDebugContext, stackFrameAddress,</a>
+<a name="ln977">				&amp;stackFrameInfo);</a>
+<a name="ln978">			if (error &lt; B_OK || stackFrameInfo.parent_frame == NULL)</a>
+<a name="ln979">				break;</a>
+<a name="ln980"> </a>
+<a name="ln981">			// lookup the return address</a>
+<a name="ln982">			_LookupSymbolAddress(lookupContext, stackFrameInfo.return_address,</a>
+<a name="ln983">				symbolBuffer, sizeof(symbolBuffer) - 1);</a>
+<a name="ln984"> </a>
+<a name="ln985">			debug_printf(&quot;  (%p)  %p  %s\n&quot;, stackFrameInfo.frame,</a>
+<a name="ln986">				stackFrameInfo.return_address, symbolBuffer);</a>
+<a name="ln987"> </a>
+<a name="ln988">			stackFrameAddress = stackFrameInfo.parent_frame;</a>
+<a name="ln989">		}</a>
+<a name="ln990"> </a>
+<a name="ln991">		// delete the symbol lookup context</a>
+<a name="ln992">		if (lookupContext)</a>
+<a name="ln993">			debug_delete_symbol_lookup_context(lookupContext);</a>
+<a name="ln994">	}</a>
+<a name="ln995">}</a>
+<a name="ln996"> </a>
+<a name="ln997"> </a>
+<a name="ln998">void</a>
+<a name="ln999">TeamDebugHandler::_NotifyAppServer(team_id team)</a>
+<a name="ln1000">{</a>
+<a name="ln1001">	// This will remove any kWindowScreenFeels of the application, so that</a>
+<a name="ln1002">	// the debugger alert is visible on screen</a>
+<a name="ln1003">	BRoster::Private roster;</a>
+<a name="ln1004">	roster.ApplicationCrashed(team);</a>
+<a name="ln1005">}</a>
+<a name="ln1006"> </a>
+<a name="ln1007"> </a>
+<a name="ln1008">void</a>
+<a name="ln1009">TeamDebugHandler::_NotifyRegistrar(team_id team, bool openAlert,</a>
+<a name="ln1010">	bool stopShutdown)</a>
+<a name="ln1011">{</a>
+<a name="ln1012">	BMessage notify(BPrivate::B_REG_TEAM_DEBUGGER_ALERT);</a>
+<a name="ln1013">	notify.AddInt32(&quot;team&quot;, team);</a>
+<a name="ln1014">	notify.AddBool(&quot;open&quot;, openAlert);</a>
+<a name="ln1015">	notify.AddBool(&quot;stop shutdown&quot;, stopShutdown);</a>
+<a name="ln1016"> </a>
+<a name="ln1017">	BRoster::Private roster;</a>
+<a name="ln1018">	BMessage reply;</a>
+<a name="ln1019">	roster.SendTo(&amp;notify, &amp;reply, false);</a>
+<a name="ln1020">}</a>
+<a name="ln1021"> </a>
+<a name="ln1022"> </a>
+<a name="ln1023">status_t</a>
+<a name="ln1024">TeamDebugHandler::_InitGUI()</a>
+<a name="ln1025">{</a>
+<a name="ln1026">	DebugServer *app = dynamic_cast&lt;DebugServer*&gt;(be_app);</a>
+<a name="ln1027">	BAutolock _(app);</a>
+<a name="ln1028">	return app-&gt;InitGUIContext();</a>
+<a name="ln1029">}</a>
+<a name="ln1030"> </a>
+<a name="ln1031"> </a>
+<a name="ln1032">status_t</a>
+<a name="ln1033">TeamDebugHandler::_HandlerThreadEntry(void *data)</a>
+<a name="ln1034">{</a>
+<a name="ln1035">	return ((TeamDebugHandler*)data)-&gt;_HandlerThread();</a>
+<a name="ln1036">}</a>
+<a name="ln1037"> </a>
+<a name="ln1038"> </a>
+<a name="ln1039">status_t</a>
+<a name="ln1040">TeamDebugHandler::_HandlerThread()</a>
+<a name="ln1041">{</a>
+<a name="ln1042">	TRACE((&quot;debug_server: TeamDebugHandler::_HandlerThread(): team %&quot; B_PRId32</a>
+<a name="ln1043">		&quot;\n&quot;, fTeam));</a>
+<a name="ln1044"> </a>
+<a name="ln1045">	// get initial message</a>
+<a name="ln1046">	TRACE((&quot;debug_server: TeamDebugHandler::_HandlerThread(): team %&quot; B_PRId32</a>
+<a name="ln1047">		&quot;: getting message...\n&quot;, fTeam));</a>
+<a name="ln1048"> </a>
+<a name="ln1049">	DebugMessage *message;</a>
+<a name="ln1050">	status_t error = _PopMessage(message);</a>
+<a name="ln1051">	int32 debugAction = kActionKillTeam;</a>
+<a name="ln1052">	if (error == B_OK) {</a>
+<a name="ln1053">		// handle the message</a>
+<a name="ln1054">		debugAction = _HandleMessage(message);</a>
+<a name="ln1055">		delete message;</a>
+<a name="ln1056">	} else {</a>
+<a name="ln1057">		debug_printf(&quot;TeamDebugHandler::_HandlerThread(): Failed to pop &quot;</a>
+<a name="ln1058">			&quot;initial message: %s&quot;, strerror(error));</a>
+<a name="ln1059">	}</a>
+<a name="ln1060"> </a>
+<a name="ln1061">	// kill the team or hand it over to the debugger</a>
+<a name="ln1062">	thread_id debuggerThread = -1;</a>
+<a name="ln1063">	if (debugAction == kActionKillTeam) {</a>
+<a name="ln1064">		// The team shall be killed. Since that is also the handling in case</a>
+<a name="ln1065">		// an error occurs while handing over the team to the debugger, we do</a>
+<a name="ln1066">		// nothing here.</a>
+<a name="ln1067">	} else if (debugAction == kActionWriteCoreFile) {</a>
+<a name="ln1068">		_WriteCoreFile();</a>
+<a name="ln1069">		debugAction = kActionKillTeam;</a>
+<a name="ln1070">	} else if ((debuggerThread = _EnterDebugger(</a>
+<a name="ln1071">			debugAction == kActionSaveReportTeam)) &gt;= 0) {</a>
+<a name="ln1072">		// wait for the &quot;handed over&quot; or a &quot;team deleted&quot; message</a>
+<a name="ln1073">		bool terminate = false;</a>
+<a name="ln1074">		do {</a>
+<a name="ln1075">			error = _PopMessage(message);</a>
+<a name="ln1076">			if (error != B_OK) {</a>
+<a name="ln1077">				debug_printf(&quot;TeamDebugHandler::_HandlerThread(): Failed to &quot;</a>
+<a name="ln1078">					&quot;pop message: %s&quot;, strerror(error));</a>
+<a name="ln1079">				debugAction = kActionKillTeam;</a>
+<a name="ln1080">				break;</a>
+<a name="ln1081">			}</a>
+<a name="ln1082"> </a>
+<a name="ln1083">			if (message-&gt;Code() == B_DEBUGGER_MESSAGE_HANDED_OVER) {</a>
+<a name="ln1084">				// The team has successfully been handed over to the debugger.</a>
+<a name="ln1085">				// Nothing to do.</a>
+<a name="ln1086">				terminate = true;</a>
+<a name="ln1087">			} else if (message-&gt;Code() == B_DEBUGGER_MESSAGE_TEAM_DELETED) {</a>
+<a name="ln1088">				// The team died. Nothing to do.</a>
+<a name="ln1089">				terminate = true;</a>
+<a name="ln1090">			} else {</a>
+<a name="ln1091">				// Some message we can ignore. The debugger will take care of</a>
+<a name="ln1092">				// it.</a>
+<a name="ln1093"> </a>
+<a name="ln1094">				// check whether the debugger thread still lives</a>
+<a name="ln1095">				thread_info threadInfo;</a>
+<a name="ln1096">				if (get_thread_info(debuggerThread, &amp;threadInfo) != B_OK) {</a>
+<a name="ln1097">					// the debugger is gone</a>
+<a name="ln1098">					debug_printf(&quot;debug_server: The debugger for team %&quot;</a>
+<a name="ln1099">						B_PRId32 &quot; seems to be gone.&quot;, fTeam);</a>
+<a name="ln1100"> </a>
+<a name="ln1101">					debugAction = kActionKillTeam;</a>
+<a name="ln1102">					terminate = true;</a>
+<a name="ln1103">				}</a>
+<a name="ln1104">			}</a>
+<a name="ln1105"> </a>
+<a name="ln1106">			delete message;</a>
+<a name="ln1107">		} while (!terminate);</a>
+<a name="ln1108">	} else</a>
+<a name="ln1109">		debugAction = kActionKillTeam;</a>
+<a name="ln1110"> </a>
+<a name="ln1111">	if (debugAction == kActionKillTeam) {</a>
+<a name="ln1112">		// kill the team</a>
+<a name="ln1113">		_KillTeam();</a>
+<a name="ln1114">	}</a>
+<a name="ln1115"> </a>
+<a name="ln1116">	// remove this handler from the roster and delete it</a>
+<a name="ln1117">	TeamDebugHandlerRoster::Default()-&gt;RemoveHandler(fTeam);</a>
+<a name="ln1118"> </a>
+<a name="ln1119">	delete this;</a>
+<a name="ln1120"> </a>
+<a name="ln1121">	return B_OK;</a>
+<a name="ln1122">}</a>
+<a name="ln1123"> </a>
+<a name="ln1124"> </a>
+<a name="ln1125">bool</a>
+<a name="ln1126">TeamDebugHandler::_ExecutableNameEquals(const char *name) const</a>
+<a name="ln1127">{</a>
+<a name="ln1128">	return strcmp(_LastPathComponent(fExecutablePath), name) == 0;</a>
+<a name="ln1129">}</a>
+<a name="ln1130"> </a>
+<a name="ln1131"> </a>
+<a name="ln1132">bool</a>
+<a name="ln1133">TeamDebugHandler::_IsAppServer() const</a>
+<a name="ln1134">{</a>
+<a name="ln1135">	return _ExecutableNameEquals(&quot;app_server&quot;);</a>
+<a name="ln1136">}</a>
+<a name="ln1137"> </a>
+<a name="ln1138"> </a>
+<a name="ln1139">bool</a>
+<a name="ln1140">TeamDebugHandler::_IsInputServer() const</a>
+<a name="ln1141">{</a>
+<a name="ln1142">	return _ExecutableNameEquals(&quot;input_server&quot;);</a>
+<a name="ln1143">}</a>
+<a name="ln1144"> </a>
+<a name="ln1145"> </a>
+<a name="ln1146">bool</a>
+<a name="ln1147">TeamDebugHandler::_IsRegistrar() const</a>
+<a name="ln1148">{</a>
+<a name="ln1149">	return _ExecutableNameEquals(&quot;registrar&quot;);</a>
+<a name="ln1150">}</a>
+<a name="ln1151"> </a>
+<a name="ln1152"> </a>
+<a name="ln1153">bool</a>
+<a name="ln1154">TeamDebugHandler::_IsGUIServer() const</a>
+<a name="ln1155">{</a>
+<a name="ln1156">	// app or input server</a>
+<a name="ln1157">	return _IsAppServer() || _IsInputServer() || _IsRegistrar();</a>
+<a name="ln1158">}</a>
+<a name="ln1159"> </a>
+<a name="ln1160"> </a>
+<a name="ln1161">const char *</a>
+<a name="ln1162">TeamDebugHandler::_LastPathComponent(const char *path)</a>
+<a name="ln1163">{</a>
+<a name="ln1164">	const char *lastSlash = strrchr(path, '/');</a>
+<a name="ln1165">	return lastSlash ? lastSlash + 1 : path;</a>
+<a name="ln1166">}</a>
+<a name="ln1167"> </a>
+<a name="ln1168"> </a>
+<a name="ln1169">team_id</a>
+<a name="ln1170">TeamDebugHandler::_FindTeam(const char *name)</a>
+<a name="ln1171">{</a>
+<a name="ln1172">	// Iterate through all teams and check their executable name.</a>
+<a name="ln1173">	int32 cookie = 0;</a>
+<a name="ln1174">	team_info teamInfo;</a>
+<a name="ln1175">	while (get_next_team_info(&amp;cookie, &amp;teamInfo) == B_OK) {</a>
+<a name="ln1176">		entry_ref ref;</a>
+<a name="ln1177">		if (BPrivate::get_app_ref(teamInfo.team, &amp;ref) == B_OK) {</a>
+<a name="ln1178">			if (strcmp(ref.name, name) == 0)</a>
+<a name="ln1179">				return teamInfo.team;</a>
+<a name="ln1180">		}</a>
+<a name="ln1181">	}</a>
+<a name="ln1182"> </a>
+<a name="ln1183">	return B_ENTRY_NOT_FOUND;</a>
+<a name="ln1184">}</a>
+<a name="ln1185"> </a>
+<a name="ln1186"> </a>
+<a name="ln1187">bool</a>
+<a name="ln1188">TeamDebugHandler::_AreGUIServersAlive()</a>
+<a name="ln1189">{</a>
+<a name="ln1190">	return _FindTeam(&quot;app_server&quot;) &gt;= 0 &amp;&amp; _FindTeam(&quot;input_server&quot;) &gt;= 0</a>
+<a name="ln1191">		&amp;&amp; _FindTeam(&quot;registrar&quot;);</a>
+<a name="ln1192">}</a>
+<a name="ln1193"> </a>
+<a name="ln1194"> </a>
+<a name="ln1195">// #pragma mark -</a>
+<a name="ln1196"> </a>
+<a name="ln1197"> </a>
+<a name="ln1198">DebugServer::DebugServer(status_t &amp;error)</a>
+<a name="ln1199">	:</a>
+<a name="ln1200">	BServer(kSignature, false, &amp;error),</a>
+<a name="ln1201">	fListenerPort(-1),</a>
+<a name="ln1202">	fListener(-1),</a>
+<a name="ln1203">	fTerminating(false)</a>
+<a name="ln1204">{</a>
+<a name="ln1205">}</a>
+<a name="ln1206"> </a>
+<a name="ln1207"> </a>
+<a name="ln1208">status_t</a>
+<a name="ln1209">DebugServer::Init()</a>
+<a name="ln1210">{</a>
+<a name="ln1211">	// create listener port</a>
+<a name="ln1212">	fListenerPort = create_port(10, &quot;kernel listener&quot;);</a>
+<a name="ln1213">	if (fListenerPort &lt; 0)</a>
+<a name="ln1214">		return fListenerPort;</a>
+<a name="ln1215"> </a>
+<a name="ln1216">	// spawn the listener thread</a>
+<a name="ln1217">	fListener = spawn_thread(_ListenerEntry, &quot;kernel listener&quot;,</a>
+<a name="ln1218">		B_NORMAL_PRIORITY, this);</a>
+<a name="ln1219">	if (fListener &lt; 0)</a>
+<a name="ln1220">		return fListener;</a>
+<a name="ln1221"> </a>
+<a name="ln1222">	// register as default debugger</a>
+<a name="ln1223">	// TODO: could set default flags</a>
+<a name="ln1224">	status_t error = install_default_debugger(fListenerPort);</a>
+<a name="ln1225">	if (error != B_OK)</a>
+<a name="ln1226">		return error;</a>
+<a name="ln1227"> </a>
+<a name="ln1228">	// resume the listener</a>
+<a name="ln1229">	resume_thread(fListener);</a>
+<a name="ln1230"> </a>
+<a name="ln1231">	return B_OK;</a>
+<a name="ln1232">}</a>
+<a name="ln1233"> </a>
+<a name="ln1234"> </a>
+<a name="ln1235">bool</a>
+<a name="ln1236">DebugServer::QuitRequested()</a>
+<a name="ln1237">{</a>
+<a name="ln1238">	// Never give up, never surrender. ;-)</a>
+<a name="ln1239">	return false;</a>
+<a name="ln1240">}</a>
+<a name="ln1241"> </a>
+<a name="ln1242"> </a>
+<a name="ln1243">status_t</a>
+<a name="ln1244">DebugServer::_ListenerEntry(void *data)</a>
+<a name="ln1245">{</a>
+<a name="ln1246">	return ((DebugServer*)data)-&gt;_Listener();</a>
+<a name="ln1247">}</a>
+<a name="ln1248"> </a>
+<a name="ln1249"> </a>
+<a name="ln1250">status_t</a>
+<a name="ln1251">DebugServer::_Listener()</a>
+<a name="ln1252">{</a>
+<a name="ln1253">	while (!fTerminating) {</a>
+<a name="ln1254">		// receive the next debug message</a>
+<a name="ln1255">		DebugMessage *message = new DebugMessage;</a>
+<a name="ln1256">		int32 code;</a>
+<a name="ln1257">		ssize_t bytesRead;</a>
+<a name="ln1258">		do {</a>
+<a name="ln1259">			bytesRead = read_port(fListenerPort, &amp;code, &amp;message-&gt;Data(),</a>
+<a name="ln1260">				sizeof(debug_debugger_message_data));</a>
+<a name="ln1261">		} while (bytesRead == B_INTERRUPTED);</a>
+<a name="ln1262"> </a>
+<a name="ln1263">		if (bytesRead &lt; 0) {</a>
+<a name="ln1264">			debug_printf(&quot;debug_server: Failed to read from listener port: &quot;</a>
+<a name="ln1265">				&quot;%s. Terminating!\n&quot;, strerror(bytesRead));</a>
+<a name="ln1266">			exit(1);</a>
+<a name="ln1267">		}</a>
+<a name="ln1268">TRACE((&quot;debug_server: Got debug message: team: %&quot; B_PRId32 &quot;, code: %&quot; B_PRId32</a>
+<a name="ln1269">	&quot;\n&quot;, message-&gt;Data().origin.team, code));</a>
+<a name="ln1270"> </a>
+<a name="ln1271">		message-&gt;SetCode((debug_debugger_message)code);</a>
+<a name="ln1272"> </a>
+<a name="ln1273">		// dispatch the message</a>
+<a name="ln1274">		TeamDebugHandlerRoster::Default()-&gt;DispatchMessage(message);</a>
+<a name="ln1275">	}</a>
+<a name="ln1276"> </a>
+<a name="ln1277">	return B_OK;</a>
+<a name="ln1278">}</a>
+<a name="ln1279"> </a>
+<a name="ln1280"> </a>
+<a name="ln1281">// #pragma mark -</a>
+<a name="ln1282"> </a>
+<a name="ln1283"> </a>
+<a name="ln1284">int</a>
+<a name="ln1285">main()</a>
+<a name="ln1286">{</a>
+<a name="ln1287">	status_t error;</a>
+<a name="ln1288"> </a>
+<a name="ln1289">	// for the time being let the debug server print to the syslog</a>
+<a name="ln1290">	int console = open(&quot;/dev/dprintf&quot;, O_RDONLY);</a>
+<a name="ln1291">	if (console &lt; 0) {</a>
+<a name="ln1292">		debug_printf(&quot;debug_server: Failed to open console: %s\n&quot;,</a>
+<a name="ln1293">			strerror(errno));</a>
+<a name="ln1294">	}</a>
+<a name="ln1295">	dup2(console, STDOUT_FILENO);</a>
+<a name="ln1296">	dup2(console, STDERR_FILENO);</a>
+<a name="ln1297">	close(console);</a>
+<a name="ln1298"> </a>
+<a name="ln1299">	// create the team debug handler roster</a>
+<a name="ln1300">	if (!TeamDebugHandlerRoster::CreateDefault()) {</a>
+<a name="ln1301">		debug_printf(&quot;debug_server: Failed to create team debug handler &quot;</a>
+<a name="ln1302">			&quot;roster.\n&quot;);</a>
+<a name="ln1303">		exit(1);</a>
+<a name="ln1304">	}</a>
+<a name="ln1305"> </a>
+<a name="ln1306">	// create application</a>
+<a name="ln1307">	DebugServer server(error);</a>
+<a name="ln1308">	if (error != B_OK) {</a>
+<a name="ln1309">		debug_printf(&quot;debug_server: Failed to create BApplication: %s\n&quot;,</a>
+<a name="ln1310">			strerror(error));</a>
+<a name="ln1311">		exit(1);</a>
+<a name="ln1312">	}</a>
+<a name="ln1313"> </a>
+<a name="ln1314">	// init application</a>
+<a name="ln1315">	error = server.Init();</a>
+<a name="ln1316">	if (error != B_OK) {</a>
+<a name="ln1317">		debug_printf(&quot;debug_server: Failed to init application: %s\n&quot;,</a>
+<a name="ln1318">			strerror(error));</a>
+<a name="ln1319">		exit(1);</a>
+<a name="ln1320">	}</a>
+<a name="ln1321"> </a>
+<a name="ln1322">	server.Run();</a>
+<a name="ln1323"> </a>
+<a name="ln1324">	return 0;</a>
+<a name="ln1325">}</a>
+
+</code></pre>
+<div class="balloon" rel="389"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fTeamInfo.</p></div>
+<div class="balloon" rel="888"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v773/" target="_blank">V773</a> Visibility scope of the 'alert' pointer was exited without releasing the memory. A memory leak is possible.</p></div>
+<div class="balloon" rel="1307"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v614/" target="_blank">V614</a> Uninitialized variable 'error' used.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

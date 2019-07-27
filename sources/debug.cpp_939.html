@@ -1,0 +1,2397 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>debug.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2008-2011, Ingo Weinhold, ingo_weinhold@gmx.de.</a>
+<a name="ln3"> * Copyright 2002-2015, Axel Dörfler, axeld@pinc-software.de.</a>
+<a name="ln4"> * Distributed under the terms of the MIT License.</a>
+<a name="ln5"> *</a>
+<a name="ln6"> * Copyright 2001, Travis Geiselbrecht. All rights reserved.</a>
+<a name="ln7"> * Distributed under the terms of the NewOS License.</a>
+<a name="ln8"> */</a>
+<a name="ln9"> </a>
+<a name="ln10"> </a>
+<a name="ln11">/*! This file contains the debugger and debug output facilities */</a>
+<a name="ln12"> </a>
+<a name="ln13"> </a>
+<a name="ln14">#include &quot;blue_screen.h&quot;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &lt;ctype.h&gt;</a>
+<a name="ln17">#include &lt;errno.h&gt;</a>
+<a name="ln18">#include &lt;stdarg.h&gt;</a>
+<a name="ln19">#include &lt;stdio.h&gt;</a>
+<a name="ln20">#include &lt;stdlib.h&gt;</a>
+<a name="ln21">#include &lt;string.h&gt;</a>
+<a name="ln22">#include &lt;syslog.h&gt;</a>
+<a name="ln23"> </a>
+<a name="ln24">#include &lt;algorithm&gt;</a>
+<a name="ln25"> </a>
+<a name="ln26">#include &lt;AutoDeleter.h&gt;</a>
+<a name="ln27">#include &lt;boot/kernel_args.h&gt;</a>
+<a name="ln28">#include &lt;cpu.h&gt;</a>
+<a name="ln29">#include &lt;debug.h&gt;</a>
+<a name="ln30">#include &lt;debug_heap.h&gt;</a>
+<a name="ln31">#include &lt;debug_paranoia.h&gt;</a>
+<a name="ln32">#include &lt;driver_settings.h&gt;</a>
+<a name="ln33">#include &lt;frame_buffer_console.h&gt;</a>
+<a name="ln34">#include &lt;int.h&gt;</a>
+<a name="ln35">#include &lt;kernel.h&gt;</a>
+<a name="ln36">#include &lt;ksystem_info.h&gt;</a>
+<a name="ln37">#include &lt;safemode.h&gt;</a>
+<a name="ln38">#include &lt;smp.h&gt;</a>
+<a name="ln39">#include &lt;thread.h&gt;</a>
+<a name="ln40">#include &lt;tracing.h&gt;</a>
+<a name="ln41">#include &lt;vm/vm.h&gt;</a>
+<a name="ln42">#include &lt;vm/VMTranslationMap.h&gt;</a>
+<a name="ln43"> </a>
+<a name="ln44">#include &lt;arch/debug_console.h&gt;</a>
+<a name="ln45">#include &lt;arch/debug.h&gt;</a>
+<a name="ln46">#include &lt;util/AutoLock.h&gt;</a>
+<a name="ln47">#include &lt;util/ring_buffer.h&gt;</a>
+<a name="ln48"> </a>
+<a name="ln49">#include &lt;syslog_daemon.h&gt;</a>
+<a name="ln50"> </a>
+<a name="ln51">#include &quot;debug_builtin_commands.h&quot;</a>
+<a name="ln52">#include &quot;debug_commands.h&quot;</a>
+<a name="ln53">#include &quot;debug_output_filter.h&quot;</a>
+<a name="ln54">#include &quot;debug_variables.h&quot;</a>
+<a name="ln55"> </a>
+<a name="ln56"> </a>
+<a name="ln57">#if __GNUC__ == 2</a>
+<a name="ln58">#	define va_copy(to, from)	__va_copy(to, from)</a>
+<a name="ln59">#endif</a>
+<a name="ln60"> </a>
+<a name="ln61"> </a>
+<a name="ln62">struct debug_memcpy_parameters {</a>
+<a name="ln63">	void*		to;</a>
+<a name="ln64">	const void*	from;</a>
+<a name="ln65">	size_t		size;</a>
+<a name="ln66">};</a>
+<a name="ln67"> </a>
+<a name="ln68">struct debug_strlcpy_parameters {</a>
+<a name="ln69">	char*		to;</a>
+<a name="ln70">	const char*	from;</a>
+<a name="ln71">	size_t		size;</a>
+<a name="ln72">	size_t		result;</a>
+<a name="ln73">};</a>
+<a name="ln74"> </a>
+<a name="ln75"> </a>
+<a name="ln76">static const char* const kKDLPrompt = &quot;kdebug&gt; &quot;;</a>
+<a name="ln77">static const char* const kKDLMessageCommandSeparator = &quot;@!&quot;;</a>
+<a name="ln78">	// separates panic() message from command list to execute</a>
+<a name="ln79"> </a>
+<a name="ln80">extern &quot;C&quot; int kgets(char* buffer, int length);</a>
+<a name="ln81"> </a>
+<a name="ln82">void call_modules_hook(bool enter);</a>
+<a name="ln83"> </a>
+<a name="ln84">static void syslog_write(const char* text, int32 length, bool notify);</a>
+<a name="ln85"> </a>
+<a name="ln86">static arch_debug_registers sDebugRegisters[SMP_MAX_CPUS];</a>
+<a name="ln87"> </a>
+<a name="ln88">static debug_page_fault_info sPageFaultInfo;</a>
+<a name="ln89"> </a>
+<a name="ln90">static bool sSerialDebugEnabled = true;</a>
+<a name="ln91">static bool sSyslogOutputEnabled = true;</a>
+<a name="ln92">static bool sBlueScreenEnabled = false;</a>
+<a name="ln93">	// must always be false on startup</a>
+<a name="ln94">static bool sDebugScreenEnabled = false;</a>
+<a name="ln95">static bool sBlueScreenOutput = true;</a>
+<a name="ln96">static bool sEmergencyKeysEnabled = true;</a>
+<a name="ln97">static spinlock sSpinlock = B_SPINLOCK_INITIALIZER;</a>
+<a name="ln98">static int32 sDebuggerOnCPU = -1;</a>
+<a name="ln99"> </a>
+<a name="ln100">static sem_id sSyslogNotify = -1;</a>
+<a name="ln101">static thread_id sSyslogWriter = -1;</a>
+<a name="ln102">static port_id sSyslogPort = -1;</a>
+<a name="ln103">static struct syslog_message* sSyslogMessage;</a>
+<a name="ln104">static struct ring_buffer* sSyslogBuffer;</a>
+<a name="ln105">static size_t sSyslogBufferOffset = 0;</a>
+<a name="ln106">	// (relative) buffer offset of the yet unsent syslog messages</a>
+<a name="ln107">static bool sSyslogDropped = false;</a>
+<a name="ln108">static bool sDebugSyslog = false;</a>
+<a name="ln109">static size_t sSyslogDebuggerOffset = 0;</a>
+<a name="ln110">	// (relative) buffer offset of the kernel debugger messages of the current</a>
+<a name="ln111">	// KDL session</a>
+<a name="ln112"> </a>
+<a name="ln113">static void* sPreviousSessionSyslogBuffer = NULL;</a>
+<a name="ln114">static size_t sPreviousSessionSyslogBufferSize = 0;</a>
+<a name="ln115"> </a>
+<a name="ln116">static const char* sCurrentKernelDebuggerMessagePrefix;</a>
+<a name="ln117">static const char* sCurrentKernelDebuggerMessage;</a>
+<a name="ln118">static va_list sCurrentKernelDebuggerMessageArgs;</a>
+<a name="ln119"> </a>
+<a name="ln120">#define DEFAULT_SYSLOG_BUFFER_SIZE 65536</a>
+<a name="ln121">#define OUTPUT_BUFFER_SIZE 1024</a>
+<a name="ln122">static char sOutputBuffer[OUTPUT_BUFFER_SIZE];</a>
+<a name="ln123">static char sInterruptOutputBuffer[OUTPUT_BUFFER_SIZE];</a>
+<a name="ln124">static char sLastOutputBuffer[OUTPUT_BUFFER_SIZE];</a>
+<a name="ln125">static DebugOutputFilter* sDebugOutputFilter = NULL;</a>
+<a name="ln126">DefaultDebugOutputFilter gDefaultDebugOutputFilter;</a>
+<a name="ln127">static mutex sOutputLock = MUTEX_INITIALIZER(&quot;debug output&quot;);</a>
+<a name="ln128"> </a>
+<a name="ln129">static void flush_pending_repeats(bool notifySyslog);</a>
+<a name="ln130">static void check_pending_repeats(void* data, int iter);</a>
+<a name="ln131"> </a>
+<a name="ln132">static int64 sMessageRepeatFirstTime = 0;</a>
+<a name="ln133">static int64 sMessageRepeatLastTime = 0;</a>
+<a name="ln134">static int32 sMessageRepeatCount = 0;</a>
+<a name="ln135"> </a>
+<a name="ln136">static debugger_module_info* sDebuggerModules[8];</a>
+<a name="ln137">static const uint32 kMaxDebuggerModules = sizeof(sDebuggerModules)</a>
+<a name="ln138">	/ sizeof(sDebuggerModules[0]);</a>
+<a name="ln139"> </a>
+<a name="ln140">#define LINE_BUFFER_SIZE 1024</a>
+<a name="ln141">#define HISTORY_SIZE 16</a>
+<a name="ln142"> </a>
+<a name="ln143">static char sLineBuffer[HISTORY_SIZE][LINE_BUFFER_SIZE] = { &quot;&quot;, };</a>
+<a name="ln144">static int32 sCurrentLine = 0;</a>
+<a name="ln145"> </a>
+<a name="ln146">static debugger_demangle_module_info* sDemangleModule;</a>
+<a name="ln147"> </a>
+<a name="ln148">static Thread* sDebuggedThread;</a>
+<a name="ln149">static int32 sInDebugger = 0;</a>
+<a name="ln150">static bool sPreviousDprintfState;</a>
+<a name="ln151">static volatile bool sHandOverKDL = false;</a>
+<a name="ln152">static int32 sHandOverKDLToCPU = -1;</a>
+<a name="ln153">static bool sCPUTrapped[SMP_MAX_CPUS];</a>
+<a name="ln154"> </a>
+<a name="ln155"> </a>
+<a name="ln156">// #pragma mark - DebugOutputFilter</a>
+<a name="ln157"> </a>
+<a name="ln158"> </a>
+<a name="ln159">DebugOutputFilter::DebugOutputFilter()</a>
+<a name="ln160">{</a>
+<a name="ln161">}</a>
+<a name="ln162"> </a>
+<a name="ln163"> </a>
+<a name="ln164">DebugOutputFilter::~DebugOutputFilter()</a>
+<a name="ln165">{</a>
+<a name="ln166">}</a>
+<a name="ln167"> </a>
+<a name="ln168"> </a>
+<a name="ln169">void</a>
+<a name="ln170">DebugOutputFilter::PrintString(const char* string)</a>
+<a name="ln171">{</a>
+<a name="ln172">}</a>
+<a name="ln173"> </a>
+<a name="ln174"> </a>
+<a name="ln175">void</a>
+<a name="ln176">DebugOutputFilter::Print(const char* format, va_list args)</a>
+<a name="ln177">{</a>
+<a name="ln178">}</a>
+<a name="ln179"> </a>
+<a name="ln180"> </a>
+<a name="ln181">void</a>
+<a name="ln182">DefaultDebugOutputFilter::PrintString(const char* string)</a>
+<a name="ln183">{</a>
+<a name="ln184">	size_t length = strlen(string);</a>
+<a name="ln185"> </a>
+<a name="ln186">	if (sSerialDebugEnabled)</a>
+<a name="ln187">		arch_debug_serial_puts(string);</a>
+<a name="ln188">	if (sSyslogOutputEnabled)</a>
+<a name="ln189">		syslog_write(string, length, false);</a>
+<a name="ln190">	if (sBlueScreenEnabled || sDebugScreenEnabled)</a>
+<a name="ln191">		blue_screen_puts(string);</a>
+<a name="ln192"> </a>
+<a name="ln193">	for (uint32 i = 0; sSerialDebugEnabled &amp;&amp; i &lt; kMaxDebuggerModules; i++) {</a>
+<a name="ln194">		if (sDebuggerModules[i] &amp;&amp; sDebuggerModules[i]-&gt;debugger_puts)</a>
+<a name="ln195">			sDebuggerModules[i]-&gt;debugger_puts(string, length);</a>
+<a name="ln196">	}</a>
+<a name="ln197">}</a>
+<a name="ln198"> </a>
+<a name="ln199"> </a>
+<a name="ln200">void</a>
+<a name="ln201">DefaultDebugOutputFilter::Print(const char* format, va_list args)</a>
+<a name="ln202">{</a>
+<a name="ln203">	vsnprintf(sInterruptOutputBuffer, OUTPUT_BUFFER_SIZE, format, args);</a>
+<a name="ln204">	flush_pending_repeats(false);</a>
+<a name="ln205">	PrintString(sInterruptOutputBuffer);</a>
+<a name="ln206">}</a>
+<a name="ln207"> </a>
+<a name="ln208"> </a>
+<a name="ln209">// #pragma mark -</a>
+<a name="ln210"> </a>
+<a name="ln211"> </a>
+<a name="ln212">DebugOutputFilter*</a>
+<a name="ln213">set_debug_output_filter(DebugOutputFilter* filter)</a>
+<a name="ln214">{</a>
+<a name="ln215">	DebugOutputFilter* oldFilter = sDebugOutputFilter;</a>
+<a name="ln216">	sDebugOutputFilter = filter;</a>
+<a name="ln217">	return oldFilter;</a>
+<a name="ln218">}</a>
+<a name="ln219"> </a>
+<a name="ln220"> </a>
+<a name="ln221">static void</a>
+<a name="ln222">kputchar(char c)</a>
+<a name="ln223">{</a>
+<a name="ln224">	if (sSerialDebugEnabled)</a>
+<a name="ln225">		arch_debug_serial_putchar(c);</a>
+<a name="ln226">	if (sBlueScreenEnabled || sDebugScreenEnabled)</a>
+<a name="ln227">		blue_screen_putchar(c);</a>
+<a name="ln228">	for (uint32 i = 0; sSerialDebugEnabled &amp;&amp; i &lt; kMaxDebuggerModules; i++)</a>
+<a name="ln229">		if (sDebuggerModules[i] &amp;&amp; sDebuggerModules[i]-&gt;debugger_puts)</a>
+<a name="ln230">			sDebuggerModules[i]-&gt;debugger_puts(&amp;c, sizeof(c));</a>
+<a name="ln231">}</a>
+<a name="ln232"> </a>
+<a name="ln233"> </a>
+<a name="ln234">void</a>
+<a name="ln235">kputs(const char* s)</a>
+<a name="ln236">{</a>
+<a name="ln237">	if (sDebugOutputFilter != NULL)</a>
+<a name="ln238">		sDebugOutputFilter-&gt;PrintString(s);</a>
+<a name="ln239">}</a>
+<a name="ln240"> </a>
+<a name="ln241"> </a>
+<a name="ln242">void</a>
+<a name="ln243">kputs_unfiltered(const char* s)</a>
+<a name="ln244">{</a>
+<a name="ln245">	gDefaultDebugOutputFilter.PrintString(s);</a>
+<a name="ln246">}</a>
+<a name="ln247"> </a>
+<a name="ln248"> </a>
+<a name="ln249">static void</a>
+<a name="ln250">insert_chars_into_line(char* buffer, int32&amp; position, int32&amp; length,</a>
+<a name="ln251">	const char* chars, int32 charCount)</a>
+<a name="ln252">{</a>
+<a name="ln253">	// move the following chars to make room for the ones to insert</a>
+<a name="ln254">	if (position &lt; length) {</a>
+<a name="ln255">		memmove(buffer + position + charCount, buffer + position,</a>
+<a name="ln256">			length - position);</a>
+<a name="ln257">	}</a>
+<a name="ln258"> </a>
+<a name="ln259">	// insert chars</a>
+<a name="ln260">	memcpy(buffer + position, chars, charCount);</a>
+<a name="ln261">	int32 oldPosition = position;</a>
+<a name="ln262">	position += charCount;</a>
+<a name="ln263">	length += charCount;</a>
+<a name="ln264"> </a>
+<a name="ln265">	// print the new chars (and the following ones)</a>
+<a name="ln266">	kprintf(&quot;%.*s&quot;, (int)(length - oldPosition),</a>
+<a name="ln267">		buffer + oldPosition);</a>
+<a name="ln268"> </a>
+<a name="ln269">	// reposition cursor, if necessary</a>
+<a name="ln270">	if (position &lt; length)</a>
+<a name="ln271">		kprintf(&quot;\x1b[%&quot; B_PRId32 &quot;D&quot;, length - position);</a>
+<a name="ln272">}</a>
+<a name="ln273"> </a>
+<a name="ln274"> </a>
+<a name="ln275">static void</a>
+<a name="ln276">insert_char_into_line(char* buffer, int32&amp; position, int32&amp; length, char c)</a>
+<a name="ln277">{</a>
+<a name="ln278">	insert_chars_into_line(buffer, position, length, &amp;c, 1);</a>
+<a name="ln279">}</a>
+<a name="ln280"> </a>
+<a name="ln281"> </a>
+<a name="ln282">static void</a>
+<a name="ln283">remove_char_from_line(char* buffer, int32&amp; position, int32&amp; length)</a>
+<a name="ln284">{</a>
+<a name="ln285">	if (position == length)</a>
+<a name="ln286">		return;</a>
+<a name="ln287"> </a>
+<a name="ln288">	length--;</a>
+<a name="ln289"> </a>
+<a name="ln290">	if (position &lt; length) {</a>
+<a name="ln291">		// move the subsequent chars</a>
+<a name="ln292">		memmove(buffer + position, buffer + position + 1, length - position);</a>
+<a name="ln293"> </a>
+<a name="ln294">		// print the rest of the line again, if necessary</a>
+<a name="ln295">		for (int32 i = position; i &lt; length; i++)</a>
+<a name="ln296">			kputchar(buffer[i]);</a>
+<a name="ln297">	}</a>
+<a name="ln298"> </a>
+<a name="ln299">	// visually clear the last char</a>
+<a name="ln300">	kputchar(' ');</a>
+<a name="ln301"> </a>
+<a name="ln302">	// reposition the cursor</a>
+<a name="ln303">	kprintf(&quot;\x1b[%&quot; B_PRId32 &quot;D&quot;, length - position + 1);</a>
+<a name="ln304">}</a>
+<a name="ln305"> </a>
+<a name="ln306"> </a>
+<a name="ln307">class LineEditingHelper {</a>
+<a name="ln308">public:</a>
+<a name="ln309">	virtual	~LineEditingHelper() {}</a>
+<a name="ln310"> </a>
+<a name="ln311">	virtual	void TabCompletion(char* buffer, int32 capacity, int32&amp; position,</a>
+<a name="ln312">		int32&amp; length) = 0;</a>
+<a name="ln313">};</a>
+<a name="ln314"> </a>
+<a name="ln315"> </a>
+<a name="ln316">class CommandLineEditingHelper : public LineEditingHelper {</a>
+<a name="ln317">public:</a>
+<a name="ln318">	CommandLineEditingHelper()</a>
+<a name="ln319">	{</a>
+<a name="ln320">	}</a>
+<a name="ln321"> </a>
+<a name="ln322">	virtual	~CommandLineEditingHelper() {}</a>
+<a name="ln323"> </a>
+<a name="ln324">	virtual	void TabCompletion(char* buffer, int32 capacity, int32&amp; position,</a>
+<a name="ln325">		int32&amp; length)</a>
+<a name="ln326">	{</a>
+<a name="ln327">		// find the first space</a>
+<a name="ln328">		char tmpChar = buffer[position];</a>
+<a name="ln329">		buffer[position] = '\0';</a>
+<a name="ln330">		char* firstSpace = strchr(buffer, ' ');</a>
+<a name="ln331">		buffer[position] = tmpChar;</a>
+<a name="ln332"> </a>
+<a name="ln333">		bool reprintLine = false;</a>
+<a name="ln334"> </a>
+<a name="ln335">		if (firstSpace != NULL) {</a>
+<a name="ln336">			// a complete command -- print its help</a>
+<a name="ln337"> </a>
+<a name="ln338">			// get the command</a>
+<a name="ln339">			tmpChar = *firstSpace;</a>
+<a name="ln340">			*firstSpace = '\0';</a>
+<a name="ln341">			bool ambiguous;</a>
+<a name="ln342">			debugger_command* command = find_debugger_command(buffer, true, ambiguous);</a>
+<a name="ln343">			*firstSpace = tmpChar;</a>
+<a name="ln344"> </a>
+<a name="ln345">			if (command != NULL) {</a>
+<a name="ln346">				kputchar('\n');</a>
+<a name="ln347">				print_debugger_command_usage(command-&gt;name);</a>
+<a name="ln348">			} else {</a>
+<a name="ln349">				if (ambiguous)</a>
+<a name="ln350">					kprintf(&quot;\nambiguous command\n&quot;);</a>
+<a name="ln351">				else</a>
+<a name="ln352">					kprintf(&quot;\nno such command\n&quot;);</a>
+<a name="ln353">			}</a>
+<a name="ln354"> </a>
+<a name="ln355">			reprintLine = true;</a>
+<a name="ln356">		} else {</a>
+<a name="ln357">			// a partial command -- look for completions</a>
+<a name="ln358"> </a>
+<a name="ln359">			// check for possible completions</a>
+<a name="ln360">			int32 count = 0;</a>
+<a name="ln361">			int32 longestName = 0;</a>
+<a name="ln362">			debugger_command* command = NULL;</a>
+<a name="ln363">			int32 longestCommonPrefix = 0;</a>
+<a name="ln364">			const char* previousCommandName = NULL;</a>
+<a name="ln365">			while ((command = next_debugger_command(command, buffer, position))</a>
+<a name="ln366">					!= NULL) {</a>
+<a name="ln367">				count++;</a>
+<a name="ln368">				int32 nameLength = strlen(command-&gt;name);</a>
+<a name="ln369">				longestName = max_c(longestName, nameLength);</a>
+<a name="ln370"> </a>
+<a name="ln371">				// updated the length of the longest common prefix of the</a>
+<a name="ln372">				// commands</a>
+<a name="ln373">				if (count == 1) {</a>
+<a name="ln374">					longestCommonPrefix = longestName;</a>
+<a name="ln375">				} else {</a>
+<a name="ln376">					longestCommonPrefix = min_c(longestCommonPrefix,</a>
+<a name="ln377">						nameLength);</a>
+<a name="ln378"> </a>
+<a name="ln379">					for (int32 i = position; i &lt; longestCommonPrefix; i++) {</a>
+<a name="ln380">						if (previousCommandName[i] != command-&gt;name[i]) {</a>
+<a name="ln381">							longestCommonPrefix = i;</a>
+<a name="ln382">							break;</a>
+<a name="ln383">						}</a>
+<a name="ln384">					}</a>
+<a name="ln385">				}</a>
+<a name="ln386"> </a>
+<a name="ln387">				previousCommandName = command-&gt;name;</a>
+<a name="ln388">			}</a>
+<a name="ln389"> </a>
+<a name="ln390">			if (count == 0) {</a>
+<a name="ln391">				// no possible completions</a>
+<a name="ln392">				kprintf(&quot;\nno completions\n&quot;);</a>
+<a name="ln393">				reprintLine = true;</a>
+<a name="ln394">			} else if (count == 1) {</a>
+<a name="ln395">				// exactly one completion</a>
+<a name="ln396">				command = next_debugger_command(NULL, buffer, position);</a>
+<a name="ln397"> </a>
+<a name="ln398">				// check for sufficient space in the buffer</a>
+<a name="ln399">				int32 neededSpace = longestName - position + 1;</a>
+<a name="ln400">					// remainder of the name plus one space</a>
+<a name="ln401">				// also consider the terminating null char</a>
+<a name="ln402">				if (length + neededSpace + 1 &gt;= capacity)</a>
+<a name="ln403">					return;</a>
+<a name="ln404"> </a>
+<a name="ln405">				insert_chars_into_line(buffer, position, length,</a>
+<a name="ln406">					command-&gt;name + position, longestName - position);</a>
+<a name="ln407">				insert_char_into_line(buffer, position, length, ' ');</a>
+<a name="ln408">			} else if (longestCommonPrefix &gt; position) {</a>
+<a name="ln409">				// multiple possible completions with longer common prefix</a>
+<a name="ln410">				// -- insert the remainder of the common prefix</a>
+<a name="ln411"> </a>
+<a name="ln412">				// check for sufficient space in the buffer</a>
+<a name="ln413">				int32 neededSpace = longestCommonPrefix - position;</a>
+<a name="ln414">				// also consider the terminating null char</a>
+<a name="ln415">				if (length + neededSpace + 1 &gt;= capacity)</a>
+<a name="ln416">					return;</a>
+<a name="ln417"> </a>
+<a name="ln418">				insert_chars_into_line(buffer, position, length,</a>
+<a name="ln419">					previousCommandName + position, neededSpace);</a>
+<a name="ln420">			} else {</a>
+<a name="ln421">				// multiple possible completions without longer common prefix</a>
+<a name="ln422">				// -- print them all</a>
+<a name="ln423">				kprintf(&quot;\n&quot;);</a>
+<a name="ln424">				reprintLine = true;</a>
+<a name="ln425"> </a>
+<a name="ln426">				int columns = 80 / (longestName + 2);</a>
+<a name="ln427">				debugger_command* command = NULL;</a>
+<a name="ln428">				int column = 0;</a>
+<a name="ln429">				while ((command = next_debugger_command(command, buffer, position))</a>
+<a name="ln430">						!= NULL) {</a>
+<a name="ln431">					// spacing</a>
+<a name="ln432">					if (column &gt; 0 &amp;&amp; column % columns == 0)</a>
+<a name="ln433">						kputchar('\n');</a>
+<a name="ln434">					column++;</a>
+<a name="ln435"> </a>
+<a name="ln436">					kprintf(&quot;  %-*s&quot;, (int)longestName, command-&gt;name);</a>
+<a name="ln437">				}</a>
+<a name="ln438">				kputchar('\n');</a>
+<a name="ln439">			}</a>
+<a name="ln440">		}</a>
+<a name="ln441"> </a>
+<a name="ln442">		// reprint the editing line, if necessary</a>
+<a name="ln443">		if (reprintLine) {</a>
+<a name="ln444">			kprintf(&quot;%s%.*s&quot;, kKDLPrompt, (int)length, buffer);</a>
+<a name="ln445">			if (position &lt; length)</a>
+<a name="ln446">				kprintf(&quot;\x1b[%&quot; B_PRId32 &quot;D&quot;, length - position);</a>
+<a name="ln447">		}</a>
+<a name="ln448">	}</a>
+<a name="ln449">};</a>
+<a name="ln450"> </a>
+<a name="ln451"> </a>
+<a name="ln452">static int</a>
+<a name="ln453">read_line(char* buffer, int32 maxLength,</a>
+<a name="ln454">	LineEditingHelper* editingHelper = NULL)</a>
+<a name="ln455">{</a>
+<a name="ln456">	int32 currentHistoryLine = sCurrentLine;</a>
+<a name="ln457">	int32 position = 0;</a>
+<a name="ln458">	int32 length = 0;</a>
+<a name="ln459">	bool done = false;</a>
+<a name="ln460">	char c = 0;</a>
+<a name="ln461"> </a>
+<a name="ln462">	while (!done) {</a>
+<a name="ln463">		c = kgetc();</a>
+<a name="ln464"> </a>
+<a name="ln465">		switch (c) {</a>
+<a name="ln466">			case '\n':</a>
+<a name="ln467">			case '\r':</a>
+<a name="ln468">				buffer[length++] = '\0';</a>
+<a name="ln469">				kputchar('\n');</a>
+<a name="ln470">				done = true;</a>
+<a name="ln471">				break;</a>
+<a name="ln472">			case '\t':</a>
+<a name="ln473">			{</a>
+<a name="ln474">				if (editingHelper != NULL) {</a>
+<a name="ln475">					editingHelper-&gt;TabCompletion(buffer, maxLength,</a>
+<a name="ln476">						position, length);</a>
+<a name="ln477">				}</a>
+<a name="ln478">				break;</a>
+<a name="ln479">			}</a>
+<a name="ln480">			case 8:		// backspace (CTRL-H)</a>
+<a name="ln481">			case 0x7f:	// backspace (xterm)</a>
+<a name="ln482">				if (position &gt; 0) {</a>
+<a name="ln483">					kputs(&quot;\x1b[1D&quot;); // move to the left one</a>
+<a name="ln484">					position--;</a>
+<a name="ln485">					remove_char_from_line(buffer, position, length);</a>
+<a name="ln486">				}</a>
+<a name="ln487">				break;</a>
+<a name="ln488">			case 0x1f &amp; 'K':	// CTRL-K -- clear line after current position</a>
+<a name="ln489">				if (position &lt; length) {</a>
+<a name="ln490">					// clear chars</a>
+<a name="ln491">					for (int32 i = position; i &lt; length; i++)</a>
+<a name="ln492">						kputchar(' ');</a>
+<a name="ln493"> </a>
+<a name="ln494">					// reposition cursor</a>
+<a name="ln495">					kprintf(&quot;\x1b[%&quot; B_PRId32 &quot;D&quot;, length - position);</a>
+<a name="ln496"> </a>
+<a name="ln497">					length = position;</a>
+<a name="ln498">				}</a>
+<a name="ln499">				break;</a>
+<a name="ln500">			case 0x1f &amp; 'L':	// CTRL-L -- clear screen</a>
+<a name="ln501">				if (sBlueScreenOutput) {</a>
+<a name="ln502">					// All the following needs to be transparent for the</a>
+<a name="ln503">					// serial debug output. I.e. after clearing the screen</a>
+<a name="ln504">					// we have to get the on-screen line into the visual state</a>
+<a name="ln505">					// it should have.</a>
+<a name="ln506"> </a>
+<a name="ln507">					// clear screen</a>
+<a name="ln508">					blue_screen_clear_screen();</a>
+<a name="ln509"> </a>
+<a name="ln510">					// reprint line</a>
+<a name="ln511">					buffer[length] = '\0';</a>
+<a name="ln512">					blue_screen_puts(kKDLPrompt);</a>
+<a name="ln513">					blue_screen_puts(buffer);</a>
+<a name="ln514"> </a>
+<a name="ln515">					// reposition cursor</a>
+<a name="ln516">					if (position &lt; length) {</a>
+<a name="ln517">						for (int i = length; i &gt; position; i--)</a>
+<a name="ln518">							blue_screen_puts(&quot;\x1b[1D&quot;);</a>
+<a name="ln519">					}</a>
+<a name="ln520">				}</a>
+<a name="ln521">				break;</a>
+<a name="ln522">			case 27: // escape sequence</a>
+<a name="ln523">				c = kgetc();</a>
+<a name="ln524">				if (c != '[') {</a>
+<a name="ln525">					// ignore broken escape sequence</a>
+<a name="ln526">					break;</a>
+<a name="ln527">				}</a>
+<a name="ln528">				c = kgetc();</a>
+<a name="ln529">				switch (c) {</a>
+<a name="ln530">					case 'C': // right arrow</a>
+<a name="ln531">						if (position &lt; length) {</a>
+<a name="ln532">							kputs(&quot;\x1b[1C&quot;); // move to the right one</a>
+<a name="ln533">							position++;</a>
+<a name="ln534">						}</a>
+<a name="ln535">						break;</a>
+<a name="ln536">					case 'D': // left arrow</a>
+<a name="ln537">						if (position &gt; 0) {</a>
+<a name="ln538">							kputs(&quot;\x1b[1D&quot;); // move to the left one</a>
+<a name="ln539">							position--;</a>
+<a name="ln540">						}</a>
+<a name="ln541">						break;</a>
+<a name="ln542">					case 'A': // up arrow</a>
+<a name="ln543">					case 'B': // down arrow</a>
+<a name="ln544">					{</a>
+<a name="ln545">						int32 historyLine = 0;</a>
+<a name="ln546"> </a>
+<a name="ln547">						if (c == 'A') {</a>
+<a name="ln548">							// up arrow</a>
+<a name="ln549">							historyLine = currentHistoryLine - 1;</a>
+<a name="ln550">							if (historyLine &lt; 0)</a>
+<a name="ln551">								historyLine = HISTORY_SIZE - 1;</a>
+<a name="ln552">						} else {</a>
+<a name="ln553">							// down arrow</a>
+<a name="ln554">							if (currentHistoryLine == sCurrentLine)</a>
+<a name="ln555">								break;</a>
+<a name="ln556"> </a>
+<a name="ln557">							historyLine = currentHistoryLine + 1;</a>
+<a name="ln558">							if (historyLine &gt;= HISTORY_SIZE)</a>
+<a name="ln559">								historyLine = 0;</a>
+<a name="ln560">						}</a>
+<a name="ln561"> </a>
+<a name="ln562">						// clear the history again if we're in the current line again</a>
+<a name="ln563">						// (the buffer we get just is the current line buffer)</a>
+<a name="ln564">						if (historyLine == sCurrentLine) {</a>
+<a name="ln565">							sLineBuffer[historyLine][0] = '\0';</a>
+<a name="ln566">						} else if (sLineBuffer[historyLine][0] == '\0') {</a>
+<a name="ln567">							// empty history lines are unused -- so bail out</a>
+<a name="ln568">							break;</a>
+<a name="ln569">						}</a>
+<a name="ln570"> </a>
+<a name="ln571">						// swap the current line with something from the history</a>
+<a name="ln572">						if (position &gt; 0)</a>
+<a name="ln573">							kprintf(&quot;\x1b[%&quot; B_PRId32 &quot;D&quot;, position); // move to beginning of line</a>
+<a name="ln574"> </a>
+<a name="ln575">						strcpy(buffer, sLineBuffer[historyLine]);</a>
+<a name="ln576">						length = position = strlen(buffer);</a>
+<a name="ln577">						kprintf(&quot;%s\x1b[K&quot;, buffer); // print the line and clear the rest</a>
+<a name="ln578">						currentHistoryLine = historyLine;</a>
+<a name="ln579">						break;</a>
+<a name="ln580">					}</a>
+<a name="ln581">					case '5':	// if &quot;5~&quot;, it's PAGE UP</a>
+<a name="ln582">					case '6':	// if &quot;6~&quot;, it's PAGE DOWN</a>
+<a name="ln583">					{</a>
+<a name="ln584">						if (kgetc() != '~')</a>
+<a name="ln585">							break;</a>
+<a name="ln586"> </a>
+<a name="ln587">						// PAGE UP: search backward, PAGE DOWN: forward</a>
+<a name="ln588">						int32 searchDirection = (c == '5' ? -1 : 1);</a>
+<a name="ln589"> </a>
+<a name="ln590">						bool found = false;</a>
+<a name="ln591">						int32 historyLine = currentHistoryLine;</a>
+<a name="ln592">						do {</a>
+<a name="ln593">							historyLine = (historyLine + searchDirection</a>
+<a name="ln594">								+ HISTORY_SIZE) % HISTORY_SIZE;</a>
+<a name="ln595">							if (historyLine == sCurrentLine)</a>
+<a name="ln596">								break;</a>
+<a name="ln597"> </a>
+<a name="ln598">							if (strncmp(sLineBuffer[historyLine], buffer,</a>
+<a name="ln599">									position) == 0) {</a>
+<a name="ln600">								found = true;</a>
+<a name="ln601">							}</a>
+<a name="ln602">						} while (!found);</a>
+<a name="ln603"> </a>
+<a name="ln604">						// bail out, if we've found nothing or hit an empty</a>
+<a name="ln605">						// (i.e. unused) history line</a>
+<a name="ln606">						if (!found || strlen(sLineBuffer[historyLine]) == 0)</a>
+<a name="ln607">							break;</a>
+<a name="ln608"> </a>
+<a name="ln609">						// found a suitable line -- replace the current buffer</a>
+<a name="ln610">						// content with it</a>
+<a name="ln611">						strcpy(buffer, sLineBuffer[historyLine]);</a>
+<a name="ln612">						length = strlen(buffer);</a>
+<a name="ln613">						kprintf(&quot;%s\x1b[K&quot;, buffer + position);</a>
+<a name="ln614">							// print the line and clear the rest</a>
+<a name="ln615">						kprintf(&quot;\x1b[%&quot; B_PRId32 &quot;D&quot;, length - position);</a>
+<a name="ln616">							// reposition cursor</a>
+<a name="ln617">						currentHistoryLine = historyLine;</a>
+<a name="ln618"> </a>
+<a name="ln619">						break;</a>
+<a name="ln620">					}</a>
+<a name="ln621">					case 'H': // home</a>
+<a name="ln622">					{</a>
+<a name="ln623">						if (position &gt; 0) {</a>
+<a name="ln624">							kprintf(&quot;\x1b[%&quot; B_PRId32 &quot;D&quot;, position);</a>
+<a name="ln625">							position = 0;</a>
+<a name="ln626">						}</a>
+<a name="ln627">						break;</a>
+<a name="ln628">					}</a>
+<a name="ln629">					case 'F': // end</a>
+<a name="ln630">					{</a>
+<a name="ln631">						if (position &lt; length) {</a>
+<a name="ln632">							kprintf(&quot;\x1b[%&quot; B_PRId32 &quot;C&quot;, length - position);</a>
+<a name="ln633">							position = length;</a>
+<a name="ln634">						}</a>
+<a name="ln635">						break;</a>
+<a name="ln636">					}</a>
+<a name="ln637">					case '3':	// if &quot;3~&quot;, it's DEL</a>
+<a name="ln638">					{</a>
+<a name="ln639">						if (kgetc() != '~')</a>
+<a name="ln640">							break;</a>
+<a name="ln641"> </a>
+<a name="ln642">						if (position &lt; length)</a>
+<a name="ln643">							remove_char_from_line(buffer, position, length);</a>
+<a name="ln644"> </a>
+<a name="ln645">						break;</a>
+<a name="ln646">					}</a>
+<a name="ln647">					default:</a>
+<a name="ln648">						break;</a>
+<a name="ln649">				}</a>
+<a name="ln650">				break;</a>
+<a name="ln651">			case '$':</a>
+<a name="ln652">			case '+':</a>
+<a name="ln653">				if (!sBlueScreenOutput) {</a>
+<a name="ln654">					/* HACK ALERT!!!</a>
+<a name="ln655">					 *</a>
+<a name="ln656">					 * If we get a $ at the beginning of the line</a>
+<a name="ln657">					 * we assume we are talking with GDB</a>
+<a name="ln658">					 */</a>
+<a name="ln659">					if (position == 0) {</a>
+<a name="ln660">						strcpy(buffer, &quot;gdb&quot;);</a>
+<a name="ln661">						position = 4;</a>
+<a name="ln662">						done = true;</a>
+<a name="ln663">						break;</a>
+<a name="ln664">					}</a>
+<a name="ln665">				}</a>
+<a name="ln666">				/* supposed to fall through */</a>
+<a name="ln667">			default:</a>
+<a name="ln668">				if (isprint(c))</a>
+<a name="ln669">					insert_char_into_line(buffer, position, length, c);</a>
+<a name="ln670">				break;</a>
+<a name="ln671">		}</a>
+<a name="ln672"> </a>
+<a name="ln673">		if (length &gt;= maxLength - 2) {</a>
+<a name="ln674">			buffer[length++] = '\0';</a>
+<a name="ln675">			kputchar('\n');</a>
+<a name="ln676">			done = true;</a>
+<a name="ln677">			break;</a>
+<a name="ln678">		}</a>
+<a name="ln679">	}</a>
+<a name="ln680"> </a>
+<a name="ln681">	return length;</a>
+<a name="ln682">}</a>
+<a name="ln683"> </a>
+<a name="ln684"> </a>
+<a name="ln685">char</a>
+<a name="ln686">kgetc(void)</a>
+<a name="ln687">{</a>
+<a name="ln688">	while (true) {</a>
+<a name="ln689">		// check serial input</a>
+<a name="ln690">		int c = arch_debug_serial_try_getchar();</a>
+<a name="ln691">		if (c &gt;= 0)</a>
+<a name="ln692">			return (char)c;</a>
+<a name="ln693"> </a>
+<a name="ln694">		// check blue screen input</a>
+<a name="ln695">		if (sBlueScreenOutput) {</a>
+<a name="ln696">			c = blue_screen_try_getchar();</a>
+<a name="ln697">			if (c &gt;= 0)</a>
+<a name="ln698">				return (char)c;</a>
+<a name="ln699">		}</a>
+<a name="ln700"> </a>
+<a name="ln701">		// give the kernel debugger modules a chance</a>
+<a name="ln702">		for (uint32 i = 0; i &lt; kMaxDebuggerModules; i++) {</a>
+<a name="ln703">			if (sDebuggerModules[i] &amp;&amp; sDebuggerModules[i]-&gt;debugger_getchar) {</a>
+<a name="ln704">				int getChar = sDebuggerModules[i]-&gt;debugger_getchar();</a>
+<a name="ln705">				if (getChar &gt;= 0)</a>
+<a name="ln706">					return (char)getChar;</a>
+<a name="ln707">			}</a>
+<a name="ln708">		}</a>
+<a name="ln709"> </a>
+<a name="ln710">		cpu_pause();</a>
+<a name="ln711">	}</a>
+<a name="ln712">}</a>
+<a name="ln713"> </a>
+<a name="ln714"> </a>
+<a name="ln715">int</a>
+<a name="ln716">kgets(char* buffer, int length)</a>
+<a name="ln717">{</a>
+<a name="ln718">	return read_line(buffer, length);</a>
+<a name="ln719">}</a>
+<a name="ln720"> </a>
+<a name="ln721"> </a>
+<a name="ln722">static void</a>
+<a name="ln723">print_kernel_debugger_message()</a>
+<a name="ln724">{</a>
+<a name="ln725">	if (sCurrentKernelDebuggerMessagePrefix != NULL</a>
+<a name="ln726">			|| sCurrentKernelDebuggerMessage != NULL) {</a>
+<a name="ln727">		if (sCurrentKernelDebuggerMessagePrefix != NULL)</a>
+<a name="ln728">			kprintf(&quot;%s&quot;, sCurrentKernelDebuggerMessagePrefix);</a>
+<a name="ln729">		if (sCurrentKernelDebuggerMessage != NULL</a>
+<a name="ln730">				&amp;&amp; sDebugOutputFilter != NULL) {</a>
+<a name="ln731">			va_list args;</a>
+<a name="ln732">			va_copy(args, sCurrentKernelDebuggerMessageArgs);</a>
+<a name="ln733"> </a>
+<a name="ln734">			if (const char* commandDelimiter = strstr(</a>
+<a name="ln735">					sCurrentKernelDebuggerMessage,</a>
+<a name="ln736">					kKDLMessageCommandSeparator)) {</a>
+<a name="ln737">				// The message string contains a list of commands to be</a>
+<a name="ln738">				// executed when entering the kernel debugger. We don't</a>
+<a name="ln739">				// want to print those, so we copy the interesting part of</a>
+<a name="ln740">				// the format string.</a>
+<a name="ln741">				if (commandDelimiter != sCurrentKernelDebuggerMessage) {</a>
+<a name="ln742">					size_t length = commandDelimiter</a>
+<a name="ln743">						- sCurrentKernelDebuggerMessage;</a>
+<a name="ln744">					if (char* format = (char*)debug_malloc(length + 1)) {</a>
+<a name="ln745">						memcpy(format, sCurrentKernelDebuggerMessage, length);</a>
+<a name="ln746">						format[length] = '\0';</a>
+<a name="ln747">						sDebugOutputFilter-&gt;Print(format, args);</a>
+<a name="ln748">						debug_free(format);</a>
+<a name="ln749">					} else {</a>
+<a name="ln750">						// allocation failed -- just print everything</a>
+<a name="ln751">						sDebugOutputFilter-&gt;Print(sCurrentKernelDebuggerMessage,</a>
+<a name="ln752">							args);</a>
+<a name="ln753">					}</a>
+<a name="ln754">				}</a>
+<a name="ln755">			} else</a>
+<a name="ln756">				sDebugOutputFilter-&gt;Print(sCurrentKernelDebuggerMessage, args);</a>
+<a name="ln757"> </a>
+<a name="ln758">			va_end(args);</a>
+<a name="ln759">		}</a>
+<a name="ln760"> </a>
+<a name="ln761">		kprintf(&quot;\n&quot;);</a>
+<a name="ln762">	}</a>
+<a name="ln763">}</a>
+<a name="ln764"> </a>
+<a name="ln765"> </a>
+<a name="ln766">static void</a>
+<a name="ln767">execute_panic_commands()</a>
+<a name="ln768">{</a>
+<a name="ln769">	if (sCurrentKernelDebuggerMessage == NULL</a>
+<a name="ln770">		|| strstr(sCurrentKernelDebuggerMessage,</a>
+<a name="ln771">				kKDLMessageCommandSeparator) == NULL) {</a>
+<a name="ln772">		return;</a>
+<a name="ln773">	}</a>
+<a name="ln774"> </a>
+<a name="ln775">	// Indeed there are commands to execute.</a>
+<a name="ln776">	const size_t kCommandBufferSize = 512;</a>
+<a name="ln777">	char* commandBuffer = (char*)debug_malloc(kCommandBufferSize);</a>
+<a name="ln778">	if (commandBuffer != NULL) {</a>
+<a name="ln779">		va_list tempArgs;</a>
+<a name="ln780">		va_copy(tempArgs, sCurrentKernelDebuggerMessageArgs);</a>
+<a name="ln781"> </a>
+<a name="ln782">		if (vsnprintf(commandBuffer, kCommandBufferSize,</a>
+<a name="ln783">				sCurrentKernelDebuggerMessage, tempArgs)</a>
+<a name="ln784">					&lt; (int)kCommandBufferSize) {</a>
+<a name="ln785">			const char* commands = strstr(commandBuffer,</a>
+<a name="ln786">				kKDLMessageCommandSeparator);</a>
+<a name="ln787">			if (commands != NULL) {</a>
+<a name="ln788">				commands += strlen(kKDLMessageCommandSeparator);</a>
+<a name="ln789">				kprintf(&quot;initial commands: %s\n&quot;, commands);</a>
+<a name="ln790">				evaluate_debug_command(commands);</a>
+<a name="ln791">			}</a>
+<a name="ln792">		}</a>
+<a name="ln793"> </a>
+<a name="ln794">		va_end(tempArgs);</a>
+<a name="ln795"> </a>
+<a name="ln796">		debug_free(commandBuffer);</a>
+<a name="ln797">	}</a>
+<a name="ln798">}</a>
+<a name="ln799"> </a>
+<a name="ln800"> </a>
+<a name="ln801">static void</a>
+<a name="ln802">stack_trace_trampoline(void*)</a>
+<a name="ln803">{</a>
+<a name="ln804">	arch_debug_stack_trace();</a>
+<a name="ln805">}</a>
+<a name="ln806"> </a>
+<a name="ln807"> </a>
+<a name="ln808">static void</a>
+<a name="ln809">kernel_debugger_loop(const char* messagePrefix, const char* message,</a>
+<a name="ln810">	va_list args, int32 cpu)</a>
+<a name="ln811">{</a>
+<a name="ln812">	DebugAllocPool* allocPool = create_debug_alloc_pool();</a>
+<a name="ln813"> </a>
+<a name="ln814">	sCurrentKernelDebuggerMessagePrefix = messagePrefix;</a>
+<a name="ln815">	sCurrentKernelDebuggerMessage = message;</a>
+<a name="ln816">	if (sCurrentKernelDebuggerMessage != NULL)</a>
+<a name="ln817">		va_copy(sCurrentKernelDebuggerMessageArgs, args);</a>
+<a name="ln818"> </a>
+<a name="ln819">	sSyslogDebuggerOffset = sSyslogBuffer != NULL</a>
+<a name="ln820">		? ring_buffer_readable(sSyslogBuffer) : 0;</a>
+<a name="ln821"> </a>
+<a name="ln822">	print_kernel_debugger_message();</a>
+<a name="ln823"> </a>
+<a name="ln824">	kprintf(&quot;Welcome to Kernel Debugging Land...\n&quot;);</a>
+<a name="ln825"> </a>
+<a name="ln826">	// Set a few temporary debug variables and print on which CPU and in which</a>
+<a name="ln827">	// thread we are running.</a>
+<a name="ln828">	set_debug_variable(&quot;_cpu&quot;, sDebuggerOnCPU);</a>
+<a name="ln829"> </a>
+<a name="ln830">	Thread* thread = thread_get_current_thread();</a>
+<a name="ln831">	if (thread == NULL) {</a>
+<a name="ln832">		kprintf(&quot;Running on CPU %&quot; B_PRId32 &quot;\n&quot;, sDebuggerOnCPU);</a>
+<a name="ln833">	} else if (!debug_is_kernel_memory_accessible((addr_t)thread,</a>
+<a name="ln834">			sizeof(Thread), B_KERNEL_READ_AREA)) {</a>
+<a name="ln835">		kprintf(&quot;Running on CPU %&quot; B_PRId32 &quot;\n&quot;, sDebuggerOnCPU);</a>
+<a name="ln836">		kprintf(&quot;Current thread pointer is %p, which is an address we &quot;</a>
+<a name="ln837">			&quot;can't read from.\n&quot;, thread);</a>
+<a name="ln838">		arch_debug_unset_current_thread();</a>
+<a name="ln839">	} else {</a>
+<a name="ln840">		set_debug_variable(&quot;_thread&quot;, (uint64)(addr_t)thread);</a>
+<a name="ln841">		set_debug_variable(&quot;_threadID&quot;, thread-&gt;id);</a>
+<a name="ln842"> </a>
+<a name="ln843">		kprintf(&quot;Thread %&quot; B_PRId32 &quot; \&quot;%.64s\&quot; running on CPU %&quot; B_PRId32 &quot;\n&quot;,</a>
+<a name="ln844">			thread-&gt;id, thread-&gt;name, sDebuggerOnCPU);</a>
+<a name="ln845"> </a>
+<a name="ln846">		if (thread-&gt;cpu != gCPU + cpu) {</a>
+<a name="ln847">			kprintf(&quot;The thread's CPU pointer is %p, but should be %p.\n&quot;,</a>
+<a name="ln848">				thread-&gt;cpu, gCPU + cpu);</a>
+<a name="ln849">			arch_debug_unset_current_thread();</a>
+<a name="ln850">		} else if (thread-&gt;team != NULL) {</a>
+<a name="ln851">			if (debug_is_kernel_memory_accessible((addr_t)thread-&gt;team,</a>
+<a name="ln852">					sizeof(Team), B_KERNEL_READ_AREA)) {</a>
+<a name="ln853">				set_debug_variable(&quot;_team&quot;, (uint64)(addr_t)thread-&gt;team);</a>
+<a name="ln854">				set_debug_variable(&quot;_teamID&quot;, thread-&gt;team-&gt;id);</a>
+<a name="ln855">			} else {</a>
+<a name="ln856">				kprintf(&quot;The thread's team pointer is %p, which is an &quot;</a>
+<a name="ln857">					&quot;address we can't read from.\n&quot;, thread-&gt;team);</a>
+<a name="ln858">				arch_debug_unset_current_thread();</a>
+<a name="ln859">			}</a>
+<a name="ln860">		}</a>
+<a name="ln861">	}</a>
+<a name="ln862"> </a>
+<a name="ln863">	if (!has_debugger_command(&quot;help&quot;) || message != NULL) {</a>
+<a name="ln864">		// No commands yet or we came here via a panic(). Always print a stack</a>
+<a name="ln865">		// trace in these cases.</a>
+<a name="ln866">		jmp_buf* jumpBuffer = (jmp_buf*)debug_malloc(sizeof(jmp_buf));</a>
+<a name="ln867">		if (jumpBuffer != NULL) {</a>
+<a name="ln868">			debug_call_with_fault_handler(*jumpBuffer, &amp;stack_trace_trampoline,</a>
+<a name="ln869">				NULL);</a>
+<a name="ln870">			debug_free(jumpBuffer);</a>
+<a name="ln871">		} else</a>
+<a name="ln872">			arch_debug_stack_trace();</a>
+<a name="ln873">	}</a>
+<a name="ln874"> </a>
+<a name="ln875">	if (has_debugger_command(&quot;help&quot;)) {</a>
+<a name="ln876">		// Commands are registered already -- execute panic() commands. Do that</a>
+<a name="ln877">		// with paging disabled, so everything is printed, even if the user</a>
+<a name="ln878">		// can't use the keyboard.</a>
+<a name="ln879">		bool pagingEnabled = blue_screen_paging_enabled();</a>
+<a name="ln880">		blue_screen_set_paging(false);</a>
+<a name="ln881"> </a>
+<a name="ln882">		execute_panic_commands();</a>
+<a name="ln883"> </a>
+<a name="ln884">		blue_screen_set_paging(pagingEnabled);</a>
+<a name="ln885">	}</a>
+<a name="ln886"> </a>
+<a name="ln887">	int32 continuableLine = -1;</a>
+<a name="ln888">		// Index of the previous command line, if the command returned</a>
+<a name="ln889">		// B_KDEBUG_CONT, i.e. asked to be repeatable, -1 otherwise.</a>
+<a name="ln890"> </a>
+<a name="ln891">	for (;;) {</a>
+<a name="ln892">		CommandLineEditingHelper editingHelper;</a>
+<a name="ln893">		kprintf(kKDLPrompt);</a>
+<a name="ln894">		char* line = sLineBuffer[sCurrentLine];</a>
+<a name="ln895">		read_line(line, LINE_BUFFER_SIZE, &amp;editingHelper);</a>
+<a name="ln896"> </a>
+<a name="ln897">		// check, if the line is empty or whitespace only</a>
+<a name="ln898">		bool whiteSpaceOnly = true;</a>
+<a name="ln899">		for (int i = 0 ; line[i] != '\0'; i++) {</a>
+<a name="ln900">			if (!isspace(line[i])) {</a>
+<a name="ln901">				whiteSpaceOnly = false;</a>
+<a name="ln902">				break;</a>
+<a name="ln903">			}</a>
+<a name="ln904">		}</a>
+<a name="ln905"> </a>
+<a name="ln906">		if (whiteSpaceOnly) {</a>
+<a name="ln907">			if (continuableLine &lt; 0)</a>
+<a name="ln908">				continue;</a>
+<a name="ln909"> </a>
+<a name="ln910">			// the previous command can be repeated</a>
+<a name="ln911">			sCurrentLine = continuableLine;</a>
+<a name="ln912">			line = sLineBuffer[sCurrentLine];</a>
+<a name="ln913">		}</a>
+<a name="ln914"> </a>
+<a name="ln915">		int rc = evaluate_debug_command(line);</a>
+<a name="ln916"> </a>
+<a name="ln917">		if (rc == B_KDEBUG_QUIT) {</a>
+<a name="ln918">			// okay, exit now.</a>
+<a name="ln919">			break;</a>
+<a name="ln920">		}</a>
+<a name="ln921"> </a>
+<a name="ln922">		// If the command is continuable, remember the current line index.</a>
+<a name="ln923">		continuableLine = (rc == B_KDEBUG_CONT ? sCurrentLine : -1);</a>
+<a name="ln924"> </a>
+<a name="ln925">		int previousLine = sCurrentLine - 1;</a>
+<a name="ln926">		if (previousLine &lt; 0)</a>
+<a name="ln927">			previousLine = HISTORY_SIZE - 1;</a>
+<a name="ln928"> </a>
+<a name="ln929">		// Only use the next slot in the history, if the entries differ</a>
+<a name="ln930">		if (strcmp(sLineBuffer[sCurrentLine], sLineBuffer[previousLine])) {</a>
+<a name="ln931">			if (++sCurrentLine &gt;= HISTORY_SIZE)</a>
+<a name="ln932">				sCurrentLine = 0;</a>
+<a name="ln933">		}</a>
+<a name="ln934">	}</a>
+<a name="ln935"> </a>
+<a name="ln936">	if (sCurrentKernelDebuggerMessage != NULL)</a>
+<a name="ln937">		va_end(sCurrentKernelDebuggerMessageArgs);</a>
+<a name="ln938"> </a>
+<a name="ln939">	delete_debug_alloc_pool(allocPool);</a>
+<a name="ln940">}</a>
+<a name="ln941"> </a>
+<a name="ln942"> </a>
+<a name="ln943">static void</a>
+<a name="ln944">enter_kernel_debugger(int32 cpu)</a>
+<a name="ln945">{</a>
+<a name="ln946">	while (atomic_add(&amp;sInDebugger, 1) &gt; 0) {</a>
+<a name="ln947">		atomic_add(&amp;sInDebugger, -1);</a>
+<a name="ln948"> </a>
+<a name="ln949">		// The debugger is already running, find out where...</a>
+<a name="ln950">		if (sDebuggerOnCPU == cpu) {</a>
+<a name="ln951">			// We are re-entering the debugger on the same CPU.</a>
+<a name="ln952">			break;</a>
+<a name="ln953">		}</a>
+<a name="ln954"> </a>
+<a name="ln955">		// Some other CPU must have entered the debugger and tried to halt</a>
+<a name="ln956">		// us. Process ICIs to ensure we get the halt request. Then we are</a>
+<a name="ln957">		// blocking there until everyone leaves the debugger and we can</a>
+<a name="ln958">		// try to enter it again.</a>
+<a name="ln959">		smp_intercpu_int_handler(cpu);</a>
+<a name="ln960">	}</a>
+<a name="ln961"> </a>
+<a name="ln962">	arch_debug_save_registers(&amp;sDebugRegisters[cpu]);</a>
+<a name="ln963">	sPreviousDprintfState = set_dprintf_enabled(true);</a>
+<a name="ln964"> </a>
+<a name="ln965">	if (!gKernelStartup &amp;&amp; sDebuggerOnCPU != cpu &amp;&amp; smp_get_num_cpus() &gt; 1) {</a>
+<a name="ln966">		// First entry on a MP system, send a halt request to all of the other</a>
+<a name="ln967">		// CPUs. Should they try to enter the debugger they will be cought in</a>
+<a name="ln968">		// the loop above.</a>
+<a name="ln969">		smp_send_broadcast_ici_interrupts_disabled(cpu, SMP_MSG_CPU_HALT, 0, 0,</a>
+<a name="ln970">			0, NULL, SMP_MSG_FLAG_SYNC);</a>
+<a name="ln971">	}</a>
+<a name="ln972"> </a>
+<a name="ln973">	if (sBlueScreenOutput) {</a>
+<a name="ln974">		if (blue_screen_enter(false) == B_OK)</a>
+<a name="ln975">			sBlueScreenEnabled = true;</a>
+<a name="ln976">	}</a>
+<a name="ln977"> </a>
+<a name="ln978">	sDebugOutputFilter = &amp;gDefaultDebugOutputFilter;</a>
+<a name="ln979"> </a>
+<a name="ln980">	sDebuggedThread = NULL;</a>
+<a name="ln981"> </a>
+<a name="ln982">	// sort the commands</a>
+<a name="ln983">	sort_debugger_commands();</a>
+<a name="ln984"> </a>
+<a name="ln985">	call_modules_hook(true);</a>
+<a name="ln986">}</a>
+<a name="ln987"> </a>
+<a name="ln988"> </a>
+<a name="ln989">static void</a>
+<a name="ln990">exit_kernel_debugger()</a>
+<a name="ln991">{</a>
+<a name="ln992">	call_modules_hook(false);</a>
+<a name="ln993">	set_dprintf_enabled(sPreviousDprintfState);</a>
+<a name="ln994"> </a>
+<a name="ln995">	sDebugOutputFilter = NULL;</a>
+<a name="ln996"> </a>
+<a name="ln997">	sBlueScreenEnabled = false;</a>
+<a name="ln998">	if (sDebugScreenEnabled)</a>
+<a name="ln999">		blue_screen_enter(true);</a>
+<a name="ln1000"> </a>
+<a name="ln1001">	atomic_add(&amp;sInDebugger, -1);</a>
+<a name="ln1002">}</a>
+<a name="ln1003"> </a>
+<a name="ln1004"> </a>
+<a name="ln1005">static void</a>
+<a name="ln1006">hand_over_kernel_debugger()</a>
+<a name="ln1007">{</a>
+<a name="ln1008">	// Wait until the hand-over is complete.</a>
+<a name="ln1009">	// The other CPU gets our sInDebugger reference and will release it when</a>
+<a name="ln1010">	// done. Note, that there's a small race condition: the other CPU could</a>
+<a name="ln1011">	// hand over to another CPU without us noticing. Since this is only</a>
+<a name="ln1012">	// initiated by the user, it is harmless, though.</a>
+<a name="ln1013">	sHandOverKDL = true;</a>
+<a name="ln1014">	while (atomic_get(&amp;sHandOverKDLToCPU) &gt;= 0)</a>
+<a name="ln1015">		cpu_wait(&amp;sHandOverKDLToCPU, -1);</a>
+<a name="ln1016">}</a>
+<a name="ln1017"> </a>
+<a name="ln1018"> </a>
+<a name="ln1019">static void</a>
+<a name="ln1020">kernel_debugger_internal(const char* messagePrefix, const char* message,</a>
+<a name="ln1021">	va_list args, int32 cpu)</a>
+<a name="ln1022">{</a>
+<a name="ln1023">	while (true) {</a>
+<a name="ln1024">		if (sHandOverKDLToCPU == cpu) {</a>
+<a name="ln1025">			sHandOverKDLToCPU = -1;</a>
+<a name="ln1026">			sHandOverKDL = false;</a>
+<a name="ln1027">		} else</a>
+<a name="ln1028">			enter_kernel_debugger(cpu);</a>
+<a name="ln1029"> </a>
+<a name="ln1030">		// If we're called recursively sDebuggerOnCPU will be != -1.</a>
+<a name="ln1031">		int32 previousCPU = sDebuggerOnCPU;</a>
+<a name="ln1032">		sDebuggerOnCPU = cpu;</a>
+<a name="ln1033"> </a>
+<a name="ln1034">		kernel_debugger_loop(messagePrefix, message, args, cpu);</a>
+<a name="ln1035"> </a>
+<a name="ln1036">		if (sHandOverKDLToCPU &lt; 0 &amp;&amp; previousCPU == -1) {</a>
+<a name="ln1037">			// We're not handing over to a different CPU and we weren't</a>
+<a name="ln1038">			// called recursively, so we'll exit the debugger.</a>
+<a name="ln1039">			exit_kernel_debugger();</a>
+<a name="ln1040">		}</a>
+<a name="ln1041"> </a>
+<a name="ln1042">		sDebuggerOnCPU = previousCPU;</a>
+<a name="ln1043"> </a>
+<a name="ln1044">		if (sHandOverKDLToCPU &lt; 0)</a>
+<a name="ln1045">			break;</a>
+<a name="ln1046"> </a>
+<a name="ln1047">		hand_over_kernel_debugger();</a>
+<a name="ln1048"> </a>
+<a name="ln1049">		debug_trap_cpu_in_kdl(cpu, true);</a>
+<a name="ln1050"> </a>
+<a name="ln1051">		if (sHandOverKDLToCPU != cpu)</a>
+<a name="ln1052">			break;</a>
+<a name="ln1053">	}</a>
+<a name="ln1054">}</a>
+<a name="ln1055"> </a>
+<a name="ln1056"> </a>
+<a name="ln1057">static int</a>
+<a name="ln1058">cmd_dump_kdl_message(int argc, char** argv)</a>
+<a name="ln1059">{</a>
+<a name="ln1060">	print_kernel_debugger_message();</a>
+<a name="ln1061">	return 0;</a>
+<a name="ln1062">}</a>
+<a name="ln1063"> </a>
+<a name="ln1064"> </a>
+<a name="ln1065">static int</a>
+<a name="ln1066">cmd_execute_panic_commands(int argc, char** argv)</a>
+<a name="ln1067">{</a>
+<a name="ln1068">	execute_panic_commands();</a>
+<a name="ln1069">	return 0;</a>
+<a name="ln1070">}</a>
+<a name="ln1071"> </a>
+<a name="ln1072"> </a>
+<a name="ln1073">static int</a>
+<a name="ln1074">cmd_dump_syslog(int argc, char** argv)</a>
+<a name="ln1075">{</a>
+<a name="ln1076">	if (!sSyslogOutputEnabled) {</a>
+<a name="ln1077">		kprintf(&quot;Syslog is not enabled.\n&quot;);</a>
+<a name="ln1078">		return 0;</a>
+<a name="ln1079">	}</a>
+<a name="ln1080"> </a>
+<a name="ln1081">	bool unsentOnly = false;</a>
+<a name="ln1082">	bool ignoreKDLOutput = true;</a>
+<a name="ln1083"> </a>
+<a name="ln1084">	int argi = 1;</a>
+<a name="ln1085">	for (; argi &lt; argc; argi++) {</a>
+<a name="ln1086">		if (strcmp(argv[argi], &quot;-n&quot;) == 0)</a>
+<a name="ln1087">			unsentOnly = true;</a>
+<a name="ln1088">		else if (strcmp(argv[argi], &quot;-k&quot;) == 0)</a>
+<a name="ln1089">			ignoreKDLOutput = false;</a>
+<a name="ln1090">		else</a>
+<a name="ln1091">			break;</a>
+<a name="ln1092">	}</a>
+<a name="ln1093"> </a>
+<a name="ln1094">	if (argi &lt; argc) {</a>
+<a name="ln1095">		print_debugger_command_usage(argv[0]);</a>
+<a name="ln1096">		return 0;</a>
+<a name="ln1097">	}</a>
+<a name="ln1098"> </a>
+<a name="ln1099">	size_t debuggerOffset = sSyslogDebuggerOffset;</a>
+<a name="ln1100">	size_t start = unsentOnly ? sSyslogBufferOffset : 0;</a>
+<a name="ln1101">	size_t end = ignoreKDLOutput</a>
+<a name="ln1102">		? debuggerOffset : ring_buffer_readable(sSyslogBuffer);</a>
+<a name="ln1103"> </a>
+<a name="ln1104">	// allocate a buffer for processing the syslog output</a>
+<a name="ln1105">	size_t bufferSize = 1024;</a>
+<a name="ln1106">	char* buffer = (char*)debug_malloc(bufferSize);</a>
+<a name="ln1107">	char stackBuffer[64];</a>
+<a name="ln1108">	if (buffer == NULL) {</a>
+<a name="ln1109">		buffer = stackBuffer;</a>
+<a name="ln1110">		bufferSize = sizeof(stackBuffer);</a>
+<a name="ln1111">	}</a>
+<a name="ln1112"> </a>
+<a name="ln1113">	// filter the output</a>
+<a name="ln1114">	bool newLine = false;</a>
+<a name="ln1115">	while (start &lt; end) {</a>
+<a name="ln1116">		size_t bytesRead = ring_buffer_peek(sSyslogBuffer, start, buffer,</a>
+<a name="ln1117">			std::min(end - start, bufferSize - 1));</a>
+<a name="ln1118">		if (bytesRead == 0)</a>
+<a name="ln1119">			break;</a>
+<a name="ln1120">		start += bytesRead;</a>
+<a name="ln1121"> </a>
+<a name="ln1122">		// remove '\0' and 0xcc</a>
+<a name="ln1123">		size_t toPrint = 0;</a>
+<a name="ln1124">		for (size_t i = 0; i &lt; bytesRead; i++) {</a>
+<a name="ln1125">			if (buffer[i] != '\0' &amp;&amp; (uint8)buffer[i] != 0xcc)</a>
+<a name="ln1126">				buffer[toPrint++] = buffer[i];</a>
+<a name="ln1127">		}</a>
+<a name="ln1128"> </a>
+<a name="ln1129">		if (toPrint &gt; 0) {</a>
+<a name="ln1130">			newLine = buffer[toPrint - 1] == '\n';</a>
+<a name="ln1131">			buffer[toPrint] = '\0';</a>
+<a name="ln1132">			kputs(buffer);</a>
+<a name="ln1133">		}</a>
+<a name="ln1134"> </a>
+<a name="ln1135">		if (debuggerOffset &gt; sSyslogDebuggerOffset) {</a>
+<a name="ln1136">			// Our output caused older syslog output to be evicted from the</a>
+<a name="ln1137">			// syslog buffer. We need to adjust our offsets accordingly. Note,</a>
+<a name="ln1138">			// this can still go wrong, if the buffer was already full and more</a>
+<a name="ln1139">			// was written to it than we have processed, but we can't help that.</a>
+<a name="ln1140">			size_t diff = debuggerOffset - sSyslogDebuggerOffset;</a>
+<a name="ln1141">			start -= std::min(start, diff);</a>
+<a name="ln1142">			end -= std::min(end, diff);</a>
+<a name="ln1143">			debuggerOffset = sSyslogDebuggerOffset;</a>
+<a name="ln1144">		}</a>
+<a name="ln1145">	}</a>
+<a name="ln1146"> </a>
+<a name="ln1147">	if (!newLine)</a>
+<a name="ln1148">		kputs(&quot;\n&quot;);</a>
+<a name="ln1149"> </a>
+<a name="ln1150">	if (buffer != stackBuffer)</a>
+<a name="ln1151">		debug_free(buffer);</a>
+<a name="ln1152"> </a>
+<a name="ln1153">	return 0;</a>
+<a name="ln1154">}</a>
+<a name="ln1155"> </a>
+<a name="ln1156"> </a>
+<a name="ln1157">static int</a>
+<a name="ln1158">cmd_switch_cpu(int argc, char** argv)</a>
+<a name="ln1159">{</a>
+<a name="ln1160">	if (argc &gt; 2) {</a>
+<a name="ln1161">		print_debugger_command_usage(argv[0]);</a>
+<a name="ln1162">		return 0;</a>
+<a name="ln1163">	}</a>
+<a name="ln1164"> </a>
+<a name="ln1165">	if (argc == 1) {</a>
+<a name="ln1166">		kprintf(&quot;running on CPU %&quot; B_PRId32 &quot;\n&quot;, smp_get_current_cpu());</a>
+<a name="ln1167">		return 0;</a>
+<a name="ln1168">	}</a>
+<a name="ln1169"> </a>
+<a name="ln1170">	int32 newCPU = parse_expression(argv[1]);</a>
+<a name="ln1171">	if (newCPU &lt; 0 || newCPU &gt;= smp_get_num_cpus()) {</a>
+<a name="ln1172">		kprintf(&quot;invalid CPU index\n&quot;);</a>
+<a name="ln1173">		return 0;</a>
+<a name="ln1174">	}</a>
+<a name="ln1175"> </a>
+<a name="ln1176">	if (newCPU == smp_get_current_cpu()) {</a>
+<a name="ln1177">		kprintf(&quot;already running on CPU %&quot; B_PRId32 &quot;\n&quot;, newCPU);</a>
+<a name="ln1178">		return 0;</a>
+<a name="ln1179">	}</a>
+<a name="ln1180"> </a>
+<a name="ln1181">	sHandOverKDLToCPU = newCPU;</a>
+<a name="ln1182"> </a>
+<a name="ln1183">	return B_KDEBUG_QUIT;</a>
+<a name="ln1184">}</a>
+<a name="ln1185"> </a>
+<a name="ln1186"> </a>
+<a name="ln1187">static status_t</a>
+<a name="ln1188">syslog_sender(void* data)</a>
+<a name="ln1189">{</a>
+<a name="ln1190">	bool bufferPending = false;</a>
+<a name="ln1191">	int32 length = 0;</a>
+<a name="ln1192"> </a>
+<a name="ln1193">	while (true) {</a>
+<a name="ln1194">		// wait for syslog data to become available</a>
+<a name="ln1195">		acquire_sem_etc(sSyslogNotify, 1, B_RELATIVE_TIMEOUT, 5000000);</a>
+<a name="ln1196">			// Note: We time out since in some situations output is added to</a>
+<a name="ln1197">			// the syslog buffer without being allowed to notify us (e.g. in</a>
+<a name="ln1198">			// the kernel debugger).</a>
+<a name="ln1199">			// TODO: A semaphore is rather unhandy here. It is released for</a>
+<a name="ln1200">			// every single message written to the buffer, but we potentially</a>
+<a name="ln1201">			// send a lot more than a single message per iteration. On the other</a>
+<a name="ln1202">			// hand, as long as the syslog daemon is not running, we acquire</a>
+<a name="ln1203">			// the semaphore anyway. A better solution would be a flag + a</a>
+<a name="ln1204">			// condition variable.</a>
+<a name="ln1205"> </a>
+<a name="ln1206">		sSyslogMessage-&gt;when = real_time_clock();</a>
+<a name="ln1207"> </a>
+<a name="ln1208">		if (!bufferPending) {</a>
+<a name="ln1209">			// We need to have exclusive access to our syslog buffer</a>
+<a name="ln1210">			cpu_status state = disable_interrupts();</a>
+<a name="ln1211">			acquire_spinlock(&amp;sSpinlock);</a>
+<a name="ln1212"> </a>
+<a name="ln1213">			length = ring_buffer_readable(sSyslogBuffer)</a>
+<a name="ln1214">				- sSyslogBufferOffset;</a>
+<a name="ln1215">			if (length &gt; (int32)SYSLOG_MAX_MESSAGE_LENGTH)</a>
+<a name="ln1216">				length = SYSLOG_MAX_MESSAGE_LENGTH;</a>
+<a name="ln1217"> </a>
+<a name="ln1218">			length = ring_buffer_peek(sSyslogBuffer, sSyslogBufferOffset,</a>
+<a name="ln1219">				(uint8*)sSyslogMessage-&gt;message, length);</a>
+<a name="ln1220">			sSyslogBufferOffset += length;</a>
+<a name="ln1221">			if (sSyslogDropped) {</a>
+<a name="ln1222">				// Add drop marker - since parts had to be dropped, it's</a>
+<a name="ln1223">				// guaranteed that we have enough space in the buffer now.</a>
+<a name="ln1224">				ring_buffer_write(sSyslogBuffer, (uint8*)&quot;&lt;DROP&gt;&quot;, 6);</a>
+<a name="ln1225">				sSyslogDropped = false;</a>
+<a name="ln1226">			}</a>
+<a name="ln1227"> </a>
+<a name="ln1228">			release_spinlock(&amp;sSpinlock);</a>
+<a name="ln1229">			restore_interrupts(state);</a>
+<a name="ln1230">		}</a>
+<a name="ln1231"> </a>
+<a name="ln1232">		if (length == 0) {</a>
+<a name="ln1233">			// The buffer we came here for might have been sent already</a>
+<a name="ln1234">			bufferPending = false;</a>
+<a name="ln1235">			continue;</a>
+<a name="ln1236">		}</a>
+<a name="ln1237"> </a>
+<a name="ln1238">		status_t status = write_port_etc(sSyslogPort, SYSLOG_MESSAGE,</a>
+<a name="ln1239">			sSyslogMessage, sizeof(struct syslog_message) + length,</a>
+<a name="ln1240">			B_RELATIVE_TIMEOUT, 0);</a>
+<a name="ln1241">		if (status == B_BAD_PORT_ID) {</a>
+<a name="ln1242">			// The port is gone, there is no need to run anymore</a>
+<a name="ln1243">			sSyslogWriter = -1;</a>
+<a name="ln1244">			return status;</a>
+<a name="ln1245">		}</a>
+<a name="ln1246"> </a>
+<a name="ln1247">		if (status != B_OK) {</a>
+<a name="ln1248">			// Sending has failed - just wait, maybe it'll work later.</a>
+<a name="ln1249">			bufferPending = true;</a>
+<a name="ln1250">			continue;</a>
+<a name="ln1251">		}</a>
+<a name="ln1252"> </a>
+<a name="ln1253">		if (bufferPending) {</a>
+<a name="ln1254">			// We could write the last pending buffer, try to read more</a>
+<a name="ln1255">			// from the syslog ring buffer</a>
+<a name="ln1256">			release_sem_etc(sSyslogNotify, 1, B_DO_NOT_RESCHEDULE);</a>
+<a name="ln1257">			bufferPending = false;</a>
+<a name="ln1258">		}</a>
+<a name="ln1259">	}</a>
+<a name="ln1260"> </a>
+<a name="ln1261">	return 0;</a>
+<a name="ln1262">}</a>
+<a name="ln1263"> </a>
+<a name="ln1264"> </a>
+<a name="ln1265">static void</a>
+<a name="ln1266">syslog_write(const char* text, int32 length, bool notify)</a>
+<a name="ln1267">{</a>
+<a name="ln1268">	if (sSyslogBuffer == NULL)</a>
+<a name="ln1269">		return;</a>
+<a name="ln1270"> </a>
+<a name="ln1271">	if (length &gt; sSyslogBuffer-&gt;size) {</a>
+<a name="ln1272">		text = &quot;&lt;DROP&gt;&quot;;</a>
+<a name="ln1273">		length = 6;</a>
+<a name="ln1274">	}</a>
+<a name="ln1275"> </a>
+<a name="ln1276">	int32 writable = ring_buffer_writable(sSyslogBuffer);</a>
+<a name="ln1277">	if (writable &lt; length) {</a>
+<a name="ln1278">		// drop old data</a>
+<a name="ln1279">		size_t toDrop = length - writable;</a>
+<a name="ln1280">		ring_buffer_flush(sSyslogBuffer, toDrop);</a>
+<a name="ln1281"> </a>
+<a name="ln1282">		if (toDrop &gt; sSyslogBufferOffset) {</a>
+<a name="ln1283">			sSyslogBufferOffset = 0;</a>
+<a name="ln1284">			sSyslogDropped = true;</a>
+<a name="ln1285">		} else</a>
+<a name="ln1286">			sSyslogBufferOffset -= toDrop;</a>
+<a name="ln1287"> </a>
+<a name="ln1288">		sSyslogDebuggerOffset -= std::min(toDrop, sSyslogDebuggerOffset);</a>
+<a name="ln1289">	}</a>
+<a name="ln1290"> </a>
+<a name="ln1291">	ring_buffer_write(sSyslogBuffer, (uint8*)text, length);</a>
+<a name="ln1292"> </a>
+<a name="ln1293">	if (notify)</a>
+<a name="ln1294">		release_sem_etc(sSyslogNotify, 1, B_DO_NOT_RESCHEDULE);</a>
+<a name="ln1295">}</a>
+<a name="ln1296"> </a>
+<a name="ln1297"> </a>
+<a name="ln1298">static status_t</a>
+<a name="ln1299">syslog_init_post_threads(void)</a>
+<a name="ln1300">{</a>
+<a name="ln1301">	if (!sSyslogOutputEnabled)</a>
+<a name="ln1302">		return B_OK;</a>
+<a name="ln1303"> </a>
+<a name="ln1304">	sSyslogNotify = create_sem(0, &quot;syslog data&quot;);</a>
+<a name="ln1305">	if (sSyslogNotify &gt;= 0)</a>
+<a name="ln1306">		return B_OK;</a>
+<a name="ln1307"> </a>
+<a name="ln1308">	// initializing kernel syslog service failed -- disable it</a>
+<a name="ln1309"> </a>
+<a name="ln1310">	sSyslogOutputEnabled = false;</a>
+<a name="ln1311"> </a>
+<a name="ln1312">	if (sSyslogBuffer != NULL) {</a>
+<a name="ln1313">		if (sDebugSyslog)</a>
+<a name="ln1314">			delete_area(area_for(sSyslogBuffer));</a>
+<a name="ln1315">		else</a>
+<a name="ln1316">			delete_ring_buffer(sSyslogBuffer);</a>
+<a name="ln1317"> </a>
+<a name="ln1318">		sSyslogBuffer = NULL;</a>
+<a name="ln1319">	}</a>
+<a name="ln1320"> </a>
+<a name="ln1321">	free(sSyslogMessage);</a>
+<a name="ln1322">	delete_sem(sSyslogNotify);</a>
+<a name="ln1323"> </a>
+<a name="ln1324">	return B_ERROR;</a>
+<a name="ln1325">}</a>
+<a name="ln1326"> </a>
+<a name="ln1327"> </a>
+<a name="ln1328">static status_t</a>
+<a name="ln1329">syslog_init_post_vm(struct kernel_args* args)</a>
+<a name="ln1330">{</a>
+<a name="ln1331">	status_t status;</a>
+<a name="ln1332">	int32 length = 0;</a>
+<a name="ln1333"> </a>
+<a name="ln1334">	if (!sSyslogOutputEnabled) {</a>
+<a name="ln1335">		sSyslogBuffer = NULL;</a>
+<a name="ln1336">			// Might already have been set in syslog_init(), if the debug syslog</a>
+<a name="ln1337">			// was enabled. Just drop it -- we'll never create the area.</a>
+<a name="ln1338">		return B_OK;</a>
+<a name="ln1339">	}</a>
+<a name="ln1340"> </a>
+<a name="ln1341">	sSyslogMessage = (syslog_message*)malloc(SYSLOG_MESSAGE_BUFFER_SIZE);</a>
+<a name="ln1342">	if (sSyslogMessage == NULL) {</a>
+<a name="ln1343">		status = B_NO_MEMORY;</a>
+<a name="ln1344">		goto err1;</a>
+<a name="ln1345">	}</a>
+<a name="ln1346"> </a>
+<a name="ln1347">	if (sSyslogBuffer == NULL) {</a>
+<a name="ln1348">		size_t bufferSize = DEFAULT_SYSLOG_BUFFER_SIZE;</a>
+<a name="ln1349">		void* handle = load_driver_settings(&quot;kernel&quot;);</a>
+<a name="ln1350">		if (handle != NULL) {</a>
+<a name="ln1351">			const char* sizeString = get_driver_parameter(handle,</a>
+<a name="ln1352">				&quot;syslog_buffer_size&quot;, NULL, NULL);</a>
+<a name="ln1353">			if (sizeString != NULL) {</a>
+<a name="ln1354">				bufferSize = strtoul(sizeString, NULL, 0);</a>
+<a name="ln1355">				if (bufferSize &gt; 262144)</a>
+<a name="ln1356">					bufferSize = 262144;</a>
+<a name="ln1357">				else if (bufferSize &lt; SYSLOG_MESSAGE_BUFFER_SIZE)</a>
+<a name="ln1358">					bufferSize = SYSLOG_MESSAGE_BUFFER_SIZE;</a>
+<a name="ln1359">			}</a>
+<a name="ln1360"> </a>
+<a name="ln1361">			unload_driver_settings(handle);</a>
+<a name="ln1362">		}</a>
+<a name="ln1363"> </a>
+<a name="ln1364">		sSyslogBuffer = create_ring_buffer(bufferSize);</a>
+<a name="ln1365"> </a>
+<a name="ln1366">		if (sSyslogBuffer == NULL) {</a>
+<a name="ln1367">			status = B_NO_MEMORY;</a>
+<a name="ln1368">			goto err2;</a>
+<a name="ln1369">		}</a>
+<a name="ln1370">	} else {</a>
+<a name="ln1371">		// create an area for the debug syslog buffer</a>
+<a name="ln1372">		void* base = (void*)ROUNDDOWN((addr_t)(void *)args-&gt;debug_output, B_PAGE_SIZE);</a>
+<a name="ln1373">		size_t size = ROUNDUP(args-&gt;debug_size, B_PAGE_SIZE);</a>
+<a name="ln1374">		area_id area = create_area(&quot;syslog debug&quot;, &amp;base, B_EXACT_ADDRESS, size,</a>
+<a name="ln1375">				B_ALREADY_WIRED, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);</a>
+<a name="ln1376">		if (area &lt; 0) {</a>
+<a name="ln1377">			status = B_NO_MEMORY;</a>
+<a name="ln1378">			goto err2;</a>
+<a name="ln1379">		}</a>
+<a name="ln1380">	}</a>
+<a name="ln1381"> </a>
+<a name="ln1382">	// initialize syslog message</a>
+<a name="ln1383">	sSyslogMessage-&gt;from = 0;</a>
+<a name="ln1384">	sSyslogMessage-&gt;options = LOG_KERN;</a>
+<a name="ln1385">	sSyslogMessage-&gt;priority = LOG_DEBUG;</a>
+<a name="ln1386">	sSyslogMessage-&gt;ident[0] = '\0';</a>
+<a name="ln1387">	//strcpy(sSyslogMessage-&gt;ident, &quot;KERNEL&quot;);</a>
+<a name="ln1388"> </a>
+<a name="ln1389">	if (args-&gt;debug_output != NULL) {</a>
+<a name="ln1390">		syslog_write((const char*)args-&gt;debug_output.Pointer(),</a>
+<a name="ln1391">			args-&gt;debug_size, false);</a>
+<a name="ln1392">	}</a>
+<a name="ln1393"> </a>
+<a name="ln1394">	// Allocate memory for the previous session's debug syslog output. In</a>
+<a name="ln1395">	// syslog_init_post_modules() we'll write it back to disk and free it.</a>
+<a name="ln1396">	if (args-&gt;previous_debug_output != NULL) {</a>
+<a name="ln1397">		sPreviousSessionSyslogBuffer = malloc(args-&gt;previous_debug_size);</a>
+<a name="ln1398">		if (sPreviousSessionSyslogBuffer != NULL) {</a>
+<a name="ln1399">			sPreviousSessionSyslogBufferSize = args-&gt;previous_debug_size;</a>
+<a name="ln1400">			memcpy(sPreviousSessionSyslogBuffer, args-&gt;previous_debug_output,</a>
+<a name="ln1401">				sPreviousSessionSyslogBufferSize);</a>
+<a name="ln1402">		}</a>
+<a name="ln1403">	}</a>
+<a name="ln1404"> </a>
+<a name="ln1405">	char revisionBuffer[64];</a>
+<a name="ln1406">	length = snprintf(revisionBuffer, sizeof(revisionBuffer),</a>
+<a name="ln1407">		&quot;Welcome to syslog debug output!\nHaiku revision: %s\n&quot;,</a>
+<a name="ln1408">		get_haiku_revision());</a>
+<a name="ln1409">	syslog_write(revisionBuffer,</a>
+<a name="ln1410">		std::min(length, (int32)sizeof(revisionBuffer) - 1), false);</a>
+<a name="ln1411"> </a>
+<a name="ln1412">	add_debugger_command_etc(&quot;syslog&quot;, &amp;cmd_dump_syslog,</a>
+<a name="ln1413">		&quot;Dumps the syslog buffer.&quot;,</a>
+<a name="ln1414">		&quot;[ \&quot;-n\&quot; ] [ \&quot;-k\&quot; ]\n&quot;</a>
+<a name="ln1415">		&quot;Dumps the whole syslog buffer, or, if -k is specified, only &quot;</a>
+<a name="ln1416">		&quot;the part that hasn't been sent yet.\n&quot;, 0);</a>
+<a name="ln1417"> </a>
+<a name="ln1418">	return B_OK;</a>
+<a name="ln1419"> </a>
+<a name="ln1420">err2:</a>
+<a name="ln1421">	free(sSyslogMessage);</a>
+<a name="ln1422">err1:</a>
+<a name="ln1423">	sSyslogOutputEnabled = false;</a>
+<a name="ln1424">	sSyslogBuffer = NULL;</a>
+<a name="ln1425">	return status;</a>
+<a name="ln1426">}</a>
+<a name="ln1427"> </a>
+<a name="ln1428">static void</a>
+<a name="ln1429">syslog_init_post_modules()</a>
+<a name="ln1430">{</a>
+<a name="ln1431">	if (sPreviousSessionSyslogBuffer == NULL)</a>
+<a name="ln1432">		return;</a>
+<a name="ln1433"> </a>
+<a name="ln1434">	void* buffer = sPreviousSessionSyslogBuffer;</a>
+<a name="ln1435">	size_t bufferSize = sPreviousSessionSyslogBufferSize;</a>
+<a name="ln1436">	sPreviousSessionSyslogBuffer = NULL;</a>
+<a name="ln1437">	sPreviousSessionSyslogBufferSize = 0;</a>
+<a name="ln1438">	MemoryDeleter bufferDeleter(buffer);</a>
+<a name="ln1439"> </a>
+<a name="ln1440">	int fd = open(&quot;/var/log/previous_syslog&quot;, O_WRONLY | O_CREAT | O_TRUNC,</a>
+<a name="ln1441">		S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);</a>
+<a name="ln1442">	if (fd &lt; 0) {</a>
+<a name="ln1443">		dprintf(&quot;Failed to open previous syslog file: %s\n&quot;, strerror(errno));</a>
+<a name="ln1444">		return;</a>
+<a name="ln1445">	}</a>
+<a name="ln1446"> </a>
+<a name="ln1447">	write(fd, buffer, bufferSize);</a>
+<a name="ln1448">	close(fd);</a>
+<a name="ln1449">}</a>
+<a name="ln1450"> </a>
+<a name="ln1451">static status_t</a>
+<a name="ln1452">syslog_init(struct kernel_args* args)</a>
+<a name="ln1453">{</a>
+<a name="ln1454">	if (!args-&gt;keep_debug_output_buffer || args-&gt;debug_output == NULL)</a>
+<a name="ln1455">		return B_OK;</a>
+<a name="ln1456"> </a>
+<a name="ln1457">	sSyslogBuffer = create_ring_buffer_etc(args-&gt;debug_output, args-&gt;debug_size,</a>
+<a name="ln1458">		RING_BUFFER_INIT_FROM_BUFFER);</a>
+<a name="ln1459">	sDebugSyslog = true;</a>
+<a name="ln1460"> </a>
+<a name="ln1461">	return B_OK;</a>
+<a name="ln1462">}</a>
+<a name="ln1463"> </a>
+<a name="ln1464"> </a>
+<a name="ln1465">static void</a>
+<a name="ln1466">debug_memcpy_trampoline(void* _parameters)</a>
+<a name="ln1467">{</a>
+<a name="ln1468">	debug_memcpy_parameters* parameters = (debug_memcpy_parameters*)_parameters;</a>
+<a name="ln1469">	memcpy(parameters-&gt;to, parameters-&gt;from, parameters-&gt;size);</a>
+<a name="ln1470">}</a>
+<a name="ln1471"> </a>
+<a name="ln1472"> </a>
+<a name="ln1473">static void</a>
+<a name="ln1474">debug_strlcpy_trampoline(void* _parameters)</a>
+<a name="ln1475">{</a>
+<a name="ln1476">	debug_strlcpy_parameters* parameters</a>
+<a name="ln1477">		= (debug_strlcpy_parameters*)_parameters;</a>
+<a name="ln1478">	parameters-&gt;result = strlcpy(parameters-&gt;to, parameters-&gt;from,</a>
+<a name="ln1479">		parameters-&gt;size);</a>
+<a name="ln1480">}</a>
+<a name="ln1481"> </a>
+<a name="ln1482"> </a>
+<a name="ln1483">void</a>
+<a name="ln1484">call_modules_hook(bool enter)</a>
+<a name="ln1485">{</a>
+<a name="ln1486">	uint32 index = 0;</a>
+<a name="ln1487">	while (index &lt; kMaxDebuggerModules &amp;&amp; sDebuggerModules[index] != NULL) {</a>
+<a name="ln1488">		debugger_module_info* module = sDebuggerModules[index];</a>
+<a name="ln1489"> </a>
+<a name="ln1490">		if (enter &amp;&amp; module-&gt;enter_debugger != NULL)</a>
+<a name="ln1491">			module-&gt;enter_debugger();</a>
+<a name="ln1492">		else if (!enter &amp;&amp; module-&gt;exit_debugger != NULL)</a>
+<a name="ln1493">			module-&gt;exit_debugger();</a>
+<a name="ln1494"> </a>
+<a name="ln1495">		index++;</a>
+<a name="ln1496">	}</a>
+<a name="ln1497">}</a>
+<a name="ln1498"> </a>
+<a name="ln1499"> </a>
+<a name="ln1500">//!	Must be called with the sSpinlock held.</a>
+<a name="ln1501">static void</a>
+<a name="ln1502">debug_output(const char* string, int32 length, bool notifySyslog)</a>
+<a name="ln1503">{</a>
+<a name="ln1504">	if (length &gt;= OUTPUT_BUFFER_SIZE)</a>
+<a name="ln1505">		length = OUTPUT_BUFFER_SIZE - 1;</a>
+<a name="ln1506"> </a>
+<a name="ln1507">	if (length &gt; 1 &amp;&amp; string[length - 1] == '\n'</a>
+<a name="ln1508">		&amp;&amp; strncmp(string, sLastOutputBuffer, length) == 0) {</a>
+<a name="ln1509">		sMessageRepeatCount++;</a>
+<a name="ln1510">		sMessageRepeatLastTime = system_time();</a>
+<a name="ln1511">		if (sMessageRepeatFirstTime == 0)</a>
+<a name="ln1512">			sMessageRepeatFirstTime = sMessageRepeatLastTime;</a>
+<a name="ln1513">	} else {</a>
+<a name="ln1514">		flush_pending_repeats(notifySyslog);</a>
+<a name="ln1515"> </a>
+<a name="ln1516">		if (sSerialDebugEnabled)</a>
+<a name="ln1517">			arch_debug_serial_puts(string);</a>
+<a name="ln1518">		if (sSyslogOutputEnabled)</a>
+<a name="ln1519">			syslog_write(string, length, notifySyslog);</a>
+<a name="ln1520">		if (sBlueScreenEnabled || sDebugScreenEnabled)</a>
+<a name="ln1521">			blue_screen_puts(string);</a>
+<a name="ln1522">		if (sSerialDebugEnabled) {</a>
+<a name="ln1523">			for (uint32 i = 0; i &lt; kMaxDebuggerModules; i++) {</a>
+<a name="ln1524">				if (sDebuggerModules[i] &amp;&amp; sDebuggerModules[i]-&gt;debugger_puts)</a>
+<a name="ln1525">					sDebuggerModules[i]-&gt;debugger_puts(string, length);</a>
+<a name="ln1526">			}</a>
+<a name="ln1527">		}</a>
+<a name="ln1528"> </a>
+<a name="ln1529">		memcpy(sLastOutputBuffer, string, length);</a>
+<a name="ln1530">		sLastOutputBuffer[length] = 0;</a>
+<a name="ln1531">	}</a>
+<a name="ln1532">}</a>
+<a name="ln1533"> </a>
+<a name="ln1534"> </a>
+<a name="ln1535">//!	Must be called with the sSpinlock held.</a>
+<a name="ln1536">static void</a>
+<a name="ln1537">flush_pending_repeats(bool notifySyslog)</a>
+<a name="ln1538">{</a>
+<a name="ln1539">	if (sMessageRepeatCount &lt;= 0)</a>
+<a name="ln1540">		return;</a>
+<a name="ln1541"> </a>
+<a name="ln1542">	if (sMessageRepeatCount &gt; 1) {</a>
+<a name="ln1543">		static char temp[40];</a>
+<a name="ln1544">		size_t length = snprintf(temp, sizeof(temp),</a>
+<a name="ln1545">			&quot;Last message repeated %&quot; B_PRId32 &quot; times.\n&quot;, sMessageRepeatCount);</a>
+<a name="ln1546">		length = std::min(length, sizeof(temp) - 1);</a>
+<a name="ln1547"> </a>
+<a name="ln1548">		if (sSerialDebugEnabled)</a>
+<a name="ln1549">			arch_debug_serial_puts(temp);</a>
+<a name="ln1550">		if (sSyslogOutputEnabled)</a>
+<a name="ln1551">			syslog_write(temp, length, notifySyslog);</a>
+<a name="ln1552">		if (sBlueScreenEnabled || sDebugScreenEnabled)</a>
+<a name="ln1553">			blue_screen_puts(temp);</a>
+<a name="ln1554">		if (sSerialDebugEnabled) {</a>
+<a name="ln1555">			for (uint32 i = 0; i &lt; kMaxDebuggerModules; i++) {</a>
+<a name="ln1556">				if (sDebuggerModules[i] &amp;&amp; sDebuggerModules[i]-&gt;debugger_puts)</a>
+<a name="ln1557">					sDebuggerModules[i]-&gt;debugger_puts(temp, length);</a>
+<a name="ln1558">			}</a>
+<a name="ln1559">		}</a>
+<a name="ln1560">	} else {</a>
+<a name="ln1561">		// if we only have one repeat just reprint the last buffer</a>
+<a name="ln1562">		size_t length = strlen(sLastOutputBuffer);</a>
+<a name="ln1563"> </a>
+<a name="ln1564">		if (sSerialDebugEnabled)</a>
+<a name="ln1565">			arch_debug_serial_puts(sLastOutputBuffer);</a>
+<a name="ln1566">		if (sSyslogOutputEnabled)</a>
+<a name="ln1567">			syslog_write(sLastOutputBuffer, length, notifySyslog);</a>
+<a name="ln1568">		if (sBlueScreenEnabled || sDebugScreenEnabled)</a>
+<a name="ln1569">			blue_screen_puts(sLastOutputBuffer);</a>
+<a name="ln1570">		if (sSerialDebugEnabled) {</a>
+<a name="ln1571">			for (uint32 i = 0; i &lt; kMaxDebuggerModules; i++) {</a>
+<a name="ln1572">				if (sDebuggerModules[i] &amp;&amp; sDebuggerModules[i]-&gt;debugger_puts) {</a>
+<a name="ln1573">					sDebuggerModules[i]-&gt;debugger_puts(sLastOutputBuffer,</a>
+<a name="ln1574">						length);</a>
+<a name="ln1575">				}</a>
+<a name="ln1576">			}</a>
+<a name="ln1577">		}</a>
+<a name="ln1578">	}</a>
+<a name="ln1579"> </a>
+<a name="ln1580">	sMessageRepeatFirstTime = 0;</a>
+<a name="ln1581">	sMessageRepeatCount = 0;</a>
+<a name="ln1582">}</a>
+<a name="ln1583"> </a>
+<a name="ln1584"> </a>
+<a name="ln1585">static void</a>
+<a name="ln1586">check_pending_repeats(void* /*data*/, int /*iteration*/)</a>
+<a name="ln1587">{</a>
+<a name="ln1588">	if (sMessageRepeatCount &gt; 0</a>
+<a name="ln1589">		&amp;&amp; (system_time() - sMessageRepeatLastTime &gt; 1000000</a>
+<a name="ln1590">			|| system_time() - sMessageRepeatFirstTime &gt; 3000000)) {</a>
+<a name="ln1591">		cpu_status state = disable_interrupts();</a>
+<a name="ln1592">		acquire_spinlock(&amp;sSpinlock);</a>
+<a name="ln1593"> </a>
+<a name="ln1594">		flush_pending_repeats(true);</a>
+<a name="ln1595"> </a>
+<a name="ln1596">		release_spinlock(&amp;sSpinlock);</a>
+<a name="ln1597">		restore_interrupts(state);</a>
+<a name="ln1598">	}</a>
+<a name="ln1599">}</a>
+<a name="ln1600"> </a>
+<a name="ln1601"> </a>
+<a name="ln1602">static void</a>
+<a name="ln1603">dprintf_args(const char* format, va_list args, bool notifySyslog)</a>
+<a name="ln1604">{</a>
+<a name="ln1605">	if (are_interrupts_enabled()) {</a>
+<a name="ln1606">		MutexLocker locker(sOutputLock);</a>
+<a name="ln1607"> </a>
+<a name="ln1608">		int32 length = vsnprintf(sOutputBuffer, OUTPUT_BUFFER_SIZE, format,</a>
+<a name="ln1609">			args);</a>
+<a name="ln1610">		length = std::min(length, (int32)OUTPUT_BUFFER_SIZE - 1);</a>
+<a name="ln1611"> </a>
+<a name="ln1612">		InterruptsSpinLocker _(sSpinlock);</a>
+<a name="ln1613">		debug_output(sOutputBuffer, length, notifySyslog);</a>
+<a name="ln1614">	} else {</a>
+<a name="ln1615">		InterruptsSpinLocker _(sSpinlock);</a>
+<a name="ln1616"> </a>
+<a name="ln1617">		int32 length = vsnprintf(sInterruptOutputBuffer, OUTPUT_BUFFER_SIZE,</a>
+<a name="ln1618">			format, args);</a>
+<a name="ln1619">		length = std::min(length, (int32)OUTPUT_BUFFER_SIZE - 1);</a>
+<a name="ln1620"> </a>
+<a name="ln1621">		debug_output(sInterruptOutputBuffer, length, notifySyslog);</a>
+<a name="ln1622">	}</a>
+<a name="ln1623">}</a>
+<a name="ln1624"> </a>
+<a name="ln1625"> </a>
+<a name="ln1626">// #pragma mark - private kernel API</a>
+<a name="ln1627"> </a>
+<a name="ln1628"> </a>
+<a name="ln1629">bool</a>
+<a name="ln1630">debug_screen_output_enabled(void)</a>
+<a name="ln1631">{</a>
+<a name="ln1632">	return sDebugScreenEnabled;</a>
+<a name="ln1633">}</a>
+<a name="ln1634"> </a>
+<a name="ln1635"> </a>
+<a name="ln1636">void</a>
+<a name="ln1637">debug_stop_screen_debug_output(void)</a>
+<a name="ln1638">{</a>
+<a name="ln1639">	sDebugScreenEnabled = false;</a>
+<a name="ln1640">}</a>
+<a name="ln1641"> </a>
+<a name="ln1642"> </a>
+<a name="ln1643">bool</a>
+<a name="ln1644">debug_debugger_running(void)</a>
+<a name="ln1645">{</a>
+<a name="ln1646">	return sDebuggerOnCPU != -1;</a>
+<a name="ln1647">}</a>
+<a name="ln1648"> </a>
+<a name="ln1649"> </a>
+<a name="ln1650">void</a>
+<a name="ln1651">debug_puts(const char* string, int32 length)</a>
+<a name="ln1652">{</a>
+<a name="ln1653">	InterruptsSpinLocker _(sSpinlock);</a>
+<a name="ln1654">	debug_output(string, length, true);</a>
+<a name="ln1655">}</a>
+<a name="ln1656"> </a>
+<a name="ln1657"> </a>
+<a name="ln1658">void</a>
+<a name="ln1659">debug_early_boot_message(const char* string)</a>
+<a name="ln1660">{</a>
+<a name="ln1661">	arch_debug_serial_early_boot_message(string);</a>
+<a name="ln1662">}</a>
+<a name="ln1663"> </a>
+<a name="ln1664"> </a>
+<a name="ln1665">void</a>
+<a name="ln1666">debug_init(kernel_args* args)</a>
+<a name="ln1667">{</a>
+<a name="ln1668">	new(&amp;gDefaultDebugOutputFilter) DefaultDebugOutputFilter;</a>
+<a name="ln1669"> </a>
+<a name="ln1670">	syslog_init(args);</a>
+<a name="ln1671"> </a>
+<a name="ln1672">	debug_paranoia_init();</a>
+<a name="ln1673">	arch_debug_console_init(args);</a>
+<a name="ln1674">}</a>
+<a name="ln1675"> </a>
+<a name="ln1676"> </a>
+<a name="ln1677">void</a>
+<a name="ln1678">debug_init_post_vm(kernel_args* args)</a>
+<a name="ln1679">{</a>
+<a name="ln1680">	add_debugger_command_etc(&quot;cpu&quot;, &amp;cmd_switch_cpu,</a>
+<a name="ln1681">		&quot;Switches to another CPU.&quot;,</a>
+<a name="ln1682">		&quot;&lt;cpu&gt;\n&quot;</a>
+<a name="ln1683">		&quot;Switches to CPU with the index &lt;cpu&gt;.\n&quot;, 0);</a>
+<a name="ln1684">	add_debugger_command_etc(&quot;message&quot;, &amp;cmd_dump_kdl_message,</a>
+<a name="ln1685">		&quot;Reprint the message printed when entering KDL&quot;,</a>
+<a name="ln1686">		&quot;\n&quot;</a>
+<a name="ln1687">		&quot;Reprints the message printed when entering KDL.\n&quot;, 0);</a>
+<a name="ln1688">	add_debugger_command_etc(&quot;panic_commands&quot;, &amp;cmd_execute_panic_commands,</a>
+<a name="ln1689">		&quot;Execute commands associated with the panic() that caused &quot;</a>
+<a name="ln1690">			&quot;entering KDL&quot;,</a>
+<a name="ln1691">		&quot;\n&quot;</a>
+<a name="ln1692">		&quot;Executes the commands associated with the panic() that caused &quot;</a>
+<a name="ln1693">			&quot;entering KDL.\n&quot;, 0);</a>
+<a name="ln1694"> </a>
+<a name="ln1695">	debug_builtin_commands_init();</a>
+<a name="ln1696">	arch_debug_init(args);</a>
+<a name="ln1697"> </a>
+<a name="ln1698">	debug_heap_init();</a>
+<a name="ln1699">	debug_variables_init();</a>
+<a name="ln1700">	frame_buffer_console_init(args);</a>
+<a name="ln1701">	tracing_init();</a>
+<a name="ln1702">}</a>
+<a name="ln1703"> </a>
+<a name="ln1704"> </a>
+<a name="ln1705">void</a>
+<a name="ln1706">debug_init_post_settings(struct kernel_args* args)</a>
+<a name="ln1707">{</a>
+<a name="ln1708">	// get debug settings</a>
+<a name="ln1709"> </a>
+<a name="ln1710">	sSerialDebugEnabled = get_safemode_boolean(&quot;serial_debug_output&quot;,</a>
+<a name="ln1711">		sSerialDebugEnabled);</a>
+<a name="ln1712">	sSyslogOutputEnabled = get_safemode_boolean(&quot;syslog_debug_output&quot;,</a>
+<a name="ln1713">		sSyslogOutputEnabled);</a>
+<a name="ln1714">	sBlueScreenOutput = get_safemode_boolean(&quot;bluescreen&quot;, true);</a>
+<a name="ln1715">	sEmergencyKeysEnabled = get_safemode_boolean(&quot;emergency_keys&quot;,</a>
+<a name="ln1716">		sEmergencyKeysEnabled);</a>
+<a name="ln1717">	sDebugScreenEnabled = get_safemode_boolean(&quot;debug_screen&quot;, false);</a>
+<a name="ln1718"> </a>
+<a name="ln1719">	if ((sBlueScreenOutput || sDebugScreenEnabled)</a>
+<a name="ln1720">		&amp;&amp; blue_screen_init() != B_OK)</a>
+<a name="ln1721">		sBlueScreenOutput = sDebugScreenEnabled = false;</a>
+<a name="ln1722"> </a>
+<a name="ln1723">	if (sDebugScreenEnabled)</a>
+<a name="ln1724">		blue_screen_enter(true);</a>
+<a name="ln1725"> </a>
+<a name="ln1726">	arch_debug_console_init_settings(args);</a>
+<a name="ln1727">	syslog_init_post_vm(args);</a>
+<a name="ln1728">}</a>
+<a name="ln1729"> </a>
+<a name="ln1730"> </a>
+<a name="ln1731">void</a>
+<a name="ln1732">debug_init_post_modules(struct kernel_args* args)</a>
+<a name="ln1733">{</a>
+<a name="ln1734">	syslog_init_post_modules();</a>
+<a name="ln1735"> </a>
+<a name="ln1736">	// check for dupped lines every 10/10 second</a>
+<a name="ln1737">	register_kernel_daemon(check_pending_repeats, NULL, 10);</a>
+<a name="ln1738"> </a>
+<a name="ln1739">	syslog_init_post_threads();</a>
+<a name="ln1740"> </a>
+<a name="ln1741">	// load kernel debugger addons</a>
+<a name="ln1742"> </a>
+<a name="ln1743">	static const char* kDemanglePrefix = &quot;debugger/demangle/&quot;;</a>
+<a name="ln1744"> </a>
+<a name="ln1745">	void* cookie = open_module_list(&quot;debugger&quot;);</a>
+<a name="ln1746">	uint32 count = 0;</a>
+<a name="ln1747">	while (count &lt; kMaxDebuggerModules) {</a>
+<a name="ln1748">		char name[B_FILE_NAME_LENGTH];</a>
+<a name="ln1749">		size_t nameLength = sizeof(name);</a>
+<a name="ln1750"> </a>
+<a name="ln1751">		if (read_next_module_name(cookie, name, &amp;nameLength) != B_OK)</a>
+<a name="ln1752">			break;</a>
+<a name="ln1753"> </a>
+<a name="ln1754">		// get demangle module, if any</a>
+<a name="ln1755">		if (!strncmp(name, kDemanglePrefix, strlen(kDemanglePrefix))) {</a>
+<a name="ln1756">			if (sDemangleModule == NULL)</a>
+<a name="ln1757">				get_module(name, (module_info**)&amp;sDemangleModule);</a>
+<a name="ln1758">			continue;</a>
+<a name="ln1759">		}</a>
+<a name="ln1760"> </a>
+<a name="ln1761">		if (get_module(name, (module_info**)&amp;sDebuggerModules[count]) == B_OK) {</a>
+<a name="ln1762">			dprintf(&quot;kernel debugger extension \&quot;%s\&quot;: loaded\n&quot;, name);</a>
+<a name="ln1763">			count++;</a>
+<a name="ln1764">		} else</a>
+<a name="ln1765">			dprintf(&quot;kernel debugger extension \&quot;%s\&quot;: failed to load\n&quot;, name);</a>
+<a name="ln1766">	}</a>
+<a name="ln1767">	close_module_list(cookie);</a>
+<a name="ln1768"> </a>
+<a name="ln1769">	frame_buffer_console_init_post_modules(args);</a>
+<a name="ln1770">}</a>
+<a name="ln1771"> </a>
+<a name="ln1772"> </a>
+<a name="ln1773">void</a>
+<a name="ln1774">debug_set_page_fault_info(addr_t faultAddress, addr_t pc, uint32 flags)</a>
+<a name="ln1775">{</a>
+<a name="ln1776">	sPageFaultInfo.fault_address = faultAddress;</a>
+<a name="ln1777">	sPageFaultInfo.pc = pc;</a>
+<a name="ln1778">	sPageFaultInfo.flags = flags;</a>
+<a name="ln1779">}</a>
+<a name="ln1780"> </a>
+<a name="ln1781"> </a>
+<a name="ln1782">debug_page_fault_info*</a>
+<a name="ln1783">debug_get_page_fault_info()</a>
+<a name="ln1784">{</a>
+<a name="ln1785">	return &amp;sPageFaultInfo;</a>
+<a name="ln1786">}</a>
+<a name="ln1787"> </a>
+<a name="ln1788"> </a>
+<a name="ln1789">void</a>
+<a name="ln1790">debug_trap_cpu_in_kdl(int32 cpu, bool returnIfHandedOver)</a>
+<a name="ln1791">{</a>
+<a name="ln1792">	InterruptsLocker locker;</a>
+<a name="ln1793"> </a>
+<a name="ln1794">	// return, if we've been called recursively (we call</a>
+<a name="ln1795">	// smp_intercpu_int_handler() below)</a>
+<a name="ln1796">	if (sCPUTrapped[cpu])</a>
+<a name="ln1797">		return;</a>
+<a name="ln1798"> </a>
+<a name="ln1799">	arch_debug_save_registers(&amp;sDebugRegisters[cpu]);</a>
+<a name="ln1800"> </a>
+<a name="ln1801">	sCPUTrapped[cpu] = true;</a>
+<a name="ln1802"> </a>
+<a name="ln1803">	while (sInDebugger != 0) {</a>
+<a name="ln1804">		if (sHandOverKDL &amp;&amp; sHandOverKDLToCPU == cpu) {</a>
+<a name="ln1805">			if (returnIfHandedOver)</a>
+<a name="ln1806">				break;</a>
+<a name="ln1807"> </a>
+<a name="ln1808">			kernel_debugger_internal(NULL, NULL,</a>
+<a name="ln1809">				sCurrentKernelDebuggerMessageArgs, cpu);</a>
+<a name="ln1810">		} else</a>
+<a name="ln1811">			smp_intercpu_int_handler(cpu);</a>
+<a name="ln1812">	}</a>
+<a name="ln1813"> </a>
+<a name="ln1814">	sCPUTrapped[cpu] = false;</a>
+<a name="ln1815">}</a>
+<a name="ln1816"> </a>
+<a name="ln1817"> </a>
+<a name="ln1818">void</a>
+<a name="ln1819">debug_double_fault(int32 cpu)</a>
+<a name="ln1820">{</a>
+<a name="ln1821">	kernel_debugger_internal(&quot;Double Fault!&quot;, NULL,</a>
+<a name="ln1822">		sCurrentKernelDebuggerMessageArgs, cpu);</a>
+<a name="ln1823">}</a>
+<a name="ln1824"> </a>
+<a name="ln1825"> </a>
+<a name="ln1826">bool</a>
+<a name="ln1827">debug_emergency_key_pressed(char key)</a>
+<a name="ln1828">{</a>
+<a name="ln1829">	if (!sEmergencyKeysEnabled)</a>
+<a name="ln1830">		return false;</a>
+<a name="ln1831"> </a>
+<a name="ln1832">	if (key == 'd') {</a>
+<a name="ln1833">		kernel_debugger(&quot;Keyboard Requested Halt.&quot;);</a>
+<a name="ln1834">		return true;</a>
+<a name="ln1835">	}</a>
+<a name="ln1836"> </a>
+<a name="ln1837">	// Broadcast to the kernel debugger modules</a>
+<a name="ln1838"> </a>
+<a name="ln1839">	for (uint32 i = 0; i &lt; kMaxDebuggerModules; i++) {</a>
+<a name="ln1840">		if (sDebuggerModules[i] &amp;&amp; sDebuggerModules[i]-&gt;emergency_key_pressed) {</a>
+<a name="ln1841">			if (sDebuggerModules[i]-&gt;emergency_key_pressed(key))</a>
+<a name="ln1842">				return true;</a>
+<a name="ln1843">		}</a>
+<a name="ln1844">	}</a>
+<a name="ln1845"> </a>
+<a name="ln1846">	return false;</a>
+<a name="ln1847">}</a>
+<a name="ln1848"> </a>
+<a name="ln1849"> </a>
+<a name="ln1850">/*!	Verifies that the complete given memory range is accessible in the current</a>
+<a name="ln1851">	context.</a>
+<a name="ln1852"> </a>
+<a name="ln1853">	Invoked in the kernel debugger only.</a>
+<a name="ln1854"> </a>
+<a name="ln1855">	\param address The start address of the memory range to be checked.</a>
+<a name="ln1856">	\param size The size of the memory range to be checked.</a>
+<a name="ln1857">	\param protection The area protection for which to check. Valid is a bitwise</a>
+<a name="ln1858">		or of one or more of \c B_KERNEL_READ_AREA or \c B_KERNEL_WRITE_AREA.</a>
+<a name="ln1859">	\return \c true, if the complete memory range can be accessed in all ways</a>
+<a name="ln1860">		specified by \a protection, \c false otherwise.</a>
+<a name="ln1861">*/</a>
+<a name="ln1862">bool</a>
+<a name="ln1863">debug_is_kernel_memory_accessible(addr_t address, size_t size,</a>
+<a name="ln1864">	uint32 protection)</a>
+<a name="ln1865">{</a>
+<a name="ln1866">	addr_t endAddress = ROUNDUP(address + size, B_PAGE_SIZE);</a>
+<a name="ln1867">	address = ROUNDDOWN(address, B_PAGE_SIZE);</a>
+<a name="ln1868"> </a>
+<a name="ln1869">	if (!IS_KERNEL_ADDRESS(address) || endAddress &lt; address)</a>
+<a name="ln1870">		return false;</a>
+<a name="ln1871"> </a>
+<a name="ln1872">	for (; address &lt; endAddress; address += B_PAGE_SIZE) {</a>
+<a name="ln1873">		if (!arch_vm_translation_map_is_kernel_page_accessible(address,</a>
+<a name="ln1874">				protection)) {</a>
+<a name="ln1875">			return false;</a>
+<a name="ln1876">		}</a>
+<a name="ln1877">	}</a>
+<a name="ln1878"> </a>
+<a name="ln1879">	return true;</a>
+<a name="ln1880">}</a>
+<a name="ln1881"> </a>
+<a name="ln1882"> </a>
+<a name="ln1883">/*!	Calls a function in a setjmp() + fault handler context.</a>
+<a name="ln1884">	May only be used in the kernel debugger.</a>
+<a name="ln1885"> </a>
+<a name="ln1886">	\param jumpBuffer Buffer to be used for setjmp()/longjmp().</a>
+<a name="ln1887">	\param function The function to be called.</a>
+<a name="ln1888">	\param parameter The parameter to be passed to the function to be called.</a>
+<a name="ln1889">	\return</a>
+<a name="ln1890">		- \c 0, when the function executed without causing a page fault or</a>
+<a name="ln1891">		  calling longjmp().</a>
+<a name="ln1892">		- \c 1, when the function caused a page fault.</a>
+<a name="ln1893">		- Any other value the function passes to longjmp().</a>
+<a name="ln1894">*/</a>
+<a name="ln1895">int</a>
+<a name="ln1896">debug_call_with_fault_handler(jmp_buf jumpBuffer, void (*function)(void*),</a>
+<a name="ln1897">	void* parameter)</a>
+<a name="ln1898">{</a>
+<a name="ln1899">	// save current fault handler</a>
+<a name="ln1900">	cpu_ent* cpu = gCPU + sDebuggerOnCPU;</a>
+<a name="ln1901">	addr_t oldFaultHandler = cpu-&gt;fault_handler;</a>
+<a name="ln1902">	addr_t oldFaultHandlerStackPointer = cpu-&gt;fault_handler_stack_pointer;</a>
+<a name="ln1903"> </a>
+<a name="ln1904">	int result = setjmp(jumpBuffer);</a>
+<a name="ln1905">	if (result == 0) {</a>
+<a name="ln1906">		arch_debug_call_with_fault_handler(cpu, jumpBuffer, function,</a>
+<a name="ln1907">			parameter);</a>
+<a name="ln1908">	}</a>
+<a name="ln1909"> </a>
+<a name="ln1910">	// restore old fault handler</a>
+<a name="ln1911">	cpu-&gt;fault_handler = oldFaultHandler;</a>
+<a name="ln1912">	cpu-&gt;fault_handler_stack_pointer = oldFaultHandlerStackPointer;</a>
+<a name="ln1913"> </a>
+<a name="ln1914">	return result;</a>
+<a name="ln1915">}</a>
+<a name="ln1916"> </a>
+<a name="ln1917"> </a>
+<a name="ln1918">/*!	Similar to user_memcpy(), but can only be invoked from within the kernel</a>
+<a name="ln1919">	debugger (and must not be used outside).</a>
+<a name="ln1920">	The supplied \a teamID specifies the address space in which to interpret</a>
+<a name="ln1921">	the addresses. It can be \c B_CURRENT_TEAM for debug_get_debugged_thread(),</a>
+<a name="ln1922">	or any valid team ID. If the addresses are both kernel addresses, the</a>
+<a name="ln1923">	argument is ignored and the current address space is used.</a>
+<a name="ln1924">*/</a>
+<a name="ln1925">status_t</a>
+<a name="ln1926">debug_memcpy(team_id teamID, void* to, const void* from, size_t size)</a>
+<a name="ln1927">{</a>
+<a name="ln1928">	// don't allow address overflows</a>
+<a name="ln1929">	if ((addr_t)from + size &lt; (addr_t)from || (addr_t)to + size &lt; (addr_t)to)</a>
+<a name="ln1930">		return B_BAD_ADDRESS;</a>
+<a name="ln1931"> </a>
+<a name="ln1932">	// Try standard memcpy() with fault handler, if the addresses can be</a>
+<a name="ln1933">	// interpreted in the current address space.</a>
+<a name="ln1934">	if ((IS_KERNEL_ADDRESS(from) &amp;&amp; IS_KERNEL_ADDRESS(to))</a>
+<a name="ln1935">			|| debug_is_debugged_team(teamID)) {</a>
+<a name="ln1936">		debug_memcpy_parameters parameters = {to, from, size};</a>
+<a name="ln1937"> </a>
+<a name="ln1938">		if (debug_call_with_fault_handler(gCPU[sDebuggerOnCPU].fault_jump_buffer,</a>
+<a name="ln1939">				&amp;debug_memcpy_trampoline, &amp;parameters) == 0) {</a>
+<a name="ln1940">			return B_OK;</a>
+<a name="ln1941">		}</a>
+<a name="ln1942">	}</a>
+<a name="ln1943"> </a>
+<a name="ln1944">	// Try harder. The pages of the respective memory could be unmapped but</a>
+<a name="ln1945">	// still exist in a cache (the page daemon does that with inactive pages).</a>
+<a name="ln1946">	while (size &gt; 0) {</a>
+<a name="ln1947">		uint8 buffer[32];</a>
+<a name="ln1948">		size_t toCopy = std::min(size, sizeof(buffer));</a>
+<a name="ln1949"> </a>
+<a name="ln1950">		// restrict the size so we don't cross page boundaries</a>
+<a name="ln1951">		if (((addr_t)from + toCopy) % B_PAGE_SIZE &lt; toCopy)</a>
+<a name="ln1952">			toCopy -= ((addr_t)from + toCopy) % B_PAGE_SIZE;</a>
+<a name="ln1953">		if (((addr_t)to + toCopy) % B_PAGE_SIZE &lt; toCopy)</a>
+<a name="ln1954">			toCopy -= ((addr_t)to + toCopy) % B_PAGE_SIZE;</a>
+<a name="ln1955"> </a>
+<a name="ln1956">		if (vm_debug_copy_page_memory(teamID, (void*)from, buffer, toCopy,</a>
+<a name="ln1957">				false) != B_OK</a>
+<a name="ln1958">			|| vm_debug_copy_page_memory(teamID, to, buffer, toCopy, true)</a>
+<a name="ln1959">				!= B_OK) {</a>
+<a name="ln1960">			return B_BAD_ADDRESS;</a>
+<a name="ln1961">		}</a>
+<a name="ln1962"> </a>
+<a name="ln1963">		from = (const uint8*)from + toCopy;</a>
+<a name="ln1964">		to = (uint8*)to + toCopy;</a>
+<a name="ln1965">		size -= toCopy;</a>
+<a name="ln1966">	}</a>
+<a name="ln1967"> </a>
+<a name="ln1968">	return B_OK;</a>
+<a name="ln1969">}</a>
+<a name="ln1970"> </a>
+<a name="ln1971"> </a>
+<a name="ln1972">/*!	Similar to user_strlcpy(), but can only be invoked from within the kernel</a>
+<a name="ln1973">	debugger (and must not be used outside).</a>
+<a name="ln1974">	The supplied \a teamID specifies the address space in which to interpret</a>
+<a name="ln1975">	the addresses. It can be \c B_CURRENT_TEAM for debug_get_debugged_thread(),</a>
+<a name="ln1976">	or any valid team ID. If the addresses are both kernel addresses, the</a>
+<a name="ln1977">	argument is ignored and the current address space is used.</a>
+<a name="ln1978">*/</a>
+<a name="ln1979">ssize_t</a>
+<a name="ln1980">debug_strlcpy(team_id teamID, char* to, const char* from, size_t size)</a>
+<a name="ln1981">{</a>
+<a name="ln1982">	if (from == NULL || (to == NULL &amp;&amp; size &gt; 0))</a>
+<a name="ln1983">		return B_BAD_ADDRESS;</a>
+<a name="ln1984"> </a>
+<a name="ln1985">	// limit size to avoid address overflows</a>
+<a name="ln1986">	size_t maxSize = std::min((addr_t)size,</a>
+<a name="ln1987">		~(addr_t)0 - std::max((addr_t)from, (addr_t)to) + 1);</a>
+<a name="ln1988">		// NOTE: Since strlcpy() determines the length of \a from, the source</a>
+<a name="ln1989">		// address might still overflow.</a>
+<a name="ln1990"> </a>
+<a name="ln1991">	// Try standard strlcpy() with fault handler, if the addresses can be</a>
+<a name="ln1992">	// interpreted in the current address space.</a>
+<a name="ln1993">	if ((IS_KERNEL_ADDRESS(from) &amp;&amp; IS_KERNEL_ADDRESS(to))</a>
+<a name="ln1994">			|| debug_is_debugged_team(teamID)) {</a>
+<a name="ln1995">		debug_strlcpy_parameters parameters = {to, from, maxSize};</a>
+<a name="ln1996"> </a>
+<a name="ln1997">		if (debug_call_with_fault_handler(</a>
+<a name="ln1998">				gCPU[sDebuggerOnCPU].fault_jump_buffer,</a>
+<a name="ln1999">				&amp;debug_strlcpy_trampoline, &amp;parameters) == 0) {</a>
+<a name="ln2000">			// If we hit the address overflow boundary, fail.</a>
+<a name="ln2001">			if (parameters.result &gt;= maxSize &amp;&amp; maxSize &lt; size)</a>
+<a name="ln2002">				return B_BAD_ADDRESS;</a>
+<a name="ln2003"> </a>
+<a name="ln2004">			return parameters.result;</a>
+<a name="ln2005">		}</a>
+<a name="ln2006">	}</a>
+<a name="ln2007"> </a>
+<a name="ln2008">	// Try harder. The pages of the respective memory could be unmapped but</a>
+<a name="ln2009">	// still exist in a cache (the page daemon does that with inactive pages).</a>
+<a name="ln2010">	size_t totalLength = 0;</a>
+<a name="ln2011">	while (maxSize &gt; 0) {</a>
+<a name="ln2012">		char buffer[32];</a>
+<a name="ln2013">		size_t toCopy = std::min(maxSize, sizeof(buffer));</a>
+<a name="ln2014"> </a>
+<a name="ln2015">		// restrict the size so we don't cross page boundaries</a>
+<a name="ln2016">		if (((addr_t)from + toCopy) % B_PAGE_SIZE &lt; toCopy)</a>
+<a name="ln2017">			toCopy -= ((addr_t)from + toCopy) % B_PAGE_SIZE;</a>
+<a name="ln2018">		if (((addr_t)to + toCopy) % B_PAGE_SIZE &lt; toCopy)</a>
+<a name="ln2019">			toCopy -= ((addr_t)to + toCopy) % B_PAGE_SIZE;</a>
+<a name="ln2020"> </a>
+<a name="ln2021">		// copy the next part of the string from the source</a>
+<a name="ln2022">		if (vm_debug_copy_page_memory(teamID, (void*)from, buffer, toCopy,</a>
+<a name="ln2023">				false) != B_OK) {</a>
+<a name="ln2024">			return B_BAD_ADDRESS;</a>
+<a name="ln2025">		}</a>
+<a name="ln2026"> </a>
+<a name="ln2027">		// determine the length of the part and whether we've reached the end</a>
+<a name="ln2028">		// of the string</a>
+<a name="ln2029">		size_t length = strnlen(buffer, toCopy);</a>
+<a name="ln2030">		bool endOfString = length &lt; toCopy;</a>
+<a name="ln2031"> </a>
+<a name="ln2032">		from = (const char*)from + toCopy;</a>
+<a name="ln2033">		totalLength += length;</a>
+<a name="ln2034">		maxSize -= length;</a>
+<a name="ln2035"> </a>
+<a name="ln2036">		if (endOfString) {</a>
+<a name="ln2037">			// only copy the actual string, including the terminating null</a>
+<a name="ln2038">			toCopy = length + 1;</a>
+<a name="ln2039">		}</a>
+<a name="ln2040"> </a>
+<a name="ln2041">		if (size &gt; 0) {</a>
+<a name="ln2042">			// We still have space left in the target buffer.</a>
+<a name="ln2043">			if (size &lt;= length) {</a>
+<a name="ln2044">				// Not enough space for the complete part. Null-terminate it and</a>
+<a name="ln2045">				// copy what we can.</a>
+<a name="ln2046">				buffer[size - 1] = '\0';</a>
+<a name="ln2047">				totalLength += length - size;</a>
+<a name="ln2048">				toCopy = size;</a>
+<a name="ln2049">			}</a>
+<a name="ln2050"> </a>
+<a name="ln2051">			if (vm_debug_copy_page_memory(teamID, to, buffer, toCopy, true)</a>
+<a name="ln2052">					!= B_OK) {</a>
+<a name="ln2053">				return B_BAD_ADDRESS;</a>
+<a name="ln2054">			}</a>
+<a name="ln2055"> </a>
+<a name="ln2056">			to = (char*)to + toCopy;</a>
+<a name="ln2057">			size -= toCopy;</a>
+<a name="ln2058">		}</a>
+<a name="ln2059"> </a>
+<a name="ln2060">		if (endOfString)</a>
+<a name="ln2061">			return totalLength;</a>
+<a name="ln2062">	}</a>
+<a name="ln2063"> </a>
+<a name="ln2064">	return totalLength;</a>
+<a name="ln2065">}</a>
+<a name="ln2066"> </a>
+<a name="ln2067"> </a>
+<a name="ln2068">// #pragma mark - public API</a>
+<a name="ln2069"> </a>
+<a name="ln2070"> </a>
+<a name="ln2071">uint64</a>
+<a name="ln2072">parse_expression(const char* expression)</a>
+<a name="ln2073">{</a>
+<a name="ln2074">	uint64 result;</a>
+<a name="ln2075">	return evaluate_debug_expression(expression, &amp;result, true) ? result : 0;</a>
+<a name="ln2076">}</a>
+<a name="ln2077"> </a>
+<a name="ln2078"> </a>
+<a name="ln2079">void</a>
+<a name="ln2080">panic(const char* format, ...)</a>
+<a name="ln2081">{</a>
+<a name="ln2082">	va_list args;</a>
+<a name="ln2083">	va_start(args, format);</a>
+<a name="ln2084"> </a>
+<a name="ln2085">	cpu_status state = disable_interrupts();</a>
+<a name="ln2086"> </a>
+<a name="ln2087">	kernel_debugger_internal(&quot;PANIC: &quot;, format, args,</a>
+<a name="ln2088">		thread_get_current_thread() ? smp_get_current_cpu() : 0);</a>
+<a name="ln2089"> </a>
+<a name="ln2090">	restore_interrupts(state);</a>
+<a name="ln2091"> </a>
+<a name="ln2092">	va_end(args);</a>
+<a name="ln2093">}</a>
+<a name="ln2094"> </a>
+<a name="ln2095"> </a>
+<a name="ln2096">void</a>
+<a name="ln2097">kernel_debugger(const char* message)</a>
+<a name="ln2098">{</a>
+<a name="ln2099">	cpu_status state = disable_interrupts();</a>
+<a name="ln2100"> </a>
+<a name="ln2101">	kernel_debugger_internal(message, NULL, sCurrentKernelDebuggerMessageArgs,</a>
+<a name="ln2102">		smp_get_current_cpu());</a>
+<a name="ln2103"> </a>
+<a name="ln2104">	restore_interrupts(state);</a>
+<a name="ln2105">}</a>
+<a name="ln2106"> </a>
+<a name="ln2107"> </a>
+<a name="ln2108">bool</a>
+<a name="ln2109">set_dprintf_enabled(bool newState)</a>
+<a name="ln2110">{</a>
+<a name="ln2111">	bool oldState = sSerialDebugEnabled;</a>
+<a name="ln2112">	sSerialDebugEnabled = newState;</a>
+<a name="ln2113"> </a>
+<a name="ln2114">	return oldState;</a>
+<a name="ln2115">}</a>
+<a name="ln2116"> </a>
+<a name="ln2117"> </a>
+<a name="ln2118">void</a>
+<a name="ln2119">dprintf(const char* format, ...)</a>
+<a name="ln2120">{</a>
+<a name="ln2121">	va_list args;</a>
+<a name="ln2122"> </a>
+<a name="ln2123">	if (!sSerialDebugEnabled &amp;&amp; !sSyslogOutputEnabled &amp;&amp; !sBlueScreenEnabled)</a>
+<a name="ln2124">		return;</a>
+<a name="ln2125"> </a>
+<a name="ln2126">	va_start(args, format);</a>
+<a name="ln2127">	dprintf_args(format, args, true);</a>
+<a name="ln2128">	va_end(args);</a>
+<a name="ln2129">}</a>
+<a name="ln2130"> </a>
+<a name="ln2131"> </a>
+<a name="ln2132">void</a>
+<a name="ln2133">dvprintf(const char* format, va_list args)</a>
+<a name="ln2134">{</a>
+<a name="ln2135">	if (!sSerialDebugEnabled &amp;&amp; !sSyslogOutputEnabled &amp;&amp; !sBlueScreenEnabled)</a>
+<a name="ln2136">		return;</a>
+<a name="ln2137"> </a>
+<a name="ln2138">	dprintf_args(format, args, true);</a>
+<a name="ln2139">}</a>
+<a name="ln2140"> </a>
+<a name="ln2141"> </a>
+<a name="ln2142">void</a>
+<a name="ln2143">dprintf_no_syslog(const char* format, ...)</a>
+<a name="ln2144">{</a>
+<a name="ln2145">	va_list args;</a>
+<a name="ln2146"> </a>
+<a name="ln2147">	if (!sSerialDebugEnabled &amp;&amp; !sBlueScreenEnabled)</a>
+<a name="ln2148">		return;</a>
+<a name="ln2149"> </a>
+<a name="ln2150">	va_start(args, format);</a>
+<a name="ln2151">	dprintf_args(format, args, false);</a>
+<a name="ln2152">	va_end(args);</a>
+<a name="ln2153">}</a>
+<a name="ln2154"> </a>
+<a name="ln2155"> </a>
+<a name="ln2156">/*!	Similar to dprintf() but thought to be used in the kernel</a>
+<a name="ln2157">	debugger only (it doesn't lock).</a>
+<a name="ln2158">*/</a>
+<a name="ln2159">void</a>
+<a name="ln2160">kprintf(const char* format, ...)</a>
+<a name="ln2161">{</a>
+<a name="ln2162">	if (sDebugOutputFilter != NULL) {</a>
+<a name="ln2163">		va_list args;</a>
+<a name="ln2164">		va_start(args, format);</a>
+<a name="ln2165">		sDebugOutputFilter-&gt;Print(format, args);</a>
+<a name="ln2166">		va_end(args);</a>
+<a name="ln2167">	}</a>
+<a name="ln2168">}</a>
+<a name="ln2169"> </a>
+<a name="ln2170"> </a>
+<a name="ln2171">void</a>
+<a name="ln2172">kprintf_unfiltered(const char* format, ...)</a>
+<a name="ln2173">{</a>
+<a name="ln2174">	va_list args;</a>
+<a name="ln2175">	va_start(args, format);</a>
+<a name="ln2176">	gDefaultDebugOutputFilter.Print(format, args);</a>
+<a name="ln2177">	va_end(args);</a>
+<a name="ln2178">}</a>
+<a name="ln2179"> </a>
+<a name="ln2180"> </a>
+<a name="ln2181">const char*</a>
+<a name="ln2182">debug_demangle_symbol(const char* symbol, char* buffer, size_t bufferSize,</a>
+<a name="ln2183">	bool* _isObjectMethod)</a>
+<a name="ln2184">{</a>
+<a name="ln2185">	if (sDemangleModule != NULL &amp;&amp; sDemangleModule-&gt;demangle_symbol != NULL) {</a>
+<a name="ln2186">		return sDemangleModule-&gt;demangle_symbol(symbol, buffer, bufferSize,</a>
+<a name="ln2187">			_isObjectMethod);</a>
+<a name="ln2188">	}</a>
+<a name="ln2189"> </a>
+<a name="ln2190">	if (_isObjectMethod != NULL)</a>
+<a name="ln2191">		*_isObjectMethod = false;</a>
+<a name="ln2192"> </a>
+<a name="ln2193">	return symbol;</a>
+<a name="ln2194">}</a>
+<a name="ln2195"> </a>
+<a name="ln2196"> </a>
+<a name="ln2197">status_t</a>
+<a name="ln2198">debug_get_next_demangled_argument(uint32* _cookie, const char* symbol,</a>
+<a name="ln2199">	char* name, size_t nameSize, int32* _type, size_t* _argumentLength)</a>
+<a name="ln2200">{</a>
+<a name="ln2201">	if (sDemangleModule != NULL &amp;&amp; sDemangleModule-&gt;get_next_argument != NULL) {</a>
+<a name="ln2202">		return sDemangleModule-&gt;get_next_argument(_cookie, symbol, name,</a>
+<a name="ln2203">			nameSize, _type, _argumentLength);</a>
+<a name="ln2204">	}</a>
+<a name="ln2205"> </a>
+<a name="ln2206">	return B_NOT_SUPPORTED;</a>
+<a name="ln2207">}</a>
+<a name="ln2208"> </a>
+<a name="ln2209"> </a>
+<a name="ln2210">struct arch_debug_registers*</a>
+<a name="ln2211">debug_get_debug_registers(int32 cpu)</a>
+<a name="ln2212">{</a>
+<a name="ln2213">	if (cpu &lt; 0 || cpu &gt; smp_get_num_cpus())</a>
+<a name="ln2214">		return NULL;</a>
+<a name="ln2215"> </a>
+<a name="ln2216">	return &amp;sDebugRegisters[cpu];</a>
+<a name="ln2217">}</a>
+<a name="ln2218"> </a>
+<a name="ln2219"> </a>
+<a name="ln2220">Thread*</a>
+<a name="ln2221">debug_set_debugged_thread(Thread* thread)</a>
+<a name="ln2222">{</a>
+<a name="ln2223">	Thread* previous = sDebuggedThread;</a>
+<a name="ln2224">	sDebuggedThread = thread;</a>
+<a name="ln2225">	return previous;</a>
+<a name="ln2226">}</a>
+<a name="ln2227"> </a>
+<a name="ln2228"> </a>
+<a name="ln2229">Thread*</a>
+<a name="ln2230">debug_get_debugged_thread()</a>
+<a name="ln2231">{</a>
+<a name="ln2232">	return sDebuggedThread != NULL</a>
+<a name="ln2233">		? sDebuggedThread : thread_get_current_thread();</a>
+<a name="ln2234">}</a>
+<a name="ln2235"> </a>
+<a name="ln2236"> </a>
+<a name="ln2237">/*!	Returns whether the supplied team ID refers to the same team the currently</a>
+<a name="ln2238">	debugged thread (debug_get_debugged_thread()) belongs to.</a>
+<a name="ln2239">	Always returns \c true, if \c B_CURRENT_TEAM is given.</a>
+<a name="ln2240">*/</a>
+<a name="ln2241">bool</a>
+<a name="ln2242">debug_is_debugged_team(team_id teamID)</a>
+<a name="ln2243">{</a>
+<a name="ln2244">	if (teamID == B_CURRENT_TEAM)</a>
+<a name="ln2245">		return true;</a>
+<a name="ln2246"> </a>
+<a name="ln2247">	Thread* thread = debug_get_debugged_thread();</a>
+<a name="ln2248">	return thread != NULL &amp;&amp; thread-&gt;team != NULL</a>
+<a name="ln2249">		&amp;&amp; thread-&gt;team-&gt;id == teamID;</a>
+<a name="ln2250">}</a>
+<a name="ln2251"> </a>
+<a name="ln2252"> </a>
+<a name="ln2253">//	#pragma mark -</a>
+<a name="ln2254">//	userland syscalls</a>
+<a name="ln2255"> </a>
+<a name="ln2256"> </a>
+<a name="ln2257">status_t</a>
+<a name="ln2258">_user_kernel_debugger(const char* userMessage)</a>
+<a name="ln2259">{</a>
+<a name="ln2260">	if (geteuid() != 0)</a>
+<a name="ln2261">		return B_NOT_ALLOWED;</a>
+<a name="ln2262"> </a>
+<a name="ln2263">	char message[512];</a>
+<a name="ln2264">	strcpy(message, &quot;USER: &quot;);</a>
+<a name="ln2265">	size_t length = strlen(message);</a>
+<a name="ln2266"> </a>
+<a name="ln2267">	if (userMessage == NULL || !IS_USER_ADDRESS(userMessage) || user_strlcpy(</a>
+<a name="ln2268">			message + length, userMessage, sizeof(message) - length) &lt; 0) {</a>
+<a name="ln2269">		return B_BAD_ADDRESS;</a>
+<a name="ln2270">	}</a>
+<a name="ln2271"> </a>
+<a name="ln2272">	kernel_debugger(message);</a>
+<a name="ln2273">	return B_OK;</a>
+<a name="ln2274">}</a>
+<a name="ln2275"> </a>
+<a name="ln2276"> </a>
+<a name="ln2277">void</a>
+<a name="ln2278">_user_register_syslog_daemon(port_id port)</a>
+<a name="ln2279">{</a>
+<a name="ln2280">	if (geteuid() != 0 || !sSyslogOutputEnabled || sSyslogNotify &lt; 0)</a>
+<a name="ln2281">		return;</a>
+<a name="ln2282"> </a>
+<a name="ln2283">	sSyslogPort = port;</a>
+<a name="ln2284"> </a>
+<a name="ln2285">	if (sSyslogWriter &lt; 0) {</a>
+<a name="ln2286">		sSyslogWriter = spawn_kernel_thread(syslog_sender, &quot;syslog sender&quot;,</a>
+<a name="ln2287">			B_LOW_PRIORITY, NULL);</a>
+<a name="ln2288">		if (sSyslogWriter &gt;= 0)</a>
+<a name="ln2289">			resume_thread(sSyslogWriter);</a>
+<a name="ln2290">	}</a>
+<a name="ln2291">}</a>
+<a name="ln2292"> </a>
+<a name="ln2293"> </a>
+<a name="ln2294">void</a>
+<a name="ln2295">_user_debug_output(const char* userString)</a>
+<a name="ln2296">{</a>
+<a name="ln2297">	if (!sSerialDebugEnabled &amp;&amp; !sSyslogOutputEnabled)</a>
+<a name="ln2298">		return;</a>
+<a name="ln2299"> </a>
+<a name="ln2300">	if (!IS_USER_ADDRESS(userString))</a>
+<a name="ln2301">		return;</a>
+<a name="ln2302"> </a>
+<a name="ln2303">	char string[512];</a>
+<a name="ln2304">	int32 length;</a>
+<a name="ln2305">	int32 toWrite;</a>
+<a name="ln2306">	do {</a>
+<a name="ln2307">		length = user_strlcpy(string, userString, sizeof(string));</a>
+<a name="ln2308">		if (length &lt;= 0)</a>
+<a name="ln2309">			break;</a>
+<a name="ln2310">		toWrite = std::min(length, (int32)sizeof(string) - 1);</a>
+<a name="ln2311">		debug_puts(string, toWrite);</a>
+<a name="ln2312">		userString += toWrite;</a>
+<a name="ln2313">	} while (length &gt; toWrite);</a>
+<a name="ln2314">}</a>
+<a name="ln2315"> </a>
+<a name="ln2316"> </a>
+<a name="ln2317">void</a>
+<a name="ln2318">dump_block(const char* buffer, int size, const char* prefix)</a>
+<a name="ln2319">{</a>
+<a name="ln2320">	const int DUMPED_BLOCK_SIZE = 16;</a>
+<a name="ln2321">	int i;</a>
+<a name="ln2322"> </a>
+<a name="ln2323">	for (i = 0; i &lt; size;) {</a>
+<a name="ln2324">		int start = i;</a>
+<a name="ln2325"> </a>
+<a name="ln2326">		dprintf(&quot;%s%04x &quot;, prefix, i);</a>
+<a name="ln2327">		for (; i &lt; start + DUMPED_BLOCK_SIZE; i++) {</a>
+<a name="ln2328">			if (!(i % 4))</a>
+<a name="ln2329">				dprintf(&quot; &quot;);</a>
+<a name="ln2330"> </a>
+<a name="ln2331">			if (i &gt;= size)</a>
+<a name="ln2332">				dprintf(&quot;  &quot;);</a>
+<a name="ln2333">			else</a>
+<a name="ln2334">				dprintf(&quot;%02x&quot;, *(unsigned char*)(buffer + i));</a>
+<a name="ln2335">		}</a>
+<a name="ln2336">		dprintf(&quot;  &quot;);</a>
+<a name="ln2337"> </a>
+<a name="ln2338">		for (i = start; i &lt; start + DUMPED_BLOCK_SIZE; i++) {</a>
+<a name="ln2339">			if (i &lt; size) {</a>
+<a name="ln2340">				char c = buffer[i];</a>
+<a name="ln2341"> </a>
+<a name="ln2342">				if (c &lt; 30)</a>
+<a name="ln2343">					dprintf(&quot;.&quot;);</a>
+<a name="ln2344">				else</a>
+<a name="ln2345">					dprintf(&quot;%c&quot;, c);</a>
+<a name="ln2346">			} else</a>
+<a name="ln2347">				break;</a>
+<a name="ln2348">		}</a>
+<a name="ln2349">		dprintf(&quot;\n&quot;);</a>
+<a name="ln2350">	}</a>
+<a name="ln2351">}</a>
+
+</code></pre>
+<div class="balloon" rel="1341"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v641/" target="_blank">V641</a> The size of the allocated memory buffer is not a multiple of the element size.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

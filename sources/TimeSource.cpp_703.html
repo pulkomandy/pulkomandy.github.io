@@ -1,0 +1,690 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>TimeSource.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2002-2012, Haiku. All Rights Reserved.</a>
+<a name="ln3"> * This file may be used under the terms of the MIT License.</a>
+<a name="ln4"> *</a>
+<a name="ln5"> * Authors:</a>
+<a name="ln6"> *    Dario Casalinuovo</a>
+<a name="ln7"> *    Marcus Overhagen</a>
+<a name="ln8"> */</a>
+<a name="ln9"> </a>
+<a name="ln10"> </a>
+<a name="ln11">#include &lt;TimeSource.h&gt;</a>
+<a name="ln12"> </a>
+<a name="ln13">#include &lt;Autolock.h&gt;</a>
+<a name="ln14"> </a>
+<a name="ln15">#include &lt;string.h&gt;</a>
+<a name="ln16"> </a>
+<a name="ln17">#include &quot;MediaDebug.h&quot;</a>
+<a name="ln18">#include &quot;DataExchange.h&quot;</a>
+<a name="ln19">#include &quot;ServerInterface.h&quot;</a>
+<a name="ln20">#include &quot;TimeSourceObject.h&quot;</a>
+<a name="ln21">#include &quot;TMap.h&quot;</a>
+<a name="ln22"> </a>
+<a name="ln23">#define DEBUG_TIMESOURCE 0</a>
+<a name="ln24"> </a>
+<a name="ln25">#if DEBUG_TIMESOURCE</a>
+<a name="ln26">	#define TRACE_TIMESOURCE printf</a>
+<a name="ln27">#else</a>
+<a name="ln28">	#define TRACE_TIMESOURCE if (1) {} else printf</a>
+<a name="ln29">#endif</a>
+<a name="ln30"> </a>
+<a name="ln31">namespace BPrivate { namespace media {</a>
+<a name="ln32"> </a>
+<a name="ln33">#define _atomic_read(p) 	atomic_or((p), 0)</a>
+<a name="ln34"> </a>
+<a name="ln35">// must be multiple of page size</a>
+<a name="ln36">#define TS_AREA_SIZE		B_PAGE_SIZE</a>
+<a name="ln37">// must be power of two</a>
+<a name="ln38">#define TS_INDEX_COUNT		128</a>
+<a name="ln39"> </a>
+<a name="ln40">// sizeof(TimeSourceTransmit) must be &lt;= TS_AREA_SIZE</a>
+<a name="ln41">struct TimeSourceTransmit</a>
+<a name="ln42">{</a>
+<a name="ln43">	int32 readindex;</a>
+<a name="ln44">	int32 writeindex;</a>
+<a name="ln45">	int32 isrunning;</a>
+<a name="ln46">	bigtime_t realtime[TS_INDEX_COUNT];</a>
+<a name="ln47">	bigtime_t perftime[TS_INDEX_COUNT];</a>
+<a name="ln48">	float drift[TS_INDEX_COUNT];</a>
+<a name="ln49">};</a>
+<a name="ln50"> </a>
+<a name="ln51">#define MAX_SLAVE_NODES 300</a>
+<a name="ln52"> </a>
+<a name="ln53"> </a>
+<a name="ln54">class SlaveNodes : public BLocker</a>
+<a name="ln55">{</a>
+<a name="ln56">public:</a>
+<a name="ln57">								SlaveNodes();</a>
+<a name="ln58">								~SlaveNodes();</a>
+<a name="ln59"> </a>
+<a name="ln60">	int32						CountSlaves() const;</a>
+<a name="ln61">	bool						GetNextSlave(port_id** id);</a>
+<a name="ln62">	void						Rewind();</a>
+<a name="ln63"> </a>
+<a name="ln64">	bool						InsertSlave(const media_node&amp; node);</a>
+<a name="ln65">	bool						RemoveSlave(const media_node&amp; node);</a>
+<a name="ln66">private:</a>
+<a name="ln67">	Map&lt;media_node_id, port_id&gt;	fSlaveList;</a>
+<a name="ln68">};</a>
+<a name="ln69"> </a>
+<a name="ln70"> </a>
+<a name="ln71">SlaveNodes::SlaveNodes()</a>
+<a name="ln72">	:</a>
+<a name="ln73">	BLocker(&quot;BTimeSource slavenodes&quot;)</a>
+<a name="ln74">{</a>
+<a name="ln75">}</a>
+<a name="ln76"> </a>
+<a name="ln77"> </a>
+<a name="ln78">SlaveNodes::~SlaveNodes()</a>
+<a name="ln79">{</a>
+<a name="ln80">	fSlaveList.MakeEmpty();</a>
+<a name="ln81">}</a>
+<a name="ln82"> </a>
+<a name="ln83"> </a>
+<a name="ln84">int32</a>
+<a name="ln85">SlaveNodes::CountSlaves() const</a>
+<a name="ln86">{</a>
+<a name="ln87">	return fSlaveList.CountItems();</a>
+<a name="ln88">}</a>
+<a name="ln89"> </a>
+<a name="ln90"> </a>
+<a name="ln91">bool</a>
+<a name="ln92">SlaveNodes::GetNextSlave(port_id** id)</a>
+<a name="ln93">{</a>
+<a name="ln94">	return fSlaveList.GetNext(id);</a>
+<a name="ln95">}</a>
+<a name="ln96"> </a>
+<a name="ln97"> </a>
+<a name="ln98">void</a>
+<a name="ln99">SlaveNodes::Rewind()</a>
+<a name="ln100">{</a>
+<a name="ln101">	fSlaveList.Rewind();</a>
+<a name="ln102">}</a>
+<a name="ln103"> </a>
+<a name="ln104"> </a>
+<a name="ln105">bool</a>
+<a name="ln106">SlaveNodes::InsertSlave(const media_node&amp; node)</a>
+<a name="ln107">{</a>
+<a name="ln108">	return fSlaveList.Insert(node.node, node.port);</a>
+<a name="ln109">}</a>
+<a name="ln110"> </a>
+<a name="ln111"> </a>
+<a name="ln112">bool</a>
+<a name="ln113">SlaveNodes::RemoveSlave(const media_node&amp; node)</a>
+<a name="ln114">{</a>
+<a name="ln115">	return fSlaveList.Remove(node.node);</a>
+<a name="ln116">}</a>
+<a name="ln117"> </a>
+<a name="ln118"> </a>
+<a name="ln119">} } // namespace BPrivate::media</a>
+<a name="ln120"> </a>
+<a name="ln121"> </a>
+<a name="ln122">/*************************************************************</a>
+<a name="ln123"> * protected BTimeSource</a>
+<a name="ln124"> *************************************************************/</a>
+<a name="ln125"> </a>
+<a name="ln126">BTimeSource::~BTimeSource()</a>
+<a name="ln127">{</a>
+<a name="ln128">	CALLED();</a>
+<a name="ln129">	if (fArea &gt; 0)</a>
+<a name="ln130">		delete_area(fArea);</a>
+<a name="ln131">	delete fSlaveNodes;</a>
+<a name="ln132">}</a>
+<a name="ln133"> </a>
+<a name="ln134">/*************************************************************</a>
+<a name="ln135"> * public BTimeSource</a>
+<a name="ln136"> *************************************************************/</a>
+<a name="ln137"> </a>
+<a name="ln138">status_t</a>
+<a name="ln139">BTimeSource::SnoozeUntil(bigtime_t performance_time,</a>
+<a name="ln140">	bigtime_t with_latency, bool retry_signals)</a>
+<a name="ln141">{</a>
+<a name="ln142">	CALLED();</a>
+<a name="ln143">	bigtime_t time;</a>
+<a name="ln144">	status_t err;</a>
+<a name="ln145">	do {</a>
+<a name="ln146">		time = RealTimeFor(performance_time, with_latency);</a>
+<a name="ln147">		err = snooze_until(time, B_SYSTEM_TIMEBASE);</a>
+<a name="ln148">	} while (err == B_INTERRUPTED &amp;&amp; retry_signals);</a>
+<a name="ln149">	return err;</a>
+<a name="ln150">}</a>
+<a name="ln151"> </a>
+<a name="ln152"> </a>
+<a name="ln153">bigtime_t</a>
+<a name="ln154">BTimeSource::Now()</a>
+<a name="ln155">{</a>
+<a name="ln156">	PRINT(8, &quot;CALLED BTimeSource::Now()\n&quot;);</a>
+<a name="ln157">	return PerformanceTimeFor(RealTime());</a>
+<a name="ln158">}</a>
+<a name="ln159"> </a>
+<a name="ln160"> </a>
+<a name="ln161">bigtime_t</a>
+<a name="ln162">BTimeSource::PerformanceTimeFor(bigtime_t real_time)</a>
+<a name="ln163">{</a>
+<a name="ln164">	PRINT(8, &quot;CALLED BTimeSource::PerformanceTimeFor()\n&quot;);</a>
+<a name="ln165">	bigtime_t last_perf_time;</a>
+<a name="ln166">	bigtime_t last_real_time;</a>
+<a name="ln167">	float last_drift;</a>
+<a name="ln168"> </a>
+<a name="ln169">	if (GetTime(&amp;last_perf_time, &amp;last_real_time, &amp;last_drift) != B_OK)</a>
+<a name="ln170">		debugger(&quot;BTimeSource::PerformanceTimeFor: GetTime failed&quot;);</a>
+<a name="ln171"> </a>
+<a name="ln172">	return last_perf_time</a>
+<a name="ln173">		+ (bigtime_t)((real_time - last_real_time) * last_drift);</a>
+<a name="ln174">}</a>
+<a name="ln175"> </a>
+<a name="ln176"> </a>
+<a name="ln177">bigtime_t</a>
+<a name="ln178">BTimeSource::RealTimeFor(bigtime_t performance_time,</a>
+<a name="ln179">	bigtime_t with_latency)</a>
+<a name="ln180">{</a>
+<a name="ln181">	PRINT(8, &quot;CALLED BTimeSource::RealTimeFor()\n&quot;);</a>
+<a name="ln182"> </a>
+<a name="ln183">	if (fIsRealtime) {</a>
+<a name="ln184">		return performance_time - with_latency;</a>
+<a name="ln185">	}</a>
+<a name="ln186"> </a>
+<a name="ln187">	bigtime_t last_perf_time;</a>
+<a name="ln188">	bigtime_t last_real_time;</a>
+<a name="ln189">	float last_drift;</a>
+<a name="ln190"> </a>
+<a name="ln191">	if (GetTime(&amp;last_perf_time, &amp;last_real_time, &amp;last_drift) != B_OK)</a>
+<a name="ln192">		debugger(&quot;BTimeSource::RealTimeFor: GetTime failed&quot;);</a>
+<a name="ln193"> </a>
+<a name="ln194">	return last_real_time - with_latency</a>
+<a name="ln195">		+ (bigtime_t)((performance_time - last_perf_time) / last_drift);</a>
+<a name="ln196">}</a>
+<a name="ln197"> </a>
+<a name="ln198"> </a>
+<a name="ln199">bool</a>
+<a name="ln200">BTimeSource::IsRunning()</a>
+<a name="ln201">{</a>
+<a name="ln202">	PRINT(8, &quot;CALLED BTimeSource::IsRunning()\n&quot;);</a>
+<a name="ln203"> </a>
+<a name="ln204">	bool isrunning;</a>
+<a name="ln205"> </a>
+<a name="ln206">	// The system time source is always running</a>
+<a name="ln207">	if (fIsRealtime)</a>
+<a name="ln208">		isrunning = true;</a>
+<a name="ln209">	else</a>
+<a name="ln210">		isrunning = fBuf ? atomic_add(&amp;fBuf-&gt;isrunning, 0) : fStarted;</a>
+<a name="ln211"> </a>
+<a name="ln212">	TRACE_TIMESOURCE(&quot;BTimeSource::IsRunning() node %&quot; B_PRId32 &quot;, port %&quot;</a>
+<a name="ln213">		B_PRId32 &quot;, %s\n&quot;, fNodeID, fControlPort, isrunning ? &quot;yes&quot; : &quot;no&quot;);</a>
+<a name="ln214">	return isrunning;</a>
+<a name="ln215">}</a>
+<a name="ln216"> </a>
+<a name="ln217"> </a>
+<a name="ln218">status_t</a>
+<a name="ln219">BTimeSource::GetTime(bigtime_t* performance_time,</a>
+<a name="ln220">	bigtime_t* real_time, float* drift)</a>
+<a name="ln221">{</a>
+<a name="ln222">	PRINT(8, &quot;CALLED BTimeSource::GetTime()\n&quot;);</a>
+<a name="ln223"> </a>
+<a name="ln224">	if (fIsRealtime) {</a>
+<a name="ln225">		*performance_time = *real_time = system_time();</a>
+<a name="ln226">		*drift = 1.0f;</a>
+<a name="ln227">		return B_OK;</a>
+<a name="ln228">	}</a>
+<a name="ln229"> </a>
+<a name="ln230">	if (fBuf == NULL)</a>
+<a name="ln231">		debugger(&quot;BTimeSource::GetTime: fBuf == NULL&quot;);</a>
+<a name="ln232"> </a>
+<a name="ln233">	int32 index = _atomic_read(&amp;fBuf-&gt;readindex);</a>
+<a name="ln234">	index &amp;= (TS_INDEX_COUNT - 1);</a>
+<a name="ln235">	*real_time = fBuf-&gt;realtime[index];</a>
+<a name="ln236">	*performance_time = fBuf-&gt;perftime[index];</a>
+<a name="ln237">	*drift = fBuf-&gt;drift[index];</a>
+<a name="ln238"> </a>
+<a name="ln239">	TRACE_TIMESOURCE(&quot;BTimeSource::GetTime     timesource %&quot; B_PRId32</a>
+<a name="ln240">		&quot;, perf %16&quot; B_PRId64 &quot;, real %16&quot; B_PRId64 &quot;, drift %2.2f\n&quot;, ID(),</a>
+<a name="ln241">		*performance_time, *real_time, *drift);</a>
+<a name="ln242">	return B_OK;</a>
+<a name="ln243">}</a>
+<a name="ln244"> </a>
+<a name="ln245"> </a>
+<a name="ln246">bigtime_t</a>
+<a name="ln247">BTimeSource::RealTime()</a>
+<a name="ln248">{</a>
+<a name="ln249">	PRINT(8, &quot;CALLED BTimeSource::RealTime()\n&quot;);</a>
+<a name="ln250">	return system_time();</a>
+<a name="ln251">}</a>
+<a name="ln252"> </a>
+<a name="ln253"> </a>
+<a name="ln254">status_t</a>
+<a name="ln255">BTimeSource::GetStartLatency(bigtime_t* out_latency)</a>
+<a name="ln256">{</a>
+<a name="ln257">	CALLED();</a>
+<a name="ln258">	*out_latency = 0;</a>
+<a name="ln259">	return B_OK;</a>
+<a name="ln260">}</a>
+<a name="ln261"> </a>
+<a name="ln262">/*************************************************************</a>
+<a name="ln263"> * protected BTimeSource</a>
+<a name="ln264"> *************************************************************/</a>
+<a name="ln265"> </a>
+<a name="ln266"> </a>
+<a name="ln267">BTimeSource::BTimeSource()</a>
+<a name="ln268">	:</a>
+<a name="ln269">	BMediaNode(&quot;This one is never called&quot;),</a>
+<a name="ln270">	fStarted(false),</a>
+<a name="ln271">	fArea(-1),</a>
+<a name="ln272">	fBuf(NULL),</a>
+<a name="ln273">	fSlaveNodes(new BPrivate::media::SlaveNodes),</a>
+<a name="ln274">	fIsRealtime(false)</a>
+<a name="ln275">{</a>
+<a name="ln276">	CALLED();</a>
+<a name="ln277">	AddNodeKind(B_TIME_SOURCE);</a>
+<a name="ln278">	// This constructor is only called by real time sources that inherit</a>
+<a name="ln279">	// BTimeSource. We create the communication area in FinishCreate(),</a>
+<a name="ln280">	// since we don't have a correct ID() until this node is registered.</a>
+<a name="ln281">}</a>
+<a name="ln282"> </a>
+<a name="ln283"> </a>
+<a name="ln284">status_t</a>
+<a name="ln285">BTimeSource::HandleMessage(int32 message, const void* rawdata,</a>
+<a name="ln286">	size_t size)</a>
+<a name="ln287">{</a>
+<a name="ln288">	PRINT(4, &quot;BTimeSource::HandleMessage %#&quot; B_PRIx32 &quot;, node %&quot; B_PRId32 &quot;\n&quot;,</a>
+<a name="ln289">		message, fNodeID);</a>
+<a name="ln290">	status_t rv;</a>
+<a name="ln291">	switch (message) {</a>
+<a name="ln292">		case TIMESOURCE_OP:</a>
+<a name="ln293">		{</a>
+<a name="ln294">			const time_source_op_info* data</a>
+<a name="ln295">				= static_cast&lt;const time_source_op_info*&gt;(rawdata);</a>
+<a name="ln296"> </a>
+<a name="ln297">			status_t result;</a>
+<a name="ln298">			result = TimeSourceOp(*data, NULL);</a>
+<a name="ln299">			if (result != B_OK) {</a>
+<a name="ln300">				ERROR(&quot;BTimeSource::HandleMessage: TimeSourceOp failed\n&quot;);</a>
+<a name="ln301">			}</a>
+<a name="ln302"> </a>
+<a name="ln303">			switch (data-&gt;op) {</a>
+<a name="ln304">				case B_TIMESOURCE_START:</a>
+<a name="ln305">					DirectStart(data-&gt;real_time);</a>
+<a name="ln306">					break;</a>
+<a name="ln307">				case B_TIMESOURCE_STOP:</a>
+<a name="ln308">					DirectStop(data-&gt;real_time, false);</a>
+<a name="ln309">					break;</a>
+<a name="ln310">				case B_TIMESOURCE_STOP_IMMEDIATELY:</a>
+<a name="ln311">					DirectStop(data-&gt;real_time, true);</a>
+<a name="ln312">					break;</a>
+<a name="ln313">				case B_TIMESOURCE_SEEK:</a>
+<a name="ln314">					DirectSeek(data-&gt;performance_time, data-&gt;real_time);</a>
+<a name="ln315">					break;</a>
+<a name="ln316">			}</a>
+<a name="ln317">			return B_OK;</a>
+<a name="ln318">		}</a>
+<a name="ln319"> </a>
+<a name="ln320">		case TIMESOURCE_ADD_SLAVE_NODE:</a>
+<a name="ln321">		{</a>
+<a name="ln322">			const timesource_add_slave_node_command* data</a>
+<a name="ln323">				= static_cast&lt;const timesource_add_slave_node_command*&gt;(rawdata);</a>
+<a name="ln324">			DirectAddMe(data-&gt;node);</a>
+<a name="ln325">			return B_OK;</a>
+<a name="ln326">		}</a>
+<a name="ln327"> </a>
+<a name="ln328">		case TIMESOURCE_REMOVE_SLAVE_NODE:</a>
+<a name="ln329">		{</a>
+<a name="ln330">			const timesource_remove_slave_node_command* data</a>
+<a name="ln331">				= static_cast&lt;const timesource_remove_slave_node_command*&gt;(rawdata);</a>
+<a name="ln332">			DirectRemoveMe(data-&gt;node);</a>
+<a name="ln333">			return B_OK;</a>
+<a name="ln334">		}</a>
+<a name="ln335"> </a>
+<a name="ln336">		case TIMESOURCE_GET_START_LATENCY:</a>
+<a name="ln337">		{</a>
+<a name="ln338">			const timesource_get_start_latency_request* request</a>
+<a name="ln339">				= static_cast&lt;const timesource_get_start_latency_request*&gt;(rawdata);</a>
+<a name="ln340">			timesource_get_start_latency_reply reply;</a>
+<a name="ln341">			rv = GetStartLatency(&amp;reply.start_latency);</a>
+<a name="ln342">			request-&gt;SendReply(rv, &amp;reply, sizeof(reply));</a>
+<a name="ln343">			return B_OK;</a>
+<a name="ln344">		}</a>
+<a name="ln345">	}</a>
+<a name="ln346">	return B_ERROR;</a>
+<a name="ln347">}</a>
+<a name="ln348"> </a>
+<a name="ln349"> </a>
+<a name="ln350">void</a>
+<a name="ln351">BTimeSource::PublishTime(bigtime_t performance_time,</a>
+<a name="ln352">	bigtime_t real_time, float drift)</a>
+<a name="ln353">{</a>
+<a name="ln354">	TRACE_TIMESOURCE(&quot;BTimeSource::PublishTime timesource %&quot; B_PRId32</a>
+<a name="ln355">		&quot;, perf %16&quot; B_PRId64 &quot;, real %16&quot; B_PRId64 &quot;, drift %2.2f\n&quot;, ID(),</a>
+<a name="ln356">		performance_time, real_time, drift);</a>
+<a name="ln357">	if (0 == fBuf) {</a>
+<a name="ln358">		ERROR(&quot;BTimeSource::PublishTime timesource %&quot; B_PRId32</a>
+<a name="ln359">			&quot;, fBuf = NULL\n&quot;, ID());</a>
+<a name="ln360">		fStarted = true;</a>
+<a name="ln361">		return;</a>
+<a name="ln362">	}</a>
+<a name="ln363"> </a>
+<a name="ln364">	int32 index = atomic_add(&amp;fBuf-&gt;writeindex, 1);</a>
+<a name="ln365">	index &amp;= (TS_INDEX_COUNT - 1);</a>
+<a name="ln366">	fBuf-&gt;realtime[index] = real_time;</a>
+<a name="ln367">	fBuf-&gt;perftime[index] = performance_time;</a>
+<a name="ln368">	fBuf-&gt;drift[index] = drift;</a>
+<a name="ln369">	atomic_add(&amp;fBuf-&gt;readindex, 1);</a>
+<a name="ln370">}</a>
+<a name="ln371"> </a>
+<a name="ln372"> </a>
+<a name="ln373">void</a>
+<a name="ln374">BTimeSource::BroadcastTimeWarp(bigtime_t at_real_time,</a>
+<a name="ln375">	bigtime_t new_performance_time)</a>
+<a name="ln376">{</a>
+<a name="ln377">	CALLED();</a>
+<a name="ln378">	ASSERT(fSlaveNodes != NULL);</a>
+<a name="ln379"> </a>
+<a name="ln380">	// calls BMediaNode::TimeWarp() of all slaved nodes</a>
+<a name="ln381"> </a>
+<a name="ln382">	TRACE(&quot;BTimeSource::BroadcastTimeWarp: at_real_time %&quot; B_PRId64</a>
+<a name="ln383">		&quot;, new_performance_time %&quot; B_PRId64 &quot;\n&quot;, at_real_time,</a>
+<a name="ln384">		new_performance_time);</a>
+<a name="ln385"> </a>
+<a name="ln386">	BAutolock lock(fSlaveNodes);</a>
+<a name="ln387"> </a>
+<a name="ln388">	port_id* port = NULL;</a>
+<a name="ln389">	while (fSlaveNodes-&gt;GetNextSlave(&amp;port) == true) {</a>
+<a name="ln390">		node_time_warp_command cmd;</a>
+<a name="ln391">		cmd.at_real_time = at_real_time;</a>
+<a name="ln392">		cmd.to_performance_time = new_performance_time;</a>
+<a name="ln393">		SendToPort(*port, NODE_TIME_WARP,</a>
+<a name="ln394">			&amp;cmd, sizeof(cmd));</a>
+<a name="ln395">	}</a>
+<a name="ln396">	fSlaveNodes-&gt;Rewind();</a>
+<a name="ln397">}</a>
+<a name="ln398"> </a>
+<a name="ln399"> </a>
+<a name="ln400">void</a>
+<a name="ln401">BTimeSource::SendRunMode(run_mode mode)</a>
+<a name="ln402">{</a>
+<a name="ln403">	CALLED();</a>
+<a name="ln404">	ASSERT(fSlaveNodes != NULL);</a>
+<a name="ln405"> </a>
+<a name="ln406">	// send the run mode change to all slaved nodes</a>
+<a name="ln407"> </a>
+<a name="ln408">	BAutolock lock(fSlaveNodes);</a>
+<a name="ln409"> </a>
+<a name="ln410">	port_id* port = NULL;</a>
+<a name="ln411">	while (fSlaveNodes-&gt;GetNextSlave(&amp;port) == true) {</a>
+<a name="ln412">		node_set_run_mode_command cmd;</a>
+<a name="ln413">		cmd.mode = mode;</a>
+<a name="ln414">		SendToPort(*port, NODE_SET_RUN_MODE,</a>
+<a name="ln415">			&amp;cmd, sizeof(cmd));</a>
+<a name="ln416">	}</a>
+<a name="ln417">	fSlaveNodes-&gt;Rewind();</a>
+<a name="ln418">}</a>
+<a name="ln419"> </a>
+<a name="ln420"> </a>
+<a name="ln421">void</a>
+<a name="ln422">BTimeSource::SetRunMode(run_mode mode)</a>
+<a name="ln423">{</a>
+<a name="ln424">	CALLED();</a>
+<a name="ln425">	BMediaNode::SetRunMode(mode);</a>
+<a name="ln426">	SendRunMode(mode);</a>
+<a name="ln427">}</a>
+<a name="ln428">/*************************************************************</a>
+<a name="ln429"> * private BTimeSource</a>
+<a name="ln430"> *************************************************************/</a>
+<a name="ln431"> </a>
+<a name="ln432">/*</a>
+<a name="ln433">//unimplemented</a>
+<a name="ln434">BTimeSource::BTimeSource(const BTimeSource &amp;clone)</a>
+<a name="ln435">BTimeSource &amp;BTimeSource::operator=(const BTimeSource &amp;clone)</a>
+<a name="ln436">*/</a>
+<a name="ln437"> </a>
+<a name="ln438">status_t BTimeSource::_Reserved_TimeSource_0(void *) { return B_ERROR; }</a>
+<a name="ln439">status_t BTimeSource::_Reserved_TimeSource_1(void *) { return B_ERROR; }</a>
+<a name="ln440">status_t BTimeSource::_Reserved_TimeSource_2(void *) { return B_ERROR; }</a>
+<a name="ln441">status_t BTimeSource::_Reserved_TimeSource_3(void *) { return B_ERROR; }</a>
+<a name="ln442">status_t BTimeSource::_Reserved_TimeSource_4(void *) { return B_ERROR; }</a>
+<a name="ln443">status_t BTimeSource::_Reserved_TimeSource_5(void *) { return B_ERROR; }</a>
+<a name="ln444"> </a>
+<a name="ln445">/* explicit */</a>
+<a name="ln446">BTimeSource::BTimeSource(media_node_id id)</a>
+<a name="ln447">	:</a>
+<a name="ln448">	BMediaNode(&quot;This one is never called&quot;),</a>
+<a name="ln449">	fStarted(false),</a>
+<a name="ln450">	fArea(-1),</a>
+<a name="ln451">	fBuf(NULL),</a>
+<a name="ln452">	fSlaveNodes(NULL),</a>
+<a name="ln453">	fIsRealtime(false)</a>
+<a name="ln454">{</a>
+<a name="ln455">	CALLED();</a>
+<a name="ln456">	AddNodeKind(B_TIME_SOURCE);</a>
+<a name="ln457">	ASSERT(id &gt; 0);</a>
+<a name="ln458"> </a>
+<a name="ln459">	// This constructor is only called by the derived</a>
+<a name="ln460">	// BPrivate::media::TimeSourceObject objects</a>
+<a name="ln461">	// We create a clone of the communication area.</a>
+<a name="ln462">	char name[32];</a>
+<a name="ln463">	sprintf(name, &quot;__timesource_buf_%&quot; B_PRId32, id);</a>
+<a name="ln464">	area_id area = find_area(name);</a>
+<a name="ln465">	if (area &lt;= 0) {</a>
+<a name="ln466">		ERROR(&quot;BTimeSource::BTimeSource couldn't find area, node %&quot; B_PRId32</a>
+<a name="ln467">			&quot;\n&quot;, id);</a>
+<a name="ln468">		return;</a>
+<a name="ln469">	}</a>
+<a name="ln470">	sprintf(name, &quot;__cloned_timesource_buf_%&quot; B_PRId32, id);</a>
+<a name="ln471"> </a>
+<a name="ln472">	void** buf = reinterpret_cast&lt;void**&gt;</a>
+<a name="ln473">		(const_cast&lt;BPrivate::media::TimeSourceTransmit**&gt;(&amp;fBuf));</a>
+<a name="ln474"> </a>
+<a name="ln475">	fArea = clone_area(name, buf, B_ANY_ADDRESS,</a>
+<a name="ln476">		B_READ_AREA | B_WRITE_AREA, area);</a>
+<a name="ln477"> </a>
+<a name="ln478">	if (fArea &lt;= 0) {</a>
+<a name="ln479">		ERROR(&quot;BTimeSource::BTimeSource couldn't clone area, node %&quot; B_PRId32</a>
+<a name="ln480">			&quot;\n&quot;, id);</a>
+<a name="ln481">		return;</a>
+<a name="ln482">	}</a>
+<a name="ln483">}</a>
+<a name="ln484"> </a>
+<a name="ln485"> </a>
+<a name="ln486">void</a>
+<a name="ln487">BTimeSource::FinishCreate()</a>
+<a name="ln488">{</a>
+<a name="ln489">	CALLED();</a>
+<a name="ln490"> </a>
+<a name="ln491">	char name[32];</a>
+<a name="ln492">	sprintf(name, &quot;__timesource_buf_%&quot; B_PRId32, ID());</a>
+<a name="ln493"> </a>
+<a name="ln494">	void** buf = reinterpret_cast&lt;void**&gt;</a>
+<a name="ln495">		(const_cast&lt;BPrivate::media::TimeSourceTransmit**&gt;(&amp;fBuf));</a>
+<a name="ln496"> </a>
+<a name="ln497">	fArea = create_area(name, buf, B_ANY_ADDRESS, TS_AREA_SIZE,</a>
+<a name="ln498">		B_FULL_LOCK, B_READ_AREA | B_WRITE_AREA);</a>
+<a name="ln499"> </a>
+<a name="ln500">	if (fArea &lt;= 0) {</a>
+<a name="ln501">		ERROR(&quot;BTimeSource::BTimeSource couldn't create area, node %&quot; B_PRId32</a>
+<a name="ln502">			&quot;\n&quot;, ID());</a>
+<a name="ln503">		fBuf = NULL;</a>
+<a name="ln504">		return;</a>
+<a name="ln505">	}</a>
+<a name="ln506">	fBuf-&gt;readindex = 0;</a>
+<a name="ln507">	fBuf-&gt;writeindex = 1;</a>
+<a name="ln508">	fBuf-&gt;realtime[0] = 0;</a>
+<a name="ln509">	fBuf-&gt;perftime[0] = 0;</a>
+<a name="ln510">	fBuf-&gt;drift[0] = 1.0f;</a>
+<a name="ln511">	fBuf-&gt;isrunning = fStarted;</a>
+<a name="ln512">}</a>
+<a name="ln513"> </a>
+<a name="ln514"> </a>
+<a name="ln515">status_t</a>
+<a name="ln516">BTimeSource::RemoveMe(BMediaNode* node)</a>
+<a name="ln517">{</a>
+<a name="ln518">	CALLED();</a>
+<a name="ln519">	if (fKinds &amp; NODE_KIND_SHADOW_TIMESOURCE) {</a>
+<a name="ln520">		timesource_remove_slave_node_command cmd;</a>
+<a name="ln521">		cmd.node = node-&gt;Node();</a>
+<a name="ln522">		SendToPort(fControlPort, TIMESOURCE_REMOVE_SLAVE_NODE,</a>
+<a name="ln523">			&amp;cmd, sizeof(cmd));</a>
+<a name="ln524">	} else {</a>
+<a name="ln525">		DirectRemoveMe(node-&gt;Node());</a>
+<a name="ln526">	}</a>
+<a name="ln527">	return B_OK;</a>
+<a name="ln528">}</a>
+<a name="ln529"> </a>
+<a name="ln530"> </a>
+<a name="ln531">status_t</a>
+<a name="ln532">BTimeSource::AddMe(BMediaNode* node)</a>
+<a name="ln533">{</a>
+<a name="ln534">	CALLED();</a>
+<a name="ln535">	if (fKinds &amp; NODE_KIND_SHADOW_TIMESOURCE) {</a>
+<a name="ln536">		timesource_add_slave_node_command cmd;</a>
+<a name="ln537">		cmd.node = node-&gt;Node();</a>
+<a name="ln538">		SendToPort(fControlPort, TIMESOURCE_ADD_SLAVE_NODE, &amp;cmd, sizeof(cmd));</a>
+<a name="ln539">	} else {</a>
+<a name="ln540">		DirectAddMe(node-&gt;Node());</a>
+<a name="ln541">	}</a>
+<a name="ln542">	return B_OK;</a>
+<a name="ln543">}</a>
+<a name="ln544"> </a>
+<a name="ln545"> </a>
+<a name="ln546">void</a>
+<a name="ln547">BTimeSource::DirectAddMe(const media_node&amp; node)</a>
+<a name="ln548">{</a>
+<a name="ln549">	CALLED();</a>
+<a name="ln550">	ASSERT(fSlaveNodes != NULL);</a>
+<a name="ln551">	BAutolock lock(fSlaveNodes);</a>
+<a name="ln552"> </a>
+<a name="ln553">	if (fSlaveNodes-&gt;CountSlaves() == MAX_SLAVE_NODES) {</a>
+<a name="ln554">		ERROR(&quot;BTimeSource::DirectAddMe reached maximum number of slaves\n&quot;);</a>
+<a name="ln555">		return;</a>
+<a name="ln556">	}</a>
+<a name="ln557">	if (fNodeID == node.node) {</a>
+<a name="ln558">		ERROR(&quot;BTimeSource::DirectAddMe should not add itself to slave nodes\n&quot;);</a>
+<a name="ln559">		return;</a>
+<a name="ln560">	}</a>
+<a name="ln561"> </a>
+<a name="ln562">	if (fSlaveNodes-&gt;InsertSlave(node) != true) {</a>
+<a name="ln563">		ERROR(&quot;BTimeSource::DirectAddMe failed\n&quot;);</a>
+<a name="ln564">		return;</a>
+<a name="ln565">	}</a>
+<a name="ln566"> </a>
+<a name="ln567">	if (fSlaveNodes-&gt;CountSlaves() == 1) {</a>
+<a name="ln568">		// start the time source</a>
+<a name="ln569">		time_source_op_info msg;</a>
+<a name="ln570">		msg.op = B_TIMESOURCE_START;</a>
+<a name="ln571">		msg.real_time = RealTime();</a>
+<a name="ln572"> </a>
+<a name="ln573">		TRACE_TIMESOURCE(&quot;starting time source %&quot; B_PRId32 &quot;\n&quot;, ID());</a>
+<a name="ln574"> </a>
+<a name="ln575">		write_port(fControlPort, TIMESOURCE_OP, &amp;msg, sizeof(msg));</a>
+<a name="ln576">	}</a>
+<a name="ln577"> }</a>
+<a name="ln578"> </a>
+<a name="ln579"> </a>
+<a name="ln580">void</a>
+<a name="ln581">BTimeSource::DirectRemoveMe(const media_node&amp; node)</a>
+<a name="ln582">{</a>
+<a name="ln583">	CALLED();</a>
+<a name="ln584">	ASSERT(fSlaveNodes != NULL);</a>
+<a name="ln585">	BAutolock lock(fSlaveNodes);</a>
+<a name="ln586"> </a>
+<a name="ln587">	if (fSlaveNodes-&gt;CountSlaves() == 0) {</a>
+<a name="ln588">		ERROR(&quot;BTimeSource::DirectRemoveMe no slots used\n&quot;);</a>
+<a name="ln589">		return;</a>
+<a name="ln590">	}</a>
+<a name="ln591"> </a>
+<a name="ln592">	if (fSlaveNodes-&gt;RemoveSlave(node) != true) {</a>
+<a name="ln593">		ERROR(&quot;BTimeSource::DirectRemoveMe failed\n&quot;);</a>
+<a name="ln594">		return;</a>
+<a name="ln595">	}</a>
+<a name="ln596"> </a>
+<a name="ln597">	if (fSlaveNodes-&gt;CountSlaves() == 0) {</a>
+<a name="ln598">		// stop the time source</a>
+<a name="ln599">		time_source_op_info msg;</a>
+<a name="ln600">		msg.op = B_TIMESOURCE_STOP_IMMEDIATELY;</a>
+<a name="ln601">		msg.real_time = RealTime();</a>
+<a name="ln602"> </a>
+<a name="ln603">		TRACE_TIMESOURCE(&quot;stopping time source %&quot; B_PRId32 &quot;\n&quot;, ID());</a>
+<a name="ln604"> </a>
+<a name="ln605">		write_port(fControlPort, TIMESOURCE_OP, &amp;msg, sizeof(msg));</a>
+<a name="ln606">	}</a>
+<a name="ln607">}</a>
+<a name="ln608"> </a>
+<a name="ln609"> </a>
+<a name="ln610">void</a>
+<a name="ln611">BTimeSource::DirectStart(bigtime_t at)</a>
+<a name="ln612">{</a>
+<a name="ln613">	CALLED();</a>
+<a name="ln614">	if (fBuf)</a>
+<a name="ln615">		atomic_or(&amp;fBuf-&gt;isrunning, 1);</a>
+<a name="ln616">	else</a>
+<a name="ln617">		fStarted = true;</a>
+<a name="ln618">}</a>
+<a name="ln619"> </a>
+<a name="ln620"> </a>
+<a name="ln621">void</a>
+<a name="ln622">BTimeSource::DirectStop(bigtime_t at, bool immediate)</a>
+<a name="ln623">{</a>
+<a name="ln624">	CALLED();</a>
+<a name="ln625">	if (fBuf)</a>
+<a name="ln626">		atomic_and(&amp;fBuf-&gt;isrunning, 0);</a>
+<a name="ln627">	else</a>
+<a name="ln628">		fStarted = false;</a>
+<a name="ln629">}</a>
+<a name="ln630"> </a>
+<a name="ln631"> </a>
+<a name="ln632">void</a>
+<a name="ln633">BTimeSource::DirectSeek(bigtime_t to, bigtime_t at)</a>
+<a name="ln634">{</a>
+<a name="ln635">	UNIMPLEMENTED();</a>
+<a name="ln636">}</a>
+<a name="ln637"> </a>
+<a name="ln638"> </a>
+<a name="ln639">void</a>
+<a name="ln640">BTimeSource::DirectSetRunMode(run_mode mode)</a>
+<a name="ln641">{</a>
+<a name="ln642">	UNIMPLEMENTED();</a>
+<a name="ln643">}</a>
+
+</code></pre>
+<div class="balloon" rel="446"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: _reserved_area, _reserved_bool_, _reserved_time_source_.</p></div>
+<div class="balloon" rel="267"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: _reserved_area, _reserved_bool_, _reserved_time_source_.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

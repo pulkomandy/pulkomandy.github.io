@@ -1,0 +1,3268 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>BPlusTree.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2001-2017, Axel Dörfler, axeld@pinc-software.de.</a>
+<a name="ln3"> * This file may be used under the terms of the MIT License.</a>
+<a name="ln4"> *</a>
+<a name="ln5"> * Roughly based on 'btlib' written by Marcus J. Ranum - it shares</a>
+<a name="ln6"> * no code but achieves binary compatibility with the on disk format.</a>
+<a name="ln7"> */</a>
+<a name="ln8"> </a>
+<a name="ln9"> </a>
+<a name="ln10">//! B+Tree implementation</a>
+<a name="ln11"> </a>
+<a name="ln12"> </a>
+<a name="ln13">#include &quot;BPlusTree.h&quot;</a>
+<a name="ln14"> </a>
+<a name="ln15">#include &lt;file_systems/QueryParserUtils.h&gt;</a>
+<a name="ln16"> </a>
+<a name="ln17">#include &quot;Debug.h&quot;</a>
+<a name="ln18">#include &quot;Utility.h&quot;</a>
+<a name="ln19"> </a>
+<a name="ln20">#if !_BOOT_MODE</a>
+<a name="ln21">#	include &quot;Inode.h&quot;</a>
+<a name="ln22">#else</a>
+<a name="ln23">#	include &quot;Stream.h&quot;</a>
+<a name="ln24"> </a>
+<a name="ln25">// BFS::Stream from the bootloader has the same API as Inode.</a>
+<a name="ln26">#	define Inode BFS::Stream</a>
+<a name="ln27"> </a>
+<a name="ln28">#	define strerror(x)		&quot;error message unavailable&quot;</a>
+<a name="ln29"> </a>
+<a name="ln30">namespace BFS {</a>
+<a name="ln31">#endif</a>
+<a name="ln32"> </a>
+<a name="ln33"> </a>
+<a name="ln34">/*!	Simple array used for the duplicate handling in the B+Tree. This is an</a>
+<a name="ln35">	on disk structure.</a>
+<a name="ln36">*/</a>
+<a name="ln37">struct duplicate_array {</a>
+<a name="ln38">	off_t	count;</a>
+<a name="ln39">	off_t	values[0];</a>
+<a name="ln40"> </a>
+<a name="ln41">	inline bool IsEmpty() const</a>
+<a name="ln42">	{</a>
+<a name="ln43">		return count == 0;</a>
+<a name="ln44">	}</a>
+<a name="ln45"> </a>
+<a name="ln46">	inline int32 Count() const</a>
+<a name="ln47">	{</a>
+<a name="ln48">		return (int32)BFS_ENDIAN_TO_HOST_INT64(count);</a>
+<a name="ln49">	}</a>
+<a name="ln50"> </a>
+<a name="ln51">	inline off_t ValueAt(uint32 index) const</a>
+<a name="ln52">	{</a>
+<a name="ln53">		return BFS_ENDIAN_TO_HOST_INT64(values[index]);</a>
+<a name="ln54">	}</a>
+<a name="ln55"> </a>
+<a name="ln56">	inline void SetValueAt(uint32 index, off_t value)</a>
+<a name="ln57">	{</a>
+<a name="ln58">		values[index] = HOST_ENDIAN_TO_BFS_INT64(value);</a>
+<a name="ln59">	}</a>
+<a name="ln60"> </a>
+<a name="ln61">	inline int32 Find(off_t value) const</a>
+<a name="ln62">	{</a>
+<a name="ln63">		int32 i;</a>
+<a name="ln64">		return _FindInternal(value, i) ? i : -1;</a>
+<a name="ln65">	}</a>
+<a name="ln66"> </a>
+<a name="ln67">	void Insert(off_t value);</a>
+<a name="ln68">	bool Remove(off_t value);</a>
+<a name="ln69"> </a>
+<a name="ln70">private:</a>
+<a name="ln71">	bool _FindInternal(off_t value, int32&amp; index) const;</a>
+<a name="ln72">} _PACKED;</a>
+<a name="ln73"> </a>
+<a name="ln74"> </a>
+<a name="ln75">#ifdef DEBUG</a>
+<a name="ln76">class NodeChecker {</a>
+<a name="ln77">public:</a>
+<a name="ln78">	NodeChecker(const bplustree_node* node, int32 nodeSize, const char* text)</a>
+<a name="ln79">		:</a>
+<a name="ln80">		fNode(node),</a>
+<a name="ln81">		fSize(nodeSize),</a>
+<a name="ln82">		fText(text)</a>
+<a name="ln83">	{</a>
+<a name="ln84">		Check(&quot;integrity check failed on construction.&quot;);</a>
+<a name="ln85">	}</a>
+<a name="ln86"> </a>
+<a name="ln87">	~NodeChecker()</a>
+<a name="ln88">	{</a>
+<a name="ln89">		Check(&quot;integrity check failed on destruction.&quot;);</a>
+<a name="ln90">	}</a>
+<a name="ln91"> </a>
+<a name="ln92">	void</a>
+<a name="ln93">	Check(const char* message)</a>
+<a name="ln94">	{</a>
+<a name="ln95">		if (fNode-&gt;CheckIntegrity(fSize) != B_OK) {</a>
+<a name="ln96">			dprintf(&quot;%s: %s\n&quot;, fText, message);</a>
+<a name="ln97">			DEBUGGER((&quot;NodeChecker integrity check failed!&quot;));</a>
+<a name="ln98">		}</a>
+<a name="ln99">	}</a>
+<a name="ln100"> </a>
+<a name="ln101">private:</a>
+<a name="ln102">	const bplustree_node*	fNode;</a>
+<a name="ln103">	int32					fSize;</a>
+<a name="ln104">	const char*				fText;</a>
+<a name="ln105">};</a>
+<a name="ln106">#endif // DEBUG</a>
+<a name="ln107"> </a>
+<a name="ln108"> </a>
+<a name="ln109">#if !_BOOT_MODE</a>
+<a name="ln110">class BitmapArray {</a>
+<a name="ln111">public:</a>
+<a name="ln112">								BitmapArray(size_t numBits);</a>
+<a name="ln113">								~BitmapArray();</a>
+<a name="ln114"> </a>
+<a name="ln115">			status_t			InitCheck() const;</a>
+<a name="ln116"> </a>
+<a name="ln117">			bool				IsSet(size_t index) const;</a>
+<a name="ln118">			void				Set(size_t index, bool set);</a>
+<a name="ln119"> </a>
+<a name="ln120">			size_t				CountSet() const { return fCountSet; }</a>
+<a name="ln121"> </a>
+<a name="ln122">private:</a>
+<a name="ln123">			uint8*				fBitmap;</a>
+<a name="ln124">			size_t				fSize;</a>
+<a name="ln125">			size_t				fCountSet;</a>
+<a name="ln126">};</a>
+<a name="ln127"> </a>
+<a name="ln128"> </a>
+<a name="ln129">struct TreeCheck {</a>
+<a name="ln130">	TreeCheck(BPlusTree* tree)</a>
+<a name="ln131">		:</a>
+<a name="ln132">		fLevelCount(0),</a>
+<a name="ln133">		fFreeCount(0),</a>
+<a name="ln134">		fNodeSize(tree-&gt;NodeSize()),</a>
+<a name="ln135">		fMaxLevels(tree-&gt;fHeader.MaxNumberOfLevels()),</a>
+<a name="ln136">		fFoundErrors(0),</a>
+<a name="ln137">		fVisited(tree-&gt;Stream()-&gt;Size() / tree-&gt;NodeSize()),</a>
+<a name="ln138">		fVisitedFragment(tree-&gt;Stream()-&gt;Size() / tree-&gt;NodeSize())</a>
+<a name="ln139">	{</a>
+<a name="ln140">		fPreviousOffsets = (off_t*)malloc(</a>
+<a name="ln141">			sizeof(off_t) * tree-&gt;fHeader.MaxNumberOfLevels());</a>
+<a name="ln142">		if (fPreviousOffsets != NULL) {</a>
+<a name="ln143">			for (size_t i = 0; i &lt; fMaxLevels; i++)</a>
+<a name="ln144">				fPreviousOffsets[i] = BPLUSTREE_NULL;</a>
+<a name="ln145">		}</a>
+<a name="ln146">	}</a>
+<a name="ln147"> </a>
+<a name="ln148">	~TreeCheck()</a>
+<a name="ln149">	{</a>
+<a name="ln150">		free(fPreviousOffsets);</a>
+<a name="ln151">	}</a>
+<a name="ln152"> </a>
+<a name="ln153">	status_t InitCheck() const</a>
+<a name="ln154">	{</a>
+<a name="ln155">		if (fPreviousOffsets == NULL)</a>
+<a name="ln156">			return B_NO_MEMORY;</a>
+<a name="ln157"> </a>
+<a name="ln158">		status_t status = fVisited.InitCheck();</a>
+<a name="ln159">		if (status != B_OK)</a>
+<a name="ln160">			return status;</a>
+<a name="ln161"> </a>
+<a name="ln162">		return fVisitedFragment.InitCheck();</a>
+<a name="ln163">	}</a>
+<a name="ln164"> </a>
+<a name="ln165">	bool Visited(off_t offset) const</a>
+<a name="ln166">	{</a>
+<a name="ln167">		return fVisited.IsSet(offset / fNodeSize);</a>
+<a name="ln168">	}</a>
+<a name="ln169"> </a>
+<a name="ln170">	void SetVisited(off_t offset)</a>
+<a name="ln171">	{</a>
+<a name="ln172">		fVisited.Set(offset / fNodeSize, true);</a>
+<a name="ln173">	}</a>
+<a name="ln174"> </a>
+<a name="ln175">	size_t VisitedCount() const</a>
+<a name="ln176">	{</a>
+<a name="ln177">		return fVisited.CountSet();</a>
+<a name="ln178">	}</a>
+<a name="ln179"> </a>
+<a name="ln180">	bool VisitedFragment(off_t offset) const</a>
+<a name="ln181">	{</a>
+<a name="ln182">		return fVisitedFragment.IsSet(offset / fNodeSize);</a>
+<a name="ln183">	}</a>
+<a name="ln184"> </a>
+<a name="ln185">	void SetVisitedFragment(off_t offset)</a>
+<a name="ln186">	{</a>
+<a name="ln187">		fVisitedFragment.Set(offset / fNodeSize, true);</a>
+<a name="ln188">	}</a>
+<a name="ln189"> </a>
+<a name="ln190">	uint32 MaxLevels() const</a>
+<a name="ln191">	{</a>
+<a name="ln192">		return fLevelCount;</a>
+<a name="ln193">	}</a>
+<a name="ln194"> </a>
+<a name="ln195">	void SetLevel(uint32 level)</a>
+<a name="ln196">	{</a>
+<a name="ln197">		if (fLevelCount &lt; level)</a>
+<a name="ln198">			fLevelCount = level;</a>
+<a name="ln199">	}</a>
+<a name="ln200"> </a>
+<a name="ln201">	off_t PreviousOffset(uint32 level)</a>
+<a name="ln202">	{</a>
+<a name="ln203">		return fPreviousOffsets[level];</a>
+<a name="ln204">	}</a>
+<a name="ln205"> </a>
+<a name="ln206">	void SetPreviousOffset(uint32 level, off_t offset)</a>
+<a name="ln207">	{</a>
+<a name="ln208">		fPreviousOffsets[level] = offset;</a>
+<a name="ln209">	}</a>
+<a name="ln210"> </a>
+<a name="ln211">	void FoundError()</a>
+<a name="ln212">	{</a>
+<a name="ln213">		fFoundErrors++;</a>
+<a name="ln214">	}</a>
+<a name="ln215"> </a>
+<a name="ln216">	bool ErrorsFound()</a>
+<a name="ln217">	{</a>
+<a name="ln218">		return fFoundErrors != 0;</a>
+<a name="ln219">	}</a>
+<a name="ln220"> </a>
+<a name="ln221">private:</a>
+<a name="ln222">			uint32				fLevelCount;</a>
+<a name="ln223">			uint32				fFreeCount;</a>
+<a name="ln224">			uint32				fNodeSize;</a>
+<a name="ln225">			uint32				fMaxLevels;</a>
+<a name="ln226">			uint32				fFoundErrors;</a>
+<a name="ln227">			BitmapArray			fVisited;</a>
+<a name="ln228">			BitmapArray			fVisitedFragment;</a>
+<a name="ln229">			off_t*				fPreviousOffsets;</a>
+<a name="ln230">};</a>
+<a name="ln231"> </a>
+<a name="ln232"> </a>
+<a name="ln233">// #pragma mark -</a>
+<a name="ln234"> </a>
+<a name="ln235"> </a>
+<a name="ln236">// Node Caching for the BPlusTree class</a>
+<a name="ln237">//</a>
+<a name="ln238">// With write support, there is the need for a function that allocates new</a>
+<a name="ln239">// nodes by either returning empty nodes, or by growing the file's data stream</a>
+<a name="ln240">//</a>
+<a name="ln241">// !! The CachedNode class assumes that you have properly locked the stream</a>
+<a name="ln242">// !! before asking for nodes.</a>
+<a name="ln243">//</a>
+<a name="ln244">// Note: This code will fail if the block size is smaller than the node size!</a>
+<a name="ln245">// Since BFS supports block sizes of 1024 bytes or greater, and the node size</a>
+<a name="ln246">// is hard-coded to 1024 bytes, that's not an issue now.</a>
+<a name="ln247"> </a>
+<a name="ln248">void</a>
+<a name="ln249">CachedNode::UnsetUnchanged(Transaction&amp; transaction)</a>
+<a name="ln250">{</a>
+<a name="ln251">	if (fTree == NULL || fTree-&gt;fStream == NULL)</a>
+<a name="ln252">		return;</a>
+<a name="ln253"> </a>
+<a name="ln254">	if (fNode != NULL) {</a>
+<a name="ln255">		void* cache = fTree-&gt;fStream-&gt;GetVolume()-&gt;BlockCache();</a>
+<a name="ln256"> </a>
+<a name="ln257">		block_cache_set_dirty(cache, fBlockNumber, false, transaction.ID());</a>
+<a name="ln258">		block_cache_put(cache, fBlockNumber);</a>
+<a name="ln259">		fNode = NULL;</a>
+<a name="ln260">	}</a>
+<a name="ln261">}</a>
+<a name="ln262">#endif // !_BOOT_MODE</a>
+<a name="ln263"> </a>
+<a name="ln264"> </a>
+<a name="ln265">void</a>
+<a name="ln266">CachedNode::Unset()</a>
+<a name="ln267">{</a>
+<a name="ln268">	if (fTree == NULL || fTree-&gt;fStream == NULL)</a>
+<a name="ln269">		return;</a>
+<a name="ln270"> </a>
+<a name="ln271">	if (fNode != NULL) {</a>
+<a name="ln272">#if !_BOOT_MODE</a>
+<a name="ln273">		if (fWritable &amp;&amp; fOffset == 0) {</a>
+<a name="ln274">			// The B+tree header has been updated - we need to update the</a>
+<a name="ln275">			// BPlusTrees copy of it, as well.</a>
+<a name="ln276">			memcpy(&amp;fTree-&gt;fHeader, fNode, sizeof(bplustree_header));</a>
+<a name="ln277">		}</a>
+<a name="ln278"> </a>
+<a name="ln279">		block_cache_put(fTree-&gt;fStream-&gt;GetVolume()-&gt;BlockCache(),</a>
+<a name="ln280">			fBlockNumber);</a>
+<a name="ln281">#endif // !_BOOT_MODE</a>
+<a name="ln282"> </a>
+<a name="ln283">		fNode = NULL;</a>
+<a name="ln284">	}</a>
+<a name="ln285">}</a>
+<a name="ln286"> </a>
+<a name="ln287"> </a>
+<a name="ln288">const bplustree_node*</a>
+<a name="ln289">CachedNode::SetTo(off_t offset, bool check)</a>
+<a name="ln290">{</a>
+<a name="ln291">	const bplustree_node* node;</a>
+<a name="ln292">	if (SetTo(offset, &amp;node, check) == B_OK)</a>
+<a name="ln293">		return node;</a>
+<a name="ln294"> </a>
+<a name="ln295">	return NULL;</a>
+<a name="ln296">}</a>
+<a name="ln297"> </a>
+<a name="ln298"> </a>
+<a name="ln299">status_t</a>
+<a name="ln300">CachedNode::SetTo(off_t offset, const bplustree_node** _node, bool check)</a>
+<a name="ln301">{</a>
+<a name="ln302">	if (fTree == NULL || fTree-&gt;fStream == NULL)</a>
+<a name="ln303">		RETURN_ERROR(B_BAD_VALUE);</a>
+<a name="ln304"> </a>
+<a name="ln305">	Unset();</a>
+<a name="ln306"> </a>
+<a name="ln307">	// You can only ask for nodes at valid positions - you can't</a>
+<a name="ln308">	// even access the b+tree header with this method (use SetToHeader()</a>
+<a name="ln309">	// instead)</a>
+<a name="ln310">	if (offset &gt; fTree-&gt;fHeader.MaximumSize() - fTree-&gt;fNodeSize</a>
+<a name="ln311">		|| offset &lt;= 0</a>
+<a name="ln312">		|| (offset % fTree-&gt;fNodeSize) != 0) {</a>
+<a name="ln313">		RETURN_ERROR(B_BAD_VALUE);</a>
+<a name="ln314">	}</a>
+<a name="ln315"> </a>
+<a name="ln316">	if (InternalSetTo(NULL, offset) != NULL &amp;&amp; check) {</a>
+<a name="ln317">		// sanity checks (links, all_key_count)</a>
+<a name="ln318">		if (!fTree-&gt;fHeader.CheckNode(fNode)) {</a>
+<a name="ln319">			FATAL((&quot;invalid node [%p] read from offset %&quot; B_PRIdOFF &quot; (block %&quot;</a>
+<a name="ln320">				B_PRIdOFF &quot;), inode at %&quot; B_PRIdINO &quot;\n&quot;, fNode, offset,</a>
+<a name="ln321">				fBlockNumber, fTree-&gt;fStream-&gt;ID()));</a>
+<a name="ln322">			return B_BAD_DATA;</a>
+<a name="ln323">		}</a>
+<a name="ln324">	}</a>
+<a name="ln325"> </a>
+<a name="ln326">	*_node = fNode;</a>
+<a name="ln327">	return B_OK;</a>
+<a name="ln328">}</a>
+<a name="ln329"> </a>
+<a name="ln330"> </a>
+<a name="ln331">#if !_BOOT_MODE</a>
+<a name="ln332">bplustree_node*</a>
+<a name="ln333">CachedNode::SetToWritable(Transaction&amp; transaction, off_t offset, bool check)</a>
+<a name="ln334">{</a>
+<a name="ln335">	if (fTree == NULL || fTree-&gt;fStream == NULL) {</a>
+<a name="ln336">		REPORT_ERROR(B_BAD_VALUE);</a>
+<a name="ln337">		return NULL;</a>
+<a name="ln338">	}</a>
+<a name="ln339"> </a>
+<a name="ln340">	Unset();</a>
+<a name="ln341"> </a>
+<a name="ln342">	// You can only ask for nodes at valid positions - you can't</a>
+<a name="ln343">	// even access the b+tree header with this method (use SetToHeader()</a>
+<a name="ln344">	// instead)</a>
+<a name="ln345">	if (offset &gt; fTree-&gt;fHeader.MaximumSize() - fTree-&gt;fNodeSize</a>
+<a name="ln346">		|| offset &lt;= 0</a>
+<a name="ln347">		|| (offset % fTree-&gt;fNodeSize) != 0)</a>
+<a name="ln348">		return NULL;</a>
+<a name="ln349"> </a>
+<a name="ln350">	if (InternalSetTo(&amp;transaction, offset) != NULL &amp;&amp; check) {</a>
+<a name="ln351">		// sanity checks (links, all_key_count)</a>
+<a name="ln352">		if (!fTree-&gt;fHeader.CheckNode(fNode)) {</a>
+<a name="ln353">			FATAL((&quot;invalid node [%p] read from offset %&quot; B_PRIdOFF &quot; (block %&quot;</a>
+<a name="ln354">				B_PRIdOFF &quot;), inode at %&quot; B_PRIdINO &quot;\n&quot;, fNode, offset,</a>
+<a name="ln355">				fBlockNumber, fTree-&gt;fStream-&gt;ID()));</a>
+<a name="ln356">			return NULL;</a>
+<a name="ln357">		}</a>
+<a name="ln358">	}</a>
+<a name="ln359">	return fNode;</a>
+<a name="ln360">}</a>
+<a name="ln361"> </a>
+<a name="ln362"> </a>
+<a name="ln363">bplustree_node*</a>
+<a name="ln364">CachedNode::MakeWritable(Transaction&amp; transaction)</a>
+<a name="ln365">{</a>
+<a name="ln366">	if (fNode == NULL)</a>
+<a name="ln367">		return NULL;</a>
+<a name="ln368"> </a>
+<a name="ln369">	if (block_cache_make_writable(transaction.GetVolume()-&gt;BlockCache(),</a>
+<a name="ln370">			fBlockNumber, transaction.ID()) == B_OK) {</a>
+<a name="ln371">		return fNode;</a>
+<a name="ln372">	}</a>
+<a name="ln373"> </a>
+<a name="ln374">	return NULL;</a>
+<a name="ln375">}</a>
+<a name="ln376">#endif // !_BOOT_MODE</a>
+<a name="ln377"> </a>
+<a name="ln378"> </a>
+<a name="ln379">const bplustree_header*</a>
+<a name="ln380">CachedNode::SetToHeader()</a>
+<a name="ln381">{</a>
+<a name="ln382">	if (fTree == NULL || fTree-&gt;fStream == NULL) {</a>
+<a name="ln383">		REPORT_ERROR(B_BAD_VALUE);</a>
+<a name="ln384">		return NULL;</a>
+<a name="ln385">	}</a>
+<a name="ln386"> </a>
+<a name="ln387">	Unset();</a>
+<a name="ln388"> </a>
+<a name="ln389">	InternalSetTo(NULL, 0LL);</a>
+<a name="ln390">	return (bplustree_header*)fNode;</a>
+<a name="ln391">}</a>
+<a name="ln392"> </a>
+<a name="ln393"> </a>
+<a name="ln394">#if !_BOOT_MODE</a>
+<a name="ln395">bplustree_header*</a>
+<a name="ln396">CachedNode::SetToWritableHeader(Transaction&amp; transaction)</a>
+<a name="ln397">{</a>
+<a name="ln398">	if (fTree == NULL || fTree-&gt;fStream == NULL) {</a>
+<a name="ln399">		REPORT_ERROR(B_BAD_VALUE);</a>
+<a name="ln400">		return NULL;</a>
+<a name="ln401">	}</a>
+<a name="ln402"> </a>
+<a name="ln403">	Unset();</a>
+<a name="ln404"> </a>
+<a name="ln405">	InternalSetTo(&amp;transaction, 0LL);</a>
+<a name="ln406"> </a>
+<a name="ln407">	if (fNode != NULL &amp;&amp; !fTree-&gt;fInTransaction) {</a>
+<a name="ln408">		transaction.AddListener(fTree);</a>
+<a name="ln409">		fTree-&gt;fInTransaction = true;</a>
+<a name="ln410"> </a>
+<a name="ln411">		if (!transaction.GetVolume()-&gt;IsInitializing()) {</a>
+<a name="ln412">			acquire_vnode(transaction.GetVolume()-&gt;FSVolume(),</a>
+<a name="ln413">				fTree-&gt;fStream-&gt;ID());</a>
+<a name="ln414">		}</a>
+<a name="ln415">	}</a>
+<a name="ln416"> </a>
+<a name="ln417">	return (bplustree_header*)fNode;</a>
+<a name="ln418">}</a>
+<a name="ln419">#endif // !_BOOT_MODE</a>
+<a name="ln420"> </a>
+<a name="ln421"> </a>
+<a name="ln422">bplustree_node*</a>
+<a name="ln423">CachedNode::InternalSetTo(Transaction* transaction, off_t offset)</a>
+<a name="ln424">{</a>
+<a name="ln425">	fNode = NULL;</a>
+<a name="ln426">	fOffset = offset;</a>
+<a name="ln427"> </a>
+<a name="ln428">	off_t fileOffset;</a>
+<a name="ln429">	block_run run;</a>
+<a name="ln430">	if (offset &lt; fTree-&gt;fStream-&gt;Size()</a>
+<a name="ln431">		&amp;&amp; fTree-&gt;fStream-&gt;FindBlockRun(offset, run, fileOffset) == B_OK) {</a>
+<a name="ln432"> </a>
+<a name="ln433">#if !_BOOT_MODE</a>
+<a name="ln434">		Volume* volume = fTree-&gt;fStream-&gt;GetVolume();</a>
+<a name="ln435">#else</a>
+<a name="ln436">		Volume* volume = &amp;fTree-&gt;fStream-&gt;GetVolume();</a>
+<a name="ln437">#endif</a>
+<a name="ln438"> </a>
+<a name="ln439">		int32 blockOffset = (offset - fileOffset) / volume-&gt;BlockSize();</a>
+<a name="ln440">		fBlockNumber = volume-&gt;ToBlock(run) + blockOffset;</a>
+<a name="ln441">		uint8* block = NULL;</a>
+<a name="ln442"> </a>
+<a name="ln443">#if !_BOOT_MODE</a>
+<a name="ln444">		if (transaction != NULL) {</a>
+<a name="ln445">			block = (uint8*)block_cache_get_writable(volume-&gt;BlockCache(),</a>
+<a name="ln446">				fBlockNumber, transaction-&gt;ID());</a>
+<a name="ln447">			fWritable = true;</a>
+<a name="ln448">		} else {</a>
+<a name="ln449">			block = (uint8*)block_cache_get(volume-&gt;BlockCache(), fBlockNumber);</a>
+<a name="ln450">			fWritable = false;</a>
+<a name="ln451">		}</a>
+<a name="ln452">#else // !_BOOT_MODE</a>
+<a name="ln453">		if (fBlock == NULL) {</a>
+<a name="ln454">			fBlock = (uint8*)malloc(volume-&gt;BlockSize());</a>
+<a name="ln455">			if (fBlock == NULL)</a>
+<a name="ln456">				return NULL;</a>
+<a name="ln457">		}</a>
+<a name="ln458"> </a>
+<a name="ln459">		if (read_pos(volume-&gt;Device(), fBlockNumber &lt;&lt; volume-&gt;BlockShift(),</a>
+<a name="ln460">				fBlock, volume-&gt;BlockSize()) == (ssize_t)volume-&gt;BlockSize()) {</a>
+<a name="ln461">			block = fBlock;</a>
+<a name="ln462">		}</a>
+<a name="ln463"> </a>
+<a name="ln464">		fWritable = false;</a>
+<a name="ln465">#endif // _BOOT_MODE</a>
+<a name="ln466"> </a>
+<a name="ln467">		if (block != NULL) {</a>
+<a name="ln468">			// The node is somewhere in that block...</a>
+<a name="ln469">			// (confusing offset calculation)</a>
+<a name="ln470">			fNode = (bplustree_node*)(block + offset</a>
+<a name="ln471">				- (fileOffset + (blockOffset &lt;&lt; volume-&gt;BlockShift())));</a>
+<a name="ln472">		} else</a>
+<a name="ln473">			REPORT_ERROR(B_IO_ERROR);</a>
+<a name="ln474">	}</a>
+<a name="ln475">	return fNode;</a>
+<a name="ln476">}</a>
+<a name="ln477"> </a>
+<a name="ln478"> </a>
+<a name="ln479">#if !_BOOT_MODE</a>
+<a name="ln480">status_t</a>
+<a name="ln481">CachedNode::Free(Transaction&amp; transaction, off_t offset)</a>
+<a name="ln482">{</a>
+<a name="ln483">	if (fTree == NULL || fTree-&gt;fStream == NULL || offset == BPLUSTREE_NULL)</a>
+<a name="ln484">		RETURN_ERROR(B_BAD_VALUE);</a>
+<a name="ln485"> </a>
+<a name="ln486">	// TODO: scan the free nodes list and remove all nodes at the end</a>
+<a name="ln487">	// of the tree - perhaps that shouldn't be done everytime that</a>
+<a name="ln488">	// function is called, perhaps it should be done when the directory</a>
+<a name="ln489">	// inode is closed or based on some calculation or whatever...</a>
+<a name="ln490"> </a>
+<a name="ln491">	CachedNode cached(fTree);</a>
+<a name="ln492">	bplustree_header* header = cached.SetToWritableHeader(transaction);</a>
+<a name="ln493">	if (header == NULL)</a>
+<a name="ln494">		return B_IO_ERROR;</a>
+<a name="ln495"> </a>
+<a name="ln496">#if 0</a>
+<a name="ln497">	// TODO: temporarily disabled because CheckNode() doesn't like this...</a>
+<a name="ln498">	// 		Also, it's such an edge case that it's almost useless, anyway.</a>
+<a name="ln499">	// if the node is the last one in the tree, we shrink</a>
+<a name="ln500">	// the tree and file size by one node</a>
+<a name="ln501">	off_t lastOffset = header-&gt;MaximumSize() - fTree-&gt;fNodeSize;</a>
+<a name="ln502">	if (offset == lastOffset) {</a>
+<a name="ln503">		status_t status = fTree-&gt;fStream-&gt;SetFileSize(transaction, lastOffset);</a>
+<a name="ln504">		if (status != B_OK)</a>
+<a name="ln505">			return status;</a>
+<a name="ln506"> </a>
+<a name="ln507">		header-&gt;maximum_size = HOST_ENDIAN_TO_BFS_INT64(lastOffset);</a>
+<a name="ln508">		return B_OK;</a>
+<a name="ln509">	}</a>
+<a name="ln510">#endif</a>
+<a name="ln511"> </a>
+<a name="ln512">	// add the node to the free nodes list</a>
+<a name="ln513">	fNode-&gt;left_link = header-&gt;free_node_pointer;</a>
+<a name="ln514">	fNode-&gt;overflow_link = HOST_ENDIAN_TO_BFS_INT64((uint64)BPLUSTREE_FREE);</a>
+<a name="ln515"> </a>
+<a name="ln516">	header-&gt;free_node_pointer = HOST_ENDIAN_TO_BFS_INT64(offset);</a>
+<a name="ln517">	return B_OK;</a>
+<a name="ln518">}</a>
+<a name="ln519"> </a>
+<a name="ln520"> </a>
+<a name="ln521">status_t</a>
+<a name="ln522">CachedNode::Allocate(Transaction&amp; transaction, bplustree_node** _node,</a>
+<a name="ln523">	off_t* _offset)</a>
+<a name="ln524">{</a>
+<a name="ln525">	if (fTree == NULL || fTree-&gt;fStream == NULL)</a>
+<a name="ln526">		RETURN_ERROR(B_BAD_VALUE);</a>
+<a name="ln527"> </a>
+<a name="ln528">	Unset();</a>
+<a name="ln529"> </a>
+<a name="ln530">	bplustree_header* header;</a>
+<a name="ln531">	status_t status;</a>
+<a name="ln532"> </a>
+<a name="ln533">	// if there are any free nodes, recycle them</a>
+<a name="ln534">	if (SetToWritable(transaction, fTree-&gt;fHeader.FreeNode(), false) != NULL) {</a>
+<a name="ln535">		CachedNode cached(fTree);</a>
+<a name="ln536">		header = cached.SetToWritableHeader(transaction);</a>
+<a name="ln537">		if (header == NULL)</a>
+<a name="ln538">			return B_IO_ERROR;</a>
+<a name="ln539"> </a>
+<a name="ln540">		*_offset = header-&gt;FreeNode();</a>
+<a name="ln541">		*_node = fNode;</a>
+<a name="ln542"> </a>
+<a name="ln543">		// set new free node pointer</a>
+<a name="ln544">		header-&gt;free_node_pointer = fNode-&gt;left_link;</a>
+<a name="ln545">		fNode-&gt;Initialize();</a>
+<a name="ln546">		return B_OK;</a>
+<a name="ln547">	}</a>
+<a name="ln548"> </a>
+<a name="ln549">	// allocate space for a new node</a>
+<a name="ln550">	Inode* stream = fTree-&gt;fStream;</a>
+<a name="ln551">	if ((status = stream-&gt;Append(transaction, fTree-&gt;fNodeSize)) != B_OK)</a>
+<a name="ln552">		return status;</a>
+<a name="ln553"> </a>
+<a name="ln554">	CachedNode cached(fTree);</a>
+<a name="ln555">	header = cached.SetToWritableHeader(transaction);</a>
+<a name="ln556">	if (header == NULL)</a>
+<a name="ln557">		return B_IO_ERROR;</a>
+<a name="ln558"> </a>
+<a name="ln559">	// the maximum_size has to be changed before the call to SetTo() - or</a>
+<a name="ln560">	// else it will fail because the requested node is out of bounds</a>
+<a name="ln561">	off_t offset = header-&gt;MaximumSize();</a>
+<a name="ln562">	header-&gt;maximum_size = HOST_ENDIAN_TO_BFS_INT64(header-&gt;MaximumSize()</a>
+<a name="ln563">		+ fTree-&gt;fNodeSize);</a>
+<a name="ln564"> </a>
+<a name="ln565">	cached.Unset();</a>
+<a name="ln566">		// SetToWritable() below needs the new values in the tree's header</a>
+<a name="ln567"> </a>
+<a name="ln568">	if (SetToWritable(transaction, offset, false) == NULL)</a>
+<a name="ln569">		RETURN_ERROR(B_ERROR);</a>
+<a name="ln570"> </a>
+<a name="ln571">	fNode-&gt;Initialize();</a>
+<a name="ln572"> </a>
+<a name="ln573">	*_offset = offset;</a>
+<a name="ln574">	*_node = fNode;</a>
+<a name="ln575">	return B_OK;</a>
+<a name="ln576">}</a>
+<a name="ln577"> </a>
+<a name="ln578"> </a>
+<a name="ln579">//	#pragma mark -</a>
+<a name="ln580"> </a>
+<a name="ln581"> </a>
+<a name="ln582">BPlusTree::BPlusTree(Transaction&amp; transaction, Inode* stream, int32 nodeSize)</a>
+<a name="ln583">	:</a>
+<a name="ln584">	fStream(NULL),</a>
+<a name="ln585">	fInTransaction(false)</a>
+<a name="ln586">{</a>
+<a name="ln587">	mutex_init(&amp;fIteratorLock, &quot;bfs b+tree iterator&quot;);</a>
+<a name="ln588">	SetTo(transaction, stream);</a>
+<a name="ln589">}</a>
+<a name="ln590">#endif // !_BOOT_MODE</a>
+<a name="ln591"> </a>
+<a name="ln592"> </a>
+<a name="ln593">BPlusTree::BPlusTree(Inode* stream)</a>
+<a name="ln594">	:</a>
+<a name="ln595">	fStream(NULL),</a>
+<a name="ln596">	fInTransaction(false)</a>
+<a name="ln597">{</a>
+<a name="ln598">#if !_BOOT_MODE</a>
+<a name="ln599">	mutex_init(&amp;fIteratorLock, &quot;bfs b+tree iterator&quot;);</a>
+<a name="ln600">#endif</a>
+<a name="ln601"> </a>
+<a name="ln602">	SetTo(stream);</a>
+<a name="ln603">}</a>
+<a name="ln604"> </a>
+<a name="ln605"> </a>
+<a name="ln606">BPlusTree::BPlusTree()</a>
+<a name="ln607">	:</a>
+<a name="ln608">	fStream(NULL),</a>
+<a name="ln609">	fNodeSize(BPLUSTREE_NODE_SIZE),</a>
+<a name="ln610">	fAllowDuplicates(true),</a>
+<a name="ln611">	fInTransaction(false),</a>
+<a name="ln612">	fStatus(B_NO_INIT)</a>
+<a name="ln613">{</a>
+<a name="ln614">#if !_BOOT_MODE</a>
+<a name="ln615">	mutex_init(&amp;fIteratorLock, &quot;bfs b+tree iterator&quot;);</a>
+<a name="ln616">#endif</a>
+<a name="ln617">}</a>
+<a name="ln618"> </a>
+<a name="ln619"> </a>
+<a name="ln620">BPlusTree::~BPlusTree()</a>
+<a name="ln621">{</a>
+<a name="ln622">#if !_BOOT_MODE</a>
+<a name="ln623">	// if there are any TreeIterators left, we need to stop them</a>
+<a name="ln624">	// (can happen when the tree's inode gets deleted while</a>
+<a name="ln625">	// traversing the tree - a TreeIterator doesn't lock the inode)</a>
+<a name="ln626">	mutex_lock(&amp;fIteratorLock);</a>
+<a name="ln627"> </a>
+<a name="ln628">	SinglyLinkedList&lt;TreeIterator&gt;::Iterator iterator</a>
+<a name="ln629">		= fIterators.GetIterator();</a>
+<a name="ln630">	while (iterator.HasNext())</a>
+<a name="ln631">		iterator.Next()-&gt;Stop();</a>
+<a name="ln632"> </a>
+<a name="ln633">	mutex_destroy(&amp;fIteratorLock);</a>
+<a name="ln634"> </a>
+<a name="ln635">	ASSERT(!fInTransaction);</a>
+<a name="ln636">#endif // !_BOOT_MODE</a>
+<a name="ln637">}</a>
+<a name="ln638"> </a>
+<a name="ln639"> </a>
+<a name="ln640">#if !_BOOT_MODE</a>
+<a name="ln641">/*! Create a new B+Tree on the specified stream */</a>
+<a name="ln642">status_t</a>
+<a name="ln643">BPlusTree::SetTo(Transaction&amp; transaction, Inode* stream, int32 nodeSize)</a>
+<a name="ln644">{</a>
+<a name="ln645">	// initializes in-memory B+Tree</a>
+<a name="ln646"> </a>
+<a name="ln647">	fStream = stream;</a>
+<a name="ln648"> </a>
+<a name="ln649">	CachedNode cached(this);</a>
+<a name="ln650">	bplustree_header* header = cached.SetToWritableHeader(transaction);</a>
+<a name="ln651">	if (header == NULL) {</a>
+<a name="ln652">		// allocate space for new header + node!</a>
+<a name="ln653">		fStatus = stream-&gt;SetFileSize(transaction, nodeSize * 2);</a>
+<a name="ln654">		if (fStatus != B_OK)</a>
+<a name="ln655">			RETURN_ERROR(fStatus);</a>
+<a name="ln656"> </a>
+<a name="ln657">		header = cached.SetToWritableHeader(transaction);</a>
+<a name="ln658">		if (header == NULL)</a>
+<a name="ln659">			RETURN_ERROR(fStatus = B_ERROR);</a>
+<a name="ln660">	}</a>
+<a name="ln661"> </a>
+<a name="ln662">	fAllowDuplicates = stream-&gt;IsIndex()</a>
+<a name="ln663">		|| (stream-&gt;Mode() &amp; S_ALLOW_DUPS) != 0;</a>
+<a name="ln664"> </a>
+<a name="ln665">	fNodeSize = nodeSize;</a>
+<a name="ln666"> </a>
+<a name="ln667">	// initialize b+tree header</a>
+<a name="ln668"> 	header-&gt;magic = HOST_ENDIAN_TO_BFS_INT32(BPLUSTREE_MAGIC);</a>
+<a name="ln669"> 	header-&gt;node_size = HOST_ENDIAN_TO_BFS_INT32(fNodeSize);</a>
+<a name="ln670"> 	header-&gt;max_number_of_levels = HOST_ENDIAN_TO_BFS_INT32(1);</a>
+<a name="ln671"> 	header-&gt;data_type = HOST_ENDIAN_TO_BFS_INT32(ModeToKeyType(stream-&gt;Mode()));</a>
+<a name="ln672"> 	header-&gt;root_node_pointer = HOST_ENDIAN_TO_BFS_INT64(nodeSize);</a>
+<a name="ln673"> 	header-&gt;free_node_pointer</a>
+<a name="ln674"> 		= HOST_ENDIAN_TO_BFS_INT64((uint64)BPLUSTREE_NULL);</a>
+<a name="ln675"> 	header-&gt;maximum_size = HOST_ENDIAN_TO_BFS_INT64(nodeSize * 2);</a>
+<a name="ln676"> </a>
+<a name="ln677">	cached.Unset();</a>
+<a name="ln678"> </a>
+<a name="ln679">	// initialize b+tree root node</a>
+<a name="ln680">	cached.SetToWritable(transaction, fHeader.RootNode(), false);</a>
+<a name="ln681">	if (cached.Node() == NULL)</a>
+<a name="ln682">		RETURN_ERROR(B_IO_ERROR);</a>
+<a name="ln683"> </a>
+<a name="ln684">	cached.Node()-&gt;Initialize();</a>
+<a name="ln685"> </a>
+<a name="ln686">	return fStatus = B_OK;</a>
+<a name="ln687">}</a>
+<a name="ln688">#endif // !_BOOT_MODE</a>
+<a name="ln689"> </a>
+<a name="ln690"> </a>
+<a name="ln691">status_t</a>
+<a name="ln692">BPlusTree::SetTo(Inode* stream)</a>
+<a name="ln693">{</a>
+<a name="ln694">	if (stream == NULL)</a>
+<a name="ln695">		RETURN_ERROR(fStatus = B_BAD_VALUE);</a>
+<a name="ln696"> </a>
+<a name="ln697">	fStream = stream;</a>
+<a name="ln698"> </a>
+<a name="ln699">	// get on-disk B+Tree header</a>
+<a name="ln700"> </a>
+<a name="ln701">	CachedNode cached(this);</a>
+<a name="ln702">	const bplustree_header* header = cached.SetToHeader();</a>
+<a name="ln703">	if (header != NULL)</a>
+<a name="ln704">		memcpy(&amp;fHeader, header, sizeof(bplustree_header));</a>
+<a name="ln705">	else</a>
+<a name="ln706">		RETURN_ERROR(fStatus = B_IO_ERROR);</a>
+<a name="ln707"> </a>
+<a name="ln708">	// is header valid?</a>
+<a name="ln709"> </a>
+<a name="ln710">	if (fHeader.MaximumSize() != stream-&gt;Size()) {</a>
+<a name="ln711">		dprintf(&quot;B+tree header size %&quot; B_PRIdOFF &quot; doesn't fit file size %&quot;</a>
+<a name="ln712">			B_PRIdOFF &quot;!\n&quot;, fHeader.MaximumSize(), stream-&gt;Size());</a>
+<a name="ln713">		// we can't change the header since we don't have a transaction</a>
+<a name="ln714">		//fHeader.maximum_size = HOST_ENDIAN_TO_BFS_INT64(stream-&gt;Size());</a>
+<a name="ln715">	}</a>
+<a name="ln716">	if (!fHeader.IsValid()) {</a>
+<a name="ln717">#ifdef DEBUG</a>
+<a name="ln718">		dump_bplustree_header(&amp;fHeader);</a>
+<a name="ln719">		dump_block((const char*)&amp;fHeader, 128);</a>
+<a name="ln720">#endif</a>
+<a name="ln721">		RETURN_ERROR(fStatus = B_BAD_DATA);</a>
+<a name="ln722">	}</a>
+<a name="ln723"> </a>
+<a name="ln724">	fNodeSize = fHeader.NodeSize();</a>
+<a name="ln725"> </a>
+<a name="ln726">	// validity check</a>
+<a name="ln727">	static const uint32 kToMode[] = {S_STR_INDEX, S_INT_INDEX, S_UINT_INDEX,</a>
+<a name="ln728">		S_LONG_LONG_INDEX, S_ULONG_LONG_INDEX, S_FLOAT_INDEX,</a>
+<a name="ln729">		S_DOUBLE_INDEX};</a>
+<a name="ln730">	uint32 mode = stream-&gt;Mode() &amp; (S_STR_INDEX | S_INT_INDEX</a>
+<a name="ln731">		| S_UINT_INDEX | S_LONG_LONG_INDEX | S_ULONG_LONG_INDEX</a>
+<a name="ln732">		| S_FLOAT_INDEX | S_DOUBLE_INDEX);</a>
+<a name="ln733"> </a>
+<a name="ln734">	if (fHeader.DataType() &gt; BPLUSTREE_DOUBLE_TYPE</a>
+<a name="ln735">		|| ((stream-&gt;Mode() &amp; S_INDEX_DIR) != 0</a>
+<a name="ln736">			&amp;&amp; kToMode[fHeader.DataType()] != mode)</a>
+<a name="ln737">		|| !stream-&gt;IsContainer()) {</a>
+<a name="ln738">		D(	dump_bplustree_header(&amp;fHeader);</a>
+<a name="ln739">			dump_inode(&amp;stream-&gt;Node());</a>
+<a name="ln740">		);</a>
+<a name="ln741">		RETURN_ERROR(fStatus = B_BAD_TYPE);</a>
+<a name="ln742">	}</a>
+<a name="ln743"> </a>
+<a name="ln744">	// although it's in stat.h, the S_ALLOW_DUPS flag is obviously unused</a>
+<a name="ln745">	// in the original BFS code - we will honour it nevertheless</a>
+<a name="ln746">	fAllowDuplicates = stream-&gt;IsIndex()</a>
+<a name="ln747">		|| (stream-&gt;Mode() &amp; S_ALLOW_DUPS) != 0;</a>
+<a name="ln748"> </a>
+<a name="ln749">	cached.SetTo(fHeader.RootNode());</a>
+<a name="ln750">	RETURN_ERROR(fStatus = cached.Node() ? B_OK : B_BAD_DATA);</a>
+<a name="ln751">}</a>
+<a name="ln752"> </a>
+<a name="ln753"> </a>
+<a name="ln754">status_t</a>
+<a name="ln755">BPlusTree::InitCheck()</a>
+<a name="ln756">{</a>
+<a name="ln757">	return fStatus;</a>
+<a name="ln758">}</a>
+<a name="ln759"> </a>
+<a name="ln760"> </a>
+<a name="ln761">#if !_BOOT_MODE</a>
+<a name="ln762">status_t</a>
+<a name="ln763">BPlusTree::Validate(bool repair, bool&amp; _errorsFound)</a>
+<a name="ln764">{</a>
+<a name="ln765">	TreeCheck check(this);</a>
+<a name="ln766">	if (check.InitCheck() != B_OK)</a>
+<a name="ln767">		return B_NO_MEMORY;</a>
+<a name="ln768"> </a>
+<a name="ln769">	check.SetVisited(0);</a>
+<a name="ln770"> </a>
+<a name="ln771">	// Walk the free nodes</a>
+<a name="ln772"> </a>
+<a name="ln773">	CachedNode cached(this);</a>
+<a name="ln774">	off_t freeOffset = fHeader.FreeNode();</a>
+<a name="ln775">	while (freeOffset &gt; 0) {</a>
+<a name="ln776">		const bplustree_node* node;</a>
+<a name="ln777">		status_t status = cached.SetTo(freeOffset, &amp;node, false);</a>
+<a name="ln778">		if (status != B_OK) {</a>
+<a name="ln779">			if (status == B_IO_ERROR)</a>
+<a name="ln780">				return B_IO_ERROR;</a>
+<a name="ln781"> </a>
+<a name="ln782">			dprintf(&quot;inode %&quot; B_PRIdOFF &quot;: free node at %&quot; B_PRIdOFF &quot; could &quot;</a>
+<a name="ln783">				&quot;not be read: %s\n&quot;, fStream-&gt;ID(), freeOffset,</a>
+<a name="ln784">				strerror(status));</a>
+<a name="ln785">			check.FoundError();</a>
+<a name="ln786">			break;</a>
+<a name="ln787">		}</a>
+<a name="ln788"> </a>
+<a name="ln789">		if (check.Visited(freeOffset)) {</a>
+<a name="ln790">			dprintf(&quot;inode %&quot; B_PRIdOFF &quot;: free node at %&quot; B_PRIdOFF</a>
+<a name="ln791">				&quot; circular!\n&quot;, fStream-&gt;ID(), freeOffset);</a>
+<a name="ln792">			// TODO: if 'repair' is true, we could collect all unvisited nodes</a>
+<a name="ln793">			// at the end, and put the into the free list</a>
+<a name="ln794">			check.FoundError();</a>
+<a name="ln795">			break;</a>
+<a name="ln796">		}</a>
+<a name="ln797"> </a>
+<a name="ln798">		check.SetVisited(freeOffset);</a>
+<a name="ln799"> </a>
+<a name="ln800">		if (node-&gt;OverflowLink() != BPLUSTREE_FREE) {</a>
+<a name="ln801">			dprintf(&quot;inode %&quot; B_PRIdOFF &quot;: free node at %&quot; B_PRIdOFF</a>
+<a name="ln802">				&quot; misses free mark!\n&quot;, fStream-&gt;ID(), freeOffset);</a>
+<a name="ln803">		}</a>
+<a name="ln804">		freeOffset = node-&gt;LeftLink();</a>
+<a name="ln805">	}</a>
+<a name="ln806"> </a>
+<a name="ln807">	// Iterate over the complete tree recursively</a>
+<a name="ln808"> </a>
+<a name="ln809">	const bplustree_node* root;</a>
+<a name="ln810">	status_t status = cached.SetTo(fHeader.RootNode(), &amp;root, true);</a>
+<a name="ln811">	if (status != B_OK)</a>
+<a name="ln812">		return status;</a>
+<a name="ln813"> </a>
+<a name="ln814">	status = _ValidateChildren(check, 0, fHeader.RootNode(), NULL, 0, root);</a>
+<a name="ln815"> </a>
+<a name="ln816">	if (check.ErrorsFound())</a>
+<a name="ln817">		_errorsFound = true;</a>
+<a name="ln818"> </a>
+<a name="ln819">	if (status != B_OK)</a>
+<a name="ln820">		return status;</a>
+<a name="ln821"> </a>
+<a name="ln822">	if (check.MaxLevels() + 1 != fHeader.MaxNumberOfLevels()) {</a>
+<a name="ln823">		dprintf(&quot;inode %&quot; B_PRIdOFF &quot;: found %&quot; B_PRIu32 &quot; max levels, &quot;</a>
+<a name="ln824">			&quot;declared %&quot; B_PRIu32 &quot;!\n&quot;, fStream-&gt;ID(), check.MaxLevels(),</a>
+<a name="ln825">			fHeader.MaxNumberOfLevels());</a>
+<a name="ln826">	}</a>
+<a name="ln827"> </a>
+<a name="ln828">	if ((off_t)check.VisitedCount() != fHeader.MaximumSize() / fNodeSize) {</a>
+<a name="ln829">		dprintf(&quot;inode %&quot; B_PRIdOFF &quot;: visited %&quot; B_PRIuSIZE &quot; from %&quot; B_PRIdOFF</a>
+<a name="ln830">			&quot; nodes.\n&quot;, fStream-&gt;ID(), check.VisitedCount(),</a>
+<a name="ln831">			fHeader.MaximumSize() / fNodeSize);</a>
+<a name="ln832">	}</a>
+<a name="ln833"> </a>
+<a name="ln834">	return B_OK;</a>
+<a name="ln835">}</a>
+<a name="ln836"> </a>
+<a name="ln837"> </a>
+<a name="ln838">status_t</a>
+<a name="ln839">BPlusTree::MakeEmpty()</a>
+<a name="ln840">{</a>
+<a name="ln841">	// Put all nodes into the free list in order</a>
+<a name="ln842">	Transaction transaction(fStream-&gt;GetVolume(), fStream-&gt;BlockNumber());</a>
+<a name="ln843"> </a>
+<a name="ln844">	// Reset the header, and root node</a>
+<a name="ln845">	CachedNode cached(this);</a>
+<a name="ln846">	bplustree_header* header = cached.SetToWritableHeader(transaction);</a>
+<a name="ln847">	if (header == NULL)</a>
+<a name="ln848">		return B_IO_ERROR;</a>
+<a name="ln849"> </a>
+<a name="ln850">	header-&gt;max_number_of_levels = HOST_ENDIAN_TO_BFS_INT32(1);</a>
+<a name="ln851">	header-&gt;root_node_pointer = HOST_ENDIAN_TO_BFS_INT64(NodeSize());</a>
+<a name="ln852">	if (fStream-&gt;Size() &gt; (off_t)NodeSize() * 2)</a>
+<a name="ln853">		header-&gt;free_node_pointer = HOST_ENDIAN_TO_BFS_INT64(2 * NodeSize());</a>
+<a name="ln854">	else {</a>
+<a name="ln855">		header-&gt;free_node_pointer</a>
+<a name="ln856">			= HOST_ENDIAN_TO_BFS_INT64((uint64)BPLUSTREE_NULL);</a>
+<a name="ln857">	}</a>
+<a name="ln858"> </a>
+<a name="ln859">	bplustree_node* node = cached.SetToWritable(transaction, NodeSize(), false);</a>
+<a name="ln860">	if (node == NULL)</a>
+<a name="ln861">		return B_IO_ERROR;</a>
+<a name="ln862"> </a>
+<a name="ln863">	node-&gt;left_link = HOST_ENDIAN_TO_BFS_INT64((uint64)BPLUSTREE_NULL);</a>
+<a name="ln864">	node-&gt;right_link = HOST_ENDIAN_TO_BFS_INT64((uint64)BPLUSTREE_NULL);</a>
+<a name="ln865">	node-&gt;overflow_link = HOST_ENDIAN_TO_BFS_INT64((uint64)BPLUSTREE_NULL);</a>
+<a name="ln866">	node-&gt;all_key_count = 0;</a>
+<a name="ln867">	node-&gt;all_key_length = 0;</a>
+<a name="ln868"> </a>
+<a name="ln869">	for (off_t offset = 2 * NodeSize(); offset &lt; fStream-&gt;Size();</a>
+<a name="ln870">			offset += NodeSize()) {</a>
+<a name="ln871">		bplustree_node* node = cached.SetToWritable(transaction, offset, false);</a>
+<a name="ln872">		if (node == NULL) {</a>
+<a name="ln873">			dprintf(&quot;--&gt; could not open %&quot; B_PRIdOFF &quot;\n&quot;, offset);</a>
+<a name="ln874">			return B_IO_ERROR;</a>
+<a name="ln875">		}</a>
+<a name="ln876">		if (offset &lt; fStream-&gt;Size() - (off_t)NodeSize())</a>
+<a name="ln877">			node-&gt;left_link = HOST_ENDIAN_TO_BFS_INT64(offset + NodeSize());</a>
+<a name="ln878">		else</a>
+<a name="ln879">			node-&gt;left_link = HOST_ENDIAN_TO_BFS_INT64((uint64)BPLUSTREE_NULL);</a>
+<a name="ln880"> </a>
+<a name="ln881">		node-&gt;overflow_link = HOST_ENDIAN_TO_BFS_INT64((uint64)BPLUSTREE_FREE);</a>
+<a name="ln882"> </a>
+<a name="ln883">		// It's not important to write it out in a single transaction; just</a>
+<a name="ln884">		// make sure it doesn't get too large</a>
+<a name="ln885">		if (offset % (1024 * 1024) == 0) {</a>
+<a name="ln886">			transaction.Done();</a>
+<a name="ln887">			transaction.Start(fStream-&gt;GetVolume(), fStream-&gt;BlockNumber());</a>
+<a name="ln888">		}</a>
+<a name="ln889">	}</a>
+<a name="ln890"> </a>
+<a name="ln891">	return transaction.Done();</a>
+<a name="ln892">}</a>
+<a name="ln893"> </a>
+<a name="ln894"> </a>
+<a name="ln895">int32</a>
+<a name="ln896">BPlusTree::TypeCodeToKeyType(type_code code)</a>
+<a name="ln897">{</a>
+<a name="ln898">	switch (code) {</a>
+<a name="ln899">		case B_STRING_TYPE:</a>
+<a name="ln900">			return BPLUSTREE_STRING_TYPE;</a>
+<a name="ln901">		case B_SSIZE_T_TYPE:</a>
+<a name="ln902">		case B_INT32_TYPE:</a>
+<a name="ln903">			return BPLUSTREE_INT32_TYPE;</a>
+<a name="ln904">		case B_SIZE_T_TYPE:</a>
+<a name="ln905">		case B_UINT32_TYPE:</a>
+<a name="ln906">			return BPLUSTREE_UINT32_TYPE;</a>
+<a name="ln907">		case B_OFF_T_TYPE:</a>
+<a name="ln908">		case B_INT64_TYPE:</a>
+<a name="ln909">			return BPLUSTREE_INT64_TYPE;</a>
+<a name="ln910">		case B_UINT64_TYPE:</a>
+<a name="ln911">			return BPLUSTREE_UINT64_TYPE;</a>
+<a name="ln912">		case B_FLOAT_TYPE:</a>
+<a name="ln913">			return BPLUSTREE_FLOAT_TYPE;</a>
+<a name="ln914">		case B_DOUBLE_TYPE:</a>
+<a name="ln915">			return BPLUSTREE_DOUBLE_TYPE;</a>
+<a name="ln916">	}</a>
+<a name="ln917">	return -1;</a>
+<a name="ln918">}</a>
+<a name="ln919"> </a>
+<a name="ln920"> </a>
+<a name="ln921">int32</a>
+<a name="ln922">BPlusTree::ModeToKeyType(mode_t mode)</a>
+<a name="ln923">{</a>
+<a name="ln924">	switch (mode &amp; (S_STR_INDEX | S_INT_INDEX | S_UINT_INDEX | S_LONG_LONG_INDEX</a>
+<a name="ln925">			| S_ULONG_LONG_INDEX | S_FLOAT_INDEX | S_DOUBLE_INDEX)) {</a>
+<a name="ln926">		case S_INT_INDEX:</a>
+<a name="ln927">			return BPLUSTREE_INT32_TYPE;</a>
+<a name="ln928">		case S_UINT_INDEX:</a>
+<a name="ln929">			return BPLUSTREE_UINT32_TYPE;</a>
+<a name="ln930">		case S_LONG_LONG_INDEX:</a>
+<a name="ln931">			return BPLUSTREE_INT64_TYPE;</a>
+<a name="ln932">		case S_ULONG_LONG_INDEX:</a>
+<a name="ln933">			return BPLUSTREE_UINT64_TYPE;</a>
+<a name="ln934">		case S_FLOAT_INDEX:</a>
+<a name="ln935">			return BPLUSTREE_FLOAT_TYPE;</a>
+<a name="ln936">		case S_DOUBLE_INDEX:</a>
+<a name="ln937">			return BPLUSTREE_DOUBLE_TYPE;</a>
+<a name="ln938">		case S_STR_INDEX:</a>
+<a name="ln939">		default:</a>
+<a name="ln940">			// default is for standard directories</a>
+<a name="ln941">			return BPLUSTREE_STRING_TYPE;</a>
+<a name="ln942">	}</a>
+<a name="ln943">}</a>
+<a name="ln944">#endif // !_BOOT_MODE</a>
+<a name="ln945"> </a>
+<a name="ln946"> </a>
+<a name="ln947">//	#pragma mark - TransactionListener implementation</a>
+<a name="ln948"> </a>
+<a name="ln949"> </a>
+<a name="ln950">#if !_BOOT_MODE</a>
+<a name="ln951">void</a>
+<a name="ln952">BPlusTree::TransactionDone(bool success)</a>
+<a name="ln953">{</a>
+<a name="ln954">	if (!success) {</a>
+<a name="ln955">		// update header from disk</a>
+<a name="ln956">		CachedNode cached(this);</a>
+<a name="ln957">		const bplustree_header* header = cached.SetToHeader();</a>
+<a name="ln958">		if (header != NULL)</a>
+<a name="ln959">			memcpy(&amp;fHeader, header, sizeof(bplustree_header));</a>
+<a name="ln960">	}</a>
+<a name="ln961">}</a>
+<a name="ln962"> </a>
+<a name="ln963"> </a>
+<a name="ln964">void</a>
+<a name="ln965">BPlusTree::RemovedFromTransaction()</a>
+<a name="ln966">{</a>
+<a name="ln967">	fInTransaction = false;</a>
+<a name="ln968"> </a>
+<a name="ln969">	if (!fStream-&gt;GetVolume()-&gt;IsInitializing())</a>
+<a name="ln970">		put_vnode(fStream-&gt;GetVolume()-&gt;FSVolume(), fStream-&gt;ID());</a>
+<a name="ln971">}</a>
+<a name="ln972"> </a>
+<a name="ln973"> </a>
+<a name="ln974">//	#pragma mark -</a>
+<a name="ln975"> </a>
+<a name="ln976"> </a>
+<a name="ln977">void</a>
+<a name="ln978">BPlusTree::_UpdateIterators(off_t offset, off_t nextOffset, uint16 keyIndex,</a>
+<a name="ln979">	uint16 splitAt, int8 change)</a>
+<a name="ln980">{</a>
+<a name="ln981">	// Although every iterator which is affected by this update currently</a>
+<a name="ln982">	// waits on a semaphore, other iterators could be added/removed at</a>
+<a name="ln983">	// any time, so we need to protect this loop</a>
+<a name="ln984">	MutexLocker _(fIteratorLock);</a>
+<a name="ln985"> </a>
+<a name="ln986">	SinglyLinkedList&lt;TreeIterator&gt;::Iterator iterator</a>
+<a name="ln987">		= fIterators.GetIterator();</a>
+<a name="ln988">	while (iterator.HasNext())</a>
+<a name="ln989">		iterator.Next()-&gt;Update(offset, nextOffset, keyIndex, splitAt, change);</a>
+<a name="ln990">}</a>
+<a name="ln991"> </a>
+<a name="ln992"> </a>
+<a name="ln993">void</a>
+<a name="ln994">BPlusTree::_AddIterator(TreeIterator* iterator)</a>
+<a name="ln995">{</a>
+<a name="ln996">	MutexLocker _(fIteratorLock);</a>
+<a name="ln997">	fIterators.Add(iterator);</a>
+<a name="ln998">}</a>
+<a name="ln999"> </a>
+<a name="ln1000"> </a>
+<a name="ln1001">void</a>
+<a name="ln1002">BPlusTree::_RemoveIterator(TreeIterator* iterator)</a>
+<a name="ln1003">{</a>
+<a name="ln1004">	MutexLocker _(fIteratorLock);</a>
+<a name="ln1005">	fIterators.Remove(iterator);</a>
+<a name="ln1006">}</a>
+<a name="ln1007">#endif // !_BOOT_MODE</a>
+<a name="ln1008"> </a>
+<a name="ln1009"> </a>
+<a name="ln1010">int32</a>
+<a name="ln1011">BPlusTree::_CompareKeys(const void* key1, int keyLength1, const void* key2,</a>
+<a name="ln1012">	int keyLength2)</a>
+<a name="ln1013">{</a>
+<a name="ln1014">	type_code type = 0;</a>
+<a name="ln1015">	switch (fHeader.DataType()) {</a>
+<a name="ln1016">	    case BPLUSTREE_STRING_TYPE:</a>
+<a name="ln1017">	    	type = B_STRING_TYPE;</a>
+<a name="ln1018">	    	break;</a>
+<a name="ln1019">		case BPLUSTREE_INT32_TYPE:</a>
+<a name="ln1020">	    	type = B_INT32_TYPE;</a>
+<a name="ln1021">	    	break;</a>
+<a name="ln1022">		case BPLUSTREE_UINT32_TYPE:</a>
+<a name="ln1023">	    	type = B_UINT32_TYPE;</a>
+<a name="ln1024">	    	break;</a>
+<a name="ln1025">		case BPLUSTREE_INT64_TYPE:</a>
+<a name="ln1026">	    	type = B_INT64_TYPE;</a>
+<a name="ln1027">	    	break;</a>
+<a name="ln1028">		case BPLUSTREE_UINT64_TYPE:</a>
+<a name="ln1029">	    	type = B_UINT64_TYPE;</a>
+<a name="ln1030">	    	break;</a>
+<a name="ln1031">		case BPLUSTREE_FLOAT_TYPE:</a>
+<a name="ln1032">	    	type = B_FLOAT_TYPE;</a>
+<a name="ln1033">	    	break;</a>
+<a name="ln1034">		case BPLUSTREE_DOUBLE_TYPE:</a>
+<a name="ln1035">	    	type = B_DOUBLE_TYPE;</a>
+<a name="ln1036">	    	break;</a>
+<a name="ln1037">	}</a>
+<a name="ln1038">	return QueryParser::compareKeys(type, key1, keyLength1, key2, keyLength2);</a>
+<a name="ln1039">}</a>
+<a name="ln1040"> </a>
+<a name="ln1041"> </a>
+<a name="ln1042">status_t</a>
+<a name="ln1043">BPlusTree::_FindKey(const bplustree_node* node, const uint8* key,</a>
+<a name="ln1044">	uint16 keyLength, uint16* _index, off_t* _next)</a>
+<a name="ln1045">{</a>
+<a name="ln1046">#ifdef DEBUG</a>
+<a name="ln1047">	NodeChecker checker(node, fNodeSize, &quot;find&quot;);</a>
+<a name="ln1048">#endif</a>
+<a name="ln1049"> </a>
+<a name="ln1050">	if (node-&gt;all_key_count == 0) {</a>
+<a name="ln1051">		if (_index)</a>
+<a name="ln1052">			*_index = 0;</a>
+<a name="ln1053">		if (_next)</a>
+<a name="ln1054">			*_next = node-&gt;OverflowLink();</a>
+<a name="ln1055">		return B_ENTRY_NOT_FOUND;</a>
+<a name="ln1056">	}</a>
+<a name="ln1057"> </a>
+<a name="ln1058">	off_t* values = node-&gt;Values();</a>
+<a name="ln1059">	int16 saveIndex = -1;</a>
+<a name="ln1060"> </a>
+<a name="ln1061">	// binary search in the key array</a>
+<a name="ln1062">	for (int16 first = 0, last = node-&gt;NumKeys() - 1; first &lt;= last;) {</a>
+<a name="ln1063">		uint16 i = (first + last) &gt;&gt; 1;</a>
+<a name="ln1064"> </a>
+<a name="ln1065">		uint16 searchLength = 0;</a>
+<a name="ln1066">		uint8* searchKey = node-&gt;KeyAt(i, &amp;searchLength);</a>
+<a name="ln1067">		if (searchKey + searchLength + sizeof(off_t) + sizeof(uint16)</a>
+<a name="ln1068">				&gt; (uint8*)node + fNodeSize</a>
+<a name="ln1069">			|| searchLength &gt; BPLUSTREE_MAX_KEY_LENGTH) {</a>
+<a name="ln1070">#if !_BOOT_MODE</a>
+<a name="ln1071">			fStream-&gt;GetVolume()-&gt;Panic();</a>
+<a name="ln1072">#endif</a>
+<a name="ln1073">			RETURN_ERROR(B_BAD_DATA);</a>
+<a name="ln1074">		}</a>
+<a name="ln1075"> </a>
+<a name="ln1076">		int32 cmp = _CompareKeys(key, keyLength, searchKey, searchLength);</a>
+<a name="ln1077">		if (cmp &lt; 0) {</a>
+<a name="ln1078">			last = i - 1;</a>
+<a name="ln1079">			saveIndex = i;</a>
+<a name="ln1080">		} else if (cmp &gt; 0) {</a>
+<a name="ln1081">			saveIndex = first = i + 1;</a>
+<a name="ln1082">		} else {</a>
+<a name="ln1083">			if (_index)</a>
+<a name="ln1084">				*_index = i;</a>
+<a name="ln1085">			if (_next)</a>
+<a name="ln1086">				*_next = BFS_ENDIAN_TO_HOST_INT64(values[i]);</a>
+<a name="ln1087">			return B_OK;</a>
+<a name="ln1088">		}</a>
+<a name="ln1089">	}</a>
+<a name="ln1090"> </a>
+<a name="ln1091">	if (_index)</a>
+<a name="ln1092">		*_index = saveIndex;</a>
+<a name="ln1093">	if (_next) {</a>
+<a name="ln1094">		if (saveIndex == node-&gt;NumKeys())</a>
+<a name="ln1095">			*_next = node-&gt;OverflowLink();</a>
+<a name="ln1096">		else</a>
+<a name="ln1097">			*_next = BFS_ENDIAN_TO_HOST_INT64(values[saveIndex]);</a>
+<a name="ln1098">	}</a>
+<a name="ln1099">	return B_ENTRY_NOT_FOUND;</a>
+<a name="ln1100">}</a>
+<a name="ln1101"> </a>
+<a name="ln1102"> </a>
+<a name="ln1103">#if !_BOOT_MODE</a>
+<a name="ln1104">/*!	Prepares the stack to contain all nodes that were passed while</a>
+<a name="ln1105">	following the key, from the root node to the leaf node that could</a>
+<a name="ln1106">	or should contain that key.</a>
+<a name="ln1107">*/</a>
+<a name="ln1108">status_t</a>
+<a name="ln1109">BPlusTree::_SeekDown(Stack&lt;node_and_key&gt;&amp; stack, const uint8* key,</a>
+<a name="ln1110">	uint16 keyLength)</a>
+<a name="ln1111">{</a>
+<a name="ln1112">	// set the root node to begin with</a>
+<a name="ln1113">	node_and_key nodeAndKey;</a>
+<a name="ln1114">	nodeAndKey.nodeOffset = fHeader.RootNode();</a>
+<a name="ln1115"> </a>
+<a name="ln1116">	CachedNode cached(this);</a>
+<a name="ln1117">	const bplustree_node* node;</a>
+<a name="ln1118">	while ((node = cached.SetTo(nodeAndKey.nodeOffset)) != NULL) {</a>
+<a name="ln1119">		// if we are already on leaf level, we're done</a>
+<a name="ln1120">		if (node-&gt;OverflowLink() == BPLUSTREE_NULL) {</a>
+<a name="ln1121">			// node that the keyIndex is not properly set here (but it's not</a>
+<a name="ln1122">			// needed in the calling functions anyway)!</a>
+<a name="ln1123">			nodeAndKey.keyIndex = 0;</a>
+<a name="ln1124">			stack.Push(nodeAndKey);</a>
+<a name="ln1125">			return B_OK;</a>
+<a name="ln1126">		}</a>
+<a name="ln1127"> </a>
+<a name="ln1128">		off_t nextOffset;</a>
+<a name="ln1129">		status_t status = _FindKey(node, key, keyLength, &amp;nodeAndKey.keyIndex,</a>
+<a name="ln1130">			&amp;nextOffset);</a>
+<a name="ln1131"> </a>
+<a name="ln1132">		if (status == B_ENTRY_NOT_FOUND &amp;&amp; nextOffset == nodeAndKey.nodeOffset)</a>
+<a name="ln1133">			RETURN_ERROR(B_ERROR);</a>
+<a name="ln1134"> </a>
+<a name="ln1135">		if ((uint32)stack.CountItems() &gt; fHeader.MaxNumberOfLevels()) {</a>
+<a name="ln1136">			dprintf(&quot;BPlusTree::_SeekDown() node walked too deep.\n&quot;);</a>
+<a name="ln1137">			break;</a>
+<a name="ln1138">		}</a>
+<a name="ln1139"> </a>
+<a name="ln1140">		// put the node offset &amp; the correct keyIndex on the stack</a>
+<a name="ln1141">		stack.Push(nodeAndKey);</a>
+<a name="ln1142"> </a>
+<a name="ln1143">		nodeAndKey.nodeOffset = nextOffset;</a>
+<a name="ln1144">	}</a>
+<a name="ln1145"> </a>
+<a name="ln1146">	FATAL((&quot;BPlusTree::_SeekDown() could not open node %&quot; B_PRIdOFF &quot;, inode %&quot;</a>
+<a name="ln1147">		B_PRIdOFF &quot;\n&quot;, nodeAndKey.nodeOffset, fStream-&gt;ID()));</a>
+<a name="ln1148">	return B_ERROR;</a>
+<a name="ln1149">}</a>
+<a name="ln1150"> </a>
+<a name="ln1151"> </a>
+<a name="ln1152">/*!	This will find a free duplicate fragment in the given bplustree_node.</a>
+<a name="ln1153">	The CachedNode will be set to the writable fragment on success.</a>
+<a name="ln1154">*/</a>
+<a name="ln1155">status_t</a>
+<a name="ln1156">BPlusTree::_FindFreeDuplicateFragment(Transaction&amp; transaction,</a>
+<a name="ln1157">	const bplustree_node* node, CachedNode&amp; cached,</a>
+<a name="ln1158">	off_t* _offset, bplustree_node** _fragment, uint32* _index)</a>
+<a name="ln1159">{</a>
+<a name="ln1160">	off_t* values = node-&gt;Values();</a>
+<a name="ln1161">	for (int32 i = 0; i &lt; node-&gt;NumKeys(); i++) {</a>
+<a name="ln1162">		off_t value = BFS_ENDIAN_TO_HOST_INT64(values[i]);</a>
+<a name="ln1163"> </a>
+<a name="ln1164">		// does the value link to a duplicate fragment?</a>
+<a name="ln1165">		if (bplustree_node::LinkType(value) != BPLUSTREE_DUPLICATE_FRAGMENT)</a>
+<a name="ln1166">			continue;</a>
+<a name="ln1167"> </a>
+<a name="ln1168">		const bplustree_node* fragment = cached.SetTo(</a>
+<a name="ln1169">			bplustree_node::FragmentOffset(value), false);</a>
+<a name="ln1170">		if (fragment == NULL) {</a>
+<a name="ln1171">			FATAL((&quot;Could not get duplicate fragment at %&quot; B_PRIdOFF &quot;, inode %&quot;</a>
+<a name="ln1172">				B_PRIdOFF &quot;\n&quot;, value, fStream-&gt;ID()));</a>
+<a name="ln1173">			continue;</a>
+<a name="ln1174">		}</a>
+<a name="ln1175"> </a>
+<a name="ln1176">		// see if there is some space left for us</a>
+<a name="ln1177">		uint32 num = bplustree_node::MaxFragments(fNodeSize);</a>
+<a name="ln1178">		for (uint32 j = 0; j &lt; num; j++) {</a>
+<a name="ln1179">			duplicate_array* array = fragment-&gt;FragmentAt(j);</a>
+<a name="ln1180"> </a>
+<a name="ln1181">			if (array-&gt;IsEmpty()) {</a>
+<a name="ln1182">				// found an unused fragment</a>
+<a name="ln1183">				*_fragment = cached.MakeWritable(transaction);</a>
+<a name="ln1184">				if (*_fragment == NULL)</a>
+<a name="ln1185">					return B_IO_ERROR;</a>
+<a name="ln1186"> </a>
+<a name="ln1187">				*_offset = bplustree_node::FragmentOffset(value);</a>
+<a name="ln1188">				*_index = j;</a>
+<a name="ln1189">				return B_OK;</a>
+<a name="ln1190">			}</a>
+<a name="ln1191">		}</a>
+<a name="ln1192">	}</a>
+<a name="ln1193">	return B_ENTRY_NOT_FOUND;</a>
+<a name="ln1194">}</a>
+<a name="ln1195"> </a>
+<a name="ln1196"> </a>
+<a name="ln1197">status_t</a>
+<a name="ln1198">BPlusTree::_InsertDuplicate(Transaction&amp; transaction, CachedNode&amp; cached,</a>
+<a name="ln1199">	const bplustree_node* node, uint16 index, off_t value)</a>
+<a name="ln1200">{</a>
+<a name="ln1201">	CachedNode cachedDuplicate(this);</a>
+<a name="ln1202">	off_t* values = node-&gt;Values();</a>
+<a name="ln1203">	off_t oldValue = BFS_ENDIAN_TO_HOST_INT64(values[index]);</a>
+<a name="ln1204">	status_t status;</a>
+<a name="ln1205">	off_t offset;</a>
+<a name="ln1206"> </a>
+<a name="ln1207">	if (bplustree_node::IsDuplicate(oldValue)) {</a>
+<a name="ln1208">		// If it's a duplicate fragment, try to insert it into that, or if it</a>
+<a name="ln1209">		// doesn't fit anymore, create a new duplicate node</a>
+<a name="ln1210"> </a>
+<a name="ln1211">		if (bplustree_node::LinkType(oldValue)</a>
+<a name="ln1212">				== BPLUSTREE_DUPLICATE_FRAGMENT) {</a>
+<a name="ln1213">			bplustree_node* duplicate = cachedDuplicate.SetToWritable(</a>
+<a name="ln1214">				transaction, bplustree_node::FragmentOffset(oldValue), false);</a>
+<a name="ln1215">			if (duplicate == NULL)</a>
+<a name="ln1216">				return B_IO_ERROR;</a>
+<a name="ln1217"> </a>
+<a name="ln1218">			duplicate_array* array = duplicate-&gt;FragmentAt(</a>
+<a name="ln1219">				bplustree_node::FragmentIndex(oldValue));</a>
+<a name="ln1220">			int32 arrayCount = array-&gt;Count();</a>
+<a name="ln1221">			if (arrayCount &gt; NUM_FRAGMENT_VALUES || arrayCount &lt; 1) {</a>
+<a name="ln1222">				FATAL((&quot;_InsertDuplicate: Invalid array[%d] size in fragment &quot;</a>
+<a name="ln1223">					&quot;%&quot; B_PRIdOFF &quot; == %&quot; B_PRId32 &quot;, inode %&quot; B_PRIdOFF &quot;!\n&quot;,</a>
+<a name="ln1224">					(int)bplustree_node::FragmentIndex(oldValue),</a>
+<a name="ln1225">					bplustree_node::FragmentOffset(oldValue), arrayCount,</a>
+<a name="ln1226">					fStream-&gt;ID()));</a>
+<a name="ln1227">				return B_BAD_DATA;</a>
+<a name="ln1228">			}</a>
+<a name="ln1229"> </a>
+<a name="ln1230">			if (arrayCount &lt; NUM_FRAGMENT_VALUES) {</a>
+<a name="ln1231">				array-&gt;Insert(value);</a>
+<a name="ln1232">			} else {</a>
+<a name="ln1233">				// Test if the fragment will be empty if we remove this key's</a>
+<a name="ln1234">				// values</a>
+<a name="ln1235">				if (duplicate-&gt;FragmentsUsed(fNodeSize) &lt; 2) {</a>
+<a name="ln1236">					// The node will be empty without our values, so let us</a>
+<a name="ln1237">					// reuse it as a duplicate node</a>
+<a name="ln1238">					offset = bplustree_node::FragmentOffset(oldValue);</a>
+<a name="ln1239"> </a>
+<a name="ln1240">					memmove(duplicate-&gt;DuplicateArray(), array,</a>
+<a name="ln1241">						(NUM_FRAGMENT_VALUES + 1) * sizeof(off_t));</a>
+<a name="ln1242">					duplicate-&gt;left_link = duplicate-&gt;right_link</a>
+<a name="ln1243">						= HOST_ENDIAN_TO_BFS_INT64((uint64)BPLUSTREE_NULL);</a>
+<a name="ln1244"> </a>
+<a name="ln1245">					array = duplicate-&gt;DuplicateArray();</a>
+<a name="ln1246">					array-&gt;Insert(value);</a>
+<a name="ln1247">				} else {</a>
+<a name="ln1248">					// Create a new duplicate node</a>
+<a name="ln1249"> </a>
+<a name="ln1250">					cachedDuplicate.UnsetUnchanged(transaction);</a>
+<a name="ln1251">						// The old duplicate has not been touched, so we can</a>
+<a name="ln1252">						// reuse it</a>
+<a name="ln1253"> </a>
+<a name="ln1254">					bplustree_node* newDuplicate;</a>
+<a name="ln1255">					status = cachedDuplicate.Allocate(transaction,</a>
+<a name="ln1256">						&amp;newDuplicate, &amp;offset);</a>
+<a name="ln1257">					if (status != B_OK)</a>
+<a name="ln1258">						RETURN_ERROR(status);</a>
+<a name="ln1259"> </a>
+<a name="ln1260">					// Copy the array from the fragment node to the duplicate</a>
+<a name="ln1261">					// node and free the old entry (by zero'ing all values)</a>
+<a name="ln1262">					newDuplicate-&gt;overflow_link = array-&gt;count;</a>
+<a name="ln1263">					memcpy(&amp;newDuplicate-&gt;all_key_count, &amp;array-&gt;values[0],</a>
+<a name="ln1264">						array-&gt;Count() * sizeof(off_t));</a>
+<a name="ln1265">					memset(array, 0, (NUM_FRAGMENT_VALUES + 1) * sizeof(off_t));</a>
+<a name="ln1266"> </a>
+<a name="ln1267">					array = newDuplicate-&gt;DuplicateArray();</a>
+<a name="ln1268">					array-&gt;Insert(value);</a>
+<a name="ln1269">				}</a>
+<a name="ln1270"> </a>
+<a name="ln1271">				// Update the main pointer to link to a duplicate node</a>
+<a name="ln1272">				if (cached.MakeWritable(transaction) == NULL)</a>
+<a name="ln1273">					return B_IO_ERROR;</a>
+<a name="ln1274"> </a>
+<a name="ln1275">				values[index]</a>
+<a name="ln1276">					= HOST_ENDIAN_TO_BFS_INT64(bplustree_node::MakeLink(</a>
+<a name="ln1277">						BPLUSTREE_DUPLICATE_NODE, offset));</a>
+<a name="ln1278">			}</a>
+<a name="ln1279"> </a>
+<a name="ln1280">			return B_OK;</a>
+<a name="ln1281">		}</a>
+<a name="ln1282"> </a>
+<a name="ln1283">		// Put the value into a dedicated duplicate node</a>
+<a name="ln1284"> </a>
+<a name="ln1285">		// search for free space in the duplicate nodes of that key</a>
+<a name="ln1286">		duplicate_array* array;</a>
+<a name="ln1287">		int32 arrayCount;</a>
+<a name="ln1288">		const bplustree_node* duplicate;</a>
+<a name="ln1289">		off_t duplicateOffset;</a>
+<a name="ln1290">		do {</a>
+<a name="ln1291">			duplicateOffset = bplustree_node::FragmentOffset(oldValue);</a>
+<a name="ln1292">			duplicate = cachedDuplicate.SetTo(duplicateOffset, false);</a>
+<a name="ln1293">			if (duplicate == NULL)</a>
+<a name="ln1294">				return B_IO_ERROR;</a>
+<a name="ln1295"> </a>
+<a name="ln1296">			array = duplicate-&gt;DuplicateArray();</a>
+<a name="ln1297">			arrayCount =array-&gt;Count();</a>
+<a name="ln1298">			if (arrayCount &gt; NUM_DUPLICATE_VALUES || arrayCount &lt; 0) {</a>
+<a name="ln1299">				FATAL((&quot;_InsertDuplicate: Invalid array size in duplicate %&quot;</a>
+<a name="ln1300">					B_PRIdOFF &quot; == %&quot; B_PRId32 &quot;, inode %&quot; B_PRIdOFF &quot;!\n&quot;,</a>
+<a name="ln1301">					duplicateOffset, arrayCount, fStream-&gt;ID()));</a>
+<a name="ln1302">				return B_BAD_DATA;</a>
+<a name="ln1303">			}</a>
+<a name="ln1304">		} while (arrayCount &gt;= NUM_DUPLICATE_VALUES</a>
+<a name="ln1305">				&amp;&amp; (oldValue = duplicate-&gt;RightLink()) != BPLUSTREE_NULL);</a>
+<a name="ln1306"> </a>
+<a name="ln1307">		bplustree_node* writableDuplicate</a>
+<a name="ln1308">			= cachedDuplicate.MakeWritable(transaction);</a>
+<a name="ln1309">		if (writableDuplicate == NULL)</a>
+<a name="ln1310">			return B_IO_ERROR;</a>
+<a name="ln1311"> </a>
+<a name="ln1312">		if (arrayCount &lt; NUM_DUPLICATE_VALUES) {</a>
+<a name="ln1313">			array = writableDuplicate-&gt;DuplicateArray();</a>
+<a name="ln1314">			array-&gt;Insert(value);</a>
+<a name="ln1315">		} else {</a>
+<a name="ln1316">			// no space left - add a new duplicate node</a>
+<a name="ln1317"> </a>
+<a name="ln1318">			bplustree_node* newDuplicate;</a>
+<a name="ln1319">			status = cachedDuplicate.Allocate(transaction, &amp;newDuplicate,</a>
+<a name="ln1320">				&amp;offset);</a>
+<a name="ln1321">			if (status != B_OK)</a>
+<a name="ln1322">				RETURN_ERROR(status);</a>
+<a name="ln1323"> </a>
+<a name="ln1324">			// link the two nodes together</a>
+<a name="ln1325">			writableDuplicate-&gt;right_link = HOST_ENDIAN_TO_BFS_INT64(offset);</a>
+<a name="ln1326">			newDuplicate-&gt;left_link = HOST_ENDIAN_TO_BFS_INT64(duplicateOffset);</a>
+<a name="ln1327"> </a>
+<a name="ln1328">			array = newDuplicate-&gt;DuplicateArray();</a>
+<a name="ln1329">			array-&gt;count = 0;</a>
+<a name="ln1330">			array-&gt;Insert(value);</a>
+<a name="ln1331">		}</a>
+<a name="ln1332">		return B_OK;</a>
+<a name="ln1333">	}</a>
+<a name="ln1334"> </a>
+<a name="ln1335">	// Search for a free duplicate fragment or create a new one</a>
+<a name="ln1336">	// to insert the duplicate value into</a>
+<a name="ln1337"> </a>
+<a name="ln1338">	uint32 fragmentIndex = 0;</a>
+<a name="ln1339">	bplustree_node* fragment;</a>
+<a name="ln1340">	if (_FindFreeDuplicateFragment(transaction, node, cachedDuplicate,</a>
+<a name="ln1341">			&amp;offset, &amp;fragment, &amp;fragmentIndex) != B_OK) {</a>
+<a name="ln1342">		// allocate a new duplicate fragment node</a>
+<a name="ln1343">		status = cachedDuplicate.Allocate(transaction, &amp;fragment, &amp;offset);</a>
+<a name="ln1344">		if (status != B_OK)</a>
+<a name="ln1345">			RETURN_ERROR(status);</a>
+<a name="ln1346"> </a>
+<a name="ln1347">		memset(fragment, 0, fNodeSize);</a>
+<a name="ln1348">	}</a>
+<a name="ln1349"> </a>
+<a name="ln1350">	duplicate_array* array = fragment-&gt;FragmentAt(fragmentIndex);</a>
+<a name="ln1351">	array-&gt;Insert(oldValue);</a>
+<a name="ln1352">	array-&gt;Insert(value);</a>
+<a name="ln1353"> </a>
+<a name="ln1354">	if (cached.MakeWritable(transaction) == NULL)</a>
+<a name="ln1355">		return B_IO_ERROR;</a>
+<a name="ln1356"> </a>
+<a name="ln1357">	values[index] = HOST_ENDIAN_TO_BFS_INT64(bplustree_node::MakeLink(</a>
+<a name="ln1358">		BPLUSTREE_DUPLICATE_FRAGMENT, offset, fragmentIndex));</a>
+<a name="ln1359"> </a>
+<a name="ln1360">	return B_OK;</a>
+<a name="ln1361">}</a>
+<a name="ln1362"> </a>
+<a name="ln1363"> </a>
+<a name="ln1364">void</a>
+<a name="ln1365">BPlusTree::_InsertKey(bplustree_node* node, uint16 index, uint8* key,</a>
+<a name="ln1366">	uint16 keyLength, off_t value)</a>
+<a name="ln1367">{</a>
+<a name="ln1368">	// should never happen, but who knows?</a>
+<a name="ln1369">	if (index &gt; node-&gt;NumKeys())</a>
+<a name="ln1370">		return;</a>
+<a name="ln1371"> </a>
+<a name="ln1372">	off_t* values = node-&gt;Values();</a>
+<a name="ln1373">	uint16* keyLengths = node-&gt;KeyLengths();</a>
+<a name="ln1374">	uint8* keys = node-&gt;Keys();</a>
+<a name="ln1375"> </a>
+<a name="ln1376">	node-&gt;all_key_count = HOST_ENDIAN_TO_BFS_INT16(node-&gt;NumKeys() + 1);</a>
+<a name="ln1377">	node-&gt;all_key_length = HOST_ENDIAN_TO_BFS_INT16(node-&gt;AllKeyLength()</a>
+<a name="ln1378">		+ keyLength);</a>
+<a name="ln1379"> </a>
+<a name="ln1380">	off_t* newValues = node-&gt;Values();</a>
+<a name="ln1381">	uint16* newKeyLengths = node-&gt;KeyLengths();</a>
+<a name="ln1382"> </a>
+<a name="ln1383">	// move values and copy new value into them</a>
+<a name="ln1384">	memmove(newValues + index + 1, values + index,</a>
+<a name="ln1385">		sizeof(off_t) * (node-&gt;NumKeys() - 1 - index));</a>
+<a name="ln1386">	memmove(newValues, values, sizeof(off_t) * index);</a>
+<a name="ln1387"> </a>
+<a name="ln1388">	newValues[index] = HOST_ENDIAN_TO_BFS_INT64(value);</a>
+<a name="ln1389"> </a>
+<a name="ln1390">	// move and update key length index</a>
+<a name="ln1391">	for (uint16 i = node-&gt;NumKeys(); i-- &gt; index + 1;) {</a>
+<a name="ln1392">		newKeyLengths[i] = HOST_ENDIAN_TO_BFS_INT16(</a>
+<a name="ln1393">			BFS_ENDIAN_TO_HOST_INT16(keyLengths[i - 1]) + keyLength);</a>
+<a name="ln1394">	}</a>
+<a name="ln1395">	memmove(newKeyLengths, keyLengths, sizeof(uint16) * index);</a>
+<a name="ln1396"> </a>
+<a name="ln1397">	int32 keyStart;</a>
+<a name="ln1398">	newKeyLengths[index] = HOST_ENDIAN_TO_BFS_INT16(keyLength</a>
+<a name="ln1399">		+ (keyStart = index &gt; 0</a>
+<a name="ln1400">			? BFS_ENDIAN_TO_HOST_INT16(newKeyLengths[index - 1]) : 0));</a>
+<a name="ln1401"> </a>
+<a name="ln1402">	// move keys and copy new key into them</a>
+<a name="ln1403">	uint16 length = BFS_ENDIAN_TO_HOST_INT16(newKeyLengths[index]);</a>
+<a name="ln1404">	int32 size = node-&gt;AllKeyLength() - length;</a>
+<a name="ln1405">	if (size &gt; 0)</a>
+<a name="ln1406">		memmove(keys + length, keys + length - keyLength, size);</a>
+<a name="ln1407"> </a>
+<a name="ln1408">	memcpy(keys + keyStart, key, keyLength);</a>
+<a name="ln1409">}</a>
+<a name="ln1410"> </a>
+<a name="ln1411"> </a>
+<a name="ln1412">/*!	Splits the \a node into two halves - the other half will be put into</a>
+<a name="ln1413">	\a other. It also takes care to create a new overflow link if the node</a>
+<a name="ln1414">	to split is an index node.</a>
+<a name="ln1415">*/</a>
+<a name="ln1416">status_t</a>
+<a name="ln1417">BPlusTree::_SplitNode(bplustree_node* node, off_t nodeOffset,</a>
+<a name="ln1418">	bplustree_node* other, off_t otherOffset, uint16* _keyIndex, uint8* key,</a>
+<a name="ln1419">	uint16* _keyLength, off_t* _value)</a>
+<a name="ln1420">{</a>
+<a name="ln1421">	if (*_keyIndex &gt; node-&gt;NumKeys() + 1)</a>
+<a name="ln1422">		return B_BAD_VALUE;</a>
+<a name="ln1423"> </a>
+<a name="ln1424">	uint16* inKeyLengths = node-&gt;KeyLengths();</a>
+<a name="ln1425">	off_t* inKeyValues = node-&gt;Values();</a>
+<a name="ln1426">	uint8* inKeys = node-&gt;Keys();</a>
+<a name="ln1427">	uint8* outKeys = other-&gt;Keys();</a>
+<a name="ln1428">	int32 keyIndex = *_keyIndex;	// can become less than zero!</a>
+<a name="ln1429"> </a>
+<a name="ln1430">	if (keyIndex &gt; node-&gt;NumKeys()) {</a>
+<a name="ln1431">		FATAL((&quot;key index out of bounds: %d, num keys: %u, inode %&quot; B_PRIdOFF</a>
+<a name="ln1432">			&quot;\n&quot;, (int)keyIndex, node-&gt;NumKeys(), fStream-&gt;ID()));</a>
+<a name="ln1433">		return B_BAD_VALUE;</a>
+<a name="ln1434">	}</a>
+<a name="ln1435"> </a>
+<a name="ln1436">	// How many keys will fit in one (half) page?</a>
+<a name="ln1437">	// The following loop will find the answer to this question and</a>
+<a name="ln1438">	// change the key lengths indices for their new home</a>
+<a name="ln1439"> </a>
+<a name="ln1440">	// &quot;bytes&quot; is the number of bytes written for the new key,</a>
+<a name="ln1441">	// &quot;bytesBefore&quot; are the bytes before that key</a>
+<a name="ln1442">	// &quot;bytesAfter&quot; are the bytes after the new key, if any</a>
+<a name="ln1443">	int32 bytes = 0, bytesBefore = 0, bytesAfter = 0;</a>
+<a name="ln1444"> </a>
+<a name="ln1445">	size_t size = fNodeSize &gt;&gt; 1;</a>
+<a name="ln1446">	int32 out, in;</a>
+<a name="ln1447">	size_t keyLengths = 0;</a>
+<a name="ln1448">	for (in = out = 0; in &lt; node-&gt;NumKeys() + 1;) {</a>
+<a name="ln1449">		keyLengths = BFS_ENDIAN_TO_HOST_INT16(inKeyLengths[in]);</a>
+<a name="ln1450"> </a>
+<a name="ln1451">		if (in == keyIndex &amp;&amp; !bytes) {</a>
+<a name="ln1452">			bytes = *_keyLength;</a>
+<a name="ln1453">			bytesBefore = in &gt; 0</a>
+<a name="ln1454">				? BFS_ENDIAN_TO_HOST_INT16(inKeyLengths[in - 1]) : 0;</a>
+<a name="ln1455">		} else {</a>
+<a name="ln1456">			if (keyIndex &lt; out)</a>
+<a name="ln1457">				bytesAfter = keyLengths - bytesBefore;</a>
+<a name="ln1458"> </a>
+<a name="ln1459">			in++;</a>
+<a name="ln1460">		}</a>
+<a name="ln1461">		out++;</a>
+<a name="ln1462"> </a>
+<a name="ln1463">		if (key_align(sizeof(bplustree_node) + bytes + keyLengths)</a>
+<a name="ln1464">				+ out * (sizeof(uint16) + sizeof(off_t)) &gt;= size) {</a>
+<a name="ln1465">			// we have found the number of keys in the new node!</a>
+<a name="ln1466">			break;</a>
+<a name="ln1467">		}</a>
+<a name="ln1468">	}</a>
+<a name="ln1469"> </a>
+<a name="ln1470">	// if the new key was not inserted, set the length of the keys</a>
+<a name="ln1471">	// that can be copied directly</a>
+<a name="ln1472"> </a>
+<a name="ln1473">	if (keyIndex &gt;= out &amp;&amp; in &gt; 0)</a>
+<a name="ln1474">		bytesBefore = BFS_ENDIAN_TO_HOST_INT16(inKeyLengths[in - 1]);</a>
+<a name="ln1475">	else if (keyIndex + 1 &lt; out)</a>
+<a name="ln1476">		bytesAfter = keyLengths - bytesBefore;</a>
+<a name="ln1477"> </a>
+<a name="ln1478">	if (bytesBefore &lt; 0 || bytesAfter &lt; 0)</a>
+<a name="ln1479">		return B_BAD_DATA;</a>
+<a name="ln1480"> </a>
+<a name="ln1481">	other-&gt;left_link = node-&gt;left_link;</a>
+<a name="ln1482">	other-&gt;right_link = HOST_ENDIAN_TO_BFS_INT64(nodeOffset);</a>
+<a name="ln1483">	other-&gt;all_key_length = HOST_ENDIAN_TO_BFS_INT16(bytes + bytesBefore</a>
+<a name="ln1484">		+ bytesAfter);</a>
+<a name="ln1485">	other-&gt;all_key_count = HOST_ENDIAN_TO_BFS_INT16(out);</a>
+<a name="ln1486"> </a>
+<a name="ln1487">	uint16* outKeyLengths = other-&gt;KeyLengths();</a>
+<a name="ln1488">	off_t* outKeyValues = other-&gt;Values();</a>
+<a name="ln1489">	int32 keys = out &gt; keyIndex ? keyIndex : out;</a>
+<a name="ln1490"> </a>
+<a name="ln1491">	if (bytesBefore) {</a>
+<a name="ln1492">		// copy the keys</a>
+<a name="ln1493">		memcpy(outKeys, inKeys, bytesBefore);</a>
+<a name="ln1494">		memcpy(outKeyLengths, inKeyLengths, keys * sizeof(uint16));</a>
+<a name="ln1495">		memcpy(outKeyValues, inKeyValues, keys * sizeof(off_t));</a>
+<a name="ln1496">	}</a>
+<a name="ln1497">	if (bytes) {</a>
+<a name="ln1498">		// copy the newly inserted key</a>
+<a name="ln1499">		memcpy(outKeys + bytesBefore, key, bytes);</a>
+<a name="ln1500">		outKeyLengths[keyIndex] = HOST_ENDIAN_TO_BFS_INT16(bytes + bytesBefore);</a>
+<a name="ln1501">		outKeyValues[keyIndex] = HOST_ENDIAN_TO_BFS_INT64(*_value);</a>
+<a name="ln1502"> </a>
+<a name="ln1503">		if (bytesAfter) {</a>
+<a name="ln1504">			// copy the keys after the new key</a>
+<a name="ln1505">			memcpy(outKeys + bytesBefore + bytes, inKeys + bytesBefore,</a>
+<a name="ln1506">				bytesAfter);</a>
+<a name="ln1507">			keys = out - keyIndex - 1;</a>
+<a name="ln1508">			for (int32 i = 0;i &lt; keys;i++) {</a>
+<a name="ln1509">				outKeyLengths[keyIndex + i + 1] = HOST_ENDIAN_TO_BFS_INT16(</a>
+<a name="ln1510">					BFS_ENDIAN_TO_HOST_INT16(inKeyLengths[keyIndex + i])</a>
+<a name="ln1511">						+ bytes);</a>
+<a name="ln1512">			}</a>
+<a name="ln1513">			memcpy(outKeyValues + keyIndex + 1, inKeyValues + keyIndex,</a>
+<a name="ln1514">				keys * sizeof(off_t));</a>
+<a name="ln1515">		}</a>
+<a name="ln1516">	}</a>
+<a name="ln1517"> </a>
+<a name="ln1518">	// if the new key was already inserted, we shouldn't use it again</a>
+<a name="ln1519">	if (in != out)</a>
+<a name="ln1520">		keyIndex--;</a>
+<a name="ln1521"> </a>
+<a name="ln1522">	int32 total = bytesBefore + bytesAfter;</a>
+<a name="ln1523"> </a>
+<a name="ln1524">	// these variables are for the key that will be returned</a>
+<a name="ln1525">	// to the parent node</a>
+<a name="ln1526">	uint8* newKey = NULL;</a>
+<a name="ln1527">	uint16 newLength;</a>
+<a name="ln1528">	bool newAllocated = false;</a>
+<a name="ln1529"> </a>
+<a name="ln1530">	// If we have split an index node, we have to drop the first key</a>
+<a name="ln1531">	// of the next node (which can also be the new key to insert).</a>
+<a name="ln1532">	// The dropped key is also the one which has to be inserted in</a>
+<a name="ln1533">	// the parent node, so we will set the &quot;newKey&quot; already here.</a>
+<a name="ln1534">	if (node-&gt;OverflowLink() != BPLUSTREE_NULL) {</a>
+<a name="ln1535">		if (in == keyIndex) {</a>
+<a name="ln1536">			newKey = key;</a>
+<a name="ln1537">			newLength = *_keyLength;</a>
+<a name="ln1538"> </a>
+<a name="ln1539">			other-&gt;overflow_link = HOST_ENDIAN_TO_BFS_INT64(*_value);</a>
+<a name="ln1540">			keyIndex--;</a>
+<a name="ln1541">		} else {</a>
+<a name="ln1542">			// If a key is dropped (is not the new key), we have to copy</a>
+<a name="ln1543">			// it, because it would be lost if not.</a>
+<a name="ln1544">			uint8* droppedKey = node-&gt;KeyAt(in, &amp;newLength);</a>
+<a name="ln1545">			if (droppedKey + newLength + sizeof(off_t) + sizeof(uint16)</a>
+<a name="ln1546">					&gt; (uint8*)node + fNodeSize</a>
+<a name="ln1547">				|| newLength &gt; BPLUSTREE_MAX_KEY_LENGTH) {</a>
+<a name="ln1548">				fStream-&gt;GetVolume()-&gt;Panic();</a>
+<a name="ln1549">				RETURN_ERROR(B_BAD_DATA);</a>
+<a name="ln1550">			}</a>
+<a name="ln1551">			newKey = (uint8*)malloc(newLength);</a>
+<a name="ln1552">			if (newKey == NULL)</a>
+<a name="ln1553">				return B_NO_MEMORY;</a>
+<a name="ln1554"> </a>
+<a name="ln1555">			newAllocated = true;</a>
+<a name="ln1556">			memcpy(newKey, droppedKey, newLength);</a>
+<a name="ln1557"> </a>
+<a name="ln1558">			other-&gt;overflow_link = inKeyValues[in];</a>
+<a name="ln1559">			total = BFS_ENDIAN_TO_HOST_INT16(inKeyLengths[in++]);</a>
+<a name="ln1560">		}</a>
+<a name="ln1561">	}</a>
+<a name="ln1562"> </a>
+<a name="ln1563">	// and now the same game for the other page and the rest of the keys</a>
+<a name="ln1564">	// (but with memmove() instead of memcpy(), because they may overlap)</a>
+<a name="ln1565"> </a>
+<a name="ln1566">	bytesBefore = bytesAfter = bytes = 0;</a>
+<a name="ln1567">	out = 0;</a>
+<a name="ln1568">	int32 skip = in;</a>
+<a name="ln1569">	while (in &lt; node-&gt;NumKeys() + 1) {</a>
+<a name="ln1570">		if (in == keyIndex &amp;&amp; !bytes) {</a>
+<a name="ln1571">			// it's enough to set bytesBefore once here, because we do</a>
+<a name="ln1572">			// not need to know the exact length of all keys in this</a>
+<a name="ln1573">			// loop</a>
+<a name="ln1574">			bytesBefore = in &gt; skip</a>
+<a name="ln1575">				? BFS_ENDIAN_TO_HOST_INT16(inKeyLengths[in - 1]) : 0;</a>
+<a name="ln1576">			bytes = *_keyLength;</a>
+<a name="ln1577">			out++;</a>
+<a name="ln1578">		} else {</a>
+<a name="ln1579">			if (in &lt; node-&gt;NumKeys()) {</a>
+<a name="ln1580">				inKeyLengths[in] = HOST_ENDIAN_TO_BFS_INT16(</a>
+<a name="ln1581">					BFS_ENDIAN_TO_HOST_INT16(inKeyLengths[in]) - total);</a>
+<a name="ln1582"> </a>
+<a name="ln1583">				if (bytes) {</a>
+<a name="ln1584">					inKeyLengths[in] = HOST_ENDIAN_TO_BFS_INT16(</a>
+<a name="ln1585">						BFS_ENDIAN_TO_HOST_INT16(inKeyLengths[in]) + bytes);</a>
+<a name="ln1586"> </a>
+<a name="ln1587">					bytesAfter = BFS_ENDIAN_TO_HOST_INT16(inKeyLengths[in])</a>
+<a name="ln1588">						- bytesBefore - bytes;</a>
+<a name="ln1589">				}</a>
+<a name="ln1590">				out++;</a>
+<a name="ln1591">			}</a>
+<a name="ln1592">			in++;</a>
+<a name="ln1593">		}</a>
+<a name="ln1594">	}</a>
+<a name="ln1595"> </a>
+<a name="ln1596">	// adjust the byte counts (since we were a bit lazy in the loop)</a>
+<a name="ln1597">	if (keyIndex &lt; skip)</a>
+<a name="ln1598">		bytesBefore = node-&gt;AllKeyLength() - total;</a>
+<a name="ln1599"> </a>
+<a name="ln1600">	if (bytesBefore &lt; 0 || bytesAfter &lt; 0) {</a>
+<a name="ln1601">		if (newAllocated)</a>
+<a name="ln1602">			free(newKey);</a>
+<a name="ln1603">		return B_BAD_DATA;</a>
+<a name="ln1604">	}</a>
+<a name="ln1605"> </a>
+<a name="ln1606">	node-&gt;left_link = HOST_ENDIAN_TO_BFS_INT64(otherOffset);</a>
+<a name="ln1607">		// right link, and overflow link can stay the same</a>
+<a name="ln1608">	node-&gt;all_key_length = HOST_ENDIAN_TO_BFS_INT16(bytes + bytesBefore</a>
+<a name="ln1609">		+ bytesAfter);</a>
+<a name="ln1610">	node-&gt;all_key_count = HOST_ENDIAN_TO_BFS_INT16(out);</a>
+<a name="ln1611"> </a>
+<a name="ln1612">	// array positions have changed</a>
+<a name="ln1613">	outKeyLengths = node-&gt;KeyLengths();</a>
+<a name="ln1614">	outKeyValues = node-&gt;Values();</a>
+<a name="ln1615"> </a>
+<a name="ln1616">	// move the keys in the old node: the order is important here,</a>
+<a name="ln1617">	// because we don't want to overwrite any contents</a>
+<a name="ln1618"> </a>
+<a name="ln1619">	keys = keyIndex &lt;= skip ? out : keyIndex - skip;</a>
+<a name="ln1620">	keyIndex -= skip;</a>
+<a name="ln1621">	in = out - keyIndex - 1;</a>
+<a name="ln1622">		// Note: keyIndex and in will contain invalid values when the new key</a>
+<a name="ln1623">		// went to the other node. But in this case bytes and bytesAfter are</a>
+<a name="ln1624">		// 0 and subsequently we never use keyIndex and in.</a>
+<a name="ln1625"> </a>
+<a name="ln1626">	if (bytesBefore)</a>
+<a name="ln1627">		memmove(inKeys, inKeys + total, bytesBefore);</a>
+<a name="ln1628">	if (bytesAfter) {</a>
+<a name="ln1629">		memmove(inKeys + bytesBefore + bytes, inKeys + total + bytesBefore,</a>
+<a name="ln1630">			bytesAfter);</a>
+<a name="ln1631">	}</a>
+<a name="ln1632"> </a>
+<a name="ln1633">	if (bytesBefore)</a>
+<a name="ln1634">		memmove(outKeyLengths, inKeyLengths + skip, keys * sizeof(uint16));</a>
+<a name="ln1635">	if (bytesAfter) {</a>
+<a name="ln1636">		// if byteAfter is &gt; 0, keyIndex is larger than skip</a>
+<a name="ln1637">		memmove(outKeyLengths + keyIndex + 1, inKeyLengths + skip + keyIndex,</a>
+<a name="ln1638">			in * sizeof(uint16));</a>
+<a name="ln1639">	}</a>
+<a name="ln1640"> </a>
+<a name="ln1641">	if (bytesBefore)</a>
+<a name="ln1642">		memmove(outKeyValues, inKeyValues + skip, keys * sizeof(off_t));</a>
+<a name="ln1643">	if (bytesAfter) {</a>
+<a name="ln1644">		memmove(outKeyValues + keyIndex + 1, inKeyValues + skip + keyIndex,</a>
+<a name="ln1645">			in * sizeof(off_t));</a>
+<a name="ln1646">	}</a>
+<a name="ln1647"> </a>
+<a name="ln1648">	if (bytes) {</a>
+<a name="ln1649">		// finally, copy the newly inserted key (don't overwrite anything)</a>
+<a name="ln1650">		memcpy(inKeys + bytesBefore, key, bytes);</a>
+<a name="ln1651">		outKeyLengths[keyIndex] = HOST_ENDIAN_TO_BFS_INT16(bytes + bytesBefore);</a>
+<a name="ln1652">		outKeyValues[keyIndex] = HOST_ENDIAN_TO_BFS_INT64(*_value);</a>
+<a name="ln1653">	}</a>
+<a name="ln1654"> </a>
+<a name="ln1655">	// Prepare the key that will be inserted in the parent node which</a>
+<a name="ln1656">	// is either the dropped key or the last of the other node.</a>
+<a name="ln1657">	// If it's the dropped key, &quot;newKey&quot; was already set earlier.</a>
+<a name="ln1658"> </a>
+<a name="ln1659">	if (newKey == NULL)</a>
+<a name="ln1660">		newKey = other-&gt;KeyAt(other-&gt;NumKeys() - 1, &amp;newLength);</a>
+<a name="ln1661"> </a>
+<a name="ln1662">	memcpy(key, newKey, newLength);</a>
+<a name="ln1663">	*_keyLength = newLength;</a>
+<a name="ln1664">	*_value = otherOffset;</a>
+<a name="ln1665"> </a>
+<a name="ln1666">	if (newAllocated)</a>
+<a name="ln1667">		free(newKey);</a>
+<a name="ln1668"> </a>
+<a name="ln1669">	return B_OK;</a>
+<a name="ln1670">}</a>
+<a name="ln1671"> </a>
+<a name="ln1672"> </a>
+<a name="ln1673">/*!	This inserts a key into the tree. The changes made to the tree will</a>
+<a name="ln1674">	all be part of the \a transaction.</a>
+<a name="ln1675">	You need to have the inode write locked.</a>
+<a name="ln1676">*/</a>
+<a name="ln1677">status_t</a>
+<a name="ln1678">BPlusTree::Insert(Transaction&amp; transaction, const uint8* key, uint16 keyLength,</a>
+<a name="ln1679">	off_t value)</a>
+<a name="ln1680">{</a>
+<a name="ln1681">	if (keyLength &lt; BPLUSTREE_MIN_KEY_LENGTH</a>
+<a name="ln1682">		|| keyLength &gt; BPLUSTREE_MAX_KEY_LENGTH)</a>
+<a name="ln1683">		RETURN_ERROR(B_BAD_VALUE);</a>
+<a name="ln1684">#ifdef DEBUG</a>
+<a name="ln1685">	if (value &lt; 0)</a>
+<a name="ln1686">		panic(&quot;tried to insert invalid value %&quot; B_PRId64 &quot;!\n&quot;, value);</a>
+<a name="ln1687">#endif</a>
+<a name="ln1688"> </a>
+<a name="ln1689">	ASSERT_WRITE_LOCKED_INODE(fStream);</a>
+<a name="ln1690"> </a>
+<a name="ln1691">	Stack&lt;node_and_key&gt; stack;</a>
+<a name="ln1692">	if (_SeekDown(stack, key, keyLength) != B_OK)</a>
+<a name="ln1693">		RETURN_ERROR(B_ERROR);</a>
+<a name="ln1694"> </a>
+<a name="ln1695">	uint8 keyBuffer[BPLUSTREE_MAX_KEY_LENGTH];</a>
+<a name="ln1696">	memcpy(keyBuffer, key, keyLength);</a>
+<a name="ln1697"> </a>
+<a name="ln1698">	node_and_key nodeAndKey;</a>
+<a name="ln1699">	const bplustree_node* node;</a>
+<a name="ln1700"> </a>
+<a name="ln1701">	CachedNode cached(this);</a>
+<a name="ln1702">	while (stack.Pop(&amp;nodeAndKey)</a>
+<a name="ln1703">		&amp;&amp; (node = cached.SetTo(nodeAndKey.nodeOffset)) != NULL) {</a>
+<a name="ln1704">#ifdef DEBUG</a>
+<a name="ln1705">		NodeChecker checker(node, fNodeSize, &quot;insert&quot;);</a>
+<a name="ln1706">#endif</a>
+<a name="ln1707">		if (node-&gt;IsLeaf()) {</a>
+<a name="ln1708">			// first round, check for duplicate entries</a>
+<a name="ln1709">			status_t status = _FindKey(node, key, keyLength,</a>
+<a name="ln1710">				&amp;nodeAndKey.keyIndex);</a>
+<a name="ln1711"> </a>
+<a name="ln1712">			// is this a duplicate entry?</a>
+<a name="ln1713">			if (status == B_OK) {</a>
+<a name="ln1714">				if (fAllowDuplicates) {</a>
+<a name="ln1715">					status = _InsertDuplicate(transaction, cached, node,</a>
+<a name="ln1716">						nodeAndKey.keyIndex, value);</a>
+<a name="ln1717">					if (status != B_OK)</a>
+<a name="ln1718">						RETURN_ERROR(status);</a>
+<a name="ln1719">					return B_OK;</a>
+<a name="ln1720">				}</a>
+<a name="ln1721"> </a>
+<a name="ln1722">				return B_NAME_IN_USE;</a>
+<a name="ln1723">			}</a>
+<a name="ln1724">		}</a>
+<a name="ln1725"> </a>
+<a name="ln1726">		bplustree_node* writableNode = cached.MakeWritable(transaction);</a>
+<a name="ln1727">		if (writableNode == NULL)</a>
+<a name="ln1728">			return B_IO_ERROR;</a>
+<a name="ln1729"> </a>
+<a name="ln1730">		// is the node big enough to hold the pair?</a>
+<a name="ln1731">		if (int32(key_align(sizeof(bplustree_node)</a>
+<a name="ln1732">				+ writableNode-&gt;AllKeyLength() + keyLength)</a>
+<a name="ln1733">				+ (writableNode-&gt;NumKeys() + 1) * (sizeof(uint16)</a>
+<a name="ln1734">				+ sizeof(off_t))) &lt; fNodeSize) {</a>
+<a name="ln1735">			_InsertKey(writableNode, nodeAndKey.keyIndex,</a>
+<a name="ln1736">				keyBuffer, keyLength, value);</a>
+<a name="ln1737">			_UpdateIterators(nodeAndKey.nodeOffset, BPLUSTREE_NULL,</a>
+<a name="ln1738">				nodeAndKey.keyIndex, 0, 1);</a>
+<a name="ln1739"> </a>
+<a name="ln1740">			return B_OK;</a>
+<a name="ln1741">		} else {</a>
+<a name="ln1742">			CachedNode cachedNewRoot(this);</a>
+<a name="ln1743">			CachedNode cachedOther(this);</a>
+<a name="ln1744"> </a>
+<a name="ln1745">			// do we need to allocate a new root node? if so, then do</a>
+<a name="ln1746">			// it now</a>
+<a name="ln1747">			off_t newRoot = BPLUSTREE_NULL;</a>
+<a name="ln1748">			if (nodeAndKey.nodeOffset == fHeader.RootNode()) {</a>
+<a name="ln1749">				bplustree_node* root;</a>
+<a name="ln1750">				status_t status = cachedNewRoot.Allocate(transaction, &amp;root,</a>
+<a name="ln1751">					&amp;newRoot);</a>
+<a name="ln1752">				if (status != B_OK) {</a>
+<a name="ln1753">					// The tree is most likely corrupted!</a>
+<a name="ln1754">					// But it's still sane at leaf level - we could set</a>
+<a name="ln1755">					// a flag in the header that forces the tree to be</a>
+<a name="ln1756">					// rebuild next time...</a>
+<a name="ln1757">					// But since we will have journaling, that's not a big</a>
+<a name="ln1758">					// problem anyway.</a>
+<a name="ln1759">					RETURN_ERROR(status);</a>
+<a name="ln1760">				}</a>
+<a name="ln1761">			}</a>
+<a name="ln1762"> </a>
+<a name="ln1763">			// reserve space for the other node</a>
+<a name="ln1764">			bplustree_node* other;</a>
+<a name="ln1765">			off_t otherOffset;</a>
+<a name="ln1766">			status_t status = cachedOther.Allocate(transaction, &amp;other,</a>
+<a name="ln1767">				&amp;otherOffset);</a>
+<a name="ln1768">			if (status != B_OK) {</a>
+<a name="ln1769">				cachedNewRoot.Free(transaction, newRoot);</a>
+<a name="ln1770">				RETURN_ERROR(status);</a>
+<a name="ln1771">			}</a>
+<a name="ln1772"> </a>
+<a name="ln1773">			if (_SplitNode(writableNode, nodeAndKey.nodeOffset, other,</a>
+<a name="ln1774">					otherOffset, &amp;nodeAndKey.keyIndex, keyBuffer, &amp;keyLength,</a>
+<a name="ln1775">					&amp;value) != B_OK) {</a>
+<a name="ln1776">				// free root node &amp; other node here</a>
+<a name="ln1777">				cachedOther.Free(transaction, otherOffset);</a>
+<a name="ln1778">				cachedNewRoot.Free(transaction, newRoot);</a>
+<a name="ln1779"> </a>
+<a name="ln1780">				RETURN_ERROR(B_ERROR);</a>
+<a name="ln1781">			}</a>
+<a name="ln1782">#ifdef DEBUG</a>
+<a name="ln1783">			checker.Check(&quot;insert split&quot;);</a>
+<a name="ln1784">			NodeChecker otherChecker(other, fNodeSize, &quot;insert split other&quot;);</a>
+<a name="ln1785">#endif</a>
+<a name="ln1786"> </a>
+<a name="ln1787">			_UpdateIterators(nodeAndKey.nodeOffset, otherOffset,</a>
+<a name="ln1788">				nodeAndKey.keyIndex, writableNode-&gt;NumKeys(), 1);</a>
+<a name="ln1789"> </a>
+<a name="ln1790">			// update the right link of the node in the left of the new node</a>
+<a name="ln1791">			if ((other = cachedOther.SetToWritable(transaction,</a>
+<a name="ln1792">					other-&gt;LeftLink())) != NULL) {</a>
+<a name="ln1793">				other-&gt;right_link = HOST_ENDIAN_TO_BFS_INT64(otherOffset);</a>
+<a name="ln1794">			}</a>
+<a name="ln1795"> </a>
+<a name="ln1796">			// create a new root if necessary</a>
+<a name="ln1797">			if (newRoot != BPLUSTREE_NULL) {</a>
+<a name="ln1798">				bplustree_node* root = cachedNewRoot.Node();</a>
+<a name="ln1799"> </a>
+<a name="ln1800">				_InsertKey(root, 0, keyBuffer, keyLength,</a>
+<a name="ln1801">					writableNode-&gt;LeftLink());</a>
+<a name="ln1802">				root-&gt;overflow_link = HOST_ENDIAN_TO_BFS_INT64(</a>
+<a name="ln1803">					nodeAndKey.nodeOffset);</a>
+<a name="ln1804"> </a>
+<a name="ln1805">				CachedNode cached(this);</a>
+<a name="ln1806">				bplustree_header* header</a>
+<a name="ln1807">					= cached.SetToWritableHeader(transaction);</a>
+<a name="ln1808">				if (header == NULL)</a>
+<a name="ln1809">					return B_IO_ERROR;</a>
+<a name="ln1810"> </a>
+<a name="ln1811">				// finally, update header to point to the new root</a>
+<a name="ln1812">				header-&gt;root_node_pointer = HOST_ENDIAN_TO_BFS_INT64(newRoot);</a>
+<a name="ln1813">				header-&gt;max_number_of_levels = HOST_ENDIAN_TO_BFS_INT32(</a>
+<a name="ln1814">					header-&gt;MaxNumberOfLevels() + 1);</a>
+<a name="ln1815"> </a>
+<a name="ln1816">				return B_OK;</a>
+<a name="ln1817">			}</a>
+<a name="ln1818">		}</a>
+<a name="ln1819">	}</a>
+<a name="ln1820">	RETURN_ERROR(B_ERROR);</a>
+<a name="ln1821">}</a>
+<a name="ln1822"> </a>
+<a name="ln1823"> </a>
+<a name="ln1824">/*!	Removes the duplicate index/value pair from the tree.</a>
+<a name="ln1825">	It's part of the private tree interface.</a>
+<a name="ln1826">*/</a>
+<a name="ln1827">status_t</a>
+<a name="ln1828">BPlusTree::_RemoveDuplicate(Transaction&amp; transaction,</a>
+<a name="ln1829">	const bplustree_node* node, CachedNode&amp; cached, uint16 index,</a>
+<a name="ln1830">	off_t value)</a>
+<a name="ln1831">{</a>
+<a name="ln1832">	off_t* values = node-&gt;Values();</a>
+<a name="ln1833">	off_t oldValue = BFS_ENDIAN_TO_HOST_INT64(values[index]);</a>
+<a name="ln1834"> </a>
+<a name="ln1835">	CachedNode cachedDuplicate(this);</a>
+<a name="ln1836">	off_t duplicateOffset = bplustree_node::FragmentOffset(oldValue);</a>
+<a name="ln1837">	bplustree_node* duplicate = cachedDuplicate.SetToWritable(transaction,</a>
+<a name="ln1838">		duplicateOffset, false);</a>
+<a name="ln1839">	if (duplicate == NULL)</a>
+<a name="ln1840">		return B_IO_ERROR;</a>
+<a name="ln1841"> </a>
+<a name="ln1842">	// if it's a duplicate fragment, remove the entry from there</a>
+<a name="ln1843">	if (bplustree_node::LinkType(oldValue) == BPLUSTREE_DUPLICATE_FRAGMENT) {</a>
+<a name="ln1844">		duplicate_array* array = duplicate-&gt;FragmentAt(</a>
+<a name="ln1845">			bplustree_node::FragmentIndex(oldValue));</a>
+<a name="ln1846">		int32 arrayCount = array-&gt;Count();</a>
+<a name="ln1847"> </a>
+<a name="ln1848">		if (arrayCount &gt; NUM_FRAGMENT_VALUES || arrayCount &lt;= 1) {</a>
+<a name="ln1849">			FATAL((&quot;_RemoveDuplicate: Invalid array[%d] size in fragment %&quot;</a>
+<a name="ln1850">				B_PRIdOFF &quot; == %&quot; B_PRId32 &quot;, inode %&quot; B_PRIdOFF &quot;!\n&quot;,</a>
+<a name="ln1851">				(int)bplustree_node::FragmentIndex(oldValue), duplicateOffset,</a>
+<a name="ln1852">				arrayCount, fStream-&gt;ID()));</a>
+<a name="ln1853">			return B_BAD_DATA;</a>
+<a name="ln1854">		}</a>
+<a name="ln1855">		if (!array-&gt;Remove(value)) {</a>
+<a name="ln1856">			FATAL((&quot;Oh no, value %&quot; B_PRIdOFF &quot; not found in fragments of node &quot;</a>
+<a name="ln1857">				&quot;%&quot; B_PRIdOFF &quot;..., inode %&quot; B_PRIdOFF &quot;\n&quot;, value,</a>
+<a name="ln1858">				duplicateOffset, fStream-&gt;ID()));</a>
+<a name="ln1859">			return B_ENTRY_NOT_FOUND;</a>
+<a name="ln1860">		}</a>
+<a name="ln1861"> </a>
+<a name="ln1862">		// remove the array from the fragment node if it is empty</a>
+<a name="ln1863">		if (--arrayCount == 1) {</a>
+<a name="ln1864">			// set the link to the remaining value</a>
+<a name="ln1865">			if (cached.MakeWritable(transaction) == NULL)</a>
+<a name="ln1866">				return B_IO_ERROR;</a>
+<a name="ln1867"> </a>
+<a name="ln1868">			values[index] = array-&gt;values[0];</a>
+<a name="ln1869"> </a>
+<a name="ln1870">			// Remove the whole fragment node, if this was the only array,</a>
+<a name="ln1871">			// otherwise free just the array</a>
+<a name="ln1872">			if (duplicate-&gt;FragmentsUsed(fNodeSize) == 1) {</a>
+<a name="ln1873">				status_t status = cachedDuplicate.Free(transaction,</a>
+<a name="ln1874">					duplicateOffset);</a>
+<a name="ln1875">				if (status != B_OK)</a>
+<a name="ln1876">					return status;</a>
+<a name="ln1877">			} else</a>
+<a name="ln1878">				array-&gt;count = 0;</a>
+<a name="ln1879">		}</a>
+<a name="ln1880">		return B_OK;</a>
+<a name="ln1881">	}</a>
+<a name="ln1882"> </a>
+<a name="ln1883">	// Remove value from a duplicate node!</a>
+<a name="ln1884"> </a>
+<a name="ln1885">	duplicate_array* array = NULL;</a>
+<a name="ln1886">	int32 arrayCount = 0;</a>
+<a name="ln1887"> </a>
+<a name="ln1888">	if (duplicate-&gt;LeftLink() != BPLUSTREE_NULL) {</a>
+<a name="ln1889">		FATAL((&quot;invalid duplicate node: first left link points to %&quot; B_PRIdOFF</a>
+<a name="ln1890">			&quot;, inode %&quot; B_PRIdOFF &quot;!\n&quot;, duplicate-&gt;LeftLink(), fStream-&gt;ID()));</a>
+<a name="ln1891">		return B_BAD_DATA;</a>
+<a name="ln1892">	}</a>
+<a name="ln1893"> </a>
+<a name="ln1894">	// Search the duplicate nodes until the entry could be found (and removed)</a>
+<a name="ln1895">	while (duplicate != NULL) {</a>
+<a name="ln1896">		array = duplicate-&gt;DuplicateArray();</a>
+<a name="ln1897">		arrayCount = array-&gt;Count();</a>
+<a name="ln1898"> </a>
+<a name="ln1899">		if (arrayCount &gt; NUM_DUPLICATE_VALUES || arrayCount &lt; 0) {</a>
+<a name="ln1900">			FATAL((&quot;_RemoveDuplicate: Invalid array size in duplicate %&quot;</a>
+<a name="ln1901">				B_PRIdOFF &quot; == %&quot; B_PRId32 &quot;, inode %&quot; B_PRIdOFF &quot;!\n&quot;,</a>
+<a name="ln1902">				duplicateOffset, arrayCount, fStream-&gt;ID()));</a>
+<a name="ln1903">			return B_BAD_DATA;</a>
+<a name="ln1904">		}</a>
+<a name="ln1905"> </a>
+<a name="ln1906">		if (array-&gt;Remove(value)) {</a>
+<a name="ln1907">			arrayCount--;</a>
+<a name="ln1908">			break;</a>
+<a name="ln1909">		}</a>
+<a name="ln1910"> </a>
+<a name="ln1911">		if ((duplicateOffset = duplicate-&gt;RightLink()) == BPLUSTREE_NULL)</a>
+<a name="ln1912">			RETURN_ERROR(B_ENTRY_NOT_FOUND);</a>
+<a name="ln1913"> </a>
+<a name="ln1914">		cachedDuplicate.UnsetUnchanged(transaction);</a>
+<a name="ln1915">		duplicate = cachedDuplicate.SetToWritable(transaction, duplicateOffset,</a>
+<a name="ln1916">			false);</a>
+<a name="ln1917">	}</a>
+<a name="ln1918">	if (duplicate == NULL)</a>
+<a name="ln1919">		RETURN_ERROR(B_IO_ERROR);</a>
+<a name="ln1920"> </a>
+<a name="ln1921">	// The entry got removed from the duplicate node, but we might want to free</a>
+<a name="ln1922">	// it now in case it's empty</a>
+<a name="ln1923"> </a>
+<a name="ln1924">	while (true) {</a>
+<a name="ln1925">		off_t left = duplicate-&gt;LeftLink();</a>
+<a name="ln1926">		off_t right = duplicate-&gt;RightLink();</a>
+<a name="ln1927">		bool isLast = left == BPLUSTREE_NULL &amp;&amp; right == BPLUSTREE_NULL;</a>
+<a name="ln1928"> </a>
+<a name="ln1929">		if ((isLast &amp;&amp; arrayCount == 1) || arrayCount == 0) {</a>
+<a name="ln1930">			// Free empty duplicate page, link their siblings together, and</a>
+<a name="ln1931">			// update the duplicate link if needed (ie. when we either remove</a>
+<a name="ln1932">			// the last duplicate node or have a new first one)</a>
+<a name="ln1933"> </a>
+<a name="ln1934">			if (left == BPLUSTREE_NULL) {</a>
+<a name="ln1935">				// the duplicate link points to us</a>
+<a name="ln1936">				if (cached.MakeWritable(transaction) == NULL)</a>
+<a name="ln1937">					return B_IO_ERROR;</a>
+<a name="ln1938"> </a>
+<a name="ln1939">				if (arrayCount == 1) {</a>
+<a name="ln1940">					// This is the last node, and there is only one value left;</a>
+<a name="ln1941">					// replace the duplicate link with that value, it's no</a>
+<a name="ln1942">					// duplicate anymore</a>
+<a name="ln1943">					values[index] = array-&gt;values[0];</a>
+<a name="ln1944">				} else {</a>
+<a name="ln1945">					// Move the duplicate link to the next node</a>
+<a name="ln1946">					values[index] = HOST_ENDIAN_TO_BFS_INT64(</a>
+<a name="ln1947">						bplustree_node::MakeLink(</a>
+<a name="ln1948">							BPLUSTREE_DUPLICATE_NODE, right));</a>
+<a name="ln1949">				}</a>
+<a name="ln1950">			}</a>
+<a name="ln1951"> </a>
+<a name="ln1952">			status_t status = cachedDuplicate.Free(transaction,</a>
+<a name="ln1953">				duplicateOffset);</a>
+<a name="ln1954">			if (status != B_OK)</a>
+<a name="ln1955">				return status;</a>
+<a name="ln1956"> </a>
+<a name="ln1957">			if (left != BPLUSTREE_NULL</a>
+<a name="ln1958">				&amp;&amp; (duplicate = cachedDuplicate.SetToWritable(transaction, left,</a>
+<a name="ln1959">						false)) != NULL) {</a>
+<a name="ln1960">				duplicate-&gt;right_link = HOST_ENDIAN_TO_BFS_INT64(right);</a>
+<a name="ln1961"> </a>
+<a name="ln1962">				// If the next node is the last node, we need to free that node</a>
+<a name="ln1963">				// and convert the duplicate entry back into a normal entry</a>
+<a name="ln1964">				array = duplicate-&gt;DuplicateArray();</a>
+<a name="ln1965">				arrayCount = array-&gt;Count();</a>
+<a name="ln1966">				if (right == BPLUSTREE_NULL</a>
+<a name="ln1967">					&amp;&amp; duplicate-&gt;LeftLink() == BPLUSTREE_NULL</a>
+<a name="ln1968">					&amp;&amp; arrayCount &lt;= NUM_FRAGMENT_VALUES) {</a>
+<a name="ln1969">					duplicateOffset = left;</a>
+<a name="ln1970">					continue;</a>
+<a name="ln1971">				}</a>
+<a name="ln1972">			}</a>
+<a name="ln1973">			if (right != BPLUSTREE_NULL</a>
+<a name="ln1974">				&amp;&amp; (duplicate = cachedDuplicate.SetToWritable(transaction,</a>
+<a name="ln1975">						right, false)) != NULL) {</a>
+<a name="ln1976">				duplicate-&gt;left_link = HOST_ENDIAN_TO_BFS_INT64(left);</a>
+<a name="ln1977"> </a>
+<a name="ln1978">				// Again, we may need to turn the duplicate entry back into a</a>
+<a name="ln1979">				// normal entry</a>
+<a name="ln1980">				array = duplicate-&gt;DuplicateArray();</a>
+<a name="ln1981">				arrayCount = array-&gt;Count();</a>
+<a name="ln1982">				if (left == BPLUSTREE_NULL</a>
+<a name="ln1983">					&amp;&amp; duplicate-&gt;RightLink() == BPLUSTREE_NULL</a>
+<a name="ln1984">					&amp;&amp; arrayCount &lt;= NUM_FRAGMENT_VALUES) {</a>
+<a name="ln1985">					duplicateOffset = right;</a>
+<a name="ln1986">					continue;</a>
+<a name="ln1987">				}</a>
+<a name="ln1988">			}</a>
+<a name="ln1989">			return B_OK;</a>
+<a name="ln1990">		}</a>
+<a name="ln1991">		if (isLast &amp;&amp; arrayCount &lt;= NUM_FRAGMENT_VALUES) {</a>
+<a name="ln1992">			// If the number of entries fits in a duplicate fragment, then</a>
+<a name="ln1993">			// either find a free fragment node, or convert this node to a</a>
+<a name="ln1994">			// fragment node.</a>
+<a name="ln1995">			CachedNode cachedOther(this);</a>
+<a name="ln1996"> </a>
+<a name="ln1997">			bplustree_node* fragment = NULL;</a>
+<a name="ln1998">			uint32 fragmentIndex = 0;</a>
+<a name="ln1999">			off_t offset;</a>
+<a name="ln2000">			if (_FindFreeDuplicateFragment(transaction, node, cachedOther,</a>
+<a name="ln2001">					&amp;offset, &amp;fragment, &amp;fragmentIndex) == B_OK) {</a>
+<a name="ln2002">				// move to other node</a>
+<a name="ln2003">				duplicate_array* target = fragment-&gt;FragmentAt(fragmentIndex);</a>
+<a name="ln2004">				memcpy(target, array,</a>
+<a name="ln2005">					(NUM_FRAGMENT_VALUES + 1) * sizeof(off_t));</a>
+<a name="ln2006"> </a>
+<a name="ln2007">				cachedDuplicate.Free(transaction, duplicateOffset);</a>
+<a name="ln2008">				duplicateOffset = offset;</a>
+<a name="ln2009">			} else {</a>
+<a name="ln2010">				// convert node</a>
+<a name="ln2011">				memmove(duplicate, array,</a>
+<a name="ln2012">					(NUM_FRAGMENT_VALUES + 1) * sizeof(off_t));</a>
+<a name="ln2013">				memset((off_t*)duplicate + NUM_FRAGMENT_VALUES + 1, 0,</a>
+<a name="ln2014">					fNodeSize - (NUM_FRAGMENT_VALUES + 1) * sizeof(off_t));</a>
+<a name="ln2015">			}</a>
+<a name="ln2016"> </a>
+<a name="ln2017">			if (cached.MakeWritable(transaction) == NULL)</a>
+<a name="ln2018">				return B_IO_ERROR;</a>
+<a name="ln2019"> </a>
+<a name="ln2020">			values[index] = HOST_ENDIAN_TO_BFS_INT64(bplustree_node::MakeLink(</a>
+<a name="ln2021">				BPLUSTREE_DUPLICATE_FRAGMENT, duplicateOffset, fragmentIndex));</a>
+<a name="ln2022">		}</a>
+<a name="ln2023">		return B_OK;</a>
+<a name="ln2024">	}</a>
+<a name="ln2025">}</a>
+<a name="ln2026"> </a>
+<a name="ln2027"> </a>
+<a name="ln2028">/*!	Removes the key with the given index from the specified node.</a>
+<a name="ln2029">	Since it has to get the key from the node anyway (to obtain it's</a>
+<a name="ln2030">	pointer), it's not needed to pass the key &amp; its length, although</a>
+<a name="ln2031">	the calling method (BPlusTree::Remove()) have this data.</a>
+<a name="ln2032">*/</a>
+<a name="ln2033">void</a>
+<a name="ln2034">BPlusTree::_RemoveKey(bplustree_node* node, uint16 index)</a>
+<a name="ln2035">{</a>
+<a name="ln2036">	// should never happen, but who knows?</a>
+<a name="ln2037">	if (index &gt; node-&gt;NumKeys() &amp;&amp; node-&gt;NumKeys() &gt; 0) {</a>
+<a name="ln2038">		FATAL((&quot;Asked me to remove key outer limits: %u, inode %&quot; B_PRIdOFF</a>
+<a name="ln2039">			&quot;\n&quot;, index, fStream-&gt;ID()));</a>
+<a name="ln2040">		return;</a>
+<a name="ln2041">	}</a>
+<a name="ln2042"> </a>
+<a name="ln2043">	off_t* values = node-&gt;Values();</a>
+<a name="ln2044"> </a>
+<a name="ln2045">	// if we would have to drop the overflow link, drop</a>
+<a name="ln2046">	// the last key instead and update the overflow link</a>
+<a name="ln2047">	// to the value of that one</a>
+<a name="ln2048">	if (!node-&gt;IsLeaf() &amp;&amp; index == node-&gt;NumKeys())</a>
+<a name="ln2049">		node-&gt;overflow_link = values[--index];</a>
+<a name="ln2050"> </a>
+<a name="ln2051">	uint16 length;</a>
+<a name="ln2052">	uint8* key = node-&gt;KeyAt(index, &amp;length);</a>
+<a name="ln2053">	if (key + length + sizeof(off_t) + sizeof(uint16) &gt; (uint8*)node + fNodeSize</a>
+<a name="ln2054">		|| length &gt; BPLUSTREE_MAX_KEY_LENGTH) {</a>
+<a name="ln2055">		FATAL((&quot;Key length to long: %s, %u inode %&quot; B_PRIdOFF &quot;\n&quot;, key, length,</a>
+<a name="ln2056">			fStream-&gt;ID()));</a>
+<a name="ln2057">		fStream-&gt;GetVolume()-&gt;Panic();</a>
+<a name="ln2058">		return;</a>
+<a name="ln2059">	}</a>
+<a name="ln2060"> </a>
+<a name="ln2061">	uint16* keyLengths = node-&gt;KeyLengths();</a>
+<a name="ln2062">	uint8* keys = node-&gt;Keys();</a>
+<a name="ln2063"> </a>
+<a name="ln2064">	node-&gt;all_key_count = HOST_ENDIAN_TO_BFS_INT16(node-&gt;NumKeys() - 1);</a>
+<a name="ln2065">	node-&gt;all_key_length = HOST_ENDIAN_TO_BFS_INT64(</a>
+<a name="ln2066">		node-&gt;AllKeyLength() - length);</a>
+<a name="ln2067"> </a>
+<a name="ln2068">	off_t* newValues = node-&gt;Values();</a>
+<a name="ln2069">	uint16* newKeyLengths = node-&gt;KeyLengths();</a>
+<a name="ln2070"> </a>
+<a name="ln2071">	// move key data</a>
+<a name="ln2072">	memmove(key, key + length, node-&gt;AllKeyLength() - (key - keys));</a>
+<a name="ln2073"> </a>
+<a name="ln2074">	// move and update key lengths</a>
+<a name="ln2075">	if (index &gt; 0 &amp;&amp; newKeyLengths != keyLengths)</a>
+<a name="ln2076">		memmove(newKeyLengths, keyLengths, index * sizeof(uint16));</a>
+<a name="ln2077">	for (uint16 i = index; i &lt; node-&gt;NumKeys(); i++) {</a>
+<a name="ln2078">		newKeyLengths[i] = HOST_ENDIAN_TO_BFS_INT16(</a>
+<a name="ln2079">			BFS_ENDIAN_TO_HOST_INT16(keyLengths[i + 1]) - length);</a>
+<a name="ln2080">	}</a>
+<a name="ln2081"> </a>
+<a name="ln2082">	// move values</a>
+<a name="ln2083">	if (index &gt; 0)</a>
+<a name="ln2084">		memmove(newValues, values, index * sizeof(off_t));</a>
+<a name="ln2085">	if (node-&gt;NumKeys() &gt; index) {</a>
+<a name="ln2086">		memmove(newValues + index, values + index + 1,</a>
+<a name="ln2087">			(node-&gt;NumKeys() - index) * sizeof(off_t));</a>
+<a name="ln2088">	}</a>
+<a name="ln2089">}</a>
+<a name="ln2090"> </a>
+<a name="ln2091"> </a>
+<a name="ln2092">/*!	Removes the specified key from the tree. The &quot;value&quot; parameter is only used</a>
+<a name="ln2093">	for trees which allow duplicates, so you may safely ignore it.</a>
+<a name="ln2094">	It's not an optional parameter, so at least you have to think about it.</a>
+<a name="ln2095">	You need to have the inode write locked.</a>
+<a name="ln2096">*/</a>
+<a name="ln2097">status_t</a>
+<a name="ln2098">BPlusTree::Remove(Transaction&amp; transaction, const uint8* key, uint16 keyLength,</a>
+<a name="ln2099">	off_t value)</a>
+<a name="ln2100">{</a>
+<a name="ln2101">	if (keyLength &lt; BPLUSTREE_MIN_KEY_LENGTH</a>
+<a name="ln2102">		|| keyLength &gt; BPLUSTREE_MAX_KEY_LENGTH)</a>
+<a name="ln2103">		RETURN_ERROR(B_BAD_VALUE);</a>
+<a name="ln2104"> </a>
+<a name="ln2105">	ASSERT_WRITE_LOCKED_INODE(fStream);</a>
+<a name="ln2106"> </a>
+<a name="ln2107">	Stack&lt;node_and_key&gt; stack;</a>
+<a name="ln2108">	if (_SeekDown(stack, key, keyLength) != B_OK)</a>
+<a name="ln2109">		RETURN_ERROR(B_ERROR);</a>
+<a name="ln2110"> </a>
+<a name="ln2111">	node_and_key nodeAndKey;</a>
+<a name="ln2112">	const bplustree_node* node;</a>
+<a name="ln2113"> </a>
+<a name="ln2114">	CachedNode cached(this);</a>
+<a name="ln2115">	while (stack.Pop(&amp;nodeAndKey)</a>
+<a name="ln2116">		&amp;&amp; (node = cached.SetTo(nodeAndKey.nodeOffset)) != NULL) {</a>
+<a name="ln2117">#ifdef DEBUG</a>
+<a name="ln2118">		NodeChecker checker(node, fNodeSize, &quot;remove&quot;);</a>
+<a name="ln2119">#endif</a>
+<a name="ln2120">		if (node-&gt;IsLeaf()) {</a>
+<a name="ln2121">			// first round, check for duplicate entries</a>
+<a name="ln2122">			status_t status = _FindKey(node, key, keyLength,</a>
+<a name="ln2123">				&amp;nodeAndKey.keyIndex);</a>
+<a name="ln2124">			if (status != B_OK)</a>
+<a name="ln2125">				RETURN_ERROR(status);</a>
+<a name="ln2126"> </a>
+<a name="ln2127">			// Is this a duplicate entry?</a>
+<a name="ln2128">			if (bplustree_node::IsDuplicate(BFS_ENDIAN_TO_HOST_INT64(</a>
+<a name="ln2129">					node-&gt;Values()[nodeAndKey.keyIndex]))) {</a>
+<a name="ln2130">				if (fAllowDuplicates) {</a>
+<a name="ln2131">					return _RemoveDuplicate(transaction, node, cached,</a>
+<a name="ln2132">						nodeAndKey.keyIndex, value);</a>
+<a name="ln2133">				}</a>
+<a name="ln2134"> </a>
+<a name="ln2135">				FATAL((&quot;dupliate node found where no duplicates are &quot;</a>
+<a name="ln2136">					&quot;allowed, inode %&quot; B_PRIdOFF &quot;!\n&quot;, fStream-&gt;ID()));</a>
+<a name="ln2137">				RETURN_ERROR(B_ERROR);</a>
+<a name="ln2138">			} else {</a>
+<a name="ln2139">				if (node-&gt;Values()[nodeAndKey.keyIndex] != value)</a>
+<a name="ln2140">					return B_ENTRY_NOT_FOUND;</a>
+<a name="ln2141"> </a>
+<a name="ln2142">				// If we will remove the last key, the iterator will be set</a>
+<a name="ln2143">				// to the next node after the current - if there aren't any</a>
+<a name="ln2144">				// more nodes, we need a way to prevent the TreeIterators to</a>
+<a name="ln2145">				// touch the old node again, we use BPLUSTREE_FREE for this</a>
+<a name="ln2146">				off_t next = node-&gt;RightLink() == BPLUSTREE_NULL</a>
+<a name="ln2147">					? BPLUSTREE_FREE : node-&gt;RightLink();</a>
+<a name="ln2148">				_UpdateIterators(nodeAndKey.nodeOffset, node-&gt;NumKeys() == 1</a>
+<a name="ln2149">					? next : BPLUSTREE_NULL, nodeAndKey.keyIndex, 0 , -1);</a>
+<a name="ln2150">			}</a>
+<a name="ln2151">		}</a>
+<a name="ln2152"> </a>
+<a name="ln2153">		bplustree_node* writableNode = cached.MakeWritable(transaction);</a>
+<a name="ln2154">		if (writableNode == NULL)</a>
+<a name="ln2155">			return B_IO_ERROR;</a>
+<a name="ln2156"> </a>
+<a name="ln2157">		// if it's an empty root node, we have to convert it</a>
+<a name="ln2158">		// to a leaf node by dropping the overflow link, or,</a>
+<a name="ln2159">		// if it's already a leaf node, just empty it</a>
+<a name="ln2160">		if (nodeAndKey.nodeOffset == fHeader.RootNode()</a>
+<a name="ln2161">			&amp;&amp; (node-&gt;NumKeys() == 0</a>
+<a name="ln2162">				|| (node-&gt;NumKeys() == 1 &amp;&amp; node-&gt;IsLeaf()))) {</a>
+<a name="ln2163">			writableNode-&gt;overflow_link</a>
+<a name="ln2164">				= HOST_ENDIAN_TO_BFS_INT64((uint64)BPLUSTREE_NULL);</a>
+<a name="ln2165">			writableNode-&gt;all_key_count = 0;</a>
+<a name="ln2166">			writableNode-&gt;all_key_length = 0;</a>
+<a name="ln2167"> </a>
+<a name="ln2168">			// if we've made a leaf node out of the root node, we need</a>
+<a name="ln2169">			// to reset the maximum number of levels in the header</a>
+<a name="ln2170">			if (fHeader.MaxNumberOfLevels() != 1) {</a>
+<a name="ln2171">				CachedNode cached(this);</a>
+<a name="ln2172">				bplustree_header* header</a>
+<a name="ln2173">					= cached.SetToWritableHeader(transaction);</a>
+<a name="ln2174">				if (header == NULL)</a>
+<a name="ln2175">					return B_IO_ERROR;</a>
+<a name="ln2176"> </a>
+<a name="ln2177">				header-&gt;max_number_of_levels = HOST_ENDIAN_TO_BFS_INT32(1);</a>
+<a name="ln2178">			}</a>
+<a name="ln2179">			return B_OK;</a>
+<a name="ln2180">		}</a>
+<a name="ln2181"> </a>
+<a name="ln2182">		// if there is only one key left, we don't have to remove</a>
+<a name="ln2183">		// it, we can just dump the node (index nodes still have</a>
+<a name="ln2184">		// the overflow link, so we have to drop the last key)</a>
+<a name="ln2185">		if (writableNode-&gt;NumKeys() &gt; 1</a>
+<a name="ln2186">			|| (!writableNode-&gt;IsLeaf() &amp;&amp; writableNode-&gt;NumKeys() == 1)) {</a>
+<a name="ln2187">			_RemoveKey(writableNode, nodeAndKey.keyIndex);</a>
+<a name="ln2188">			return B_OK;</a>
+<a name="ln2189">		}</a>
+<a name="ln2190"> </a>
+<a name="ln2191">		// when we are here, we can just free the node, but</a>
+<a name="ln2192">		// we have to update the right/left link of the</a>
+<a name="ln2193">		// siblings first</a>
+<a name="ln2194">		CachedNode otherCached(this);</a>
+<a name="ln2195">		bplustree_node* other = otherCached.SetToWritable(transaction,</a>
+<a name="ln2196">			writableNode-&gt;LeftLink());</a>
+<a name="ln2197">		if (other != NULL)</a>
+<a name="ln2198">			other-&gt;right_link = writableNode-&gt;right_link;</a>
+<a name="ln2199"> </a>
+<a name="ln2200">		if ((other = otherCached.SetToWritable(transaction, node-&gt;RightLink()))</a>
+<a name="ln2201">				!= NULL) {</a>
+<a name="ln2202">			other-&gt;left_link = writableNode-&gt;left_link;</a>
+<a name="ln2203">		}</a>
+<a name="ln2204"> </a>
+<a name="ln2205">		cached.Free(transaction, nodeAndKey.nodeOffset);</a>
+<a name="ln2206">	}</a>
+<a name="ln2207">	RETURN_ERROR(B_ERROR);</a>
+<a name="ln2208">}</a>
+<a name="ln2209"> </a>
+<a name="ln2210"> </a>
+<a name="ln2211">/*!	Replaces the value for the key in the tree.</a>
+<a name="ln2212">	Returns B_OK if the key could be found and its value replaced,</a>
+<a name="ln2213">	B_ENTRY_NOT_FOUND if the key couldn't be found, and other errors</a>
+<a name="ln2214">	to indicate that something went terribly wrong.</a>
+<a name="ln2215">	Note that this doesn't work with duplicates - it will just</a>
+<a name="ln2216">	return B_BAD_TYPE if you call this function on a tree where</a>
+<a name="ln2217">	duplicates are allowed.</a>
+<a name="ln2218">	You need to have the inode write locked.</a>
+<a name="ln2219">*/</a>
+<a name="ln2220">status_t</a>
+<a name="ln2221">BPlusTree::Replace(Transaction&amp; transaction, const uint8* key, uint16 keyLength,</a>
+<a name="ln2222">	off_t value)</a>
+<a name="ln2223">{</a>
+<a name="ln2224">	if (keyLength &lt; BPLUSTREE_MIN_KEY_LENGTH</a>
+<a name="ln2225">		|| keyLength &gt; BPLUSTREE_MAX_KEY_LENGTH</a>
+<a name="ln2226">		|| key == NULL)</a>
+<a name="ln2227">		RETURN_ERROR(B_BAD_VALUE);</a>
+<a name="ln2228"> </a>
+<a name="ln2229">	if (fAllowDuplicates)</a>
+<a name="ln2230">		RETURN_ERROR(B_BAD_TYPE);</a>
+<a name="ln2231"> </a>
+<a name="ln2232">	ASSERT_WRITE_LOCKED_INODE(fStream);</a>
+<a name="ln2233"> </a>
+<a name="ln2234">	off_t nodeOffset = fHeader.RootNode();</a>
+<a name="ln2235">	CachedNode cached(this);</a>
+<a name="ln2236">	const bplustree_node* node;</a>
+<a name="ln2237"> </a>
+<a name="ln2238">	while ((node = cached.SetTo(nodeOffset)) != NULL) {</a>
+<a name="ln2239">		uint16 keyIndex = 0;</a>
+<a name="ln2240">		off_t nextOffset;</a>
+<a name="ln2241">		status_t status = _FindKey(node, key, keyLength, &amp;keyIndex,</a>
+<a name="ln2242">			&amp;nextOffset);</a>
+<a name="ln2243"> </a>
+<a name="ln2244">		if (node-&gt;OverflowLink() == BPLUSTREE_NULL) {</a>
+<a name="ln2245">			if (status == B_OK) {</a>
+<a name="ln2246">				bplustree_node* writableNode = cached.MakeWritable(transaction);</a>
+<a name="ln2247">				if (writableNode != NULL) {</a>
+<a name="ln2248">					writableNode-&gt;Values()[keyIndex]</a>
+<a name="ln2249">						= HOST_ENDIAN_TO_BFS_INT64(value);</a>
+<a name="ln2250">				} else</a>
+<a name="ln2251">					status = B_IO_ERROR;</a>
+<a name="ln2252">			}</a>
+<a name="ln2253"> </a>
+<a name="ln2254">			return status;</a>
+<a name="ln2255">		} else if (nextOffset == nodeOffset)</a>
+<a name="ln2256">			RETURN_ERROR(B_ERROR);</a>
+<a name="ln2257"> </a>
+<a name="ln2258">		nodeOffset = nextOffset;</a>
+<a name="ln2259">	}</a>
+<a name="ln2260">	RETURN_ERROR(B_ERROR);</a>
+<a name="ln2261">}</a>
+<a name="ln2262">#endif // !_BOOT_MODE</a>
+<a name="ln2263"> </a>
+<a name="ln2264"> </a>
+<a name="ln2265">/*!	Searches the key in the tree, and stores the offset found in _value,</a>
+<a name="ln2266">	if successful.</a>
+<a name="ln2267">	It's very similar to BPlusTree::SeekDown(), but doesn't fill a stack</a>
+<a name="ln2268">	while it descends the tree.</a>
+<a name="ln2269">	Returns B_OK when the key could be found, B_ENTRY_NOT_FOUND if not.</a>
+<a name="ln2270">	It can also return other errors to indicate that something went wrong.</a>
+<a name="ln2271">	Note that this doesn't work with duplicates - it will just return</a>
+<a name="ln2272">	B_BAD_TYPE if you call this function on a tree where duplicates are</a>
+<a name="ln2273">	allowed.</a>
+<a name="ln2274">	You need to have the inode read or write locked.</a>
+<a name="ln2275">*/</a>
+<a name="ln2276">status_t</a>
+<a name="ln2277">BPlusTree::Find(const uint8* key, uint16 keyLength, off_t* _value)</a>
+<a name="ln2278">{</a>
+<a name="ln2279">	if (keyLength &lt; BPLUSTREE_MIN_KEY_LENGTH</a>
+<a name="ln2280">		|| keyLength &gt; BPLUSTREE_MAX_KEY_LENGTH</a>
+<a name="ln2281">		|| key == NULL)</a>
+<a name="ln2282">		RETURN_ERROR(B_BAD_VALUE);</a>
+<a name="ln2283"> </a>
+<a name="ln2284">	if (fAllowDuplicates)</a>
+<a name="ln2285">		RETURN_ERROR(B_BAD_TYPE);</a>
+<a name="ln2286"> </a>
+<a name="ln2287">#if !_BOOT_MODE</a>
+<a name="ln2288">	ASSERT_READ_LOCKED_INODE(fStream);</a>
+<a name="ln2289">#endif</a>
+<a name="ln2290"> </a>
+<a name="ln2291">	off_t nodeOffset = fHeader.RootNode();</a>
+<a name="ln2292">	CachedNode cached(this);</a>
+<a name="ln2293">	const bplustree_node* node;</a>
+<a name="ln2294"> </a>
+<a name="ln2295">#ifdef DEBUG</a>
+<a name="ln2296">	int32 levels = 0;</a>
+<a name="ln2297">#endif</a>
+<a name="ln2298"> </a>
+<a name="ln2299">	while ((node = cached.SetTo(nodeOffset)) != NULL) {</a>
+<a name="ln2300">		uint16 keyIndex = 0;</a>
+<a name="ln2301">		off_t nextOffset;</a>
+<a name="ln2302">		status_t status = _FindKey(node, key, keyLength, &amp;keyIndex,</a>
+<a name="ln2303">			&amp;nextOffset);</a>
+<a name="ln2304"> </a>
+<a name="ln2305">#ifdef DEBUG</a>
+<a name="ln2306">		levels++;</a>
+<a name="ln2307">#endif</a>
+<a name="ln2308">		if (node-&gt;OverflowLink() == BPLUSTREE_NULL) {</a>
+<a name="ln2309">			if (status == B_OK &amp;&amp; _value != NULL)</a>
+<a name="ln2310">				*_value = BFS_ENDIAN_TO_HOST_INT64(node-&gt;Values()[keyIndex]);</a>
+<a name="ln2311"> </a>
+<a name="ln2312">#ifdef DEBUG</a>
+<a name="ln2313">			if (levels != (int32)fHeader.MaxNumberOfLevels())</a>
+<a name="ln2314">				DEBUGGER((&quot;levels don't match&quot;));</a>
+<a name="ln2315">#endif</a>
+<a name="ln2316">			return status;</a>
+<a name="ln2317">		} else if (nextOffset == nodeOffset)</a>
+<a name="ln2318">			RETURN_ERROR(B_ERROR);</a>
+<a name="ln2319"> </a>
+<a name="ln2320">		nodeOffset = nextOffset;</a>
+<a name="ln2321">	}</a>
+<a name="ln2322">	FATAL((&quot;b+tree node at %&quot; B_PRIdOFF &quot; could not be loaded, inode %&quot;</a>
+<a name="ln2323">		B_PRIdOFF &quot;\n&quot;, nodeOffset, fStream-&gt;ID()));</a>
+<a name="ln2324">	RETURN_ERROR(B_ERROR);</a>
+<a name="ln2325">}</a>
+<a name="ln2326"> </a>
+<a name="ln2327"> </a>
+<a name="ln2328">#if !_BOOT_MODE</a>
+<a name="ln2329">status_t</a>
+<a name="ln2330">BPlusTree::_ValidateChildren(TreeCheck&amp; check, uint32 level, off_t offset,</a>
+<a name="ln2331">	const uint8* largestKey, uint16 largestKeyLength,</a>
+<a name="ln2332">	const bplustree_node* parent)</a>
+<a name="ln2333">{</a>
+<a name="ln2334">	if (parent-&gt;CheckIntegrity(fNodeSize) != B_OK) {</a>
+<a name="ln2335">		dprintf(&quot;inode %&quot; B_PRIdOFF &quot;: node %&quot; B_PRIdOFF &quot; integrity check &quot;</a>
+<a name="ln2336">			&quot;failed!\n&quot;, fStream-&gt;ID(), offset);</a>
+<a name="ln2337">		check.FoundError();</a>
+<a name="ln2338">		return B_OK;</a>
+<a name="ln2339">	}</a>
+<a name="ln2340">	if (level &gt;= fHeader.MaxNumberOfLevels()) {</a>
+<a name="ln2341">		dprintf(&quot;inode %&quot; B_PRIdOFF &quot;: maximum level surpassed at %&quot; B_PRIdOFF</a>
+<a name="ln2342">			&quot;!\n&quot;, fStream-&gt;ID(), offset);</a>
+<a name="ln2343">		check.FoundError();</a>
+<a name="ln2344">		return B_OK;</a>
+<a name="ln2345">	}</a>
+<a name="ln2346"> </a>
+<a name="ln2347">	check.SetLevel(level);</a>
+<a name="ln2348"> </a>
+<a name="ln2349">	if (check.Visited(offset)) {</a>
+<a name="ln2350">		dprintf(&quot;inode %&quot; B_PRIdOFF &quot;: node %&quot; B_PRIdOFF &quot; already visited!\n&quot;,</a>
+<a name="ln2351">			fStream-&gt;ID(), offset);</a>
+<a name="ln2352">		check.FoundError();</a>
+<a name="ln2353">		return B_OK;</a>
+<a name="ln2354">	}</a>
+<a name="ln2355"> </a>
+<a name="ln2356">	check.SetVisited(offset);</a>
+<a name="ln2357"> </a>
+<a name="ln2358">	uint32 count = parent-&gt;NumKeys();</a>
+<a name="ln2359">	off_t* values = parent-&gt;Values();</a>
+<a name="ln2360">	off_t lastOffset = check.PreviousOffset(level);</a>
+<a name="ln2361">	CachedNode cached(this);</a>
+<a name="ln2362"> </a>
+<a name="ln2363">	for (uint32 i = 0; i &lt; count; i++) {</a>
+<a name="ln2364">		uint16 keyLength;</a>
+<a name="ln2365">		uint8* key = parent-&gt;KeyAt(i, &amp;keyLength);</a>
+<a name="ln2366">		if (largestKey != NULL) {</a>
+<a name="ln2367">			int result = _CompareKeys(key, keyLength, largestKey,</a>
+<a name="ln2368">				largestKeyLength);</a>
+<a name="ln2369">			if (result &gt; 0 || (result == 0 &amp;&amp; i != count - 1)) {</a>
+<a name="ln2370">				dprintf(&quot;inode %&quot; B_PRIdOFF &quot;: node %&quot; B_PRIdOFF &quot; key %&quot;</a>
+<a name="ln2371">					B_PRIu32 &quot; larger than it should!\n&quot;,</a>
+<a name="ln2372">					fStream-&gt;ID(), offset, i);</a>
+<a name="ln2373">				check.FoundError();</a>
+<a name="ln2374">			}</a>
+<a name="ln2375">		}</a>
+<a name="ln2376"> </a>
+<a name="ln2377">		off_t childOffset = BFS_ENDIAN_TO_HOST_INT64(values[i]);</a>
+<a name="ln2378">		if (bplustree_node::IsDuplicate(childOffset)) {</a>
+<a name="ln2379">			// Walk the duplicate nodes</a>
+<a name="ln2380">			off_t duplicateOffset = bplustree_node::FragmentOffset(childOffset);</a>
+<a name="ln2381">			off_t lastDuplicateOffset = BPLUSTREE_NULL;</a>
+<a name="ln2382"> </a>
+<a name="ln2383">			while (duplicateOffset != BPLUSTREE_NULL) {</a>
+<a name="ln2384">				const bplustree_node* node;</a>
+<a name="ln2385">				status_t status = cached.SetTo(duplicateOffset, &amp;node, false);</a>
+<a name="ln2386">				if (status != B_OK) {</a>
+<a name="ln2387">					if (status == B_IO_ERROR)</a>
+<a name="ln2388">						return B_IO_ERROR;</a>
+<a name="ln2389"> </a>
+<a name="ln2390">					dprintf(&quot;inode %&quot; B_PRIdOFF &quot;: duplicate node at %&quot;</a>
+<a name="ln2391">						B_PRIdOFF &quot; could not be read: %s\n&quot;, fStream-&gt;ID(),</a>
+<a name="ln2392">						duplicateOffset, strerror(status));</a>
+<a name="ln2393">					check.FoundError();</a>
+<a name="ln2394">					break;</a>
+<a name="ln2395">				}</a>
+<a name="ln2396"> </a>
+<a name="ln2397">				bool isFragmentNode = bplustree_node::LinkType(childOffset)</a>
+<a name="ln2398">					== BPLUSTREE_DUPLICATE_FRAGMENT;</a>
+<a name="ln2399">				bool isKnownFragment = isFragmentNode</a>
+<a name="ln2400">					&amp;&amp; check.VisitedFragment(duplicateOffset);</a>
+<a name="ln2401"> </a>
+<a name="ln2402">				if (!isKnownFragment &amp;&amp; check.Visited(duplicateOffset)) {</a>
+<a name="ln2403">					dprintf(&quot;inode %&quot; B_PRIdOFF &quot;: %s node at %&quot;</a>
+<a name="ln2404">						B_PRIdOFF &quot; already visited, referenced from %&quot;</a>
+<a name="ln2405">						B_PRIdOFF &quot;!\n&quot;, fStream-&gt;ID(),</a>
+<a name="ln2406">						isFragmentNode ? &quot;fragment&quot; : &quot;duplicate&quot;,</a>
+<a name="ln2407">						duplicateOffset, offset);</a>
+<a name="ln2408">					check.FoundError();</a>
+<a name="ln2409">					break;</a>
+<a name="ln2410">				}</a>
+<a name="ln2411"> </a>
+<a name="ln2412">				// Fragment nodes may be visited more than once from different</a>
+<a name="ln2413">				// places</a>
+<a name="ln2414">				if (!check.Visited(duplicateOffset))</a>
+<a name="ln2415">					check.SetVisited(duplicateOffset);</a>
+<a name="ln2416">				if (!isKnownFragment &amp;&amp; isFragmentNode)</a>
+<a name="ln2417">					check.SetVisitedFragment(duplicateOffset);</a>
+<a name="ln2418"> </a>
+<a name="ln2419">				duplicate_array* array;</a>
+<a name="ln2420">				int32 minSize;</a>
+<a name="ln2421">				int32 maxSize;</a>
+<a name="ln2422">				if (isFragmentNode) {</a>
+<a name="ln2423">					array = node-&gt;FragmentAt(</a>
+<a name="ln2424">						bplustree_node::FragmentIndex(childOffset));</a>
+<a name="ln2425">					minSize = 2;</a>
+<a name="ln2426">					maxSize = NUM_FRAGMENT_VALUES;</a>
+<a name="ln2427">				} else {</a>
+<a name="ln2428">					array = node-&gt;DuplicateArray();</a>
+<a name="ln2429">					minSize = 1;</a>
+<a name="ln2430">					maxSize = NUM_DUPLICATE_VALUES;</a>
+<a name="ln2431">				}</a>
+<a name="ln2432">				int32 arrayCount = array-&gt;Count();</a>
+<a name="ln2433"> </a>
+<a name="ln2434">				if (arrayCount &lt; minSize || arrayCount &gt; maxSize) {</a>
+<a name="ln2435">					dprintf(&quot;inode %&quot; B_PRIdOFF &quot;: duplicate at %&quot; B_PRIdOFF</a>
+<a name="ln2436">						&quot; has invalid array size %&quot; B_PRId32 &quot;!\n&quot;,</a>
+<a name="ln2437">						fStream-&gt;ID(), duplicateOffset, arrayCount);</a>
+<a name="ln2438">					check.FoundError();</a>
+<a name="ln2439">				} else {</a>
+<a name="ln2440">					// Simple check if the values in the array may be valid</a>
+<a name="ln2441">					for (int32 j = 0; j &lt; arrayCount; j++) {</a>
+<a name="ln2442">						if (!fStream-&gt;GetVolume()-&gt;IsValidInodeBlock(</a>
+<a name="ln2443">								array-&gt;ValueAt(j))) {</a>
+<a name="ln2444">							dprintf(&quot;inode %&quot; B_PRIdOFF &quot;: duplicate at %&quot;</a>
+<a name="ln2445">								B_PRIdOFF &quot; contains invalid block %&quot; B_PRIdOFF</a>
+<a name="ln2446">								&quot; at %&quot; B_PRId32 &quot;!\n&quot;, fStream-&gt;ID(),</a>
+<a name="ln2447">								duplicateOffset, array-&gt;ValueAt(j), j);</a>
+<a name="ln2448">							check.FoundError();</a>
+<a name="ln2449">							break;</a>
+<a name="ln2450">						}</a>
+<a name="ln2451">					}</a>
+<a name="ln2452">				}</a>
+<a name="ln2453"> </a>
+<a name="ln2454">				// A fragment node is not linked (and does not have valid links)</a>
+<a name="ln2455">				if (isFragmentNode)</a>
+<a name="ln2456">					break;</a>
+<a name="ln2457"> </a>
+<a name="ln2458">				if (node-&gt;LeftLink() != lastDuplicateOffset) {</a>
+<a name="ln2459">					dprintf(&quot;inode %&quot; B_PRIdOFF &quot;: duplicate at %&quot; B_PRIdOFF</a>
+<a name="ln2460">						&quot; has wrong left link %&quot; B_PRIdOFF &quot;, expected %&quot;</a>
+<a name="ln2461">						B_PRIdOFF &quot;!\n&quot;, fStream-&gt;ID(), duplicateOffset,</a>
+<a name="ln2462">						node-&gt;LeftLink(), lastDuplicateOffset);</a>
+<a name="ln2463">					check.FoundError();</a>
+<a name="ln2464">				}</a>
+<a name="ln2465"> </a>
+<a name="ln2466">				lastDuplicateOffset = duplicateOffset;</a>
+<a name="ln2467">				duplicateOffset = node-&gt;RightLink();</a>
+<a name="ln2468">			}</a>
+<a name="ln2469">		} else if (!parent-&gt;IsLeaf()) {</a>
+<a name="ln2470">			// Test a regular child node recursively</a>
+<a name="ln2471">			off_t nextOffset = parent-&gt;OverflowLink();</a>
+<a name="ln2472">			if (i &lt; count - 1)</a>
+<a name="ln2473">				nextOffset = BFS_ENDIAN_TO_HOST_INT64(values[i + 1]);</a>
+<a name="ln2474"> </a>
+<a name="ln2475">			if (i == 0 &amp;&amp; lastOffset != BPLUSTREE_NULL) {</a>
+<a name="ln2476">				// Test right link of the previous node</a>
+<a name="ln2477">				const bplustree_node* previous = cached.SetTo(lastOffset, true);</a>
+<a name="ln2478">				if (previous == NULL)</a>
+<a name="ln2479">					return B_IO_ERROR;</a>
+<a name="ln2480"> </a>
+<a name="ln2481">				if (previous-&gt;RightLink() != childOffset) {</a>
+<a name="ln2482">					dprintf(&quot;inode %&quot; B_PRIdOFF &quot;: node at %&quot; B_PRIdOFF &quot; has &quot;</a>
+<a name="ln2483">						&quot;wrong right link %&quot; B_PRIdOFF &quot;, expected %&quot; B_PRIdOFF</a>
+<a name="ln2484">						&quot;!\n&quot;, fStream-&gt;ID(), lastOffset, previous-&gt;RightLink(),</a>
+<a name="ln2485">						childOffset);</a>
+<a name="ln2486">					check.FoundError();</a>
+<a name="ln2487">				}</a>
+<a name="ln2488">			}</a>
+<a name="ln2489"> </a>
+<a name="ln2490">			status_t status = _ValidateChild(check, cached, level, childOffset,</a>
+<a name="ln2491">				lastOffset, nextOffset, key, keyLength);</a>
+<a name="ln2492">			if (status != B_OK)</a>
+<a name="ln2493">				return status;</a>
+<a name="ln2494">		} else if (!fStream-&gt;GetVolume()-&gt;IsValidInodeBlock(childOffset)) {</a>
+<a name="ln2495">			dprintf(&quot;inode %&quot; B_PRIdOFF &quot;: node at %&quot; B_PRIdOFF &quot; contains &quot;</a>
+<a name="ln2496">				&quot;invalid block %&quot; B_PRIdOFF &quot; at %&quot; B_PRId32 &quot;!\n&quot;,</a>
+<a name="ln2497">				fStream-&gt;ID(), offset, childOffset, i);</a>
+<a name="ln2498">			check.FoundError();</a>
+<a name="ln2499">		}</a>
+<a name="ln2500"> </a>
+<a name="ln2501">		lastOffset = childOffset;</a>
+<a name="ln2502">	}</a>
+<a name="ln2503"> </a>
+<a name="ln2504">	if (parent-&gt;OverflowLink() != BPLUSTREE_NULL) {</a>
+<a name="ln2505">		off_t childOffset = parent-&gt;OverflowLink();</a>
+<a name="ln2506">		status_t status = _ValidateChild(check, cached, level, childOffset,</a>
+<a name="ln2507">			lastOffset, 0, NULL, 0);</a>
+<a name="ln2508">		if (status != B_OK)</a>
+<a name="ln2509">			return status;</a>
+<a name="ln2510"> </a>
+<a name="ln2511">		lastOffset = childOffset;</a>
+<a name="ln2512">	}</a>
+<a name="ln2513"> </a>
+<a name="ln2514">	check.SetPreviousOffset(level, lastOffset);</a>
+<a name="ln2515">	return B_OK;</a>
+<a name="ln2516">}</a>
+<a name="ln2517"> </a>
+<a name="ln2518"> </a>
+<a name="ln2519">status_t</a>
+<a name="ln2520">BPlusTree::_ValidateChild(TreeCheck&amp; check, CachedNode&amp; cached, uint32 level,</a>
+<a name="ln2521">	off_t offset, off_t lastOffset, off_t nextOffset,</a>
+<a name="ln2522">	const uint8* key, uint16 keyLength)</a>
+<a name="ln2523">{</a>
+<a name="ln2524">	const bplustree_node* node;</a>
+<a name="ln2525">	status_t status = cached.SetTo(offset, &amp;node, true);</a>
+<a name="ln2526">	if (status != B_OK) {</a>
+<a name="ln2527">		if (status == B_IO_ERROR)</a>
+<a name="ln2528">			return B_IO_ERROR;</a>
+<a name="ln2529"> </a>
+<a name="ln2530">		dprintf(&quot;inode %&quot; B_PRIdOFF &quot;: node at %&quot; B_PRIdOFF &quot; could not be &quot;</a>
+<a name="ln2531">			&quot;read: %s\n&quot;, fStream-&gt;ID(), offset, strerror(status));</a>
+<a name="ln2532">		check.FoundError();</a>
+<a name="ln2533">		return B_OK;</a>
+<a name="ln2534">	}</a>
+<a name="ln2535"> </a>
+<a name="ln2536">	if (node-&gt;LeftLink() != lastOffset) {</a>
+<a name="ln2537">		dprintf(&quot;inode %&quot; B_PRIdOFF &quot;: node at %&quot; B_PRIdOFF &quot; has &quot;</a>
+<a name="ln2538">			&quot;wrong left link %&quot; B_PRIdOFF &quot;, expected %&quot; B_PRIdOFF</a>
+<a name="ln2539">			&quot;!\n&quot;, fStream-&gt;ID(), offset, node-&gt;LeftLink(), lastOffset);</a>
+<a name="ln2540">		check.FoundError();</a>
+<a name="ln2541">	}</a>
+<a name="ln2542"> </a>
+<a name="ln2543">	if (nextOffset != 0 &amp;&amp; node-&gt;RightLink() != nextOffset) {</a>
+<a name="ln2544">		dprintf(&quot;inode %&quot; B_PRIdOFF &quot;: node at %&quot; B_PRIdOFF &quot; has &quot;</a>
+<a name="ln2545">			&quot;wrong right link %&quot; B_PRIdOFF &quot;, expected %&quot; B_PRIdOFF</a>
+<a name="ln2546">			&quot;!\n&quot;, fStream-&gt;ID(), offset, node-&gt;RightLink(), nextOffset);</a>
+<a name="ln2547">		check.FoundError();</a>
+<a name="ln2548">	}</a>
+<a name="ln2549"> </a>
+<a name="ln2550">	return _ValidateChildren(check, level + 1, offset, key, keyLength, node);</a>
+<a name="ln2551">}</a>
+<a name="ln2552">#endif // !_BOOT_MODE</a>
+<a name="ln2553"> </a>
+<a name="ln2554"> </a>
+<a name="ln2555">//	#pragma mark -</a>
+<a name="ln2556"> </a>
+<a name="ln2557"> </a>
+<a name="ln2558">TreeIterator::TreeIterator(BPlusTree* tree)</a>
+<a name="ln2559">	:</a>
+<a name="ln2560">	fTree(tree),</a>
+<a name="ln2561">	fCurrentNodeOffset(BPLUSTREE_NULL)</a>
+<a name="ln2562">{</a>
+<a name="ln2563">#if !_BOOT_MODE</a>
+<a name="ln2564">	tree-&gt;_AddIterator(this);</a>
+<a name="ln2565">#endif</a>
+<a name="ln2566">}</a>
+<a name="ln2567"> </a>
+<a name="ln2568"> </a>
+<a name="ln2569">TreeIterator::~TreeIterator()</a>
+<a name="ln2570">{</a>
+<a name="ln2571">#if !_BOOT_MODE</a>
+<a name="ln2572">	if (fTree)</a>
+<a name="ln2573">		fTree-&gt;_RemoveIterator(this);</a>
+<a name="ln2574">#endif</a>
+<a name="ln2575">}</a>
+<a name="ln2576"> </a>
+<a name="ln2577"> </a>
+<a name="ln2578">status_t</a>
+<a name="ln2579">TreeIterator::Goto(int8 to)</a>
+<a name="ln2580">{</a>
+<a name="ln2581">	if (fTree == NULL || fTree-&gt;fStream == NULL)</a>
+<a name="ln2582">		RETURN_ERROR(B_BAD_VALUE);</a>
+<a name="ln2583"> </a>
+<a name="ln2584">#if !_BOOT_MODE</a>
+<a name="ln2585">	// lock access to stream</a>
+<a name="ln2586">	InodeReadLocker locker(fTree-&gt;fStream);</a>
+<a name="ln2587">#endif</a>
+<a name="ln2588"> </a>
+<a name="ln2589">	off_t nodeOffset = fTree-&gt;fHeader.RootNode();</a>
+<a name="ln2590">	CachedNode cached(fTree);</a>
+<a name="ln2591">	const bplustree_node* node;</a>
+<a name="ln2592"> </a>
+<a name="ln2593">	while ((node = cached.SetTo(nodeOffset)) != NULL) {</a>
+<a name="ln2594">		// is the node a leaf node?</a>
+<a name="ln2595">		if (node-&gt;OverflowLink() == BPLUSTREE_NULL) {</a>
+<a name="ln2596">			fCurrentNodeOffset = nodeOffset;</a>
+<a name="ln2597">			fCurrentKey = to == BPLUSTREE_BEGIN ? -1 : node-&gt;NumKeys();</a>
+<a name="ln2598">			fDuplicateNode = BPLUSTREE_NULL;</a>
+<a name="ln2599"> </a>
+<a name="ln2600">			return B_OK;</a>
+<a name="ln2601">		}</a>
+<a name="ln2602"> </a>
+<a name="ln2603">		// get the next node offset depending on the direction (and if there</a>
+<a name="ln2604">		// are any keys in that node at all)</a>
+<a name="ln2605">		off_t nextOffset;</a>
+<a name="ln2606">		if (to == BPLUSTREE_END || node-&gt;all_key_count == 0)</a>
+<a name="ln2607">			nextOffset = node-&gt;OverflowLink();</a>
+<a name="ln2608">		else {</a>
+<a name="ln2609">			if (node-&gt;AllKeyLength() &gt; fTree-&gt;fNodeSize</a>
+<a name="ln2610">				|| (addr_t)node-&gt;Values() &gt; (addr_t)node + fTree-&gt;fNodeSize</a>
+<a name="ln2611">					- 8 * node-&gt;NumKeys())</a>
+<a name="ln2612">				RETURN_ERROR(B_ERROR);</a>
+<a name="ln2613"> </a>
+<a name="ln2614">			nextOffset = BFS_ENDIAN_TO_HOST_INT64(node-&gt;Values()[0]);</a>
+<a name="ln2615">		}</a>
+<a name="ln2616">		if (nextOffset == nodeOffset)</a>
+<a name="ln2617">			break;</a>
+<a name="ln2618"> </a>
+<a name="ln2619">		nodeOffset = nextOffset;</a>
+<a name="ln2620">	}</a>
+<a name="ln2621">	FATAL((&quot;%s fails\n&quot;, __FUNCTION__));</a>
+<a name="ln2622"> </a>
+<a name="ln2623">	RETURN_ERROR(B_ERROR);</a>
+<a name="ln2624">}</a>
+<a name="ln2625"> </a>
+<a name="ln2626"> </a>
+<a name="ln2627">/*!	Iterates through the tree in the specified direction.</a>
+<a name="ln2628">	When it iterates through duplicates, the &quot;key&quot; is only updated for the</a>
+<a name="ln2629">	first entry - if you need to know when this happens, use the &quot;duplicate&quot;</a>
+<a name="ln2630">	parameter which is 0 for no duplicate, 1 for the first, and 2 for all</a>
+<a name="ln2631">	the other duplicates.</a>
+<a name="ln2632">	That's not too nice, but saves the 256 bytes that would be needed to</a>
+<a name="ln2633">	store the last key - if this will ever become an issue, it will be</a>
+<a name="ln2634">	easy to change.</a>
+<a name="ln2635">	The other advantage of this is, that the queries can skip all duplicates</a>
+<a name="ln2636">	at once when they are not relevant to them.</a>
+<a name="ln2637">*/</a>
+<a name="ln2638">status_t</a>
+<a name="ln2639">TreeIterator::Traverse(int8 direction, void* key, uint16* keyLength,</a>
+<a name="ln2640">	uint16 maxLength, off_t* value, uint16* duplicate)</a>
+<a name="ln2641">{</a>
+<a name="ln2642">	if (fTree == NULL)</a>
+<a name="ln2643">		return B_INTERRUPTED;</a>
+<a name="ln2644"> </a>
+<a name="ln2645">	bool forward = direction == BPLUSTREE_FORWARD;</a>
+<a name="ln2646"> </a>
+<a name="ln2647">	if (fCurrentNodeOffset == BPLUSTREE_NULL</a>
+<a name="ln2648">		&amp;&amp; Goto(forward ? BPLUSTREE_BEGIN : BPLUSTREE_END) != B_OK)</a>
+<a name="ln2649">		RETURN_ERROR(B_ERROR);</a>
+<a name="ln2650"> </a>
+<a name="ln2651">	// if the tree was emptied since the last call</a>
+<a name="ln2652">	if (fCurrentNodeOffset == BPLUSTREE_FREE)</a>
+<a name="ln2653">		return B_ENTRY_NOT_FOUND;</a>
+<a name="ln2654"> </a>
+<a name="ln2655">#if !_BOOT_MODE</a>
+<a name="ln2656">	// lock access to stream</a>
+<a name="ln2657">	InodeReadLocker locker(fTree-&gt;fStream);</a>
+<a name="ln2658">#endif</a>
+<a name="ln2659"> </a>
+<a name="ln2660">	CachedNode cached(fTree);</a>
+<a name="ln2661">	const bplustree_node* node;</a>
+<a name="ln2662"> </a>
+<a name="ln2663">	if (fDuplicateNode != BPLUSTREE_NULL) {</a>
+<a name="ln2664">		// regardless of traverse direction the duplicates are always presented</a>
+<a name="ln2665">		// in the same order; since they are all considered as equal, this</a>
+<a name="ln2666">		// shouldn't cause any problems</a>
+<a name="ln2667"> </a>
+<a name="ln2668">		if (!fIsFragment || fDuplicate &lt; fNumDuplicates) {</a>
+<a name="ln2669">			node = cached.SetTo(bplustree_node::FragmentOffset(fDuplicateNode),</a>
+<a name="ln2670">				false);</a>
+<a name="ln2671">		} else</a>
+<a name="ln2672">			node = NULL;</a>
+<a name="ln2673"> </a>
+<a name="ln2674">		if (node != NULL) {</a>
+<a name="ln2675">			if (!fIsFragment &amp;&amp; fDuplicate &gt;= fNumDuplicates) {</a>
+<a name="ln2676">				// If the node is out of duplicates, we go directly to the next</a>
+<a name="ln2677">				// one</a>
+<a name="ln2678">				fDuplicateNode = node-&gt;RightLink();</a>
+<a name="ln2679">				if (fDuplicateNode != BPLUSTREE_NULL</a>
+<a name="ln2680">					&amp;&amp; (node = cached.SetTo(fDuplicateNode, false)) != NULL) {</a>
+<a name="ln2681">					fNumDuplicates = node-&gt;CountDuplicates(fDuplicateNode,</a>
+<a name="ln2682">						false);</a>
+<a name="ln2683">					fDuplicate = 0;</a>
+<a name="ln2684">				}</a>
+<a name="ln2685">			}</a>
+<a name="ln2686">			if (fDuplicate &lt; fNumDuplicates) {</a>
+<a name="ln2687">				*value = node-&gt;DuplicateAt(fDuplicateNode, fIsFragment,</a>
+<a name="ln2688">					fDuplicate++);</a>
+<a name="ln2689">				if (duplicate)</a>
+<a name="ln2690">					*duplicate = 2;</a>
+<a name="ln2691">				return B_OK;</a>
+<a name="ln2692">			}</a>
+<a name="ln2693">		}</a>
+<a name="ln2694">		fDuplicateNode = BPLUSTREE_NULL;</a>
+<a name="ln2695">	}</a>
+<a name="ln2696"> </a>
+<a name="ln2697">	off_t savedNodeOffset = fCurrentNodeOffset;</a>
+<a name="ln2698">	int32 savedKey = fCurrentKey;</a>
+<a name="ln2699"> </a>
+<a name="ln2700">	if ((node = cached.SetTo(fCurrentNodeOffset)) == NULL)</a>
+<a name="ln2701">		RETURN_ERROR(B_ERROR);</a>
+<a name="ln2702"> </a>
+<a name="ln2703">	if (duplicate)</a>
+<a name="ln2704">		*duplicate = 0;</a>
+<a name="ln2705"> </a>
+<a name="ln2706">	fCurrentKey += direction;</a>
+<a name="ln2707"> </a>
+<a name="ln2708">	// is the current key in the current node?</a>
+<a name="ln2709">	while ((forward &amp;&amp; fCurrentKey &gt;= node-&gt;NumKeys())</a>
+<a name="ln2710">			|| (!forward &amp;&amp; fCurrentKey &lt; 0)) {</a>
+<a name="ln2711">		fCurrentNodeOffset = forward ? node-&gt;RightLink() : node-&gt;LeftLink();</a>
+<a name="ln2712"> </a>
+<a name="ln2713">		// are there any more nodes?</a>
+<a name="ln2714">		if (fCurrentNodeOffset != BPLUSTREE_NULL) {</a>
+<a name="ln2715">			node = cached.SetTo(fCurrentNodeOffset);</a>
+<a name="ln2716">			if (!node)</a>
+<a name="ln2717">				RETURN_ERROR(B_ERROR);</a>
+<a name="ln2718"> </a>
+<a name="ln2719">			// reset current key</a>
+<a name="ln2720">			fCurrentKey = forward ? 0 : node-&gt;NumKeys() - 1;</a>
+<a name="ln2721">		} else {</a>
+<a name="ln2722">			// there are no nodes left, so turn back to the last key</a>
+<a name="ln2723">			fCurrentNodeOffset = savedNodeOffset;</a>
+<a name="ln2724">			fCurrentKey = savedKey;</a>
+<a name="ln2725"> </a>
+<a name="ln2726">			return B_ENTRY_NOT_FOUND;</a>
+<a name="ln2727">		}</a>
+<a name="ln2728">	}</a>
+<a name="ln2729"> </a>
+<a name="ln2730">	if (node-&gt;all_key_count == 0)</a>
+<a name="ln2731">		RETURN_ERROR(B_ERROR);	// B_ENTRY_NOT_FOUND ?</a>
+<a name="ln2732"> </a>
+<a name="ln2733">	uint16 length = 0;</a>
+<a name="ln2734">	uint8* keyStart = node-&gt;KeyAt(fCurrentKey, &amp;length);</a>
+<a name="ln2735">	if (keyStart + length + sizeof(off_t) + sizeof(uint16)</a>
+<a name="ln2736">			&gt; (uint8*)node + fTree-&gt;fNodeSize</a>
+<a name="ln2737">		|| length &gt; BPLUSTREE_MAX_KEY_LENGTH) {</a>
+<a name="ln2738">#if !_BOOT_MODE</a>
+<a name="ln2739">		fTree-&gt;fStream-&gt;GetVolume()-&gt;Panic();</a>
+<a name="ln2740">#endif</a>
+<a name="ln2741">		RETURN_ERROR(B_BAD_DATA);</a>
+<a name="ln2742">	}</a>
+<a name="ln2743"> </a>
+<a name="ln2744">	// include the termination for string types</a>
+<a name="ln2745">	bool needsTermination = fTree-&gt;fHeader.DataType() == BPLUSTREE_STRING_TYPE;</a>
+<a name="ln2746">	if (length + (needsTermination ? 1 : 0) &gt; maxLength) {</a>
+<a name="ln2747">		if (!needsTermination || maxLength &lt; INODE_FILE_NAME_LENGTH) {</a>
+<a name="ln2748">			// The buffer is too small, restore the last key and return</a>
+<a name="ln2749">			// an error</a>
+<a name="ln2750">			fCurrentNodeOffset = savedNodeOffset;</a>
+<a name="ln2751">			fCurrentKey = savedKey;</a>
+<a name="ln2752">			return B_BUFFER_OVERFLOW;</a>
+<a name="ln2753">		}</a>
+<a name="ln2754"> </a>
+<a name="ln2755">		// Always cut off strings at the maximum buffer size, and leave</a>
+<a name="ln2756">		// room for a terminating null byte.</a>
+<a name="ln2757">		// This allows to handle larger key sizes gracefully.</a>
+<a name="ln2758">		length = maxLength - 1;</a>
+<a name="ln2759">	}</a>
+<a name="ln2760"> </a>
+<a name="ln2761">	memcpy(key, keyStart, length);</a>
+<a name="ln2762"> </a>
+<a name="ln2763">	if (needsTermination)</a>
+<a name="ln2764">		((char*)key)[length] = '\0';</a>
+<a name="ln2765"> </a>
+<a name="ln2766">	*keyLength = length;</a>
+<a name="ln2767"> </a>
+<a name="ln2768">	off_t offset = BFS_ENDIAN_TO_HOST_INT64(node-&gt;Values()[fCurrentKey]);</a>
+<a name="ln2769"> </a>
+<a name="ln2770">	// duplicate fragments?</a>
+<a name="ln2771">	uint8 type = bplustree_node::LinkType(offset);</a>
+<a name="ln2772">	if (type == BPLUSTREE_DUPLICATE_FRAGMENT</a>
+<a name="ln2773">		|| type == BPLUSTREE_DUPLICATE_NODE) {</a>
+<a name="ln2774">		fDuplicateNode = offset;</a>
+<a name="ln2775"> </a>
+<a name="ln2776">		node = cached.SetTo(bplustree_node::FragmentOffset(fDuplicateNode),</a>
+<a name="ln2777">			false);</a>
+<a name="ln2778">		if (node == NULL)</a>
+<a name="ln2779">			RETURN_ERROR(B_ERROR);</a>
+<a name="ln2780"> </a>
+<a name="ln2781">		fIsFragment = type == BPLUSTREE_DUPLICATE_FRAGMENT;</a>
+<a name="ln2782"> </a>
+<a name="ln2783">		fNumDuplicates = node-&gt;CountDuplicates(offset, fIsFragment);</a>
+<a name="ln2784">		if (fNumDuplicates) {</a>
+<a name="ln2785">			offset = node-&gt;DuplicateAt(offset, fIsFragment, 0);</a>
+<a name="ln2786">			fDuplicate = 1;</a>
+<a name="ln2787">			if (duplicate)</a>
+<a name="ln2788">				*duplicate = 1;</a>
+<a name="ln2789">		} else {</a>
+<a name="ln2790">			// Shouldn't happen, but we're dealing here with potentially</a>
+<a name="ln2791">			// corrupt disks...</a>
+<a name="ln2792">			fDuplicateNode = BPLUSTREE_NULL;</a>
+<a name="ln2793">			offset = 0;</a>
+<a name="ln2794">		}</a>
+<a name="ln2795">	}</a>
+<a name="ln2796">	*value = offset;</a>
+<a name="ln2797"> </a>
+<a name="ln2798">	return B_OK;</a>
+<a name="ln2799">}</a>
+<a name="ln2800"> </a>
+<a name="ln2801"> </a>
+<a name="ln2802">/*!	This is more or less a copy of BPlusTree::Find() - but it just</a>
+<a name="ln2803">	sets the current position in the iterator, regardless of if the</a>
+<a name="ln2804">	key could be found or not.</a>
+<a name="ln2805">*/</a>
+<a name="ln2806">status_t</a>
+<a name="ln2807">TreeIterator::Find(const uint8* key, uint16 keyLength)</a>
+<a name="ln2808">{</a>
+<a name="ln2809">	if (fTree == NULL)</a>
+<a name="ln2810">		return B_INTERRUPTED;</a>
+<a name="ln2811">	if (keyLength &lt; BPLUSTREE_MIN_KEY_LENGTH</a>
+<a name="ln2812">		|| keyLength &gt; BPLUSTREE_MAX_KEY_LENGTH</a>
+<a name="ln2813">		|| key == NULL)</a>
+<a name="ln2814">		RETURN_ERROR(B_BAD_VALUE);</a>
+<a name="ln2815"> </a>
+<a name="ln2816">#if !_BOOT_MODE</a>
+<a name="ln2817">	// lock access to stream</a>
+<a name="ln2818">	InodeReadLocker locker(fTree-&gt;fStream);</a>
+<a name="ln2819">#endif</a>
+<a name="ln2820"> </a>
+<a name="ln2821">	off_t nodeOffset = fTree-&gt;fHeader.RootNode();</a>
+<a name="ln2822"> </a>
+<a name="ln2823">	CachedNode cached(fTree);</a>
+<a name="ln2824">	const bplustree_node* node;</a>
+<a name="ln2825">	while ((node = cached.SetTo(nodeOffset)) != NULL) {</a>
+<a name="ln2826">		uint16 keyIndex = 0;</a>
+<a name="ln2827">		off_t nextOffset;</a>
+<a name="ln2828">		status_t status = fTree-&gt;_FindKey(node, key, keyLength, &amp;keyIndex,</a>
+<a name="ln2829">			&amp;nextOffset);</a>
+<a name="ln2830"> </a>
+<a name="ln2831">		if (node-&gt;OverflowLink() == BPLUSTREE_NULL) {</a>
+<a name="ln2832">			fCurrentNodeOffset = nodeOffset;</a>
+<a name="ln2833">			fCurrentKey = keyIndex - 1;</a>
+<a name="ln2834">			fDuplicateNode = BPLUSTREE_NULL;</a>
+<a name="ln2835"> </a>
+<a name="ln2836">			return status;</a>
+<a name="ln2837">		} else if (nextOffset == nodeOffset)</a>
+<a name="ln2838">			RETURN_ERROR(B_ERROR);</a>
+<a name="ln2839"> </a>
+<a name="ln2840">		nodeOffset = nextOffset;</a>
+<a name="ln2841">	}</a>
+<a name="ln2842">	RETURN_ERROR(B_ERROR);</a>
+<a name="ln2843">}</a>
+<a name="ln2844"> </a>
+<a name="ln2845"> </a>
+<a name="ln2846">void</a>
+<a name="ln2847">TreeIterator::SkipDuplicates()</a>
+<a name="ln2848">{</a>
+<a name="ln2849">	fDuplicateNode = BPLUSTREE_NULL;</a>
+<a name="ln2850">}</a>
+<a name="ln2851"> </a>
+<a name="ln2852"> </a>
+<a name="ln2853">void</a>
+<a name="ln2854">TreeIterator::Update(off_t offset, off_t nextOffset, uint16 keyIndex,</a>
+<a name="ln2855">	uint16 splitAt, int8 change)</a>
+<a name="ln2856">{</a>
+<a name="ln2857">	if (offset != fCurrentNodeOffset)</a>
+<a name="ln2858">		return;</a>
+<a name="ln2859"> </a>
+<a name="ln2860">	if (nextOffset != BPLUSTREE_NULL) {</a>
+<a name="ln2861">		fCurrentNodeOffset = nextOffset;</a>
+<a name="ln2862">		if (splitAt &lt;= fCurrentKey) {</a>
+<a name="ln2863">			fCurrentKey -= splitAt;</a>
+<a name="ln2864">			keyIndex -= splitAt;</a>
+<a name="ln2865">		}</a>
+<a name="ln2866">	}</a>
+<a name="ln2867"> </a>
+<a name="ln2868">	// Adjust fCurrentKey to point to the same key as before.</a>
+<a name="ln2869">	// Note, that if a key is inserted at the current position</a>
+<a name="ln2870">	// it won't be included in this tree transition.</a>
+<a name="ln2871">	if (keyIndex &lt;= fCurrentKey)</a>
+<a name="ln2872">		fCurrentKey += change;</a>
+<a name="ln2873"> </a>
+<a name="ln2874">	// TODO: duplicate handling!</a>
+<a name="ln2875">}</a>
+<a name="ln2876"> </a>
+<a name="ln2877"> </a>
+<a name="ln2878">void</a>
+<a name="ln2879">TreeIterator::Stop()</a>
+<a name="ln2880">{</a>
+<a name="ln2881">	fTree = NULL;</a>
+<a name="ln2882">}</a>
+<a name="ln2883"> </a>
+<a name="ln2884"> </a>
+<a name="ln2885">#ifdef DEBUG</a>
+<a name="ln2886">void</a>
+<a name="ln2887">TreeIterator::Dump()</a>
+<a name="ln2888">{</a>
+<a name="ln2889">	__out(&quot;TreeIterator at %p:\n&quot;, this);</a>
+<a name="ln2890">	__out(&quot;\tfTree = %p\n&quot;, fTree);</a>
+<a name="ln2891">	__out(&quot;\tfCurrentNodeOffset = %&quot; B_PRId64 &quot;\n&quot;, fCurrentNodeOffset);</a>
+<a name="ln2892">	__out(&quot;\tfCurrentKey = %d\n&quot;, (int)fCurrentKey);</a>
+<a name="ln2893">	__out(&quot;\tfDuplicateNode = %&quot; B_PRId64 &quot; (%&quot; B_PRId64 &quot;, 0x%&quot; B_PRIx64 &quot;)\n&quot;,</a>
+<a name="ln2894">		bplustree_node::FragmentOffset(fDuplicateNode), fDuplicateNode,</a>
+<a name="ln2895">		fDuplicateNode);</a>
+<a name="ln2896">	__out(&quot;\tfDuplicate = %u\n&quot;, fDuplicate);</a>
+<a name="ln2897">	__out(&quot;\tfNumDuplicates = %u\n&quot;, fNumDuplicates);</a>
+<a name="ln2898">	__out(&quot;\tfIsFragment = %s\n&quot;, fIsFragment ? &quot;true&quot; : &quot;false&quot;);</a>
+<a name="ln2899">}</a>
+<a name="ln2900">#endif</a>
+<a name="ln2901"> </a>
+<a name="ln2902"> </a>
+<a name="ln2903">// #pragma mark -</a>
+<a name="ln2904"> </a>
+<a name="ln2905"> </a>
+<a name="ln2906">bool</a>
+<a name="ln2907">bplustree_header::IsValid() const</a>
+<a name="ln2908">{</a>
+<a name="ln2909">	return Magic() == BPLUSTREE_MAGIC</a>
+<a name="ln2910">		&amp;&amp; (RootNode() % NodeSize()) == 0</a>
+<a name="ln2911">		&amp;&amp; IsValidLink(RootNode())</a>
+<a name="ln2912">		&amp;&amp; IsValidLink(FreeNode());</a>
+<a name="ln2913">}</a>
+<a name="ln2914"> </a>
+<a name="ln2915"> </a>
+<a name="ln2916">// #pragma mark -</a>
+<a name="ln2917"> </a>
+<a name="ln2918"> </a>
+<a name="ln2919">void</a>
+<a name="ln2920">bplustree_node::Initialize()</a>
+<a name="ln2921">{</a>
+<a name="ln2922">	left_link = right_link = overflow_link</a>
+<a name="ln2923">		= HOST_ENDIAN_TO_BFS_INT64((uint64)BPLUSTREE_NULL);</a>
+<a name="ln2924">	all_key_count = 0;</a>
+<a name="ln2925">	all_key_length = 0;</a>
+<a name="ln2926">}</a>
+<a name="ln2927"> </a>
+<a name="ln2928"> </a>
+<a name="ln2929">uint8*</a>
+<a name="ln2930">bplustree_node::KeyAt(int32 index, uint16* keyLength) const</a>
+<a name="ln2931">{</a>
+<a name="ln2932">	if (index &lt; 0 || index &gt; NumKeys())</a>
+<a name="ln2933">		return NULL;</a>
+<a name="ln2934"> </a>
+<a name="ln2935">	uint8* keyStart = Keys();</a>
+<a name="ln2936">	uint16* keyLengths = KeyLengths();</a>
+<a name="ln2937"> </a>
+<a name="ln2938">	*keyLength = BFS_ENDIAN_TO_HOST_INT16(keyLengths[index])</a>
+<a name="ln2939">		- (index != 0 ? BFS_ENDIAN_TO_HOST_INT16(keyLengths[index - 1]) : 0);</a>
+<a name="ln2940">	if (index &gt; 0)</a>
+<a name="ln2941">		keyStart += BFS_ENDIAN_TO_HOST_INT16(keyLengths[index - 1]);</a>
+<a name="ln2942"> </a>
+<a name="ln2943">	return keyStart;</a>
+<a name="ln2944">}</a>
+<a name="ln2945"> </a>
+<a name="ln2946"> </a>
+<a name="ln2947">uint8</a>
+<a name="ln2948">bplustree_node::CountDuplicates(off_t offset, bool isFragment) const</a>
+<a name="ln2949">{</a>
+<a name="ln2950">	// the duplicate fragment handling is currently hard-coded to a node size</a>
+<a name="ln2951">	// of 1024 bytes - with future versions of BFS, this may be a problem</a>
+<a name="ln2952"> </a>
+<a name="ln2953">	if (isFragment) {</a>
+<a name="ln2954">		uint32 fragment = (NUM_FRAGMENT_VALUES + 1) * ((uint64)offset &amp; 0x3ff);</a>
+<a name="ln2955"> </a>
+<a name="ln2956">		return ((off_t*)this)[fragment];</a>
+<a name="ln2957">	}</a>
+<a name="ln2958">	return OverflowLink();</a>
+<a name="ln2959">}</a>
+<a name="ln2960"> </a>
+<a name="ln2961"> </a>
+<a name="ln2962">off_t</a>
+<a name="ln2963">bplustree_node::DuplicateAt(off_t offset, bool isFragment, int8 index) const</a>
+<a name="ln2964">{</a>
+<a name="ln2965">	uint32 start;</a>
+<a name="ln2966">	if (isFragment)</a>
+<a name="ln2967">		start = 8 * ((uint64)offset &amp; 0x3ff);</a>
+<a name="ln2968">	else</a>
+<a name="ln2969">		start = 2;</a>
+<a name="ln2970"> </a>
+<a name="ln2971">	return ((off_t*)this)[start + 1 + index];</a>
+<a name="ln2972">}</a>
+<a name="ln2973"> </a>
+<a name="ln2974"> </a>
+<a name="ln2975">/*!	Although the name suggests it, this function doesn't return the real</a>
+<a name="ln2976">	used fragment count; at least, it can only count to two: it returns</a>
+<a name="ln2977">	0, if there is no fragment used, 1 if there is only one fragment</a>
+<a name="ln2978">	used, and 2 if there are at least 2 fragments used.</a>
+<a name="ln2979">*/</a>
+<a name="ln2980">uint32</a>
+<a name="ln2981">bplustree_node::FragmentsUsed(uint32 nodeSize) const</a>
+<a name="ln2982">{</a>
+<a name="ln2983">	uint32 used = 0;</a>
+<a name="ln2984">	for (uint32 i = 0; i &lt; MaxFragments(nodeSize); i++) {</a>
+<a name="ln2985">		duplicate_array* array = FragmentAt(i);</a>
+<a name="ln2986">		if (array-&gt;Count() &gt; 0 &amp;&amp; ++used &gt; 1)</a>
+<a name="ln2987">			return used;</a>
+<a name="ln2988">	}</a>
+<a name="ln2989">	return used;</a>
+<a name="ln2990">}</a>
+<a name="ln2991"> </a>
+<a name="ln2992"> </a>
+<a name="ln2993">status_t</a>
+<a name="ln2994">bplustree_node::CheckIntegrity(uint32 nodeSize) const</a>
+<a name="ln2995">{</a>
+<a name="ln2996">	if (NumKeys() &gt; nodeSize || AllKeyLength() &gt; nodeSize)</a>
+<a name="ln2997">		DEBUGGER((&quot;invalid node: key/length count&quot;));</a>
+<a name="ln2998"> </a>
+<a name="ln2999">	for (int32 i = 0; i &lt; NumKeys(); i++) {</a>
+<a name="ln3000">		uint16 length = 0;</a>
+<a name="ln3001">		uint8* key = KeyAt(i, &amp;length);</a>
+<a name="ln3002">		if (key + length + sizeof(off_t) + sizeof(uint16)</a>
+<a name="ln3003">				&gt; (uint8*)this + nodeSize</a>
+<a name="ln3004">			|| length &gt; BPLUSTREE_MAX_KEY_LENGTH) {</a>
+<a name="ln3005">			dprintf(&quot;invalid node %p, key %d: keys corrupted\n&quot;, this, (int)i);</a>
+<a name="ln3006">			return B_BAD_DATA;</a>
+<a name="ln3007">		}</a>
+<a name="ln3008">		if (Values()[i] == -1) {</a>
+<a name="ln3009">			dprintf(&quot;invalid node %p, value %d: %&quot; B_PRIdOFF &quot;: values &quot;</a>
+<a name="ln3010">				&quot;corrupted\n&quot;, this, (int)i, Values()[i]);</a>
+<a name="ln3011">			return B_BAD_DATA;</a>
+<a name="ln3012">		}</a>
+<a name="ln3013">	}</a>
+<a name="ln3014">	return B_OK;</a>
+<a name="ln3015">}</a>
+<a name="ln3016"> </a>
+<a name="ln3017"> </a>
+<a name="ln3018">// #pragma mark -</a>
+<a name="ln3019"> </a>
+<a name="ln3020"> </a>
+<a name="ln3021">#if !_BOOT_MODE</a>
+<a name="ln3022">BitmapArray::BitmapArray(size_t numBits)</a>
+<a name="ln3023">{</a>
+<a name="ln3024">	fSize = (numBits + 7) / 8;</a>
+<a name="ln3025">	fBitmap = (uint8*)calloc(fSize, 1);</a>
+<a name="ln3026">	fCountSet = 0;</a>
+<a name="ln3027">}</a>
+<a name="ln3028"> </a>
+<a name="ln3029"> </a>
+<a name="ln3030">BitmapArray::~BitmapArray()</a>
+<a name="ln3031">{</a>
+<a name="ln3032">	free(fBitmap);</a>
+<a name="ln3033">}</a>
+<a name="ln3034"> </a>
+<a name="ln3035"> </a>
+<a name="ln3036">status_t</a>
+<a name="ln3037">BitmapArray::InitCheck() const</a>
+<a name="ln3038">{</a>
+<a name="ln3039">	return fBitmap != NULL ? B_OK : B_NO_MEMORY;</a>
+<a name="ln3040">}</a>
+<a name="ln3041"> </a>
+<a name="ln3042"> </a>
+<a name="ln3043">bool</a>
+<a name="ln3044">BitmapArray::IsSet(size_t index) const</a>
+<a name="ln3045">{</a>
+<a name="ln3046">	uint32 byteIndex = index / 8;</a>
+<a name="ln3047">	if (byteIndex &gt;= fSize)</a>
+<a name="ln3048">		return false;</a>
+<a name="ln3049"> </a>
+<a name="ln3050">	return (fBitmap[byteIndex] &amp; (1UL &lt;&lt; (index &amp; 0x7))) != 0;</a>
+<a name="ln3051">}</a>
+<a name="ln3052"> </a>
+<a name="ln3053"> </a>
+<a name="ln3054">void</a>
+<a name="ln3055">BitmapArray::Set(size_t index, bool set)</a>
+<a name="ln3056">{</a>
+<a name="ln3057">	uint32 byteIndex = index / 8;</a>
+<a name="ln3058">	if (byteIndex &gt;= fSize)</a>
+<a name="ln3059">		return;</a>
+<a name="ln3060"> </a>
+<a name="ln3061">	if (set) {</a>
+<a name="ln3062">		fBitmap[byteIndex] |= 1UL &lt;&lt; (index &amp; 0x7);</a>
+<a name="ln3063">		fCountSet++;</a>
+<a name="ln3064">	} else {</a>
+<a name="ln3065">		fBitmap[byteIndex] &amp;= ~(1UL &lt;&lt; (index &amp; 0x7));</a>
+<a name="ln3066">		fCountSet--;</a>
+<a name="ln3067">	}</a>
+<a name="ln3068">}</a>
+<a name="ln3069">#endif // !_BOOT_MODE</a>
+<a name="ln3070"> </a>
+<a name="ln3071"> </a>
+<a name="ln3072">// #pragma mark -</a>
+<a name="ln3073"> </a>
+<a name="ln3074"> </a>
+<a name="ln3075">bool</a>
+<a name="ln3076">duplicate_array::_FindInternal(off_t value, int32&amp; index) const</a>
+<a name="ln3077">{</a>
+<a name="ln3078">	int32 min = 0, max = Count() - 1;</a>
+<a name="ln3079">	off_t cmp;</a>
+<a name="ln3080">	while (min &lt;= max) {</a>
+<a name="ln3081">		index = (min + max) / 2;</a>
+<a name="ln3082"> </a>
+<a name="ln3083">		cmp = ValueAt(index) - value;</a>
+<a name="ln3084">		if (cmp &lt; 0)</a>
+<a name="ln3085">			min = index + 1;</a>
+<a name="ln3086">		else if (cmp &gt; 0)</a>
+<a name="ln3087">			max = index - 1;</a>
+<a name="ln3088">		else</a>
+<a name="ln3089">			return true;</a>
+<a name="ln3090">	}</a>
+<a name="ln3091">	return false;</a>
+<a name="ln3092">}</a>
+<a name="ln3093"> </a>
+<a name="ln3094"> </a>
+<a name="ln3095">void</a>
+<a name="ln3096">duplicate_array::Insert(off_t value)</a>
+<a name="ln3097">{</a>
+<a name="ln3098">	// if there are more than 8 values in this array, use a</a>
+<a name="ln3099">	// binary search, if not, just iterate linearly to find</a>
+<a name="ln3100">	// the insertion point</a>
+<a name="ln3101">	int32 size = Count();</a>
+<a name="ln3102">	int32 i = 0;</a>
+<a name="ln3103">	if (size &gt; 8 ) {</a>
+<a name="ln3104">		if (!_FindInternal(value, i) &amp;&amp; ValueAt(i) &lt;= value)</a>
+<a name="ln3105">			i++;</a>
+<a name="ln3106">	} else {</a>
+<a name="ln3107">		for (i = 0; i &lt; size; i++) {</a>
+<a name="ln3108">			if (ValueAt(i) &gt; value)</a>
+<a name="ln3109">				break;</a>
+<a name="ln3110">		}</a>
+<a name="ln3111">	}</a>
+<a name="ln3112"> </a>
+<a name="ln3113">	memmove(&amp;values[i + 1], &amp;values[i], (size - i) * sizeof(off_t));</a>
+<a name="ln3114">	values[i] = HOST_ENDIAN_TO_BFS_INT64(value);</a>
+<a name="ln3115">	count = HOST_ENDIAN_TO_BFS_INT64(size + 1);</a>
+<a name="ln3116">}</a>
+<a name="ln3117"> </a>
+<a name="ln3118"> </a>
+<a name="ln3119">bool</a>
+<a name="ln3120">duplicate_array::Remove(off_t value)</a>
+<a name="ln3121">{</a>
+<a name="ln3122">	int32 index = Find(value);</a>
+<a name="ln3123">	if (index == -1)</a>
+<a name="ln3124">		return false;</a>
+<a name="ln3125"> </a>
+<a name="ln3126">	int32 newSize = Count() - 1;</a>
+<a name="ln3127">	memmove(&amp;values[index], &amp;values[index + 1],</a>
+<a name="ln3128">		(newSize - index) * sizeof(off_t));</a>
+<a name="ln3129">	count = HOST_ENDIAN_TO_BFS_INT64(newSize);</a>
+<a name="ln3130"> </a>
+<a name="ln3131">	return true;</a>
+<a name="ln3132">}</a>
+<a name="ln3133"> </a>
+<a name="ln3134"> </a>
+<a name="ln3135">#if _BOOT_MODE</a>
+<a name="ln3136">} // namespace BFS</a>
+<a name="ln3137">#endif</a>
+
+</code></pre>
+<div class="balloon" rel="1900"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2038"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the third actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="1889"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the third actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="1889"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="1856"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the fourth actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="1900"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the fourth actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="1856"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="1849"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the fifth actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2055"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the fourth actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="1849"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the third actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="1431"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the fourth actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="1299"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the fourth actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2135"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="1856"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the third actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="1222"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the fifth actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2322"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="353"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the fifth actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="711"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="711"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the third actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="782"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="782"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the third actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="790"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="790"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the third actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="801"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the third actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="823"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="829"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="829"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the third actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="829"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the fourth actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="873"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="1146"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="1146"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the third actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="1171"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="1171"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the third actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="1299"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="1222"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the third actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2335"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the third actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2335"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2482"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the third actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2482"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the fourth actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2482"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the fifth actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2495"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2495"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the third actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2495"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the fourth actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2530"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2530"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the third actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2537"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2537"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the third actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2537"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the fourth actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2537"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the fifth actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2544"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2544"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the third actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2544"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the fourth actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2544"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the fifth actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="3009"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the fourth actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2482"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2459"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the fifth actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2459"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the fourth actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2459"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the third actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="353"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the fourth actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2341"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2341"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the third actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2350"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2350"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the third actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2370"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2370"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the third actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2390"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2322"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the third actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2390"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the third actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2403"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the fourth actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2403"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the fifth actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2435"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2435"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the third actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2444"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2444"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the third actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2444"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the fourth actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2459"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2403"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="353"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the third actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="801"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2011"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v512/" target="_blank">V512</a> A call of the 'memmove' function will lead to overflow of the buffer 'duplicate'.</p></div>
+<div class="balloon" rel="606"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fHeader.</p></div>
+<div class="balloon" rel="276"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v512/" target="_blank">V512</a> A call of the 'memcpy' function will lead to the 'fNode' buffer becoming out of range.</p></div>
+<div class="balloon" rel="1603"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v773/" target="_blank">V773</a> The function was exited without releasing the 'newKey' pointer. A memory leak is possible.</p></div>
+<div class="balloon" rel="319"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the third actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="319"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the fourth actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="319"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the fifth actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

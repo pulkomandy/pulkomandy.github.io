@@ -1,0 +1,1377 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>fifo.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2007-2013, Ingo Weinhold, ingo_weinhold@gmx.de.</a>
+<a name="ln3"> * Copyright 2003-2010, Axel Dörfler, axeld@pinc-software.de.</a>
+<a name="ln4"> * Distributed under the terms of the MIT License.</a>
+<a name="ln5"> */</a>
+<a name="ln6"> </a>
+<a name="ln7"> </a>
+<a name="ln8">#include &quot;fifo.h&quot;</a>
+<a name="ln9"> </a>
+<a name="ln10">#include &lt;limits.h&gt;</a>
+<a name="ln11">#include &lt;stdio.h&gt;</a>
+<a name="ln12">#include &lt;stdlib.h&gt;</a>
+<a name="ln13">#include &lt;string.h&gt;</a>
+<a name="ln14">#include &lt;sys/ioctl.h&gt;</a>
+<a name="ln15">#include &lt;sys/stat.h&gt;</a>
+<a name="ln16"> </a>
+<a name="ln17">#include &lt;new&gt;</a>
+<a name="ln18"> </a>
+<a name="ln19">#include &lt;KernelExport.h&gt;</a>
+<a name="ln20">#include &lt;NodeMonitor.h&gt;</a>
+<a name="ln21">#include &lt;Select.h&gt;</a>
+<a name="ln22"> </a>
+<a name="ln23">#include &lt;condition_variable.h&gt;</a>
+<a name="ln24">#include &lt;debug_hex_dump.h&gt;</a>
+<a name="ln25">#include &lt;lock.h&gt;</a>
+<a name="ln26">#include &lt;select_sync_pool.h&gt;</a>
+<a name="ln27">#include &lt;syscall_restart.h&gt;</a>
+<a name="ln28">#include &lt;team.h&gt;</a>
+<a name="ln29">#include &lt;thread.h&gt;</a>
+<a name="ln30">#include &lt;util/DoublyLinkedList.h&gt;</a>
+<a name="ln31">#include &lt;util/AutoLock.h&gt;</a>
+<a name="ln32">#include &lt;util/ring_buffer.h&gt;</a>
+<a name="ln33">#include &lt;vfs.h&gt;</a>
+<a name="ln34">#include &lt;vfs_defs.h&gt;</a>
+<a name="ln35">#include &lt;vm/vm.h&gt;</a>
+<a name="ln36"> </a>
+<a name="ln37"> </a>
+<a name="ln38">//#define TRACE_FIFO</a>
+<a name="ln39">#ifdef TRACE_FIFO</a>
+<a name="ln40">#	define TRACE(x...) dprintf(x)</a>
+<a name="ln41">#else</a>
+<a name="ln42">#	define TRACE(x...)</a>
+<a name="ln43">#endif</a>
+<a name="ln44"> </a>
+<a name="ln45"> </a>
+<a name="ln46">namespace fifo {</a>
+<a name="ln47"> </a>
+<a name="ln48"> </a>
+<a name="ln49">struct file_cookie;</a>
+<a name="ln50">class Inode;</a>
+<a name="ln51"> </a>
+<a name="ln52"> </a>
+<a name="ln53">class RingBuffer {</a>
+<a name="ln54">public:</a>
+<a name="ln55">								RingBuffer();</a>
+<a name="ln56">								~RingBuffer();</a>
+<a name="ln57"> </a>
+<a name="ln58">			status_t			CreateBuffer();</a>
+<a name="ln59">			void				DeleteBuffer();</a>
+<a name="ln60"> </a>
+<a name="ln61">			ssize_t				Write(const void* buffer, size_t length,</a>
+<a name="ln62">									bool isUser);</a>
+<a name="ln63">			ssize_t				Read(void* buffer, size_t length, bool isUser);</a>
+<a name="ln64">			ssize_t				Peek(size_t offset, void* buffer,</a>
+<a name="ln65">									size_t length) const;</a>
+<a name="ln66"> </a>
+<a name="ln67">			size_t				Readable() const;</a>
+<a name="ln68">			size_t				Writable() const;</a>
+<a name="ln69"> </a>
+<a name="ln70">private:</a>
+<a name="ln71">			struct ring_buffer*	fBuffer;</a>
+<a name="ln72">};</a>
+<a name="ln73"> </a>
+<a name="ln74"> </a>
+<a name="ln75">class ReadRequest : public DoublyLinkedListLinkImpl&lt;ReadRequest&gt; {</a>
+<a name="ln76">public:</a>
+<a name="ln77">	ReadRequest(file_cookie* cookie)</a>
+<a name="ln78">		:</a>
+<a name="ln79">		fThread(thread_get_current_thread()),</a>
+<a name="ln80">		fCookie(cookie),</a>
+<a name="ln81">		fNotified(true)</a>
+<a name="ln82">	{</a>
+<a name="ln83">		B_INITIALIZE_SPINLOCK(&amp;fLock);</a>
+<a name="ln84">	}</a>
+<a name="ln85"> </a>
+<a name="ln86">	void SetNotified(bool notified)</a>
+<a name="ln87">	{</a>
+<a name="ln88">		InterruptsSpinLocker _(fLock);</a>
+<a name="ln89">		fNotified = notified;</a>
+<a name="ln90">	}</a>
+<a name="ln91"> </a>
+<a name="ln92">	void Notify(status_t status = B_OK)</a>
+<a name="ln93">	{</a>
+<a name="ln94">		InterruptsSpinLocker _(fLock);</a>
+<a name="ln95">		TRACE(&quot;ReadRequest %p::Notify(), fNotified %d\n&quot;, this, fNotified);</a>
+<a name="ln96"> </a>
+<a name="ln97">		if (!fNotified) {</a>
+<a name="ln98">			thread_unblock(fThread, status);</a>
+<a name="ln99">			fNotified = true;</a>
+<a name="ln100">		}</a>
+<a name="ln101">	}</a>
+<a name="ln102"> </a>
+<a name="ln103">	Thread* GetThread() const</a>
+<a name="ln104">	{</a>
+<a name="ln105">		return fThread;</a>
+<a name="ln106">	}</a>
+<a name="ln107"> </a>
+<a name="ln108">	file_cookie* Cookie() const</a>
+<a name="ln109">	{</a>
+<a name="ln110">		return fCookie;</a>
+<a name="ln111">	}</a>
+<a name="ln112"> </a>
+<a name="ln113">private:</a>
+<a name="ln114">	spinlock		fLock;</a>
+<a name="ln115">	Thread*			fThread;</a>
+<a name="ln116">	file_cookie*	fCookie;</a>
+<a name="ln117">	volatile bool	fNotified;</a>
+<a name="ln118">};</a>
+<a name="ln119"> </a>
+<a name="ln120"> </a>
+<a name="ln121">class WriteRequest : public DoublyLinkedListLinkImpl&lt;WriteRequest&gt; {</a>
+<a name="ln122">public:</a>
+<a name="ln123">	WriteRequest(Thread* thread, size_t minimalWriteCount)</a>
+<a name="ln124">		:</a>
+<a name="ln125">		fThread(thread),</a>
+<a name="ln126">		fMinimalWriteCount(minimalWriteCount)</a>
+<a name="ln127">	{</a>
+<a name="ln128">	}</a>
+<a name="ln129"> </a>
+<a name="ln130">	Thread* GetThread() const</a>
+<a name="ln131">	{</a>
+<a name="ln132">		return fThread;</a>
+<a name="ln133">	}</a>
+<a name="ln134"> </a>
+<a name="ln135">	size_t MinimalWriteCount() const</a>
+<a name="ln136">	{</a>
+<a name="ln137">		return fMinimalWriteCount;</a>
+<a name="ln138">	}</a>
+<a name="ln139"> </a>
+<a name="ln140">private:</a>
+<a name="ln141">	Thread*	fThread;</a>
+<a name="ln142">	size_t	fMinimalWriteCount;</a>
+<a name="ln143">};</a>
+<a name="ln144"> </a>
+<a name="ln145"> </a>
+<a name="ln146">typedef DoublyLinkedList&lt;ReadRequest&gt; ReadRequestList;</a>
+<a name="ln147">typedef DoublyLinkedList&lt;WriteRequest&gt; WriteRequestList;</a>
+<a name="ln148"> </a>
+<a name="ln149"> </a>
+<a name="ln150">class Inode {</a>
+<a name="ln151">public:</a>
+<a name="ln152">								Inode();</a>
+<a name="ln153">								~Inode();</a>
+<a name="ln154"> </a>
+<a name="ln155">			status_t			InitCheck();</a>
+<a name="ln156"> </a>
+<a name="ln157">			bool				IsActive() const { return fActive; }</a>
+<a name="ln158">			timespec			CreationTime() const { return fCreationTime; }</a>
+<a name="ln159">			void				SetCreationTime(timespec creationTime)</a>
+<a name="ln160">									{ fCreationTime = creationTime; }</a>
+<a name="ln161">			timespec			ModificationTime() const</a>
+<a name="ln162">									{ return fModificationTime; }</a>
+<a name="ln163">			void				SetModificationTime(timespec modificationTime)</a>
+<a name="ln164">									{ fModificationTime = modificationTime; }</a>
+<a name="ln165"> </a>
+<a name="ln166">			mutex*				RequestLock() { return &amp;fRequestLock; }</a>
+<a name="ln167"> </a>
+<a name="ln168">			status_t			WriteDataToBuffer(const void* data,</a>
+<a name="ln169">									size_t* _length, bool nonBlocking,</a>
+<a name="ln170">									bool isUser);</a>
+<a name="ln171">			status_t			ReadDataFromBuffer(void* data, size_t* _length,</a>
+<a name="ln172">									bool nonBlocking, bool isUser,</a>
+<a name="ln173">									ReadRequest&amp; request);</a>
+<a name="ln174">			size_t				BytesAvailable() const</a>
+<a name="ln175">									{ return fBuffer.Readable(); }</a>
+<a name="ln176">			size_t				BytesWritable() const</a>
+<a name="ln177">									{ return fBuffer.Writable(); }</a>
+<a name="ln178"> </a>
+<a name="ln179">			void				AddReadRequest(ReadRequest&amp; request);</a>
+<a name="ln180">			void				RemoveReadRequest(ReadRequest&amp; request);</a>
+<a name="ln181">			status_t			WaitForReadRequest(ReadRequest&amp; request);</a>
+<a name="ln182"> </a>
+<a name="ln183">			void				NotifyBytesRead(size_t bytes);</a>
+<a name="ln184">			void				NotifyReadDone();</a>
+<a name="ln185">			void				NotifyBytesWritten(size_t bytes);</a>
+<a name="ln186">			void				NotifyEndClosed(bool writer);</a>
+<a name="ln187"> </a>
+<a name="ln188">			void				Open(int openMode);</a>
+<a name="ln189">			void				Close(file_cookie* cookie);</a>
+<a name="ln190">			int32				ReaderCount() const { return fReaderCount; }</a>
+<a name="ln191">			int32				WriterCount() const { return fWriterCount; }</a>
+<a name="ln192"> </a>
+<a name="ln193">			status_t			Select(uint8 event, selectsync* sync,</a>
+<a name="ln194">									int openMode);</a>
+<a name="ln195">			status_t			Deselect(uint8 event, selectsync* sync,</a>
+<a name="ln196">									int openMode);</a>
+<a name="ln197"> </a>
+<a name="ln198">			void				Dump(bool dumpData) const;</a>
+<a name="ln199">	static	int					Dump(int argc, char** argv);</a>
+<a name="ln200"> </a>
+<a name="ln201">private:</a>
+<a name="ln202">			timespec			fCreationTime;</a>
+<a name="ln203">			timespec			fModificationTime;</a>
+<a name="ln204"> </a>
+<a name="ln205">			RingBuffer			fBuffer;</a>
+<a name="ln206"> </a>
+<a name="ln207">			ReadRequestList		fReadRequests;</a>
+<a name="ln208">			WriteRequestList	fWriteRequests;</a>
+<a name="ln209"> </a>
+<a name="ln210">			mutex				fRequestLock;</a>
+<a name="ln211"> </a>
+<a name="ln212">			ConditionVariable	fWriteCondition;</a>
+<a name="ln213"> </a>
+<a name="ln214">			int32				fReaderCount;</a>
+<a name="ln215">			int32				fWriterCount;</a>
+<a name="ln216">			bool				fActive;</a>
+<a name="ln217"> </a>
+<a name="ln218">			select_sync_pool*	fReadSelectSyncPool;</a>
+<a name="ln219">			select_sync_pool*	fWriteSelectSyncPool;</a>
+<a name="ln220">};</a>
+<a name="ln221"> </a>
+<a name="ln222"> </a>
+<a name="ln223">class FIFOInode : public Inode {</a>
+<a name="ln224">public:</a>
+<a name="ln225">	FIFOInode(fs_vnode* vnode)</a>
+<a name="ln226">		:</a>
+<a name="ln227">		Inode(),</a>
+<a name="ln228">		fSuperVnode(*vnode)</a>
+<a name="ln229">	{</a>
+<a name="ln230">	}</a>
+<a name="ln231"> </a>
+<a name="ln232">	fs_vnode*	SuperVnode() { return &amp;fSuperVnode; }</a>
+<a name="ln233"> </a>
+<a name="ln234">private:</a>
+<a name="ln235">	fs_vnode	fSuperVnode;</a>
+<a name="ln236">};</a>
+<a name="ln237"> </a>
+<a name="ln238"> </a>
+<a name="ln239">struct file_cookie {</a>
+<a name="ln240">	int	open_mode;</a>
+<a name="ln241">			// guarded by Inode::fRequestLock</a>
+<a name="ln242"> </a>
+<a name="ln243">	void SetNonBlocking(bool nonBlocking)</a>
+<a name="ln244">	{</a>
+<a name="ln245">		if (nonBlocking)</a>
+<a name="ln246">			open_mode |= O_NONBLOCK;</a>
+<a name="ln247">		else</a>
+<a name="ln248">			open_mode &amp;= ~(int)O_NONBLOCK;</a>
+<a name="ln249">	}</a>
+<a name="ln250">};</a>
+<a name="ln251"> </a>
+<a name="ln252"> </a>
+<a name="ln253">// #pragma mark -</a>
+<a name="ln254"> </a>
+<a name="ln255"> </a>
+<a name="ln256">RingBuffer::RingBuffer()</a>
+<a name="ln257">	:</a>
+<a name="ln258">	fBuffer(NULL)</a>
+<a name="ln259">{</a>
+<a name="ln260">}</a>
+<a name="ln261"> </a>
+<a name="ln262"> </a>
+<a name="ln263">RingBuffer::~RingBuffer()</a>
+<a name="ln264">{</a>
+<a name="ln265">	DeleteBuffer();</a>
+<a name="ln266">}</a>
+<a name="ln267"> </a>
+<a name="ln268"> </a>
+<a name="ln269">status_t</a>
+<a name="ln270">RingBuffer::CreateBuffer()</a>
+<a name="ln271">{</a>
+<a name="ln272">	if (fBuffer != NULL)</a>
+<a name="ln273">		return B_OK;</a>
+<a name="ln274"> </a>
+<a name="ln275">	fBuffer = create_ring_buffer(VFS_FIFO_BUFFER_CAPACITY);</a>
+<a name="ln276">	return fBuffer != NULL ? B_OK : B_NO_MEMORY;</a>
+<a name="ln277">}</a>
+<a name="ln278"> </a>
+<a name="ln279"> </a>
+<a name="ln280">void</a>
+<a name="ln281">RingBuffer::DeleteBuffer()</a>
+<a name="ln282">{</a>
+<a name="ln283">	if (fBuffer != NULL) {</a>
+<a name="ln284">		delete_ring_buffer(fBuffer);</a>
+<a name="ln285">		fBuffer = NULL;</a>
+<a name="ln286">	}</a>
+<a name="ln287">}</a>
+<a name="ln288"> </a>
+<a name="ln289"> </a>
+<a name="ln290">inline ssize_t</a>
+<a name="ln291">RingBuffer::Write(const void* buffer, size_t length, bool isUser)</a>
+<a name="ln292">{</a>
+<a name="ln293">	if (fBuffer == NULL)</a>
+<a name="ln294">		return B_NO_MEMORY;</a>
+<a name="ln295">	if (isUser &amp;&amp; !IS_USER_ADDRESS(buffer))</a>
+<a name="ln296">		return B_BAD_ADDRESS;</a>
+<a name="ln297"> </a>
+<a name="ln298">	return isUser</a>
+<a name="ln299">		? ring_buffer_user_write(fBuffer, (const uint8*)buffer, length)</a>
+<a name="ln300">		: ring_buffer_write(fBuffer, (const uint8*)buffer, length);</a>
+<a name="ln301">}</a>
+<a name="ln302"> </a>
+<a name="ln303"> </a>
+<a name="ln304">inline ssize_t</a>
+<a name="ln305">RingBuffer::Read(void* buffer, size_t length, bool isUser)</a>
+<a name="ln306">{</a>
+<a name="ln307">	if (fBuffer == NULL)</a>
+<a name="ln308">		return B_NO_MEMORY;</a>
+<a name="ln309">	if (isUser &amp;&amp; !IS_USER_ADDRESS(buffer))</a>
+<a name="ln310">		return B_BAD_ADDRESS;</a>
+<a name="ln311"> </a>
+<a name="ln312">	return isUser</a>
+<a name="ln313">		? ring_buffer_user_read(fBuffer, (uint8*)buffer, length)</a>
+<a name="ln314">		: ring_buffer_read(fBuffer, (uint8*)buffer, length);</a>
+<a name="ln315">}</a>
+<a name="ln316"> </a>
+<a name="ln317"> </a>
+<a name="ln318">inline ssize_t</a>
+<a name="ln319">RingBuffer::Peek(size_t offset, void* buffer, size_t length) const</a>
+<a name="ln320">{</a>
+<a name="ln321">	if (fBuffer == NULL)</a>
+<a name="ln322">		return B_NO_MEMORY;</a>
+<a name="ln323"> </a>
+<a name="ln324">	return ring_buffer_peek(fBuffer, offset, (uint8*)buffer, length);</a>
+<a name="ln325">}</a>
+<a name="ln326"> </a>
+<a name="ln327"> </a>
+<a name="ln328">inline size_t</a>
+<a name="ln329">RingBuffer::Readable() const</a>
+<a name="ln330">{</a>
+<a name="ln331">	return fBuffer != NULL ? ring_buffer_readable(fBuffer) : 0;</a>
+<a name="ln332">}</a>
+<a name="ln333"> </a>
+<a name="ln334"> </a>
+<a name="ln335">inline size_t</a>
+<a name="ln336">RingBuffer::Writable() const</a>
+<a name="ln337">{</a>
+<a name="ln338">	return fBuffer != NULL ? ring_buffer_writable(fBuffer) : 0;</a>
+<a name="ln339">}</a>
+<a name="ln340"> </a>
+<a name="ln341"> </a>
+<a name="ln342">//	#pragma mark -</a>
+<a name="ln343"> </a>
+<a name="ln344"> </a>
+<a name="ln345">Inode::Inode()</a>
+<a name="ln346">	:</a>
+<a name="ln347">	fReadRequests(),</a>
+<a name="ln348">	fWriteRequests(),</a>
+<a name="ln349">	fReaderCount(0),</a>
+<a name="ln350">	fWriterCount(0),</a>
+<a name="ln351">	fActive(false),</a>
+<a name="ln352">	fReadSelectSyncPool(NULL),</a>
+<a name="ln353">	fWriteSelectSyncPool(NULL)</a>
+<a name="ln354">{</a>
+<a name="ln355">	fWriteCondition.Publish(this, &quot;pipe&quot;);</a>
+<a name="ln356">	mutex_init(&amp;fRequestLock, &quot;pipe request&quot;);</a>
+<a name="ln357"> </a>
+<a name="ln358">	bigtime_t time = real_time_clock();</a>
+<a name="ln359">	fModificationTime.tv_sec = time / 1000000;</a>
+<a name="ln360">	fModificationTime.tv_nsec = (time % 1000000) * 1000;</a>
+<a name="ln361">	fCreationTime = fModificationTime;</a>
+<a name="ln362">}</a>
+<a name="ln363"> </a>
+<a name="ln364"> </a>
+<a name="ln365">Inode::~Inode()</a>
+<a name="ln366">{</a>
+<a name="ln367">	fWriteCondition.Unpublish();</a>
+<a name="ln368">	mutex_destroy(&amp;fRequestLock);</a>
+<a name="ln369">}</a>
+<a name="ln370"> </a>
+<a name="ln371"> </a>
+<a name="ln372">status_t</a>
+<a name="ln373">Inode::InitCheck()</a>
+<a name="ln374">{</a>
+<a name="ln375">	return B_OK;</a>
+<a name="ln376">}</a>
+<a name="ln377"> </a>
+<a name="ln378"> </a>
+<a name="ln379">/*!	Writes the specified data bytes to the inode's ring buffer. The</a>
+<a name="ln380">	request lock must be held when calling this method.</a>
+<a name="ln381">	Notifies readers if necessary, so that blocking readers will get started.</a>
+<a name="ln382">	Returns B_OK for success, B_BAD_ADDRESS if copying from the buffer failed,</a>
+<a name="ln383">	and various semaphore errors (like B_WOULD_BLOCK in non-blocking mode). If</a>
+<a name="ln384">	the returned length is &gt; 0, the returned error code can be ignored.</a>
+<a name="ln385">*/</a>
+<a name="ln386">status_t</a>
+<a name="ln387">Inode::WriteDataToBuffer(const void* _data, size_t* _length, bool nonBlocking,</a>
+<a name="ln388">	bool isUser)</a>
+<a name="ln389">{</a>
+<a name="ln390">	const uint8* data = (const uint8*)_data;</a>
+<a name="ln391">	size_t dataSize = *_length;</a>
+<a name="ln392">	size_t&amp; written = *_length;</a>
+<a name="ln393">	written = 0;</a>
+<a name="ln394"> </a>
+<a name="ln395">	TRACE(&quot;Inode %p::WriteDataToBuffer(data = %p, bytes = %zu)\n&quot;, this, data,</a>
+<a name="ln396">		dataSize);</a>
+<a name="ln397"> </a>
+<a name="ln398">	// A request up to VFS_FIFO_ATOMIC_WRITE_SIZE bytes shall not be</a>
+<a name="ln399">	// interleaved with other writer's data.</a>
+<a name="ln400">	size_t minToWrite = 1;</a>
+<a name="ln401">	if (dataSize &lt;= VFS_FIFO_ATOMIC_WRITE_SIZE)</a>
+<a name="ln402">		minToWrite = dataSize;</a>
+<a name="ln403"> </a>
+<a name="ln404">	while (dataSize &gt; 0) {</a>
+<a name="ln405">		// Wait until enough space in the buffer is available.</a>
+<a name="ln406">		while (!fActive</a>
+<a name="ln407">				|| (fBuffer.Writable() &lt; minToWrite &amp;&amp; fReaderCount &gt; 0)) {</a>
+<a name="ln408">			if (nonBlocking)</a>
+<a name="ln409">				return B_WOULD_BLOCK;</a>
+<a name="ln410"> </a>
+<a name="ln411">			ConditionVariableEntry entry;</a>
+<a name="ln412">			entry.Add(this);</a>
+<a name="ln413"> </a>
+<a name="ln414">			WriteRequest request(thread_get_current_thread(), minToWrite);</a>
+<a name="ln415">			fWriteRequests.Add(&amp;request);</a>
+<a name="ln416"> </a>
+<a name="ln417">			mutex_unlock(&amp;fRequestLock);</a>
+<a name="ln418">			status_t status = entry.Wait(B_CAN_INTERRUPT);</a>
+<a name="ln419">			mutex_lock(&amp;fRequestLock);</a>
+<a name="ln420"> </a>
+<a name="ln421">			fWriteRequests.Remove(&amp;request);</a>
+<a name="ln422"> </a>
+<a name="ln423">			if (status != B_OK)</a>
+<a name="ln424">				return status;</a>
+<a name="ln425">		}</a>
+<a name="ln426"> </a>
+<a name="ln427">		// write only as long as there are readers left</a>
+<a name="ln428">		if (fActive &amp;&amp; fReaderCount == 0) {</a>
+<a name="ln429">			if (written == 0)</a>
+<a name="ln430">				send_signal(find_thread(NULL), SIGPIPE);</a>
+<a name="ln431">			return EPIPE;</a>
+<a name="ln432">		}</a>
+<a name="ln433"> </a>
+<a name="ln434">		// write as much as we can</a>
+<a name="ln435"> </a>
+<a name="ln436">		size_t toWrite = (fActive ? fBuffer.Writable() : 0);</a>
+<a name="ln437">		if (toWrite &gt; dataSize)</a>
+<a name="ln438">			toWrite = dataSize;</a>
+<a name="ln439"> </a>
+<a name="ln440">		if (toWrite &gt; 0) {</a>
+<a name="ln441">			ssize_t bytesWritten = fBuffer.Write(data, toWrite, isUser);</a>
+<a name="ln442">			if (bytesWritten &lt; 0)</a>
+<a name="ln443">				return bytesWritten;</a>
+<a name="ln444">		}</a>
+<a name="ln445"> </a>
+<a name="ln446">		data += toWrite;</a>
+<a name="ln447">		dataSize -= toWrite;</a>
+<a name="ln448">		written += toWrite;</a>
+<a name="ln449"> </a>
+<a name="ln450">		NotifyBytesWritten(toWrite);</a>
+<a name="ln451">	}</a>
+<a name="ln452"> </a>
+<a name="ln453">	return B_OK;</a>
+<a name="ln454">}</a>
+<a name="ln455"> </a>
+<a name="ln456"> </a>
+<a name="ln457">status_t</a>
+<a name="ln458">Inode::ReadDataFromBuffer(void* data, size_t* _length, bool nonBlocking,</a>
+<a name="ln459">	bool isUser, ReadRequest&amp; request)</a>
+<a name="ln460">{</a>
+<a name="ln461">	size_t dataSize = *_length;</a>
+<a name="ln462">	*_length = 0;</a>
+<a name="ln463"> </a>
+<a name="ln464">	// wait until our request is first in queue</a>
+<a name="ln465">	status_t error;</a>
+<a name="ln466">	if (fReadRequests.Head() != &amp;request) {</a>
+<a name="ln467">		if (nonBlocking)</a>
+<a name="ln468">			return B_WOULD_BLOCK;</a>
+<a name="ln469"> </a>
+<a name="ln470">		TRACE(&quot;Inode %p::%s(): wait for request %p to become the first &quot;</a>
+<a name="ln471">			&quot;request.\n&quot;, this, __FUNCTION__, &amp;request);</a>
+<a name="ln472"> </a>
+<a name="ln473">		error = WaitForReadRequest(request);</a>
+<a name="ln474">		if (error != B_OK)</a>
+<a name="ln475">			return error;</a>
+<a name="ln476">	}</a>
+<a name="ln477"> </a>
+<a name="ln478">	// wait until data are available</a>
+<a name="ln479">	while (fBuffer.Readable() == 0) {</a>
+<a name="ln480">		if (nonBlocking)</a>
+<a name="ln481">			return B_WOULD_BLOCK;</a>
+<a name="ln482"> </a>
+<a name="ln483">		if (fActive &amp;&amp; fWriterCount == 0)</a>
+<a name="ln484">			return B_OK;</a>
+<a name="ln485"> </a>
+<a name="ln486">		TRACE(&quot;Inode %p::%s(): wait for data, request %p\n&quot;, this, __FUNCTION__,</a>
+<a name="ln487">			&amp;request);</a>
+<a name="ln488"> </a>
+<a name="ln489">		error = WaitForReadRequest(request);</a>
+<a name="ln490">		if (error != B_OK)</a>
+<a name="ln491">			return error;</a>
+<a name="ln492">	}</a>
+<a name="ln493"> </a>
+<a name="ln494">	// read as much as we can</a>
+<a name="ln495">	size_t toRead = fBuffer.Readable();</a>
+<a name="ln496">	if (toRead &gt; dataSize)</a>
+<a name="ln497">		toRead = dataSize;</a>
+<a name="ln498"> </a>
+<a name="ln499">	ssize_t bytesRead = fBuffer.Read(data, toRead, isUser);</a>
+<a name="ln500">	if (bytesRead &lt; 0)</a>
+<a name="ln501">		return bytesRead;</a>
+<a name="ln502"> </a>
+<a name="ln503">	NotifyBytesRead(toRead);</a>
+<a name="ln504"> </a>
+<a name="ln505">	*_length = toRead;</a>
+<a name="ln506"> </a>
+<a name="ln507">	return B_OK;</a>
+<a name="ln508">}</a>
+<a name="ln509"> </a>
+<a name="ln510"> </a>
+<a name="ln511">void</a>
+<a name="ln512">Inode::AddReadRequest(ReadRequest&amp; request)</a>
+<a name="ln513">{</a>
+<a name="ln514">	fReadRequests.Add(&amp;request);</a>
+<a name="ln515">}</a>
+<a name="ln516"> </a>
+<a name="ln517"> </a>
+<a name="ln518">void</a>
+<a name="ln519">Inode::RemoveReadRequest(ReadRequest&amp; request)</a>
+<a name="ln520">{</a>
+<a name="ln521">	fReadRequests.Remove(&amp;request);</a>
+<a name="ln522">}</a>
+<a name="ln523"> </a>
+<a name="ln524"> </a>
+<a name="ln525">status_t</a>
+<a name="ln526">Inode::WaitForReadRequest(ReadRequest&amp; request)</a>
+<a name="ln527">{</a>
+<a name="ln528">	// add the entry to wait on</a>
+<a name="ln529">	thread_prepare_to_block(thread_get_current_thread(), B_CAN_INTERRUPT,</a>
+<a name="ln530">		THREAD_BLOCK_TYPE_OTHER, &quot;fifo read request&quot;);</a>
+<a name="ln531"> </a>
+<a name="ln532">	request.SetNotified(false);</a>
+<a name="ln533"> </a>
+<a name="ln534">	// wait</a>
+<a name="ln535">	mutex_unlock(&amp;fRequestLock);</a>
+<a name="ln536">	status_t status = thread_block();</a>
+<a name="ln537"> </a>
+<a name="ln538">	// Before going to lock again, we need to make sure no one tries to</a>
+<a name="ln539">	// unblock us. Otherwise that would screw with mutex_lock().</a>
+<a name="ln540">	request.SetNotified(true);</a>
+<a name="ln541"> </a>
+<a name="ln542">	mutex_lock(&amp;fRequestLock);</a>
+<a name="ln543"> </a>
+<a name="ln544">	return status;</a>
+<a name="ln545">}</a>
+<a name="ln546"> </a>
+<a name="ln547"> </a>
+<a name="ln548">void</a>
+<a name="ln549">Inode::NotifyBytesRead(size_t bytes)</a>
+<a name="ln550">{</a>
+<a name="ln551">	// notify writer, if something can be written now</a>
+<a name="ln552">	size_t writable = fBuffer.Writable();</a>
+<a name="ln553">	if (bytes &gt; 0) {</a>
+<a name="ln554">		// notify select()ors only, if nothing was writable before</a>
+<a name="ln555">		if (writable == bytes) {</a>
+<a name="ln556">			if (fWriteSelectSyncPool)</a>
+<a name="ln557">				notify_select_event_pool(fWriteSelectSyncPool, B_SELECT_WRITE);</a>
+<a name="ln558">		}</a>
+<a name="ln559"> </a>
+<a name="ln560">		// If any of the waiting writers has a minimal write count that has</a>
+<a name="ln561">		// now become satisfied, we notify all of them (condition variables</a>
+<a name="ln562">		// don't support doing that selectively).</a>
+<a name="ln563">		WriteRequest* request;</a>
+<a name="ln564">		WriteRequestList::Iterator iterator = fWriteRequests.GetIterator();</a>
+<a name="ln565">		while ((request = iterator.Next()) != NULL) {</a>
+<a name="ln566">			size_t minWriteCount = request-&gt;MinimalWriteCount();</a>
+<a name="ln567">			if (minWriteCount &gt; 0 &amp;&amp; minWriteCount &lt;= writable</a>
+<a name="ln568">					&amp;&amp; minWriteCount &gt; writable - bytes) {</a>
+<a name="ln569">				fWriteCondition.NotifyAll();</a>
+<a name="ln570">				break;</a>
+<a name="ln571">			}</a>
+<a name="ln572">		}</a>
+<a name="ln573">	}</a>
+<a name="ln574">}</a>
+<a name="ln575"> </a>
+<a name="ln576"> </a>
+<a name="ln577">void</a>
+<a name="ln578">Inode::NotifyReadDone()</a>
+<a name="ln579">{</a>
+<a name="ln580">	// notify next reader, if there's still something to be read</a>
+<a name="ln581">	if (fBuffer.Readable() &gt; 0) {</a>
+<a name="ln582">		if (ReadRequest* request = fReadRequests.First())</a>
+<a name="ln583">			request-&gt;Notify();</a>
+<a name="ln584">	}</a>
+<a name="ln585">}</a>
+<a name="ln586"> </a>
+<a name="ln587"> </a>
+<a name="ln588">void</a>
+<a name="ln589">Inode::NotifyBytesWritten(size_t bytes)</a>
+<a name="ln590">{</a>
+<a name="ln591">	// notify reader, if something can be read now</a>
+<a name="ln592">	if (bytes &gt; 0 &amp;&amp; fBuffer.Readable() == bytes) {</a>
+<a name="ln593">		if (fReadSelectSyncPool)</a>
+<a name="ln594">			notify_select_event_pool(fReadSelectSyncPool, B_SELECT_READ);</a>
+<a name="ln595"> </a>
+<a name="ln596">		if (ReadRequest* request = fReadRequests.First())</a>
+<a name="ln597">			request-&gt;Notify();</a>
+<a name="ln598">	}</a>
+<a name="ln599">}</a>
+<a name="ln600"> </a>
+<a name="ln601"> </a>
+<a name="ln602">void</a>
+<a name="ln603">Inode::NotifyEndClosed(bool writer)</a>
+<a name="ln604">{</a>
+<a name="ln605">	TRACE(&quot;Inode %p::%s(%s)\n&quot;, this, __FUNCTION__,</a>
+<a name="ln606">		writer ? &quot;writer&quot; : &quot;reader&quot;);</a>
+<a name="ln607"> </a>
+<a name="ln608">	if (writer) {</a>
+<a name="ln609">		// Our last writer has been closed; if the pipe</a>
+<a name="ln610">		// contains no data, unlock all waiting readers</a>
+<a name="ln611">		TRACE(&quot;  buffer readable: %zu\n&quot;, fBuffer.Readable());</a>
+<a name="ln612">		if (fBuffer.Readable() == 0) {</a>
+<a name="ln613">			ReadRequestList::Iterator iterator = fReadRequests.GetIterator();</a>
+<a name="ln614">			while (ReadRequest* request = iterator.Next())</a>
+<a name="ln615">				request-&gt;Notify();</a>
+<a name="ln616"> </a>
+<a name="ln617">			if (fReadSelectSyncPool)</a>
+<a name="ln618">				notify_select_event_pool(fReadSelectSyncPool, B_SELECT_READ);</a>
+<a name="ln619">		}</a>
+<a name="ln620">	} else {</a>
+<a name="ln621">		// Last reader is gone. Wake up all writers.</a>
+<a name="ln622">		fWriteCondition.NotifyAll();</a>
+<a name="ln623"> </a>
+<a name="ln624">		if (fWriteSelectSyncPool) {</a>
+<a name="ln625">			notify_select_event_pool(fWriteSelectSyncPool, B_SELECT_WRITE);</a>
+<a name="ln626">			notify_select_event_pool(fWriteSelectSyncPool, B_SELECT_ERROR);</a>
+<a name="ln627">		}</a>
+<a name="ln628">	}</a>
+<a name="ln629">}</a>
+<a name="ln630"> </a>
+<a name="ln631"> </a>
+<a name="ln632">void</a>
+<a name="ln633">Inode::Open(int openMode)</a>
+<a name="ln634">{</a>
+<a name="ln635">	MutexLocker locker(RequestLock());</a>
+<a name="ln636"> </a>
+<a name="ln637">	if ((openMode &amp; O_ACCMODE) == O_WRONLY)</a>
+<a name="ln638">		fWriterCount++;</a>
+<a name="ln639"> </a>
+<a name="ln640">	if ((openMode &amp; O_ACCMODE) == O_RDONLY || (openMode &amp; O_ACCMODE) == O_RDWR)</a>
+<a name="ln641">		fReaderCount++;</a>
+<a name="ln642"> </a>
+<a name="ln643">	if (fReaderCount &gt; 0 &amp;&amp; fWriterCount &gt; 0) {</a>
+<a name="ln644">		TRACE(&quot;Inode %p::Open(): fifo becomes active\n&quot;, this);</a>
+<a name="ln645">		fBuffer.CreateBuffer();</a>
+<a name="ln646">		fActive = true;</a>
+<a name="ln647"> </a>
+<a name="ln648">		// notify all waiting writers that they can start</a>
+<a name="ln649">		if (fWriteSelectSyncPool)</a>
+<a name="ln650">			notify_select_event_pool(fWriteSelectSyncPool, B_SELECT_WRITE);</a>
+<a name="ln651">		fWriteCondition.NotifyAll();</a>
+<a name="ln652">	}</a>
+<a name="ln653">}</a>
+<a name="ln654"> </a>
+<a name="ln655"> </a>
+<a name="ln656">void</a>
+<a name="ln657">Inode::Close(file_cookie* cookie)</a>
+<a name="ln658">{</a>
+<a name="ln659">	TRACE(&quot;Inode %p::Close(openMode = %d)\n&quot;, this, openMode);</a>
+<a name="ln660"> </a>
+<a name="ln661">	MutexLocker locker(RequestLock());</a>
+<a name="ln662"> </a>
+<a name="ln663">	int openMode = cookie-&gt;open_mode;</a>
+<a name="ln664"> </a>
+<a name="ln665">	// Notify all currently reading file descriptors</a>
+<a name="ln666">	ReadRequestList::Iterator iterator = fReadRequests.GetIterator();</a>
+<a name="ln667">	while (ReadRequest* request = iterator.Next()) {</a>
+<a name="ln668">		if (request-&gt;Cookie() == cookie)</a>
+<a name="ln669">			request-&gt;Notify(B_FILE_ERROR);</a>
+<a name="ln670">	}</a>
+<a name="ln671"> </a>
+<a name="ln672">	if ((openMode &amp; O_ACCMODE) == O_WRONLY &amp;&amp; --fWriterCount == 0)</a>
+<a name="ln673">		NotifyEndClosed(true);</a>
+<a name="ln674"> </a>
+<a name="ln675">	if ((openMode &amp; O_ACCMODE) == O_RDONLY</a>
+<a name="ln676">		|| (openMode &amp; O_ACCMODE) == O_RDWR) {</a>
+<a name="ln677">		if (--fReaderCount == 0)</a>
+<a name="ln678">			NotifyEndClosed(false);</a>
+<a name="ln679">	}</a>
+<a name="ln680"> </a>
+<a name="ln681">	if (fWriterCount == 0) {</a>
+<a name="ln682">		// Notify any still reading writers to stop</a>
+<a name="ln683">		// TODO: This only works reliable if there is only one writer - we could</a>
+<a name="ln684">		// do the same thing done for the read requests.</a>
+<a name="ln685">		fWriteCondition.NotifyAll(B_FILE_ERROR);</a>
+<a name="ln686">	}</a>
+<a name="ln687"> </a>
+<a name="ln688">	if (fReaderCount == 0 &amp;&amp; fWriterCount == 0) {</a>
+<a name="ln689">		fActive = false;</a>
+<a name="ln690">		fBuffer.DeleteBuffer();</a>
+<a name="ln691">	}</a>
+<a name="ln692">}</a>
+<a name="ln693"> </a>
+<a name="ln694"> </a>
+<a name="ln695">status_t</a>
+<a name="ln696">Inode::Select(uint8 event, selectsync* sync, int openMode)</a>
+<a name="ln697">{</a>
+<a name="ln698">	bool writer = true;</a>
+<a name="ln699">	select_sync_pool** pool;</a>
+<a name="ln700">	if ((openMode &amp; O_RWMASK) == O_RDONLY) {</a>
+<a name="ln701">		pool = &amp;fReadSelectSyncPool;</a>
+<a name="ln702">		writer = false;</a>
+<a name="ln703">	} else if ((openMode &amp; O_RWMASK) == O_WRONLY) {</a>
+<a name="ln704">		pool = &amp;fWriteSelectSyncPool;</a>
+<a name="ln705">	} else</a>
+<a name="ln706">		return B_NOT_ALLOWED;</a>
+<a name="ln707"> </a>
+<a name="ln708">	if (add_select_sync_pool_entry(pool, sync, event) != B_OK)</a>
+<a name="ln709">		return B_ERROR;</a>
+<a name="ln710"> </a>
+<a name="ln711">	// signal right away, if the condition holds already</a>
+<a name="ln712">	if (writer) {</a>
+<a name="ln713">		if ((event == B_SELECT_WRITE</a>
+<a name="ln714">				&amp;&amp; (fBuffer.Writable() &gt; 0 || fReaderCount == 0))</a>
+<a name="ln715">			|| (event == B_SELECT_ERROR &amp;&amp; fReaderCount == 0)) {</a>
+<a name="ln716">			return notify_select_event(sync, event);</a>
+<a name="ln717">		}</a>
+<a name="ln718">	} else {</a>
+<a name="ln719">		if (event == B_SELECT_READ</a>
+<a name="ln720">				&amp;&amp; (fBuffer.Readable() &gt; 0 || fWriterCount == 0)) {</a>
+<a name="ln721">			return notify_select_event(sync, event);</a>
+<a name="ln722">		}</a>
+<a name="ln723">	}</a>
+<a name="ln724"> </a>
+<a name="ln725">	return B_OK;</a>
+<a name="ln726">}</a>
+<a name="ln727"> </a>
+<a name="ln728"> </a>
+<a name="ln729">status_t</a>
+<a name="ln730">Inode::Deselect(uint8 event, selectsync* sync, int openMode)</a>
+<a name="ln731">{</a>
+<a name="ln732">	select_sync_pool** pool;</a>
+<a name="ln733">	if ((openMode &amp; O_RWMASK) == O_RDONLY) {</a>
+<a name="ln734">		pool = &amp;fReadSelectSyncPool;</a>
+<a name="ln735">	} else if ((openMode &amp; O_RWMASK) == O_WRONLY) {</a>
+<a name="ln736">		pool = &amp;fWriteSelectSyncPool;</a>
+<a name="ln737">	} else</a>
+<a name="ln738">		return B_NOT_ALLOWED;</a>
+<a name="ln739"> </a>
+<a name="ln740">	remove_select_sync_pool_entry(pool, sync, event);</a>
+<a name="ln741">	return B_OK;</a>
+<a name="ln742">}</a>
+<a name="ln743"> </a>
+<a name="ln744"> </a>
+<a name="ln745">void</a>
+<a name="ln746">Inode::Dump(bool dumpData) const</a>
+<a name="ln747">{</a>
+<a name="ln748">	kprintf(&quot;FIFO %p\n&quot;, this);</a>
+<a name="ln749">	kprintf(&quot;  active:        %s\n&quot;, fActive ? &quot;true&quot; : &quot;false&quot;);</a>
+<a name="ln750">	kprintf(&quot;  readers:       %&quot; B_PRId32 &quot;\n&quot;, fReaderCount);</a>
+<a name="ln751">	kprintf(&quot;  writers:       %&quot; B_PRId32 &quot;\n&quot;, fWriterCount);</a>
+<a name="ln752"> </a>
+<a name="ln753">	if (!fReadRequests.IsEmpty()) {</a>
+<a name="ln754">		kprintf(&quot; pending readers:\n&quot;);</a>
+<a name="ln755">		for (ReadRequestList::ConstIterator it = fReadRequests.GetIterator();</a>
+<a name="ln756">			ReadRequest* request = it.Next();) {</a>
+<a name="ln757">			kprintf(&quot;    %p: thread %&quot; B_PRId32 &quot;, cookie: %p\n&quot;, request,</a>
+<a name="ln758">				request-&gt;GetThread()-&gt;id, request-&gt;Cookie());</a>
+<a name="ln759">		}</a>
+<a name="ln760">	}</a>
+<a name="ln761"> </a>
+<a name="ln762">	if (!fWriteRequests.IsEmpty()) {</a>
+<a name="ln763">		kprintf(&quot; pending writers:\n&quot;);</a>
+<a name="ln764">		for (WriteRequestList::ConstIterator it = fWriteRequests.GetIterator();</a>
+<a name="ln765">			WriteRequest* request = it.Next();) {</a>
+<a name="ln766">			kprintf(&quot;    %p:  thread %&quot; B_PRId32 &quot;, min count: %zu\n&quot;, request,</a>
+<a name="ln767">				request-&gt;GetThread()-&gt;id, request-&gt;MinimalWriteCount());</a>
+<a name="ln768">		}</a>
+<a name="ln769">	}</a>
+<a name="ln770"> </a>
+<a name="ln771">	kprintf(&quot;  %zu bytes buffered\n&quot;, fBuffer.Readable());</a>
+<a name="ln772"> </a>
+<a name="ln773">	if (dumpData &amp;&amp; fBuffer.Readable() &gt; 0) {</a>
+<a name="ln774">		struct DataProvider : BKernel::HexDumpDataProvider {</a>
+<a name="ln775">			DataProvider(const RingBuffer&amp; buffer)</a>
+<a name="ln776">				:</a>
+<a name="ln777">				fBuffer(buffer),</a>
+<a name="ln778">				fOffset(0)</a>
+<a name="ln779">			{</a>
+<a name="ln780">			}</a>
+<a name="ln781"> </a>
+<a name="ln782">			virtual bool HasMoreData() const</a>
+<a name="ln783">			{</a>
+<a name="ln784">				return fOffset &lt; fBuffer.Readable();</a>
+<a name="ln785">			}</a>
+<a name="ln786"> </a>
+<a name="ln787">			virtual uint8 NextByte()</a>
+<a name="ln788">			{</a>
+<a name="ln789">				uint8 byte = '\0';</a>
+<a name="ln790">				if (fOffset &lt; fBuffer.Readable()) {</a>
+<a name="ln791">					fBuffer.Peek(fOffset, &amp;byte, 1);</a>
+<a name="ln792">					fOffset++;</a>
+<a name="ln793">				}</a>
+<a name="ln794">				return byte;</a>
+<a name="ln795">			}</a>
+<a name="ln796"> </a>
+<a name="ln797">			virtual bool GetAddressString(char* buffer, size_t bufferSize) const</a>
+<a name="ln798">			{</a>
+<a name="ln799">				snprintf(buffer, bufferSize, &quot;    %4zx&quot;, fOffset);</a>
+<a name="ln800">				return true;</a>
+<a name="ln801">			}</a>
+<a name="ln802"> </a>
+<a name="ln803">		private:</a>
+<a name="ln804">			const RingBuffer&amp;	fBuffer;</a>
+<a name="ln805">			size_t				fOffset;</a>
+<a name="ln806">		};</a>
+<a name="ln807"> </a>
+<a name="ln808">		DataProvider dataProvider(fBuffer);</a>
+<a name="ln809">		BKernel::print_hex_dump(dataProvider, fBuffer.Readable());</a>
+<a name="ln810">	}</a>
+<a name="ln811">}</a>
+<a name="ln812"> </a>
+<a name="ln813"> </a>
+<a name="ln814">/*static*/ int</a>
+<a name="ln815">Inode::Dump(int argc, char** argv)</a>
+<a name="ln816">{</a>
+<a name="ln817">	bool dumpData = false;</a>
+<a name="ln818">	int argi = 1;</a>
+<a name="ln819">	if (argi &lt; argc &amp;&amp; strcmp(argv[argi], &quot;-d&quot;) == 0) {</a>
+<a name="ln820">		dumpData = true;</a>
+<a name="ln821">		argi++;</a>
+<a name="ln822">	}</a>
+<a name="ln823"> </a>
+<a name="ln824">	if (argi &gt;= argc || argi + 2 &lt; argc) {</a>
+<a name="ln825">		print_debugger_command_usage(argv[0]);</a>
+<a name="ln826">		return 0;</a>
+<a name="ln827">	}</a>
+<a name="ln828"> </a>
+<a name="ln829">	Inode* node = (Inode*)parse_expression(argv[argi]);</a>
+<a name="ln830">	if (IS_USER_ADDRESS(node)) {</a>
+<a name="ln831">		kprintf(&quot;invalid FIFO address\n&quot;);</a>
+<a name="ln832">		return 0;</a>
+<a name="ln833">	}</a>
+<a name="ln834"> </a>
+<a name="ln835">	node-&gt;Dump(dumpData);</a>
+<a name="ln836">	return 0;</a>
+<a name="ln837">}</a>
+<a name="ln838"> </a>
+<a name="ln839"> </a>
+<a name="ln840">//	#pragma mark - vnode API</a>
+<a name="ln841"> </a>
+<a name="ln842"> </a>
+<a name="ln843">static status_t</a>
+<a name="ln844">fifo_put_vnode(fs_volume* volume, fs_vnode* vnode, bool reenter)</a>
+<a name="ln845">{</a>
+<a name="ln846">	FIFOInode* fifo = (FIFOInode*)vnode-&gt;private_node;</a>
+<a name="ln847">	fs_vnode* superVnode = fifo-&gt;SuperVnode();</a>
+<a name="ln848"> </a>
+<a name="ln849">	status_t error = B_OK;</a>
+<a name="ln850">	if (superVnode-&gt;ops-&gt;put_vnode != NULL)</a>
+<a name="ln851">		error = superVnode-&gt;ops-&gt;put_vnode(volume, superVnode, reenter);</a>
+<a name="ln852"> </a>
+<a name="ln853">	delete fifo;</a>
+<a name="ln854"> </a>
+<a name="ln855">	return error;</a>
+<a name="ln856">}</a>
+<a name="ln857"> </a>
+<a name="ln858"> </a>
+<a name="ln859">static status_t</a>
+<a name="ln860">fifo_remove_vnode(fs_volume* volume, fs_vnode* vnode, bool reenter)</a>
+<a name="ln861">{</a>
+<a name="ln862">	FIFOInode* fifo = (FIFOInode*)vnode-&gt;private_node;</a>
+<a name="ln863">	fs_vnode* superVnode = fifo-&gt;SuperVnode();</a>
+<a name="ln864"> </a>
+<a name="ln865">	status_t error = B_OK;</a>
+<a name="ln866">	if (superVnode-&gt;ops-&gt;remove_vnode != NULL)</a>
+<a name="ln867">		error = superVnode-&gt;ops-&gt;remove_vnode(volume, superVnode, reenter);</a>
+<a name="ln868"> </a>
+<a name="ln869">	delete fifo;</a>
+<a name="ln870"> </a>
+<a name="ln871">	return error;</a>
+<a name="ln872">}</a>
+<a name="ln873"> </a>
+<a name="ln874"> </a>
+<a name="ln875">static status_t</a>
+<a name="ln876">fifo_open(fs_volume* _volume, fs_vnode* _node, int openMode,</a>
+<a name="ln877">	void** _cookie)</a>
+<a name="ln878">{</a>
+<a name="ln879">	Inode* inode = (Inode*)_node-&gt;private_node;</a>
+<a name="ln880"> </a>
+<a name="ln881">	TRACE(&quot;fifo_open(): node = %p, openMode = %d\n&quot;, inode, openMode);</a>
+<a name="ln882"> </a>
+<a name="ln883">	file_cookie* cookie = (file_cookie*)malloc(sizeof(file_cookie));</a>
+<a name="ln884">	if (cookie == NULL)</a>
+<a name="ln885">		return B_NO_MEMORY;</a>
+<a name="ln886"> </a>
+<a name="ln887">	TRACE(&quot;  open cookie = %p\n&quot;, cookie);</a>
+<a name="ln888">	cookie-&gt;open_mode = openMode;</a>
+<a name="ln889">	inode-&gt;Open(openMode);</a>
+<a name="ln890"> </a>
+<a name="ln891">	*_cookie = (void*)cookie;</a>
+<a name="ln892"> </a>
+<a name="ln893">	return B_OK;</a>
+<a name="ln894">}</a>
+<a name="ln895"> </a>
+<a name="ln896"> </a>
+<a name="ln897">static status_t</a>
+<a name="ln898">fifo_close(fs_volume* volume, fs_vnode* vnode, void* _cookie)</a>
+<a name="ln899">{</a>
+<a name="ln900">	file_cookie* cookie = (file_cookie*)_cookie;</a>
+<a name="ln901">	FIFOInode* fifo = (FIFOInode*)vnode-&gt;private_node;</a>
+<a name="ln902"> </a>
+<a name="ln903">	fifo-&gt;Close(cookie);</a>
+<a name="ln904"> </a>
+<a name="ln905">	return B_OK;</a>
+<a name="ln906">}</a>
+<a name="ln907"> </a>
+<a name="ln908"> </a>
+<a name="ln909">static status_t</a>
+<a name="ln910">fifo_free_cookie(fs_volume* _volume, fs_vnode* _node, void* _cookie)</a>
+<a name="ln911">{</a>
+<a name="ln912">	file_cookie* cookie = (file_cookie*)_cookie;</a>
+<a name="ln913"> </a>
+<a name="ln914">	TRACE(&quot;fifo_freecookie: entry vnode %p, cookie %p\n&quot;, _node, _cookie);</a>
+<a name="ln915"> </a>
+<a name="ln916">	free(cookie);</a>
+<a name="ln917"> </a>
+<a name="ln918">	return B_OK;</a>
+<a name="ln919">}</a>
+<a name="ln920"> </a>
+<a name="ln921"> </a>
+<a name="ln922">static status_t</a>
+<a name="ln923">fifo_fsync(fs_volume* _volume, fs_vnode* _node)</a>
+<a name="ln924">{</a>
+<a name="ln925">	return B_OK;</a>
+<a name="ln926">}</a>
+<a name="ln927"> </a>
+<a name="ln928"> </a>
+<a name="ln929">static status_t</a>
+<a name="ln930">fifo_read(fs_volume* _volume, fs_vnode* _node, void* _cookie,</a>
+<a name="ln931">	off_t /*pos*/, void* buffer, size_t* _length)</a>
+<a name="ln932">{</a>
+<a name="ln933">	file_cookie* cookie = (file_cookie*)_cookie;</a>
+<a name="ln934">	Inode* inode = (Inode*)_node-&gt;private_node;</a>
+<a name="ln935"> </a>
+<a name="ln936">	TRACE(&quot;fifo_read(vnode = %p, cookie = %p, length = %lu, mode = %d)\n&quot;,</a>
+<a name="ln937">		inode, cookie, *_length, cookie-&gt;open_mode);</a>
+<a name="ln938"> </a>
+<a name="ln939">	MutexLocker locker(inode-&gt;RequestLock());</a>
+<a name="ln940"> </a>
+<a name="ln941">	if ((cookie-&gt;open_mode &amp; O_RWMASK) != O_RDONLY)</a>
+<a name="ln942">		return B_NOT_ALLOWED;</a>
+<a name="ln943"> </a>
+<a name="ln944">	if (inode-&gt;IsActive() &amp;&amp; inode-&gt;WriterCount() == 0) {</a>
+<a name="ln945">		// as long there is no writer, and the pipe is empty,</a>
+<a name="ln946">		// we always just return 0 to indicate end of file</a>
+<a name="ln947">		if (inode-&gt;BytesAvailable() == 0) {</a>
+<a name="ln948">			*_length = 0;</a>
+<a name="ln949">			return B_OK;</a>
+<a name="ln950">		}</a>
+<a name="ln951">	}</a>
+<a name="ln952"> </a>
+<a name="ln953">	// issue read request</a>
+<a name="ln954"> </a>
+<a name="ln955">	ReadRequest request(cookie);</a>
+<a name="ln956">	inode-&gt;AddReadRequest(request);</a>
+<a name="ln957"> </a>
+<a name="ln958">	TRACE(&quot;  issue read request %p\n&quot;, &amp;request);</a>
+<a name="ln959"> </a>
+<a name="ln960">	size_t length = *_length;</a>
+<a name="ln961">	status_t status = inode-&gt;ReadDataFromBuffer(buffer, &amp;length,</a>
+<a name="ln962">		(cookie-&gt;open_mode &amp; O_NONBLOCK) != 0, is_called_via_syscall(),</a>
+<a name="ln963">		request);</a>
+<a name="ln964"> </a>
+<a name="ln965">	inode-&gt;RemoveReadRequest(request);</a>
+<a name="ln966">	inode-&gt;NotifyReadDone();</a>
+<a name="ln967"> </a>
+<a name="ln968">	TRACE(&quot;  done reading request %p, length %zu\n&quot;, &amp;request, length);</a>
+<a name="ln969"> </a>
+<a name="ln970">	if (length &gt; 0)</a>
+<a name="ln971">		status = B_OK;</a>
+<a name="ln972"> </a>
+<a name="ln973">	*_length = length;</a>
+<a name="ln974">	return status;</a>
+<a name="ln975">}</a>
+<a name="ln976"> </a>
+<a name="ln977"> </a>
+<a name="ln978">static status_t</a>
+<a name="ln979">fifo_write(fs_volume* _volume, fs_vnode* _node, void* _cookie,</a>
+<a name="ln980">	off_t /*pos*/, const void* buffer, size_t* _length)</a>
+<a name="ln981">{</a>
+<a name="ln982">	file_cookie* cookie = (file_cookie*)_cookie;</a>
+<a name="ln983">	Inode* inode = (Inode*)_node-&gt;private_node;</a>
+<a name="ln984"> </a>
+<a name="ln985">	TRACE(&quot;fifo_write(vnode = %p, cookie = %p, length = %lu)\n&quot;,</a>
+<a name="ln986">		_node, cookie, *_length);</a>
+<a name="ln987"> </a>
+<a name="ln988">	MutexLocker locker(inode-&gt;RequestLock());</a>
+<a name="ln989"> </a>
+<a name="ln990">	if ((cookie-&gt;open_mode &amp; O_RWMASK) != O_WRONLY)</a>
+<a name="ln991">		return B_NOT_ALLOWED;</a>
+<a name="ln992"> </a>
+<a name="ln993">	size_t length = *_length;</a>
+<a name="ln994">	if (length == 0)</a>
+<a name="ln995">		return B_OK;</a>
+<a name="ln996"> </a>
+<a name="ln997">	// copy data into ring buffer</a>
+<a name="ln998">	status_t status = inode-&gt;WriteDataToBuffer(buffer, &amp;length,</a>
+<a name="ln999">		(cookie-&gt;open_mode &amp; O_NONBLOCK) != 0, is_called_via_syscall());</a>
+<a name="ln1000"> </a>
+<a name="ln1001">	if (length &gt; 0)</a>
+<a name="ln1002">		status = B_OK;</a>
+<a name="ln1003"> </a>
+<a name="ln1004">	*_length = length;</a>
+<a name="ln1005">	return status;</a>
+<a name="ln1006">}</a>
+<a name="ln1007"> </a>
+<a name="ln1008"> </a>
+<a name="ln1009">static status_t</a>
+<a name="ln1010">fifo_read_stat(fs_volume* volume, fs_vnode* vnode, struct ::stat* st)</a>
+<a name="ln1011">{</a>
+<a name="ln1012">	FIFOInode* fifo = (FIFOInode*)vnode-&gt;private_node;</a>
+<a name="ln1013">	fs_vnode* superVnode = fifo-&gt;SuperVnode();</a>
+<a name="ln1014"> </a>
+<a name="ln1015">	if (superVnode-&gt;ops-&gt;read_stat == NULL)</a>
+<a name="ln1016">		return B_BAD_VALUE;</a>
+<a name="ln1017"> </a>
+<a name="ln1018">	status_t error = superVnode-&gt;ops-&gt;read_stat(volume, superVnode, st);</a>
+<a name="ln1019">	if (error != B_OK)</a>
+<a name="ln1020">		return error;</a>
+<a name="ln1021"> </a>
+<a name="ln1022"> </a>
+<a name="ln1023">	MutexLocker locker(fifo-&gt;RequestLock());</a>
+<a name="ln1024"> </a>
+<a name="ln1025">	st-&gt;st_size = fifo-&gt;BytesAvailable();</a>
+<a name="ln1026"> </a>
+<a name="ln1027">	st-&gt;st_blksize = 4096;</a>
+<a name="ln1028"> </a>
+<a name="ln1029">	// TODO: Just pass the changes to our modification time on to the super node.</a>
+<a name="ln1030">	st-&gt;st_atim.tv_sec = time(NULL);</a>
+<a name="ln1031">	st-&gt;st_atim.tv_nsec = 0;</a>
+<a name="ln1032">	st-&gt;st_mtim = st-&gt;st_ctim = fifo-&gt;ModificationTime();</a>
+<a name="ln1033"> </a>
+<a name="ln1034">	return B_OK;</a>
+<a name="ln1035">}</a>
+<a name="ln1036"> </a>
+<a name="ln1037"> </a>
+<a name="ln1038">static status_t</a>
+<a name="ln1039">fifo_write_stat(fs_volume* volume, fs_vnode* vnode, const struct ::stat* st,</a>
+<a name="ln1040">	uint32 statMask)</a>
+<a name="ln1041">{</a>
+<a name="ln1042">	// we cannot change the size of anything</a>
+<a name="ln1043">	if ((statMask &amp; B_STAT_SIZE) != 0)</a>
+<a name="ln1044">		return B_BAD_VALUE;</a>
+<a name="ln1045"> </a>
+<a name="ln1046">	FIFOInode* fifo = (FIFOInode*)vnode-&gt;private_node;</a>
+<a name="ln1047">	fs_vnode* superVnode = fifo-&gt;SuperVnode();</a>
+<a name="ln1048"> </a>
+<a name="ln1049">	if (superVnode-&gt;ops-&gt;write_stat == NULL)</a>
+<a name="ln1050">		return B_BAD_VALUE;</a>
+<a name="ln1051"> </a>
+<a name="ln1052">	status_t error = superVnode-&gt;ops-&gt;write_stat(volume, superVnode, st,</a>
+<a name="ln1053">		statMask);</a>
+<a name="ln1054">	if (error != B_OK)</a>
+<a name="ln1055">		return error;</a>
+<a name="ln1056"> </a>
+<a name="ln1057">	return B_OK;</a>
+<a name="ln1058">}</a>
+<a name="ln1059"> </a>
+<a name="ln1060"> </a>
+<a name="ln1061">static status_t</a>
+<a name="ln1062">fifo_ioctl(fs_volume* _volume, fs_vnode* _node, void* _cookie, uint32 op,</a>
+<a name="ln1063">	void* buffer, size_t length)</a>
+<a name="ln1064">{</a>
+<a name="ln1065">	file_cookie* cookie = (file_cookie*)_cookie;</a>
+<a name="ln1066">	Inode* inode = (Inode*)_node-&gt;private_node;</a>
+<a name="ln1067"> </a>
+<a name="ln1068">	TRACE(&quot;fifo_ioctl: vnode %p, cookie %p, op %ld, buf %p, len %ld\n&quot;,</a>
+<a name="ln1069">		_vnode, _cookie, op, buffer, length);</a>
+<a name="ln1070"> </a>
+<a name="ln1071">	switch (op) {</a>
+<a name="ln1072">		case FIONBIO:</a>
+<a name="ln1073">		{</a>
+<a name="ln1074">			if (buffer == NULL)</a>
+<a name="ln1075">				return B_BAD_VALUE;</a>
+<a name="ln1076"> </a>
+<a name="ln1077">			int value;</a>
+<a name="ln1078">			if (is_called_via_syscall()) {</a>
+<a name="ln1079">				if (!IS_USER_ADDRESS(buffer)</a>
+<a name="ln1080">					|| user_memcpy(&amp;value, buffer, sizeof(int)) != B_OK) {</a>
+<a name="ln1081">					return B_BAD_ADDRESS;</a>
+<a name="ln1082">				}</a>
+<a name="ln1083">			} else</a>
+<a name="ln1084">				value = *(int*)buffer;</a>
+<a name="ln1085"> </a>
+<a name="ln1086">			MutexLocker locker(inode-&gt;RequestLock());</a>
+<a name="ln1087">			cookie-&gt;SetNonBlocking(value != 0);</a>
+<a name="ln1088">			return B_OK;</a>
+<a name="ln1089">		}</a>
+<a name="ln1090"> </a>
+<a name="ln1091">		case FIONREAD:</a>
+<a name="ln1092">		{</a>
+<a name="ln1093">			if (buffer == NULL)</a>
+<a name="ln1094">				return B_BAD_VALUE;</a>
+<a name="ln1095"> </a>
+<a name="ln1096">			MutexLocker locker(inode-&gt;RequestLock());</a>
+<a name="ln1097">			int available = (int)inode-&gt;BytesAvailable();</a>
+<a name="ln1098">			locker.Unlock();</a>
+<a name="ln1099"> </a>
+<a name="ln1100">			if (is_called_via_syscall()) {</a>
+<a name="ln1101">				if (!IS_USER_ADDRESS(buffer)</a>
+<a name="ln1102">					|| user_memcpy(buffer, &amp;available, sizeof(available))</a>
+<a name="ln1103">						!= B_OK) {</a>
+<a name="ln1104">					return B_BAD_ADDRESS;</a>
+<a name="ln1105">				}</a>
+<a name="ln1106">			} else</a>
+<a name="ln1107">				*(int*)buffer = available;</a>
+<a name="ln1108"> </a>
+<a name="ln1109">			return B_OK;</a>
+<a name="ln1110">		}</a>
+<a name="ln1111"> </a>
+<a name="ln1112">		case B_SET_BLOCKING_IO:</a>
+<a name="ln1113">		case B_SET_NONBLOCKING_IO:</a>
+<a name="ln1114">		{</a>
+<a name="ln1115">			MutexLocker locker(inode-&gt;RequestLock());</a>
+<a name="ln1116">			cookie-&gt;SetNonBlocking(op == B_SET_NONBLOCKING_IO);</a>
+<a name="ln1117">			return B_OK;</a>
+<a name="ln1118">		}</a>
+<a name="ln1119">	}</a>
+<a name="ln1120"> </a>
+<a name="ln1121">	return EINVAL;</a>
+<a name="ln1122">}</a>
+<a name="ln1123"> </a>
+<a name="ln1124"> </a>
+<a name="ln1125">static status_t</a>
+<a name="ln1126">fifo_set_flags(fs_volume* _volume, fs_vnode* _node, void* _cookie,</a>
+<a name="ln1127">	int flags)</a>
+<a name="ln1128">{</a>
+<a name="ln1129">	Inode* inode = (Inode*)_node-&gt;private_node;</a>
+<a name="ln1130">	file_cookie* cookie = (file_cookie*)_cookie;</a>
+<a name="ln1131"> </a>
+<a name="ln1132">	TRACE(&quot;fifo_set_flags(vnode = %p, flags = %x)\n&quot;, _vnode, flags);</a>
+<a name="ln1133"> </a>
+<a name="ln1134">	MutexLocker locker(inode-&gt;RequestLock());</a>
+<a name="ln1135">	cookie-&gt;open_mode = (cookie-&gt;open_mode &amp; ~(O_APPEND | O_NONBLOCK)) | flags;</a>
+<a name="ln1136">	return B_OK;</a>
+<a name="ln1137">}</a>
+<a name="ln1138"> </a>
+<a name="ln1139"> </a>
+<a name="ln1140">static status_t</a>
+<a name="ln1141">fifo_select(fs_volume* _volume, fs_vnode* _node, void* _cookie,</a>
+<a name="ln1142">	uint8 event, selectsync* sync)</a>
+<a name="ln1143">{</a>
+<a name="ln1144">	file_cookie* cookie = (file_cookie*)_cookie;</a>
+<a name="ln1145"> </a>
+<a name="ln1146">	TRACE(&quot;fifo_select(vnode = %p)\n&quot;, _node);</a>
+<a name="ln1147">	Inode* inode = (Inode*)_node-&gt;private_node;</a>
+<a name="ln1148">	if (!inode)</a>
+<a name="ln1149">		return B_ERROR;</a>
+<a name="ln1150"> </a>
+<a name="ln1151">	MutexLocker locker(inode-&gt;RequestLock());</a>
+<a name="ln1152">	return inode-&gt;Select(event, sync, cookie-&gt;open_mode);</a>
+<a name="ln1153">}</a>
+<a name="ln1154"> </a>
+<a name="ln1155"> </a>
+<a name="ln1156">static status_t</a>
+<a name="ln1157">fifo_deselect(fs_volume* _volume, fs_vnode* _node, void* _cookie,</a>
+<a name="ln1158">	uint8 event, selectsync* sync)</a>
+<a name="ln1159">{</a>
+<a name="ln1160">	file_cookie* cookie = (file_cookie*)_cookie;</a>
+<a name="ln1161"> </a>
+<a name="ln1162">	TRACE(&quot;fifo_deselect(vnode = %p)\n&quot;, _node);</a>
+<a name="ln1163">	Inode* inode = (Inode*)_node-&gt;private_node;</a>
+<a name="ln1164">	if (inode == NULL)</a>
+<a name="ln1165">		return B_ERROR;</a>
+<a name="ln1166"> </a>
+<a name="ln1167">	MutexLocker locker(inode-&gt;RequestLock());</a>
+<a name="ln1168">	return inode-&gt;Deselect(event, sync, cookie-&gt;open_mode);</a>
+<a name="ln1169">}</a>
+<a name="ln1170"> </a>
+<a name="ln1171"> </a>
+<a name="ln1172">static bool</a>
+<a name="ln1173">fifo_can_page(fs_volume* _volume, fs_vnode* _node, void* cookie)</a>
+<a name="ln1174">{</a>
+<a name="ln1175">	return false;</a>
+<a name="ln1176">}</a>
+<a name="ln1177"> </a>
+<a name="ln1178"> </a>
+<a name="ln1179">static status_t</a>
+<a name="ln1180">fifo_read_pages(fs_volume* _volume, fs_vnode* _node, void* cookie, off_t pos,</a>
+<a name="ln1181">	const iovec* vecs, size_t count, size_t* _numBytes)</a>
+<a name="ln1182">{</a>
+<a name="ln1183">	return B_NOT_ALLOWED;</a>
+<a name="ln1184">}</a>
+<a name="ln1185"> </a>
+<a name="ln1186"> </a>
+<a name="ln1187">static status_t</a>
+<a name="ln1188">fifo_write_pages(fs_volume* _volume, fs_vnode* _node, void* cookie,</a>
+<a name="ln1189">	off_t pos, const iovec* vecs, size_t count, size_t* _numBytes)</a>
+<a name="ln1190">{</a>
+<a name="ln1191">	return B_NOT_ALLOWED;</a>
+<a name="ln1192">}</a>
+<a name="ln1193"> </a>
+<a name="ln1194"> </a>
+<a name="ln1195">static status_t</a>
+<a name="ln1196">fifo_get_super_vnode(fs_volume* volume, fs_vnode* vnode, fs_volume* superVolume,</a>
+<a name="ln1197">	fs_vnode* _superVnode)</a>
+<a name="ln1198">{</a>
+<a name="ln1199">	FIFOInode* fifo = (FIFOInode*)vnode-&gt;private_node;</a>
+<a name="ln1200">	fs_vnode* superVnode = fifo-&gt;SuperVnode();</a>
+<a name="ln1201"> </a>
+<a name="ln1202">	if (superVnode-&gt;ops-&gt;get_super_vnode != NULL) {</a>
+<a name="ln1203">		return superVnode-&gt;ops-&gt;get_super_vnode(volume, superVnode, superVolume,</a>
+<a name="ln1204">			_superVnode);</a>
+<a name="ln1205">	}</a>
+<a name="ln1206"> </a>
+<a name="ln1207">	*_superVnode = *superVnode;</a>
+<a name="ln1208"> </a>
+<a name="ln1209">	return B_OK;</a>
+<a name="ln1210">}</a>
+<a name="ln1211"> </a>
+<a name="ln1212"> </a>
+<a name="ln1213">static fs_vnode_ops sFIFOVnodeOps = {</a>
+<a name="ln1214">	NULL,	// lookup</a>
+<a name="ln1215">	NULL,	// get_vnode_name</a>
+<a name="ln1216">					// TODO: This is suboptimal! We'd need to forward the</a>
+<a name="ln1217">					// super node's hook, if it has got one.</a>
+<a name="ln1218"> </a>
+<a name="ln1219">	&amp;fifo_put_vnode,</a>
+<a name="ln1220">	&amp;fifo_remove_vnode,</a>
+<a name="ln1221"> </a>
+<a name="ln1222">	&amp;fifo_can_page,</a>
+<a name="ln1223">	&amp;fifo_read_pages,</a>
+<a name="ln1224">	&amp;fifo_write_pages,</a>
+<a name="ln1225"> </a>
+<a name="ln1226">	NULL,	// io()</a>
+<a name="ln1227">	NULL,	// cancel_io()</a>
+<a name="ln1228"> </a>
+<a name="ln1229">	NULL,	// get_file_map</a>
+<a name="ln1230"> </a>
+<a name="ln1231">	/* common */</a>
+<a name="ln1232">	&amp;fifo_ioctl,</a>
+<a name="ln1233">	&amp;fifo_set_flags,</a>
+<a name="ln1234">	&amp;fifo_select,</a>
+<a name="ln1235">	&amp;fifo_deselect,</a>
+<a name="ln1236">	&amp;fifo_fsync,</a>
+<a name="ln1237"> </a>
+<a name="ln1238">	NULL,	// fs_read_link</a>
+<a name="ln1239">	NULL,	// fs_symlink</a>
+<a name="ln1240">	NULL,	// fs_link</a>
+<a name="ln1241">	NULL,	// unlink</a>
+<a name="ln1242">	NULL,	// rename</a>
+<a name="ln1243"> </a>
+<a name="ln1244">	NULL,	// fs_access()</a>
+<a name="ln1245">	&amp;fifo_read_stat,</a>
+<a name="ln1246">	&amp;fifo_write_stat,</a>
+<a name="ln1247">	NULL,</a>
+<a name="ln1248"> </a>
+<a name="ln1249">	/* file */</a>
+<a name="ln1250">	NULL,	// create()</a>
+<a name="ln1251">	&amp;fifo_open,</a>
+<a name="ln1252">	&amp;fifo_close,</a>
+<a name="ln1253">	&amp;fifo_free_cookie,</a>
+<a name="ln1254">	&amp;fifo_read,</a>
+<a name="ln1255">	&amp;fifo_write,</a>
+<a name="ln1256"> </a>
+<a name="ln1257">	/* directory */</a>
+<a name="ln1258">	NULL,	// create_dir</a>
+<a name="ln1259">	NULL,	// remove_dir</a>
+<a name="ln1260">	NULL,	// open_dir</a>
+<a name="ln1261">	NULL,	// close_dir</a>
+<a name="ln1262">	NULL,	// free_dir_cookie</a>
+<a name="ln1263">	NULL,	// read_dir</a>
+<a name="ln1264">	NULL,	// rewind_dir</a>
+<a name="ln1265"> </a>
+<a name="ln1266">	/* attribute directory operations */</a>
+<a name="ln1267">	NULL,	// open_attr_dir</a>
+<a name="ln1268">	NULL,	// close_attr_dir</a>
+<a name="ln1269">	NULL,	// free_attr_dir_cookie</a>
+<a name="ln1270">	NULL,	// read_attr_dir</a>
+<a name="ln1271">	NULL,	// rewind_attr_dir</a>
+<a name="ln1272"> </a>
+<a name="ln1273">	/* attribute operations */</a>
+<a name="ln1274">	NULL,	// create_attr</a>
+<a name="ln1275">	NULL,	// open_attr</a>
+<a name="ln1276">	NULL,	// close_attr</a>
+<a name="ln1277">	NULL,	// free_attr_cookie</a>
+<a name="ln1278">	NULL,	// read_attr</a>
+<a name="ln1279">	NULL,	// write_attr</a>
+<a name="ln1280"> </a>
+<a name="ln1281">	NULL,	// read_attr_stat</a>
+<a name="ln1282">	NULL,	// write_attr_stat</a>
+<a name="ln1283">	NULL,	// rename_attr</a>
+<a name="ln1284">	NULL,	// remove_attr</a>
+<a name="ln1285"> </a>
+<a name="ln1286">	/* support for node and FS layers */</a>
+<a name="ln1287">	NULL,	// create_special_node</a>
+<a name="ln1288">	&amp;fifo_get_super_vnode,</a>
+<a name="ln1289">};</a>
+<a name="ln1290"> </a>
+<a name="ln1291"> </a>
+<a name="ln1292">}	// namespace fifo</a>
+<a name="ln1293"> </a>
+<a name="ln1294"> </a>
+<a name="ln1295">using namespace fifo;</a>
+<a name="ln1296"> </a>
+<a name="ln1297"> </a>
+<a name="ln1298">// #pragma mark -</a>
+<a name="ln1299"> </a>
+<a name="ln1300"> </a>
+<a name="ln1301">status_t</a>
+<a name="ln1302">create_fifo_vnode(fs_volume* superVolume, fs_vnode* vnode)</a>
+<a name="ln1303">{</a>
+<a name="ln1304">	FIFOInode* fifo = new(std::nothrow) FIFOInode(vnode);</a>
+<a name="ln1305">	if (fifo == NULL)</a>
+<a name="ln1306">		return B_NO_MEMORY;</a>
+<a name="ln1307"> </a>
+<a name="ln1308">	status_t status = fifo-&gt;InitCheck();</a>
+<a name="ln1309">	if (status != B_OK) {</a>
+<a name="ln1310">		delete fifo;</a>
+<a name="ln1311">		return status;</a>
+<a name="ln1312">	}</a>
+<a name="ln1313"> </a>
+<a name="ln1314">	vnode-&gt;private_node = fifo;</a>
+<a name="ln1315">	vnode-&gt;ops = &amp;sFIFOVnodeOps;</a>
+<a name="ln1316"> </a>
+<a name="ln1317">	return B_OK;</a>
+<a name="ln1318">}</a>
+<a name="ln1319"> </a>
+<a name="ln1320"> </a>
+<a name="ln1321">void</a>
+<a name="ln1322">fifo_init()</a>
+<a name="ln1323">{</a>
+<a name="ln1324">	add_debugger_command_etc(&quot;fifo&quot;, &amp;Inode::Dump,</a>
+<a name="ln1325">		&quot;Print info about the specified FIFO node&quot;,</a>
+<a name="ln1326">		&quot;[ \&quot;-d\&quot; ] &lt;address&gt;\n&quot;</a>
+<a name="ln1327">		&quot;Prints information about the FIFO node specified by address\n&quot;</a>
+<a name="ln1328">		&quot;&lt;address&gt;. If \&quot;-d\&quot; is given, the data in the FIFO's ring buffer\n&quot;</a>
+<a name="ln1329">		&quot;hexdumped as well.\n&quot;,</a>
+<a name="ln1330">		0);</a>
+<a name="ln1331">}</a>
+
+</code></pre>
+<div class="balloon" rel="77"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fLock.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

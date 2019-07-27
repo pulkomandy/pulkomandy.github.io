@@ -1,0 +1,777 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>link.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2006-2013, Haiku, Inc. All Rights Reserved.</a>
+<a name="ln3"> * Distributed under the terms of the MIT License.</a>
+<a name="ln4"> *</a>
+<a name="ln5"> * Authors:</a>
+<a name="ln6"> *		Axel Dörfler, axeld@pinc-software.de</a>
+<a name="ln7"> */</a>
+<a name="ln8"> </a>
+<a name="ln9"> </a>
+<a name="ln10">//! The net_protocol one talks to when using the AF_LINK protocol</a>
+<a name="ln11"> </a>
+<a name="ln12"> </a>
+<a name="ln13">#include &quot;link.h&quot;</a>
+<a name="ln14"> </a>
+<a name="ln15">#include &lt;net/if_dl.h&gt;</a>
+<a name="ln16">#include &lt;net/if_types.h&gt;</a>
+<a name="ln17">#include &lt;new&gt;</a>
+<a name="ln18">#include &lt;stdlib.h&gt;</a>
+<a name="ln19">#include &lt;string.h&gt;</a>
+<a name="ln20">#include &lt;sys/sockio.h&gt;</a>
+<a name="ln21"> </a>
+<a name="ln22">#include &lt;KernelExport.h&gt;</a>
+<a name="ln23"> </a>
+<a name="ln24">#include &lt;lock.h&gt;</a>
+<a name="ln25">#include &lt;net_datalink.h&gt;</a>
+<a name="ln26">#include &lt;net_device.h&gt;</a>
+<a name="ln27">#include &lt;ProtocolUtilities.h&gt;</a>
+<a name="ln28">#include &lt;util/AutoLock.h&gt;</a>
+<a name="ln29"> </a>
+<a name="ln30">#include &quot;device_interfaces.h&quot;</a>
+<a name="ln31">#include &quot;domains.h&quot;</a>
+<a name="ln32">#include &quot;interfaces.h&quot;</a>
+<a name="ln33">#include &quot;stack_private.h&quot;</a>
+<a name="ln34">#include &quot;utility.h&quot;</a>
+<a name="ln35"> </a>
+<a name="ln36"> </a>
+<a name="ln37">class LocalStackBundle {</a>
+<a name="ln38">public:</a>
+<a name="ln39">	static net_stack_module_info* Stack() { return &amp;gNetStackModule; }</a>
+<a name="ln40">	static net_buffer_module_info* Buffer() { return &amp;gNetBufferModule; }</a>
+<a name="ln41">};</a>
+<a name="ln42"> </a>
+<a name="ln43">typedef DatagramSocket&lt;MutexLocking, LocalStackBundle&gt; LocalDatagramSocket;</a>
+<a name="ln44"> </a>
+<a name="ln45">class LinkProtocol : public net_protocol, public LocalDatagramSocket {</a>
+<a name="ln46">public:</a>
+<a name="ln47">								LinkProtocol(net_socket* socket);</a>
+<a name="ln48">	virtual						~LinkProtocol();</a>
+<a name="ln49"> </a>
+<a name="ln50">			status_t			StartMonitoring(const char* deviceName);</a>
+<a name="ln51">			status_t			StopMonitoring(const char* deviceName);</a>
+<a name="ln52"> </a>
+<a name="ln53">			status_t			Bind(const sockaddr* address);</a>
+<a name="ln54">			status_t			Unbind();</a>
+<a name="ln55">			bool				IsBound() const</a>
+<a name="ln56">									{ return fBoundToDevice != NULL; }</a>
+<a name="ln57"> </a>
+<a name="ln58">			size_t				MTU();</a>
+<a name="ln59"> </a>
+<a name="ln60">protected:</a>
+<a name="ln61">			status_t			SocketStatus(bool peek) const;</a>
+<a name="ln62"> </a>
+<a name="ln63">private:</a>
+<a name="ln64">			status_t			_Unregister();</a>
+<a name="ln65"> </a>
+<a name="ln66">	static	status_t			_MonitorData(net_device_monitor* monitor,</a>
+<a name="ln67">									net_buffer* buffer);</a>
+<a name="ln68">	static	void				_MonitorEvent(net_device_monitor* monitor,</a>
+<a name="ln69">									int32 event);</a>
+<a name="ln70">	static	status_t			_ReceiveData(void* cookie, net_device* device,</a>
+<a name="ln71">									net_buffer* buffer);</a>
+<a name="ln72"> </a>
+<a name="ln73">private:</a>
+<a name="ln74">			net_device_monitor	fMonitor;</a>
+<a name="ln75">			net_device_interface* fMonitoredDevice;</a>
+<a name="ln76">			net_device_interface* fBoundToDevice;</a>
+<a name="ln77">			uint32				fBoundType;</a>
+<a name="ln78">};</a>
+<a name="ln79"> </a>
+<a name="ln80"> </a>
+<a name="ln81">struct net_domain* sDomain;</a>
+<a name="ln82"> </a>
+<a name="ln83"> </a>
+<a name="ln84">LinkProtocol::LinkProtocol(net_socket* socket)</a>
+<a name="ln85">	:</a>
+<a name="ln86">	LocalDatagramSocket(&quot;packet capture&quot;, socket),</a>
+<a name="ln87">	fMonitoredDevice(NULL),</a>
+<a name="ln88">	fBoundToDevice(NULL)</a>
+<a name="ln89">{</a>
+<a name="ln90">	fMonitor.cookie = this;</a>
+<a name="ln91">	fMonitor.receive = _MonitorData;</a>
+<a name="ln92">	fMonitor.event = _MonitorEvent;</a>
+<a name="ln93">}</a>
+<a name="ln94"> </a>
+<a name="ln95"> </a>
+<a name="ln96">LinkProtocol::~LinkProtocol()</a>
+<a name="ln97">{</a>
+<a name="ln98">	if (fMonitoredDevice != NULL) {</a>
+<a name="ln99">		unregister_device_monitor(fMonitoredDevice-&gt;device, &amp;fMonitor);</a>
+<a name="ln100">		put_device_interface(fMonitoredDevice);</a>
+<a name="ln101">	} else</a>
+<a name="ln102">		Unbind();</a>
+<a name="ln103">}</a>
+<a name="ln104"> </a>
+<a name="ln105"> </a>
+<a name="ln106">status_t</a>
+<a name="ln107">LinkProtocol::StartMonitoring(const char* deviceName)</a>
+<a name="ln108">{</a>
+<a name="ln109">	MutexLocker locker(fLock);</a>
+<a name="ln110"> </a>
+<a name="ln111">	if (fMonitoredDevice != NULL)</a>
+<a name="ln112">		return B_BUSY;</a>
+<a name="ln113"> </a>
+<a name="ln114">	net_device_interface* interface = get_device_interface(deviceName);</a>
+<a name="ln115">	if (interface == NULL)</a>
+<a name="ln116">		return B_DEVICE_NOT_FOUND;</a>
+<a name="ln117"> </a>
+<a name="ln118">	status_t status = register_device_monitor(interface-&gt;device, &amp;fMonitor);</a>
+<a name="ln119">	if (status &lt; B_OK) {</a>
+<a name="ln120">		put_device_interface(interface);</a>
+<a name="ln121">		return status;</a>
+<a name="ln122">	}</a>
+<a name="ln123"> </a>
+<a name="ln124">	fMonitoredDevice = interface;</a>
+<a name="ln125">	return B_OK;</a>
+<a name="ln126">}</a>
+<a name="ln127"> </a>
+<a name="ln128"> </a>
+<a name="ln129">status_t</a>
+<a name="ln130">LinkProtocol::StopMonitoring(const char* deviceName)</a>
+<a name="ln131">{</a>
+<a name="ln132">	MutexLocker locker(fLock);</a>
+<a name="ln133"> </a>
+<a name="ln134">	if (fMonitoredDevice == NULL</a>
+<a name="ln135">		|| strcmp(fMonitoredDevice-&gt;device-&gt;name, deviceName) != 0)</a>
+<a name="ln136">		return B_BAD_VALUE;</a>
+<a name="ln137"> </a>
+<a name="ln138">	return _Unregister();</a>
+<a name="ln139">}</a>
+<a name="ln140"> </a>
+<a name="ln141"> </a>
+<a name="ln142">status_t</a>
+<a name="ln143">LinkProtocol::Bind(const sockaddr* address)</a>
+<a name="ln144">{</a>
+<a name="ln145">	// Only root is allowed to bind to a link layer interface</a>
+<a name="ln146">	if (address == NULL || geteuid() != 0)</a>
+<a name="ln147">		return B_NOT_ALLOWED;</a>
+<a name="ln148"> </a>
+<a name="ln149">	MutexLocker locker(fLock);</a>
+<a name="ln150"> </a>
+<a name="ln151">	if (fMonitoredDevice != NULL)</a>
+<a name="ln152">		return B_BUSY;</a>
+<a name="ln153"> </a>
+<a name="ln154">	Interface* interface = get_interface_for_link(sDomain, address);</a>
+<a name="ln155">	if (interface == NULL)</a>
+<a name="ln156">		return B_BAD_VALUE;</a>
+<a name="ln157"> </a>
+<a name="ln158">	net_device_interface* boundTo</a>
+<a name="ln159">		= acquire_device_interface(interface-&gt;DeviceInterface());</a>
+<a name="ln160"> </a>
+<a name="ln161">	interface-&gt;ReleaseReference();</a>
+<a name="ln162"> </a>
+<a name="ln163">	if (boundTo == NULL)</a>
+<a name="ln164">		return B_BAD_VALUE;</a>
+<a name="ln165"> </a>
+<a name="ln166">	sockaddr_dl&amp; linkAddress = *(sockaddr_dl*)address;</a>
+<a name="ln167"> </a>
+<a name="ln168">	if (linkAddress.sdl_type != 0) {</a>
+<a name="ln169">		fBoundType = B_NET_FRAME_TYPE(linkAddress.sdl_type,</a>
+<a name="ln170">			ntohs(linkAddress.sdl_e_type));</a>
+<a name="ln171">		// Bind to the type requested - this is needed in order to</a>
+<a name="ln172">		// receive any buffers</a>
+<a name="ln173">		// TODO: this could be easily changed by introducing catch all or rule</a>
+<a name="ln174">		// based handlers!</a>
+<a name="ln175">		status_t status = register_device_handler(boundTo-&gt;device, fBoundType,</a>
+<a name="ln176">			&amp;LinkProtocol::_ReceiveData, this);</a>
+<a name="ln177">		if (status != B_OK)</a>
+<a name="ln178">			return status;</a>
+<a name="ln179">	} else</a>
+<a name="ln180">		fBoundType = 0;</a>
+<a name="ln181"> </a>
+<a name="ln182">	fBoundToDevice = boundTo;</a>
+<a name="ln183">	socket-&gt;bound_to_device = boundTo-&gt;device-&gt;index;</a>
+<a name="ln184"> </a>
+<a name="ln185">	memcpy(&amp;socket-&gt;address, address, sizeof(struct sockaddr_storage));</a>
+<a name="ln186">	socket-&gt;address.ss_len = sizeof(struct sockaddr_storage);</a>
+<a name="ln187"> </a>
+<a name="ln188">	return B_OK;</a>
+<a name="ln189">}</a>
+<a name="ln190"> </a>
+<a name="ln191"> </a>
+<a name="ln192">status_t</a>
+<a name="ln193">LinkProtocol::Unbind()</a>
+<a name="ln194">{</a>
+<a name="ln195">	MutexLocker locker(fLock);</a>
+<a name="ln196"> </a>
+<a name="ln197">	if (fBoundToDevice == NULL)</a>
+<a name="ln198">		return B_BAD_VALUE;</a>
+<a name="ln199"> </a>
+<a name="ln200">	unregister_device_handler(fBoundToDevice-&gt;device, fBoundType);</a>
+<a name="ln201">	put_device_interface(fBoundToDevice);</a>
+<a name="ln202"> </a>
+<a name="ln203">	socket-&gt;bound_to_device = 0;</a>
+<a name="ln204">	socket-&gt;address.ss_len = 0;</a>
+<a name="ln205">	return B_OK;</a>
+<a name="ln206">}</a>
+<a name="ln207"> </a>
+<a name="ln208"> </a>
+<a name="ln209">size_t</a>
+<a name="ln210">LinkProtocol::MTU()</a>
+<a name="ln211">{</a>
+<a name="ln212">	MutexLocker locker(fLock);</a>
+<a name="ln213"> </a>
+<a name="ln214">	if (!IsBound())</a>
+<a name="ln215">		return 0;</a>
+<a name="ln216"> </a>
+<a name="ln217">	return fBoundToDevice-&gt;device-&gt;mtu;</a>
+<a name="ln218">}</a>
+<a name="ln219"> </a>
+<a name="ln220"> </a>
+<a name="ln221">status_t</a>
+<a name="ln222">LinkProtocol::SocketStatus(bool peek) const</a>
+<a name="ln223">{</a>
+<a name="ln224">	if (fMonitoredDevice == NULL &amp;&amp; !IsBound())</a>
+<a name="ln225">		return B_DEVICE_NOT_FOUND;</a>
+<a name="ln226"> </a>
+<a name="ln227">	return LocalDatagramSocket::SocketStatus(peek);</a>
+<a name="ln228">}</a>
+<a name="ln229"> </a>
+<a name="ln230"> </a>
+<a name="ln231">status_t</a>
+<a name="ln232">LinkProtocol::_Unregister()</a>
+<a name="ln233">{</a>
+<a name="ln234">	if (fMonitoredDevice == NULL)</a>
+<a name="ln235">		return B_BAD_VALUE;</a>
+<a name="ln236"> </a>
+<a name="ln237">	status_t status = unregister_device_monitor(fMonitoredDevice-&gt;device,</a>
+<a name="ln238">		&amp;fMonitor);</a>
+<a name="ln239">	put_device_interface(fMonitoredDevice);</a>
+<a name="ln240">	fMonitoredDevice = NULL;</a>
+<a name="ln241"> </a>
+<a name="ln242">	return status;</a>
+<a name="ln243">}</a>
+<a name="ln244"> </a>
+<a name="ln245"> </a>
+<a name="ln246">/*static*/ status_t</a>
+<a name="ln247">LinkProtocol::_MonitorData(net_device_monitor* monitor, net_buffer* packet)</a>
+<a name="ln248">{</a>
+<a name="ln249">	return ((LinkProtocol*)monitor-&gt;cookie)-&gt;EnqueueClone(packet);</a>
+<a name="ln250">}</a>
+<a name="ln251"> </a>
+<a name="ln252"> </a>
+<a name="ln253">/*static*/ void</a>
+<a name="ln254">LinkProtocol::_MonitorEvent(net_device_monitor* monitor, int32 event)</a>
+<a name="ln255">{</a>
+<a name="ln256">	LinkProtocol* protocol = (LinkProtocol*)monitor-&gt;cookie;</a>
+<a name="ln257"> </a>
+<a name="ln258">	if (event == B_DEVICE_GOING_DOWN) {</a>
+<a name="ln259">		MutexLocker _(protocol-&gt;fLock);</a>
+<a name="ln260"> </a>
+<a name="ln261">		protocol-&gt;_Unregister();</a>
+<a name="ln262">		if (protocol-&gt;IsEmpty()) {</a>
+<a name="ln263">			protocol-&gt;WakeAll();</a>
+<a name="ln264">			notify_socket(protocol-&gt;socket, B_SELECT_READ, B_DEVICE_NOT_FOUND);</a>
+<a name="ln265">		}</a>
+<a name="ln266">	}</a>
+<a name="ln267">}</a>
+<a name="ln268"> </a>
+<a name="ln269"> </a>
+<a name="ln270">/*static*/ status_t</a>
+<a name="ln271">LinkProtocol::_ReceiveData(void* cookie, net_device* device, net_buffer* buffer)</a>
+<a name="ln272">{</a>
+<a name="ln273">	LinkProtocol* protocol = (LinkProtocol*)cookie;</a>
+<a name="ln274"> </a>
+<a name="ln275">	return protocol-&gt;Enqueue(buffer);</a>
+<a name="ln276">}</a>
+<a name="ln277"> </a>
+<a name="ln278"> </a>
+<a name="ln279">//	#pragma mark -</a>
+<a name="ln280"> </a>
+<a name="ln281"> </a>
+<a name="ln282">static bool</a>
+<a name="ln283">user_request_get_device_interface(void* value, struct ifreq&amp; request,</a>
+<a name="ln284">	net_device_interface*&amp; interface)</a>
+<a name="ln285">{</a>
+<a name="ln286">	if (user_memcpy(&amp;request, value, IF_NAMESIZE) &lt; B_OK)</a>
+<a name="ln287">		return false;</a>
+<a name="ln288"> </a>
+<a name="ln289">	interface = get_device_interface(request.ifr_name);</a>
+<a name="ln290">	return true;</a>
+<a name="ln291">}</a>
+<a name="ln292"> </a>
+<a name="ln293"> </a>
+<a name="ln294">//	#pragma mark - net_protocol module</a>
+<a name="ln295"> </a>
+<a name="ln296"> </a>
+<a name="ln297">static net_protocol*</a>
+<a name="ln298">link_init_protocol(net_socket* socket)</a>
+<a name="ln299">{</a>
+<a name="ln300">	LinkProtocol* protocol = new (std::nothrow) LinkProtocol(socket);</a>
+<a name="ln301">	if (protocol != NULL &amp;&amp; protocol-&gt;InitCheck() &lt; B_OK) {</a>
+<a name="ln302">		delete protocol;</a>
+<a name="ln303">		return NULL;</a>
+<a name="ln304">	}</a>
+<a name="ln305"> </a>
+<a name="ln306">	return protocol;</a>
+<a name="ln307">}</a>
+<a name="ln308"> </a>
+<a name="ln309"> </a>
+<a name="ln310">static status_t</a>
+<a name="ln311">link_uninit_protocol(net_protocol* protocol)</a>
+<a name="ln312">{</a>
+<a name="ln313">	delete (LinkProtocol*)protocol;</a>
+<a name="ln314">	return B_OK;</a>
+<a name="ln315">}</a>
+<a name="ln316"> </a>
+<a name="ln317"> </a>
+<a name="ln318">static status_t</a>
+<a name="ln319">link_open(net_protocol* protocol)</a>
+<a name="ln320">{</a>
+<a name="ln321">	return B_OK;</a>
+<a name="ln322">}</a>
+<a name="ln323"> </a>
+<a name="ln324"> </a>
+<a name="ln325">static status_t</a>
+<a name="ln326">link_close(net_protocol* protocol)</a>
+<a name="ln327">{</a>
+<a name="ln328">	return B_OK;</a>
+<a name="ln329">}</a>
+<a name="ln330"> </a>
+<a name="ln331"> </a>
+<a name="ln332">static status_t</a>
+<a name="ln333">link_free(net_protocol* protocol)</a>
+<a name="ln334">{</a>
+<a name="ln335">	return B_OK;</a>
+<a name="ln336">}</a>
+<a name="ln337"> </a>
+<a name="ln338"> </a>
+<a name="ln339">static status_t</a>
+<a name="ln340">link_connect(net_protocol* protocol, const struct sockaddr* address)</a>
+<a name="ln341">{</a>
+<a name="ln342">	return B_NOT_SUPPORTED;</a>
+<a name="ln343">}</a>
+<a name="ln344"> </a>
+<a name="ln345"> </a>
+<a name="ln346">static status_t</a>
+<a name="ln347">link_accept(net_protocol* protocol, struct net_socket** _acceptedSocket)</a>
+<a name="ln348">{</a>
+<a name="ln349">	return B_NOT_SUPPORTED;</a>
+<a name="ln350">}</a>
+<a name="ln351"> </a>
+<a name="ln352"> </a>
+<a name="ln353">static status_t</a>
+<a name="ln354">link_control(net_protocol* _protocol, int level, int option, void* value,</a>
+<a name="ln355">	size_t* _length)</a>
+<a name="ln356">{</a>
+<a name="ln357">	LinkProtocol* protocol = (LinkProtocol*)_protocol;</a>
+<a name="ln358"> </a>
+<a name="ln359">	switch (option) {</a>
+<a name="ln360">		case SIOCGIFINDEX:</a>
+<a name="ln361">		{</a>
+<a name="ln362">			// get index of interface</a>
+<a name="ln363">			net_device_interface* interface;</a>
+<a name="ln364">			struct ifreq request;</a>
+<a name="ln365">			if (!user_request_get_device_interface(value, request, interface))</a>
+<a name="ln366">				return B_BAD_ADDRESS;</a>
+<a name="ln367"> </a>
+<a name="ln368">			if (interface != NULL) {</a>
+<a name="ln369">				request.ifr_index = interface-&gt;device-&gt;index;</a>
+<a name="ln370">				put_device_interface(interface);</a>
+<a name="ln371">			} else</a>
+<a name="ln372">				request.ifr_index = 0;</a>
+<a name="ln373"> </a>
+<a name="ln374">			return user_memcpy(value, &amp;request, sizeof(struct ifreq));</a>
+<a name="ln375">		}</a>
+<a name="ln376">		case SIOCGIFNAME:</a>
+<a name="ln377">		{</a>
+<a name="ln378">			// get name of interface via index</a>
+<a name="ln379">			struct ifreq request;</a>
+<a name="ln380">			if (user_memcpy(&amp;request, value, sizeof(struct ifreq)) &lt; B_OK)</a>
+<a name="ln381">				return B_BAD_ADDRESS;</a>
+<a name="ln382"> </a>
+<a name="ln383">			net_device_interface* interface</a>
+<a name="ln384">				= get_device_interface(request.ifr_index);</a>
+<a name="ln385">			if (interface == NULL)</a>
+<a name="ln386">				return B_DEVICE_NOT_FOUND;</a>
+<a name="ln387"> </a>
+<a name="ln388">			strlcpy(request.ifr_name, interface-&gt;device-&gt;name, IF_NAMESIZE);</a>
+<a name="ln389">			put_device_interface(interface);</a>
+<a name="ln390"> </a>
+<a name="ln391">			return user_memcpy(value, &amp;request, sizeof(struct ifreq));</a>
+<a name="ln392">		}</a>
+<a name="ln393"> </a>
+<a name="ln394">		case SIOCGIFCOUNT:</a>
+<a name="ln395">		{</a>
+<a name="ln396">			// count number of interfaces</a>
+<a name="ln397">			struct ifconf config;</a>
+<a name="ln398">			config.ifc_value = count_device_interfaces();</a>
+<a name="ln399"> </a>
+<a name="ln400">			return user_memcpy(value, &amp;config, sizeof(struct ifconf));</a>
+<a name="ln401">		}</a>
+<a name="ln402"> </a>
+<a name="ln403">		case SIOCGIFCONF:</a>
+<a name="ln404">		{</a>
+<a name="ln405">			// retrieve available interfaces</a>
+<a name="ln406">			struct ifconf config;</a>
+<a name="ln407">			if (user_memcpy(&amp;config, value, sizeof(struct ifconf)) &lt; B_OK)</a>
+<a name="ln408">				return B_BAD_ADDRESS;</a>
+<a name="ln409"> </a>
+<a name="ln410">			status_t result = list_device_interfaces(config.ifc_buf,</a>
+<a name="ln411">				(size_t*)&amp;config.ifc_len);</a>
+<a name="ln412">			if (result != B_OK)</a>
+<a name="ln413">				return result;</a>
+<a name="ln414"> </a>
+<a name="ln415">			return user_memcpy(value, &amp;config, sizeof(struct ifconf));</a>
+<a name="ln416">		}</a>
+<a name="ln417"> </a>
+<a name="ln418">		case SIOCGIFADDR:</a>
+<a name="ln419">		{</a>
+<a name="ln420">			// get address of interface</a>
+<a name="ln421">			net_device_interface* interface;</a>
+<a name="ln422">			struct ifreq request;</a>
+<a name="ln423">			if (!user_request_get_device_interface(value, request, interface))</a>
+<a name="ln424">				return B_BAD_ADDRESS;</a>
+<a name="ln425"> </a>
+<a name="ln426">			if (interface == NULL)</a>
+<a name="ln427">				return B_DEVICE_NOT_FOUND;</a>
+<a name="ln428"> </a>
+<a name="ln429">			sockaddr_storage address;</a>
+<a name="ln430">			get_device_interface_address(interface, (sockaddr*)&amp;address);</a>
+<a name="ln431">			put_device_interface(interface);</a>
+<a name="ln432"> </a>
+<a name="ln433">			return user_memcpy(&amp;((struct ifreq*)value)-&gt;ifr_addr,</a>
+<a name="ln434">				&amp;address, address.ss_len);</a>
+<a name="ln435">		}</a>
+<a name="ln436"> </a>
+<a name="ln437">		case SIOCGIFFLAGS:</a>
+<a name="ln438">		{</a>
+<a name="ln439">			// get flags of interface</a>
+<a name="ln440">			net_device_interface* interface;</a>
+<a name="ln441">			struct ifreq request;</a>
+<a name="ln442">			if (!user_request_get_device_interface(value, request, interface))</a>
+<a name="ln443">				return B_BAD_ADDRESS;</a>
+<a name="ln444"> </a>
+<a name="ln445">			if (interface == NULL)</a>
+<a name="ln446">				return B_DEVICE_NOT_FOUND;</a>
+<a name="ln447"> </a>
+<a name="ln448">			request.ifr_flags = interface-&gt;device-&gt;flags;</a>
+<a name="ln449">			put_device_interface(interface);</a>
+<a name="ln450"> </a>
+<a name="ln451">			return user_memcpy(&amp;((struct ifreq*)value)-&gt;ifr_flags,</a>
+<a name="ln452">				&amp;request.ifr_flags, sizeof(request.ifr_flags));</a>
+<a name="ln453">		}</a>
+<a name="ln454"> </a>
+<a name="ln455">		case SIOCGIFMEDIA:</a>
+<a name="ln456">		{</a>
+<a name="ln457">			// get media</a>
+<a name="ln458">			if (*_length &lt; sizeof(ifmediareq))</a>
+<a name="ln459">				return B_BAD_VALUE;</a>
+<a name="ln460"> </a>
+<a name="ln461">			net_device_interface* interface;</a>
+<a name="ln462">			struct ifmediareq request;</a>
+<a name="ln463">			if (!user_request_get_device_interface(value, (ifreq&amp;)request,</a>
+<a name="ln464">					interface))</a>
+<a name="ln465">				return B_BAD_ADDRESS;</a>
+<a name="ln466"> </a>
+<a name="ln467">			if (interface == NULL)</a>
+<a name="ln468">				return B_DEVICE_NOT_FOUND;</a>
+<a name="ln469"> </a>
+<a name="ln470">			if (user_memcpy(&amp;request, value, sizeof(ifmediareq)) != B_OK) {</a>
+<a name="ln471">				put_device_interface(interface);</a>
+<a name="ln472">				return B_BAD_ADDRESS;</a>
+<a name="ln473">			}</a>
+<a name="ln474"> </a>
+<a name="ln475">			// TODO: see above.</a>
+<a name="ln476">			if (interface-&gt;device-&gt;module-&gt;control(interface-&gt;device,</a>
+<a name="ln477">					SIOCGIFMEDIA, &amp;request,</a>
+<a name="ln478">					sizeof(struct ifmediareq)) != B_OK) {</a>
+<a name="ln479">				memset(&amp;request, 0, sizeof(struct ifmediareq));</a>
+<a name="ln480">				request.ifm_active = request.ifm_current</a>
+<a name="ln481">					= interface-&gt;device-&gt;media;</a>
+<a name="ln482">			}</a>
+<a name="ln483">			put_device_interface(interface);</a>
+<a name="ln484"> </a>
+<a name="ln485">			return user_memcpy(value, &amp;request, sizeof(struct ifmediareq));</a>
+<a name="ln486">		}</a>
+<a name="ln487"> </a>
+<a name="ln488">		case SIOCSPACKETCAP:</a>
+<a name="ln489">		{</a>
+<a name="ln490">			// Only root is allowed to capture packets</a>
+<a name="ln491">			if (geteuid() != 0)</a>
+<a name="ln492">				return B_NOT_ALLOWED;</a>
+<a name="ln493"> </a>
+<a name="ln494">			struct ifreq request;</a>
+<a name="ln495">			if (user_memcpy(&amp;request, value, IF_NAMESIZE) != B_OK)</a>
+<a name="ln496">				return B_BAD_ADDRESS;</a>
+<a name="ln497"> </a>
+<a name="ln498">			return protocol-&gt;StartMonitoring(request.ifr_name);</a>
+<a name="ln499">		}</a>
+<a name="ln500"> </a>
+<a name="ln501">		case SIOCCPACKETCAP:</a>
+<a name="ln502">		{</a>
+<a name="ln503">			struct ifreq request;</a>
+<a name="ln504">			if (user_memcpy(&amp;request, value, IF_NAMESIZE) != B_OK)</a>
+<a name="ln505">				return B_BAD_ADDRESS;</a>
+<a name="ln506"> </a>
+<a name="ln507">			return protocol-&gt;StopMonitoring(request.ifr_name);</a>
+<a name="ln508">		}</a>
+<a name="ln509">	}</a>
+<a name="ln510"> </a>
+<a name="ln511">	return gNetDatalinkModule.control(sDomain, option, value, _length);</a>
+<a name="ln512">}</a>
+<a name="ln513"> </a>
+<a name="ln514"> </a>
+<a name="ln515">static status_t</a>
+<a name="ln516">link_getsockopt(net_protocol* protocol, int level, int option, void* value,</a>
+<a name="ln517">	int* length)</a>
+<a name="ln518">{</a>
+<a name="ln519">	if (protocol-&gt;next != NULL) {</a>
+<a name="ln520">		return protocol-&gt;next-&gt;module-&gt;getsockopt(protocol, level, option,</a>
+<a name="ln521">			value, length);</a>
+<a name="ln522">	}</a>
+<a name="ln523"> </a>
+<a name="ln524">	return gNetSocketModule.get_option(protocol-&gt;socket, level, option, value,</a>
+<a name="ln525">		length);</a>
+<a name="ln526">}</a>
+<a name="ln527"> </a>
+<a name="ln528"> </a>
+<a name="ln529">static status_t</a>
+<a name="ln530">link_setsockopt(net_protocol* protocol, int level, int option,</a>
+<a name="ln531">	const void* value, int length)</a>
+<a name="ln532">{</a>
+<a name="ln533">	if (protocol-&gt;next != NULL) {</a>
+<a name="ln534">		return protocol-&gt;next-&gt;module-&gt;setsockopt(protocol, level, option,</a>
+<a name="ln535">			value, length);</a>
+<a name="ln536">	}</a>
+<a name="ln537"> </a>
+<a name="ln538">	return gNetSocketModule.set_option(protocol-&gt;socket, level, option,</a>
+<a name="ln539">		value, length);</a>
+<a name="ln540">}</a>
+<a name="ln541"> </a>
+<a name="ln542"> </a>
+<a name="ln543">static status_t</a>
+<a name="ln544">link_bind(net_protocol* _protocol, const struct sockaddr* address)</a>
+<a name="ln545">{</a>
+<a name="ln546">	LinkProtocol* protocol = (LinkProtocol*)_protocol;</a>
+<a name="ln547">	return protocol-&gt;Bind(address);</a>
+<a name="ln548">}</a>
+<a name="ln549"> </a>
+<a name="ln550"> </a>
+<a name="ln551">static status_t</a>
+<a name="ln552">link_unbind(net_protocol* _protocol, struct sockaddr* address)</a>
+<a name="ln553">{</a>
+<a name="ln554">	LinkProtocol* protocol = (LinkProtocol*)_protocol;</a>
+<a name="ln555">	return protocol-&gt;Unbind();</a>
+<a name="ln556">}</a>
+<a name="ln557"> </a>
+<a name="ln558"> </a>
+<a name="ln559">static status_t</a>
+<a name="ln560">link_listen(net_protocol* protocol, int count)</a>
+<a name="ln561">{</a>
+<a name="ln562">	return B_NOT_SUPPORTED;</a>
+<a name="ln563">}</a>
+<a name="ln564"> </a>
+<a name="ln565"> </a>
+<a name="ln566">static status_t</a>
+<a name="ln567">link_shutdown(net_protocol* protocol, int direction)</a>
+<a name="ln568">{</a>
+<a name="ln569">	return B_NOT_SUPPORTED;</a>
+<a name="ln570">}</a>
+<a name="ln571"> </a>
+<a name="ln572"> </a>
+<a name="ln573">static status_t</a>
+<a name="ln574">link_send_data(net_protocol* protocol, net_buffer* buffer)</a>
+<a name="ln575">{</a>
+<a name="ln576">	return gNetDatalinkModule.send_data(protocol, sDomain, buffer);</a>
+<a name="ln577">}</a>
+<a name="ln578"> </a>
+<a name="ln579"> </a>
+<a name="ln580">static status_t</a>
+<a name="ln581">link_send_routed_data(net_protocol* protocol, struct net_route* route,</a>
+<a name="ln582">	net_buffer* buffer)</a>
+<a name="ln583">{</a>
+<a name="ln584">	if (buffer-&gt;destination-&gt;sa_family != buffer-&gt;source-&gt;sa_family</a>
+<a name="ln585">		|| buffer-&gt;destination-&gt;sa_family != AF_LINK)</a>
+<a name="ln586">		return B_BAD_VALUE;</a>
+<a name="ln587"> </a>
+<a name="ln588">	// The datalink layer will take care of the framing</a>
+<a name="ln589"> </a>
+<a name="ln590">	return gNetDatalinkModule.send_routed_data(route, buffer);</a>
+<a name="ln591">}</a>
+<a name="ln592"> </a>
+<a name="ln593"> </a>
+<a name="ln594">static ssize_t</a>
+<a name="ln595">link_send_avail(net_protocol* _protocol)</a>
+<a name="ln596">{</a>
+<a name="ln597">	LinkProtocol* protocol = (LinkProtocol*)_protocol;</a>
+<a name="ln598">	if (!protocol-&gt;IsBound())</a>
+<a name="ln599">		return B_ERROR;</a>
+<a name="ln600"> </a>
+<a name="ln601">	return protocol-&gt;socket-&gt;send.buffer_size;</a>
+<a name="ln602">}</a>
+<a name="ln603"> </a>
+<a name="ln604"> </a>
+<a name="ln605">static status_t</a>
+<a name="ln606">link_read_data(net_protocol* protocol, size_t numBytes, uint32 flags,</a>
+<a name="ln607">	net_buffer** _buffer)</a>
+<a name="ln608">{</a>
+<a name="ln609">	return ((LinkProtocol*)protocol)-&gt;Dequeue(flags, _buffer);</a>
+<a name="ln610">}</a>
+<a name="ln611"> </a>
+<a name="ln612"> </a>
+<a name="ln613">static ssize_t</a>
+<a name="ln614">link_read_avail(net_protocol* protocol)</a>
+<a name="ln615">{</a>
+<a name="ln616">	return ((LinkProtocol*)protocol)-&gt;AvailableData();</a>
+<a name="ln617">}</a>
+<a name="ln618"> </a>
+<a name="ln619"> </a>
+<a name="ln620">static struct net_domain*</a>
+<a name="ln621">link_get_domain(net_protocol* protocol)</a>
+<a name="ln622">{</a>
+<a name="ln623">	return sDomain;</a>
+<a name="ln624">}</a>
+<a name="ln625"> </a>
+<a name="ln626"> </a>
+<a name="ln627">static size_t</a>
+<a name="ln628">link_get_mtu(net_protocol* _protocol, const struct sockaddr* address)</a>
+<a name="ln629">{</a>
+<a name="ln630">	LinkProtocol* protocol = (LinkProtocol*)_protocol;</a>
+<a name="ln631">	return protocol-&gt;MTU();</a>
+<a name="ln632">}</a>
+<a name="ln633"> </a>
+<a name="ln634"> </a>
+<a name="ln635">static status_t</a>
+<a name="ln636">link_receive_data(net_buffer* buffer)</a>
+<a name="ln637">{</a>
+<a name="ln638">	// We never receive any data this way</a>
+<a name="ln639">	return B_ERROR;</a>
+<a name="ln640">}</a>
+<a name="ln641"> </a>
+<a name="ln642"> </a>
+<a name="ln643">static status_t</a>
+<a name="ln644">link_error_received(net_error error, net_buffer* data)</a>
+<a name="ln645">{</a>
+<a name="ln646">	// We don't do any error processing</a>
+<a name="ln647">	return B_ERROR;</a>
+<a name="ln648">}</a>
+<a name="ln649"> </a>
+<a name="ln650"> </a>
+<a name="ln651">static status_t</a>
+<a name="ln652">link_error_reply(net_protocol* protocol, net_buffer* cause, net_error error,</a>
+<a name="ln653">	net_error_data* errorData)</a>
+<a name="ln654">{</a>
+<a name="ln655">	// We don't do any error processing</a>
+<a name="ln656">	return B_ERROR;</a>
+<a name="ln657">}</a>
+<a name="ln658"> </a>
+<a name="ln659"> </a>
+<a name="ln660">static status_t</a>
+<a name="ln661">link_std_ops(int32 op, ...)</a>
+<a name="ln662">{</a>
+<a name="ln663">	switch (op) {</a>
+<a name="ln664">		case B_MODULE_INIT:</a>
+<a name="ln665">			return register_domain(AF_LINK, &quot;link&quot;, NULL, NULL, &amp;sDomain);</a>
+<a name="ln666"> </a>
+<a name="ln667">		case B_MODULE_UNINIT:</a>
+<a name="ln668">			unregister_domain(sDomain);</a>
+<a name="ln669">			return B_OK;</a>
+<a name="ln670"> </a>
+<a name="ln671">		default:</a>
+<a name="ln672">			return B_ERROR;</a>
+<a name="ln673">	}</a>
+<a name="ln674">}</a>
+<a name="ln675"> </a>
+<a name="ln676"> </a>
+<a name="ln677">//	#pragma mark -</a>
+<a name="ln678"> </a>
+<a name="ln679"> </a>
+<a name="ln680">void</a>
+<a name="ln681">link_init()</a>
+<a name="ln682">{</a>
+<a name="ln683">	register_domain_protocols(AF_LINK, SOCK_DGRAM, 0, &quot;network/stack/link/v1&quot;,</a>
+<a name="ln684">		NULL);</a>
+<a name="ln685"> </a>
+<a name="ln686">	// TODO: this should actually be registered for all types (besides local)</a>
+<a name="ln687">	register_domain_datalink_protocols(AF_LINK, IFT_ETHER,</a>
+<a name="ln688">		&quot;network/datalink_protocols/ethernet_frame/v1&quot;,</a>
+<a name="ln689">		NULL);</a>
+<a name="ln690">}</a>
+<a name="ln691"> </a>
+<a name="ln692"> </a>
+<a name="ln693">net_protocol_module_info gLinkModule = {</a>
+<a name="ln694">	{</a>
+<a name="ln695">		&quot;network/stack/link/v1&quot;,</a>
+<a name="ln696">		0,</a>
+<a name="ln697">		link_std_ops</a>
+<a name="ln698">	},</a>
+<a name="ln699">	NET_PROTOCOL_ATOMIC_MESSAGES,</a>
+<a name="ln700"> </a>
+<a name="ln701">	link_init_protocol,</a>
+<a name="ln702">	link_uninit_protocol,</a>
+<a name="ln703">	link_open,</a>
+<a name="ln704">	link_close,</a>
+<a name="ln705">	link_free,</a>
+<a name="ln706">	link_connect,</a>
+<a name="ln707">	link_accept,</a>
+<a name="ln708">	link_control,</a>
+<a name="ln709">	link_getsockopt,</a>
+<a name="ln710">	link_setsockopt,</a>
+<a name="ln711">	link_bind,</a>
+<a name="ln712">	link_unbind,</a>
+<a name="ln713">	link_listen,</a>
+<a name="ln714">	link_shutdown,</a>
+<a name="ln715">	link_send_data,</a>
+<a name="ln716">	link_send_routed_data,</a>
+<a name="ln717">	link_send_avail,</a>
+<a name="ln718">	link_read_data,</a>
+<a name="ln719">	link_read_avail,</a>
+<a name="ln720">	link_get_domain,</a>
+<a name="ln721">	link_get_mtu,</a>
+<a name="ln722">	link_receive_data,</a>
+<a name="ln723">	NULL,		// deliver_data</a>
+<a name="ln724">	link_error_received,</a>
+<a name="ln725">	link_error_reply,</a>
+<a name="ln726">	NULL,		// add_ancillary_data()</a>
+<a name="ln727">	NULL,		// process_ancillary_data()</a>
+<a name="ln728">	NULL,		// process_ancillary_data_no_container()</a>
+<a name="ln729">	NULL,		// send_data_no_buffer()</a>
+<a name="ln730">	NULL		// read_data_no_buffer()</a>
+<a name="ln731">};</a>
+
+</code></pre>
+<div class="balloon" rel="84"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fBoundType.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

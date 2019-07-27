@@ -1,0 +1,3680 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>block_cache.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2004-2012, Axel Dörfler, axeld@pinc-software.de.</a>
+<a name="ln3"> * Distributed under the terms of the MIT License.</a>
+<a name="ln4"> */</a>
+<a name="ln5"> </a>
+<a name="ln6"> </a>
+<a name="ln7">#include &lt;block_cache.h&gt;</a>
+<a name="ln8"> </a>
+<a name="ln9">#include &lt;unistd.h&gt;</a>
+<a name="ln10">#include &lt;stdlib.h&gt;</a>
+<a name="ln11">#include &lt;string.h&gt;</a>
+<a name="ln12">#include &lt;errno.h&gt;</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &lt;KernelExport.h&gt;</a>
+<a name="ln15">#include &lt;fs_cache.h&gt;</a>
+<a name="ln16"> </a>
+<a name="ln17">#include &lt;condition_variable.h&gt;</a>
+<a name="ln18">#include &lt;lock.h&gt;</a>
+<a name="ln19">#include &lt;low_resource_manager.h&gt;</a>
+<a name="ln20">#include &lt;slab/Slab.h&gt;</a>
+<a name="ln21">#include &lt;tracing.h&gt;</a>
+<a name="ln22">#include &lt;util/kernel_cpp.h&gt;</a>
+<a name="ln23">#include &lt;util/DoublyLinkedList.h&gt;</a>
+<a name="ln24">#include &lt;util/AutoLock.h&gt;</a>
+<a name="ln25">#include &lt;vm/vm_page.h&gt;</a>
+<a name="ln26"> </a>
+<a name="ln27">#include &quot;kernel_debug_config.h&quot;</a>
+<a name="ln28"> </a>
+<a name="ln29"> </a>
+<a name="ln30">// TODO: this is a naive but growing implementation to test the API:</a>
+<a name="ln31">//	block reading/writing is not at all optimized for speed, it will</a>
+<a name="ln32">//	just read and write single blocks.</a>
+<a name="ln33">// TODO: the retrieval/copy of the original data could be delayed until the</a>
+<a name="ln34">//		new data must be written, ie. in low memory situations.</a>
+<a name="ln35"> </a>
+<a name="ln36">//#define TRACE_BLOCK_CACHE</a>
+<a name="ln37">#ifdef TRACE_BLOCK_CACHE</a>
+<a name="ln38">#	define TRACE(x)	dprintf x</a>
+<a name="ln39">#else</a>
+<a name="ln40">#	define TRACE(x) ;</a>
+<a name="ln41">#endif</a>
+<a name="ln42"> </a>
+<a name="ln43">#define TRACE_ALWAYS(x) dprintf x</a>
+<a name="ln44"> </a>
+<a name="ln45">// This macro is used for fatal situations that are acceptable in a running</a>
+<a name="ln46">// system, like out of memory situations - should only panic for debugging.</a>
+<a name="ln47">#define FATAL(x) panic x</a>
+<a name="ln48"> </a>
+<a name="ln49">static const bigtime_t kTransactionIdleTime = 2000000LL;</a>
+<a name="ln50">	// a transaction is considered idle after 2 seconds of inactivity</a>
+<a name="ln51"> </a>
+<a name="ln52"> </a>
+<a name="ln53">namespace {</a>
+<a name="ln54"> </a>
+<a name="ln55">struct cache_transaction;</a>
+<a name="ln56">struct cached_block;</a>
+<a name="ln57">struct block_cache;</a>
+<a name="ln58">typedef DoublyLinkedListLink&lt;cached_block&gt; block_link;</a>
+<a name="ln59"> </a>
+<a name="ln60">struct cached_block {</a>
+<a name="ln61">	cached_block*	next;			// next in hash</a>
+<a name="ln62">	cached_block*	transaction_next;</a>
+<a name="ln63">	block_link		link;</a>
+<a name="ln64">	off_t			block_number;</a>
+<a name="ln65">	void*			current_data;</a>
+<a name="ln66">		// The data that is seen by everyone using the API; this one is always</a>
+<a name="ln67">		// present.</a>
+<a name="ln68">	void*			original_data;</a>
+<a name="ln69">		// When in a transaction, this contains the original data from before</a>
+<a name="ln70">		// the transaction.</a>
+<a name="ln71">	void*			parent_data;</a>
+<a name="ln72">		// This is a lazily alloced buffer that represents the contents of the</a>
+<a name="ln73">		// block in the parent transaction. It may point to current_data if the</a>
+<a name="ln74">		// contents have been changed only in the parent transaction, or, if the</a>
+<a name="ln75">		// block has been changed in the current sub transaction already, to a</a>
+<a name="ln76">		// new block containing the contents changed in the parent transaction.</a>
+<a name="ln77">		// If this is NULL, the block has not been changed in the parent</a>
+<a name="ln78">		// transaction at all.</a>
+<a name="ln79">#if BLOCK_CACHE_DEBUG_CHANGED</a>
+<a name="ln80">	void*			compare;</a>
+<a name="ln81">#endif</a>
+<a name="ln82">	int32			ref_count;</a>
+<a name="ln83">	int32			last_accessed;</a>
+<a name="ln84">	bool			busy_reading : 1;</a>
+<a name="ln85">	bool			busy_writing : 1;</a>
+<a name="ln86">	bool			is_writing : 1;</a>
+<a name="ln87">		// Block has been checked out for writing without transactions, and</a>
+<a name="ln88">		// cannot be written back if set</a>
+<a name="ln89">	bool			is_dirty : 1;</a>
+<a name="ln90">	bool			unused : 1;</a>
+<a name="ln91">	bool			discard : 1;</a>
+<a name="ln92">	bool			busy_reading_waiters : 1;</a>
+<a name="ln93">	bool			busy_writing_waiters : 1;</a>
+<a name="ln94">	cache_transaction* transaction;</a>
+<a name="ln95">		// This is the current active transaction, if any, the block is</a>
+<a name="ln96">		// currently in (meaning was changed as a part of it).</a>
+<a name="ln97">	cache_transaction* previous_transaction;</a>
+<a name="ln98">		// This is set to the last transaction that was ended containing this</a>
+<a name="ln99">		// block. In this case, the block has not yet written back yet, and</a>
+<a name="ln100">		// the changed data is either in current_data, or original_data -- the</a>
+<a name="ln101">		// latter if the block is already being part of another transaction.</a>
+<a name="ln102">		// There can only be one previous transaction, so when the active</a>
+<a name="ln103">		// transaction ends, the changes of the previous transaction have to</a>
+<a name="ln104">		// be written back before that transaction becomes the next previous</a>
+<a name="ln105">		// transaction.</a>
+<a name="ln106"> </a>
+<a name="ln107">	bool CanBeWritten() const;</a>
+<a name="ln108">	int32 LastAccess() const</a>
+<a name="ln109">		{ return system_time() / 1000000L - last_accessed; }</a>
+<a name="ln110">};</a>
+<a name="ln111"> </a>
+<a name="ln112">typedef DoublyLinkedList&lt;cached_block,</a>
+<a name="ln113">	DoublyLinkedListMemberGetLink&lt;cached_block,</a>
+<a name="ln114">		&amp;cached_block::link&gt; &gt; block_list;</a>
+<a name="ln115"> </a>
+<a name="ln116">struct cache_notification : DoublyLinkedListLinkImpl&lt;cache_notification&gt; {</a>
+<a name="ln117">	int32			transaction_id;</a>
+<a name="ln118">	int32			events_pending;</a>
+<a name="ln119">	int32			events;</a>
+<a name="ln120">	transaction_notification_hook hook;</a>
+<a name="ln121">	void*			data;</a>
+<a name="ln122">	bool			delete_after_event;</a>
+<a name="ln123">};</a>
+<a name="ln124"> </a>
+<a name="ln125">typedef DoublyLinkedList&lt;cache_notification&gt; NotificationList;</a>
+<a name="ln126"> </a>
+<a name="ln127">struct BlockHash {</a>
+<a name="ln128">	typedef off_t			KeyType;</a>
+<a name="ln129">	typedef	cached_block	ValueType;</a>
+<a name="ln130"> </a>
+<a name="ln131">	size_t HashKey(KeyType key) const</a>
+<a name="ln132">	{</a>
+<a name="ln133">		return key;</a>
+<a name="ln134">	}</a>
+<a name="ln135"> </a>
+<a name="ln136">	size_t Hash(ValueType* block) const</a>
+<a name="ln137">	{</a>
+<a name="ln138">		return block-&gt;block_number;</a>
+<a name="ln139">	}</a>
+<a name="ln140"> </a>
+<a name="ln141">	bool Compare(KeyType key, ValueType* block) const</a>
+<a name="ln142">	{</a>
+<a name="ln143">		return block-&gt;block_number == key;</a>
+<a name="ln144">	}</a>
+<a name="ln145"> </a>
+<a name="ln146">	ValueType*&amp; GetLink(ValueType* value) const</a>
+<a name="ln147">	{</a>
+<a name="ln148">		return value-&gt;next;</a>
+<a name="ln149">	}</a>
+<a name="ln150">};</a>
+<a name="ln151"> </a>
+<a name="ln152">typedef BOpenHashTable&lt;BlockHash&gt; BlockTable;</a>
+<a name="ln153"> </a>
+<a name="ln154"> </a>
+<a name="ln155">struct TransactionHash {</a>
+<a name="ln156">	typedef int32				KeyType;</a>
+<a name="ln157">	typedef	cache_transaction	ValueType;</a>
+<a name="ln158"> </a>
+<a name="ln159">	size_t HashKey(KeyType key) const</a>
+<a name="ln160">	{</a>
+<a name="ln161">		return key;</a>
+<a name="ln162">	}</a>
+<a name="ln163"> </a>
+<a name="ln164">	size_t Hash(ValueType* transaction) const;</a>
+<a name="ln165">	bool Compare(KeyType key, ValueType* transaction) const;</a>
+<a name="ln166">	ValueType*&amp; GetLink(ValueType* value) const;</a>
+<a name="ln167">};</a>
+<a name="ln168"> </a>
+<a name="ln169">typedef BOpenHashTable&lt;TransactionHash&gt; TransactionTable;</a>
+<a name="ln170"> </a>
+<a name="ln171"> </a>
+<a name="ln172">struct block_cache : DoublyLinkedListLinkImpl&lt;block_cache&gt; {</a>
+<a name="ln173">	BlockTable*		hash;</a>
+<a name="ln174">	mutex			lock;</a>
+<a name="ln175">	int				fd;</a>
+<a name="ln176">	off_t			max_blocks;</a>
+<a name="ln177">	size_t			block_size;</a>
+<a name="ln178">	int32			next_transaction_id;</a>
+<a name="ln179">	cache_transaction* last_transaction;</a>
+<a name="ln180">	TransactionTable* transaction_hash;</a>
+<a name="ln181"> </a>
+<a name="ln182">	object_cache*	buffer_cache;</a>
+<a name="ln183">	block_list		unused_blocks;</a>
+<a name="ln184">	uint32			unused_block_count;</a>
+<a name="ln185"> </a>
+<a name="ln186">	ConditionVariable busy_reading_condition;</a>
+<a name="ln187">	uint32			busy_reading_count;</a>
+<a name="ln188">	bool			busy_reading_waiters;</a>
+<a name="ln189"> </a>
+<a name="ln190">	ConditionVariable busy_writing_condition;</a>
+<a name="ln191">	uint32			busy_writing_count;</a>
+<a name="ln192">	bool			busy_writing_waiters;</a>
+<a name="ln193"> </a>
+<a name="ln194">	uint32			num_dirty_blocks;</a>
+<a name="ln195">	bool			read_only;</a>
+<a name="ln196"> </a>
+<a name="ln197">	NotificationList pending_notifications;</a>
+<a name="ln198">	ConditionVariable condition_variable;</a>
+<a name="ln199"> </a>
+<a name="ln200">					block_cache(int fd, off_t numBlocks, size_t blockSize,</a>
+<a name="ln201">						bool readOnly);</a>
+<a name="ln202">					~block_cache();</a>
+<a name="ln203"> </a>
+<a name="ln204">	status_t		Init();</a>
+<a name="ln205"> </a>
+<a name="ln206">	void			Free(void* buffer);</a>
+<a name="ln207">	void*			Allocate();</a>
+<a name="ln208">	void			FreeBlock(cached_block* block);</a>
+<a name="ln209">	cached_block*	NewBlock(off_t blockNumber);</a>
+<a name="ln210">	void			FreeBlockParentData(cached_block* block);</a>
+<a name="ln211"> </a>
+<a name="ln212">	void			RemoveUnusedBlocks(int32 count, int32 minSecondsOld = 0);</a>
+<a name="ln213">	void			RemoveBlock(cached_block* block);</a>
+<a name="ln214">	void			DiscardBlock(cached_block* block);</a>
+<a name="ln215"> </a>
+<a name="ln216">private:</a>
+<a name="ln217">	static void		_LowMemoryHandler(void* data, uint32 resources,</a>
+<a name="ln218">						int32 level);</a>
+<a name="ln219">	cached_block*	_GetUnusedBlock();</a>
+<a name="ln220">};</a>
+<a name="ln221"> </a>
+<a name="ln222">struct cache_listener;</a>
+<a name="ln223">typedef DoublyLinkedListLink&lt;cache_listener&gt; listener_link;</a>
+<a name="ln224"> </a>
+<a name="ln225">struct cache_listener : cache_notification {</a>
+<a name="ln226">	listener_link	link;</a>
+<a name="ln227">};</a>
+<a name="ln228"> </a>
+<a name="ln229">typedef DoublyLinkedList&lt;cache_listener,</a>
+<a name="ln230">	DoublyLinkedListMemberGetLink&lt;cache_listener,</a>
+<a name="ln231">		&amp;cache_listener::link&gt; &gt; ListenerList;</a>
+<a name="ln232"> </a>
+<a name="ln233"> </a>
+<a name="ln234">struct cache_transaction {</a>
+<a name="ln235">	cache_transaction();</a>
+<a name="ln236"> </a>
+<a name="ln237">	cache_transaction* next;</a>
+<a name="ln238">	int32			id;</a>
+<a name="ln239">	int32			num_blocks;</a>
+<a name="ln240">	int32			main_num_blocks;</a>
+<a name="ln241">	int32			sub_num_blocks;</a>
+<a name="ln242">	cached_block*	first_block;</a>
+<a name="ln243">	block_list		blocks;</a>
+<a name="ln244">	ListenerList	listeners;</a>
+<a name="ln245">	bool			open;</a>
+<a name="ln246">	bool			has_sub_transaction;</a>
+<a name="ln247">	bigtime_t		last_used;</a>
+<a name="ln248">	int32			busy_writing_count;</a>
+<a name="ln249">};</a>
+<a name="ln250"> </a>
+<a name="ln251"> </a>
+<a name="ln252">class BlockWriter {</a>
+<a name="ln253">public:</a>
+<a name="ln254">								BlockWriter(block_cache* cache,</a>
+<a name="ln255">									size_t max = SIZE_MAX);</a>
+<a name="ln256">								~BlockWriter();</a>
+<a name="ln257"> </a>
+<a name="ln258">			bool				Add(cached_block* block,</a>
+<a name="ln259">									cache_transaction* transaction = NULL);</a>
+<a name="ln260">			bool				Add(cache_transaction* transaction,</a>
+<a name="ln261">									bool&amp; hasLeftOvers);</a>
+<a name="ln262"> </a>
+<a name="ln263">			status_t			Write(cache_transaction* transaction = NULL,</a>
+<a name="ln264">									bool canUnlock = true);</a>
+<a name="ln265"> </a>
+<a name="ln266">			bool				DeletedTransaction() const</a>
+<a name="ln267">									{ return fDeletedTransaction; }</a>
+<a name="ln268"> </a>
+<a name="ln269">	static	status_t			WriteBlock(block_cache* cache,</a>
+<a name="ln270">									cached_block* block);</a>
+<a name="ln271"> </a>
+<a name="ln272">private:</a>
+<a name="ln273">			void*				_Data(cached_block* block) const;</a>
+<a name="ln274">			status_t			_WriteBlock(cached_block* block);</a>
+<a name="ln275">			void				_BlockDone(cached_block* block,</a>
+<a name="ln276">									cache_transaction* transaction);</a>
+<a name="ln277">			void				_UnmarkWriting(cached_block* block);</a>
+<a name="ln278"> </a>
+<a name="ln279">	static	int					_CompareBlocks(const void* _blockA,</a>
+<a name="ln280">									const void* _blockB);</a>
+<a name="ln281"> </a>
+<a name="ln282">private:</a>
+<a name="ln283">	static	const size_t		kBufferSize = 64;</a>
+<a name="ln284"> </a>
+<a name="ln285">			block_cache*		fCache;</a>
+<a name="ln286">			cached_block*		fBuffer[kBufferSize];</a>
+<a name="ln287">			cached_block**		fBlocks;</a>
+<a name="ln288">			size_t				fCount;</a>
+<a name="ln289">			size_t				fTotal;</a>
+<a name="ln290">			size_t				fCapacity;</a>
+<a name="ln291">			size_t				fMax;</a>
+<a name="ln292">			status_t			fStatus;</a>
+<a name="ln293">			bool				fDeletedTransaction;</a>
+<a name="ln294">};</a>
+<a name="ln295"> </a>
+<a name="ln296"> </a>
+<a name="ln297">class TransactionLocking {</a>
+<a name="ln298">public:</a>
+<a name="ln299">	inline bool Lock(block_cache* cache)</a>
+<a name="ln300">	{</a>
+<a name="ln301">		mutex_lock(&amp;cache-&gt;lock);</a>
+<a name="ln302"> </a>
+<a name="ln303">		while (cache-&gt;busy_writing_count != 0) {</a>
+<a name="ln304">			// wait for all blocks to be written</a>
+<a name="ln305">			ConditionVariableEntry entry;</a>
+<a name="ln306">			cache-&gt;busy_writing_condition.Add(&amp;entry);</a>
+<a name="ln307">			cache-&gt;busy_writing_waiters = true;</a>
+<a name="ln308"> </a>
+<a name="ln309">			mutex_unlock(&amp;cache-&gt;lock);</a>
+<a name="ln310"> </a>
+<a name="ln311">			entry.Wait();</a>
+<a name="ln312"> </a>
+<a name="ln313">			mutex_lock(&amp;cache-&gt;lock);</a>
+<a name="ln314">		}</a>
+<a name="ln315"> </a>
+<a name="ln316">		return true;</a>
+<a name="ln317">	}</a>
+<a name="ln318"> </a>
+<a name="ln319">	inline void Unlock(block_cache* cache)</a>
+<a name="ln320">	{</a>
+<a name="ln321">		mutex_unlock(&amp;cache-&gt;lock);</a>
+<a name="ln322">	}</a>
+<a name="ln323">};</a>
+<a name="ln324"> </a>
+<a name="ln325">typedef AutoLocker&lt;block_cache, TransactionLocking&gt; TransactionLocker;</a>
+<a name="ln326"> </a>
+<a name="ln327">} // namespace</a>
+<a name="ln328"> </a>
+<a name="ln329"> </a>
+<a name="ln330">#if BLOCK_CACHE_BLOCK_TRACING &amp;&amp; !defined(BUILDING_USERLAND_FS_SERVER)</a>
+<a name="ln331">namespace BlockTracing {</a>
+<a name="ln332"> </a>
+<a name="ln333">class Action : public AbstractTraceEntry {</a>
+<a name="ln334">public:</a>
+<a name="ln335">	Action(block_cache* cache, cached_block* block)</a>
+<a name="ln336">		:</a>
+<a name="ln337">		fCache(cache),</a>
+<a name="ln338">		fBlockNumber(block-&gt;block_number),</a>
+<a name="ln339">		fIsDirty(block-&gt;is_dirty),</a>
+<a name="ln340">		fHasOriginal(block-&gt;original_data != NULL),</a>
+<a name="ln341">		fHasParent(block-&gt;parent_data != NULL),</a>
+<a name="ln342">		fTransactionID(-1),</a>
+<a name="ln343">		fPreviousID(-1)</a>
+<a name="ln344">	{</a>
+<a name="ln345">		if (block-&gt;transaction != NULL)</a>
+<a name="ln346">			fTransactionID = block-&gt;transaction-&gt;id;</a>
+<a name="ln347">		if (block-&gt;previous_transaction != NULL)</a>
+<a name="ln348">			fPreviousID = block-&gt;previous_transaction-&gt;id;</a>
+<a name="ln349">	}</a>
+<a name="ln350"> </a>
+<a name="ln351">	virtual void AddDump(TraceOutput&amp; out)</a>
+<a name="ln352">	{</a>
+<a name="ln353">		out.Print(&quot;block cache %p, %s %&quot; B_PRIu64 &quot;, %c%c%c transaction %&quot; B_PRId32</a>
+<a name="ln354">			&quot; (previous id %&quot; B_PRId32 &quot;)\n&quot;, fCache, _Action(), fBlockNumber,</a>
+<a name="ln355">			fIsDirty ? 'd' : '-', fHasOriginal ? 'o' : '-',</a>
+<a name="ln356">			fHasParent ? 'p' : '-', fTransactionID, fPreviousID);</a>
+<a name="ln357">	}</a>
+<a name="ln358"> </a>
+<a name="ln359">	virtual const char* _Action() const = 0;</a>
+<a name="ln360"> </a>
+<a name="ln361">private:</a>
+<a name="ln362">	block_cache*		fCache;</a>
+<a name="ln363">	uint64				fBlockNumber;</a>
+<a name="ln364">	bool				fIsDirty;</a>
+<a name="ln365">	bool				fHasOriginal;</a>
+<a name="ln366">	bool				fHasParent;</a>
+<a name="ln367">	int32				fTransactionID;</a>
+<a name="ln368">	int32				fPreviousID;</a>
+<a name="ln369">};</a>
+<a name="ln370"> </a>
+<a name="ln371">class Get : public Action {</a>
+<a name="ln372">public:</a>
+<a name="ln373">	Get(block_cache* cache, cached_block* block)</a>
+<a name="ln374">		:</a>
+<a name="ln375">		Action(cache, block)</a>
+<a name="ln376">	{</a>
+<a name="ln377">		Initialized();</a>
+<a name="ln378">	}</a>
+<a name="ln379"> </a>
+<a name="ln380">	virtual const char* _Action() const { return &quot;get&quot;; }</a>
+<a name="ln381">};</a>
+<a name="ln382"> </a>
+<a name="ln383">class Put : public Action {</a>
+<a name="ln384">public:</a>
+<a name="ln385">	Put(block_cache* cache, cached_block* block)</a>
+<a name="ln386">		:</a>
+<a name="ln387">		Action(cache, block)</a>
+<a name="ln388">	{</a>
+<a name="ln389">		Initialized();</a>
+<a name="ln390">	}</a>
+<a name="ln391"> </a>
+<a name="ln392">	virtual const char* _Action() const { return &quot;put&quot;; }</a>
+<a name="ln393">};</a>
+<a name="ln394"> </a>
+<a name="ln395">class Read : public Action {</a>
+<a name="ln396">public:</a>
+<a name="ln397">	Read(block_cache* cache, cached_block* block)</a>
+<a name="ln398">		:</a>
+<a name="ln399">		Action(cache, block)</a>
+<a name="ln400">	{</a>
+<a name="ln401">		Initialized();</a>
+<a name="ln402">	}</a>
+<a name="ln403"> </a>
+<a name="ln404">	virtual const char* _Action() const { return &quot;read&quot;; }</a>
+<a name="ln405">};</a>
+<a name="ln406"> </a>
+<a name="ln407">class Write : public Action {</a>
+<a name="ln408">public:</a>
+<a name="ln409">	Write(block_cache* cache, cached_block* block)</a>
+<a name="ln410">		:</a>
+<a name="ln411">		Action(cache, block)</a>
+<a name="ln412">	{</a>
+<a name="ln413">		Initialized();</a>
+<a name="ln414">	}</a>
+<a name="ln415"> </a>
+<a name="ln416">	virtual const char* _Action() const { return &quot;write&quot;; }</a>
+<a name="ln417">};</a>
+<a name="ln418"> </a>
+<a name="ln419">class Flush : public Action {</a>
+<a name="ln420">public:</a>
+<a name="ln421">	Flush(block_cache* cache, cached_block* block, bool getUnused = false)</a>
+<a name="ln422">		:</a>
+<a name="ln423">		Action(cache, block),</a>
+<a name="ln424">		fGetUnused(getUnused)</a>
+<a name="ln425">	{</a>
+<a name="ln426">		Initialized();</a>
+<a name="ln427">	}</a>
+<a name="ln428"> </a>
+<a name="ln429">	virtual const char* _Action() const</a>
+<a name="ln430">		{ return fGetUnused ? &quot;get-unused&quot; : &quot;flush&quot;; }</a>
+<a name="ln431"> </a>
+<a name="ln432">private:</a>
+<a name="ln433">	bool	fGetUnused;</a>
+<a name="ln434">};</a>
+<a name="ln435"> </a>
+<a name="ln436">class Error : public AbstractTraceEntry {</a>
+<a name="ln437">public:</a>
+<a name="ln438">	Error(block_cache* cache, uint64 blockNumber, const char* message,</a>
+<a name="ln439">			status_t status = B_OK)</a>
+<a name="ln440">		:</a>
+<a name="ln441">		fCache(cache),</a>
+<a name="ln442">		fBlockNumber(blockNumber),</a>
+<a name="ln443">		fMessage(message),</a>
+<a name="ln444">		fStatus(status)</a>
+<a name="ln445">	{</a>
+<a name="ln446">		Initialized();</a>
+<a name="ln447">	}</a>
+<a name="ln448"> </a>
+<a name="ln449">	virtual void AddDump(TraceOutput&amp; out)</a>
+<a name="ln450">	{</a>
+<a name="ln451">		out.Print(&quot;block cache %p, error %&quot; B_PRIu64 &quot;, %s%s%s&quot;,</a>
+<a name="ln452">			fCache, fBlockNumber, fMessage, fStatus != B_OK ? &quot;: &quot; : &quot;&quot;,</a>
+<a name="ln453">			fStatus != B_OK ? strerror(fStatus) : &quot;&quot;);</a>
+<a name="ln454">	}</a>
+<a name="ln455"> </a>
+<a name="ln456">private:</a>
+<a name="ln457">	block_cache*	fCache;</a>
+<a name="ln458">	uint64			fBlockNumber;</a>
+<a name="ln459">	const char*		fMessage;</a>
+<a name="ln460">	status_t		fStatus;</a>
+<a name="ln461">};</a>
+<a name="ln462"> </a>
+<a name="ln463">#if BLOCK_CACHE_BLOCK_TRACING &gt;= 2</a>
+<a name="ln464">class BlockData : public AbstractTraceEntry {</a>
+<a name="ln465">public:</a>
+<a name="ln466">	enum {</a>
+<a name="ln467">		kCurrent	= 0x01,</a>
+<a name="ln468">		kParent		= 0x02,</a>
+<a name="ln469">		kOriginal	= 0x04</a>
+<a name="ln470">	};</a>
+<a name="ln471"> </a>
+<a name="ln472">	BlockData(block_cache* cache, cached_block* block, const char* message)</a>
+<a name="ln473">		:</a>
+<a name="ln474">		fCache(cache),</a>
+<a name="ln475">		fSize(cache-&gt;block_size),</a>
+<a name="ln476">		fBlockNumber(block-&gt;block_number),</a>
+<a name="ln477">		fMessage(message)</a>
+<a name="ln478">	{</a>
+<a name="ln479">		_Allocate(fCurrent, block-&gt;current_data);</a>
+<a name="ln480">		_Allocate(fParent, block-&gt;parent_data);</a>
+<a name="ln481">		_Allocate(fOriginal, block-&gt;original_data);</a>
+<a name="ln482"> </a>
+<a name="ln483">#if KTRACE_PRINTF_STACK_TRACE</a>
+<a name="ln484">		fStackTrace = capture_tracing_stack_trace(KTRACE_PRINTF_STACK_TRACE, 1,</a>
+<a name="ln485">			false);</a>
+<a name="ln486">#endif</a>
+<a name="ln487"> </a>
+<a name="ln488">		Initialized();</a>
+<a name="ln489">	}</a>
+<a name="ln490"> </a>
+<a name="ln491">	virtual void AddDump(TraceOutput&amp; out)</a>
+<a name="ln492">	{</a>
+<a name="ln493">		out.Print(&quot;block cache %p, block %&quot; B_PRIu64 &quot;, data %c%c%c: %s&quot;,</a>
+<a name="ln494">			fCache, fBlockNumber, fCurrent != NULL ? 'c' : '-',</a>
+<a name="ln495">			fParent != NULL ? 'p' : '-', fOriginal != NULL ? 'o' : '-',</a>
+<a name="ln496">			fMessage);</a>
+<a name="ln497">	}</a>
+<a name="ln498"> </a>
+<a name="ln499">#if KTRACE_PRINTF_STACK_TRACE</a>
+<a name="ln500">	virtual void DumpStackTrace(TraceOutput&amp; out)</a>
+<a name="ln501">	{</a>
+<a name="ln502">		out.PrintStackTrace(fStackTrace);</a>
+<a name="ln503">	}</a>
+<a name="ln504">#endif</a>
+<a name="ln505"> </a>
+<a name="ln506">	void DumpBlocks(uint32 which, uint32 offset, uint32 size)</a>
+<a name="ln507">	{</a>
+<a name="ln508">		if ((which &amp; kCurrent) != 0)</a>
+<a name="ln509">			DumpBlock(kCurrent, offset, size);</a>
+<a name="ln510">		if ((which &amp; kParent) != 0)</a>
+<a name="ln511">			DumpBlock(kParent, offset, size);</a>
+<a name="ln512">		if ((which &amp; kOriginal) != 0)</a>
+<a name="ln513">			DumpBlock(kOriginal, offset, size);</a>
+<a name="ln514">	}</a>
+<a name="ln515"> </a>
+<a name="ln516">	void DumpBlock(uint32 which, uint32 offset, uint32 size)</a>
+<a name="ln517">	{</a>
+<a name="ln518">		if (offset &gt; fSize) {</a>
+<a name="ln519">			kprintf(&quot;invalid offset (block size %&quot; B_PRIu32 &quot;)\n&quot;, fSize);</a>
+<a name="ln520">			return;</a>
+<a name="ln521">		}</a>
+<a name="ln522">		if (offset + size &gt; fSize)</a>
+<a name="ln523">			size = fSize - offset;</a>
+<a name="ln524"> </a>
+<a name="ln525">		const char* label;</a>
+<a name="ln526">		uint8* data;</a>
+<a name="ln527"> </a>
+<a name="ln528">		if ((which &amp; kCurrent) != 0) {</a>
+<a name="ln529">			label = &quot;current&quot;;</a>
+<a name="ln530">			data = fCurrent;</a>
+<a name="ln531">		} else if ((which &amp; kParent) != 0) {</a>
+<a name="ln532">			label = &quot;parent&quot;;</a>
+<a name="ln533">			data = fParent;</a>
+<a name="ln534">		} else if ((which &amp; kOriginal) != 0) {</a>
+<a name="ln535">			label = &quot;original&quot;;</a>
+<a name="ln536">			data = fOriginal;</a>
+<a name="ln537">		} else</a>
+<a name="ln538">			return;</a>
+<a name="ln539"> </a>
+<a name="ln540">		kprintf(&quot;%s: offset %&quot; B_PRIu32 &quot;, %&quot; B_PRIu32 &quot; bytes\n&quot;, label, offset, size);</a>
+<a name="ln541"> </a>
+<a name="ln542">		static const uint32 kBlockSize = 16;</a>
+<a name="ln543">		data += offset;</a>
+<a name="ln544"> </a>
+<a name="ln545">		for (uint32 i = 0; i &lt; size;) {</a>
+<a name="ln546">			int start = i;</a>
+<a name="ln547"> </a>
+<a name="ln548">			kprintf(&quot;  %04&quot; B_PRIx32 &quot; &quot;, i);</a>
+<a name="ln549">			for (; i &lt; start + kBlockSize; i++) {</a>
+<a name="ln550">				if (!(i % 4))</a>
+<a name="ln551">					kprintf(&quot; &quot;);</a>
+<a name="ln552"> </a>
+<a name="ln553">				if (i &gt;= size)</a>
+<a name="ln554">					kprintf(&quot;  &quot;);</a>
+<a name="ln555">				else</a>
+<a name="ln556">					kprintf(&quot;%02x&quot;, data[i]);</a>
+<a name="ln557">			}</a>
+<a name="ln558"> </a>
+<a name="ln559">			kprintf(&quot;\n&quot;);</a>
+<a name="ln560">		}</a>
+<a name="ln561">	}</a>
+<a name="ln562"> </a>
+<a name="ln563">private:</a>
+<a name="ln564">	void _Allocate(uint8*&amp; target, void* source)</a>
+<a name="ln565">	{</a>
+<a name="ln566">		if (source == NULL) {</a>
+<a name="ln567">			target = NULL;</a>
+<a name="ln568">			return;</a>
+<a name="ln569">		}</a>
+<a name="ln570"> </a>
+<a name="ln571">		target = alloc_tracing_buffer_memcpy(source, fSize, false);</a>
+<a name="ln572">	}</a>
+<a name="ln573"> </a>
+<a name="ln574">	block_cache*	fCache;</a>
+<a name="ln575">	uint32			fSize;</a>
+<a name="ln576">	uint64			fBlockNumber;</a>
+<a name="ln577">	const char*		fMessage;</a>
+<a name="ln578">	uint8*			fCurrent;</a>
+<a name="ln579">	uint8*			fParent;</a>
+<a name="ln580">	uint8*			fOriginal;</a>
+<a name="ln581">#if KTRACE_PRINTF_STACK_TRACE</a>
+<a name="ln582">	tracing_stack_trace* fStackTrace;</a>
+<a name="ln583">#endif</a>
+<a name="ln584">};</a>
+<a name="ln585">#endif	// BLOCK_CACHE_BLOCK_TRACING &gt;= 2</a>
+<a name="ln586"> </a>
+<a name="ln587">}	// namespace BlockTracing</a>
+<a name="ln588"> </a>
+<a name="ln589">#	define TB(x) new(std::nothrow) BlockTracing::x;</a>
+<a name="ln590">#else</a>
+<a name="ln591">#	define TB(x) ;</a>
+<a name="ln592">#endif</a>
+<a name="ln593"> </a>
+<a name="ln594">#if BLOCK_CACHE_BLOCK_TRACING &gt;= 2</a>
+<a name="ln595">#	define TB2(x) new(std::nothrow) BlockTracing::x;</a>
+<a name="ln596">#else</a>
+<a name="ln597">#	define TB2(x) ;</a>
+<a name="ln598">#endif</a>
+<a name="ln599"> </a>
+<a name="ln600"> </a>
+<a name="ln601">#if BLOCK_CACHE_TRANSACTION_TRACING &amp;&amp; !defined(BUILDING_USERLAND_FS_SERVER)</a>
+<a name="ln602">namespace TransactionTracing {</a>
+<a name="ln603"> </a>
+<a name="ln604">class Action : public AbstractTraceEntry {</a>
+<a name="ln605">public:</a>
+<a name="ln606">	Action(const char* label, block_cache* cache,</a>
+<a name="ln607">			cache_transaction* transaction)</a>
+<a name="ln608">		:</a>
+<a name="ln609">		fCache(cache),</a>
+<a name="ln610">		fTransaction(transaction),</a>
+<a name="ln611">		fID(transaction-&gt;id),</a>
+<a name="ln612">		fSub(transaction-&gt;has_sub_transaction),</a>
+<a name="ln613">		fNumBlocks(transaction-&gt;num_blocks),</a>
+<a name="ln614">		fSubNumBlocks(transaction-&gt;sub_num_blocks)</a>
+<a name="ln615">	{</a>
+<a name="ln616">		strlcpy(fLabel, label, sizeof(fLabel));</a>
+<a name="ln617">		Initialized();</a>
+<a name="ln618">	}</a>
+<a name="ln619"> </a>
+<a name="ln620">	virtual void AddDump(TraceOutput&amp; out)</a>
+<a name="ln621">	{</a>
+<a name="ln622">		out.Print(&quot;block cache %p, %s transaction %p (id %&quot; B_PRId32 &quot;)%s&quot;</a>
+<a name="ln623">			&quot;, %&quot; B_PRId32 &quot;/%&quot; B_PRId32 &quot; blocks&quot;, fCache, fLabel, fTransaction,</a>
+<a name="ln624">			fID, fSub ? &quot; sub&quot; : &quot;&quot;, fNumBlocks, fSubNumBlocks);</a>
+<a name="ln625">	}</a>
+<a name="ln626"> </a>
+<a name="ln627">private:</a>
+<a name="ln628">	char				fLabel[12];</a>
+<a name="ln629">	block_cache*		fCache;</a>
+<a name="ln630">	cache_transaction*	fTransaction;</a>
+<a name="ln631">	int32				fID;</a>
+<a name="ln632">	bool				fSub;</a>
+<a name="ln633">	int32				fNumBlocks;</a>
+<a name="ln634">	int32				fSubNumBlocks;</a>
+<a name="ln635">};</a>
+<a name="ln636"> </a>
+<a name="ln637">class Detach : public AbstractTraceEntry {</a>
+<a name="ln638">public:</a>
+<a name="ln639">	Detach(block_cache* cache, cache_transaction* transaction,</a>
+<a name="ln640">			cache_transaction* newTransaction)</a>
+<a name="ln641">		:</a>
+<a name="ln642">		fCache(cache),</a>
+<a name="ln643">		fTransaction(transaction),</a>
+<a name="ln644">		fID(transaction-&gt;id),</a>
+<a name="ln645">		fSub(transaction-&gt;has_sub_transaction),</a>
+<a name="ln646">		fNewTransaction(newTransaction),</a>
+<a name="ln647">		fNewID(newTransaction-&gt;id)</a>
+<a name="ln648">	{</a>
+<a name="ln649">		Initialized();</a>
+<a name="ln650">	}</a>
+<a name="ln651"> </a>
+<a name="ln652">	virtual void AddDump(TraceOutput&amp; out)</a>
+<a name="ln653">	{</a>
+<a name="ln654">		out.Print(&quot;block cache %p, detach transaction %p (id %&quot; B_PRId32 &quot;)&quot;</a>
+<a name="ln655">			&quot;from transaction %p (id %&quot; B_PRId32 &quot;)%s&quot;,</a>
+<a name="ln656">			fCache, fNewTransaction, fNewID, fTransaction, fID,</a>
+<a name="ln657">			fSub ? &quot; sub&quot; : &quot;&quot;);</a>
+<a name="ln658">	}</a>
+<a name="ln659"> </a>
+<a name="ln660">private:</a>
+<a name="ln661">	block_cache*		fCache;</a>
+<a name="ln662">	cache_transaction*	fTransaction;</a>
+<a name="ln663">	int32				fID;</a>
+<a name="ln664">	bool				fSub;</a>
+<a name="ln665">	cache_transaction*	fNewTransaction;</a>
+<a name="ln666">	int32				fNewID;</a>
+<a name="ln667">};</a>
+<a name="ln668"> </a>
+<a name="ln669">class Abort : public AbstractTraceEntry {</a>
+<a name="ln670">public:</a>
+<a name="ln671">	Abort(block_cache* cache, cache_transaction* transaction)</a>
+<a name="ln672">		:</a>
+<a name="ln673">		fCache(cache),</a>
+<a name="ln674">		fTransaction(transaction),</a>
+<a name="ln675">		fID(transaction-&gt;id),</a>
+<a name="ln676">		fNumBlocks(0)</a>
+<a name="ln677">	{</a>
+<a name="ln678">		bool isSub = transaction-&gt;has_sub_transaction;</a>
+<a name="ln679">		fNumBlocks = isSub ? transaction-&gt;sub_num_blocks</a>
+<a name="ln680">			: transaction-&gt;num_blocks;</a>
+<a name="ln681">		fBlocks = (off_t*)alloc_tracing_buffer(fNumBlocks * sizeof(off_t));</a>
+<a name="ln682">		if (fBlocks != NULL) {</a>
+<a name="ln683">			cached_block* block = transaction-&gt;first_block;</a>
+<a name="ln684">			for (int32 i = 0; block != NULL &amp;&amp; i &lt; fNumBlocks;</a>
+<a name="ln685">					block = block-&gt;transaction_next) {</a>
+<a name="ln686">				fBlocks[i++] = block-&gt;block_number;</a>
+<a name="ln687">			}</a>
+<a name="ln688">		} else</a>
+<a name="ln689">			fNumBlocks = 0;</a>
+<a name="ln690"> </a>
+<a name="ln691">#if KTRACE_PRINTF_STACK_TRACE</a>
+<a name="ln692">		fStackTrace = capture_tracing_stack_trace(KTRACE_PRINTF_STACK_TRACE, 1,</a>
+<a name="ln693">			false);</a>
+<a name="ln694">#endif</a>
+<a name="ln695"> </a>
+<a name="ln696">		Initialized();</a>
+<a name="ln697">	}</a>
+<a name="ln698"> </a>
+<a name="ln699">	virtual void AddDump(TraceOutput&amp; out)</a>
+<a name="ln700">	{</a>
+<a name="ln701">		out.Print(&quot;block cache %p, abort transaction &quot;</a>
+<a name="ln702">			&quot;%p (id %&quot; B_PRId32 &quot;), blocks&quot;, fCache, fTransaction, fID);</a>
+<a name="ln703">		for (int32 i = 0; i &lt; fNumBlocks &amp;&amp; !out.IsFull(); i++)</a>
+<a name="ln704">			out.Print(&quot; %&quot; B_PRIdOFF, fBlocks[i]);</a>
+<a name="ln705">	}</a>
+<a name="ln706"> </a>
+<a name="ln707">#if KTRACE_PRINTF_STACK_TRACE</a>
+<a name="ln708">	virtual void DumpStackTrace(TraceOutput&amp; out)</a>
+<a name="ln709">	{</a>
+<a name="ln710">		out.PrintStackTrace(fStackTrace);</a>
+<a name="ln711">	}</a>
+<a name="ln712">#endif</a>
+<a name="ln713"> </a>
+<a name="ln714">private:</a>
+<a name="ln715">	block_cache*		fCache;</a>
+<a name="ln716">	cache_transaction*	fTransaction;</a>
+<a name="ln717">	int32				fID;</a>
+<a name="ln718">	off_t*				fBlocks;</a>
+<a name="ln719">	int32				fNumBlocks;</a>
+<a name="ln720">#if KTRACE_PRINTF_STACK_TRACE</a>
+<a name="ln721">	tracing_stack_trace* fStackTrace;</a>
+<a name="ln722">#endif</a>
+<a name="ln723">};</a>
+<a name="ln724"> </a>
+<a name="ln725">}	// namespace TransactionTracing</a>
+<a name="ln726"> </a>
+<a name="ln727">#	define T(x) new(std::nothrow) TransactionTracing::x;</a>
+<a name="ln728">#else</a>
+<a name="ln729">#	define T(x) ;</a>
+<a name="ln730">#endif</a>
+<a name="ln731"> </a>
+<a name="ln732"> </a>
+<a name="ln733">static DoublyLinkedList&lt;block_cache&gt; sCaches;</a>
+<a name="ln734">static mutex sCachesLock = MUTEX_INITIALIZER(&quot;block caches&quot;);</a>
+<a name="ln735">static mutex sCachesMemoryUseLock</a>
+<a name="ln736">	= MUTEX_INITIALIZER(&quot;block caches memory use&quot;);</a>
+<a name="ln737">static size_t sUsedMemory;</a>
+<a name="ln738">static sem_id sEventSemaphore;</a>
+<a name="ln739">static mutex sNotificationsLock</a>
+<a name="ln740">	= MUTEX_INITIALIZER(&quot;block cache notifications&quot;);</a>
+<a name="ln741">static thread_id sNotifierWriterThread;</a>
+<a name="ln742">static DoublyLinkedListLink&lt;block_cache&gt; sMarkCache;</a>
+<a name="ln743">	// TODO: this only works if the link is the first entry of block_cache</a>
+<a name="ln744">static object_cache* sBlockCache;</a>
+<a name="ln745"> </a>
+<a name="ln746"> </a>
+<a name="ln747">//	#pragma mark - notifications/listener</a>
+<a name="ln748"> </a>
+<a name="ln749"> </a>
+<a name="ln750">/*!	Checks whether or not this is an event that closes a transaction. */</a>
+<a name="ln751">static inline bool</a>
+<a name="ln752">is_closing_event(int32 event)</a>
+<a name="ln753">{</a>
+<a name="ln754">	return (event &amp; (TRANSACTION_ABORTED | TRANSACTION_ENDED)) != 0;</a>
+<a name="ln755">}</a>
+<a name="ln756"> </a>
+<a name="ln757"> </a>
+<a name="ln758">static inline bool</a>
+<a name="ln759">is_written_event(int32 event)</a>
+<a name="ln760">{</a>
+<a name="ln761">	return (event &amp; TRANSACTION_WRITTEN) != 0;</a>
+<a name="ln762">}</a>
+<a name="ln763"> </a>
+<a name="ln764"> </a>
+<a name="ln765">/*!	From the specified \a notification, it will remove the lowest pending</a>
+<a name="ln766">	event, and return that one in \a _event.</a>
+<a name="ln767">	If there is no pending event anymore, it will return \c false.</a>
+<a name="ln768">*/</a>
+<a name="ln769">static bool</a>
+<a name="ln770">get_next_pending_event(cache_notification* notification, int32* _event)</a>
+<a name="ln771">{</a>
+<a name="ln772">	for (int32 eventMask = 1; eventMask &lt;= TRANSACTION_IDLE; eventMask &lt;&lt;= 1) {</a>
+<a name="ln773">		int32 pending = atomic_and(&amp;notification-&gt;events_pending,</a>
+<a name="ln774">			~eventMask);</a>
+<a name="ln775"> </a>
+<a name="ln776">		bool more = (pending &amp; ~eventMask) != 0;</a>
+<a name="ln777"> </a>
+<a name="ln778">		if ((pending &amp; eventMask) != 0) {</a>
+<a name="ln779">			*_event = eventMask;</a>
+<a name="ln780">			return more;</a>
+<a name="ln781">		}</a>
+<a name="ln782">	}</a>
+<a name="ln783"> </a>
+<a name="ln784">	return false;</a>
+<a name="ln785">}</a>
+<a name="ln786"> </a>
+<a name="ln787"> </a>
+<a name="ln788">static void</a>
+<a name="ln789">flush_pending_notifications(block_cache* cache)</a>
+<a name="ln790">{</a>
+<a name="ln791">	ASSERT_LOCKED_MUTEX(&amp;sCachesLock);</a>
+<a name="ln792"> </a>
+<a name="ln793">	while (true) {</a>
+<a name="ln794">		MutexLocker locker(sNotificationsLock);</a>
+<a name="ln795"> </a>
+<a name="ln796">		cache_notification* notification = cache-&gt;pending_notifications.Head();</a>
+<a name="ln797">		if (notification == NULL)</a>
+<a name="ln798">			return;</a>
+<a name="ln799"> </a>
+<a name="ln800">		bool deleteAfterEvent = false;</a>
+<a name="ln801">		int32 event = -1;</a>
+<a name="ln802">		if (!get_next_pending_event(notification, &amp;event)) {</a>
+<a name="ln803">			// remove the notification if this was the last pending event</a>
+<a name="ln804">			cache-&gt;pending_notifications.Remove(notification);</a>
+<a name="ln805">			deleteAfterEvent = notification-&gt;delete_after_event;</a>
+<a name="ln806">		}</a>
+<a name="ln807"> </a>
+<a name="ln808">		if (event &gt;= 0) {</a>
+<a name="ln809">			// Notify listener, we need to copy the notification, as it might</a>
+<a name="ln810">			// be removed when we unlock the list.</a>
+<a name="ln811">			cache_notification copy = *notification;</a>
+<a name="ln812">			locker.Unlock();</a>
+<a name="ln813"> </a>
+<a name="ln814">			copy.hook(copy.transaction_id, event, copy.data);</a>
+<a name="ln815"> </a>
+<a name="ln816">			locker.Lock();</a>
+<a name="ln817">		}</a>
+<a name="ln818"> </a>
+<a name="ln819">		if (deleteAfterEvent)</a>
+<a name="ln820">			delete notification;</a>
+<a name="ln821">	}</a>
+<a name="ln822">}</a>
+<a name="ln823"> </a>
+<a name="ln824"> </a>
+<a name="ln825">/*!	Flushes all pending notifications by calling the appropriate hook</a>
+<a name="ln826">	functions.</a>
+<a name="ln827">	Must not be called with a cache lock held.</a>
+<a name="ln828">*/</a>
+<a name="ln829">static void</a>
+<a name="ln830">flush_pending_notifications()</a>
+<a name="ln831">{</a>
+<a name="ln832">	MutexLocker _(sCachesLock);</a>
+<a name="ln833"> </a>
+<a name="ln834">	DoublyLinkedList&lt;block_cache&gt;::Iterator iterator = sCaches.GetIterator();</a>
+<a name="ln835">	while (iterator.HasNext()) {</a>
+<a name="ln836">		block_cache* cache = iterator.Next();</a>
+<a name="ln837"> </a>
+<a name="ln838">		flush_pending_notifications(cache);</a>
+<a name="ln839">	}</a>
+<a name="ln840">}</a>
+<a name="ln841"> </a>
+<a name="ln842"> </a>
+<a name="ln843">/*!	Initializes the \a notification as specified. */</a>
+<a name="ln844">static void</a>
+<a name="ln845">set_notification(cache_transaction* transaction,</a>
+<a name="ln846">	cache_notification &amp;notification, int32 events,</a>
+<a name="ln847">	transaction_notification_hook hook, void* data)</a>
+<a name="ln848">{</a>
+<a name="ln849">	notification.transaction_id = transaction != NULL ? transaction-&gt;id : -1;</a>
+<a name="ln850">	notification.events_pending = 0;</a>
+<a name="ln851">	notification.events = events;</a>
+<a name="ln852">	notification.hook = hook;</a>
+<a name="ln853">	notification.data = data;</a>
+<a name="ln854">	notification.delete_after_event = false;</a>
+<a name="ln855">}</a>
+<a name="ln856"> </a>
+<a name="ln857"> </a>
+<a name="ln858">/*!	Makes sure the notification is deleted. It either deletes it directly,</a>
+<a name="ln859">	when possible, or marks it for deletion if the notification is pending.</a>
+<a name="ln860">*/</a>
+<a name="ln861">static void</a>
+<a name="ln862">delete_notification(cache_notification* notification)</a>
+<a name="ln863">{</a>
+<a name="ln864">	MutexLocker locker(sNotificationsLock);</a>
+<a name="ln865"> </a>
+<a name="ln866">	if (notification-&gt;events_pending != 0)</a>
+<a name="ln867">		notification-&gt;delete_after_event = true;</a>
+<a name="ln868">	else</a>
+<a name="ln869">		delete notification;</a>
+<a name="ln870">}</a>
+<a name="ln871"> </a>
+<a name="ln872"> </a>
+<a name="ln873">/*!	Adds the notification to the pending notifications list, or, if it's</a>
+<a name="ln874">	already part of it, updates its events_pending field.</a>
+<a name="ln875">	Also marks the notification to be deleted if \a deleteNotification</a>
+<a name="ln876">	is \c true.</a>
+<a name="ln877">	Triggers the notifier thread to run.</a>
+<a name="ln878">*/</a>
+<a name="ln879">static void</a>
+<a name="ln880">add_notification(block_cache* cache, cache_notification* notification,</a>
+<a name="ln881">	int32 event, bool deleteNotification)</a>
+<a name="ln882">{</a>
+<a name="ln883">	if (notification-&gt;hook == NULL)</a>
+<a name="ln884">		return;</a>
+<a name="ln885"> </a>
+<a name="ln886">	int32 pending = atomic_or(&amp;notification-&gt;events_pending, event);</a>
+<a name="ln887">	if (pending == 0) {</a>
+<a name="ln888">		// not yet part of the notification list</a>
+<a name="ln889">		MutexLocker locker(sNotificationsLock);</a>
+<a name="ln890">		if (deleteNotification)</a>
+<a name="ln891">			notification-&gt;delete_after_event = true;</a>
+<a name="ln892">		cache-&gt;pending_notifications.Add(notification);</a>
+<a name="ln893">	} else if (deleteNotification) {</a>
+<a name="ln894">		// we might need to delete it ourselves if we're late</a>
+<a name="ln895">		delete_notification(notification);</a>
+<a name="ln896">	}</a>
+<a name="ln897"> </a>
+<a name="ln898">	release_sem_etc(sEventSemaphore, 1, B_DO_NOT_RESCHEDULE);</a>
+<a name="ln899">		// We're probably still holding some locks that makes rescheduling</a>
+<a name="ln900">		// not a good idea at this point.</a>
+<a name="ln901">}</a>
+<a name="ln902"> </a>
+<a name="ln903"> </a>
+<a name="ln904">/*!	Notifies all interested listeners of this transaction about the \a event.</a>
+<a name="ln905">	If \a event is a closing event (ie. TRANSACTION_ENDED, and</a>
+<a name="ln906">	TRANSACTION_ABORTED), all listeners except those listening to</a>
+<a name="ln907">	TRANSACTION_WRITTEN will be removed.</a>
+<a name="ln908">*/</a>
+<a name="ln909">static void</a>
+<a name="ln910">notify_transaction_listeners(block_cache* cache, cache_transaction* transaction,</a>
+<a name="ln911">	int32 event)</a>
+<a name="ln912">{</a>
+<a name="ln913">	T(Action(&quot;notify&quot;, cache, transaction));</a>
+<a name="ln914"> </a>
+<a name="ln915">	bool isClosing = is_closing_event(event);</a>
+<a name="ln916">	bool isWritten = is_written_event(event);</a>
+<a name="ln917"> </a>
+<a name="ln918">	ListenerList::Iterator iterator = transaction-&gt;listeners.GetIterator();</a>
+<a name="ln919">	while (iterator.HasNext()) {</a>
+<a name="ln920">		cache_listener* listener = iterator.Next();</a>
+<a name="ln921"> </a>
+<a name="ln922">		bool remove = (isClosing &amp;&amp; !is_written_event(listener-&gt;events))</a>
+<a name="ln923">			|| (isWritten &amp;&amp; is_written_event(listener-&gt;events));</a>
+<a name="ln924">		if (remove)</a>
+<a name="ln925">			iterator.Remove();</a>
+<a name="ln926"> </a>
+<a name="ln927">		if ((listener-&gt;events &amp; event) != 0)</a>
+<a name="ln928">			add_notification(cache, listener, event, remove);</a>
+<a name="ln929">		else if (remove)</a>
+<a name="ln930">			delete_notification(listener);</a>
+<a name="ln931">	}</a>
+<a name="ln932">}</a>
+<a name="ln933"> </a>
+<a name="ln934"> </a>
+<a name="ln935">/*!	Removes and deletes all listeners that are still monitoring this</a>
+<a name="ln936">	transaction.</a>
+<a name="ln937">*/</a>
+<a name="ln938">static void</a>
+<a name="ln939">remove_transaction_listeners(block_cache* cache, cache_transaction* transaction)</a>
+<a name="ln940">{</a>
+<a name="ln941">	ListenerList::Iterator iterator = transaction-&gt;listeners.GetIterator();</a>
+<a name="ln942">	while (iterator.HasNext()) {</a>
+<a name="ln943">		cache_listener* listener = iterator.Next();</a>
+<a name="ln944">		iterator.Remove();</a>
+<a name="ln945"> </a>
+<a name="ln946">		delete_notification(listener);</a>
+<a name="ln947">	}</a>
+<a name="ln948">}</a>
+<a name="ln949"> </a>
+<a name="ln950"> </a>
+<a name="ln951">static status_t</a>
+<a name="ln952">add_transaction_listener(block_cache* cache, cache_transaction* transaction,</a>
+<a name="ln953">	int32 events, transaction_notification_hook hookFunction, void* data)</a>
+<a name="ln954">{</a>
+<a name="ln955">	ListenerList::Iterator iterator = transaction-&gt;listeners.GetIterator();</a>
+<a name="ln956">	while (iterator.HasNext()) {</a>
+<a name="ln957">		cache_listener* listener = iterator.Next();</a>
+<a name="ln958"> </a>
+<a name="ln959">		if (listener-&gt;data == data &amp;&amp; listener-&gt;hook == hookFunction) {</a>
+<a name="ln960">			// this listener already exists, just update it</a>
+<a name="ln961">			listener-&gt;events |= events;</a>
+<a name="ln962">			return B_OK;</a>
+<a name="ln963">		}</a>
+<a name="ln964">	}</a>
+<a name="ln965"> </a>
+<a name="ln966">	cache_listener* listener = new(std::nothrow) cache_listener;</a>
+<a name="ln967">	if (listener == NULL)</a>
+<a name="ln968">		return B_NO_MEMORY;</a>
+<a name="ln969"> </a>
+<a name="ln970">	set_notification(transaction, *listener, events, hookFunction, data);</a>
+<a name="ln971">	transaction-&gt;listeners.Add(listener);</a>
+<a name="ln972">	return B_OK;</a>
+<a name="ln973">}</a>
+<a name="ln974"> </a>
+<a name="ln975"> </a>
+<a name="ln976">//	#pragma mark - private transaction</a>
+<a name="ln977"> </a>
+<a name="ln978"> </a>
+<a name="ln979">cache_transaction::cache_transaction()</a>
+<a name="ln980">{</a>
+<a name="ln981">	num_blocks = 0;</a>
+<a name="ln982">	main_num_blocks = 0;</a>
+<a name="ln983">	sub_num_blocks = 0;</a>
+<a name="ln984">	first_block = NULL;</a>
+<a name="ln985">	open = true;</a>
+<a name="ln986">	has_sub_transaction = false;</a>
+<a name="ln987">	last_used = system_time();</a>
+<a name="ln988">	busy_writing_count = 0;</a>
+<a name="ln989">}</a>
+<a name="ln990"> </a>
+<a name="ln991"> </a>
+<a name="ln992">static void</a>
+<a name="ln993">delete_transaction(block_cache* cache, cache_transaction* transaction)</a>
+<a name="ln994">{</a>
+<a name="ln995">	if (cache-&gt;last_transaction == transaction)</a>
+<a name="ln996">		cache-&gt;last_transaction = NULL;</a>
+<a name="ln997"> </a>
+<a name="ln998">	remove_transaction_listeners(cache, transaction);</a>
+<a name="ln999">	delete transaction;</a>
+<a name="ln1000">}</a>
+<a name="ln1001"> </a>
+<a name="ln1002"> </a>
+<a name="ln1003">static cache_transaction*</a>
+<a name="ln1004">lookup_transaction(block_cache* cache, int32 id)</a>
+<a name="ln1005">{</a>
+<a name="ln1006">	return cache-&gt;transaction_hash-&gt;Lookup(id);</a>
+<a name="ln1007">}</a>
+<a name="ln1008"> </a>
+<a name="ln1009"> </a>
+<a name="ln1010">size_t TransactionHash::Hash(cache_transaction* transaction) const</a>
+<a name="ln1011">{</a>
+<a name="ln1012">	return transaction-&gt;id;</a>
+<a name="ln1013">}</a>
+<a name="ln1014"> </a>
+<a name="ln1015"> </a>
+<a name="ln1016">bool TransactionHash::Compare(int32 key, cache_transaction* transaction) const</a>
+<a name="ln1017">{</a>
+<a name="ln1018">	return transaction-&gt;id == key;</a>
+<a name="ln1019">}</a>
+<a name="ln1020"> </a>
+<a name="ln1021"> </a>
+<a name="ln1022">cache_transaction*&amp; TransactionHash::GetLink(cache_transaction* value) const</a>
+<a name="ln1023">{</a>
+<a name="ln1024">	return value-&gt;next;</a>
+<a name="ln1025">}</a>
+<a name="ln1026"> </a>
+<a name="ln1027"> </a>
+<a name="ln1028">/*!	Writes back any changes made to blocks in \a transaction that are still</a>
+<a name="ln1029">	part of a previous transacton.</a>
+<a name="ln1030">*/</a>
+<a name="ln1031">static status_t</a>
+<a name="ln1032">write_blocks_in_previous_transaction(block_cache* cache,</a>
+<a name="ln1033">	cache_transaction* transaction)</a>
+<a name="ln1034">{</a>
+<a name="ln1035">	BlockWriter writer(cache);</a>
+<a name="ln1036"> </a>
+<a name="ln1037">	cached_block* block = transaction-&gt;first_block;</a>
+<a name="ln1038">	for (; block != NULL; block = block-&gt;transaction_next) {</a>
+<a name="ln1039">		if (block-&gt;previous_transaction != NULL) {</a>
+<a name="ln1040">			// need to write back pending changes</a>
+<a name="ln1041">			writer.Add(block);</a>
+<a name="ln1042">		}</a>
+<a name="ln1043">	}</a>
+<a name="ln1044"> </a>
+<a name="ln1045">	return writer.Write();</a>
+<a name="ln1046">}</a>
+<a name="ln1047"> </a>
+<a name="ln1048"> </a>
+<a name="ln1049">//	#pragma mark - cached_block</a>
+<a name="ln1050"> </a>
+<a name="ln1051"> </a>
+<a name="ln1052">bool</a>
+<a name="ln1053">cached_block::CanBeWritten() const</a>
+<a name="ln1054">{</a>
+<a name="ln1055">	return !busy_writing &amp;&amp; !busy_reading</a>
+<a name="ln1056">		&amp;&amp; (previous_transaction != NULL</a>
+<a name="ln1057">			|| (transaction == NULL &amp;&amp; is_dirty &amp;&amp; !is_writing));</a>
+<a name="ln1058">}</a>
+<a name="ln1059"> </a>
+<a name="ln1060"> </a>
+<a name="ln1061">//	#pragma mark - BlockWriter</a>
+<a name="ln1062"> </a>
+<a name="ln1063"> </a>
+<a name="ln1064">BlockWriter::BlockWriter(block_cache* cache, size_t max)</a>
+<a name="ln1065">	:</a>
+<a name="ln1066">	fCache(cache),</a>
+<a name="ln1067">	fBlocks(fBuffer),</a>
+<a name="ln1068">	fCount(0),</a>
+<a name="ln1069">	fTotal(0),</a>
+<a name="ln1070">	fCapacity(kBufferSize),</a>
+<a name="ln1071">	fMax(max),</a>
+<a name="ln1072">	fStatus(B_OK),</a>
+<a name="ln1073">	fDeletedTransaction(false)</a>
+<a name="ln1074">{</a>
+<a name="ln1075">}</a>
+<a name="ln1076"> </a>
+<a name="ln1077"> </a>
+<a name="ln1078">BlockWriter::~BlockWriter()</a>
+<a name="ln1079">{</a>
+<a name="ln1080">	if (fBlocks != fBuffer)</a>
+<a name="ln1081">		free(fBlocks);</a>
+<a name="ln1082">}</a>
+<a name="ln1083"> </a>
+<a name="ln1084"> </a>
+<a name="ln1085">/*!	Adds the specified block to the to be written array. If no more blocks can</a>
+<a name="ln1086">	be added, false is returned, otherwise true.</a>
+<a name="ln1087">*/</a>
+<a name="ln1088">bool</a>
+<a name="ln1089">BlockWriter::Add(cached_block* block, cache_transaction* transaction)</a>
+<a name="ln1090">{</a>
+<a name="ln1091">	ASSERT(block-&gt;CanBeWritten());</a>
+<a name="ln1092"> </a>
+<a name="ln1093">	if (fTotal == fMax)</a>
+<a name="ln1094">		return false;</a>
+<a name="ln1095"> </a>
+<a name="ln1096">	if (fCount &gt;= fCapacity) {</a>
+<a name="ln1097">		// Enlarge array if necessary</a>
+<a name="ln1098">		cached_block** newBlocks;</a>
+<a name="ln1099">		size_t newCapacity = max_c(256, fCapacity * 2);</a>
+<a name="ln1100">		if (fBlocks == fBuffer)</a>
+<a name="ln1101">			newBlocks = (cached_block**)malloc(newCapacity * sizeof(void*));</a>
+<a name="ln1102">		else {</a>
+<a name="ln1103">			newBlocks = (cached_block**)realloc(fBlocks,</a>
+<a name="ln1104">				newCapacity * sizeof(void*));</a>
+<a name="ln1105">		}</a>
+<a name="ln1106"> </a>
+<a name="ln1107">		if (newBlocks == NULL) {</a>
+<a name="ln1108">			// Allocating a larger array failed - we need to write back what</a>
+<a name="ln1109">			// we have synchronously now (this will also clear the array)</a>
+<a name="ln1110">			Write(transaction, false);</a>
+<a name="ln1111">		} else {</a>
+<a name="ln1112">			if (fBlocks == fBuffer)</a>
+<a name="ln1113">				memcpy(newBlocks, fBuffer, kBufferSize * sizeof(void*));</a>
+<a name="ln1114"> </a>
+<a name="ln1115">			fBlocks = newBlocks;</a>
+<a name="ln1116">			fCapacity = newCapacity;</a>
+<a name="ln1117">		}</a>
+<a name="ln1118">	}</a>
+<a name="ln1119"> </a>
+<a name="ln1120">	fBlocks[fCount++] = block;</a>
+<a name="ln1121">	fTotal++;</a>
+<a name="ln1122">	block-&gt;busy_writing = true;</a>
+<a name="ln1123">	fCache-&gt;busy_writing_count++;</a>
+<a name="ln1124">	if (block-&gt;previous_transaction != NULL)</a>
+<a name="ln1125">		block-&gt;previous_transaction-&gt;busy_writing_count++;</a>
+<a name="ln1126"> </a>
+<a name="ln1127">	return true;</a>
+<a name="ln1128">}</a>
+<a name="ln1129"> </a>
+<a name="ln1130"> </a>
+<a name="ln1131">/*!	Adds all blocks of the specified transaction to the to be written array.</a>
+<a name="ln1132">	If no more blocks can be added, false is returned, otherwise true.</a>
+<a name="ln1133">*/</a>
+<a name="ln1134">bool</a>
+<a name="ln1135">BlockWriter::Add(cache_transaction* transaction, bool&amp; hasLeftOvers)</a>
+<a name="ln1136">{</a>
+<a name="ln1137">	ASSERT(!transaction-&gt;open);</a>
+<a name="ln1138"> </a>
+<a name="ln1139">	if (transaction-&gt;busy_writing_count != 0) {</a>
+<a name="ln1140">		hasLeftOvers = true;</a>
+<a name="ln1141">		return true;</a>
+<a name="ln1142">	}</a>
+<a name="ln1143"> </a>
+<a name="ln1144">	hasLeftOvers = false;</a>
+<a name="ln1145"> </a>
+<a name="ln1146">	block_list::Iterator blockIterator = transaction-&gt;blocks.GetIterator();</a>
+<a name="ln1147">	while (cached_block* block = blockIterator.Next()) {</a>
+<a name="ln1148">		if (!block-&gt;CanBeWritten()) {</a>
+<a name="ln1149">			// This block was already part of a previous transaction within this</a>
+<a name="ln1150">			// writer</a>
+<a name="ln1151">			hasLeftOvers = true;</a>
+<a name="ln1152">			continue;</a>
+<a name="ln1153">		}</a>
+<a name="ln1154">		if (!Add(block, transaction))</a>
+<a name="ln1155">			return false;</a>
+<a name="ln1156"> </a>
+<a name="ln1157">		if (DeletedTransaction())</a>
+<a name="ln1158">			break;</a>
+<a name="ln1159">	}</a>
+<a name="ln1160"> </a>
+<a name="ln1161">	return true;</a>
+<a name="ln1162">}</a>
+<a name="ln1163"> </a>
+<a name="ln1164"> </a>
+<a name="ln1165">/*! Cache must be locked when calling this method, but it will be unlocked</a>
+<a name="ln1166">	while the blocks are written back.</a>
+<a name="ln1167">*/</a>
+<a name="ln1168">status_t</a>
+<a name="ln1169">BlockWriter::Write(cache_transaction* transaction, bool canUnlock)</a>
+<a name="ln1170">{</a>
+<a name="ln1171">	if (fCount == 0)</a>
+<a name="ln1172">		return B_OK;</a>
+<a name="ln1173"> </a>
+<a name="ln1174">	if (canUnlock)</a>
+<a name="ln1175">		mutex_unlock(&amp;fCache-&gt;lock);</a>
+<a name="ln1176"> </a>
+<a name="ln1177">	// Sort blocks in their on-disk order</a>
+<a name="ln1178">	// TODO: ideally, this should be handled by the I/O scheduler</a>
+<a name="ln1179"> </a>
+<a name="ln1180">	qsort(fBlocks, fCount, sizeof(void*), &amp;_CompareBlocks);</a>
+<a name="ln1181">	fDeletedTransaction = false;</a>
+<a name="ln1182"> </a>
+<a name="ln1183">	for (uint32 i = 0; i &lt; fCount; i++) {</a>
+<a name="ln1184">		status_t status = _WriteBlock(fBlocks[i]);</a>
+<a name="ln1185">		if (status != B_OK) {</a>
+<a name="ln1186">			// propagate to global error handling</a>
+<a name="ln1187">			if (fStatus == B_OK)</a>
+<a name="ln1188">				fStatus = status;</a>
+<a name="ln1189"> </a>
+<a name="ln1190">			_UnmarkWriting(fBlocks[i]);</a>
+<a name="ln1191">			fBlocks[i] = NULL;</a>
+<a name="ln1192">				// This block will not be marked clean</a>
+<a name="ln1193">		}</a>
+<a name="ln1194">	}</a>
+<a name="ln1195"> </a>
+<a name="ln1196">	if (canUnlock)</a>
+<a name="ln1197">		mutex_lock(&amp;fCache-&gt;lock);</a>
+<a name="ln1198"> </a>
+<a name="ln1199">	for (uint32 i = 0; i &lt; fCount; i++)</a>
+<a name="ln1200">		_BlockDone(fBlocks[i], transaction);</a>
+<a name="ln1201"> </a>
+<a name="ln1202">	fCount = 0;</a>
+<a name="ln1203">	return fStatus;</a>
+<a name="ln1204">}</a>
+<a name="ln1205"> </a>
+<a name="ln1206"> </a>
+<a name="ln1207">/*!	Writes the specified \a block back to disk. It will always only write back</a>
+<a name="ln1208">	the oldest change of the block if it is part of more than one transaction.</a>
+<a name="ln1209">	It will automatically send out TRANSACTION_WRITTEN notices, as well as</a>
+<a name="ln1210">	delete transactions when they are no longer used, and \a deleteTransaction</a>
+<a name="ln1211">	is \c true.</a>
+<a name="ln1212">*/</a>
+<a name="ln1213">/*static*/ status_t</a>
+<a name="ln1214">BlockWriter::WriteBlock(block_cache* cache, cached_block* block)</a>
+<a name="ln1215">{</a>
+<a name="ln1216">	BlockWriter writer(cache);</a>
+<a name="ln1217"> </a>
+<a name="ln1218">	writer.Add(block);</a>
+<a name="ln1219">	return writer.Write();</a>
+<a name="ln1220">}</a>
+<a name="ln1221"> </a>
+<a name="ln1222"> </a>
+<a name="ln1223">void*</a>
+<a name="ln1224">BlockWriter::_Data(cached_block* block) const</a>
+<a name="ln1225">{</a>
+<a name="ln1226">	return block-&gt;previous_transaction != NULL &amp;&amp; block-&gt;original_data != NULL</a>
+<a name="ln1227">		? block-&gt;original_data : block-&gt;current_data;</a>
+<a name="ln1228">		// We first need to write back changes from previous transactions</a>
+<a name="ln1229">}</a>
+<a name="ln1230"> </a>
+<a name="ln1231"> </a>
+<a name="ln1232">status_t</a>
+<a name="ln1233">BlockWriter::_WriteBlock(cached_block* block)</a>
+<a name="ln1234">{</a>
+<a name="ln1235">	ASSERT(block-&gt;busy_writing);</a>
+<a name="ln1236"> </a>
+<a name="ln1237">	TRACE((&quot;BlockWriter::_WriteBlock(block %&quot; B_PRIdOFF &quot;)\n&quot;, block-&gt;block_number));</a>
+<a name="ln1238">	TB(Write(fCache, block));</a>
+<a name="ln1239">	TB2(BlockData(fCache, block, &quot;before write&quot;));</a>
+<a name="ln1240"> </a>
+<a name="ln1241">	size_t blockSize = fCache-&gt;block_size;</a>
+<a name="ln1242"> </a>
+<a name="ln1243">	ssize_t written = write_pos(fCache-&gt;fd,</a>
+<a name="ln1244">		block-&gt;block_number * blockSize, _Data(block), blockSize);</a>
+<a name="ln1245"> </a>
+<a name="ln1246">	if (written != (ssize_t)blockSize) {</a>
+<a name="ln1247">		TB(Error(fCache, block-&gt;block_number, &quot;write failed&quot;, written));</a>
+<a name="ln1248">		TRACE_ALWAYS((&quot;could not write back block %&quot; B_PRIdOFF &quot; (%s)\n&quot;, block-&gt;block_number,</a>
+<a name="ln1249">			strerror(errno)));</a>
+<a name="ln1250">		if (written &lt; 0)</a>
+<a name="ln1251">			return errno;</a>
+<a name="ln1252"> </a>
+<a name="ln1253">		return B_IO_ERROR;</a>
+<a name="ln1254">	}</a>
+<a name="ln1255"> </a>
+<a name="ln1256">	return B_OK;</a>
+<a name="ln1257">}</a>
+<a name="ln1258"> </a>
+<a name="ln1259"> </a>
+<a name="ln1260">void</a>
+<a name="ln1261">BlockWriter::_BlockDone(cached_block* block,</a>
+<a name="ln1262">	cache_transaction* transaction)</a>
+<a name="ln1263">{</a>
+<a name="ln1264">	if (block == NULL) {</a>
+<a name="ln1265">		// An error occured when trying to write this block</a>
+<a name="ln1266">		return;</a>
+<a name="ln1267">	}</a>
+<a name="ln1268"> </a>
+<a name="ln1269">	if (fCache-&gt;num_dirty_blocks &gt; 0)</a>
+<a name="ln1270">		fCache-&gt;num_dirty_blocks--;</a>
+<a name="ln1271"> </a>
+<a name="ln1272">	if (_Data(block) == block-&gt;current_data)</a>
+<a name="ln1273">		block-&gt;is_dirty = false;</a>
+<a name="ln1274"> </a>
+<a name="ln1275">	_UnmarkWriting(block);</a>
+<a name="ln1276"> </a>
+<a name="ln1277">	cache_transaction* previous = block-&gt;previous_transaction;</a>
+<a name="ln1278">	if (previous != NULL) {</a>
+<a name="ln1279">		previous-&gt;blocks.Remove(block);</a>
+<a name="ln1280">		block-&gt;previous_transaction = NULL;</a>
+<a name="ln1281"> </a>
+<a name="ln1282">		if (block-&gt;original_data != NULL &amp;&amp; block-&gt;transaction == NULL) {</a>
+<a name="ln1283">			// This block is not part of a transaction, so it does not need</a>
+<a name="ln1284">			// its original pointer anymore.</a>
+<a name="ln1285">			fCache-&gt;Free(block-&gt;original_data);</a>
+<a name="ln1286">			block-&gt;original_data = NULL;</a>
+<a name="ln1287">		}</a>
+<a name="ln1288"> </a>
+<a name="ln1289">		// Has the previous transaction been finished with that write?</a>
+<a name="ln1290">		if (--previous-&gt;num_blocks == 0) {</a>
+<a name="ln1291">			TRACE((&quot;cache transaction %&quot; B_PRId32 &quot; finished!\n&quot;, previous-&gt;id));</a>
+<a name="ln1292">			T(Action(&quot;written&quot;, fCache, previous));</a>
+<a name="ln1293"> </a>
+<a name="ln1294">			notify_transaction_listeners(fCache, previous,</a>
+<a name="ln1295">				TRANSACTION_WRITTEN);</a>
+<a name="ln1296"> </a>
+<a name="ln1297">			if (transaction != NULL) {</a>
+<a name="ln1298">				// This function is called while iterating transaction_hash. We</a>
+<a name="ln1299">				// use RemoveUnchecked so the iterator is still valid. A regular</a>
+<a name="ln1300">				// Remove can trigger a resize of the hash table which would</a>
+<a name="ln1301">				// result in the linked items in the table changing order.</a>
+<a name="ln1302">				fCache-&gt;transaction_hash-&gt;RemoveUnchecked(transaction);</a>
+<a name="ln1303">			} else</a>
+<a name="ln1304">				fCache-&gt;transaction_hash-&gt;Remove(previous);</a>
+<a name="ln1305"> </a>
+<a name="ln1306">			delete_transaction(fCache, previous);</a>
+<a name="ln1307">			fDeletedTransaction = true;</a>
+<a name="ln1308">		}</a>
+<a name="ln1309">	}</a>
+<a name="ln1310">	if (block-&gt;transaction == NULL &amp;&amp; block-&gt;ref_count == 0 &amp;&amp; !block-&gt;unused) {</a>
+<a name="ln1311">		// the block is no longer used</a>
+<a name="ln1312">		ASSERT(block-&gt;original_data == NULL &amp;&amp; block-&gt;parent_data == NULL);</a>
+<a name="ln1313">		block-&gt;unused = true;</a>
+<a name="ln1314">		fCache-&gt;unused_blocks.Add(block);</a>
+<a name="ln1315">		fCache-&gt;unused_block_count++;</a>
+<a name="ln1316">	}</a>
+<a name="ln1317"> </a>
+<a name="ln1318">	TB2(BlockData(fCache, block, &quot;after write&quot;));</a>
+<a name="ln1319">}</a>
+<a name="ln1320"> </a>
+<a name="ln1321"> </a>
+<a name="ln1322">void</a>
+<a name="ln1323">BlockWriter::_UnmarkWriting(cached_block* block)</a>
+<a name="ln1324">{</a>
+<a name="ln1325">	block-&gt;busy_writing = false;</a>
+<a name="ln1326">	if (block-&gt;previous_transaction != NULL)</a>
+<a name="ln1327">		block-&gt;previous_transaction-&gt;busy_writing_count--;</a>
+<a name="ln1328">	fCache-&gt;busy_writing_count--;</a>
+<a name="ln1329"> </a>
+<a name="ln1330">	if ((fCache-&gt;busy_writing_waiters &amp;&amp; fCache-&gt;busy_writing_count == 0)</a>
+<a name="ln1331">		|| block-&gt;busy_writing_waiters) {</a>
+<a name="ln1332">		fCache-&gt;busy_writing_waiters = false;</a>
+<a name="ln1333">		block-&gt;busy_writing_waiters = false;</a>
+<a name="ln1334">		fCache-&gt;busy_writing_condition.NotifyAll();</a>
+<a name="ln1335">	}</a>
+<a name="ln1336">}</a>
+<a name="ln1337"> </a>
+<a name="ln1338"> </a>
+<a name="ln1339">/*static*/ int</a>
+<a name="ln1340">BlockWriter::_CompareBlocks(const void* _blockA, const void* _blockB)</a>
+<a name="ln1341">{</a>
+<a name="ln1342">	cached_block* blockA = *(cached_block**)_blockA;</a>
+<a name="ln1343">	cached_block* blockB = *(cached_block**)_blockB;</a>
+<a name="ln1344"> </a>
+<a name="ln1345">	off_t diff = blockA-&gt;block_number - blockB-&gt;block_number;</a>
+<a name="ln1346">	if (diff &gt; 0)</a>
+<a name="ln1347">		return 1;</a>
+<a name="ln1348"> </a>
+<a name="ln1349">	return diff &lt; 0 ? -1 : 0;</a>
+<a name="ln1350">}</a>
+<a name="ln1351"> </a>
+<a name="ln1352"> </a>
+<a name="ln1353">//	#pragma mark - block_cache</a>
+<a name="ln1354"> </a>
+<a name="ln1355"> </a>
+<a name="ln1356">block_cache::block_cache(int _fd, off_t numBlocks, size_t blockSize,</a>
+<a name="ln1357">		bool readOnly)</a>
+<a name="ln1358">	:</a>
+<a name="ln1359">	hash(NULL),</a>
+<a name="ln1360">	fd(_fd),</a>
+<a name="ln1361">	max_blocks(numBlocks),</a>
+<a name="ln1362">	block_size(blockSize),</a>
+<a name="ln1363">	next_transaction_id(1),</a>
+<a name="ln1364">	last_transaction(NULL),</a>
+<a name="ln1365">	transaction_hash(NULL),</a>
+<a name="ln1366">	buffer_cache(NULL),</a>
+<a name="ln1367">	unused_block_count(0),</a>
+<a name="ln1368">	busy_reading_count(0),</a>
+<a name="ln1369">	busy_reading_waiters(false),</a>
+<a name="ln1370">	busy_writing_count(0),</a>
+<a name="ln1371">	busy_writing_waiters(0),</a>
+<a name="ln1372">	num_dirty_blocks(0),</a>
+<a name="ln1373">	read_only(readOnly)</a>
+<a name="ln1374">{</a>
+<a name="ln1375">}</a>
+<a name="ln1376"> </a>
+<a name="ln1377"> </a>
+<a name="ln1378">/*! Should be called with the cache's lock held. */</a>
+<a name="ln1379">block_cache::~block_cache()</a>
+<a name="ln1380">{</a>
+<a name="ln1381">	unregister_low_resource_handler(&amp;_LowMemoryHandler, this);</a>
+<a name="ln1382"> </a>
+<a name="ln1383">	delete transaction_hash;</a>
+<a name="ln1384">	delete hash;</a>
+<a name="ln1385"> </a>
+<a name="ln1386">	delete_object_cache(buffer_cache);</a>
+<a name="ln1387"> </a>
+<a name="ln1388">	mutex_destroy(&amp;lock);</a>
+<a name="ln1389">}</a>
+<a name="ln1390"> </a>
+<a name="ln1391"> </a>
+<a name="ln1392">status_t</a>
+<a name="ln1393">block_cache::Init()</a>
+<a name="ln1394">{</a>
+<a name="ln1395">	busy_reading_condition.Init(this, &quot;cache block busy_reading&quot;);</a>
+<a name="ln1396">	busy_writing_condition.Init(this, &quot;cache block busy writing&quot;);</a>
+<a name="ln1397">	condition_variable.Init(this, &quot;cache transaction sync&quot;);</a>
+<a name="ln1398">	mutex_init(&amp;lock, &quot;block cache&quot;);</a>
+<a name="ln1399"> </a>
+<a name="ln1400">	buffer_cache = create_object_cache_etc(&quot;block cache buffers&quot;, block_size,</a>
+<a name="ln1401">		8, 0, 0, 0, CACHE_LARGE_SLAB, NULL, NULL, NULL, NULL);</a>
+<a name="ln1402">	if (buffer_cache == NULL)</a>
+<a name="ln1403">		return B_NO_MEMORY;</a>
+<a name="ln1404"> </a>
+<a name="ln1405">	hash = new BlockTable();</a>
+<a name="ln1406">	if (hash == NULL || hash-&gt;Init(1024) != B_OK)</a>
+<a name="ln1407">		return B_NO_MEMORY;</a>
+<a name="ln1408"> </a>
+<a name="ln1409">	transaction_hash = new(std::nothrow) TransactionTable();</a>
+<a name="ln1410">	if (transaction_hash == NULL || transaction_hash-&gt;Init(16) != B_OK)</a>
+<a name="ln1411">		return B_NO_MEMORY;</a>
+<a name="ln1412"> </a>
+<a name="ln1413">	return register_low_resource_handler(&amp;_LowMemoryHandler, this,</a>
+<a name="ln1414">		B_KERNEL_RESOURCE_PAGES | B_KERNEL_RESOURCE_MEMORY</a>
+<a name="ln1415">			| B_KERNEL_RESOURCE_ADDRESS_SPACE, 0);</a>
+<a name="ln1416">}</a>
+<a name="ln1417"> </a>
+<a name="ln1418"> </a>
+<a name="ln1419">void</a>
+<a name="ln1420">block_cache::Free(void* buffer)</a>
+<a name="ln1421">{</a>
+<a name="ln1422">	if (buffer != NULL)</a>
+<a name="ln1423">		object_cache_free(buffer_cache, buffer, 0);</a>
+<a name="ln1424">}</a>
+<a name="ln1425"> </a>
+<a name="ln1426"> </a>
+<a name="ln1427">void*</a>
+<a name="ln1428">block_cache::Allocate()</a>
+<a name="ln1429">{</a>
+<a name="ln1430">	void* block = object_cache_alloc(buffer_cache, 0);</a>
+<a name="ln1431">	if (block != NULL)</a>
+<a name="ln1432">		return block;</a>
+<a name="ln1433"> </a>
+<a name="ln1434">	// recycle existing before allocating a new one</a>
+<a name="ln1435">	RemoveUnusedBlocks(100);</a>
+<a name="ln1436"> </a>
+<a name="ln1437">	return object_cache_alloc(buffer_cache, 0);</a>
+<a name="ln1438">}</a>
+<a name="ln1439"> </a>
+<a name="ln1440"> </a>
+<a name="ln1441">void</a>
+<a name="ln1442">block_cache::FreeBlock(cached_block* block)</a>
+<a name="ln1443">{</a>
+<a name="ln1444">	Free(block-&gt;current_data);</a>
+<a name="ln1445"> </a>
+<a name="ln1446">	if (block-&gt;original_data != NULL || block-&gt;parent_data != NULL) {</a>
+<a name="ln1447">		panic(&quot;block_cache::FreeBlock(): %&quot; B_PRIdOFF &quot;, original %p, parent %p\n&quot;,</a>
+<a name="ln1448">			block-&gt;block_number, block-&gt;original_data, block-&gt;parent_data);</a>
+<a name="ln1449">	}</a>
+<a name="ln1450"> </a>
+<a name="ln1451">#if BLOCK_CACHE_DEBUG_CHANGED</a>
+<a name="ln1452">	Free(block-&gt;compare);</a>
+<a name="ln1453">#endif</a>
+<a name="ln1454"> </a>
+<a name="ln1455">	object_cache_free(sBlockCache, block, 0);</a>
+<a name="ln1456">}</a>
+<a name="ln1457"> </a>
+<a name="ln1458"> </a>
+<a name="ln1459">/*! Allocates a new block for \a blockNumber, ready for use */</a>
+<a name="ln1460">cached_block*</a>
+<a name="ln1461">block_cache::NewBlock(off_t blockNumber)</a>
+<a name="ln1462">{</a>
+<a name="ln1463">	cached_block* block = NULL;</a>
+<a name="ln1464"> </a>
+<a name="ln1465">	if (low_resource_state(B_KERNEL_RESOURCE_PAGES | B_KERNEL_RESOURCE_MEMORY</a>
+<a name="ln1466">			| B_KERNEL_RESOURCE_ADDRESS_SPACE) != B_NO_LOW_RESOURCE) {</a>
+<a name="ln1467">		// recycle existing instead of allocating a new one</a>
+<a name="ln1468">		block = _GetUnusedBlock();</a>
+<a name="ln1469">	}</a>
+<a name="ln1470">	if (block == NULL) {</a>
+<a name="ln1471">		block = (cached_block*)object_cache_alloc(sBlockCache, 0);</a>
+<a name="ln1472">		if (block != NULL) {</a>
+<a name="ln1473">			block-&gt;current_data = Allocate();</a>
+<a name="ln1474">			if (block-&gt;current_data == NULL) {</a>
+<a name="ln1475">				object_cache_free(sBlockCache, block, 0);</a>
+<a name="ln1476">				return NULL;</a>
+<a name="ln1477">			}</a>
+<a name="ln1478">		} else {</a>
+<a name="ln1479">			TB(Error(this, blockNumber, &quot;allocation failed&quot;));</a>
+<a name="ln1480">			dprintf(&quot;block allocation failed, unused list is %sempty.\n&quot;,</a>
+<a name="ln1481">				unused_blocks.IsEmpty() ? &quot;&quot; : &quot;not &quot;);</a>
+<a name="ln1482"> </a>
+<a name="ln1483">			// allocation failed, try to reuse an unused block</a>
+<a name="ln1484">			block = _GetUnusedBlock();</a>
+<a name="ln1485">			if (block == NULL) {</a>
+<a name="ln1486">				TB(Error(this, blockNumber, &quot;get unused failed&quot;));</a>
+<a name="ln1487">				FATAL((&quot;could not allocate block!\n&quot;));</a>
+<a name="ln1488">				return NULL;</a>
+<a name="ln1489">			}</a>
+<a name="ln1490">		}</a>
+<a name="ln1491">	}</a>
+<a name="ln1492"> </a>
+<a name="ln1493">	block-&gt;block_number = blockNumber;</a>
+<a name="ln1494">	block-&gt;ref_count = 0;</a>
+<a name="ln1495">	block-&gt;last_accessed = 0;</a>
+<a name="ln1496">	block-&gt;transaction_next = NULL;</a>
+<a name="ln1497">	block-&gt;transaction = block-&gt;previous_transaction = NULL;</a>
+<a name="ln1498">	block-&gt;original_data = NULL;</a>
+<a name="ln1499">	block-&gt;parent_data = NULL;</a>
+<a name="ln1500">	block-&gt;busy_reading = false;</a>
+<a name="ln1501">	block-&gt;busy_writing = false;</a>
+<a name="ln1502">	block-&gt;is_writing = false;</a>
+<a name="ln1503">	block-&gt;is_dirty = false;</a>
+<a name="ln1504">	block-&gt;unused = false;</a>
+<a name="ln1505">	block-&gt;discard = false;</a>
+<a name="ln1506">	block-&gt;busy_reading_waiters = false;</a>
+<a name="ln1507">	block-&gt;busy_writing_waiters = false;</a>
+<a name="ln1508">#if BLOCK_CACHE_DEBUG_CHANGED</a>
+<a name="ln1509">	block-&gt;compare = NULL;</a>
+<a name="ln1510">#endif</a>
+<a name="ln1511"> </a>
+<a name="ln1512">	return block;</a>
+<a name="ln1513">}</a>
+<a name="ln1514"> </a>
+<a name="ln1515"> </a>
+<a name="ln1516">void</a>
+<a name="ln1517">block_cache::FreeBlockParentData(cached_block* block)</a>
+<a name="ln1518">{</a>
+<a name="ln1519">	ASSERT(block-&gt;parent_data != NULL);</a>
+<a name="ln1520">	if (block-&gt;parent_data != block-&gt;current_data)</a>
+<a name="ln1521">		Free(block-&gt;parent_data);</a>
+<a name="ln1522">	block-&gt;parent_data = NULL;</a>
+<a name="ln1523">}</a>
+<a name="ln1524"> </a>
+<a name="ln1525"> </a>
+<a name="ln1526">void</a>
+<a name="ln1527">block_cache::RemoveUnusedBlocks(int32 count, int32 minSecondsOld)</a>
+<a name="ln1528">{</a>
+<a name="ln1529">	TRACE((&quot;block_cache: remove up to %&quot; B_PRId32 &quot; unused blocks\n&quot;, count));</a>
+<a name="ln1530"> </a>
+<a name="ln1531">	for (block_list::Iterator iterator = unused_blocks.GetIterator();</a>
+<a name="ln1532">			cached_block* block = iterator.Next();) {</a>
+<a name="ln1533">		if (minSecondsOld &gt;= block-&gt;LastAccess()) {</a>
+<a name="ln1534">			// The list is sorted by last access</a>
+<a name="ln1535">			break;</a>
+<a name="ln1536">		}</a>
+<a name="ln1537">		if (block-&gt;busy_reading || block-&gt;busy_writing)</a>
+<a name="ln1538">			continue;</a>
+<a name="ln1539"> </a>
+<a name="ln1540">		TB(Flush(this, block));</a>
+<a name="ln1541">		TRACE((&quot;  remove block %&quot; B_PRIdOFF &quot;, last accessed %&quot; B_PRId32 &quot;\n&quot;,</a>
+<a name="ln1542">			block-&gt;block_number, block-&gt;last_accessed));</a>
+<a name="ln1543"> </a>
+<a name="ln1544">		// this can only happen if no transactions are used</a>
+<a name="ln1545">		if (block-&gt;is_dirty &amp;&amp; !block-&gt;discard) {</a>
+<a name="ln1546">			if (block-&gt;busy_writing)</a>
+<a name="ln1547">				continue;</a>
+<a name="ln1548"> </a>
+<a name="ln1549">			BlockWriter::WriteBlock(this, block);</a>
+<a name="ln1550">		}</a>
+<a name="ln1551"> </a>
+<a name="ln1552">		// remove block from lists</a>
+<a name="ln1553">		iterator.Remove();</a>
+<a name="ln1554">		unused_block_count--;</a>
+<a name="ln1555">		RemoveBlock(block);</a>
+<a name="ln1556"> </a>
+<a name="ln1557">		if (--count &lt;= 0)</a>
+<a name="ln1558">			break;</a>
+<a name="ln1559">	}</a>
+<a name="ln1560">}</a>
+<a name="ln1561"> </a>
+<a name="ln1562"> </a>
+<a name="ln1563">void</a>
+<a name="ln1564">block_cache::RemoveBlock(cached_block* block)</a>
+<a name="ln1565">{</a>
+<a name="ln1566">	hash-&gt;Remove(block);</a>
+<a name="ln1567">	FreeBlock(block);</a>
+<a name="ln1568">}</a>
+<a name="ln1569"> </a>
+<a name="ln1570"> </a>
+<a name="ln1571">/*!	Discards the block from a transaction (this method must not be called</a>
+<a name="ln1572">	for blocks not part of a transaction).</a>
+<a name="ln1573">*/</a>
+<a name="ln1574">void</a>
+<a name="ln1575">block_cache::DiscardBlock(cached_block* block)</a>
+<a name="ln1576">{</a>
+<a name="ln1577">	ASSERT(block-&gt;discard);</a>
+<a name="ln1578">	ASSERT(block-&gt;previous_transaction == NULL);</a>
+<a name="ln1579"> </a>
+<a name="ln1580">	if (block-&gt;parent_data != NULL)</a>
+<a name="ln1581">		FreeBlockParentData(block);</a>
+<a name="ln1582"> </a>
+<a name="ln1583">	if (block-&gt;original_data != NULL) {</a>
+<a name="ln1584">		Free(block-&gt;original_data);</a>
+<a name="ln1585">		block-&gt;original_data = NULL;</a>
+<a name="ln1586">	}</a>
+<a name="ln1587"> </a>
+<a name="ln1588">	RemoveBlock(block);</a>
+<a name="ln1589">}</a>
+<a name="ln1590"> </a>
+<a name="ln1591"> </a>
+<a name="ln1592">void</a>
+<a name="ln1593">block_cache::_LowMemoryHandler(void* data, uint32 resources, int32 level)</a>
+<a name="ln1594">{</a>
+<a name="ln1595">	TRACE((&quot;block_cache: low memory handler called with level %&quot; B_PRId32 &quot;\n&quot;, level));</a>
+<a name="ln1596"> </a>
+<a name="ln1597">	// free some blocks according to the low memory state</a>
+<a name="ln1598">	// (if there is enough memory left, we don't free any)</a>
+<a name="ln1599"> </a>
+<a name="ln1600">	block_cache* cache = (block_cache*)data;</a>
+<a name="ln1601">	int32 free = 0;</a>
+<a name="ln1602">	int32 secondsOld = 0;</a>
+<a name="ln1603">	switch (level) {</a>
+<a name="ln1604">		case B_NO_LOW_RESOURCE:</a>
+<a name="ln1605">			return;</a>
+<a name="ln1606">		case B_LOW_RESOURCE_NOTE:</a>
+<a name="ln1607">			free = cache-&gt;unused_block_count / 8;</a>
+<a name="ln1608">			secondsOld = 120;</a>
+<a name="ln1609">			break;</a>
+<a name="ln1610">		case B_LOW_RESOURCE_WARNING:</a>
+<a name="ln1611">			free = cache-&gt;unused_block_count / 4;</a>
+<a name="ln1612">			secondsOld = 10;</a>
+<a name="ln1613">			break;</a>
+<a name="ln1614">		case B_LOW_RESOURCE_CRITICAL:</a>
+<a name="ln1615">			free = cache-&gt;unused_block_count / 2;</a>
+<a name="ln1616">			secondsOld = 0;</a>
+<a name="ln1617">			break;</a>
+<a name="ln1618">	}</a>
+<a name="ln1619"> </a>
+<a name="ln1620">	MutexLocker locker(&amp;cache-&gt;lock);</a>
+<a name="ln1621"> </a>
+<a name="ln1622">	if (!locker.IsLocked()) {</a>
+<a name="ln1623">		// If our block_cache were deleted, it could be that we had</a>
+<a name="ln1624">		// been called before that deletion went through, therefore,</a>
+<a name="ln1625">		// acquiring its lock might fail.</a>
+<a name="ln1626">		return;</a>
+<a name="ln1627">	}</a>
+<a name="ln1628"> </a>
+<a name="ln1629">#ifdef TRACE_BLOCK_CACHE</a>
+<a name="ln1630">	uint32 oldUnused = cache-&gt;unused_block_count;</a>
+<a name="ln1631">#endif</a>
+<a name="ln1632"> </a>
+<a name="ln1633">	cache-&gt;RemoveUnusedBlocks(free, secondsOld);</a>
+<a name="ln1634"> </a>
+<a name="ln1635">	TRACE((&quot;block_cache::_LowMemoryHandler(): %p: unused: %&quot; B_PRIu32 &quot; -&gt; %&quot; B_PRIu32 &quot;\n&quot;,</a>
+<a name="ln1636">		cache, oldUnused, cache-&gt;unused_block_count));</a>
+<a name="ln1637">}</a>
+<a name="ln1638"> </a>
+<a name="ln1639"> </a>
+<a name="ln1640">cached_block*</a>
+<a name="ln1641">block_cache::_GetUnusedBlock()</a>
+<a name="ln1642">{</a>
+<a name="ln1643">	TRACE((&quot;block_cache: get unused block\n&quot;));</a>
+<a name="ln1644"> </a>
+<a name="ln1645">	for (block_list::Iterator iterator = unused_blocks.GetIterator();</a>
+<a name="ln1646">			cached_block* block = iterator.Next();) {</a>
+<a name="ln1647">		TB(Flush(this, block, true));</a>
+<a name="ln1648">		// this can only happen if no transactions are used</a>
+<a name="ln1649">		if (block-&gt;is_dirty &amp;&amp; !block-&gt;busy_writing &amp;&amp; !block-&gt;discard)</a>
+<a name="ln1650">			BlockWriter::WriteBlock(this, block);</a>
+<a name="ln1651"> </a>
+<a name="ln1652">		// remove block from lists</a>
+<a name="ln1653">		iterator.Remove();</a>
+<a name="ln1654">		unused_block_count--;</a>
+<a name="ln1655">		hash-&gt;Remove(block);</a>
+<a name="ln1656"> </a>
+<a name="ln1657">		ASSERT(block-&gt;original_data == NULL &amp;&amp; block-&gt;parent_data == NULL);</a>
+<a name="ln1658">		block-&gt;unused = false;</a>
+<a name="ln1659"> </a>
+<a name="ln1660">		// TODO: see if compare data is handled correctly here!</a>
+<a name="ln1661">#if BLOCK_CACHE_DEBUG_CHANGED</a>
+<a name="ln1662">		if (block-&gt;compare != NULL)</a>
+<a name="ln1663">			Free(block-&gt;compare);</a>
+<a name="ln1664">#endif</a>
+<a name="ln1665">		return block;</a>
+<a name="ln1666">	}</a>
+<a name="ln1667"> </a>
+<a name="ln1668">	return NULL;</a>
+<a name="ln1669">}</a>
+<a name="ln1670"> </a>
+<a name="ln1671"> </a>
+<a name="ln1672">//	#pragma mark - private block functions</a>
+<a name="ln1673"> </a>
+<a name="ln1674"> </a>
+<a name="ln1675">/*!	Cache must be locked.</a>
+<a name="ln1676">*/</a>
+<a name="ln1677">static void</a>
+<a name="ln1678">mark_block_busy_reading(block_cache* cache, cached_block* block)</a>
+<a name="ln1679">{</a>
+<a name="ln1680">	block-&gt;busy_reading = true;</a>
+<a name="ln1681">	cache-&gt;busy_reading_count++;</a>
+<a name="ln1682">}</a>
+<a name="ln1683"> </a>
+<a name="ln1684"> </a>
+<a name="ln1685">/*!	Cache must be locked.</a>
+<a name="ln1686">*/</a>
+<a name="ln1687">static void</a>
+<a name="ln1688">mark_block_unbusy_reading(block_cache* cache, cached_block* block)</a>
+<a name="ln1689">{</a>
+<a name="ln1690">	block-&gt;busy_reading = false;</a>
+<a name="ln1691">	cache-&gt;busy_reading_count--;</a>
+<a name="ln1692"> </a>
+<a name="ln1693">	if ((cache-&gt;busy_reading_waiters &amp;&amp; cache-&gt;busy_reading_count == 0)</a>
+<a name="ln1694">		|| block-&gt;busy_reading_waiters) {</a>
+<a name="ln1695">		cache-&gt;busy_reading_waiters = false;</a>
+<a name="ln1696">		block-&gt;busy_reading_waiters = false;</a>
+<a name="ln1697">		cache-&gt;busy_reading_condition.NotifyAll();</a>
+<a name="ln1698">	}</a>
+<a name="ln1699">}</a>
+<a name="ln1700"> </a>
+<a name="ln1701"> </a>
+<a name="ln1702">/*!	Cache must be locked.</a>
+<a name="ln1703">*/</a>
+<a name="ln1704">static void</a>
+<a name="ln1705">wait_for_busy_reading_block(block_cache* cache, cached_block* block)</a>
+<a name="ln1706">{</a>
+<a name="ln1707">	while (block-&gt;busy_reading) {</a>
+<a name="ln1708">		// wait for at least the specified block to be read in</a>
+<a name="ln1709">		ConditionVariableEntry entry;</a>
+<a name="ln1710">		cache-&gt;busy_reading_condition.Add(&amp;entry);</a>
+<a name="ln1711">		block-&gt;busy_reading_waiters = true;</a>
+<a name="ln1712"> </a>
+<a name="ln1713">		mutex_unlock(&amp;cache-&gt;lock);</a>
+<a name="ln1714"> </a>
+<a name="ln1715">		entry.Wait();</a>
+<a name="ln1716"> </a>
+<a name="ln1717">		mutex_lock(&amp;cache-&gt;lock);</a>
+<a name="ln1718">	}</a>
+<a name="ln1719">}</a>
+<a name="ln1720"> </a>
+<a name="ln1721"> </a>
+<a name="ln1722">/*!	Cache must be locked.</a>
+<a name="ln1723">*/</a>
+<a name="ln1724">static void</a>
+<a name="ln1725">wait_for_busy_reading_blocks(block_cache* cache)</a>
+<a name="ln1726">{</a>
+<a name="ln1727">	while (cache-&gt;busy_reading_count != 0) {</a>
+<a name="ln1728">		// wait for all blocks to be read in</a>
+<a name="ln1729">		ConditionVariableEntry entry;</a>
+<a name="ln1730">		cache-&gt;busy_reading_condition.Add(&amp;entry);</a>
+<a name="ln1731">		cache-&gt;busy_reading_waiters = true;</a>
+<a name="ln1732"> </a>
+<a name="ln1733">		mutex_unlock(&amp;cache-&gt;lock);</a>
+<a name="ln1734"> </a>
+<a name="ln1735">		entry.Wait();</a>
+<a name="ln1736"> </a>
+<a name="ln1737">		mutex_lock(&amp;cache-&gt;lock);</a>
+<a name="ln1738">	}</a>
+<a name="ln1739">}</a>
+<a name="ln1740"> </a>
+<a name="ln1741"> </a>
+<a name="ln1742">/*!	Cache must be locked.</a>
+<a name="ln1743">*/</a>
+<a name="ln1744">static void</a>
+<a name="ln1745">wait_for_busy_writing_block(block_cache* cache, cached_block* block)</a>
+<a name="ln1746">{</a>
+<a name="ln1747">	while (block-&gt;busy_writing) {</a>
+<a name="ln1748">		// wait for all blocks to be written back</a>
+<a name="ln1749">		ConditionVariableEntry entry;</a>
+<a name="ln1750">		cache-&gt;busy_writing_condition.Add(&amp;entry);</a>
+<a name="ln1751">		block-&gt;busy_writing_waiters = true;</a>
+<a name="ln1752"> </a>
+<a name="ln1753">		mutex_unlock(&amp;cache-&gt;lock);</a>
+<a name="ln1754"> </a>
+<a name="ln1755">		entry.Wait();</a>
+<a name="ln1756"> </a>
+<a name="ln1757">		mutex_lock(&amp;cache-&gt;lock);</a>
+<a name="ln1758">	}</a>
+<a name="ln1759">}</a>
+<a name="ln1760"> </a>
+<a name="ln1761"> </a>
+<a name="ln1762">/*!	Cache must be locked.</a>
+<a name="ln1763">*/</a>
+<a name="ln1764">static void</a>
+<a name="ln1765">wait_for_busy_writing_blocks(block_cache* cache)</a>
+<a name="ln1766">{</a>
+<a name="ln1767">	while (cache-&gt;busy_writing_count != 0) {</a>
+<a name="ln1768">		// wait for all blocks to be written back</a>
+<a name="ln1769">		ConditionVariableEntry entry;</a>
+<a name="ln1770">		cache-&gt;busy_writing_condition.Add(&amp;entry);</a>
+<a name="ln1771">		cache-&gt;busy_writing_waiters = true;</a>
+<a name="ln1772"> </a>
+<a name="ln1773">		mutex_unlock(&amp;cache-&gt;lock);</a>
+<a name="ln1774"> </a>
+<a name="ln1775">		entry.Wait();</a>
+<a name="ln1776"> </a>
+<a name="ln1777">		mutex_lock(&amp;cache-&gt;lock);</a>
+<a name="ln1778">	}</a>
+<a name="ln1779">}</a>
+<a name="ln1780"> </a>
+<a name="ln1781"> </a>
+<a name="ln1782">/*!	Removes a reference from the specified \a block. If this was the last</a>
+<a name="ln1783">	reference, the block is moved into the unused list.</a>
+<a name="ln1784">	In low memory situations, it will also free some blocks from that list,</a>
+<a name="ln1785">	but not necessarily the \a block it just released.</a>
+<a name="ln1786">*/</a>
+<a name="ln1787">static void</a>
+<a name="ln1788">put_cached_block(block_cache* cache, cached_block* block)</a>
+<a name="ln1789">{</a>
+<a name="ln1790">#if BLOCK_CACHE_DEBUG_CHANGED</a>
+<a name="ln1791">	if (!block-&gt;is_dirty &amp;&amp; block-&gt;compare != NULL</a>
+<a name="ln1792">		&amp;&amp; memcmp(block-&gt;current_data, block-&gt;compare, cache-&gt;block_size)) {</a>
+<a name="ln1793">		dprintf(&quot;new block:\n&quot;);</a>
+<a name="ln1794">		dump_block((const char*)block-&gt;current_data, 256, &quot;  &quot;);</a>
+<a name="ln1795">		dprintf(&quot;unchanged block:\n&quot;);</a>
+<a name="ln1796">		dump_block((const char*)block-&gt;compare, 256, &quot;  &quot;);</a>
+<a name="ln1797">		BlockWriter::WriteBlock(cache, block);</a>
+<a name="ln1798">		panic(&quot;block_cache: supposed to be clean block was changed!\n&quot;);</a>
+<a name="ln1799"> </a>
+<a name="ln1800">		cache-&gt;Free(block-&gt;compare);</a>
+<a name="ln1801">		block-&gt;compare = NULL;</a>
+<a name="ln1802">	}</a>
+<a name="ln1803">#endif</a>
+<a name="ln1804">	TB(Put(cache, block));</a>
+<a name="ln1805"> </a>
+<a name="ln1806">	if (block-&gt;ref_count &lt; 1) {</a>
+<a name="ln1807">		panic(&quot;Invalid ref_count for block %p, cache %p\n&quot;, block, cache);</a>
+<a name="ln1808">		return;</a>
+<a name="ln1809">	}</a>
+<a name="ln1810"> </a>
+<a name="ln1811">	if (--block-&gt;ref_count == 0</a>
+<a name="ln1812">		&amp;&amp; block-&gt;transaction == NULL &amp;&amp; block-&gt;previous_transaction == NULL) {</a>
+<a name="ln1813">		// This block is not used anymore, and not part of any transaction</a>
+<a name="ln1814">		block-&gt;is_writing = false;</a>
+<a name="ln1815"> </a>
+<a name="ln1816">		if (block-&gt;discard) {</a>
+<a name="ln1817">			cache-&gt;RemoveBlock(block);</a>
+<a name="ln1818">		} else {</a>
+<a name="ln1819">			// put this block in the list of unused blocks</a>
+<a name="ln1820">			ASSERT(!block-&gt;unused);</a>
+<a name="ln1821">			block-&gt;unused = true;</a>
+<a name="ln1822"> </a>
+<a name="ln1823">			ASSERT(block-&gt;original_data == NULL &amp;&amp; block-&gt;parent_data == NULL);</a>
+<a name="ln1824">			cache-&gt;unused_blocks.Add(block);</a>
+<a name="ln1825">			cache-&gt;unused_block_count++;</a>
+<a name="ln1826">		}</a>
+<a name="ln1827">	}</a>
+<a name="ln1828">}</a>
+<a name="ln1829"> </a>
+<a name="ln1830"> </a>
+<a name="ln1831">static void</a>
+<a name="ln1832">put_cached_block(block_cache* cache, off_t blockNumber)</a>
+<a name="ln1833">{</a>
+<a name="ln1834">	if (blockNumber &lt; 0 || blockNumber &gt;= cache-&gt;max_blocks) {</a>
+<a name="ln1835">		panic(&quot;put_cached_block: invalid block number %&quot; B_PRIdOFF &quot; (max %&quot; B_PRIdOFF &quot;)&quot;,</a>
+<a name="ln1836">			blockNumber, cache-&gt;max_blocks - 1);</a>
+<a name="ln1837">	}</a>
+<a name="ln1838"> </a>
+<a name="ln1839">	cached_block* block = cache-&gt;hash-&gt;Lookup(blockNumber);</a>
+<a name="ln1840">	if (block != NULL)</a>
+<a name="ln1841">		put_cached_block(cache, block);</a>
+<a name="ln1842">	else {</a>
+<a name="ln1843">		TB(Error(cache, blockNumber, &quot;put unknown&quot;));</a>
+<a name="ln1844">	}</a>
+<a name="ln1845">}</a>
+<a name="ln1846"> </a>
+<a name="ln1847"> </a>
+<a name="ln1848">/*!	Retrieves the block \a blockNumber from the hash table, if it's already</a>
+<a name="ln1849">	there, or reads it from the disk.</a>
+<a name="ln1850">	You need to have the cache locked when calling this function.</a>
+<a name="ln1851"> </a>
+<a name="ln1852">	\param _allocated tells you whether or not a new block has been allocated</a>
+<a name="ln1853">		to satisfy your request.</a>
+<a name="ln1854">	\param readBlock if \c false, the block will not be read in case it was</a>
+<a name="ln1855">		not already in the cache. The block you retrieve may contain random</a>
+<a name="ln1856">		data. If \c true, the cache will be temporarily unlocked while the</a>
+<a name="ln1857">		block is read in.</a>
+<a name="ln1858">*/</a>
+<a name="ln1859">static cached_block*</a>
+<a name="ln1860">get_cached_block(block_cache* cache, off_t blockNumber, bool* _allocated,</a>
+<a name="ln1861">	bool readBlock = true)</a>
+<a name="ln1862">{</a>
+<a name="ln1863">	ASSERT_LOCKED_MUTEX(&amp;cache-&gt;lock);</a>
+<a name="ln1864"> </a>
+<a name="ln1865">	if (blockNumber &lt; 0 || blockNumber &gt;= cache-&gt;max_blocks) {</a>
+<a name="ln1866">		panic(&quot;get_cached_block: invalid block number %&quot; B_PRIdOFF &quot; (max %&quot; B_PRIdOFF &quot;)&quot;,</a>
+<a name="ln1867">			blockNumber, cache-&gt;max_blocks - 1);</a>
+<a name="ln1868">		return NULL;</a>
+<a name="ln1869">	}</a>
+<a name="ln1870"> </a>
+<a name="ln1871">retry:</a>
+<a name="ln1872">	cached_block* block = cache-&gt;hash-&gt;Lookup(blockNumber);</a>
+<a name="ln1873">	*_allocated = false;</a>
+<a name="ln1874"> </a>
+<a name="ln1875">	if (block == NULL) {</a>
+<a name="ln1876">		// put block into cache</a>
+<a name="ln1877">		block = cache-&gt;NewBlock(blockNumber);</a>
+<a name="ln1878">		if (block == NULL)</a>
+<a name="ln1879">			return NULL;</a>
+<a name="ln1880"> </a>
+<a name="ln1881">		cache-&gt;hash-&gt;Insert(block);</a>
+<a name="ln1882">		*_allocated = true;</a>
+<a name="ln1883">	} else if (block-&gt;busy_reading) {</a>
+<a name="ln1884">		// The block is currently busy_reading - wait and try again later</a>
+<a name="ln1885">		wait_for_busy_reading_block(cache, block);</a>
+<a name="ln1886">		goto retry;</a>
+<a name="ln1887">	}</a>
+<a name="ln1888"> </a>
+<a name="ln1889">	if (block-&gt;unused) {</a>
+<a name="ln1890">		//TRACE((&quot;remove block %&quot; B_PRIdOFF &quot; from unused\n&quot;, blockNumber));</a>
+<a name="ln1891">		block-&gt;unused = false;</a>
+<a name="ln1892">		cache-&gt;unused_blocks.Remove(block);</a>
+<a name="ln1893">		cache-&gt;unused_block_count--;</a>
+<a name="ln1894">	}</a>
+<a name="ln1895"> </a>
+<a name="ln1896">	if (*_allocated &amp;&amp; readBlock) {</a>
+<a name="ln1897">		// read block into cache</a>
+<a name="ln1898">		int32 blockSize = cache-&gt;block_size;</a>
+<a name="ln1899"> </a>
+<a name="ln1900">		mark_block_busy_reading(cache, block);</a>
+<a name="ln1901">		mutex_unlock(&amp;cache-&gt;lock);</a>
+<a name="ln1902"> </a>
+<a name="ln1903">		ssize_t bytesRead = read_pos(cache-&gt;fd, blockNumber * blockSize,</a>
+<a name="ln1904">			block-&gt;current_data, blockSize);</a>
+<a name="ln1905"> </a>
+<a name="ln1906">		mutex_lock(&amp;cache-&gt;lock);</a>
+<a name="ln1907">		if (bytesRead &lt; blockSize) {</a>
+<a name="ln1908">			cache-&gt;RemoveBlock(block);</a>
+<a name="ln1909">			TB(Error(cache, blockNumber, &quot;read failed&quot;, bytesRead));</a>
+<a name="ln1910"> </a>
+<a name="ln1911">			TRACE_ALWAYS((&quot;could not read block %&quot; B_PRIdOFF &quot;: bytesRead: %zd, error: %s\n&quot;,</a>
+<a name="ln1912">				blockNumber, bytesRead, strerror(errno)));</a>
+<a name="ln1913">			return NULL;</a>
+<a name="ln1914">		}</a>
+<a name="ln1915">		TB(Read(cache, block));</a>
+<a name="ln1916"> </a>
+<a name="ln1917">		mark_block_unbusy_reading(cache, block);</a>
+<a name="ln1918">	}</a>
+<a name="ln1919"> </a>
+<a name="ln1920">	block-&gt;ref_count++;</a>
+<a name="ln1921">	block-&gt;last_accessed = system_time() / 1000000L;</a>
+<a name="ln1922"> </a>
+<a name="ln1923">	return block;</a>
+<a name="ln1924">}</a>
+<a name="ln1925"> </a>
+<a name="ln1926"> </a>
+<a name="ln1927">/*!	Returns the writable block data for the requested blockNumber.</a>
+<a name="ln1928">	If \a cleared is true, the block is not read from disk; an empty block</a>
+<a name="ln1929">	is returned.</a>
+<a name="ln1930"> </a>
+<a name="ln1931">	This is the only method to insert a block into a transaction. It makes</a>
+<a name="ln1932">	sure that the previous block contents are preserved in that case.</a>
+<a name="ln1933">*/</a>
+<a name="ln1934">static void*</a>
+<a name="ln1935">get_writable_cached_block(block_cache* cache, off_t blockNumber, off_t base,</a>
+<a name="ln1936">	off_t length, int32 transactionID, bool cleared)</a>
+<a name="ln1937">{</a>
+<a name="ln1938">	TRACE((&quot;get_writable_cached_block(blockNumber = %&quot; B_PRIdOFF &quot;, transaction = %&quot; B_PRId32 &quot;)\n&quot;,</a>
+<a name="ln1939">		blockNumber, transactionID));</a>
+<a name="ln1940"> </a>
+<a name="ln1941">	if (blockNumber &lt; 0 || blockNumber &gt;= cache-&gt;max_blocks) {</a>
+<a name="ln1942">		panic(&quot;get_writable_cached_block: invalid block number %&quot; B_PRIdOFF &quot; (max %&quot; B_PRIdOFF &quot;)&quot;,</a>
+<a name="ln1943">			blockNumber, cache-&gt;max_blocks - 1);</a>
+<a name="ln1944">	}</a>
+<a name="ln1945"> </a>
+<a name="ln1946">	bool allocated;</a>
+<a name="ln1947">	cached_block* block = get_cached_block(cache, blockNumber, &amp;allocated,</a>
+<a name="ln1948">		!cleared);</a>
+<a name="ln1949">	if (block == NULL)</a>
+<a name="ln1950">		return NULL;</a>
+<a name="ln1951"> </a>
+<a name="ln1952">	if (block-&gt;busy_writing)</a>
+<a name="ln1953">		wait_for_busy_writing_block(cache, block);</a>
+<a name="ln1954"> </a>
+<a name="ln1955">	block-&gt;discard = false;</a>
+<a name="ln1956"> </a>
+<a name="ln1957">	// if there is no transaction support, we just return the current block</a>
+<a name="ln1958">	if (transactionID == -1) {</a>
+<a name="ln1959">		if (cleared) {</a>
+<a name="ln1960">			mark_block_busy_reading(cache, block);</a>
+<a name="ln1961">			mutex_unlock(&amp;cache-&gt;lock);</a>
+<a name="ln1962"> </a>
+<a name="ln1963">			memset(block-&gt;current_data, 0, cache-&gt;block_size);</a>
+<a name="ln1964"> </a>
+<a name="ln1965">			mutex_lock(&amp;cache-&gt;lock);</a>
+<a name="ln1966">			mark_block_unbusy_reading(cache, block);</a>
+<a name="ln1967">		}</a>
+<a name="ln1968"> </a>
+<a name="ln1969">		block-&gt;is_writing = true;</a>
+<a name="ln1970"> </a>
+<a name="ln1971">		if (!block-&gt;is_dirty) {</a>
+<a name="ln1972">			cache-&gt;num_dirty_blocks++;</a>
+<a name="ln1973">			block-&gt;is_dirty = true;</a>
+<a name="ln1974">				// mark the block as dirty</a>
+<a name="ln1975">		}</a>
+<a name="ln1976"> </a>
+<a name="ln1977">		TB(Get(cache, block));</a>
+<a name="ln1978">		return block-&gt;current_data;</a>
+<a name="ln1979">	}</a>
+<a name="ln1980"> </a>
+<a name="ln1981">	cache_transaction* transaction = block-&gt;transaction;</a>
+<a name="ln1982"> </a>
+<a name="ln1983">	if (transaction != NULL &amp;&amp; transaction-&gt;id != transactionID) {</a>
+<a name="ln1984">		// TODO: we have to wait here until the other transaction is done.</a>
+<a name="ln1985">		//	Maybe we should even panic, since we can't prevent any deadlocks.</a>
+<a name="ln1986">		panic(&quot;get_writable_cached_block(): asked to get busy writable block &quot;</a>
+<a name="ln1987">			&quot;(transaction %&quot; B_PRId32 &quot;)\n&quot;, block-&gt;transaction-&gt;id);</a>
+<a name="ln1988">		put_cached_block(cache, block);</a>
+<a name="ln1989">		return NULL;</a>
+<a name="ln1990">	}</a>
+<a name="ln1991">	if (transaction == NULL &amp;&amp; transactionID != -1) {</a>
+<a name="ln1992">		// get new transaction</a>
+<a name="ln1993">		transaction = lookup_transaction(cache, transactionID);</a>
+<a name="ln1994">		if (transaction == NULL) {</a>
+<a name="ln1995">			panic(&quot;get_writable_cached_block(): invalid transaction %&quot; B_PRId32 &quot;!\n&quot;,</a>
+<a name="ln1996">				transactionID);</a>
+<a name="ln1997">			put_cached_block(cache, block);</a>
+<a name="ln1998">			return NULL;</a>
+<a name="ln1999">		}</a>
+<a name="ln2000">		if (!transaction-&gt;open) {</a>
+<a name="ln2001">			panic(&quot;get_writable_cached_block(): transaction already done!\n&quot;);</a>
+<a name="ln2002">			put_cached_block(cache, block);</a>
+<a name="ln2003">			return NULL;</a>
+<a name="ln2004">		}</a>
+<a name="ln2005"> </a>
+<a name="ln2006">		block-&gt;transaction = transaction;</a>
+<a name="ln2007"> </a>
+<a name="ln2008">		// attach the block to the transaction block list</a>
+<a name="ln2009">		block-&gt;transaction_next = transaction-&gt;first_block;</a>
+<a name="ln2010">		transaction-&gt;first_block = block;</a>
+<a name="ln2011">		transaction-&gt;num_blocks++;</a>
+<a name="ln2012">	}</a>
+<a name="ln2013">	if (transaction != NULL)</a>
+<a name="ln2014">		transaction-&gt;last_used = system_time();</a>
+<a name="ln2015"> </a>
+<a name="ln2016">	bool wasUnchanged = block-&gt;original_data == NULL</a>
+<a name="ln2017">		|| block-&gt;previous_transaction != NULL;</a>
+<a name="ln2018"> </a>
+<a name="ln2019">	if (!(allocated &amp;&amp; cleared) &amp;&amp; block-&gt;original_data == NULL) {</a>
+<a name="ln2020">		// we already have data, so we need to preserve it</a>
+<a name="ln2021">		block-&gt;original_data = cache-&gt;Allocate();</a>
+<a name="ln2022">		if (block-&gt;original_data == NULL) {</a>
+<a name="ln2023">			TB(Error(cache, blockNumber, &quot;allocate original failed&quot;));</a>
+<a name="ln2024">			FATAL((&quot;could not allocate original_data\n&quot;));</a>
+<a name="ln2025">			put_cached_block(cache, block);</a>
+<a name="ln2026">			return NULL;</a>
+<a name="ln2027">		}</a>
+<a name="ln2028"> </a>
+<a name="ln2029">		mark_block_busy_reading(cache, block);</a>
+<a name="ln2030">		mutex_unlock(&amp;cache-&gt;lock);</a>
+<a name="ln2031"> </a>
+<a name="ln2032">		memcpy(block-&gt;original_data, block-&gt;current_data, cache-&gt;block_size);</a>
+<a name="ln2033"> </a>
+<a name="ln2034">		mutex_lock(&amp;cache-&gt;lock);</a>
+<a name="ln2035">		mark_block_unbusy_reading(cache, block);</a>
+<a name="ln2036">	}</a>
+<a name="ln2037">	if (block-&gt;parent_data == block-&gt;current_data) {</a>
+<a name="ln2038">		// remember any previous contents for the parent transaction</a>
+<a name="ln2039">		block-&gt;parent_data = cache-&gt;Allocate();</a>
+<a name="ln2040">		if (block-&gt;parent_data == NULL) {</a>
+<a name="ln2041">			// TODO: maybe we should just continue the current transaction in</a>
+<a name="ln2042">			// this case...</a>
+<a name="ln2043">			TB(Error(cache, blockNumber, &quot;allocate parent failed&quot;));</a>
+<a name="ln2044">			FATAL((&quot;could not allocate parent\n&quot;));</a>
+<a name="ln2045">			put_cached_block(cache, block);</a>
+<a name="ln2046">			return NULL;</a>
+<a name="ln2047">		}</a>
+<a name="ln2048"> </a>
+<a name="ln2049">		mark_block_busy_reading(cache, block);</a>
+<a name="ln2050">		mutex_unlock(&amp;cache-&gt;lock);</a>
+<a name="ln2051"> </a>
+<a name="ln2052">		memcpy(block-&gt;parent_data, block-&gt;current_data, cache-&gt;block_size);</a>
+<a name="ln2053"> </a>
+<a name="ln2054">		mutex_lock(&amp;cache-&gt;lock);</a>
+<a name="ln2055">		mark_block_unbusy_reading(cache, block);</a>
+<a name="ln2056"> </a>
+<a name="ln2057">		transaction-&gt;sub_num_blocks++;</a>
+<a name="ln2058">	} else if (transaction != NULL &amp;&amp; transaction-&gt;has_sub_transaction</a>
+<a name="ln2059">		&amp;&amp; block-&gt;parent_data == NULL &amp;&amp; wasUnchanged)</a>
+<a name="ln2060">		transaction-&gt;sub_num_blocks++;</a>
+<a name="ln2061"> </a>
+<a name="ln2062">	if (cleared) {</a>
+<a name="ln2063">		mark_block_busy_reading(cache, block);</a>
+<a name="ln2064">		mutex_unlock(&amp;cache-&gt;lock);</a>
+<a name="ln2065"> </a>
+<a name="ln2066">		memset(block-&gt;current_data, 0, cache-&gt;block_size);</a>
+<a name="ln2067"> </a>
+<a name="ln2068">		mutex_lock(&amp;cache-&gt;lock);</a>
+<a name="ln2069">		mark_block_unbusy_reading(cache, block);</a>
+<a name="ln2070">	}</a>
+<a name="ln2071"> </a>
+<a name="ln2072">	block-&gt;is_dirty = true;</a>
+<a name="ln2073">	TB(Get(cache, block));</a>
+<a name="ln2074">	TB2(BlockData(cache, block, &quot;get writable&quot;));</a>
+<a name="ln2075"> </a>
+<a name="ln2076">	return block-&gt;current_data;</a>
+<a name="ln2077">}</a>
+<a name="ln2078"> </a>
+<a name="ln2079"> </a>
+<a name="ln2080">#if DEBUG_BLOCK_CACHE</a>
+<a name="ln2081"> </a>
+<a name="ln2082"> </a>
+<a name="ln2083">static void</a>
+<a name="ln2084">dump_block(cached_block* block)</a>
+<a name="ln2085">{</a>
+<a name="ln2086">	kprintf(&quot;%08lx %9&quot; B_PRIdOFF &quot; %08lx %08lx %08lx %5&quot; B_PRId32 &quot; %6&quot; B_PRId32</a>
+<a name="ln2087">		&quot; %c%c%c%c%c%c %08lx %08lx\n&quot;,</a>
+<a name="ln2088">		(addr_t)block, block-&gt;block_number,</a>
+<a name="ln2089">		(addr_t)block-&gt;current_data, (addr_t)block-&gt;original_data,</a>
+<a name="ln2090">		(addr_t)block-&gt;parent_data, block-&gt;ref_count, block-&gt;LastAccess(),</a>
+<a name="ln2091">		block-&gt;busy_reading ? 'r' : '-', block-&gt;busy_writing ? 'w' : '-',</a>
+<a name="ln2092">		block-&gt;is_writing ? 'W' : '-', block-&gt;is_dirty ? 'D' : '-',</a>
+<a name="ln2093">		block-&gt;unused ? 'U' : '-', block-&gt;discard ? 'D' : '-',</a>
+<a name="ln2094">		(addr_t)block-&gt;transaction,</a>
+<a name="ln2095">		(addr_t)block-&gt;previous_transaction);</a>
+<a name="ln2096">}</a>
+<a name="ln2097"> </a>
+<a name="ln2098"> </a>
+<a name="ln2099">static void</a>
+<a name="ln2100">dump_block_long(cached_block* block)</a>
+<a name="ln2101">{</a>
+<a name="ln2102">	kprintf(&quot;BLOCK %p\n&quot;, block);</a>
+<a name="ln2103">	kprintf(&quot; current data:  %p\n&quot;, block-&gt;current_data);</a>
+<a name="ln2104">	kprintf(&quot; original data: %p\n&quot;, block-&gt;original_data);</a>
+<a name="ln2105">	kprintf(&quot; parent data:   %p\n&quot;, block-&gt;parent_data);</a>
+<a name="ln2106">#if BLOCK_CACHE_DEBUG_CHANGED</a>
+<a name="ln2107">	kprintf(&quot; compare data:  %p\n&quot;, block-&gt;compare);</a>
+<a name="ln2108">#endif</a>
+<a name="ln2109">	kprintf(&quot; ref_count:     %&quot; B_PRId32 &quot;\n&quot;, block-&gt;ref_count);</a>
+<a name="ln2110">	kprintf(&quot; accessed:      %&quot; B_PRId32 &quot;\n&quot;, block-&gt;LastAccess());</a>
+<a name="ln2111">	kprintf(&quot; flags:        &quot;);</a>
+<a name="ln2112">	if (block-&gt;busy_reading)</a>
+<a name="ln2113">		kprintf(&quot; busy_reading&quot;);</a>
+<a name="ln2114">	if (block-&gt;busy_writing)</a>
+<a name="ln2115">		kprintf(&quot; busy_writing&quot;);</a>
+<a name="ln2116">	if (block-&gt;is_writing)</a>
+<a name="ln2117">		kprintf(&quot; is-writing&quot;);</a>
+<a name="ln2118">	if (block-&gt;is_dirty)</a>
+<a name="ln2119">		kprintf(&quot; is-dirty&quot;);</a>
+<a name="ln2120">	if (block-&gt;unused)</a>
+<a name="ln2121">		kprintf(&quot; unused&quot;);</a>
+<a name="ln2122">	if (block-&gt;discard)</a>
+<a name="ln2123">		kprintf(&quot; discard&quot;);</a>
+<a name="ln2124">	kprintf(&quot;\n&quot;);</a>
+<a name="ln2125">	if (block-&gt;transaction != NULL) {</a>
+<a name="ln2126">		kprintf(&quot; transaction:   %p (%&quot; B_PRId32 &quot;)\n&quot;, block-&gt;transaction,</a>
+<a name="ln2127">			block-&gt;transaction-&gt;id);</a>
+<a name="ln2128">		if (block-&gt;transaction_next != NULL) {</a>
+<a name="ln2129">			kprintf(&quot; next in transaction: %&quot; B_PRIdOFF &quot;\n&quot;,</a>
+<a name="ln2130">				block-&gt;transaction_next-&gt;block_number);</a>
+<a name="ln2131">		}</a>
+<a name="ln2132">	}</a>
+<a name="ln2133">	if (block-&gt;previous_transaction != NULL) {</a>
+<a name="ln2134">		kprintf(&quot; previous transaction: %p (%&quot; B_PRId32 &quot;)\n&quot;,</a>
+<a name="ln2135">			block-&gt;previous_transaction,</a>
+<a name="ln2136">			block-&gt;previous_transaction-&gt;id);</a>
+<a name="ln2137">	}</a>
+<a name="ln2138"> </a>
+<a name="ln2139">	set_debug_variable(&quot;_current&quot;, (addr_t)block-&gt;current_data);</a>
+<a name="ln2140">	set_debug_variable(&quot;_original&quot;, (addr_t)block-&gt;original_data);</a>
+<a name="ln2141">	set_debug_variable(&quot;_parent&quot;, (addr_t)block-&gt;parent_data);</a>
+<a name="ln2142">}</a>
+<a name="ln2143"> </a>
+<a name="ln2144"> </a>
+<a name="ln2145">static int</a>
+<a name="ln2146">dump_cached_block(int argc, char** argv)</a>
+<a name="ln2147">{</a>
+<a name="ln2148">	if (argc != 2) {</a>
+<a name="ln2149">		kprintf(&quot;usage: %s &lt;block-address&gt;\n&quot;, argv[0]);</a>
+<a name="ln2150">		return 0;</a>
+<a name="ln2151">	}</a>
+<a name="ln2152"> </a>
+<a name="ln2153">	dump_block_long((struct cached_block*)(addr_t)parse_expression(argv[1]));</a>
+<a name="ln2154">	return 0;</a>
+<a name="ln2155">}</a>
+<a name="ln2156"> </a>
+<a name="ln2157"> </a>
+<a name="ln2158">static int</a>
+<a name="ln2159">dump_cache(int argc, char** argv)</a>
+<a name="ln2160">{</a>
+<a name="ln2161">	bool showTransactions = false;</a>
+<a name="ln2162">	bool showBlocks = false;</a>
+<a name="ln2163">	int32 i = 1;</a>
+<a name="ln2164">	while (argv[i] != NULL &amp;&amp; argv[i][0] == '-') {</a>
+<a name="ln2165">		for (char* arg = &amp;argv[i][1]; arg[0]; arg++) {</a>
+<a name="ln2166">			switch (arg[0]) {</a>
+<a name="ln2167">				case 'b':</a>
+<a name="ln2168">					showBlocks = true;</a>
+<a name="ln2169">					break;</a>
+<a name="ln2170">				case 't':</a>
+<a name="ln2171">					showTransactions = true;</a>
+<a name="ln2172">					break;</a>
+<a name="ln2173">				default:</a>
+<a name="ln2174">					print_debugger_command_usage(argv[0]);</a>
+<a name="ln2175">					return 0;</a>
+<a name="ln2176">			}</a>
+<a name="ln2177">		}</a>
+<a name="ln2178">		i++;</a>
+<a name="ln2179">	}</a>
+<a name="ln2180"> </a>
+<a name="ln2181">	if (i &gt;= argc) {</a>
+<a name="ln2182">		print_debugger_command_usage(argv[0]);</a>
+<a name="ln2183">		return 0;</a>
+<a name="ln2184">	}</a>
+<a name="ln2185"> </a>
+<a name="ln2186">	block_cache* cache = (struct block_cache*)(addr_t)parse_expression(argv[i]);</a>
+<a name="ln2187">	if (cache == NULL) {</a>
+<a name="ln2188">		kprintf(&quot;invalid cache address\n&quot;);</a>
+<a name="ln2189">		return 0;</a>
+<a name="ln2190">	}</a>
+<a name="ln2191"> </a>
+<a name="ln2192">	off_t blockNumber = -1;</a>
+<a name="ln2193">	if (i + 1 &lt; argc) {</a>
+<a name="ln2194">		blockNumber = parse_expression(argv[i + 1]);</a>
+<a name="ln2195">		cached_block* block = cache-&gt;hash-&gt;Lookup(blockNumber);</a>
+<a name="ln2196">		if (block != NULL)</a>
+<a name="ln2197">			dump_block_long(block);</a>
+<a name="ln2198">		else</a>
+<a name="ln2199">			kprintf(&quot;block %&quot; B_PRIdOFF &quot; not found\n&quot;, blockNumber);</a>
+<a name="ln2200">		return 0;</a>
+<a name="ln2201">	}</a>
+<a name="ln2202"> </a>
+<a name="ln2203">	kprintf(&quot;BLOCK CACHE: %p\n&quot;, cache);</a>
+<a name="ln2204"> </a>
+<a name="ln2205">	kprintf(&quot; fd:           %d\n&quot;, cache-&gt;fd);</a>
+<a name="ln2206">	kprintf(&quot; max_blocks:   %&quot; B_PRIdOFF &quot;\n&quot;, cache-&gt;max_blocks);</a>
+<a name="ln2207">	kprintf(&quot; block_size:   %zu\n&quot;, cache-&gt;block_size);</a>
+<a name="ln2208">	kprintf(&quot; next_transaction_id: %&quot; B_PRId32 &quot;\n&quot;, cache-&gt;next_transaction_id);</a>
+<a name="ln2209">	kprintf(&quot; buffer_cache: %p\n&quot;, cache-&gt;buffer_cache);</a>
+<a name="ln2210">	kprintf(&quot; busy_reading: %&quot; B_PRIu32 &quot;, %s waiters\n&quot;, cache-&gt;busy_reading_count,</a>
+<a name="ln2211">		cache-&gt;busy_reading_waiters ? &quot;has&quot; : &quot;no&quot;);</a>
+<a name="ln2212">	kprintf(&quot; busy_writing: %&quot; B_PRIu32 &quot;, %s waiters\n&quot;, cache-&gt;busy_writing_count,</a>
+<a name="ln2213">		cache-&gt;busy_writing_waiters ? &quot;has&quot; : &quot;no&quot;);</a>
+<a name="ln2214"> </a>
+<a name="ln2215">	if (!cache-&gt;pending_notifications.IsEmpty()) {</a>
+<a name="ln2216">		kprintf(&quot; pending notifications:\n&quot;);</a>
+<a name="ln2217"> </a>
+<a name="ln2218">		NotificationList::Iterator iterator</a>
+<a name="ln2219">			= cache-&gt;pending_notifications.GetIterator();</a>
+<a name="ln2220">		while (iterator.HasNext()) {</a>
+<a name="ln2221">			cache_notification* notification = iterator.Next();</a>
+<a name="ln2222"> </a>
+<a name="ln2223">			kprintf(&quot;  %p %5&quot; B_PRIx32 &quot; %p - %p\n&quot;, notification,</a>
+<a name="ln2224">				notification-&gt;events_pending, notification-&gt;hook,</a>
+<a name="ln2225">				notification-&gt;data);</a>
+<a name="ln2226">		}</a>
+<a name="ln2227">	}</a>
+<a name="ln2228"> </a>
+<a name="ln2229">	if (showTransactions) {</a>
+<a name="ln2230">		kprintf(&quot; transactions:\n&quot;);</a>
+<a name="ln2231">		kprintf(&quot;address       id state  blocks  main   sub\n&quot;);</a>
+<a name="ln2232"> </a>
+<a name="ln2233">		TransactionTable::Iterator iterator(cache-&gt;transaction_hash);</a>
+<a name="ln2234"> </a>
+<a name="ln2235">		while (iterator.HasNext()) {</a>
+<a name="ln2236">			cache_transaction* transaction = iterator.Next();</a>
+<a name="ln2237">			kprintf(&quot;%p %5&quot; B_PRId32 &quot; %-7s %5&quot; B_PRId32 &quot; %5&quot; B_PRId32 &quot; %5&quot;</a>
+<a name="ln2238">				B_PRId32 &quot;\n&quot;, transaction, transaction-&gt;id,</a>
+<a name="ln2239">				transaction-&gt;open ? &quot;open&quot; : &quot;closed&quot;,</a>
+<a name="ln2240">				transaction-&gt;num_blocks, transaction-&gt;main_num_blocks,</a>
+<a name="ln2241">				transaction-&gt;sub_num_blocks);</a>
+<a name="ln2242">		}</a>
+<a name="ln2243">	}</a>
+<a name="ln2244"> </a>
+<a name="ln2245">	if (showBlocks) {</a>
+<a name="ln2246">		kprintf(&quot; blocks:\n&quot;);</a>
+<a name="ln2247">		kprintf(&quot;address  block no. current  original parent    refs access &quot;</a>
+<a name="ln2248">			&quot;flags transact prev. trans\n&quot;);</a>
+<a name="ln2249">	}</a>
+<a name="ln2250"> </a>
+<a name="ln2251">	uint32 referenced = 0;</a>
+<a name="ln2252">	uint32 count = 0;</a>
+<a name="ln2253">	uint32 dirty = 0;</a>
+<a name="ln2254">	uint32 discarded = 0;</a>
+<a name="ln2255">	BlockTable::Iterator iterator(cache-&gt;hash);</a>
+<a name="ln2256">	while (iterator.HasNext()) {</a>
+<a name="ln2257">		cached_block* block = iterator.Next();</a>
+<a name="ln2258">		if (showBlocks)</a>
+<a name="ln2259">			dump_block(block);</a>
+<a name="ln2260"> </a>
+<a name="ln2261">		if (block-&gt;is_dirty)</a>
+<a name="ln2262">			dirty++;</a>
+<a name="ln2263">		if (block-&gt;discard)</a>
+<a name="ln2264">			discarded++;</a>
+<a name="ln2265">		if (block-&gt;ref_count)</a>
+<a name="ln2266">			referenced++;</a>
+<a name="ln2267">		count++;</a>
+<a name="ln2268">	}</a>
+<a name="ln2269"> </a>
+<a name="ln2270">	kprintf(&quot; %&quot; B_PRIu32 &quot; blocks total, %&quot; B_PRIu32 &quot; dirty, %&quot; B_PRIu32</a>
+<a name="ln2271">		&quot; discarded, %&quot; B_PRIu32 &quot; referenced, %&quot; B_PRIu32 &quot; busy, %&quot; B_PRIu32</a>
+<a name="ln2272">		&quot; in unused.\n&quot;,</a>
+<a name="ln2273">		count, dirty, discarded, referenced, cache-&gt;busy_reading_count,</a>
+<a name="ln2274">		cache-&gt;unused_block_count);</a>
+<a name="ln2275">	return 0;</a>
+<a name="ln2276">}</a>
+<a name="ln2277"> </a>
+<a name="ln2278"> </a>
+<a name="ln2279">static int</a>
+<a name="ln2280">dump_transaction(int argc, char** argv)</a>
+<a name="ln2281">{</a>
+<a name="ln2282">	bool showBlocks = false;</a>
+<a name="ln2283">	int i = 1;</a>
+<a name="ln2284">	if (argc &gt; 1 &amp;&amp; !strcmp(argv[1], &quot;-b&quot;)) {</a>
+<a name="ln2285">		showBlocks = true;</a>
+<a name="ln2286">		i++;</a>
+<a name="ln2287">	}</a>
+<a name="ln2288"> </a>
+<a name="ln2289">	if (argc - i &lt; 1 || argc - i &gt; 2) {</a>
+<a name="ln2290">		print_debugger_command_usage(argv[0]);</a>
+<a name="ln2291">		return 0;</a>
+<a name="ln2292">	}</a>
+<a name="ln2293"> </a>
+<a name="ln2294">	cache_transaction* transaction = NULL;</a>
+<a name="ln2295"> </a>
+<a name="ln2296">	if (argc - i == 1) {</a>
+<a name="ln2297">		transaction = (cache_transaction*)(addr_t)parse_expression(argv[i]);</a>
+<a name="ln2298">	} else {</a>
+<a name="ln2299">		block_cache* cache = (block_cache*)(addr_t)parse_expression(argv[i]);</a>
+<a name="ln2300">		int32 id = parse_expression(argv[i + 1]);</a>
+<a name="ln2301">		transaction = lookup_transaction(cache, id);</a>
+<a name="ln2302">		if (transaction == NULL) {</a>
+<a name="ln2303">			kprintf(&quot;No transaction with ID %&quot; B_PRId32 &quot; found.\n&quot;, id);</a>
+<a name="ln2304">			return 0;</a>
+<a name="ln2305">		}</a>
+<a name="ln2306">	}</a>
+<a name="ln2307"> </a>
+<a name="ln2308">	kprintf(&quot;TRANSACTION %p\n&quot;, transaction);</a>
+<a name="ln2309"> </a>
+<a name="ln2310">	kprintf(&quot; id:             %&quot; B_PRId32 &quot;\n&quot;, transaction-&gt;id);</a>
+<a name="ln2311">	kprintf(&quot; num block:      %&quot; B_PRId32 &quot;\n&quot;, transaction-&gt;num_blocks);</a>
+<a name="ln2312">	kprintf(&quot; main num block: %&quot; B_PRId32 &quot;\n&quot;, transaction-&gt;main_num_blocks);</a>
+<a name="ln2313">	kprintf(&quot; sub num block:  %&quot; B_PRId32 &quot;\n&quot;, transaction-&gt;sub_num_blocks);</a>
+<a name="ln2314">	kprintf(&quot; has sub:        %d\n&quot;, transaction-&gt;has_sub_transaction);</a>
+<a name="ln2315">	kprintf(&quot; state:          %s\n&quot;, transaction-&gt;open ? &quot;open&quot; : &quot;closed&quot;);</a>
+<a name="ln2316">	kprintf(&quot; idle:           %&quot; B_PRId64 &quot; secs\n&quot;,</a>
+<a name="ln2317">		(system_time() - transaction-&gt;last_used) / 1000000);</a>
+<a name="ln2318"> </a>
+<a name="ln2319">	kprintf(&quot; listeners:\n&quot;);</a>
+<a name="ln2320"> </a>
+<a name="ln2321">	ListenerList::Iterator iterator = transaction-&gt;listeners.GetIterator();</a>
+<a name="ln2322">	while (iterator.HasNext()) {</a>
+<a name="ln2323">		cache_listener* listener = iterator.Next();</a>
+<a name="ln2324"> </a>
+<a name="ln2325">		kprintf(&quot;  %p %5&quot; B_PRIx32 &quot; %p - %p\n&quot;, listener, listener-&gt;events_pending,</a>
+<a name="ln2326">			listener-&gt;hook, listener-&gt;data);</a>
+<a name="ln2327">	}</a>
+<a name="ln2328"> </a>
+<a name="ln2329">	if (!showBlocks)</a>
+<a name="ln2330">		return 0;</a>
+<a name="ln2331"> </a>
+<a name="ln2332">	kprintf(&quot; blocks:\n&quot;);</a>
+<a name="ln2333">	kprintf(&quot;address  block no. current  original parent    refs access &quot;</a>
+<a name="ln2334">		&quot;flags transact prev. trans\n&quot;);</a>
+<a name="ln2335"> </a>
+<a name="ln2336">	cached_block* block = transaction-&gt;first_block;</a>
+<a name="ln2337">	while (block != NULL) {</a>
+<a name="ln2338">		dump_block(block);</a>
+<a name="ln2339">		block = block-&gt;transaction_next;</a>
+<a name="ln2340">	}</a>
+<a name="ln2341"> </a>
+<a name="ln2342">	kprintf(&quot;--\n&quot;);</a>
+<a name="ln2343"> </a>
+<a name="ln2344">	block_list::Iterator blockIterator = transaction-&gt;blocks.GetIterator();</a>
+<a name="ln2345">	while (blockIterator.HasNext()) {</a>
+<a name="ln2346">		block = blockIterator.Next();</a>
+<a name="ln2347">		dump_block(block);</a>
+<a name="ln2348">	}</a>
+<a name="ln2349"> </a>
+<a name="ln2350">	return 0;</a>
+<a name="ln2351">}</a>
+<a name="ln2352"> </a>
+<a name="ln2353"> </a>
+<a name="ln2354">static int</a>
+<a name="ln2355">dump_caches(int argc, char** argv)</a>
+<a name="ln2356">{</a>
+<a name="ln2357">	kprintf(&quot;Block caches:\n&quot;);</a>
+<a name="ln2358">	DoublyLinkedList&lt;block_cache&gt;::Iterator i = sCaches.GetIterator();</a>
+<a name="ln2359">	while (i.HasNext()) {</a>
+<a name="ln2360">		block_cache* cache = i.Next();</a>
+<a name="ln2361">		if (cache == (block_cache*)&amp;sMarkCache)</a>
+<a name="ln2362">			continue;</a>
+<a name="ln2363"> </a>
+<a name="ln2364">		kprintf(&quot;  %p\n&quot;, cache);</a>
+<a name="ln2365">	}</a>
+<a name="ln2366"> </a>
+<a name="ln2367">	return 0;</a>
+<a name="ln2368">}</a>
+<a name="ln2369"> </a>
+<a name="ln2370"> </a>
+<a name="ln2371">#if BLOCK_CACHE_BLOCK_TRACING &gt;= 2</a>
+<a name="ln2372">static int</a>
+<a name="ln2373">dump_block_data(int argc, char** argv)</a>
+<a name="ln2374">{</a>
+<a name="ln2375">	using namespace BlockTracing;</a>
+<a name="ln2376"> </a>
+<a name="ln2377">	// Determine which blocks to show</a>
+<a name="ln2378"> </a>
+<a name="ln2379">	bool printStackTrace = true;</a>
+<a name="ln2380">	uint32 which = 0;</a>
+<a name="ln2381">	int32 i = 1;</a>
+<a name="ln2382">	while (i &lt; argc &amp;&amp; argv[i][0] == '-') {</a>
+<a name="ln2383">		char* arg = &amp;argv[i][1];</a>
+<a name="ln2384">		while (arg[0]) {</a>
+<a name="ln2385">			switch (arg[0]) {</a>
+<a name="ln2386">				case 'c':</a>
+<a name="ln2387">					which |= BlockData::kCurrent;</a>
+<a name="ln2388">					break;</a>
+<a name="ln2389">				case 'p':</a>
+<a name="ln2390">					which |= BlockData::kParent;</a>
+<a name="ln2391">					break;</a>
+<a name="ln2392">				case 'o':</a>
+<a name="ln2393">					which |= BlockData::kOriginal;</a>
+<a name="ln2394">					break;</a>
+<a name="ln2395"> </a>
+<a name="ln2396">				default:</a>
+<a name="ln2397">					kprintf(&quot;invalid block specifier (only o/c/p are &quot;</a>
+<a name="ln2398">						&quot;allowed).\n&quot;);</a>
+<a name="ln2399">					return 0;</a>
+<a name="ln2400">			}</a>
+<a name="ln2401">			arg++;</a>
+<a name="ln2402">		}</a>
+<a name="ln2403"> </a>
+<a name="ln2404">		i++;</a>
+<a name="ln2405">	}</a>
+<a name="ln2406">	if (which == 0)</a>
+<a name="ln2407">		which = BlockData::kCurrent | BlockData::kParent | BlockData::kOriginal;</a>
+<a name="ln2408"> </a>
+<a name="ln2409">	if (i == argc) {</a>
+<a name="ln2410">		print_debugger_command_usage(argv[0]);</a>
+<a name="ln2411">		return 0;</a>
+<a name="ln2412">	}</a>
+<a name="ln2413"> </a>
+<a name="ln2414">	// Get the range of blocks to print</a>
+<a name="ln2415"> </a>
+<a name="ln2416">	int64 from = parse_expression(argv[i]);</a>
+<a name="ln2417">	int64 to = from;</a>
+<a name="ln2418">	if (argc &gt; i + 1)</a>
+<a name="ln2419">		to = parse_expression(argv[i + 1]);</a>
+<a name="ln2420">	if (to &lt; from)</a>
+<a name="ln2421">		to = from;</a>
+<a name="ln2422"> </a>
+<a name="ln2423">	uint32 offset = 0;</a>
+<a name="ln2424">	uint32 size = LONG_MAX;</a>
+<a name="ln2425">	if (argc &gt; i + 2)</a>
+<a name="ln2426">		offset = parse_expression(argv[i + 2]);</a>
+<a name="ln2427">	if (argc &gt; i + 3)</a>
+<a name="ln2428">		size = parse_expression(argv[i + 3]);</a>
+<a name="ln2429"> </a>
+<a name="ln2430">	TraceEntryIterator iterator;</a>
+<a name="ln2431">	iterator.MoveTo(from - 1);</a>
+<a name="ln2432"> </a>
+<a name="ln2433">	static char sBuffer[1024];</a>
+<a name="ln2434">	LazyTraceOutput out(sBuffer, sizeof(sBuffer), TRACE_OUTPUT_TEAM_ID);</a>
+<a name="ln2435"> </a>
+<a name="ln2436">	while (TraceEntry* entry = iterator.Next()) {</a>
+<a name="ln2437">		int32 index = iterator.Index();</a>
+<a name="ln2438">		if (index &gt; to)</a>
+<a name="ln2439">			break;</a>
+<a name="ln2440"> </a>
+<a name="ln2441">		Action* action = dynamic_cast&lt;Action*&gt;(entry);</a>
+<a name="ln2442">		if (action != NULL) {</a>
+<a name="ln2443">			out.Clear();</a>
+<a name="ln2444">			out.DumpEntry(action);</a>
+<a name="ln2445">			continue;</a>
+<a name="ln2446">		}</a>
+<a name="ln2447"> </a>
+<a name="ln2448">		BlockData* blockData = dynamic_cast&lt;BlockData*&gt;(entry);</a>
+<a name="ln2449">		if (blockData == NULL)</a>
+<a name="ln2450">			continue;</a>
+<a name="ln2451"> </a>
+<a name="ln2452">		out.Clear();</a>
+<a name="ln2453"> </a>
+<a name="ln2454">		const char* dump = out.DumpEntry(entry);</a>
+<a name="ln2455">		int length = strlen(dump);</a>
+<a name="ln2456">		if (length &gt; 0 &amp;&amp; dump[length - 1] == '\n')</a>
+<a name="ln2457">			length--;</a>
+<a name="ln2458"> </a>
+<a name="ln2459">		kprintf(&quot;%5&quot; B_PRId32 &quot;. %.*s\n&quot;, index, length, dump);</a>
+<a name="ln2460"> </a>
+<a name="ln2461">		if (printStackTrace) {</a>
+<a name="ln2462">			out.Clear();</a>
+<a name="ln2463">			entry-&gt;DumpStackTrace(out);</a>
+<a name="ln2464">			if (out.Size() &gt; 0)</a>
+<a name="ln2465">				kputs(out.Buffer());</a>
+<a name="ln2466">		}</a>
+<a name="ln2467"> </a>
+<a name="ln2468">		blockData-&gt;DumpBlocks(which, offset, size);</a>
+<a name="ln2469">	}</a>
+<a name="ln2470"> </a>
+<a name="ln2471">	return 0;</a>
+<a name="ln2472">}</a>
+<a name="ln2473">#endif	// BLOCK_CACHE_BLOCK_TRACING &gt;= 2</a>
+<a name="ln2474"> </a>
+<a name="ln2475"> </a>
+<a name="ln2476">#endif	// DEBUG_BLOCK_CACHE</a>
+<a name="ln2477"> </a>
+<a name="ln2478"> </a>
+<a name="ln2479">/*!	Traverses through the block_cache list, and returns one cache after the</a>
+<a name="ln2480">	other. The cache returned is automatically locked when you get it, and</a>
+<a name="ln2481">	unlocked with the next call to this function. Ignores caches that are in</a>
+<a name="ln2482">	deletion state.</a>
+<a name="ln2483">	Returns \c NULL when the end of the list is reached.</a>
+<a name="ln2484">*/</a>
+<a name="ln2485">static block_cache*</a>
+<a name="ln2486">get_next_locked_block_cache(block_cache* last)</a>
+<a name="ln2487">{</a>
+<a name="ln2488">	MutexLocker _(sCachesLock);</a>
+<a name="ln2489"> </a>
+<a name="ln2490">	block_cache* cache;</a>
+<a name="ln2491">	if (last != NULL) {</a>
+<a name="ln2492">		mutex_unlock(&amp;last-&gt;lock);</a>
+<a name="ln2493"> </a>
+<a name="ln2494">		cache = sCaches.GetNext((block_cache*)&amp;sMarkCache);</a>
+<a name="ln2495">		sCaches.Remove((block_cache*)&amp;sMarkCache);</a>
+<a name="ln2496">	} else</a>
+<a name="ln2497">		cache = sCaches.Head();</a>
+<a name="ln2498"> </a>
+<a name="ln2499">	if (cache != NULL) {</a>
+<a name="ln2500">		mutex_lock(&amp;cache-&gt;lock);</a>
+<a name="ln2501">		sCaches.Insert(sCaches.GetNext(cache), (block_cache*)&amp;sMarkCache);</a>
+<a name="ln2502">	}</a>
+<a name="ln2503"> </a>
+<a name="ln2504">	return cache;</a>
+<a name="ln2505">}</a>
+<a name="ln2506"> </a>
+<a name="ln2507"> </a>
+<a name="ln2508">/*!	Background thread that continuously checks for pending notifications of</a>
+<a name="ln2509">	all caches.</a>
+<a name="ln2510">	Every two seconds, it will also write back up to 64 blocks per cache.</a>
+<a name="ln2511">*/</a>
+<a name="ln2512">static status_t</a>
+<a name="ln2513">block_notifier_and_writer(void* /*data*/)</a>
+<a name="ln2514">{</a>
+<a name="ln2515">	const bigtime_t kTimeout = 2000000LL;</a>
+<a name="ln2516">	bigtime_t timeout = kTimeout;</a>
+<a name="ln2517"> </a>
+<a name="ln2518">	while (true) {</a>
+<a name="ln2519">		bigtime_t start = system_time();</a>
+<a name="ln2520"> </a>
+<a name="ln2521">		status_t status = acquire_sem_etc(sEventSemaphore, 1,</a>
+<a name="ln2522">			B_RELATIVE_TIMEOUT, timeout);</a>
+<a name="ln2523">		if (status == B_OK) {</a>
+<a name="ln2524">			flush_pending_notifications();</a>
+<a name="ln2525">			timeout -= system_time() - start;</a>
+<a name="ln2526">			continue;</a>
+<a name="ln2527">		}</a>
+<a name="ln2528"> </a>
+<a name="ln2529">		// write 64 blocks of each block_cache every two seconds</a>
+<a name="ln2530">		// TODO: change this once we have an I/O scheduler</a>
+<a name="ln2531">		timeout = kTimeout;</a>
+<a name="ln2532">		size_t usedMemory;</a>
+<a name="ln2533">		object_cache_get_usage(sBlockCache, &amp;usedMemory);</a>
+<a name="ln2534"> </a>
+<a name="ln2535">		block_cache* cache = NULL;</a>
+<a name="ln2536">		while ((cache = get_next_locked_block_cache(cache)) != NULL) {</a>
+<a name="ln2537">			BlockWriter writer(cache, 64);</a>
+<a name="ln2538"> </a>
+<a name="ln2539">			size_t cacheUsedMemory;</a>
+<a name="ln2540">			object_cache_get_usage(cache-&gt;buffer_cache, &amp;cacheUsedMemory);</a>
+<a name="ln2541">			usedMemory += cacheUsedMemory;</a>
+<a name="ln2542"> </a>
+<a name="ln2543">			if (cache-&gt;num_dirty_blocks) {</a>
+<a name="ln2544">				// This cache is not using transactions, we'll scan the blocks</a>
+<a name="ln2545">				// directly</a>
+<a name="ln2546">				BlockTable::Iterator iterator(cache-&gt;hash);</a>
+<a name="ln2547"> </a>
+<a name="ln2548">				while (iterator.HasNext()) {</a>
+<a name="ln2549">					cached_block* block = iterator.Next();</a>
+<a name="ln2550">					if (block-&gt;CanBeWritten() &amp;&amp; !writer.Add(block))</a>
+<a name="ln2551">						break;</a>
+<a name="ln2552">				}</a>
+<a name="ln2553"> </a>
+<a name="ln2554">			} else {</a>
+<a name="ln2555">				TransactionTable::Iterator iterator(cache-&gt;transaction_hash);</a>
+<a name="ln2556"> </a>
+<a name="ln2557">				while (iterator.HasNext()) {</a>
+<a name="ln2558">					cache_transaction* transaction = iterator.Next();</a>
+<a name="ln2559">					if (transaction-&gt;open) {</a>
+<a name="ln2560">						if (system_time() &gt; transaction-&gt;last_used</a>
+<a name="ln2561">								+ kTransactionIdleTime) {</a>
+<a name="ln2562">							// Transaction is open but idle</a>
+<a name="ln2563">							notify_transaction_listeners(cache, transaction,</a>
+<a name="ln2564">								TRANSACTION_IDLE);</a>
+<a name="ln2565">						}</a>
+<a name="ln2566">						continue;</a>
+<a name="ln2567">					}</a>
+<a name="ln2568"> </a>
+<a name="ln2569">					bool hasLeftOvers;</a>
+<a name="ln2570">						// we ignore this one</a>
+<a name="ln2571">					if (!writer.Add(transaction, hasLeftOvers))</a>
+<a name="ln2572">						break;</a>
+<a name="ln2573">				}</a>
+<a name="ln2574">			}</a>
+<a name="ln2575"> </a>
+<a name="ln2576">			writer.Write();</a>
+<a name="ln2577"> </a>
+<a name="ln2578">			if ((block_cache_used_memory() / B_PAGE_SIZE)</a>
+<a name="ln2579">					&gt; vm_page_num_pages() / 2) {</a>
+<a name="ln2580">				// Try to reduce memory usage to half of the available</a>
+<a name="ln2581">				// RAM at maximum</a>
+<a name="ln2582">				cache-&gt;RemoveUnusedBlocks(1000, 10);</a>
+<a name="ln2583">			}</a>
+<a name="ln2584">		}</a>
+<a name="ln2585"> </a>
+<a name="ln2586">		MutexLocker _(sCachesMemoryUseLock);</a>
+<a name="ln2587">		sUsedMemory = usedMemory;</a>
+<a name="ln2588">	}</a>
+<a name="ln2589"> </a>
+<a name="ln2590">	// never can get here</a>
+<a name="ln2591">	return B_OK;</a>
+<a name="ln2592">}</a>
+<a name="ln2593"> </a>
+<a name="ln2594"> </a>
+<a name="ln2595">/*!	Notify function for wait_for_notifications(). */</a>
+<a name="ln2596">static void</a>
+<a name="ln2597">notify_sync(int32 transactionID, int32 event, void* _cache)</a>
+<a name="ln2598">{</a>
+<a name="ln2599">	block_cache* cache = (block_cache*)_cache;</a>
+<a name="ln2600"> </a>
+<a name="ln2601">	cache-&gt;condition_variable.NotifyOne();</a>
+<a name="ln2602">}</a>
+<a name="ln2603"> </a>
+<a name="ln2604"> </a>
+<a name="ln2605">/*!	Must be called with the sCachesLock held. */</a>
+<a name="ln2606">static bool</a>
+<a name="ln2607">is_valid_cache(block_cache* cache)</a>
+<a name="ln2608">{</a>
+<a name="ln2609">	ASSERT_LOCKED_MUTEX(&amp;sCachesLock);</a>
+<a name="ln2610"> </a>
+<a name="ln2611">	DoublyLinkedList&lt;block_cache&gt;::Iterator iterator = sCaches.GetIterator();</a>
+<a name="ln2612">	while (iterator.HasNext()) {</a>
+<a name="ln2613">		if (cache == iterator.Next())</a>
+<a name="ln2614">			return true;</a>
+<a name="ln2615">	}</a>
+<a name="ln2616"> </a>
+<a name="ln2617">	return false;</a>
+<a name="ln2618">}</a>
+<a name="ln2619"> </a>
+<a name="ln2620"> </a>
+<a name="ln2621">/*!	Waits until all pending notifications are carried out.</a>
+<a name="ln2622">	Safe to be called from the block writer/notifier thread.</a>
+<a name="ln2623">	You must not hold the \a cache lock when calling this function.</a>
+<a name="ln2624">*/</a>
+<a name="ln2625">static void</a>
+<a name="ln2626">wait_for_notifications(block_cache* cache)</a>
+<a name="ln2627">{</a>
+<a name="ln2628">	MutexLocker locker(sCachesLock);</a>
+<a name="ln2629"> </a>
+<a name="ln2630">	if (find_thread(NULL) == sNotifierWriterThread) {</a>
+<a name="ln2631">		// We're the notifier thread, don't wait, but flush all pending</a>
+<a name="ln2632">		// notifications directly.</a>
+<a name="ln2633">		if (is_valid_cache(cache))</a>
+<a name="ln2634">			flush_pending_notifications(cache);</a>
+<a name="ln2635">		return;</a>
+<a name="ln2636">	}</a>
+<a name="ln2637"> </a>
+<a name="ln2638">	// add sync notification</a>
+<a name="ln2639">	cache_notification notification;</a>
+<a name="ln2640">	set_notification(NULL, notification, TRANSACTION_WRITTEN, notify_sync,</a>
+<a name="ln2641">		cache);</a>
+<a name="ln2642"> </a>
+<a name="ln2643">	ConditionVariableEntry entry;</a>
+<a name="ln2644">	cache-&gt;condition_variable.Add(&amp;entry);</a>
+<a name="ln2645"> </a>
+<a name="ln2646">	add_notification(cache, &amp;notification, TRANSACTION_WRITTEN, false);</a>
+<a name="ln2647">	locker.Unlock();</a>
+<a name="ln2648"> </a>
+<a name="ln2649">	// wait for notification hook to be called</a>
+<a name="ln2650">	entry.Wait();</a>
+<a name="ln2651">}</a>
+<a name="ln2652"> </a>
+<a name="ln2653"> </a>
+<a name="ln2654">status_t</a>
+<a name="ln2655">block_cache_init(void)</a>
+<a name="ln2656">{</a>
+<a name="ln2657">	sBlockCache = create_object_cache_etc(&quot;cached blocks&quot;, sizeof(cached_block),</a>
+<a name="ln2658">		8, 0, 0, 0, CACHE_LARGE_SLAB, NULL, NULL, NULL, NULL);</a>
+<a name="ln2659">	if (sBlockCache == NULL)</a>
+<a name="ln2660">		return B_NO_MEMORY;</a>
+<a name="ln2661"> </a>
+<a name="ln2662">	new (&amp;sCaches) DoublyLinkedList&lt;block_cache&gt;;</a>
+<a name="ln2663">		// manually call constructor</a>
+<a name="ln2664"> </a>
+<a name="ln2665">	sEventSemaphore = create_sem(0, &quot;block cache event&quot;);</a>
+<a name="ln2666">	if (sEventSemaphore &lt; B_OK)</a>
+<a name="ln2667">		return sEventSemaphore;</a>
+<a name="ln2668"> </a>
+<a name="ln2669">	sNotifierWriterThread = spawn_kernel_thread(&amp;block_notifier_and_writer,</a>
+<a name="ln2670">		&quot;block notifier/writer&quot;, B_LOW_PRIORITY, NULL);</a>
+<a name="ln2671">	if (sNotifierWriterThread &gt;= B_OK)</a>
+<a name="ln2672">		resume_thread(sNotifierWriterThread);</a>
+<a name="ln2673"> </a>
+<a name="ln2674">#if DEBUG_BLOCK_CACHE</a>
+<a name="ln2675">	add_debugger_command_etc(&quot;block_caches&quot;, &amp;dump_caches,</a>
+<a name="ln2676">		&quot;dumps all block caches&quot;, &quot;\n&quot;, 0);</a>
+<a name="ln2677">	add_debugger_command_etc(&quot;block_cache&quot;, &amp;dump_cache,</a>
+<a name="ln2678">		&quot;dumps a specific block cache&quot;,</a>
+<a name="ln2679">		&quot;[-bt] &lt;cache-address&gt; [block-number]\n&quot;</a>
+<a name="ln2680">		&quot;  -t lists the transactions\n&quot;</a>
+<a name="ln2681">		&quot;  -b lists all blocks\n&quot;, 0);</a>
+<a name="ln2682">	add_debugger_command(&quot;cached_block&quot;, &amp;dump_cached_block,</a>
+<a name="ln2683">		&quot;dumps the specified cached block&quot;);</a>
+<a name="ln2684">	add_debugger_command_etc(&quot;transaction&quot;, &amp;dump_transaction,</a>
+<a name="ln2685">		&quot;dumps a specific transaction&quot;, &quot;[-b] ((&lt;cache&gt; &lt;id&gt;) | &lt;transaction&gt;)\n&quot;</a>
+<a name="ln2686">		&quot;Either use a block cache pointer and an ID or a pointer to the transaction.\n&quot;</a>
+<a name="ln2687">		&quot;  -b lists all blocks that are part of this transaction\n&quot;, 0);</a>
+<a name="ln2688">#	if BLOCK_CACHE_BLOCK_TRACING &gt;= 2</a>
+<a name="ln2689">	add_debugger_command_etc(&quot;block_cache_data&quot;, &amp;dump_block_data,</a>
+<a name="ln2690">		&quot;dumps the data blocks logged for the actions&quot;,</a>
+<a name="ln2691">		&quot;[-cpo] &lt;from&gt; [&lt;to&gt; [&lt;offset&gt; [&lt;size&gt;]]]\n&quot;</a>
+<a name="ln2692">		&quot;If no data specifier is used, all blocks are shown by default.\n&quot;</a>
+<a name="ln2693">		&quot; -c       the current data is shown, if available.\n&quot;</a>
+<a name="ln2694">		&quot; -p       the parent data is shown, if available.\n&quot;</a>
+<a name="ln2695">		&quot; -o       the original data is shown, if available.\n&quot;</a>
+<a name="ln2696">		&quot; &lt;from&gt;   first index of tracing entries to show.\n&quot;</a>
+<a name="ln2697">		&quot; &lt;to&gt;     if given, the last entry. If not, only &lt;from&gt; is shown.\n&quot;</a>
+<a name="ln2698">		&quot; &lt;offset&gt; the offset of the block data.\n&quot;</a>
+<a name="ln2699">		&quot; &lt;from&gt;   the size of the block data that is dumped\n&quot;, 0);</a>
+<a name="ln2700">#	endif</a>
+<a name="ln2701">#endif	// DEBUG_BLOCK_CACHE</a>
+<a name="ln2702"> </a>
+<a name="ln2703">	return B_OK;</a>
+<a name="ln2704">}</a>
+<a name="ln2705"> </a>
+<a name="ln2706"> </a>
+<a name="ln2707">size_t</a>
+<a name="ln2708">block_cache_used_memory(void)</a>
+<a name="ln2709">{</a>
+<a name="ln2710">	MutexLocker _(sCachesMemoryUseLock);</a>
+<a name="ln2711">	return sUsedMemory;</a>
+<a name="ln2712">}</a>
+<a name="ln2713"> </a>
+<a name="ln2714"> </a>
+<a name="ln2715">//	#pragma mark - public transaction API</a>
+<a name="ln2716"> </a>
+<a name="ln2717"> </a>
+<a name="ln2718">int32</a>
+<a name="ln2719">cache_start_transaction(void* _cache)</a>
+<a name="ln2720">{</a>
+<a name="ln2721">	block_cache* cache = (block_cache*)_cache;</a>
+<a name="ln2722">	TransactionLocker locker(cache);</a>
+<a name="ln2723"> </a>
+<a name="ln2724">	if (cache-&gt;last_transaction &amp;&amp; cache-&gt;last_transaction-&gt;open) {</a>
+<a name="ln2725">		panic(&quot;last transaction (%&quot; B_PRId32 &quot;) still open!\n&quot;,</a>
+<a name="ln2726">			cache-&gt;last_transaction-&gt;id);</a>
+<a name="ln2727">	}</a>
+<a name="ln2728"> </a>
+<a name="ln2729">	cache_transaction* transaction = new(std::nothrow) cache_transaction;</a>
+<a name="ln2730">	if (transaction == NULL)</a>
+<a name="ln2731">		return B_NO_MEMORY;</a>
+<a name="ln2732"> </a>
+<a name="ln2733">	transaction-&gt;id = atomic_add(&amp;cache-&gt;next_transaction_id, 1);</a>
+<a name="ln2734">	cache-&gt;last_transaction = transaction;</a>
+<a name="ln2735"> </a>
+<a name="ln2736">	TRACE((&quot;cache_start_transaction(): id %&quot; B_PRId32 &quot; started\n&quot;, transaction-&gt;id));</a>
+<a name="ln2737">	T(Action(&quot;start&quot;, cache, transaction));</a>
+<a name="ln2738"> </a>
+<a name="ln2739">	cache-&gt;transaction_hash-&gt;Insert(transaction);</a>
+<a name="ln2740"> </a>
+<a name="ln2741">	return transaction-&gt;id;</a>
+<a name="ln2742">}</a>
+<a name="ln2743"> </a>
+<a name="ln2744"> </a>
+<a name="ln2745">status_t</a>
+<a name="ln2746">cache_sync_transaction(void* _cache, int32 id)</a>
+<a name="ln2747">{</a>
+<a name="ln2748">	block_cache* cache = (block_cache*)_cache;</a>
+<a name="ln2749">	bool hadBusy;</a>
+<a name="ln2750"> </a>
+<a name="ln2751">	TRACE((&quot;cache_sync_transaction(id %&quot; B_PRId32 &quot;)\n&quot;, id));</a>
+<a name="ln2752"> </a>
+<a name="ln2753">	do {</a>
+<a name="ln2754">		TransactionLocker locker(cache);</a>
+<a name="ln2755">		hadBusy = false;</a>
+<a name="ln2756"> </a>
+<a name="ln2757">		BlockWriter writer(cache);</a>
+<a name="ln2758">		TransactionTable::Iterator iterator(cache-&gt;transaction_hash);</a>
+<a name="ln2759"> </a>
+<a name="ln2760">		while (iterator.HasNext()) {</a>
+<a name="ln2761">			// close all earlier transactions which haven't been closed yet</a>
+<a name="ln2762">			cache_transaction* transaction = iterator.Next();</a>
+<a name="ln2763"> </a>
+<a name="ln2764">			if (transaction-&gt;busy_writing_count != 0) {</a>
+<a name="ln2765">				hadBusy = true;</a>
+<a name="ln2766">				continue;</a>
+<a name="ln2767">			}</a>
+<a name="ln2768">			if (transaction-&gt;id &lt;= id &amp;&amp; !transaction-&gt;open) {</a>
+<a name="ln2769">				// write back all of their remaining dirty blocks</a>
+<a name="ln2770">				T(Action(&quot;sync&quot;, cache, transaction));</a>
+<a name="ln2771"> </a>
+<a name="ln2772">				bool hasLeftOvers;</a>
+<a name="ln2773">				writer.Add(transaction, hasLeftOvers);</a>
+<a name="ln2774"> </a>
+<a name="ln2775">				if (hasLeftOvers) {</a>
+<a name="ln2776">					// This transaction contains blocks that a previous</a>
+<a name="ln2777">					// transaction is trying to write back in this write run</a>
+<a name="ln2778">					hadBusy = true;</a>
+<a name="ln2779">				}</a>
+<a name="ln2780">			}</a>
+<a name="ln2781">		}</a>
+<a name="ln2782"> </a>
+<a name="ln2783">		status_t status = writer.Write();</a>
+<a name="ln2784">		if (status != B_OK)</a>
+<a name="ln2785">			return status;</a>
+<a name="ln2786">	} while (hadBusy);</a>
+<a name="ln2787"> </a>
+<a name="ln2788">	wait_for_notifications(cache);</a>
+<a name="ln2789">		// make sure that all pending TRANSACTION_WRITTEN notifications</a>
+<a name="ln2790">		// are handled after we return</a>
+<a name="ln2791">	return B_OK;</a>
+<a name="ln2792">}</a>
+<a name="ln2793"> </a>
+<a name="ln2794"> </a>
+<a name="ln2795">status_t</a>
+<a name="ln2796">cache_end_transaction(void* _cache, int32 id,</a>
+<a name="ln2797">	transaction_notification_hook hook, void* data)</a>
+<a name="ln2798">{</a>
+<a name="ln2799">	block_cache* cache = (block_cache*)_cache;</a>
+<a name="ln2800">	TransactionLocker locker(cache);</a>
+<a name="ln2801"> </a>
+<a name="ln2802">	TRACE((&quot;cache_end_transaction(id = %&quot; B_PRId32 &quot;)\n&quot;, id));</a>
+<a name="ln2803"> </a>
+<a name="ln2804">	cache_transaction* transaction = lookup_transaction(cache, id);</a>
+<a name="ln2805">	if (transaction == NULL) {</a>
+<a name="ln2806">		panic(&quot;cache_end_transaction(): invalid transaction ID\n&quot;);</a>
+<a name="ln2807">		return B_BAD_VALUE;</a>
+<a name="ln2808">	}</a>
+<a name="ln2809"> </a>
+<a name="ln2810">	// Write back all pending transaction blocks</a>
+<a name="ln2811">	status_t status = write_blocks_in_previous_transaction(cache, transaction);</a>
+<a name="ln2812">	if (status != B_OK)</a>
+<a name="ln2813">		return status;</a>
+<a name="ln2814"> </a>
+<a name="ln2815">	notify_transaction_listeners(cache, transaction, TRANSACTION_ENDED);</a>
+<a name="ln2816"> </a>
+<a name="ln2817">	if (hook != NULL</a>
+<a name="ln2818">		&amp;&amp; add_transaction_listener(cache, transaction, TRANSACTION_WRITTEN,</a>
+<a name="ln2819">			hook, data) != B_OK) {</a>
+<a name="ln2820">		return B_NO_MEMORY;</a>
+<a name="ln2821">	}</a>
+<a name="ln2822"> </a>
+<a name="ln2823">	T(Action(&quot;end&quot;, cache, transaction));</a>
+<a name="ln2824"> </a>
+<a name="ln2825">	// iterate through all blocks and free the unchanged original contents</a>
+<a name="ln2826"> </a>
+<a name="ln2827">	cached_block* next;</a>
+<a name="ln2828">	for (cached_block* block = transaction-&gt;first_block; block != NULL;</a>
+<a name="ln2829">			block = next) {</a>
+<a name="ln2830">		next = block-&gt;transaction_next;</a>
+<a name="ln2831">		ASSERT(block-&gt;previous_transaction == NULL);</a>
+<a name="ln2832"> </a>
+<a name="ln2833">		if (block-&gt;discard) {</a>
+<a name="ln2834">			// This block has been discarded in the transaction</a>
+<a name="ln2835">			cache-&gt;DiscardBlock(block);</a>
+<a name="ln2836">			transaction-&gt;num_blocks--;</a>
+<a name="ln2837">			continue;</a>
+<a name="ln2838">		}</a>
+<a name="ln2839"> </a>
+<a name="ln2840">		if (block-&gt;original_data != NULL) {</a>
+<a name="ln2841">			cache-&gt;Free(block-&gt;original_data);</a>
+<a name="ln2842">			block-&gt;original_data = NULL;</a>
+<a name="ln2843">		}</a>
+<a name="ln2844">		if (block-&gt;parent_data != NULL) {</a>
+<a name="ln2845">			ASSERT(transaction-&gt;has_sub_transaction);</a>
+<a name="ln2846">			cache-&gt;FreeBlockParentData(block);</a>
+<a name="ln2847">		}</a>
+<a name="ln2848"> </a>
+<a name="ln2849">		// move the block to the previous transaction list</a>
+<a name="ln2850">		transaction-&gt;blocks.Add(block);</a>
+<a name="ln2851"> </a>
+<a name="ln2852">		block-&gt;previous_transaction = transaction;</a>
+<a name="ln2853">		block-&gt;transaction_next = NULL;</a>
+<a name="ln2854">		block-&gt;transaction = NULL;</a>
+<a name="ln2855">	}</a>
+<a name="ln2856"> </a>
+<a name="ln2857">	transaction-&gt;open = false;</a>
+<a name="ln2858">	return B_OK;</a>
+<a name="ln2859">}</a>
+<a name="ln2860"> </a>
+<a name="ln2861"> </a>
+<a name="ln2862">status_t</a>
+<a name="ln2863">cache_abort_transaction(void* _cache, int32 id)</a>
+<a name="ln2864">{</a>
+<a name="ln2865">	block_cache* cache = (block_cache*)_cache;</a>
+<a name="ln2866">	TransactionLocker locker(cache);</a>
+<a name="ln2867"> </a>
+<a name="ln2868">	TRACE((&quot;cache_abort_transaction(id = %&quot; B_PRId32 &quot;)\n&quot;, id));</a>
+<a name="ln2869"> </a>
+<a name="ln2870">	cache_transaction* transaction = lookup_transaction(cache, id);</a>
+<a name="ln2871">	if (transaction == NULL) {</a>
+<a name="ln2872">		panic(&quot;cache_abort_transaction(): invalid transaction ID\n&quot;);</a>
+<a name="ln2873">		return B_BAD_VALUE;</a>
+<a name="ln2874">	}</a>
+<a name="ln2875"> </a>
+<a name="ln2876">	T(Abort(cache, transaction));</a>
+<a name="ln2877">	notify_transaction_listeners(cache, transaction, TRANSACTION_ABORTED);</a>
+<a name="ln2878"> </a>
+<a name="ln2879">	// iterate through all blocks and restore their original contents</a>
+<a name="ln2880"> </a>
+<a name="ln2881">	cached_block* block = transaction-&gt;first_block;</a>
+<a name="ln2882">	cached_block* next;</a>
+<a name="ln2883">	for (; block != NULL; block = next) {</a>
+<a name="ln2884">		next = block-&gt;transaction_next;</a>
+<a name="ln2885"> </a>
+<a name="ln2886">		if (block-&gt;original_data != NULL) {</a>
+<a name="ln2887">			TRACE((&quot;cache_abort_transaction(id = %&quot; B_PRId32 &quot;): restored contents of &quot;</a>
+<a name="ln2888">				&quot;block %&quot; B_PRIdOFF &quot;\n&quot;, transaction-&gt;id, block-&gt;block_number));</a>
+<a name="ln2889">			memcpy(block-&gt;current_data, block-&gt;original_data,</a>
+<a name="ln2890">				cache-&gt;block_size);</a>
+<a name="ln2891">			cache-&gt;Free(block-&gt;original_data);</a>
+<a name="ln2892">			block-&gt;original_data = NULL;</a>
+<a name="ln2893">		}</a>
+<a name="ln2894">		if (transaction-&gt;has_sub_transaction &amp;&amp; block-&gt;parent_data != NULL)</a>
+<a name="ln2895">			cache-&gt;FreeBlockParentData(block);</a>
+<a name="ln2896"> </a>
+<a name="ln2897">		block-&gt;transaction_next = NULL;</a>
+<a name="ln2898">		block-&gt;transaction = NULL;</a>
+<a name="ln2899">		block-&gt;discard = false;</a>
+<a name="ln2900">		if (block-&gt;previous_transaction == NULL)</a>
+<a name="ln2901">			block-&gt;is_dirty = false;</a>
+<a name="ln2902">	}</a>
+<a name="ln2903"> </a>
+<a name="ln2904">	cache-&gt;transaction_hash-&gt;Remove(transaction);</a>
+<a name="ln2905">	delete_transaction(cache, transaction);</a>
+<a name="ln2906">	return B_OK;</a>
+<a name="ln2907">}</a>
+<a name="ln2908"> </a>
+<a name="ln2909"> </a>
+<a name="ln2910">/*!	Acknowledges the current parent transaction, and starts a new transaction</a>
+<a name="ln2911">	from its sub transaction.</a>
+<a name="ln2912">	The new transaction also gets a new transaction ID.</a>
+<a name="ln2913">*/</a>
+<a name="ln2914">int32</a>
+<a name="ln2915">cache_detach_sub_transaction(void* _cache, int32 id,</a>
+<a name="ln2916">	transaction_notification_hook hook, void* data)</a>
+<a name="ln2917">{</a>
+<a name="ln2918">	block_cache* cache = (block_cache*)_cache;</a>
+<a name="ln2919">	TransactionLocker locker(cache);</a>
+<a name="ln2920"> </a>
+<a name="ln2921">	TRACE((&quot;cache_detach_sub_transaction(id = %&quot; B_PRId32 &quot;)\n&quot;, id));</a>
+<a name="ln2922"> </a>
+<a name="ln2923">	cache_transaction* transaction = lookup_transaction(cache, id);</a>
+<a name="ln2924">	if (transaction == NULL) {</a>
+<a name="ln2925">		panic(&quot;cache_detach_sub_transaction(): invalid transaction ID\n&quot;);</a>
+<a name="ln2926">		return B_BAD_VALUE;</a>
+<a name="ln2927">	}</a>
+<a name="ln2928">	if (!transaction-&gt;has_sub_transaction)</a>
+<a name="ln2929">		return B_BAD_VALUE;</a>
+<a name="ln2930"> </a>
+<a name="ln2931">	// iterate through all blocks and free the unchanged original contents</a>
+<a name="ln2932"> </a>
+<a name="ln2933">	status_t status = write_blocks_in_previous_transaction(cache, transaction);</a>
+<a name="ln2934">	if (status != B_OK)</a>
+<a name="ln2935">		return status;</a>
+<a name="ln2936"> </a>
+<a name="ln2937">	// create a new transaction for the sub transaction</a>
+<a name="ln2938">	cache_transaction* newTransaction = new(std::nothrow) cache_transaction;</a>
+<a name="ln2939">	if (newTransaction == NULL)</a>
+<a name="ln2940">		return B_NO_MEMORY;</a>
+<a name="ln2941"> </a>
+<a name="ln2942">	newTransaction-&gt;id = atomic_add(&amp;cache-&gt;next_transaction_id, 1);</a>
+<a name="ln2943">	T(Detach(cache, transaction, newTransaction));</a>
+<a name="ln2944"> </a>
+<a name="ln2945">	notify_transaction_listeners(cache, transaction, TRANSACTION_ENDED);</a>
+<a name="ln2946"> </a>
+<a name="ln2947">	if (add_transaction_listener(cache, transaction, TRANSACTION_WRITTEN, hook,</a>
+<a name="ln2948">			data) != B_OK) {</a>
+<a name="ln2949">		delete newTransaction;</a>
+<a name="ln2950">		return B_NO_MEMORY;</a>
+<a name="ln2951">	}</a>
+<a name="ln2952"> </a>
+<a name="ln2953">	cached_block* last = NULL;</a>
+<a name="ln2954">	cached_block* next;</a>
+<a name="ln2955">	for (cached_block* block = transaction-&gt;first_block; block != NULL;</a>
+<a name="ln2956">			block = next) {</a>
+<a name="ln2957">		next = block-&gt;transaction_next;</a>
+<a name="ln2958">		ASSERT(block-&gt;previous_transaction == NULL);</a>
+<a name="ln2959"> </a>
+<a name="ln2960">		if (block-&gt;discard) {</a>
+<a name="ln2961">			cache-&gt;DiscardBlock(block);</a>
+<a name="ln2962">			transaction-&gt;main_num_blocks--;</a>
+<a name="ln2963">			continue;</a>
+<a name="ln2964">		}</a>
+<a name="ln2965"> </a>
+<a name="ln2966">		if (block-&gt;parent_data != NULL) {</a>
+<a name="ln2967">			// The block changed in the parent - free the original data, since</a>
+<a name="ln2968">			// they will be replaced by what is in current.</a>
+<a name="ln2969">			ASSERT(block-&gt;original_data != NULL);</a>
+<a name="ln2970">			cache-&gt;Free(block-&gt;original_data);</a>
+<a name="ln2971"> </a>
+<a name="ln2972">			if (block-&gt;parent_data != block-&gt;current_data) {</a>
+<a name="ln2973">				// The block had been changed in both transactions</a>
+<a name="ln2974">				block-&gt;original_data = block-&gt;parent_data;</a>
+<a name="ln2975">			} else {</a>
+<a name="ln2976">				// The block has only been changed in the parent</a>
+<a name="ln2977">				block-&gt;original_data = NULL;</a>
+<a name="ln2978">			}</a>
+<a name="ln2979"> </a>
+<a name="ln2980">			// move the block to the previous transaction list</a>
+<a name="ln2981">			transaction-&gt;blocks.Add(block);</a>
+<a name="ln2982">			block-&gt;previous_transaction = transaction;</a>
+<a name="ln2983">			block-&gt;parent_data = NULL;</a>
+<a name="ln2984">		}</a>
+<a name="ln2985"> </a>
+<a name="ln2986">		if (block-&gt;original_data != NULL) {</a>
+<a name="ln2987">			// This block had been changed in the current sub transaction,</a>
+<a name="ln2988">			// we need to move this block over to the new transaction.</a>
+<a name="ln2989">			ASSERT(block-&gt;parent_data == NULL);</a>
+<a name="ln2990"> </a>
+<a name="ln2991">			if (last == NULL)</a>
+<a name="ln2992">				newTransaction-&gt;first_block = block;</a>
+<a name="ln2993">			else</a>
+<a name="ln2994">				last-&gt;transaction_next = block;</a>
+<a name="ln2995"> </a>
+<a name="ln2996">			block-&gt;transaction = newTransaction;</a>
+<a name="ln2997">			last = block;</a>
+<a name="ln2998">		} else</a>
+<a name="ln2999">			block-&gt;transaction = NULL;</a>
+<a name="ln3000"> </a>
+<a name="ln3001">		block-&gt;transaction_next = NULL;</a>
+<a name="ln3002">	}</a>
+<a name="ln3003"> </a>
+<a name="ln3004">	newTransaction-&gt;num_blocks = transaction-&gt;sub_num_blocks;</a>
+<a name="ln3005"> </a>
+<a name="ln3006">	transaction-&gt;open = false;</a>
+<a name="ln3007">	transaction-&gt;has_sub_transaction = false;</a>
+<a name="ln3008">	transaction-&gt;num_blocks = transaction-&gt;main_num_blocks;</a>
+<a name="ln3009">	transaction-&gt;sub_num_blocks = 0;</a>
+<a name="ln3010"> </a>
+<a name="ln3011">	cache-&gt;transaction_hash-&gt;Insert(newTransaction);</a>
+<a name="ln3012">	cache-&gt;last_transaction = newTransaction;</a>
+<a name="ln3013"> </a>
+<a name="ln3014">	return newTransaction-&gt;id;</a>
+<a name="ln3015">}</a>
+<a name="ln3016"> </a>
+<a name="ln3017"> </a>
+<a name="ln3018">status_t</a>
+<a name="ln3019">cache_abort_sub_transaction(void* _cache, int32 id)</a>
+<a name="ln3020">{</a>
+<a name="ln3021">	block_cache* cache = (block_cache*)_cache;</a>
+<a name="ln3022">	TransactionLocker locker(cache);</a>
+<a name="ln3023"> </a>
+<a name="ln3024">	TRACE((&quot;cache_abort_sub_transaction(id = %&quot; B_PRId32 &quot;)\n&quot;, id));</a>
+<a name="ln3025"> </a>
+<a name="ln3026">	cache_transaction* transaction = lookup_transaction(cache, id);</a>
+<a name="ln3027">	if (transaction == NULL) {</a>
+<a name="ln3028">		panic(&quot;cache_abort_sub_transaction(): invalid transaction ID\n&quot;);</a>
+<a name="ln3029">		return B_BAD_VALUE;</a>
+<a name="ln3030">	}</a>
+<a name="ln3031">	if (!transaction-&gt;has_sub_transaction)</a>
+<a name="ln3032">		return B_BAD_VALUE;</a>
+<a name="ln3033"> </a>
+<a name="ln3034">	T(Abort(cache, transaction));</a>
+<a name="ln3035">	notify_transaction_listeners(cache, transaction, TRANSACTION_ABORTED);</a>
+<a name="ln3036"> </a>
+<a name="ln3037">	// revert all changes back to the version of the parent</a>
+<a name="ln3038"> </a>
+<a name="ln3039">	cached_block* block = transaction-&gt;first_block;</a>
+<a name="ln3040">	cached_block* last = NULL;</a>
+<a name="ln3041">	cached_block* next;</a>
+<a name="ln3042">	for (; block != NULL; block = next) {</a>
+<a name="ln3043">		next = block-&gt;transaction_next;</a>
+<a name="ln3044"> </a>
+<a name="ln3045">		if (block-&gt;parent_data == NULL) {</a>
+<a name="ln3046">			// The parent transaction didn't change the block, but the sub</a>
+<a name="ln3047">			// transaction did - we need to revert to the original data.</a>
+<a name="ln3048">			// The block is no longer part of the transaction</a>
+<a name="ln3049">			if (block-&gt;original_data != NULL) {</a>
+<a name="ln3050">				// The block might not have original data if was empty</a>
+<a name="ln3051">				memcpy(block-&gt;current_data, block-&gt;original_data,</a>
+<a name="ln3052">					cache-&gt;block_size);</a>
+<a name="ln3053">			}</a>
+<a name="ln3054"> </a>
+<a name="ln3055">			if (last != NULL)</a>
+<a name="ln3056">				last-&gt;transaction_next = next;</a>
+<a name="ln3057">			else</a>
+<a name="ln3058">				transaction-&gt;first_block = next;</a>
+<a name="ln3059"> </a>
+<a name="ln3060">			block-&gt;transaction_next = NULL;</a>
+<a name="ln3061">			block-&gt;transaction = NULL;</a>
+<a name="ln3062">			transaction-&gt;num_blocks--;</a>
+<a name="ln3063"> </a>
+<a name="ln3064">			if (block-&gt;previous_transaction == NULL) {</a>
+<a name="ln3065">				cache-&gt;Free(block-&gt;original_data);</a>
+<a name="ln3066">				block-&gt;original_data = NULL;</a>
+<a name="ln3067">				block-&gt;is_dirty = false;</a>
+<a name="ln3068"> </a>
+<a name="ln3069">				if (block-&gt;ref_count == 0) {</a>
+<a name="ln3070">					// Move the block into the unused list if possible</a>
+<a name="ln3071">					block-&gt;unused = true;</a>
+<a name="ln3072">					cache-&gt;unused_blocks.Add(block);</a>
+<a name="ln3073">					cache-&gt;unused_block_count++;</a>
+<a name="ln3074">				}</a>
+<a name="ln3075">			}</a>
+<a name="ln3076">		} else {</a>
+<a name="ln3077">			if (block-&gt;parent_data != block-&gt;current_data) {</a>
+<a name="ln3078">				// The block has been changed and must be restored - the block</a>
+<a name="ln3079">				// is still dirty and part of the transaction</a>
+<a name="ln3080">				TRACE((&quot;cache_abort_sub_transaction(id = %&quot; B_PRId32 &quot;): &quot;</a>
+<a name="ln3081">					&quot;restored contents of block %&quot; B_PRIdOFF &quot;\n&quot;,</a>
+<a name="ln3082">					transaction-&gt;id, block-&gt;block_number));</a>
+<a name="ln3083">				memcpy(block-&gt;current_data, block-&gt;parent_data,</a>
+<a name="ln3084">					cache-&gt;block_size);</a>
+<a name="ln3085">				cache-&gt;Free(block-&gt;parent_data);</a>
+<a name="ln3086">				// The block stays dirty</a>
+<a name="ln3087">			}</a>
+<a name="ln3088">			block-&gt;parent_data = NULL;</a>
+<a name="ln3089">			last = block;</a>
+<a name="ln3090">		}</a>
+<a name="ln3091"> </a>
+<a name="ln3092">		block-&gt;discard = false;</a>
+<a name="ln3093">	}</a>
+<a name="ln3094"> </a>
+<a name="ln3095">	// all subsequent changes will go into the main transaction</a>
+<a name="ln3096">	transaction-&gt;has_sub_transaction = false;</a>
+<a name="ln3097">	transaction-&gt;sub_num_blocks = 0;</a>
+<a name="ln3098"> </a>
+<a name="ln3099">	return B_OK;</a>
+<a name="ln3100">}</a>
+<a name="ln3101"> </a>
+<a name="ln3102"> </a>
+<a name="ln3103">status_t</a>
+<a name="ln3104">cache_start_sub_transaction(void* _cache, int32 id)</a>
+<a name="ln3105">{</a>
+<a name="ln3106">	block_cache* cache = (block_cache*)_cache;</a>
+<a name="ln3107">	TransactionLocker locker(cache);</a>
+<a name="ln3108"> </a>
+<a name="ln3109">	TRACE((&quot;cache_start_sub_transaction(id = %&quot; B_PRId32 &quot;)\n&quot;, id));</a>
+<a name="ln3110"> </a>
+<a name="ln3111">	cache_transaction* transaction = lookup_transaction(cache, id);</a>
+<a name="ln3112">	if (transaction == NULL) {</a>
+<a name="ln3113">		panic(&quot;cache_start_sub_transaction(): invalid transaction ID %&quot; B_PRId32 &quot;\n&quot;,</a>
+<a name="ln3114">			id);</a>
+<a name="ln3115">		return B_BAD_VALUE;</a>
+<a name="ln3116">	}</a>
+<a name="ln3117"> </a>
+<a name="ln3118">	notify_transaction_listeners(cache, transaction, TRANSACTION_ENDED);</a>
+<a name="ln3119"> </a>
+<a name="ln3120">	// move all changed blocks up to the parent</a>
+<a name="ln3121"> </a>
+<a name="ln3122">	cached_block* block = transaction-&gt;first_block;</a>
+<a name="ln3123">	cached_block* next;</a>
+<a name="ln3124">	for (; block != NULL; block = next) {</a>
+<a name="ln3125">		next = block-&gt;transaction_next;</a>
+<a name="ln3126"> </a>
+<a name="ln3127">		if (block-&gt;parent_data != NULL) {</a>
+<a name="ln3128">			// There already is an older sub transaction - we acknowledge</a>
+<a name="ln3129">			// its changes and move its blocks up to the parent</a>
+<a name="ln3130">			ASSERT(transaction-&gt;has_sub_transaction);</a>
+<a name="ln3131">			cache-&gt;FreeBlockParentData(block);</a>
+<a name="ln3132">		}</a>
+<a name="ln3133">		if (block-&gt;discard) {</a>
+<a name="ln3134">			// This block has been discarded in the parent transaction.</a>
+<a name="ln3135">			// Just throw away any changes made in this transaction, so that</a>
+<a name="ln3136">			// it can still be reverted to its original contents if needed</a>
+<a name="ln3137">			ASSERT(block-&gt;previous_transaction == NULL);</a>
+<a name="ln3138">			if (block-&gt;original_data != NULL) {</a>
+<a name="ln3139">				memcpy(block-&gt;current_data, block-&gt;original_data,</a>
+<a name="ln3140">					cache-&gt;block_size);</a>
+<a name="ln3141">				block-&gt;original_data = NULL;</a>
+<a name="ln3142">			}</a>
+<a name="ln3143">			continue;</a>
+<a name="ln3144">		}</a>
+<a name="ln3145"> </a>
+<a name="ln3146">		// we &quot;allocate&quot; the parent data lazily, that means, we don't copy</a>
+<a name="ln3147">		// the data (and allocate memory for it) until we need to</a>
+<a name="ln3148">		block-&gt;parent_data = block-&gt;current_data;</a>
+<a name="ln3149">	}</a>
+<a name="ln3150"> </a>
+<a name="ln3151">	// all subsequent changes will go into the sub transaction</a>
+<a name="ln3152">	transaction-&gt;has_sub_transaction = true;</a>
+<a name="ln3153">	transaction-&gt;main_num_blocks = transaction-&gt;num_blocks;</a>
+<a name="ln3154">	transaction-&gt;sub_num_blocks = 0;</a>
+<a name="ln3155">	T(Action(&quot;start-sub&quot;, cache, transaction));</a>
+<a name="ln3156"> </a>
+<a name="ln3157">	return B_OK;</a>
+<a name="ln3158">}</a>
+<a name="ln3159"> </a>
+<a name="ln3160"> </a>
+<a name="ln3161">/*!	Adds a transaction listener that gets notified when the transaction</a>
+<a name="ln3162">	is ended, aborted, written, or idle as specified by \a events.</a>
+<a name="ln3163">	The listener gets automatically removed when the transaction ends.</a>
+<a name="ln3164">*/</a>
+<a name="ln3165">status_t</a>
+<a name="ln3166">cache_add_transaction_listener(void* _cache, int32 id, int32 events,</a>
+<a name="ln3167">	transaction_notification_hook hook, void* data)</a>
+<a name="ln3168">{</a>
+<a name="ln3169">	block_cache* cache = (block_cache*)_cache;</a>
+<a name="ln3170">	TransactionLocker locker(cache);</a>
+<a name="ln3171"> </a>
+<a name="ln3172">	cache_transaction* transaction = lookup_transaction(cache, id);</a>
+<a name="ln3173">	if (transaction == NULL)</a>
+<a name="ln3174">		return B_BAD_VALUE;</a>
+<a name="ln3175"> </a>
+<a name="ln3176">	return add_transaction_listener(cache, transaction, events, hook, data);</a>
+<a name="ln3177">}</a>
+<a name="ln3178"> </a>
+<a name="ln3179"> </a>
+<a name="ln3180">status_t</a>
+<a name="ln3181">cache_remove_transaction_listener(void* _cache, int32 id,</a>
+<a name="ln3182">	transaction_notification_hook hookFunction, void* data)</a>
+<a name="ln3183">{</a>
+<a name="ln3184">	block_cache* cache = (block_cache*)_cache;</a>
+<a name="ln3185">	TransactionLocker locker(cache);</a>
+<a name="ln3186"> </a>
+<a name="ln3187">	cache_transaction* transaction = lookup_transaction(cache, id);</a>
+<a name="ln3188">	if (transaction == NULL)</a>
+<a name="ln3189">		return B_BAD_VALUE;</a>
+<a name="ln3190"> </a>
+<a name="ln3191">	ListenerList::Iterator iterator = transaction-&gt;listeners.GetIterator();</a>
+<a name="ln3192">	while (iterator.HasNext()) {</a>
+<a name="ln3193">		cache_listener* listener = iterator.Next();</a>
+<a name="ln3194">		if (listener-&gt;data == data &amp;&amp; listener-&gt;hook == hookFunction) {</a>
+<a name="ln3195">			iterator.Remove();</a>
+<a name="ln3196"> </a>
+<a name="ln3197">			if (listener-&gt;events_pending != 0) {</a>
+<a name="ln3198">				MutexLocker _(sNotificationsLock);</a>
+<a name="ln3199">				if (listener-&gt;events_pending != 0)</a>
+<a name="ln3200">					cache-&gt;pending_notifications.Remove(listener);</a>
+<a name="ln3201">			}</a>
+<a name="ln3202">			delete listener;</a>
+<a name="ln3203">			return B_OK;</a>
+<a name="ln3204">		}</a>
+<a name="ln3205">	}</a>
+<a name="ln3206"> </a>
+<a name="ln3207">	return B_ENTRY_NOT_FOUND;</a>
+<a name="ln3208">}</a>
+<a name="ln3209"> </a>
+<a name="ln3210"> </a>
+<a name="ln3211">status_t</a>
+<a name="ln3212">cache_next_block_in_transaction(void* _cache, int32 id, bool mainOnly,</a>
+<a name="ln3213">	long* _cookie, off_t* _blockNumber, void** _data, void** _unchangedData)</a>
+<a name="ln3214">{</a>
+<a name="ln3215">	cached_block* block = (cached_block*)*_cookie;</a>
+<a name="ln3216">	block_cache* cache = (block_cache*)_cache;</a>
+<a name="ln3217">	TransactionLocker locker(cache);</a>
+<a name="ln3218"> </a>
+<a name="ln3219">	cache_transaction* transaction = lookup_transaction(cache, id);</a>
+<a name="ln3220">	if (transaction == NULL || !transaction-&gt;open)</a>
+<a name="ln3221">		return B_BAD_VALUE;</a>
+<a name="ln3222"> </a>
+<a name="ln3223">	if (block == NULL)</a>
+<a name="ln3224">		block = transaction-&gt;first_block;</a>
+<a name="ln3225">	else</a>
+<a name="ln3226">		block = block-&gt;transaction_next;</a>
+<a name="ln3227"> </a>
+<a name="ln3228">	if (transaction-&gt;has_sub_transaction) {</a>
+<a name="ln3229">		if (mainOnly) {</a>
+<a name="ln3230">			// find next block that the parent changed</a>
+<a name="ln3231">			while (block != NULL &amp;&amp; block-&gt;parent_data == NULL)</a>
+<a name="ln3232">				block = block-&gt;transaction_next;</a>
+<a name="ln3233">		} else {</a>
+<a name="ln3234">			// find next non-discarded block</a>
+<a name="ln3235">			while (block != NULL &amp;&amp; block-&gt;discard)</a>
+<a name="ln3236">				block = block-&gt;transaction_next;</a>
+<a name="ln3237">		}</a>
+<a name="ln3238">	}</a>
+<a name="ln3239"> </a>
+<a name="ln3240">	if (block == NULL)</a>
+<a name="ln3241">		return B_ENTRY_NOT_FOUND;</a>
+<a name="ln3242"> </a>
+<a name="ln3243">	if (_blockNumber)</a>
+<a name="ln3244">		*_blockNumber = block-&gt;block_number;</a>
+<a name="ln3245">	if (_data)</a>
+<a name="ln3246">		*_data = mainOnly ? block-&gt;parent_data : block-&gt;current_data;</a>
+<a name="ln3247">	if (_unchangedData)</a>
+<a name="ln3248">		*_unchangedData = block-&gt;original_data;</a>
+<a name="ln3249"> </a>
+<a name="ln3250">	*_cookie = (addr_t)block;</a>
+<a name="ln3251">	return B_OK;</a>
+<a name="ln3252">}</a>
+<a name="ln3253"> </a>
+<a name="ln3254"> </a>
+<a name="ln3255">int32</a>
+<a name="ln3256">cache_blocks_in_transaction(void* _cache, int32 id)</a>
+<a name="ln3257">{</a>
+<a name="ln3258">	block_cache* cache = (block_cache*)_cache;</a>
+<a name="ln3259">	TransactionLocker locker(cache);</a>
+<a name="ln3260"> </a>
+<a name="ln3261">	cache_transaction* transaction = lookup_transaction(cache, id);</a>
+<a name="ln3262">	if (transaction == NULL)</a>
+<a name="ln3263">		return B_BAD_VALUE;</a>
+<a name="ln3264"> </a>
+<a name="ln3265">	return transaction-&gt;num_blocks;</a>
+<a name="ln3266">}</a>
+<a name="ln3267"> </a>
+<a name="ln3268"> </a>
+<a name="ln3269">/*!	Returns the number of blocks that are part of the main transaction. If this</a>
+<a name="ln3270">	transaction does not have a sub transaction yet, this is the same value as</a>
+<a name="ln3271">	cache_blocks_in_transaction() would return.</a>
+<a name="ln3272">*/</a>
+<a name="ln3273">int32</a>
+<a name="ln3274">cache_blocks_in_main_transaction(void* _cache, int32 id)</a>
+<a name="ln3275">{</a>
+<a name="ln3276">	block_cache* cache = (block_cache*)_cache;</a>
+<a name="ln3277">	TransactionLocker locker(cache);</a>
+<a name="ln3278"> </a>
+<a name="ln3279">	cache_transaction* transaction = lookup_transaction(cache, id);</a>
+<a name="ln3280">	if (transaction == NULL)</a>
+<a name="ln3281">		return B_BAD_VALUE;</a>
+<a name="ln3282"> </a>
+<a name="ln3283">	if (transaction-&gt;has_sub_transaction)</a>
+<a name="ln3284">		return transaction-&gt;main_num_blocks;</a>
+<a name="ln3285"> </a>
+<a name="ln3286">	return transaction-&gt;num_blocks;</a>
+<a name="ln3287">}</a>
+<a name="ln3288"> </a>
+<a name="ln3289"> </a>
+<a name="ln3290">int32</a>
+<a name="ln3291">cache_blocks_in_sub_transaction(void* _cache, int32 id)</a>
+<a name="ln3292">{</a>
+<a name="ln3293">	block_cache* cache = (block_cache*)_cache;</a>
+<a name="ln3294">	TransactionLocker locker(cache);</a>
+<a name="ln3295"> </a>
+<a name="ln3296">	cache_transaction* transaction = lookup_transaction(cache, id);</a>
+<a name="ln3297">	if (transaction == NULL)</a>
+<a name="ln3298">		return B_BAD_VALUE;</a>
+<a name="ln3299"> </a>
+<a name="ln3300">	return transaction-&gt;sub_num_blocks;</a>
+<a name="ln3301">}</a>
+<a name="ln3302"> </a>
+<a name="ln3303"> </a>
+<a name="ln3304">/*!	Check if block is in transaction</a>
+<a name="ln3305">*/</a>
+<a name="ln3306">bool</a>
+<a name="ln3307">cache_has_block_in_transaction(void* _cache, int32 id, off_t blockNumber)</a>
+<a name="ln3308">{</a>
+<a name="ln3309">	block_cache* cache = (block_cache*)_cache;</a>
+<a name="ln3310">	TransactionLocker locker(cache);</a>
+<a name="ln3311"> </a>
+<a name="ln3312">	cached_block* block = cache-&gt;hash-&gt;Lookup(blockNumber);</a>
+<a name="ln3313"> </a>
+<a name="ln3314">	return (block != NULL &amp;&amp; block-&gt;transaction != NULL</a>
+<a name="ln3315">		&amp;&amp; block-&gt;transaction-&gt;id == id);</a>
+<a name="ln3316">}</a>
+<a name="ln3317"> </a>
+<a name="ln3318"> </a>
+<a name="ln3319">//	#pragma mark - public block cache API</a>
+<a name="ln3320"> </a>
+<a name="ln3321"> </a>
+<a name="ln3322">void</a>
+<a name="ln3323">block_cache_delete(void* _cache, bool allowWrites)</a>
+<a name="ln3324">{</a>
+<a name="ln3325">	block_cache* cache = (block_cache*)_cache;</a>
+<a name="ln3326"> </a>
+<a name="ln3327">	if (allowWrites)</a>
+<a name="ln3328">		block_cache_sync(cache);</a>
+<a name="ln3329"> </a>
+<a name="ln3330">	mutex_lock(&amp;sCachesLock);</a>
+<a name="ln3331">	sCaches.Remove(cache);</a>
+<a name="ln3332">	mutex_unlock(&amp;sCachesLock);</a>
+<a name="ln3333"> </a>
+<a name="ln3334">	mutex_lock(&amp;cache-&gt;lock);</a>
+<a name="ln3335"> </a>
+<a name="ln3336">	// wait for all blocks to become unbusy</a>
+<a name="ln3337">	wait_for_busy_reading_blocks(cache);</a>
+<a name="ln3338">	wait_for_busy_writing_blocks(cache);</a>
+<a name="ln3339"> </a>
+<a name="ln3340">	// free all blocks</a>
+<a name="ln3341"> </a>
+<a name="ln3342">	cached_block* block = cache-&gt;hash-&gt;Clear(true);</a>
+<a name="ln3343">	while (block != NULL) {</a>
+<a name="ln3344">		cached_block* next = block-&gt;next;</a>
+<a name="ln3345">		cache-&gt;FreeBlock(block);</a>
+<a name="ln3346">		block = next;</a>
+<a name="ln3347">	}</a>
+<a name="ln3348"> </a>
+<a name="ln3349">	// free all transactions (they will all be aborted)</a>
+<a name="ln3350"> </a>
+<a name="ln3351">	cache_transaction* transaction = cache-&gt;transaction_hash-&gt;Clear(true);</a>
+<a name="ln3352">	while (transaction != NULL) {</a>
+<a name="ln3353">		cache_transaction* next = transaction-&gt;next;</a>
+<a name="ln3354">		delete transaction;</a>
+<a name="ln3355">		transaction = next;</a>
+<a name="ln3356">	}</a>
+<a name="ln3357"> </a>
+<a name="ln3358">	delete cache;</a>
+<a name="ln3359">}</a>
+<a name="ln3360"> </a>
+<a name="ln3361"> </a>
+<a name="ln3362">void*</a>
+<a name="ln3363">block_cache_create(int fd, off_t numBlocks, size_t blockSize, bool readOnly)</a>
+<a name="ln3364">{</a>
+<a name="ln3365">	block_cache* cache = new(std::nothrow) block_cache(fd, numBlocks, blockSize,</a>
+<a name="ln3366">		readOnly);</a>
+<a name="ln3367">	if (cache == NULL)</a>
+<a name="ln3368">		return NULL;</a>
+<a name="ln3369"> </a>
+<a name="ln3370">	if (cache-&gt;Init() != B_OK) {</a>
+<a name="ln3371">		delete cache;</a>
+<a name="ln3372">		return NULL;</a>
+<a name="ln3373">	}</a>
+<a name="ln3374"> </a>
+<a name="ln3375">	MutexLocker _(sCachesLock);</a>
+<a name="ln3376">	sCaches.Add(cache);</a>
+<a name="ln3377"> </a>
+<a name="ln3378">	return cache;</a>
+<a name="ln3379">}</a>
+<a name="ln3380"> </a>
+<a name="ln3381"> </a>
+<a name="ln3382">status_t</a>
+<a name="ln3383">block_cache_sync(void* _cache)</a>
+<a name="ln3384">{</a>
+<a name="ln3385">	block_cache* cache = (block_cache*)_cache;</a>
+<a name="ln3386"> </a>
+<a name="ln3387">	// We will sync all dirty blocks to disk that have a completed</a>
+<a name="ln3388">	// transaction or no transaction only</a>
+<a name="ln3389"> </a>
+<a name="ln3390">	MutexLocker locker(&amp;cache-&gt;lock);</a>
+<a name="ln3391"> </a>
+<a name="ln3392">	BlockWriter writer(cache);</a>
+<a name="ln3393">	BlockTable::Iterator iterator(cache-&gt;hash);</a>
+<a name="ln3394"> </a>
+<a name="ln3395">	while (iterator.HasNext()) {</a>
+<a name="ln3396">		cached_block* block = iterator.Next();</a>
+<a name="ln3397">		if (block-&gt;CanBeWritten())</a>
+<a name="ln3398">			writer.Add(block);</a>
+<a name="ln3399">	}</a>
+<a name="ln3400"> </a>
+<a name="ln3401">	status_t status = writer.Write();</a>
+<a name="ln3402"> </a>
+<a name="ln3403">	locker.Unlock();</a>
+<a name="ln3404"> </a>
+<a name="ln3405">	wait_for_notifications(cache);</a>
+<a name="ln3406">		// make sure that all pending TRANSACTION_WRITTEN notifications</a>
+<a name="ln3407">		// are handled after we return</a>
+<a name="ln3408">	return status;</a>
+<a name="ln3409">}</a>
+<a name="ln3410"> </a>
+<a name="ln3411"> </a>
+<a name="ln3412">status_t</a>
+<a name="ln3413">block_cache_sync_etc(void* _cache, off_t blockNumber, size_t numBlocks)</a>
+<a name="ln3414">{</a>
+<a name="ln3415">	block_cache* cache = (block_cache*)_cache;</a>
+<a name="ln3416"> </a>
+<a name="ln3417">	// We will sync all dirty blocks to disk that have a completed</a>
+<a name="ln3418">	// transaction or no transaction only</a>
+<a name="ln3419"> </a>
+<a name="ln3420">	if (blockNumber &lt; 0 || blockNumber &gt;= cache-&gt;max_blocks) {</a>
+<a name="ln3421">		panic(&quot;block_cache_sync_etc: invalid block number %&quot; B_PRIdOFF</a>
+<a name="ln3422">			&quot; (max %&quot; B_PRIdOFF &quot;)&quot;,</a>
+<a name="ln3423">			blockNumber, cache-&gt;max_blocks - 1);</a>
+<a name="ln3424">		return B_BAD_VALUE;</a>
+<a name="ln3425">	}</a>
+<a name="ln3426"> </a>
+<a name="ln3427">	MutexLocker locker(&amp;cache-&gt;lock);</a>
+<a name="ln3428">	BlockWriter writer(cache);</a>
+<a name="ln3429"> </a>
+<a name="ln3430">	for (; numBlocks &gt; 0; numBlocks--, blockNumber++) {</a>
+<a name="ln3431">		cached_block* block = cache-&gt;hash-&gt;Lookup(blockNumber);</a>
+<a name="ln3432">		if (block == NULL)</a>
+<a name="ln3433">			continue;</a>
+<a name="ln3434"> </a>
+<a name="ln3435">		if (block-&gt;CanBeWritten())</a>
+<a name="ln3436">			writer.Add(block);</a>
+<a name="ln3437">	}</a>
+<a name="ln3438"> </a>
+<a name="ln3439">	status_t status = writer.Write();</a>
+<a name="ln3440"> </a>
+<a name="ln3441">	locker.Unlock();</a>
+<a name="ln3442"> </a>
+<a name="ln3443">	wait_for_notifications(cache);</a>
+<a name="ln3444">		// make sure that all pending TRANSACTION_WRITTEN notifications</a>
+<a name="ln3445">		// are handled after we return</a>
+<a name="ln3446">	return status;</a>
+<a name="ln3447">}</a>
+<a name="ln3448"> </a>
+<a name="ln3449"> </a>
+<a name="ln3450">/*!	Discards a block from the current transaction or from the cache.</a>
+<a name="ln3451">	You have to call this function when you no longer use a block, ie. when it</a>
+<a name="ln3452">	might be reclaimed by the file cache in order to make sure they won't</a>
+<a name="ln3453">	interfere.</a>
+<a name="ln3454">*/</a>
+<a name="ln3455">void</a>
+<a name="ln3456">block_cache_discard(void* _cache, off_t blockNumber, size_t numBlocks)</a>
+<a name="ln3457">{</a>
+<a name="ln3458">	// TODO: this could be a nice place to issue the ATA trim command</a>
+<a name="ln3459">	block_cache* cache = (block_cache*)_cache;</a>
+<a name="ln3460">	TransactionLocker locker(cache);</a>
+<a name="ln3461"> </a>
+<a name="ln3462">	BlockWriter writer(cache);</a>
+<a name="ln3463"> </a>
+<a name="ln3464">	for (size_t i = 0; i &lt; numBlocks; i++, blockNumber++) {</a>
+<a name="ln3465">		cached_block* block = cache-&gt;hash-&gt;Lookup(blockNumber);</a>
+<a name="ln3466">		if (block != NULL &amp;&amp; block-&gt;previous_transaction != NULL)</a>
+<a name="ln3467">			writer.Add(block);</a>
+<a name="ln3468">	}</a>
+<a name="ln3469"> </a>
+<a name="ln3470">	writer.Write();</a>
+<a name="ln3471">		// TODO: this can fail, too!</a>
+<a name="ln3472"> </a>
+<a name="ln3473">	blockNumber -= numBlocks;</a>
+<a name="ln3474">		// reset blockNumber to its original value</a>
+<a name="ln3475"> </a>
+<a name="ln3476">	for (size_t i = 0; i &lt; numBlocks; i++, blockNumber++) {</a>
+<a name="ln3477">		cached_block* block = cache-&gt;hash-&gt;Lookup(blockNumber);</a>
+<a name="ln3478">		if (block == NULL)</a>
+<a name="ln3479">			continue;</a>
+<a name="ln3480"> </a>
+<a name="ln3481">		ASSERT(block-&gt;previous_transaction == NULL);</a>
+<a name="ln3482"> </a>
+<a name="ln3483">		if (block-&gt;unused) {</a>
+<a name="ln3484">			cache-&gt;unused_blocks.Remove(block);</a>
+<a name="ln3485">			cache-&gt;unused_block_count--;</a>
+<a name="ln3486">			cache-&gt;RemoveBlock(block);</a>
+<a name="ln3487">		} else {</a>
+<a name="ln3488">			if (block-&gt;transaction != NULL &amp;&amp; block-&gt;parent_data != NULL</a>
+<a name="ln3489">				&amp;&amp; block-&gt;parent_data != block-&gt;current_data) {</a>
+<a name="ln3490">				panic(&quot;Discarded block %&quot; B_PRIdOFF &quot; has already been changed in this &quot;</a>
+<a name="ln3491">					&quot;transaction!&quot;, blockNumber);</a>
+<a name="ln3492">			}</a>
+<a name="ln3493"> </a>
+<a name="ln3494">			// mark it as discarded (in the current transaction only, if any)</a>
+<a name="ln3495">			block-&gt;discard = true;</a>
+<a name="ln3496">		}</a>
+<a name="ln3497">	}</a>
+<a name="ln3498">}</a>
+<a name="ln3499"> </a>
+<a name="ln3500"> </a>
+<a name="ln3501">status_t</a>
+<a name="ln3502">block_cache_make_writable(void* _cache, off_t blockNumber, int32 transaction)</a>
+<a name="ln3503">{</a>
+<a name="ln3504">	block_cache* cache = (block_cache*)_cache;</a>
+<a name="ln3505">	MutexLocker locker(&amp;cache-&gt;lock);</a>
+<a name="ln3506"> </a>
+<a name="ln3507">	if (cache-&gt;read_only) {</a>
+<a name="ln3508">		panic(&quot;tried to make block writable on a read-only cache!&quot;);</a>
+<a name="ln3509">		return B_ERROR;</a>
+<a name="ln3510">	}</a>
+<a name="ln3511"> </a>
+<a name="ln3512">	// TODO: this can be done better!</a>
+<a name="ln3513">	void* block = get_writable_cached_block(cache, blockNumber,</a>
+<a name="ln3514">		blockNumber, 1, transaction, false);</a>
+<a name="ln3515">	if (block != NULL) {</a>
+<a name="ln3516">		put_cached_block((block_cache*)_cache, blockNumber);</a>
+<a name="ln3517">		return B_OK;</a>
+<a name="ln3518">	}</a>
+<a name="ln3519"> </a>
+<a name="ln3520">	return B_ERROR;</a>
+<a name="ln3521">}</a>
+<a name="ln3522"> </a>
+<a name="ln3523"> </a>
+<a name="ln3524">void*</a>
+<a name="ln3525">block_cache_get_writable_etc(void* _cache, off_t blockNumber, off_t base,</a>
+<a name="ln3526">	off_t length, int32 transaction)</a>
+<a name="ln3527">{</a>
+<a name="ln3528">	block_cache* cache = (block_cache*)_cache;</a>
+<a name="ln3529">	MutexLocker locker(&amp;cache-&gt;lock);</a>
+<a name="ln3530"> </a>
+<a name="ln3531">	TRACE((&quot;block_cache_get_writable_etc(block = %&quot; B_PRIdOFF &quot;, transaction = %&quot; B_PRId32 &quot;)\n&quot;,</a>
+<a name="ln3532">		blockNumber, transaction));</a>
+<a name="ln3533">	if (cache-&gt;read_only)</a>
+<a name="ln3534">		panic(&quot;tried to get writable block on a read-only cache!&quot;);</a>
+<a name="ln3535"> </a>
+<a name="ln3536">	return get_writable_cached_block(cache, blockNumber, base, length,</a>
+<a name="ln3537">		transaction, false);</a>
+<a name="ln3538">}</a>
+<a name="ln3539"> </a>
+<a name="ln3540"> </a>
+<a name="ln3541">void*</a>
+<a name="ln3542">block_cache_get_writable(void* _cache, off_t blockNumber, int32 transaction)</a>
+<a name="ln3543">{</a>
+<a name="ln3544">	return block_cache_get_writable_etc(_cache, blockNumber,</a>
+<a name="ln3545">		blockNumber, 1, transaction);</a>
+<a name="ln3546">}</a>
+<a name="ln3547"> </a>
+<a name="ln3548"> </a>
+<a name="ln3549">void*</a>
+<a name="ln3550">block_cache_get_empty(void* _cache, off_t blockNumber, int32 transaction)</a>
+<a name="ln3551">{</a>
+<a name="ln3552">	block_cache* cache = (block_cache*)_cache;</a>
+<a name="ln3553">	MutexLocker locker(&amp;cache-&gt;lock);</a>
+<a name="ln3554"> </a>
+<a name="ln3555">	TRACE((&quot;block_cache_get_empty(block = %&quot; B_PRIdOFF &quot;, transaction = %&quot; B_PRId32 &quot;)\n&quot;,</a>
+<a name="ln3556">		blockNumber, transaction));</a>
+<a name="ln3557">	if (cache-&gt;read_only)</a>
+<a name="ln3558">		panic(&quot;tried to get empty writable block on a read-only cache!&quot;);</a>
+<a name="ln3559"> </a>
+<a name="ln3560">	return get_writable_cached_block((block_cache*)_cache, blockNumber,</a>
+<a name="ln3561">		blockNumber, 1, transaction, true);</a>
+<a name="ln3562">}</a>
+<a name="ln3563"> </a>
+<a name="ln3564"> </a>
+<a name="ln3565">const void*</a>
+<a name="ln3566">block_cache_get_etc(void* _cache, off_t blockNumber, off_t base, off_t length)</a>
+<a name="ln3567">{</a>
+<a name="ln3568">	block_cache* cache = (block_cache*)_cache;</a>
+<a name="ln3569">	MutexLocker locker(&amp;cache-&gt;lock);</a>
+<a name="ln3570">	bool allocated;</a>
+<a name="ln3571"> </a>
+<a name="ln3572">	cached_block* block = get_cached_block(cache, blockNumber, &amp;allocated);</a>
+<a name="ln3573">	if (block == NULL)</a>
+<a name="ln3574">		return NULL;</a>
+<a name="ln3575"> </a>
+<a name="ln3576">#if BLOCK_CACHE_DEBUG_CHANGED</a>
+<a name="ln3577">	if (block-&gt;compare == NULL)</a>
+<a name="ln3578">		block-&gt;compare = cache-&gt;Allocate();</a>
+<a name="ln3579">	if (block-&gt;compare != NULL)</a>
+<a name="ln3580">		memcpy(block-&gt;compare, block-&gt;current_data, cache-&gt;block_size);</a>
+<a name="ln3581">#endif</a>
+<a name="ln3582">	TB(Get(cache, block));</a>
+<a name="ln3583"> </a>
+<a name="ln3584">	return block-&gt;current_data;</a>
+<a name="ln3585">}</a>
+<a name="ln3586"> </a>
+<a name="ln3587"> </a>
+<a name="ln3588">const void*</a>
+<a name="ln3589">block_cache_get(void* _cache, off_t blockNumber)</a>
+<a name="ln3590">{</a>
+<a name="ln3591">	return block_cache_get_etc(_cache, blockNumber, blockNumber, 1);</a>
+<a name="ln3592">}</a>
+<a name="ln3593"> </a>
+<a name="ln3594"> </a>
+<a name="ln3595">/*!	Changes the internal status of a writable block to \a dirty. This can be</a>
+<a name="ln3596">	helpful in case you realize you don't need to change that block anymore</a>
+<a name="ln3597">	for whatever reason.</a>
+<a name="ln3598"> </a>
+<a name="ln3599">	Note, you must only use this function on blocks that were acquired</a>
+<a name="ln3600">	writable!</a>
+<a name="ln3601">*/</a>
+<a name="ln3602">status_t</a>
+<a name="ln3603">block_cache_set_dirty(void* _cache, off_t blockNumber, bool dirty,</a>
+<a name="ln3604">	int32 transaction)</a>
+<a name="ln3605">{</a>
+<a name="ln3606">	block_cache* cache = (block_cache*)_cache;</a>
+<a name="ln3607">	MutexLocker locker(&amp;cache-&gt;lock);</a>
+<a name="ln3608"> </a>
+<a name="ln3609">	cached_block* block = cache-&gt;hash-&gt;Lookup(blockNumber);</a>
+<a name="ln3610">	if (block == NULL)</a>
+<a name="ln3611">		return B_BAD_VALUE;</a>
+<a name="ln3612">	if (block-&gt;is_dirty == dirty) {</a>
+<a name="ln3613">		// there is nothing to do for us</a>
+<a name="ln3614">		return B_OK;</a>
+<a name="ln3615">	}</a>
+<a name="ln3616"> </a>
+<a name="ln3617">	// TODO: not yet implemented</a>
+<a name="ln3618">	if (dirty)</a>
+<a name="ln3619">		panic(&quot;block_cache_set_dirty(): not yet implemented that way!\n&quot;);</a>
+<a name="ln3620"> </a>
+<a name="ln3621">	return B_OK;</a>
+<a name="ln3622">}</a>
+<a name="ln3623"> </a>
+<a name="ln3624"> </a>
+<a name="ln3625">void</a>
+<a name="ln3626">block_cache_put(void* _cache, off_t blockNumber)</a>
+<a name="ln3627">{</a>
+<a name="ln3628">	block_cache* cache = (block_cache*)_cache;</a>
+<a name="ln3629">	MutexLocker locker(&amp;cache-&gt;lock);</a>
+<a name="ln3630"> </a>
+<a name="ln3631">	put_cached_block(cache, blockNumber);</a>
+<a name="ln3632">}</a>
+<a name="ln3633"> </a>
+
+</code></pre>
+<div class="balloon" rel="979"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: next, id.</p></div>
+<div class="balloon" rel="1356"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: lock, busy_reading_condition, busy_writing_condition, condition_variable.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

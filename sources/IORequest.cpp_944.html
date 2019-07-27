@@ -1,0 +1,1487 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>IORequest.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2008-2011, Ingo Weinhold, ingo_weinhold@gmx.de.</a>
+<a name="ln3"> * Copyright 2008-2017, Axel Dörfler, axeld@pinc-software.de.</a>
+<a name="ln4"> * Distributed under the terms of the MIT License.</a>
+<a name="ln5"> */</a>
+<a name="ln6"> </a>
+<a name="ln7"> </a>
+<a name="ln8">#include &quot;IORequest.h&quot;</a>
+<a name="ln9"> </a>
+<a name="ln10">#include &lt;string.h&gt;</a>
+<a name="ln11"> </a>
+<a name="ln12">#include &lt;arch/debug.h&gt;</a>
+<a name="ln13">#include &lt;debug.h&gt;</a>
+<a name="ln14">#include &lt;heap.h&gt;</a>
+<a name="ln15">#include &lt;kernel.h&gt;</a>
+<a name="ln16">#include &lt;team.h&gt;</a>
+<a name="ln17">#include &lt;thread.h&gt;</a>
+<a name="ln18">#include &lt;util/AutoLock.h&gt;</a>
+<a name="ln19">#include &lt;vm/vm.h&gt;</a>
+<a name="ln20">#include &lt;vm/VMAddressSpace.h&gt;</a>
+<a name="ln21"> </a>
+<a name="ln22">#include &quot;dma_resources.h&quot;</a>
+<a name="ln23"> </a>
+<a name="ln24"> </a>
+<a name="ln25">//#define TRACE_IO_REQUEST</a>
+<a name="ln26">#ifdef TRACE_IO_REQUEST</a>
+<a name="ln27">#	define TRACE(x...) dprintf(x)</a>
+<a name="ln28">#else</a>
+<a name="ln29">#	define TRACE(x...) ;</a>
+<a name="ln30">#endif</a>
+<a name="ln31"> </a>
+<a name="ln32"> </a>
+<a name="ln33">// partial I/O operation phases</a>
+<a name="ln34">enum {</a>
+<a name="ln35">	PHASE_READ_BEGIN	= 0,</a>
+<a name="ln36">	PHASE_READ_END		= 1,</a>
+<a name="ln37">	PHASE_DO_ALL		= 2</a>
+<a name="ln38">};</a>
+<a name="ln39"> </a>
+<a name="ln40"> </a>
+<a name="ln41">struct virtual_vec_cookie {</a>
+<a name="ln42">	uint32			vec_index;</a>
+<a name="ln43">	generic_size_t	vec_offset;</a>
+<a name="ln44">	area_id			mapped_area;</a>
+<a name="ln45">	void*			physical_page_handle;</a>
+<a name="ln46">	addr_t			virtual_address;</a>
+<a name="ln47"> </a>
+<a name="ln48">	virtual_vec_cookie()</a>
+<a name="ln49">		:</a>
+<a name="ln50">		vec_index(0),</a>
+<a name="ln51">		vec_offset(0),</a>
+<a name="ln52">		mapped_area(-1),</a>
+<a name="ln53">		physical_page_handle(NULL),</a>
+<a name="ln54">		virtual_address((addr_t)-1)</a>
+<a name="ln55">	{</a>
+<a name="ln56">	}</a>
+<a name="ln57"> </a>
+<a name="ln58">	void PutPhysicalPageIfNeeded()</a>
+<a name="ln59">	{</a>
+<a name="ln60">		if (virtual_address != (addr_t)-1) {</a>
+<a name="ln61">			vm_put_physical_page(virtual_address, physical_page_handle);</a>
+<a name="ln62">			virtual_address = (addr_t)-1;</a>
+<a name="ln63">		}</a>
+<a name="ln64">	}</a>
+<a name="ln65">};</a>
+<a name="ln66"> </a>
+<a name="ln67"> </a>
+<a name="ln68">// #pragma mark -</a>
+<a name="ln69"> </a>
+<a name="ln70"> </a>
+<a name="ln71">IORequestChunk::IORequestChunk()</a>
+<a name="ln72">	:</a>
+<a name="ln73">	fParent(NULL),</a>
+<a name="ln74">	fStatus(1)</a>
+<a name="ln75">{</a>
+<a name="ln76">}</a>
+<a name="ln77"> </a>
+<a name="ln78"> </a>
+<a name="ln79">IORequestChunk::~IORequestChunk()</a>
+<a name="ln80">{</a>
+<a name="ln81">}</a>
+<a name="ln82"> </a>
+<a name="ln83"> </a>
+<a name="ln84">//	#pragma mark -</a>
+<a name="ln85"> </a>
+<a name="ln86"> </a>
+<a name="ln87">IOBuffer*</a>
+<a name="ln88">IOBuffer::Create(uint32 count, bool vip)</a>
+<a name="ln89">{</a>
+<a name="ln90">	size_t size = sizeof(IOBuffer) + sizeof(generic_io_vec) * (count - 1);</a>
+<a name="ln91">	IOBuffer* buffer</a>
+<a name="ln92">		= (IOBuffer*)(malloc_etc(size, vip ? HEAP_PRIORITY_VIP : 0));</a>
+<a name="ln93">	if (buffer == NULL)</a>
+<a name="ln94">		return NULL;</a>
+<a name="ln95"> </a>
+<a name="ln96">	buffer-&gt;fCapacity = count;</a>
+<a name="ln97">	buffer-&gt;fVecCount = 0;</a>
+<a name="ln98">	buffer-&gt;fUser = false;</a>
+<a name="ln99">	buffer-&gt;fPhysical = false;</a>
+<a name="ln100">	buffer-&gt;fVIP = vip;</a>
+<a name="ln101">	buffer-&gt;fMemoryLocked = false;</a>
+<a name="ln102"> </a>
+<a name="ln103">	return buffer;</a>
+<a name="ln104">}</a>
+<a name="ln105"> </a>
+<a name="ln106"> </a>
+<a name="ln107">void</a>
+<a name="ln108">IOBuffer::Delete()</a>
+<a name="ln109">{</a>
+<a name="ln110">	free_etc(this, fVIP ? HEAP_PRIORITY_VIP : 0);</a>
+<a name="ln111">}</a>
+<a name="ln112"> </a>
+<a name="ln113"> </a>
+<a name="ln114">void</a>
+<a name="ln115">IOBuffer::SetVecs(generic_size_t firstVecOffset, const generic_io_vec* vecs,</a>
+<a name="ln116">	uint32 count, generic_size_t length, uint32 flags)</a>
+<a name="ln117">{</a>
+<a name="ln118">	memcpy(fVecs, vecs, sizeof(generic_io_vec) * count);</a>
+<a name="ln119"> </a>
+<a name="ln120">	if (count &gt; 0 &amp;&amp; firstVecOffset &gt; 0) {</a>
+<a name="ln121">		fVecs[0].base += firstVecOffset;</a>
+<a name="ln122">		fVecs[0].length -= firstVecOffset;</a>
+<a name="ln123">	}</a>
+<a name="ln124"> </a>
+<a name="ln125">	fVecCount = count;</a>
+<a name="ln126">	fLength = length;</a>
+<a name="ln127">	fPhysical = (flags &amp; B_PHYSICAL_IO_REQUEST) != 0;</a>
+<a name="ln128">	fUser = !fPhysical &amp;&amp; IS_USER_ADDRESS(vecs[0].base);</a>
+<a name="ln129">}</a>
+<a name="ln130"> </a>
+<a name="ln131"> </a>
+<a name="ln132">status_t</a>
+<a name="ln133">IOBuffer::GetNextVirtualVec(void*&amp; _cookie, iovec&amp; vector)</a>
+<a name="ln134">{</a>
+<a name="ln135">	virtual_vec_cookie* cookie = (virtual_vec_cookie*)_cookie;</a>
+<a name="ln136">	if (cookie == NULL) {</a>
+<a name="ln137">		cookie = new(malloc_flags(fVIP ? HEAP_PRIORITY_VIP : 0))</a>
+<a name="ln138">			virtual_vec_cookie;</a>
+<a name="ln139">		if (cookie == NULL)</a>
+<a name="ln140">			return B_NO_MEMORY;</a>
+<a name="ln141"> </a>
+<a name="ln142">		_cookie = cookie;</a>
+<a name="ln143">	}</a>
+<a name="ln144"> </a>
+<a name="ln145">	// recycle a potential previously mapped page</a>
+<a name="ln146">	cookie-&gt;PutPhysicalPageIfNeeded();</a>
+<a name="ln147"> </a>
+<a name="ln148">	if (cookie-&gt;vec_index &gt;= fVecCount)</a>
+<a name="ln149">		return B_BAD_INDEX;</a>
+<a name="ln150"> </a>
+<a name="ln151">	if (!fPhysical) {</a>
+<a name="ln152">		vector.iov_base = (void*)(addr_t)fVecs[cookie-&gt;vec_index].base;</a>
+<a name="ln153">		vector.iov_len = fVecs[cookie-&gt;vec_index++].length;</a>
+<a name="ln154">		return B_OK;</a>
+<a name="ln155">	}</a>
+<a name="ln156"> </a>
+<a name="ln157">	if (cookie-&gt;vec_index == 0</a>
+<a name="ln158">		&amp;&amp; (fVecCount &gt; 1 || fVecs[0].length &gt; B_PAGE_SIZE)) {</a>
+<a name="ln159">		void* mappedAddress;</a>
+<a name="ln160">		addr_t mappedSize;</a>
+<a name="ln161"> </a>
+<a name="ln162">// TODO: This is a potential violation of the VIP requirement, since</a>
+<a name="ln163">// vm_map_physical_memory_vecs() allocates memory without special flags!</a>
+<a name="ln164">		cookie-&gt;mapped_area = vm_map_physical_memory_vecs(</a>
+<a name="ln165">			VMAddressSpace::KernelID(), &quot;io buffer mapped physical vecs&quot;,</a>
+<a name="ln166">			&amp;mappedAddress, B_ANY_KERNEL_ADDRESS, &amp;mappedSize,</a>
+<a name="ln167">			B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, fVecs, fVecCount);</a>
+<a name="ln168"> </a>
+<a name="ln169">		if (cookie-&gt;mapped_area &gt;= 0) {</a>
+<a name="ln170">			vector.iov_base = mappedAddress;</a>
+<a name="ln171">			vector.iov_len = mappedSize;</a>
+<a name="ln172">			return B_OK;</a>
+<a name="ln173">		} else</a>
+<a name="ln174">			ktrace_printf(&quot;failed to map area: %s\n&quot;, strerror(cookie-&gt;mapped_area));</a>
+<a name="ln175">	}</a>
+<a name="ln176"> </a>
+<a name="ln177">	// fallback to page wise mapping</a>
+<a name="ln178">	generic_io_vec&amp; currentVec = fVecs[cookie-&gt;vec_index];</a>
+<a name="ln179">	generic_addr_t address = currentVec.base + cookie-&gt;vec_offset;</a>
+<a name="ln180">	size_t pageOffset = address % B_PAGE_SIZE;</a>
+<a name="ln181"> </a>
+<a name="ln182">// TODO: This is a potential violation of the VIP requirement, since</a>
+<a name="ln183">// vm_get_physical_page() may allocate memory without special flags!</a>
+<a name="ln184">	status_t result = vm_get_physical_page(address - pageOffset,</a>
+<a name="ln185">		&amp;cookie-&gt;virtual_address, &amp;cookie-&gt;physical_page_handle);</a>
+<a name="ln186">	if (result != B_OK)</a>
+<a name="ln187">		return result;</a>
+<a name="ln188"> </a>
+<a name="ln189">	generic_size_t length = min_c(currentVec.length - cookie-&gt;vec_offset,</a>
+<a name="ln190">		B_PAGE_SIZE - pageOffset);</a>
+<a name="ln191"> </a>
+<a name="ln192">	vector.iov_base = (void*)(cookie-&gt;virtual_address + pageOffset);</a>
+<a name="ln193">	vector.iov_len = length;</a>
+<a name="ln194"> </a>
+<a name="ln195">	cookie-&gt;vec_offset += length;</a>
+<a name="ln196">	if (cookie-&gt;vec_offset &gt;= currentVec.length) {</a>
+<a name="ln197">		cookie-&gt;vec_index++;</a>
+<a name="ln198">		cookie-&gt;vec_offset = 0;</a>
+<a name="ln199">	}</a>
+<a name="ln200"> </a>
+<a name="ln201">	return B_OK;</a>
+<a name="ln202">}</a>
+<a name="ln203"> </a>
+<a name="ln204"> </a>
+<a name="ln205">void</a>
+<a name="ln206">IOBuffer::FreeVirtualVecCookie(void* _cookie)</a>
+<a name="ln207">{</a>
+<a name="ln208">	virtual_vec_cookie* cookie = (virtual_vec_cookie*)_cookie;</a>
+<a name="ln209">	if (cookie-&gt;mapped_area &gt;= 0)</a>
+<a name="ln210">		delete_area(cookie-&gt;mapped_area);</a>
+<a name="ln211"> </a>
+<a name="ln212">	cookie-&gt;PutPhysicalPageIfNeeded();</a>
+<a name="ln213"> </a>
+<a name="ln214">	free_etc(cookie, fVIP ? HEAP_PRIORITY_VIP : 0);</a>
+<a name="ln215">}</a>
+<a name="ln216"> </a>
+<a name="ln217"> </a>
+<a name="ln218">status_t</a>
+<a name="ln219">IOBuffer::LockMemory(team_id team, bool isWrite)</a>
+<a name="ln220">{</a>
+<a name="ln221">	if (fMemoryLocked) {</a>
+<a name="ln222">		panic(&quot;memory already locked!&quot;);</a>
+<a name="ln223">		return B_BAD_VALUE;</a>
+<a name="ln224">	}</a>
+<a name="ln225"> </a>
+<a name="ln226">	for (uint32 i = 0; i &lt; fVecCount; i++) {</a>
+<a name="ln227">		status_t status = lock_memory_etc(team, (void*)(addr_t)fVecs[i].base,</a>
+<a name="ln228">			fVecs[i].length, isWrite ? 0 : B_READ_DEVICE);</a>
+<a name="ln229">		if (status != B_OK) {</a>
+<a name="ln230">			_UnlockMemory(team, i, isWrite);</a>
+<a name="ln231">			return status;</a>
+<a name="ln232">		}</a>
+<a name="ln233">	}</a>
+<a name="ln234"> </a>
+<a name="ln235">	fMemoryLocked = true;</a>
+<a name="ln236">	return B_OK;</a>
+<a name="ln237">}</a>
+<a name="ln238"> </a>
+<a name="ln239"> </a>
+<a name="ln240">void</a>
+<a name="ln241">IOBuffer::_UnlockMemory(team_id team, size_t count, bool isWrite)</a>
+<a name="ln242">{</a>
+<a name="ln243">	for (uint32 i = 0; i &lt; count; i++) {</a>
+<a name="ln244">		unlock_memory_etc(team, (void*)(addr_t)fVecs[i].base, fVecs[i].length,</a>
+<a name="ln245">			isWrite ? 0 : B_READ_DEVICE);</a>
+<a name="ln246">	}</a>
+<a name="ln247">}</a>
+<a name="ln248"> </a>
+<a name="ln249"> </a>
+<a name="ln250">void</a>
+<a name="ln251">IOBuffer::UnlockMemory(team_id team, bool isWrite)</a>
+<a name="ln252">{</a>
+<a name="ln253">	if (!fMemoryLocked) {</a>
+<a name="ln254">		panic(&quot;memory not locked&quot;);</a>
+<a name="ln255">		return;</a>
+<a name="ln256">	}</a>
+<a name="ln257"> </a>
+<a name="ln258">	_UnlockMemory(team, fVecCount, isWrite);</a>
+<a name="ln259">	fMemoryLocked = false;</a>
+<a name="ln260">}</a>
+<a name="ln261"> </a>
+<a name="ln262"> </a>
+<a name="ln263">void</a>
+<a name="ln264">IOBuffer::Dump() const</a>
+<a name="ln265">{</a>
+<a name="ln266">	kprintf(&quot;IOBuffer at %p\n&quot;, this);</a>
+<a name="ln267"> </a>
+<a name="ln268">	kprintf(&quot;  origin:     %s\n&quot;, fUser ? &quot;user&quot; : &quot;kernel&quot;);</a>
+<a name="ln269">	kprintf(&quot;  kind:       %s\n&quot;, fPhysical ? &quot;physical&quot; : &quot;virtual&quot;);</a>
+<a name="ln270">	kprintf(&quot;  length:     %&quot; B_PRIuGENADDR &quot;\n&quot;, fLength);</a>
+<a name="ln271">	kprintf(&quot;  capacity:   %&quot; B_PRIuSIZE &quot;\n&quot;, fCapacity);</a>
+<a name="ln272">	kprintf(&quot;  vecs:       %&quot; B_PRIuSIZE &quot;\n&quot;, fVecCount);</a>
+<a name="ln273"> </a>
+<a name="ln274">	for (uint32 i = 0; i &lt; fVecCount; i++) {</a>
+<a name="ln275">		kprintf(&quot;    [%&quot; B_PRIu32 &quot;] %#&quot; B_PRIxGENADDR &quot;, %&quot; B_PRIuGENADDR &quot;\n&quot;,</a>
+<a name="ln276">			i, fVecs[i].base, fVecs[i].length);</a>
+<a name="ln277">	}</a>
+<a name="ln278">}</a>
+<a name="ln279"> </a>
+<a name="ln280"> </a>
+<a name="ln281">// #pragma mark -</a>
+<a name="ln282"> </a>
+<a name="ln283"> </a>
+<a name="ln284">bool</a>
+<a name="ln285">IOOperation::Finish()</a>
+<a name="ln286">{</a>
+<a name="ln287">	TRACE(&quot;IOOperation::Finish()\n&quot;);</a>
+<a name="ln288">	if (fStatus == B_OK) {</a>
+<a name="ln289">		if (fParent-&gt;IsWrite()) {</a>
+<a name="ln290">			TRACE(&quot;  is write\n&quot;);</a>
+<a name="ln291">			if (fPhase == PHASE_READ_BEGIN) {</a>
+<a name="ln292">				TRACE(&quot;  phase read begin\n&quot;);</a>
+<a name="ln293">				// repair phase adjusted vec</a>
+<a name="ln294">				fDMABuffer-&gt;VecAt(fSavedVecIndex).length = fSavedVecLength;</a>
+<a name="ln295"> </a>
+<a name="ln296">				// partial write: copy partial begin to bounce buffer</a>
+<a name="ln297">				bool skipReadEndPhase;</a>
+<a name="ln298">				status_t error = _CopyPartialBegin(true, skipReadEndPhase);</a>
+<a name="ln299">				if (error == B_OK) {</a>
+<a name="ln300">					// We're done with the first phase only (read in begin).</a>
+<a name="ln301">					// Get ready for next phase...</a>
+<a name="ln302">					fPhase = HasPartialEnd() &amp;&amp; !skipReadEndPhase</a>
+<a name="ln303">						? PHASE_READ_END : PHASE_DO_ALL;</a>
+<a name="ln304">					_PrepareVecs();</a>
+<a name="ln305">					ResetStatus();</a>
+<a name="ln306">						// TODO: Is there a race condition, if the request is</a>
+<a name="ln307">						// aborted at the same time?</a>
+<a name="ln308">					return false;</a>
+<a name="ln309">				}</a>
+<a name="ln310"> </a>
+<a name="ln311">				SetStatus(error);</a>
+<a name="ln312">			} else if (fPhase == PHASE_READ_END) {</a>
+<a name="ln313">				TRACE(&quot;  phase read end\n&quot;);</a>
+<a name="ln314">				// repair phase adjusted vec</a>
+<a name="ln315">				generic_io_vec&amp; vec = fDMABuffer-&gt;VecAt(fSavedVecIndex);</a>
+<a name="ln316">				vec.base += vec.length - fSavedVecLength;</a>
+<a name="ln317">				vec.length = fSavedVecLength;</a>
+<a name="ln318"> </a>
+<a name="ln319">				// partial write: copy partial end to bounce buffer</a>
+<a name="ln320">				status_t error = _CopyPartialEnd(true);</a>
+<a name="ln321">				if (error == B_OK) {</a>
+<a name="ln322">					// We're done with the second phase only (read in end).</a>
+<a name="ln323">					// Get ready for next phase...</a>
+<a name="ln324">					fPhase = PHASE_DO_ALL;</a>
+<a name="ln325">					ResetStatus();</a>
+<a name="ln326">						// TODO: Is there a race condition, if the request is</a>
+<a name="ln327">						// aborted at the same time?</a>
+<a name="ln328">					return false;</a>
+<a name="ln329">				}</a>
+<a name="ln330"> </a>
+<a name="ln331">				SetStatus(error);</a>
+<a name="ln332">			}</a>
+<a name="ln333">		}</a>
+<a name="ln334">	}</a>
+<a name="ln335"> </a>
+<a name="ln336">	if (fParent-&gt;IsRead() &amp;&amp; UsesBounceBuffer()) {</a>
+<a name="ln337">		TRACE(&quot;  read with bounce buffer\n&quot;);</a>
+<a name="ln338">		// copy the bounce buffer segments to the final location</a>
+<a name="ln339">		uint8* bounceBuffer = (uint8*)fDMABuffer-&gt;BounceBufferAddress();</a>
+<a name="ln340">		phys_addr_t bounceBufferStart</a>
+<a name="ln341">			= fDMABuffer-&gt;PhysicalBounceBufferAddress();</a>
+<a name="ln342">		phys_addr_t bounceBufferEnd = bounceBufferStart</a>
+<a name="ln343">			+ fDMABuffer-&gt;BounceBufferSize();</a>
+<a name="ln344"> </a>
+<a name="ln345">		const generic_io_vec* vecs = fDMABuffer-&gt;Vecs();</a>
+<a name="ln346">		uint32 vecCount = fDMABuffer-&gt;VecCount();</a>
+<a name="ln347"> </a>
+<a name="ln348">		status_t error = B_OK;</a>
+<a name="ln349"> </a>
+<a name="ln350">		// We iterate through the vecs we have read, moving offset (the device</a>
+<a name="ln351">		// offset) as we go. If [offset, offset + vec.length) intersects with</a>
+<a name="ln352">		// [startOffset, endOffset) we copy to the final location.</a>
+<a name="ln353">		off_t offset = fOffset;</a>
+<a name="ln354">		const off_t startOffset = fOriginalOffset;</a>
+<a name="ln355">		const off_t endOffset = fOriginalOffset + fOriginalLength;</a>
+<a name="ln356"> </a>
+<a name="ln357">		for (uint32 i = 0; error == B_OK &amp;&amp; i &lt; vecCount; i++) {</a>
+<a name="ln358">			const generic_io_vec&amp; vec = vecs[i];</a>
+<a name="ln359">			generic_addr_t base = vec.base;</a>
+<a name="ln360">			generic_size_t length = vec.length;</a>
+<a name="ln361"> </a>
+<a name="ln362">			if (offset &lt; startOffset) {</a>
+<a name="ln363">				// If the complete vector is before the start offset, skip it.</a>
+<a name="ln364">				if (offset + (off_t)length &lt;= startOffset) {</a>
+<a name="ln365">					offset += length;</a>
+<a name="ln366">					continue;</a>
+<a name="ln367">				}</a>
+<a name="ln368"> </a>
+<a name="ln369">				// The vector starts before the start offset, but intersects</a>
+<a name="ln370">				// with it. Skip the part we aren't interested in.</a>
+<a name="ln371">				generic_size_t diff = startOffset - offset;</a>
+<a name="ln372">				offset += diff;</a>
+<a name="ln373">				base += diff;</a>
+<a name="ln374">				length -= diff;</a>
+<a name="ln375">			}</a>
+<a name="ln376"> </a>
+<a name="ln377">			if (offset + (off_t)length &gt; endOffset) {</a>
+<a name="ln378">				// If we're already beyond the end offset, we're done.</a>
+<a name="ln379">				if (offset &gt;= endOffset)</a>
+<a name="ln380">					break;</a>
+<a name="ln381"> </a>
+<a name="ln382">				// The vector extends beyond the end offset -- cut it.</a>
+<a name="ln383">				length = endOffset - offset;</a>
+<a name="ln384">			}</a>
+<a name="ln385"> </a>
+<a name="ln386">			if (base &gt;= bounceBufferStart &amp;&amp; base &lt; bounceBufferEnd) {</a>
+<a name="ln387">				error = fParent-&gt;CopyData(</a>
+<a name="ln388">					bounceBuffer + (base - bounceBufferStart), offset, length);</a>
+<a name="ln389">			}</a>
+<a name="ln390"> </a>
+<a name="ln391">			offset += length;</a>
+<a name="ln392">		}</a>
+<a name="ln393"> </a>
+<a name="ln394">		if (error != B_OK)</a>
+<a name="ln395">			SetStatus(error);</a>
+<a name="ln396">	}</a>
+<a name="ln397"> </a>
+<a name="ln398">	return true;</a>
+<a name="ln399">}</a>
+<a name="ln400"> </a>
+<a name="ln401"> </a>
+<a name="ln402">/*!	Note: SetPartial() must be called first!</a>
+<a name="ln403">*/</a>
+<a name="ln404">status_t</a>
+<a name="ln405">IOOperation::Prepare(IORequest* request)</a>
+<a name="ln406">{</a>
+<a name="ln407">	if (fParent != NULL)</a>
+<a name="ln408">		fParent-&gt;RemoveOperation(this);</a>
+<a name="ln409"> </a>
+<a name="ln410">	fParent = request;</a>
+<a name="ln411"> </a>
+<a name="ln412">	fTransferredBytes = 0;</a>
+<a name="ln413"> </a>
+<a name="ln414">	// set initial phase</a>
+<a name="ln415">	fPhase = PHASE_DO_ALL;</a>
+<a name="ln416">	if (fParent-&gt;IsWrite()) {</a>
+<a name="ln417">		// Copy data to bounce buffer segments, save the partial begin/end vec,</a>
+<a name="ln418">		// which will be copied after their respective read phase.</a>
+<a name="ln419">		if (UsesBounceBuffer()) {</a>
+<a name="ln420">			TRACE(&quot;  write with bounce buffer\n&quot;);</a>
+<a name="ln421">			uint8* bounceBuffer = (uint8*)fDMABuffer-&gt;BounceBufferAddress();</a>
+<a name="ln422">			phys_addr_t bounceBufferStart</a>
+<a name="ln423">				= fDMABuffer-&gt;PhysicalBounceBufferAddress();</a>
+<a name="ln424">			phys_addr_t bounceBufferEnd = bounceBufferStart</a>
+<a name="ln425">				+ fDMABuffer-&gt;BounceBufferSize();</a>
+<a name="ln426"> </a>
+<a name="ln427">			const generic_io_vec* vecs = fDMABuffer-&gt;Vecs();</a>
+<a name="ln428">			uint32 vecCount = fDMABuffer-&gt;VecCount();</a>
+<a name="ln429">			generic_size_t vecOffset = 0;</a>
+<a name="ln430">			uint32 i = 0;</a>
+<a name="ln431"> </a>
+<a name="ln432">			off_t offset = fOffset;</a>
+<a name="ln433">			off_t endOffset = fOffset + fLength;</a>
+<a name="ln434"> </a>
+<a name="ln435">			if (HasPartialBegin()) {</a>
+<a name="ln436">				// skip first block</a>
+<a name="ln437">				generic_size_t toSkip = fBlockSize;</a>
+<a name="ln438">				while (toSkip &gt; 0) {</a>
+<a name="ln439">					if (vecs[i].length &lt;= toSkip) {</a>
+<a name="ln440">						toSkip -= vecs[i].length;</a>
+<a name="ln441">						i++;</a>
+<a name="ln442">					} else {</a>
+<a name="ln443">						vecOffset = toSkip;</a>
+<a name="ln444">						break;</a>
+<a name="ln445">					}</a>
+<a name="ln446">				}</a>
+<a name="ln447"> </a>
+<a name="ln448">				offset += fBlockSize;</a>
+<a name="ln449">			}</a>
+<a name="ln450"> </a>
+<a name="ln451">			if (HasPartialEnd()) {</a>
+<a name="ln452">				// skip last block</a>
+<a name="ln453">				generic_size_t toSkip = fBlockSize;</a>
+<a name="ln454">				while (toSkip &gt; 0) {</a>
+<a name="ln455">					if (vecs[vecCount - 1].length &lt;= toSkip) {</a>
+<a name="ln456">						toSkip -= vecs[vecCount - 1].length;</a>
+<a name="ln457">						vecCount--;</a>
+<a name="ln458">					} else</a>
+<a name="ln459">						break;</a>
+<a name="ln460">				}</a>
+<a name="ln461"> </a>
+<a name="ln462">				endOffset -= fBlockSize;</a>
+<a name="ln463">			}</a>
+<a name="ln464"> </a>
+<a name="ln465">			for (; i &lt; vecCount; i++) {</a>
+<a name="ln466">				const generic_io_vec&amp; vec = vecs[i];</a>
+<a name="ln467">				generic_addr_t base = vec.base + vecOffset;</a>
+<a name="ln468">				generic_size_t length = vec.length - vecOffset;</a>
+<a name="ln469">				vecOffset = 0;</a>
+<a name="ln470"> </a>
+<a name="ln471">				if (base &gt;= bounceBufferStart &amp;&amp; base &lt; bounceBufferEnd) {</a>
+<a name="ln472">					if (offset + (off_t)length &gt; endOffset)</a>
+<a name="ln473">						length = endOffset - offset;</a>
+<a name="ln474">					status_t error = fParent-&gt;CopyData(offset,</a>
+<a name="ln475">						bounceBuffer + (base - bounceBufferStart), length);</a>
+<a name="ln476">					if (error != B_OK)</a>
+<a name="ln477">						return error;</a>
+<a name="ln478">				}</a>
+<a name="ln479"> </a>
+<a name="ln480">				offset += length;</a>
+<a name="ln481">			}</a>
+<a name="ln482">		}</a>
+<a name="ln483"> </a>
+<a name="ln484">		if (HasPartialBegin())</a>
+<a name="ln485">			fPhase = PHASE_READ_BEGIN;</a>
+<a name="ln486">		else if (HasPartialEnd())</a>
+<a name="ln487">			fPhase = PHASE_READ_END;</a>
+<a name="ln488"> </a>
+<a name="ln489">		_PrepareVecs();</a>
+<a name="ln490">	}</a>
+<a name="ln491"> </a>
+<a name="ln492">	ResetStatus();</a>
+<a name="ln493"> </a>
+<a name="ln494">	if (fParent != NULL)</a>
+<a name="ln495">		fParent-&gt;AddOperation(this);</a>
+<a name="ln496"> </a>
+<a name="ln497">	return B_OK;</a>
+<a name="ln498">}</a>
+<a name="ln499"> </a>
+<a name="ln500"> </a>
+<a name="ln501">void</a>
+<a name="ln502">IOOperation::SetOriginalRange(off_t offset, generic_size_t length)</a>
+<a name="ln503">{</a>
+<a name="ln504">	fOriginalOffset = fOffset = offset;</a>
+<a name="ln505">	fOriginalLength = fLength = length;</a>
+<a name="ln506">}</a>
+<a name="ln507"> </a>
+<a name="ln508"> </a>
+<a name="ln509">void</a>
+<a name="ln510">IOOperation::SetRange(off_t offset, generic_size_t length)</a>
+<a name="ln511">{</a>
+<a name="ln512">	fOffset = offset;</a>
+<a name="ln513">	fLength = length;</a>
+<a name="ln514">}</a>
+<a name="ln515"> </a>
+<a name="ln516"> </a>
+<a name="ln517">off_t</a>
+<a name="ln518">IOOperation::Offset() const</a>
+<a name="ln519">{</a>
+<a name="ln520">	return fPhase == PHASE_READ_END ? fOffset + fLength - fBlockSize : fOffset;</a>
+<a name="ln521">}</a>
+<a name="ln522"> </a>
+<a name="ln523"> </a>
+<a name="ln524">generic_size_t</a>
+<a name="ln525">IOOperation::Length() const</a>
+<a name="ln526">{</a>
+<a name="ln527">	return fPhase == PHASE_DO_ALL ? fLength : fBlockSize;</a>
+<a name="ln528">}</a>
+<a name="ln529"> </a>
+<a name="ln530"> </a>
+<a name="ln531">generic_io_vec*</a>
+<a name="ln532">IOOperation::Vecs() const</a>
+<a name="ln533">{</a>
+<a name="ln534">	switch (fPhase) {</a>
+<a name="ln535">		case PHASE_READ_END:</a>
+<a name="ln536">			return fDMABuffer-&gt;Vecs() + fSavedVecIndex;</a>
+<a name="ln537">		case PHASE_READ_BEGIN:</a>
+<a name="ln538">		case PHASE_DO_ALL:</a>
+<a name="ln539">		default:</a>
+<a name="ln540">			return fDMABuffer-&gt;Vecs();</a>
+<a name="ln541">	}</a>
+<a name="ln542">}</a>
+<a name="ln543"> </a>
+<a name="ln544"> </a>
+<a name="ln545">uint32</a>
+<a name="ln546">IOOperation::VecCount() const</a>
+<a name="ln547">{</a>
+<a name="ln548">	switch (fPhase) {</a>
+<a name="ln549">		case PHASE_READ_BEGIN:</a>
+<a name="ln550">			return fSavedVecIndex + 1;</a>
+<a name="ln551">		case PHASE_READ_END:</a>
+<a name="ln552">			return fDMABuffer-&gt;VecCount() - fSavedVecIndex;</a>
+<a name="ln553">		case PHASE_DO_ALL:</a>
+<a name="ln554">		default:</a>
+<a name="ln555">			return fDMABuffer-&gt;VecCount();</a>
+<a name="ln556">	}</a>
+<a name="ln557">}</a>
+<a name="ln558"> </a>
+<a name="ln559"> </a>
+<a name="ln560">void</a>
+<a name="ln561">IOOperation::SetPartial(bool partialBegin, bool partialEnd)</a>
+<a name="ln562">{</a>
+<a name="ln563">	TRACE(&quot;partial begin %d, end %d\n&quot;, partialBegin, partialEnd);</a>
+<a name="ln564">	fPartialBegin = partialBegin;</a>
+<a name="ln565">	fPartialEnd = partialEnd;</a>
+<a name="ln566">}</a>
+<a name="ln567"> </a>
+<a name="ln568"> </a>
+<a name="ln569">bool</a>
+<a name="ln570">IOOperation::IsWrite() const</a>
+<a name="ln571">{</a>
+<a name="ln572">	return fParent-&gt;IsWrite() &amp;&amp; fPhase == PHASE_DO_ALL;</a>
+<a name="ln573">}</a>
+<a name="ln574"> </a>
+<a name="ln575"> </a>
+<a name="ln576">bool</a>
+<a name="ln577">IOOperation::IsRead() const</a>
+<a name="ln578">{</a>
+<a name="ln579">	return fParent-&gt;IsRead();</a>
+<a name="ln580">}</a>
+<a name="ln581"> </a>
+<a name="ln582"> </a>
+<a name="ln583">void</a>
+<a name="ln584">IOOperation::_PrepareVecs()</a>
+<a name="ln585">{</a>
+<a name="ln586">	// we need to prepare the vecs for consumption by the drivers</a>
+<a name="ln587">	if (fPhase == PHASE_READ_BEGIN) {</a>
+<a name="ln588">		generic_io_vec* vecs = fDMABuffer-&gt;Vecs();</a>
+<a name="ln589">		uint32 vecCount = fDMABuffer-&gt;VecCount();</a>
+<a name="ln590">		generic_size_t vecLength = fBlockSize;</a>
+<a name="ln591">		for (uint32 i = 0; i &lt; vecCount; i++) {</a>
+<a name="ln592">			generic_io_vec&amp; vec = vecs[i];</a>
+<a name="ln593">			if (vec.length &gt;= vecLength) {</a>
+<a name="ln594">				fSavedVecIndex = i;</a>
+<a name="ln595">				fSavedVecLength = vec.length;</a>
+<a name="ln596">				vec.length = vecLength;</a>
+<a name="ln597">				break;</a>
+<a name="ln598">			}</a>
+<a name="ln599">			vecLength -= vec.length;</a>
+<a name="ln600">		}</a>
+<a name="ln601">	} else if (fPhase == PHASE_READ_END) {</a>
+<a name="ln602">		generic_io_vec* vecs = fDMABuffer-&gt;Vecs();</a>
+<a name="ln603">		uint32 vecCount = fDMABuffer-&gt;VecCount();</a>
+<a name="ln604">		generic_size_t vecLength = fBlockSize;</a>
+<a name="ln605">		for (int32 i = vecCount - 1; i &gt;= 0; i--) {</a>
+<a name="ln606">			generic_io_vec&amp; vec = vecs[i];</a>
+<a name="ln607">			if (vec.length &gt;= vecLength) {</a>
+<a name="ln608">				fSavedVecIndex = i;</a>
+<a name="ln609">				fSavedVecLength = vec.length;</a>
+<a name="ln610">				vec.base += vec.length - vecLength;</a>
+<a name="ln611">				vec.length = vecLength;</a>
+<a name="ln612">				break;</a>
+<a name="ln613">			}</a>
+<a name="ln614">			vecLength -= vec.length;</a>
+<a name="ln615">		}</a>
+<a name="ln616">	}</a>
+<a name="ln617">}</a>
+<a name="ln618"> </a>
+<a name="ln619"> </a>
+<a name="ln620">status_t</a>
+<a name="ln621">IOOperation::_CopyPartialBegin(bool isWrite, bool&amp; singleBlockOnly)</a>
+<a name="ln622">{</a>
+<a name="ln623">	generic_size_t relativeOffset = OriginalOffset() - fOffset;</a>
+<a name="ln624">	generic_size_t length = fBlockSize - relativeOffset;</a>
+<a name="ln625"> </a>
+<a name="ln626">	singleBlockOnly = length &gt;= OriginalLength();</a>
+<a name="ln627">	if (singleBlockOnly)</a>
+<a name="ln628">		length = OriginalLength();</a>
+<a name="ln629"> </a>
+<a name="ln630">	TRACE(&quot;_CopyPartialBegin(%s, single only %d)\n&quot;,</a>
+<a name="ln631">		isWrite ? &quot;write&quot; : &quot;read&quot;, singleBlockOnly);</a>
+<a name="ln632"> </a>
+<a name="ln633">	if (isWrite) {</a>
+<a name="ln634">		return fParent-&gt;CopyData(OriginalOffset(),</a>
+<a name="ln635">			(uint8*)fDMABuffer-&gt;BounceBufferAddress() + relativeOffset, length);</a>
+<a name="ln636">	} else {</a>
+<a name="ln637">		return fParent-&gt;CopyData(</a>
+<a name="ln638">			(uint8*)fDMABuffer-&gt;BounceBufferAddress() + relativeOffset,</a>
+<a name="ln639">			OriginalOffset(), length);</a>
+<a name="ln640">	}</a>
+<a name="ln641">}</a>
+<a name="ln642"> </a>
+<a name="ln643"> </a>
+<a name="ln644">status_t</a>
+<a name="ln645">IOOperation::_CopyPartialEnd(bool isWrite)</a>
+<a name="ln646">{</a>
+<a name="ln647">	TRACE(&quot;_CopyPartialEnd(%s)\n&quot;, isWrite ? &quot;write&quot; : &quot;read&quot;);</a>
+<a name="ln648"> </a>
+<a name="ln649">	const generic_io_vec&amp; lastVec</a>
+<a name="ln650">		= fDMABuffer-&gt;VecAt(fDMABuffer-&gt;VecCount() - 1);</a>
+<a name="ln651">	off_t lastVecPos = fOffset + fLength - fBlockSize;</a>
+<a name="ln652">	uint8* base = (uint8*)fDMABuffer-&gt;BounceBufferAddress()</a>
+<a name="ln653">		+ (lastVec.base + lastVec.length - fBlockSize</a>
+<a name="ln654">		- fDMABuffer-&gt;PhysicalBounceBufferAddress());</a>
+<a name="ln655">		// NOTE: this won't work if we don't use the bounce buffer contiguously</a>
+<a name="ln656">		// (because of boundary alignments).</a>
+<a name="ln657">	generic_size_t length = OriginalOffset() + OriginalLength() - lastVecPos;</a>
+<a name="ln658"> </a>
+<a name="ln659">	if (isWrite)</a>
+<a name="ln660">		return fParent-&gt;CopyData(lastVecPos, base, length);</a>
+<a name="ln661"> </a>
+<a name="ln662">	return fParent-&gt;CopyData(base, lastVecPos, length);</a>
+<a name="ln663">}</a>
+<a name="ln664"> </a>
+<a name="ln665"> </a>
+<a name="ln666">void</a>
+<a name="ln667">IOOperation::Dump() const</a>
+<a name="ln668">{</a>
+<a name="ln669">	kprintf(&quot;io_operation at %p\n&quot;, this);</a>
+<a name="ln670"> </a>
+<a name="ln671">	kprintf(&quot;  parent:           %p\n&quot;, fParent);</a>
+<a name="ln672">	kprintf(&quot;  status:           %s\n&quot;, strerror(fStatus));</a>
+<a name="ln673">	kprintf(&quot;  dma buffer:       %p\n&quot;, fDMABuffer);</a>
+<a name="ln674">	kprintf(&quot;  offset:           %-8&quot; B_PRIdOFF &quot; (original: %&quot; B_PRIdOFF &quot;)\n&quot;,</a>
+<a name="ln675">		fOffset, fOriginalOffset);</a>
+<a name="ln676">	kprintf(&quot;  length:           %-8&quot; B_PRIuGENADDR &quot; (original: %&quot;</a>
+<a name="ln677">		B_PRIuGENADDR &quot;)\n&quot;, fLength, fOriginalLength);</a>
+<a name="ln678">	kprintf(&quot;  transferred:      %&quot; B_PRIuGENADDR &quot;\n&quot;, fTransferredBytes);</a>
+<a name="ln679">	kprintf(&quot;  block size:       %&quot; B_PRIuGENADDR &quot;\n&quot;, fBlockSize);</a>
+<a name="ln680">	kprintf(&quot;  saved vec index:  %u\n&quot;, fSavedVecIndex);</a>
+<a name="ln681">	kprintf(&quot;  saved vec length: %u\n&quot;, fSavedVecLength);</a>
+<a name="ln682">	kprintf(&quot;  r/w:              %s\n&quot;, IsWrite() ? &quot;write&quot; : &quot;read&quot;);</a>
+<a name="ln683">	kprintf(&quot;  phase:            %s\n&quot;, fPhase == PHASE_READ_BEGIN</a>
+<a name="ln684">		? &quot;read begin&quot; : fPhase == PHASE_READ_END ? &quot;read end&quot;</a>
+<a name="ln685">		: fPhase == PHASE_DO_ALL ? &quot;do all&quot; : &quot;unknown&quot;);</a>
+<a name="ln686">	kprintf(&quot;  partial begin:    %s\n&quot;, fPartialBegin ? &quot;yes&quot; : &quot;no&quot;);</a>
+<a name="ln687">	kprintf(&quot;  partial end:      %s\n&quot;, fPartialEnd ? &quot;yes&quot; : &quot;no&quot;);</a>
+<a name="ln688">	kprintf(&quot;  bounce buffer:    %s\n&quot;, fUsesBounceBuffer ? &quot;yes&quot; : &quot;no&quot;);</a>
+<a name="ln689"> </a>
+<a name="ln690">	set_debug_variable(&quot;_parent&quot;, (addr_t)fParent);</a>
+<a name="ln691">	set_debug_variable(&quot;_buffer&quot;, (addr_t)fDMABuffer);</a>
+<a name="ln692">}</a>
+<a name="ln693"> </a>
+<a name="ln694"> </a>
+<a name="ln695">// #pragma mark -</a>
+<a name="ln696"> </a>
+<a name="ln697"> </a>
+<a name="ln698">IORequest::IORequest()</a>
+<a name="ln699">	:</a>
+<a name="ln700">	fIsNotified(false),</a>
+<a name="ln701">	fFinishedCallback(NULL),</a>
+<a name="ln702">	fFinishedCookie(NULL),</a>
+<a name="ln703">	fIterationCallback(NULL),</a>
+<a name="ln704">	fIterationCookie(NULL)</a>
+<a name="ln705">{</a>
+<a name="ln706">	mutex_init(&amp;fLock, &quot;I/O request lock&quot;);</a>
+<a name="ln707">	fFinishedCondition.Init(this, &quot;I/O request finished&quot;);</a>
+<a name="ln708">}</a>
+<a name="ln709"> </a>
+<a name="ln710"> </a>
+<a name="ln711">IORequest::~IORequest()</a>
+<a name="ln712">{</a>
+<a name="ln713">	mutex_lock(&amp;fLock);</a>
+<a name="ln714">	DeleteSubRequests();</a>
+<a name="ln715">	if (fBuffer != NULL)</a>
+<a name="ln716">		fBuffer-&gt;Delete();</a>
+<a name="ln717">	mutex_destroy(&amp;fLock);</a>
+<a name="ln718">}</a>
+<a name="ln719"> </a>
+<a name="ln720"> </a>
+<a name="ln721">/* static */ IORequest*</a>
+<a name="ln722">IORequest::Create(bool vip)</a>
+<a name="ln723">{</a>
+<a name="ln724">	return vip</a>
+<a name="ln725">		? new(malloc_flags(HEAP_PRIORITY_VIP)) IORequest</a>
+<a name="ln726">		: new(std::nothrow) IORequest;</a>
+<a name="ln727">}</a>
+<a name="ln728"> </a>
+<a name="ln729"> </a>
+<a name="ln730">status_t</a>
+<a name="ln731">IORequest::Init(off_t offset, generic_addr_t buffer, generic_size_t length,</a>
+<a name="ln732">	bool write, uint32 flags)</a>
+<a name="ln733">{</a>
+<a name="ln734">	ASSERT(offset &gt;= 0);</a>
+<a name="ln735"> </a>
+<a name="ln736">	generic_io_vec vec;</a>
+<a name="ln737">	vec.base = buffer;</a>
+<a name="ln738">	vec.length = length;</a>
+<a name="ln739">	return Init(offset, &amp;vec, 1, length, write, flags);</a>
+<a name="ln740">}</a>
+<a name="ln741"> </a>
+<a name="ln742"> </a>
+<a name="ln743">status_t</a>
+<a name="ln744">IORequest::Init(off_t offset, generic_size_t firstVecOffset,</a>
+<a name="ln745">	const generic_io_vec* vecs, size_t count, generic_size_t length, bool write,</a>
+<a name="ln746">	uint32 flags)</a>
+<a name="ln747">{</a>
+<a name="ln748">	ASSERT(offset &gt;= 0);</a>
+<a name="ln749"> </a>
+<a name="ln750">	fBuffer = IOBuffer::Create(count, (flags &amp; B_VIP_IO_REQUEST) != 0);</a>
+<a name="ln751">	if (fBuffer == NULL)</a>
+<a name="ln752">		return B_NO_MEMORY;</a>
+<a name="ln753"> </a>
+<a name="ln754">	fBuffer-&gt;SetVecs(firstVecOffset, vecs, count, length, flags);</a>
+<a name="ln755"> </a>
+<a name="ln756">	fOwner = NULL;</a>
+<a name="ln757">	fOffset = offset;</a>
+<a name="ln758">	fLength = length;</a>
+<a name="ln759">	fRelativeParentOffset = 0;</a>
+<a name="ln760">	fTransferSize = 0;</a>
+<a name="ln761">	fFlags = flags;</a>
+<a name="ln762">	Thread* thread = thread_get_current_thread();</a>
+<a name="ln763">	fTeam = thread-&gt;team-&gt;id;</a>
+<a name="ln764">	fThread = thread-&gt;id;</a>
+<a name="ln765">	fIsWrite = write;</a>
+<a name="ln766">	fPartialTransfer = false;</a>
+<a name="ln767">	fSuppressChildNotifications = false;</a>
+<a name="ln768"> </a>
+<a name="ln769">	// these are for iteration</a>
+<a name="ln770">	fVecIndex = 0;</a>
+<a name="ln771">	fVecOffset = 0;</a>
+<a name="ln772">	fRemainingBytes = length;</a>
+<a name="ln773"> </a>
+<a name="ln774">	fPendingChildren = 0;</a>
+<a name="ln775"> </a>
+<a name="ln776">	fStatus = 1;</a>
+<a name="ln777"> </a>
+<a name="ln778">	return B_OK;</a>
+<a name="ln779">}</a>
+<a name="ln780"> </a>
+<a name="ln781"> </a>
+<a name="ln782">status_t</a>
+<a name="ln783">IORequest::CreateSubRequest(off_t parentOffset, off_t offset,</a>
+<a name="ln784">	generic_size_t length, IORequest*&amp; _subRequest)</a>
+<a name="ln785">{</a>
+<a name="ln786">	ASSERT(parentOffset &gt;= fOffset &amp;&amp; length &lt;= fLength</a>
+<a name="ln787">		&amp;&amp; parentOffset - fOffset &lt;= (off_t)(fLength - length));</a>
+<a name="ln788"> </a>
+<a name="ln789">	// find start vec</a>
+<a name="ln790">	generic_size_t vecOffset = parentOffset - fOffset;</a>
+<a name="ln791">	generic_io_vec* vecs = fBuffer-&gt;Vecs();</a>
+<a name="ln792">	int32 vecCount = fBuffer-&gt;VecCount();</a>
+<a name="ln793">	int32 startVec = 0;</a>
+<a name="ln794">	for (; startVec &lt; vecCount; startVec++) {</a>
+<a name="ln795">		const generic_io_vec&amp; vec = vecs[startVec];</a>
+<a name="ln796">		if (vecOffset &lt; vec.length)</a>
+<a name="ln797">			break;</a>
+<a name="ln798"> </a>
+<a name="ln799">		vecOffset -= vec.length;</a>
+<a name="ln800">	}</a>
+<a name="ln801"> </a>
+<a name="ln802">	// count vecs</a>
+<a name="ln803">	generic_size_t currentVecOffset = vecOffset;</a>
+<a name="ln804">	int32 endVec = startVec;</a>
+<a name="ln805">	generic_size_t remainingLength = length;</a>
+<a name="ln806">	for (; endVec &lt; vecCount; endVec++) {</a>
+<a name="ln807">		const generic_io_vec&amp; vec = vecs[endVec];</a>
+<a name="ln808">		if (vec.length - currentVecOffset &gt;= remainingLength)</a>
+<a name="ln809">			break;</a>
+<a name="ln810"> </a>
+<a name="ln811">		remainingLength -= vec.length - currentVecOffset;</a>
+<a name="ln812">		currentVecOffset = 0;</a>
+<a name="ln813">	}</a>
+<a name="ln814"> </a>
+<a name="ln815">	// create subrequest</a>
+<a name="ln816">	IORequest* subRequest = Create((fFlags &amp; B_VIP_IO_REQUEST) != 0);</a>
+<a name="ln817">	if (subRequest == NULL)</a>
+<a name="ln818">		return B_NO_MEMORY;</a>
+<a name="ln819"> </a>
+<a name="ln820">	status_t error = subRequest-&gt;Init(offset, vecOffset, vecs + startVec,</a>
+<a name="ln821">		endVec - startVec + 1, length, fIsWrite, fFlags &amp; ~B_DELETE_IO_REQUEST);</a>
+<a name="ln822">	if (error != B_OK) {</a>
+<a name="ln823">		delete subRequest;</a>
+<a name="ln824">		return error;</a>
+<a name="ln825">	}</a>
+<a name="ln826"> </a>
+<a name="ln827">	subRequest-&gt;fRelativeParentOffset = parentOffset - fOffset;</a>
+<a name="ln828">	subRequest-&gt;fTeam = fTeam;</a>
+<a name="ln829">	subRequest-&gt;fThread = fThread;</a>
+<a name="ln830"> </a>
+<a name="ln831">	_subRequest = subRequest;</a>
+<a name="ln832">	subRequest-&gt;SetParent(this);</a>
+<a name="ln833"> </a>
+<a name="ln834">	MutexLocker _(fLock);</a>
+<a name="ln835"> </a>
+<a name="ln836">	fChildren.Add(subRequest);</a>
+<a name="ln837">	fPendingChildren++;</a>
+<a name="ln838">	TRACE(&quot;IORequest::CreateSubRequest(): request: %p, subrequest: %p\n&quot;, this,</a>
+<a name="ln839">		subRequest);</a>
+<a name="ln840"> </a>
+<a name="ln841">	return B_OK;</a>
+<a name="ln842">}</a>
+<a name="ln843"> </a>
+<a name="ln844"> </a>
+<a name="ln845">void</a>
+<a name="ln846">IORequest::DeleteSubRequests()</a>
+<a name="ln847">{</a>
+<a name="ln848">	while (IORequestChunk* chunk = fChildren.RemoveHead())</a>
+<a name="ln849">		delete chunk;</a>
+<a name="ln850">	fPendingChildren = 0;</a>
+<a name="ln851">}</a>
+<a name="ln852"> </a>
+<a name="ln853"> </a>
+<a name="ln854">void</a>
+<a name="ln855">IORequest::SetFinishedCallback(io_request_finished_callback callback,</a>
+<a name="ln856">	void* cookie)</a>
+<a name="ln857">{</a>
+<a name="ln858">	fFinishedCallback = callback;</a>
+<a name="ln859">	fFinishedCookie = cookie;</a>
+<a name="ln860">}</a>
+<a name="ln861"> </a>
+<a name="ln862"> </a>
+<a name="ln863">void</a>
+<a name="ln864">IORequest::SetIterationCallback(io_request_iterate_callback callback,</a>
+<a name="ln865">	void* cookie)</a>
+<a name="ln866">{</a>
+<a name="ln867">	fIterationCallback = callback;</a>
+<a name="ln868">	fIterationCookie = cookie;</a>
+<a name="ln869">}</a>
+<a name="ln870"> </a>
+<a name="ln871"> </a>
+<a name="ln872">io_request_finished_callback</a>
+<a name="ln873">IORequest::FinishedCallback(void** _cookie) const</a>
+<a name="ln874">{</a>
+<a name="ln875">	if (_cookie != NULL)</a>
+<a name="ln876">		*_cookie = fFinishedCookie;</a>
+<a name="ln877">	return fFinishedCallback;</a>
+<a name="ln878">}</a>
+<a name="ln879"> </a>
+<a name="ln880"> </a>
+<a name="ln881">status_t</a>
+<a name="ln882">IORequest::Wait(uint32 flags, bigtime_t timeout)</a>
+<a name="ln883">{</a>
+<a name="ln884">	MutexLocker locker(fLock);</a>
+<a name="ln885"> </a>
+<a name="ln886">	if (IsFinished() &amp;&amp; fIsNotified)</a>
+<a name="ln887">		return Status();</a>
+<a name="ln888"> </a>
+<a name="ln889">	ConditionVariableEntry entry;</a>
+<a name="ln890">	fFinishedCondition.Add(&amp;entry);</a>
+<a name="ln891"> </a>
+<a name="ln892">	locker.Unlock();</a>
+<a name="ln893"> </a>
+<a name="ln894">	status_t error = entry.Wait(flags, timeout);</a>
+<a name="ln895">	if (error != B_OK)</a>
+<a name="ln896">		return error;</a>
+<a name="ln897"> </a>
+<a name="ln898">	return Status();</a>
+<a name="ln899">}</a>
+<a name="ln900"> </a>
+<a name="ln901"> </a>
+<a name="ln902">void</a>
+<a name="ln903">IORequest::NotifyFinished()</a>
+<a name="ln904">{</a>
+<a name="ln905">	TRACE(&quot;IORequest::NotifyFinished(): request: %p\n&quot;, this);</a>
+<a name="ln906"> </a>
+<a name="ln907">	MutexLocker locker(fLock);</a>
+<a name="ln908"> </a>
+<a name="ln909">	if (fStatus == B_OK &amp;&amp; !fPartialTransfer &amp;&amp; RemainingBytes() &gt; 0) {</a>
+<a name="ln910">		// The request is not really done yet. If it has an iteration callback,</a>
+<a name="ln911">		// call it.</a>
+<a name="ln912">		if (fIterationCallback != NULL) {</a>
+<a name="ln913">			ResetStatus();</a>
+<a name="ln914">			locker.Unlock();</a>
+<a name="ln915">			bool partialTransfer = false;</a>
+<a name="ln916">			status_t error = fIterationCallback(fIterationCookie, this,</a>
+<a name="ln917">				&amp;partialTransfer);</a>
+<a name="ln918">			if (error == B_OK &amp;&amp; !partialTransfer)</a>
+<a name="ln919">				return;</a>
+<a name="ln920"> </a>
+<a name="ln921">			// Iteration failed, which means we're responsible for notifying the</a>
+<a name="ln922">			// requests finished.</a>
+<a name="ln923">			locker.Lock();</a>
+<a name="ln924">			fStatus = error;</a>
+<a name="ln925">			fPartialTransfer = true;</a>
+<a name="ln926">		}</a>
+<a name="ln927">	}</a>
+<a name="ln928"> </a>
+<a name="ln929">	ASSERT(!fIsNotified);</a>
+<a name="ln930">	ASSERT(fPendingChildren == 0);</a>
+<a name="ln931">	ASSERT(fChildren.IsEmpty()</a>
+<a name="ln932">		|| dynamic_cast&lt;IOOperation*&gt;(fChildren.Head()) == NULL);</a>
+<a name="ln933"> </a>
+<a name="ln934">	// unlock the memory</a>
+<a name="ln935">	if (fBuffer-&gt;IsMemoryLocked())</a>
+<a name="ln936">		fBuffer-&gt;UnlockMemory(fTeam, fIsWrite);</a>
+<a name="ln937"> </a>
+<a name="ln938">	// Cache the callbacks before we unblock waiters and unlock. Any of the</a>
+<a name="ln939">	// following could delete this request, so we don't want to touch it</a>
+<a name="ln940">	// once we have started telling others that it is done.</a>
+<a name="ln941">	IORequest* parent = fParent;</a>
+<a name="ln942">	io_request_finished_callback finishedCallback = fFinishedCallback;</a>
+<a name="ln943">	void* finishedCookie = fFinishedCookie;</a>
+<a name="ln944">	status_t status = fStatus;</a>
+<a name="ln945">	generic_size_t lastTransferredOffset</a>
+<a name="ln946">		= fRelativeParentOffset + fTransferSize;</a>
+<a name="ln947">	bool partialTransfer = status != B_OK || fPartialTransfer;</a>
+<a name="ln948">	bool deleteRequest = (fFlags &amp; B_DELETE_IO_REQUEST) != 0;</a>
+<a name="ln949"> </a>
+<a name="ln950">	// unblock waiters</a>
+<a name="ln951">	fIsNotified = true;</a>
+<a name="ln952">	fFinishedCondition.NotifyAll();</a>
+<a name="ln953"> </a>
+<a name="ln954">	locker.Unlock();</a>
+<a name="ln955"> </a>
+<a name="ln956">	// notify callback</a>
+<a name="ln957">	if (finishedCallback != NULL) {</a>
+<a name="ln958">		finishedCallback(finishedCookie, this, status, partialTransfer,</a>
+<a name="ln959">			lastTransferredOffset);</a>
+<a name="ln960">	}</a>
+<a name="ln961"> </a>
+<a name="ln962">	// notify parent</a>
+<a name="ln963">	if (parent != NULL) {</a>
+<a name="ln964">		parent-&gt;SubRequestFinished(this, status, partialTransfer,</a>
+<a name="ln965">			lastTransferredOffset);</a>
+<a name="ln966">	}</a>
+<a name="ln967"> </a>
+<a name="ln968">	if (deleteRequest)</a>
+<a name="ln969">		delete this;</a>
+<a name="ln970">}</a>
+<a name="ln971"> </a>
+<a name="ln972"> </a>
+<a name="ln973">/*!	Returns whether this request or any of it's ancestors has a finished or</a>
+<a name="ln974">	notification callback. Used to decide whether NotifyFinished() can be called</a>
+<a name="ln975">	synchronously.</a>
+<a name="ln976">*/</a>
+<a name="ln977">bool</a>
+<a name="ln978">IORequest::HasCallbacks() const</a>
+<a name="ln979">{</a>
+<a name="ln980">	if (fFinishedCallback != NULL || fIterationCallback != NULL)</a>
+<a name="ln981">		return true;</a>
+<a name="ln982"> </a>
+<a name="ln983">	return fParent != NULL &amp;&amp; fParent-&gt;HasCallbacks();</a>
+<a name="ln984">}</a>
+<a name="ln985"> </a>
+<a name="ln986"> </a>
+<a name="ln987">void</a>
+<a name="ln988">IORequest::SetStatusAndNotify(status_t status)</a>
+<a name="ln989">{</a>
+<a name="ln990">	MutexLocker locker(fLock);</a>
+<a name="ln991"> </a>
+<a name="ln992">	if (fStatus != 1)</a>
+<a name="ln993">		return;</a>
+<a name="ln994"> </a>
+<a name="ln995">	fStatus = status;</a>
+<a name="ln996"> </a>
+<a name="ln997">	locker.Unlock();</a>
+<a name="ln998"> </a>
+<a name="ln999">	NotifyFinished();</a>
+<a name="ln1000">}</a>
+<a name="ln1001"> </a>
+<a name="ln1002"> </a>
+<a name="ln1003">void</a>
+<a name="ln1004">IORequest::OperationFinished(IOOperation* operation, status_t status,</a>
+<a name="ln1005">	bool partialTransfer, generic_size_t transferEndOffset)</a>
+<a name="ln1006">{</a>
+<a name="ln1007">	TRACE(&quot;IORequest::OperationFinished(%p, %#&quot; B_PRIx32 &quot;): request: %p\n&quot;,</a>
+<a name="ln1008">		operation, status, this);</a>
+<a name="ln1009"> </a>
+<a name="ln1010">	MutexLocker locker(fLock);</a>
+<a name="ln1011"> </a>
+<a name="ln1012">	fChildren.Remove(operation);</a>
+<a name="ln1013">	operation-&gt;SetParent(NULL);</a>
+<a name="ln1014"> </a>
+<a name="ln1015">	if (status != B_OK || partialTransfer) {</a>
+<a name="ln1016">		if (fTransferSize &gt; transferEndOffset)</a>
+<a name="ln1017">			fTransferSize = transferEndOffset;</a>
+<a name="ln1018">		fPartialTransfer = true;</a>
+<a name="ln1019">	}</a>
+<a name="ln1020"> </a>
+<a name="ln1021">	if (status != B_OK &amp;&amp; fStatus == 1)</a>
+<a name="ln1022">		fStatus = status;</a>
+<a name="ln1023"> </a>
+<a name="ln1024">	if (--fPendingChildren &gt; 0)</a>
+<a name="ln1025">		return;</a>
+<a name="ln1026"> </a>
+<a name="ln1027">	// last child finished</a>
+<a name="ln1028"> </a>
+<a name="ln1029">	// set status, if not done yet</a>
+<a name="ln1030">	if (fStatus == 1)</a>
+<a name="ln1031">		fStatus = B_OK;</a>
+<a name="ln1032">}</a>
+<a name="ln1033"> </a>
+<a name="ln1034"> </a>
+<a name="ln1035">void</a>
+<a name="ln1036">IORequest::SubRequestFinished(IORequest* request, status_t status,</a>
+<a name="ln1037">	bool partialTransfer, generic_size_t transferEndOffset)</a>
+<a name="ln1038">{</a>
+<a name="ln1039">	TRACE(&quot;IORequest::SubrequestFinished(%p, %#&quot; B_PRIx32 &quot;, %d, %&quot;</a>
+<a name="ln1040">		B_PRIuGENADDR &quot;): request: %p\n&quot;, request, status, partialTransfer, transferEndOffset, this);</a>
+<a name="ln1041"> </a>
+<a name="ln1042">	MutexLocker locker(fLock);</a>
+<a name="ln1043"> </a>
+<a name="ln1044">	if (status != B_OK || partialTransfer) {</a>
+<a name="ln1045">		if (fTransferSize &gt; transferEndOffset)</a>
+<a name="ln1046">			fTransferSize = transferEndOffset;</a>
+<a name="ln1047">		fPartialTransfer = true;</a>
+<a name="ln1048">	}</a>
+<a name="ln1049"> </a>
+<a name="ln1050">	if (status != B_OK &amp;&amp; fStatus == 1)</a>
+<a name="ln1051">		fStatus = status;</a>
+<a name="ln1052"> </a>
+<a name="ln1053">	if (--fPendingChildren &gt; 0 || fSuppressChildNotifications)</a>
+<a name="ln1054">		return;</a>
+<a name="ln1055"> </a>
+<a name="ln1056">	// last child finished</a>
+<a name="ln1057"> </a>
+<a name="ln1058">	// set status, if not done yet</a>
+<a name="ln1059">	if (fStatus == 1)</a>
+<a name="ln1060">		fStatus = B_OK;</a>
+<a name="ln1061"> </a>
+<a name="ln1062">	locker.Unlock();</a>
+<a name="ln1063"> </a>
+<a name="ln1064">	NotifyFinished();</a>
+<a name="ln1065">}</a>
+<a name="ln1066"> </a>
+<a name="ln1067"> </a>
+<a name="ln1068">void</a>
+<a name="ln1069">IORequest::SetUnfinished()</a>
+<a name="ln1070">{</a>
+<a name="ln1071">	MutexLocker _(fLock);</a>
+<a name="ln1072">	ResetStatus();</a>
+<a name="ln1073">}</a>
+<a name="ln1074"> </a>
+<a name="ln1075"> </a>
+<a name="ln1076">void</a>
+<a name="ln1077">IORequest::SetTransferredBytes(bool partialTransfer,</a>
+<a name="ln1078">	generic_size_t transferredBytes)</a>
+<a name="ln1079">{</a>
+<a name="ln1080">	TRACE(&quot;%p-&gt;IORequest::SetTransferredBytes(%d, %&quot; B_PRIuGENADDR &quot;)\n&quot;, this,</a>
+<a name="ln1081">		partialTransfer, transferredBytes);</a>
+<a name="ln1082"> </a>
+<a name="ln1083">	MutexLocker _(fLock);</a>
+<a name="ln1084"> </a>
+<a name="ln1085">	fPartialTransfer = partialTransfer;</a>
+<a name="ln1086">	fTransferSize = transferredBytes;</a>
+<a name="ln1087">}</a>
+<a name="ln1088"> </a>
+<a name="ln1089"> </a>
+<a name="ln1090">void</a>
+<a name="ln1091">IORequest::SetSuppressChildNotifications(bool suppress)</a>
+<a name="ln1092">{</a>
+<a name="ln1093">	fSuppressChildNotifications = suppress;</a>
+<a name="ln1094">}</a>
+<a name="ln1095"> </a>
+<a name="ln1096"> </a>
+<a name="ln1097">void</a>
+<a name="ln1098">IORequest::Advance(generic_size_t bySize)</a>
+<a name="ln1099">{</a>
+<a name="ln1100">	TRACE(&quot;IORequest::Advance(%&quot; B_PRIuGENADDR &quot;): remaining: %&quot; B_PRIuGENADDR</a>
+<a name="ln1101">		&quot; -&gt; %&quot; B_PRIuGENADDR &quot;\n&quot;, bySize, fRemainingBytes,</a>
+<a name="ln1102">		fRemainingBytes - bySize);</a>
+<a name="ln1103">	fRemainingBytes -= bySize;</a>
+<a name="ln1104">	fTransferSize += bySize;</a>
+<a name="ln1105"> </a>
+<a name="ln1106">	generic_io_vec* vecs = fBuffer-&gt;Vecs();</a>
+<a name="ln1107">	uint32 vecCount = fBuffer-&gt;VecCount();</a>
+<a name="ln1108">	while (fVecIndex &lt; vecCount</a>
+<a name="ln1109">			&amp;&amp; vecs[fVecIndex].length - fVecOffset &lt;= bySize) {</a>
+<a name="ln1110">		bySize -= vecs[fVecIndex].length - fVecOffset;</a>
+<a name="ln1111">		fVecOffset = 0;</a>
+<a name="ln1112">		fVecIndex++;</a>
+<a name="ln1113">	}</a>
+<a name="ln1114"> </a>
+<a name="ln1115">	fVecOffset += bySize;</a>
+<a name="ln1116">}</a>
+<a name="ln1117"> </a>
+<a name="ln1118"> </a>
+<a name="ln1119">IORequest*</a>
+<a name="ln1120">IORequest::FirstSubRequest()</a>
+<a name="ln1121">{</a>
+<a name="ln1122">	return dynamic_cast&lt;IORequest*&gt;(fChildren.Head());</a>
+<a name="ln1123">}</a>
+<a name="ln1124"> </a>
+<a name="ln1125"> </a>
+<a name="ln1126">IORequest*</a>
+<a name="ln1127">IORequest::NextSubRequest(IORequest* previous)</a>
+<a name="ln1128">{</a>
+<a name="ln1129">	if (previous == NULL)</a>
+<a name="ln1130">		return NULL;</a>
+<a name="ln1131">	return dynamic_cast&lt;IORequest*&gt;(fChildren.GetNext(previous));</a>
+<a name="ln1132">}</a>
+<a name="ln1133"> </a>
+<a name="ln1134"> </a>
+<a name="ln1135">void</a>
+<a name="ln1136">IORequest::AddOperation(IOOperation* operation)</a>
+<a name="ln1137">{</a>
+<a name="ln1138">	MutexLocker locker(fLock);</a>
+<a name="ln1139">	TRACE(&quot;IORequest::AddOperation(%p): request: %p\n&quot;, operation, this);</a>
+<a name="ln1140">	fChildren.Add(operation);</a>
+<a name="ln1141">	fPendingChildren++;</a>
+<a name="ln1142">}</a>
+<a name="ln1143"> </a>
+<a name="ln1144"> </a>
+<a name="ln1145">void</a>
+<a name="ln1146">IORequest::RemoveOperation(IOOperation* operation)</a>
+<a name="ln1147">{</a>
+<a name="ln1148">	MutexLocker locker(fLock);</a>
+<a name="ln1149">	fChildren.Remove(operation);</a>
+<a name="ln1150">	operation-&gt;SetParent(NULL);</a>
+<a name="ln1151">}</a>
+<a name="ln1152"> </a>
+<a name="ln1153"> </a>
+<a name="ln1154">status_t</a>
+<a name="ln1155">IORequest::CopyData(off_t offset, void* buffer, size_t size)</a>
+<a name="ln1156">{</a>
+<a name="ln1157">	return _CopyData(buffer, offset, size, true);</a>
+<a name="ln1158">}</a>
+<a name="ln1159"> </a>
+<a name="ln1160"> </a>
+<a name="ln1161">status_t</a>
+<a name="ln1162">IORequest::CopyData(const void* buffer, off_t offset, size_t size)</a>
+<a name="ln1163">{</a>
+<a name="ln1164">	return _CopyData((void*)buffer, offset, size, false);</a>
+<a name="ln1165">}</a>
+<a name="ln1166"> </a>
+<a name="ln1167"> </a>
+<a name="ln1168">status_t</a>
+<a name="ln1169">IORequest::ClearData(off_t offset, generic_size_t size)</a>
+<a name="ln1170">{</a>
+<a name="ln1171">	if (size == 0)</a>
+<a name="ln1172">		return B_OK;</a>
+<a name="ln1173"> </a>
+<a name="ln1174">	if (offset &lt; fOffset || offset + (off_t)size &gt; fOffset + (off_t)fLength) {</a>
+<a name="ln1175">		panic(&quot;IORequest::ClearData(): invalid range: (%&quot; B_PRIdOFF</a>
+<a name="ln1176">			&quot;, %&quot; B_PRIuGENADDR &quot;)&quot;, offset, size);</a>
+<a name="ln1177">		return B_BAD_VALUE;</a>
+<a name="ln1178">	}</a>
+<a name="ln1179"> </a>
+<a name="ln1180">	// If we can, we directly copy from/to the virtual buffer. The memory is</a>
+<a name="ln1181">	// locked in this case.</a>
+<a name="ln1182">	status_t (*clearFunction)(generic_addr_t, generic_size_t, team_id);</a>
+<a name="ln1183">	if (fBuffer-&gt;IsPhysical()) {</a>
+<a name="ln1184">		clearFunction = &amp;IORequest::_ClearDataPhysical;</a>
+<a name="ln1185">	} else {</a>
+<a name="ln1186">		clearFunction = fBuffer-&gt;IsUser() &amp;&amp; fTeam != team_get_current_team_id()</a>
+<a name="ln1187">			? &amp;IORequest::_ClearDataUser : &amp;IORequest::_ClearDataSimple;</a>
+<a name="ln1188">	}</a>
+<a name="ln1189"> </a>
+<a name="ln1190">	// skip bytes if requested</a>
+<a name="ln1191">	generic_io_vec* vecs = fBuffer-&gt;Vecs();</a>
+<a name="ln1192">	generic_size_t skipBytes = offset - fOffset;</a>
+<a name="ln1193">	generic_size_t vecOffset = 0;</a>
+<a name="ln1194">	while (skipBytes &gt; 0) {</a>
+<a name="ln1195">		if (vecs[0].length &gt; skipBytes) {</a>
+<a name="ln1196">			vecOffset = skipBytes;</a>
+<a name="ln1197">			break;</a>
+<a name="ln1198">		}</a>
+<a name="ln1199"> </a>
+<a name="ln1200">		skipBytes -= vecs[0].length;</a>
+<a name="ln1201">		vecs++;</a>
+<a name="ln1202">	}</a>
+<a name="ln1203"> </a>
+<a name="ln1204">	// clear vector-wise</a>
+<a name="ln1205">	while (size &gt; 0) {</a>
+<a name="ln1206">		generic_size_t toClear = min_c(size, vecs[0].length - vecOffset);</a>
+<a name="ln1207">		status_t error = clearFunction(vecs[0].base + vecOffset, toClear,</a>
+<a name="ln1208">			fTeam);</a>
+<a name="ln1209">		if (error != B_OK)</a>
+<a name="ln1210">			return error;</a>
+<a name="ln1211"> </a>
+<a name="ln1212">		size -= toClear;</a>
+<a name="ln1213">		vecs++;</a>
+<a name="ln1214">		vecOffset = 0;</a>
+<a name="ln1215">	}</a>
+<a name="ln1216"> </a>
+<a name="ln1217">	return B_OK;</a>
+<a name="ln1218"> </a>
+<a name="ln1219">}</a>
+<a name="ln1220"> </a>
+<a name="ln1221"> </a>
+<a name="ln1222">status_t</a>
+<a name="ln1223">IORequest::_CopyData(void* _buffer, off_t offset, size_t size, bool copyIn)</a>
+<a name="ln1224">{</a>
+<a name="ln1225">	if (size == 0)</a>
+<a name="ln1226">		return B_OK;</a>
+<a name="ln1227"> </a>
+<a name="ln1228">	uint8* buffer = (uint8*)_buffer;</a>
+<a name="ln1229"> </a>
+<a name="ln1230">	if (offset &lt; fOffset || offset + (off_t)size &gt; fOffset + (off_t)fLength) {</a>
+<a name="ln1231">		panic(&quot;IORequest::_CopyData(): invalid range: (%&quot; B_PRIdOFF &quot;, %lu)&quot;,</a>
+<a name="ln1232">			offset, size);</a>
+<a name="ln1233">		return B_BAD_VALUE;</a>
+<a name="ln1234">	}</a>
+<a name="ln1235"> </a>
+<a name="ln1236">	// If we can, we directly copy from/to the virtual buffer. The memory is</a>
+<a name="ln1237">	// locked in this case.</a>
+<a name="ln1238">	status_t (*copyFunction)(void*, generic_addr_t, size_t, team_id, bool);</a>
+<a name="ln1239">	if (fBuffer-&gt;IsPhysical()) {</a>
+<a name="ln1240">		copyFunction = &amp;IORequest::_CopyPhysical;</a>
+<a name="ln1241">	} else {</a>
+<a name="ln1242">		copyFunction = fBuffer-&gt;IsUser() &amp;&amp; fTeam != team_get_current_team_id()</a>
+<a name="ln1243">			? &amp;IORequest::_CopyUser : &amp;IORequest::_CopySimple;</a>
+<a name="ln1244">	}</a>
+<a name="ln1245"> </a>
+<a name="ln1246">	// skip bytes if requested</a>
+<a name="ln1247">	generic_io_vec* vecs = fBuffer-&gt;Vecs();</a>
+<a name="ln1248">	generic_size_t skipBytes = offset - fOffset;</a>
+<a name="ln1249">	generic_size_t vecOffset = 0;</a>
+<a name="ln1250">	while (skipBytes &gt; 0) {</a>
+<a name="ln1251">		if (vecs[0].length &gt; skipBytes) {</a>
+<a name="ln1252">			vecOffset = skipBytes;</a>
+<a name="ln1253">			break;</a>
+<a name="ln1254">		}</a>
+<a name="ln1255"> </a>
+<a name="ln1256">		skipBytes -= vecs[0].length;</a>
+<a name="ln1257">		vecs++;</a>
+<a name="ln1258">	}</a>
+<a name="ln1259"> </a>
+<a name="ln1260">	// copy vector-wise</a>
+<a name="ln1261">	while (size &gt; 0) {</a>
+<a name="ln1262">		generic_size_t toCopy = min_c(size, vecs[0].length - vecOffset);</a>
+<a name="ln1263">		status_t error = copyFunction(buffer, vecs[0].base + vecOffset, toCopy,</a>
+<a name="ln1264">			fTeam, copyIn);</a>
+<a name="ln1265">		if (error != B_OK)</a>
+<a name="ln1266">			return error;</a>
+<a name="ln1267"> </a>
+<a name="ln1268">		buffer += toCopy;</a>
+<a name="ln1269">		size -= toCopy;</a>
+<a name="ln1270">		vecs++;</a>
+<a name="ln1271">		vecOffset = 0;</a>
+<a name="ln1272">	}</a>
+<a name="ln1273"> </a>
+<a name="ln1274">	return B_OK;</a>
+<a name="ln1275">}</a>
+<a name="ln1276"> </a>
+<a name="ln1277"> </a>
+<a name="ln1278">/* static */ status_t</a>
+<a name="ln1279">IORequest::_CopySimple(void* bounceBuffer, generic_addr_t external, size_t size,</a>
+<a name="ln1280">	team_id team, bool copyIn)</a>
+<a name="ln1281">{</a>
+<a name="ln1282">	TRACE(&quot;  IORequest::_CopySimple(%p, %#&quot; B_PRIxGENADDR &quot;, %lu, %d)\n&quot;,</a>
+<a name="ln1283">		bounceBuffer, external, size, copyIn);</a>
+<a name="ln1284">	if (IS_USER_ADDRESS(external)) {</a>
+<a name="ln1285">		status_t status = B_OK;</a>
+<a name="ln1286">		if (copyIn)</a>
+<a name="ln1287">			status = user_memcpy(bounceBuffer, (void*)(addr_t)external, size);</a>
+<a name="ln1288">		else</a>
+<a name="ln1289">			status = user_memcpy((void*)(addr_t)external, bounceBuffer, size);</a>
+<a name="ln1290">		if (status &lt; B_OK)</a>
+<a name="ln1291">			return status;</a>
+<a name="ln1292">		return B_OK;</a>
+<a name="ln1293">	}</a>
+<a name="ln1294">	if (copyIn)</a>
+<a name="ln1295">		memcpy(bounceBuffer, (void*)(addr_t)external, size);</a>
+<a name="ln1296">	else</a>
+<a name="ln1297">		memcpy((void*)(addr_t)external, bounceBuffer, size);</a>
+<a name="ln1298">	return B_OK;</a>
+<a name="ln1299">}</a>
+<a name="ln1300"> </a>
+<a name="ln1301"> </a>
+<a name="ln1302">/* static */ status_t</a>
+<a name="ln1303">IORequest::_CopyPhysical(void* bounceBuffer, generic_addr_t external,</a>
+<a name="ln1304">	size_t size, team_id team, bool copyIn)</a>
+<a name="ln1305">{</a>
+<a name="ln1306">	if (copyIn)</a>
+<a name="ln1307">		return vm_memcpy_from_physical(bounceBuffer, external, size, false);</a>
+<a name="ln1308"> </a>
+<a name="ln1309">	return vm_memcpy_to_physical(external, bounceBuffer, size, false);</a>
+<a name="ln1310">}</a>
+<a name="ln1311"> </a>
+<a name="ln1312"> </a>
+<a name="ln1313">/* static */ status_t</a>
+<a name="ln1314">IORequest::_CopyUser(void* _bounceBuffer, generic_addr_t _external, size_t size,</a>
+<a name="ln1315">	team_id team, bool copyIn)</a>
+<a name="ln1316">{</a>
+<a name="ln1317">	uint8* bounceBuffer = (uint8*)_bounceBuffer;</a>
+<a name="ln1318">	uint8* external = (uint8*)(addr_t)_external;</a>
+<a name="ln1319"> </a>
+<a name="ln1320">	while (size &gt; 0) {</a>
+<a name="ln1321">		static const int32 kEntryCount = 8;</a>
+<a name="ln1322">		physical_entry entries[kEntryCount];</a>
+<a name="ln1323"> </a>
+<a name="ln1324">		uint32 count = kEntryCount;</a>
+<a name="ln1325">		status_t error = get_memory_map_etc(team, external, size, entries,</a>
+<a name="ln1326">			&amp;count);</a>
+<a name="ln1327">		if (error != B_OK &amp;&amp; error != B_BUFFER_OVERFLOW) {</a>
+<a name="ln1328">			panic(&quot;IORequest::_CopyUser(): Failed to get physical memory for &quot;</a>
+<a name="ln1329">				&quot;user memory %p\n&quot;, external);</a>
+<a name="ln1330">			return B_BAD_ADDRESS;</a>
+<a name="ln1331">		}</a>
+<a name="ln1332"> </a>
+<a name="ln1333">		for (uint32 i = 0; i &lt; count; i++) {</a>
+<a name="ln1334">			const physical_entry&amp; entry = entries[i];</a>
+<a name="ln1335">			error = _CopyPhysical(bounceBuffer, entry.address, entry.size, team,</a>
+<a name="ln1336">				copyIn);</a>
+<a name="ln1337">			if (error != B_OK)</a>
+<a name="ln1338">				return error;</a>
+<a name="ln1339"> </a>
+<a name="ln1340">			size -= entry.size;</a>
+<a name="ln1341">			bounceBuffer += entry.size;</a>
+<a name="ln1342">			external += entry.size;</a>
+<a name="ln1343">		}</a>
+<a name="ln1344">	}</a>
+<a name="ln1345"> </a>
+<a name="ln1346">	return B_OK;</a>
+<a name="ln1347">}</a>
+<a name="ln1348"> </a>
+<a name="ln1349"> </a>
+<a name="ln1350">/*static*/ status_t</a>
+<a name="ln1351">IORequest::_ClearDataSimple(generic_addr_t external, generic_size_t size,</a>
+<a name="ln1352">	team_id team)</a>
+<a name="ln1353">{</a>
+<a name="ln1354">	memset((void*)(addr_t)external, 0, (size_t)size);</a>
+<a name="ln1355">	return B_OK;</a>
+<a name="ln1356">}</a>
+<a name="ln1357"> </a>
+<a name="ln1358"> </a>
+<a name="ln1359">/*static*/ status_t</a>
+<a name="ln1360">IORequest::_ClearDataPhysical(generic_addr_t external, generic_size_t size,</a>
+<a name="ln1361">	team_id team)</a>
+<a name="ln1362">{</a>
+<a name="ln1363">	return vm_memset_physical((phys_addr_t)external, 0, (phys_size_t)size);</a>
+<a name="ln1364">}</a>
+<a name="ln1365"> </a>
+<a name="ln1366"> </a>
+<a name="ln1367">/*static*/ status_t</a>
+<a name="ln1368">IORequest::_ClearDataUser(generic_addr_t _external, generic_size_t size,</a>
+<a name="ln1369">	team_id team)</a>
+<a name="ln1370">{</a>
+<a name="ln1371">	uint8* external = (uint8*)(addr_t)_external;</a>
+<a name="ln1372"> </a>
+<a name="ln1373">	while (size &gt; 0) {</a>
+<a name="ln1374">		static const int32 kEntryCount = 8;</a>
+<a name="ln1375">		physical_entry entries[kEntryCount];</a>
+<a name="ln1376"> </a>
+<a name="ln1377">		uint32 count = kEntryCount;</a>
+<a name="ln1378">		status_t error = get_memory_map_etc(team, external, size, entries,</a>
+<a name="ln1379">			&amp;count);</a>
+<a name="ln1380">		if (error != B_OK &amp;&amp; error != B_BUFFER_OVERFLOW) {</a>
+<a name="ln1381">			panic(&quot;IORequest::_ClearDataUser(): Failed to get physical memory &quot;</a>
+<a name="ln1382">				&quot;for user memory %p\n&quot;, external);</a>
+<a name="ln1383">			return B_BAD_ADDRESS;</a>
+<a name="ln1384">		}</a>
+<a name="ln1385"> </a>
+<a name="ln1386">		for (uint32 i = 0; i &lt; count; i++) {</a>
+<a name="ln1387">			const physical_entry&amp; entry = entries[i];</a>
+<a name="ln1388">			error = _ClearDataPhysical(entry.address, entry.size, team);</a>
+<a name="ln1389">			if (error != B_OK)</a>
+<a name="ln1390">				return error;</a>
+<a name="ln1391"> </a>
+<a name="ln1392">			size -= entry.size;</a>
+<a name="ln1393">			external += entry.size;</a>
+<a name="ln1394">		}</a>
+<a name="ln1395">	}</a>
+<a name="ln1396"> </a>
+<a name="ln1397">	return B_OK;</a>
+<a name="ln1398">}</a>
+<a name="ln1399"> </a>
+<a name="ln1400"> </a>
+<a name="ln1401">void</a>
+<a name="ln1402">IORequest::Dump() const</a>
+<a name="ln1403">{</a>
+<a name="ln1404">	kprintf(&quot;io_request at %p\n&quot;, this);</a>
+<a name="ln1405"> </a>
+<a name="ln1406">	kprintf(&quot;  owner:             %p\n&quot;, fOwner);</a>
+<a name="ln1407">	kprintf(&quot;  parent:            %p\n&quot;, fParent);</a>
+<a name="ln1408">	kprintf(&quot;  status:            %s\n&quot;, strerror(fStatus));</a>
+<a name="ln1409">	kprintf(&quot;  mutex:             %p\n&quot;, &amp;fLock);</a>
+<a name="ln1410">	kprintf(&quot;  IOBuffer:          %p\n&quot;, fBuffer);</a>
+<a name="ln1411">	kprintf(&quot;  offset:            %&quot; B_PRIdOFF &quot;\n&quot;, fOffset);</a>
+<a name="ln1412">	kprintf(&quot;  length:            %&quot; B_PRIuGENADDR &quot;\n&quot;, fLength);</a>
+<a name="ln1413">	kprintf(&quot;  transfer size:     %&quot; B_PRIuGENADDR &quot;\n&quot;, fTransferSize);</a>
+<a name="ln1414">	kprintf(&quot;  relative offset:   %&quot; B_PRIuGENADDR &quot;\n&quot;, fRelativeParentOffset);</a>
+<a name="ln1415">	kprintf(&quot;  pending children:  %&quot; B_PRId32 &quot;\n&quot;, fPendingChildren);</a>
+<a name="ln1416">	kprintf(&quot;  flags:             %#&quot; B_PRIx32 &quot;\n&quot;, fFlags);</a>
+<a name="ln1417">	kprintf(&quot;  team:              %&quot; B_PRId32 &quot;\n&quot;, fTeam);</a>
+<a name="ln1418">	kprintf(&quot;  thread:            %&quot; B_PRId32 &quot;\n&quot;, fThread);</a>
+<a name="ln1419">	kprintf(&quot;  r/w:               %s\n&quot;, fIsWrite ? &quot;write&quot; : &quot;read&quot;);</a>
+<a name="ln1420">	kprintf(&quot;  partial transfer:  %s\n&quot;, fPartialTransfer ? &quot;yes&quot; : &quot;no&quot;);</a>
+<a name="ln1421">	kprintf(&quot;  finished cvar:     %p\n&quot;, &amp;fFinishedCondition);</a>
+<a name="ln1422">	kprintf(&quot;  iteration:\n&quot;);</a>
+<a name="ln1423">	kprintf(&quot;    vec index:       %&quot; B_PRIu32 &quot;\n&quot;, fVecIndex);</a>
+<a name="ln1424">	kprintf(&quot;    vec offset:      %&quot; B_PRIuGENADDR &quot;\n&quot;, fVecOffset);</a>
+<a name="ln1425">	kprintf(&quot;    remaining bytes: %&quot; B_PRIuGENADDR &quot;\n&quot;, fRemainingBytes);</a>
+<a name="ln1426">	kprintf(&quot;  callbacks:\n&quot;);</a>
+<a name="ln1427">	kprintf(&quot;    finished %p, cookie %p\n&quot;, fFinishedCallback, fFinishedCookie);</a>
+<a name="ln1428">	kprintf(&quot;    iteration %p, cookie %p\n&quot;, fIterationCallback,</a>
+<a name="ln1429">		fIterationCookie);</a>
+<a name="ln1430">	kprintf(&quot;  children:\n&quot;);</a>
+<a name="ln1431"> </a>
+<a name="ln1432">	IORequestChunkList::ConstIterator iterator = fChildren.GetIterator();</a>
+<a name="ln1433">	while (iterator.HasNext()) {</a>
+<a name="ln1434">		kprintf(&quot;    %p\n&quot;, iterator.Next());</a>
+<a name="ln1435">	}</a>
+<a name="ln1436"> </a>
+<a name="ln1437">	set_debug_variable(&quot;_parent&quot;, (addr_t)fParent);</a>
+<a name="ln1438">	set_debug_variable(&quot;_mutex&quot;, (addr_t)&amp;fLock);</a>
+<a name="ln1439">	set_debug_variable(&quot;_buffer&quot;, (addr_t)fBuffer);</a>
+<a name="ln1440">	set_debug_variable(&quot;_cvar&quot;, (addr_t)&amp;fFinishedCondition);</a>
+<a name="ln1441">}</a>
+
+</code></pre>
+<div class="balloon" rel="474"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v595/" target="_blank">V595</a> The 'fParent' pointer was utilized before it was verified against nullptr. Check lines: 474, 494.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

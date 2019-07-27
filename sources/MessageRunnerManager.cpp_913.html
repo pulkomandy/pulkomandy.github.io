@@ -1,0 +1,819 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>MessageRunnerManager.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2001-2006, Haiku, Inc. All Rights Reserved.</a>
+<a name="ln3"> * Distributed under the terms of the MIT License.</a>
+<a name="ln4"> *</a>
+<a name="ln5"> * Authors:</a>
+<a name="ln6"> *		Ingo Weinhold (bonefish@users.sf.net)</a>
+<a name="ln7"> */</a>
+<a name="ln8"> </a>
+<a name="ln9"> </a>
+<a name="ln10">#include &lt;algorithm&gt;</a>
+<a name="ln11">#include &lt;new&gt;</a>
+<a name="ln12"> </a>
+<a name="ln13">#include &lt;Autolock.h&gt;</a>
+<a name="ln14">#include &lt;Message.h&gt;</a>
+<a name="ln15">#include &lt;MessagePrivate.h&gt;</a>
+<a name="ln16">#include &lt;Messenger.h&gt;</a>
+<a name="ln17">#include &lt;OS.h&gt;</a>
+<a name="ln18">#include &lt;RegistrarDefs.h&gt;</a>
+<a name="ln19"> </a>
+<a name="ln20">#include &quot;Debug.h&quot;</a>
+<a name="ln21">#include &quot;Event.h&quot;</a>
+<a name="ln22">#include &quot;EventQueue.h&quot;</a>
+<a name="ln23">#include &quot;MessageDeliverer.h&quot;</a>
+<a name="ln24">#include &quot;MessageRunnerManager.h&quot;</a>
+<a name="ln25"> </a>
+<a name="ln26">using std::max;</a>
+<a name="ln27">using std::nothrow;</a>
+<a name="ln28"> </a>
+<a name="ln29">/*!	\class MessageRunnerManager</a>
+<a name="ln30">	\brief Manages the registrar side &quot;shadows&quot; of BMessageRunners.</a>
+<a name="ln31"> </a>
+<a name="ln32">	The class features four methods to which the registrar application</a>
+<a name="ln33">	dispatches the message runner specific request messages.</a>
+<a name="ln34"> </a>
+<a name="ln35">	Each active message runner (i.e. one that still has messages to be sent)</a>
+<a name="ln36">	is represented by a RunnerInfo that comprises all necessary information,</a>
+<a name="ln37">	among these a RunnerEvent added to the event queue. When the event is</a>
+<a name="ln38">	executed, it calls the _DoEvent() method, which in turn sends the message</a>
+<a name="ln39">	runner message to the respective target and schedules the event for the</a>
+<a name="ln40">	next time the message has to be sent (_ScheduleEvent()).</a>
+<a name="ln41"> </a>
+<a name="ln42">	A couple of helper methods provide convenient access to the RunnerInfo</a>
+<a name="ln43">	list (\a fRunnerInfos). A BLocker (\a fLock) and respective locking</a>
+<a name="ln44">	methods are used to serialize the access to the member variables.</a>
+<a name="ln45">*/</a>
+<a name="ln46"> </a>
+<a name="ln47">/*! \var BList MessageRunnerManager::fRunnerInfos</a>
+<a name="ln48">	\brief The list of RunnerInfos.</a>
+<a name="ln49">*/</a>
+<a name="ln50"> </a>
+<a name="ln51">/*! \var BLocker MessageRunnerManager::fLock</a>
+<a name="ln52">	\brief A locker used to serialize the access to the object's variable</a>
+<a name="ln53">		   members.</a>
+<a name="ln54">*/</a>
+<a name="ln55"> </a>
+<a name="ln56">/*! \var EventQueue *MessageRunnerManager::fEventQueue</a>
+<a name="ln57">	\brief Event queue used by the manager.</a>
+<a name="ln58">*/</a>
+<a name="ln59"> </a>
+<a name="ln60">/*! \var int32 MessageRunnerManager::fNextToken</a>
+<a name="ln61">	\brief Next unused token for message runners.</a>
+<a name="ln62">*/</a>
+<a name="ln63"> </a>
+<a name="ln64"> </a>
+<a name="ln65">using namespace BPrivate;</a>
+<a name="ln66"> </a>
+<a name="ln67">//! The minimal time interval for message runners (50 ms).</a>
+<a name="ln68">static const bigtime_t kMininalTimeInterval = 50000LL;</a>
+<a name="ln69"> </a>
+<a name="ln70"> </a>
+<a name="ln71">static bigtime_t</a>
+<a name="ln72">add_time(bigtime_t a, bigtime_t b)</a>
+<a name="ln73">{</a>
+<a name="ln74">	// avoid a bigtime_t overflow</a>
+<a name="ln75">	if (LONGLONG_MAX - b &lt; a)</a>
+<a name="ln76">		return LONGLONG_MAX;</a>
+<a name="ln77">	else</a>
+<a name="ln78">		return a + b;</a>
+<a name="ln79">}</a>
+<a name="ln80"> </a>
+<a name="ln81"> </a>
+<a name="ln82">// RunnerEvent</a>
+<a name="ln83">/*!	\brief Event class used to by the message runner manager.</a>
+<a name="ln84"> </a>
+<a name="ln85">	For each active message runner such an event is used. It invokes</a>
+<a name="ln86">	MessageRunnerManager::_DoEvent() on execution.</a>
+<a name="ln87">*/</a>
+<a name="ln88">class MessageRunnerManager::RunnerEvent : public Event {</a>
+<a name="ln89">public:</a>
+<a name="ln90">	/*!	\brief Creates a new RunnerEvent.</a>
+<a name="ln91">		\param manager The message runner manager.</a>
+<a name="ln92">		\param info The RunnerInfo for the message runner.</a>
+<a name="ln93">	*/</a>
+<a name="ln94">	RunnerEvent(MessageRunnerManager *manager, RunnerInfo *info)</a>
+<a name="ln95">		: Event(false),</a>
+<a name="ln96">		  fManager(manager),</a>
+<a name="ln97">		  fInfo(info)</a>
+<a name="ln98">	{</a>
+<a name="ln99">	}</a>
+<a name="ln100"> </a>
+<a name="ln101">	/*!	\brief Hook method invoked when the event is executed.</a>
+<a name="ln102"> </a>
+<a name="ln103">		Implements Event. Calls MessageRunnerManager::_DoEvent().</a>
+<a name="ln104">		</a>
+<a name="ln105">		\param queue The event queue executing the event.</a>
+<a name="ln106">		\return \c true, if the object shall be deleted, \c false otherwise.</a>
+<a name="ln107">	*/</a>
+<a name="ln108">	virtual bool Do(EventQueue *queue)</a>
+<a name="ln109">	{</a>
+<a name="ln110">		return fManager-&gt;_DoEvent(fInfo);</a>
+<a name="ln111">	}</a>
+<a name="ln112"> </a>
+<a name="ln113">private:</a>
+<a name="ln114">	MessageRunnerManager	*fManager;	//!&lt; The message runner manager.</a>
+<a name="ln115">	RunnerInfo				*fInfo;		//!&lt; The message runner info.</a>
+<a name="ln116">};</a>
+<a name="ln117"> </a>
+<a name="ln118"> </a>
+<a name="ln119">// RunnerInfo</a>
+<a name="ln120">/*!	\brief Contains all needed information about an active message runner.</a>
+<a name="ln121">*/</a>
+<a name="ln122">struct MessageRunnerManager::RunnerInfo {</a>
+<a name="ln123">	/*!	\brief Creates a new RunnerInfo.</a>
+<a name="ln124">		\param team The team owning the message runner.</a>
+<a name="ln125">		\param token The unique token associated with the message runner.</a>
+<a name="ln126">		\param target The target the message shall be sent to.</a>
+<a name="ln127">		\param message The message to be sent to the target.</a>
+<a name="ln128">		\param interval The message runner's time interval.</a>
+<a name="ln129">		\param count The number of times the message shall be sent.</a>
+<a name="ln130">		\param replyTarget The reply target for the delivered message.</a>
+<a name="ln131">	*/</a>
+<a name="ln132">	RunnerInfo(team_id team, int32 token, BMessenger target, BMessage *message,</a>
+<a name="ln133">			   bigtime_t interval, int32 count, BMessenger replyTarget)</a>
+<a name="ln134">		: team(team),</a>
+<a name="ln135">		  token(token),</a>
+<a name="ln136">		  target(target),</a>
+<a name="ln137">		  message(message),</a>
+<a name="ln138">		  interval(interval),</a>
+<a name="ln139">		  count(count),</a>
+<a name="ln140">		  replyTarget(replyTarget),</a>
+<a name="ln141">		  time(0),</a>
+<a name="ln142">		  event(NULL),</a>
+<a name="ln143">		  rescheduled(false)</a>
+<a name="ln144">	{</a>
+<a name="ln145">	}</a>
+<a name="ln146"> </a>
+<a name="ln147">	/*!	\brief Frees all resources associated with the object.</a>
+<a name="ln148"> </a>
+<a name="ln149">		The message and the event are delete.</a>
+<a name="ln150">	*/</a>
+<a name="ln151">	~RunnerInfo()</a>
+<a name="ln152">	{</a>
+<a name="ln153">		delete message;</a>
+<a name="ln154">		delete event;</a>
+<a name="ln155">	}</a>
+<a name="ln156"> </a>
+<a name="ln157">	/*!	\brief Delivers the message to the respective target.</a>
+<a name="ln158">		\return \c B_OK, if the message has successfully been delivered or</a>
+<a name="ln159">				the target does still exist and its message port is full,</a>
+<a name="ln160">				an error code otherwise.</a>
+<a name="ln161">	*/</a>
+<a name="ln162">	status_t DeliverMessage()</a>
+<a name="ln163">	{</a>
+<a name="ln164">		if (count &gt; 0)</a>
+<a name="ln165">			count--;</a>
+<a name="ln166"> </a>
+<a name="ln167">		// set the reply target</a>
+<a name="ln168">		BMessage::Private(message).SetReply(replyTarget);</a>
+<a name="ln169"> </a>
+<a name="ln170">		// deliver the message: We use the MessageDeliverer to allow the</a>
+<a name="ln171">		// message to be delivered, even if the target port is temporarily</a>
+<a name="ln172">		// full. For periodic message runners, that have to deliver further</a>
+<a name="ln173">		// messages, we restrict the delivery timeout to the message interval.</a>
+<a name="ln174">		status_t error;</a>
+<a name="ln175">		if (count &gt; 0) {</a>
+<a name="ln176">			error = MessageDeliverer::Default()-&gt;DeliverMessage(message, target,</a>
+<a name="ln177">				interval);</a>
+<a name="ln178">		} else {</a>
+<a name="ln179">			error = MessageDeliverer::Default()-&gt;DeliverMessage(message,</a>
+<a name="ln180">				target);</a>
+<a name="ln181">		}</a>
+<a name="ln182"> </a>
+<a name="ln183">		// B_WOULD_BLOCK is as good as B_OK. We return an error only, if</a>
+<a name="ln184">		// there are serious problems with the target, i.e. if it doesn't</a>
+<a name="ln185">		// exist anymore for instance. A full message port is harmless.</a>
+<a name="ln186">		if (error == B_WOULD_BLOCK)</a>
+<a name="ln187">			error = B_OK;</a>
+<a name="ln188">		return error;</a>
+<a name="ln189">	}</a>
+<a name="ln190"> </a>
+<a name="ln191">	team_id		team;			//!&lt; The team owning the message runner.</a>
+<a name="ln192">	int32		token;			/*!&lt; The unique token associated with the</a>
+<a name="ln193">									 message runner. */</a>
+<a name="ln194">	BMessenger	target;			//!&lt; The target the message shall be sent to.</a>
+<a name="ln195">	BMessage	*message;		//!&lt; The message to be sent to the target.</a>
+<a name="ln196">	bigtime_t	interval;		//!&lt; The message runner's time interval.</a>
+<a name="ln197">	int32		count;			/*!&lt; The number of times the message shall be</a>
+<a name="ln198">									 sent. */</a>
+<a name="ln199">	BMessenger	replyTarget;	/*!&lt; The reply target for the delivered</a>
+<a name="ln200">									 message. */</a>
+<a name="ln201">	bigtime_t	time;			/*!&lt; Time at which the next message will be</a>
+<a name="ln202">									 sent. */</a>
+<a name="ln203">	RunnerEvent	*event;			//!&lt; Runner event for the message runner.</a>
+<a name="ln204">	bool		rescheduled;	/*!&lt; Set to \c true when the event has been</a>
+<a name="ln205">									 started to be executed while it was</a>
+<a name="ln206">									 rescheduled. */</a>
+<a name="ln207">};</a>
+<a name="ln208"> </a>
+<a name="ln209"> </a>
+<a name="ln210">// constructor</a>
+<a name="ln211">/*!	\brief Creates a new MessageRunnerManager.</a>
+<a name="ln212">	\param eventQueue The EventQueue the manager shall use.</a>
+<a name="ln213">*/</a>
+<a name="ln214">MessageRunnerManager::MessageRunnerManager(EventQueue *eventQueue)</a>
+<a name="ln215">	: fRunnerInfos(),</a>
+<a name="ln216">	  fLock(),</a>
+<a name="ln217">	  fEventQueue(eventQueue),</a>
+<a name="ln218">	  fNextToken(0)</a>
+<a name="ln219">{</a>
+<a name="ln220">}</a>
+<a name="ln221"> </a>
+<a name="ln222">// destructor</a>
+<a name="ln223">/*!	\brief Frees all resources associated with the object.</a>
+<a name="ln224"> </a>
+<a name="ln225">	The manager's event queue must already have been stopped</a>
+<a name="ln226">	(EventQueue::Die()).</a>
+<a name="ln227">*/</a>
+<a name="ln228">MessageRunnerManager::~MessageRunnerManager()</a>
+<a name="ln229">{</a>
+<a name="ln230">	// The event queue should already be stopped, but must still exist.</a>
+<a name="ln231">	// If it is still running and an event gets executed after we've locked</a>
+<a name="ln232">	// ourselves, then it will access an already deleted manager.</a>
+<a name="ln233">	BAutolock _lock(fLock);</a>
+<a name="ln234">	for (int32 i = 0; RunnerInfo *info = _InfoAt(i); i++) {</a>
+<a name="ln235">		if (!fEventQueue-&gt;RemoveEvent(info-&gt;event))</a>
+<a name="ln236">			info-&gt;event = NULL;</a>
+<a name="ln237">		delete info;</a>
+<a name="ln238">	}</a>
+<a name="ln239">	fRunnerInfos.MakeEmpty();</a>
+<a name="ln240">}</a>
+<a name="ln241"> </a>
+<a name="ln242">// HandleRegisterRunner</a>
+<a name="ln243">/*!	\brief Handles a registration request (BMessageRunner::InitData()).</a>
+<a name="ln244">	\param request The request message.</a>
+<a name="ln245">*/</a>
+<a name="ln246">void</a>
+<a name="ln247">MessageRunnerManager::HandleRegisterRunner(BMessage *request)</a>
+<a name="ln248">{</a>
+<a name="ln249">	FUNCTION_START();</a>
+<a name="ln250"> </a>
+<a name="ln251">	BAutolock _lock(fLock);</a>
+<a name="ln252">	status_t error = B_OK;</a>
+<a name="ln253">	// get the parameters</a>
+<a name="ln254">	team_id team;</a>
+<a name="ln255">	BMessenger target;</a>
+<a name="ln256">	// TODO: This should be a &quot;new (nothrow)&quot;, but R5's BMessage doesn't</a>
+<a name="ln257">	// define that version.</a>
+<a name="ln258">	BMessage *message = new BMessage;</a>
+<a name="ln259">	bigtime_t interval;</a>
+<a name="ln260">	int32 count;</a>
+<a name="ln261">	BMessenger replyTarget;</a>
+<a name="ln262">	if (error == B_OK &amp;&amp; message == NULL)</a>
+<a name="ln263">		error = B_NO_MEMORY;</a>
+<a name="ln264">	if (error == B_OK &amp;&amp; request-&gt;FindInt32(&quot;team&quot;, &amp;team) != B_OK)</a>
+<a name="ln265">		error = B_BAD_VALUE;</a>
+<a name="ln266">	if (error == B_OK &amp;&amp; request-&gt;FindMessenger(&quot;target&quot;, &amp;target) != B_OK)</a>
+<a name="ln267">		error = B_BAD_VALUE;</a>
+<a name="ln268">	if (error == B_OK &amp;&amp; request-&gt;FindMessage(&quot;message&quot;, message) != B_OK)</a>
+<a name="ln269">		error = B_BAD_VALUE;</a>
+<a name="ln270">	if (error == B_OK &amp;&amp; request-&gt;FindInt64(&quot;interval&quot;, &amp;interval) != B_OK)</a>
+<a name="ln271">		error = B_BAD_VALUE;</a>
+<a name="ln272">	if (error == B_OK &amp;&amp; request-&gt;FindInt32(&quot;count&quot;, &amp;count) != B_OK)</a>
+<a name="ln273">		error = B_BAD_VALUE;</a>
+<a name="ln274">	if (error == B_OK</a>
+<a name="ln275">		&amp;&amp; request-&gt;FindMessenger(&quot;reply_target&quot;, &amp;replyTarget) != B_OK) {</a>
+<a name="ln276">		error = B_BAD_VALUE;</a>
+<a name="ln277">	}</a>
+<a name="ln278"> </a>
+<a name="ln279">	// check the parameters</a>
+<a name="ln280">	if (error == B_OK &amp;&amp; count == 0)</a>
+<a name="ln281">		error = B_BAD_VALUE;</a>
+<a name="ln282"> </a>
+<a name="ln283">	// add a new runner info</a>
+<a name="ln284">	RunnerInfo *info = NULL;</a>
+<a name="ln285">	if (error == B_OK) {</a>
+<a name="ln286">		interval = max(interval, kMininalTimeInterval);</a>
+<a name="ln287">		info = new(nothrow) RunnerInfo(team, _NextToken(), target, message,</a>
+<a name="ln288">									   interval, count, replyTarget);</a>
+<a name="ln289">		if (info) {</a>
+<a name="ln290">			info-&gt;time = system_time();</a>
+<a name="ln291">			if (!_AddInfo(info))</a>
+<a name="ln292">				error = B_NO_MEMORY;</a>
+<a name="ln293">		} else</a>
+<a name="ln294">			error = B_NO_MEMORY;</a>
+<a name="ln295">	}</a>
+<a name="ln296"> </a>
+<a name="ln297">	// create a new event</a>
+<a name="ln298">	RunnerEvent *event = NULL;</a>
+<a name="ln299">	if (error == B_OK) {</a>
+<a name="ln300">		event = new(nothrow) RunnerEvent(this, info);</a>
+<a name="ln301">		if (event) {</a>
+<a name="ln302">			info-&gt;event = event;</a>
+<a name="ln303">			if (!_ScheduleEvent(info))</a>
+<a name="ln304">				error = B_NO_MEMORY;	// TODO: The only possible reason?</a>
+<a name="ln305">		} else</a>
+<a name="ln306">			error = B_NO_MEMORY;</a>
+<a name="ln307">	}</a>
+<a name="ln308"> </a>
+<a name="ln309">	// cleanup on error</a>
+<a name="ln310">	if (error != B_OK) {</a>
+<a name="ln311">		if (info) {</a>
+<a name="ln312">			_RemoveInfo(info);</a>
+<a name="ln313">			delete info;</a>
+<a name="ln314">		}</a>
+<a name="ln315">		delete message;</a>
+<a name="ln316">	}</a>
+<a name="ln317"> </a>
+<a name="ln318">	// reply to the request</a>
+<a name="ln319">	if (error == B_OK) {</a>
+<a name="ln320">		BMessage reply(B_REG_SUCCESS);</a>
+<a name="ln321">		reply.AddInt32(&quot;token&quot;, info-&gt;token);</a>
+<a name="ln322">		request-&gt;SendReply(&amp;reply);</a>
+<a name="ln323">	} else {</a>
+<a name="ln324">		BMessage reply(B_REG_ERROR);</a>
+<a name="ln325">		reply.AddInt32(&quot;error&quot;, error);</a>
+<a name="ln326">		request-&gt;SendReply(&amp;reply);</a>
+<a name="ln327">	}</a>
+<a name="ln328"> </a>
+<a name="ln329">	FUNCTION_END();</a>
+<a name="ln330">}</a>
+<a name="ln331"> </a>
+<a name="ln332">// HandleUnregisterRunner</a>
+<a name="ln333">/*!	\brief Handles an unregistration request (BMessageRunner destructor).</a>
+<a name="ln334">	\param request The request message.</a>
+<a name="ln335">*/</a>
+<a name="ln336">void</a>
+<a name="ln337">MessageRunnerManager::HandleUnregisterRunner(BMessage *request)</a>
+<a name="ln338">{</a>
+<a name="ln339">	FUNCTION_START();</a>
+<a name="ln340"> </a>
+<a name="ln341">	BAutolock _lock(fLock);</a>
+<a name="ln342">	status_t error = B_OK;</a>
+<a name="ln343">	// get the parameters</a>
+<a name="ln344">	int32 token;</a>
+<a name="ln345">	if (error == B_OK &amp;&amp; request-&gt;FindInt32(&quot;token&quot;, &amp;token) != B_OK)</a>
+<a name="ln346">		error = B_BAD_VALUE;</a>
+<a name="ln347">	// find and delete the runner info</a>
+<a name="ln348">	if (error == B_OK) {</a>
+<a name="ln349">		if (RunnerInfo *info = _InfoForToken(token))</a>
+<a name="ln350">			_DeleteInfo(info, false);</a>
+<a name="ln351">		else</a>
+<a name="ln352">			error = B_BAD_VALUE;</a>
+<a name="ln353">	}</a>
+<a name="ln354">	// reply to the request</a>
+<a name="ln355">	if (error == B_OK) {</a>
+<a name="ln356">		BMessage reply(B_REG_SUCCESS);</a>
+<a name="ln357">		request-&gt;SendReply(&amp;reply);</a>
+<a name="ln358">	} else {</a>
+<a name="ln359">		BMessage reply(B_REG_ERROR);</a>
+<a name="ln360">		reply.AddInt32(&quot;error&quot;, error);</a>
+<a name="ln361">		request-&gt;SendReply(&amp;reply);</a>
+<a name="ln362">	}</a>
+<a name="ln363"> </a>
+<a name="ln364">	FUNCTION_END();</a>
+<a name="ln365">}</a>
+<a name="ln366"> </a>
+<a name="ln367">// HandleSetRunnerParams</a>
+<a name="ln368">/*!	\brief Handles an parameter change request (BMessageRunner::SetParams()).</a>
+<a name="ln369">	\param request The request message.</a>
+<a name="ln370">*/</a>
+<a name="ln371">void</a>
+<a name="ln372">MessageRunnerManager::HandleSetRunnerParams(BMessage *request)</a>
+<a name="ln373">{</a>
+<a name="ln374">	FUNCTION_START();</a>
+<a name="ln375"> </a>
+<a name="ln376">	BAutolock _lock(fLock);</a>
+<a name="ln377">	status_t error = B_OK;</a>
+<a name="ln378">	// get the parameters</a>
+<a name="ln379">	int32 token;</a>
+<a name="ln380">	bigtime_t interval;</a>
+<a name="ln381">	int32 count;</a>
+<a name="ln382">	bool setInterval = false;</a>
+<a name="ln383">	bool setCount = false;</a>
+<a name="ln384">	if (error == B_OK &amp;&amp; request-&gt;FindInt32(&quot;token&quot;, &amp;token) != B_OK)</a>
+<a name="ln385">		error = B_BAD_VALUE;</a>
+<a name="ln386">	if (error == B_OK &amp;&amp; request-&gt;FindInt64(&quot;interval&quot;, &amp;interval) == B_OK)</a>
+<a name="ln387">		setInterval = true;</a>
+<a name="ln388">	if (error == B_OK &amp;&amp; request-&gt;FindInt32(&quot;count&quot;, &amp;count) == B_OK)</a>
+<a name="ln389">		setCount = true;</a>
+<a name="ln390"> </a>
+<a name="ln391">	// find the runner info</a>
+<a name="ln392">	RunnerInfo *info = NULL;</a>
+<a name="ln393">	if (error == B_OK) {</a>
+<a name="ln394">		info = _InfoForToken(token);</a>
+<a name="ln395">		if (!info) {</a>
+<a name="ln396">			// TODO: At this point, the runner could have been deleted already.</a>
+<a name="ln397">			//	Since setting its parameters at this point should still be</a>
+<a name="ln398">			//	valid, we'd have to recreate it.</a>
+<a name="ln399">			//	(Even though the documentation in *our* BMessageRunner</a>
+<a name="ln400">			//	implementation specifically denies the possibility of setting</a>
+<a name="ln401">			//	the runner's parameters at this point, it would still be nice</a>
+<a name="ln402">			//	to allow this.)</a>
+<a name="ln403">			error = B_BAD_VALUE;</a>
+<a name="ln404">		}</a>
+<a name="ln405">	}</a>
+<a name="ln406"> </a>
+<a name="ln407">	// set the new values</a>
+<a name="ln408">	if (error == B_OK) {</a>
+<a name="ln409">		bool eventRemoved = false;</a>
+<a name="ln410">		bool deleteInfo = false;</a>
+<a name="ln411">		// count</a>
+<a name="ln412">		if (setCount) {</a>
+<a name="ln413">			if (count == 0)</a>
+<a name="ln414">				deleteInfo = true;</a>
+<a name="ln415">			else</a>
+<a name="ln416">				info-&gt;count = count;</a>
+<a name="ln417">		}</a>
+<a name="ln418">		// interval</a>
+<a name="ln419">		if (setInterval) {</a>
+<a name="ln420">			eventRemoved = fEventQueue-&gt;RemoveEvent(info-&gt;event);</a>
+<a name="ln421">			if (!eventRemoved)</a>
+<a name="ln422">				info-&gt;rescheduled = true;</a>
+<a name="ln423">			interval = max(interval, kMininalTimeInterval);</a>
+<a name="ln424">			info-&gt;interval = interval;</a>
+<a name="ln425">			info-&gt;time = system_time();</a>
+<a name="ln426">			if (!_ScheduleEvent(info))</a>
+<a name="ln427">				error = B_NO_MEMORY;	// TODO: The only possible reason?</a>
+<a name="ln428">		}</a>
+<a name="ln429">		// remove and delete the info on error</a>
+<a name="ln430">		if (error != B_OK || deleteInfo)</a>
+<a name="ln431">			_DeleteInfo(info, eventRemoved);</a>
+<a name="ln432">	}</a>
+<a name="ln433"> </a>
+<a name="ln434">	// reply to the request</a>
+<a name="ln435">	if (error == B_OK) {</a>
+<a name="ln436">		BMessage reply(B_REG_SUCCESS);</a>
+<a name="ln437">		request-&gt;SendReply(&amp;reply);</a>
+<a name="ln438">	} else {</a>
+<a name="ln439">		BMessage reply(B_REG_ERROR);</a>
+<a name="ln440">		reply.AddInt32(&quot;error&quot;, error);</a>
+<a name="ln441">		request-&gt;SendReply(&amp;reply);</a>
+<a name="ln442">	}</a>
+<a name="ln443"> </a>
+<a name="ln444">	FUNCTION_END();</a>
+<a name="ln445">}</a>
+<a name="ln446"> </a>
+<a name="ln447">// HandleGetRunnerInfo</a>
+<a name="ln448">/*!	\brief Handles an get info request (BMessageRunner::GetInfo()).</a>
+<a name="ln449">	\param request The request message.</a>
+<a name="ln450">*/</a>
+<a name="ln451">void</a>
+<a name="ln452">MessageRunnerManager::HandleGetRunnerInfo(BMessage *request)</a>
+<a name="ln453">{</a>
+<a name="ln454">	FUNCTION_START();</a>
+<a name="ln455"> </a>
+<a name="ln456">	BAutolock _lock(fLock);</a>
+<a name="ln457">	status_t error = B_OK;</a>
+<a name="ln458">	// get the parameters</a>
+<a name="ln459">	int32 token;</a>
+<a name="ln460">	if (error == B_OK &amp;&amp; request-&gt;FindInt32(&quot;token&quot;, &amp;token) != B_OK)</a>
+<a name="ln461">		error = B_BAD_VALUE;</a>
+<a name="ln462">	// find the runner info</a>
+<a name="ln463">	RunnerInfo *info = NULL;</a>
+<a name="ln464">	if (error == B_OK) {</a>
+<a name="ln465">		info = _InfoForToken(token);</a>
+<a name="ln466">		if (!info)</a>
+<a name="ln467">			error = B_BAD_VALUE;</a>
+<a name="ln468">	}</a>
+<a name="ln469">	// reply to the request</a>
+<a name="ln470">	if (error == B_OK) {</a>
+<a name="ln471">		BMessage reply(B_REG_SUCCESS);</a>
+<a name="ln472">		reply.AddInt64(&quot;interval&quot;, info-&gt;interval);</a>
+<a name="ln473">		reply.AddInt32(&quot;count&quot;, info-&gt;count);</a>
+<a name="ln474">		request-&gt;SendReply(&amp;reply);</a>
+<a name="ln475">	} else {</a>
+<a name="ln476">		BMessage reply(B_REG_ERROR);</a>
+<a name="ln477">		reply.AddInt32(&quot;error&quot;, error);</a>
+<a name="ln478">		request-&gt;SendReply(&amp;reply);</a>
+<a name="ln479">	}</a>
+<a name="ln480"> </a>
+<a name="ln481">	FUNCTION_END();</a>
+<a name="ln482">}</a>
+<a name="ln483"> </a>
+<a name="ln484">// Lock</a>
+<a name="ln485">/*!	\brief Locks the manager.</a>
+<a name="ln486">	\return \c true, if locked successfully, \c false otherwise.</a>
+<a name="ln487">*/</a>
+<a name="ln488">bool</a>
+<a name="ln489">MessageRunnerManager::Lock()</a>
+<a name="ln490">{</a>
+<a name="ln491">	return fLock.Lock();</a>
+<a name="ln492">}</a>
+<a name="ln493"> </a>
+<a name="ln494">// Unlock</a>
+<a name="ln495">/*!	\brief Unlocks the manager.</a>
+<a name="ln496">*/</a>
+<a name="ln497">void</a>
+<a name="ln498">MessageRunnerManager::Unlock()</a>
+<a name="ln499">{</a>
+<a name="ln500">	fLock.Unlock();</a>
+<a name="ln501">}</a>
+<a name="ln502"> </a>
+<a name="ln503">// _AddInfo</a>
+<a name="ln504">/*!	\brief Adds a RunnerInfo to the list of RunnerInfos.</a>
+<a name="ln505"> </a>
+<a name="ln506">	\note The manager must be locked.</a>
+<a name="ln507"> </a>
+<a name="ln508">	\param info The RunnerInfo to be added.</a>
+<a name="ln509">	\return \c true, if added successfully, \c false otherwise.</a>
+<a name="ln510">*/</a>
+<a name="ln511">bool</a>
+<a name="ln512">MessageRunnerManager::_AddInfo(RunnerInfo *info)</a>
+<a name="ln513">{</a>
+<a name="ln514">	return fRunnerInfos.AddItem(info);</a>
+<a name="ln515">}</a>
+<a name="ln516"> </a>
+<a name="ln517">// _RemoveInfo</a>
+<a name="ln518">/*!	\brief Removes a RunnerInfo from the list of RunnerInfos.</a>
+<a name="ln519"> </a>
+<a name="ln520">	\note The manager must be locked.</a>
+<a name="ln521"> </a>
+<a name="ln522">	\param info The RunnerInfo to be removed.</a>
+<a name="ln523">	\return \c true, if removed successfully, \c false, if the list doesn't</a>
+<a name="ln524">			contain the supplied info.</a>
+<a name="ln525">*/</a>
+<a name="ln526">bool</a>
+<a name="ln527">MessageRunnerManager::_RemoveInfo(RunnerInfo *info)</a>
+<a name="ln528">{</a>
+<a name="ln529">	return fRunnerInfos.RemoveItem(info);</a>
+<a name="ln530">}</a>
+<a name="ln531"> </a>
+<a name="ln532">// _RemoveInfo</a>
+<a name="ln533">/*!	\brief Removes a RunnerInfo at a given index from the list of RunnerInfos.</a>
+<a name="ln534"> </a>
+<a name="ln535">	\note The manager must be locked.</a>
+<a name="ln536"> </a>
+<a name="ln537">	\param index The index of the RunnerInfo to be removed.</a>
+<a name="ln538">	\return \c true, if removed successfully, \c false, if the supplied index</a>
+<a name="ln539">			is out of range.</a>
+<a name="ln540">*/</a>
+<a name="ln541">MessageRunnerManager::RunnerInfo*</a>
+<a name="ln542">MessageRunnerManager::_RemoveInfo(int32 index)</a>
+<a name="ln543">{</a>
+<a name="ln544">	return (RunnerInfo*)fRunnerInfos.RemoveItem(index);</a>
+<a name="ln545">}</a>
+<a name="ln546"> </a>
+<a name="ln547">// _RemoveInfoWithToken</a>
+<a name="ln548">/*!	\brief Removes a RunnerInfo with a specified token from the list of</a>
+<a name="ln549">		   RunnerInfos.</a>
+<a name="ln550"> </a>
+<a name="ln551">	\note The manager must be locked.</a>
+<a name="ln552"> </a>
+<a name="ln553">	\param token The token identifying the RunnerInfo to be removed.</a>
+<a name="ln554">	\return \c true, if removed successfully, \c false, if the list doesn't</a>
+<a name="ln555">			contain an info with the supplied token.</a>
+<a name="ln556">*/</a>
+<a name="ln557">MessageRunnerManager::RunnerInfo*</a>
+<a name="ln558">MessageRunnerManager::_RemoveInfoWithToken(int32 token)</a>
+<a name="ln559">{</a>
+<a name="ln560">	RunnerInfo *info = NULL;</a>
+<a name="ln561">	int32 index = _IndexOfToken(token);</a>
+<a name="ln562">	if (index &gt;= 0)</a>
+<a name="ln563">		info = _RemoveInfo(index);</a>
+<a name="ln564">	return info;</a>
+<a name="ln565">}</a>
+<a name="ln566"> </a>
+<a name="ln567">// _DeleteInfo</a>
+<a name="ln568">/*!	\brief Removes a RunnerInfo from the list of RunnerInfos and deletes it.</a>
+<a name="ln569"> </a>
+<a name="ln570">	\note The manager must be locked.</a>
+<a name="ln571"> </a>
+<a name="ln572">	\param index The index of the RunnerInfo to be deleted.</a>
+<a name="ln573">	\return \c true, if removed and deleted successfully, \c false, if the</a>
+<a name="ln574">			list doesn't contain the supplied info.</a>
+<a name="ln575">*/</a>
+<a name="ln576">bool</a>
+<a name="ln577">MessageRunnerManager::_DeleteInfo(RunnerInfo *info, bool eventRemoved)</a>
+<a name="ln578">{</a>
+<a name="ln579">	bool result = _RemoveInfo(info);</a>
+<a name="ln580">	if (result) {</a>
+<a name="ln581">		// If the event is not in the event queue and has not been removed</a>
+<a name="ln582">		// just before, then it is in progress. It will delete itself.</a>
+<a name="ln583">		if (!eventRemoved &amp;&amp; !fEventQueue-&gt;RemoveEvent(info-&gt;event))</a>
+<a name="ln584">			info-&gt;event = NULL;</a>
+<a name="ln585">		delete info;</a>
+<a name="ln586">	}</a>
+<a name="ln587">	return result;</a>
+<a name="ln588">}</a>
+<a name="ln589"> </a>
+<a name="ln590">// _CountInfos</a>
+<a name="ln591">/*!	\brief Returns the number of RunnerInfos in the list of RunnerInfos.</a>
+<a name="ln592"> </a>
+<a name="ln593">	\note The manager must be locked.</a>
+<a name="ln594"> </a>
+<a name="ln595">	\return Returns the number of RunnerInfos in the list of RunnerInfos.</a>
+<a name="ln596">*/</a>
+<a name="ln597">int32</a>
+<a name="ln598">MessageRunnerManager::_CountInfos() const</a>
+<a name="ln599">{</a>
+<a name="ln600">	return fRunnerInfos.CountItems();</a>
+<a name="ln601">}</a>
+<a name="ln602"> </a>
+<a name="ln603">// _InfoAt</a>
+<a name="ln604">/*!	\brief Returns the RunnerInfo at the specified index in the list of</a>
+<a name="ln605">		   RunnerInfos.</a>
+<a name="ln606"> </a>
+<a name="ln607">	\note The manager must be locked.</a>
+<a name="ln608"> </a>
+<a name="ln609">	\param index The index of the RunnerInfo to be returned.</a>
+<a name="ln610">	\return The runner info at the specified index, or \c NULL, if the index</a>
+<a name="ln611">			is out of range.</a>
+<a name="ln612">*/</a>
+<a name="ln613">MessageRunnerManager::RunnerInfo*</a>
+<a name="ln614">MessageRunnerManager::_InfoAt(int32 index) const</a>
+<a name="ln615">{</a>
+<a name="ln616">	return (RunnerInfo*)fRunnerInfos.ItemAt(index);</a>
+<a name="ln617">}</a>
+<a name="ln618"> </a>
+<a name="ln619">// _InfoForToken</a>
+<a name="ln620">/*!	\brief Returns the RunnerInfo with the specified index.</a>
+<a name="ln621"> </a>
+<a name="ln622">	\note The manager must be locked.</a>
+<a name="ln623"> </a>
+<a name="ln624">	\param token The token identifying the RunnerInfo to be returned.</a>
+<a name="ln625">	\return The runner info at the specified index, or \c NULL, if the list</a>
+<a name="ln626">			doesn't contain an info with the specified token.</a>
+<a name="ln627">*/</a>
+<a name="ln628">MessageRunnerManager::RunnerInfo*</a>
+<a name="ln629">MessageRunnerManager::_InfoForToken(int32 token) const</a>
+<a name="ln630">{</a>
+<a name="ln631">	return _InfoAt(_IndexOfToken(token));</a>
+<a name="ln632">}</a>
+<a name="ln633"> </a>
+<a name="ln634">// _IndexOf</a>
+<a name="ln635">/*!	\brief Returns the index of the supplied RunnerInfo in the list of</a>
+<a name="ln636">		   RunnerInfos.</a>
+<a name="ln637"> </a>
+<a name="ln638">	\note The manager must be locked.</a>
+<a name="ln639"> </a>
+<a name="ln640">	\param info The RunnerInfo whose index shall be returned.</a>
+<a name="ln641">	\return The index of the supplied RunnerInfo, or -1, if the list doesn't</a>
+<a name="ln642">			contain the supplied info.</a>
+<a name="ln643">*/</a>
+<a name="ln644">int32</a>
+<a name="ln645">MessageRunnerManager::_IndexOf(RunnerInfo *info) const</a>
+<a name="ln646">{</a>
+<a name="ln647">	return fRunnerInfos.IndexOf(info);</a>
+<a name="ln648">}</a>
+<a name="ln649"> </a>
+<a name="ln650">// _IndexOfToken</a>
+<a name="ln651">/*!	\brief Returns the index of the RunnerInfo identified by the supplied</a>
+<a name="ln652">		   token in the list of RunnerInfos.</a>
+<a name="ln653"> </a>
+<a name="ln654">	\note The manager must be locked.</a>
+<a name="ln655"> </a>
+<a name="ln656">	\param token The token identifying the RunnerInfo whose index shall be</a>
+<a name="ln657">		   returned.</a>
+<a name="ln658">	\return The index of the requested RunnerInfo, or -1, if the list doesn't</a>
+<a name="ln659">			contain an info with the supplied token.</a>
+<a name="ln660">*/</a>
+<a name="ln661">int32</a>
+<a name="ln662">MessageRunnerManager::_IndexOfToken(int32 token) const</a>
+<a name="ln663">{</a>
+<a name="ln664">	for (int32 i = 0; RunnerInfo *info = _InfoAt(i); i++) {</a>
+<a name="ln665">		if (info-&gt;token == token)</a>
+<a name="ln666">			return i;</a>
+<a name="ln667">	}</a>
+<a name="ln668">	return -1;</a>
+<a name="ln669">}</a>
+<a name="ln670"> </a>
+<a name="ln671">// _DoEvent</a>
+<a name="ln672">/*!	\brief Invoked when a message runner's event is executed.</a>
+<a name="ln673"> </a>
+<a name="ln674">	If the message runner info is still valid and the event was not just</a>
+<a name="ln675">	rescheduled, the message is delivered to the message runner's target</a>
+<a name="ln676">	and the event is rescheduled.</a>
+<a name="ln677"> </a>
+<a name="ln678">	\param info The message runner's info.</a>
+<a name="ln679">	\return \c true, if the event object shall be deleted, \c false otherwise.</a>
+<a name="ln680">*/</a>
+<a name="ln681">bool</a>
+<a name="ln682">MessageRunnerManager::_DoEvent(RunnerInfo *info)</a>
+<a name="ln683">{</a>
+<a name="ln684">	FUNCTION_START();</a>
+<a name="ln685"> </a>
+<a name="ln686">	BAutolock _lock(fLock);</a>
+<a name="ln687">	bool deleteEvent = false;</a>
+<a name="ln688">	// first check whether the info does still exist</a>
+<a name="ln689">	if (_lock.IsLocked() &amp;&amp; _IndexOf(info) &gt;= 0) {</a>
+<a name="ln690">		// If the event has been rescheduled after being removed from the</a>
+<a name="ln691">		// queue for execution, it needs to be ignored. This may happen, when</a>
+<a name="ln692">		// the interval is modified.</a>
+<a name="ln693">		if (info-&gt;rescheduled)</a>
+<a name="ln694">			info-&gt;rescheduled = false;</a>
+<a name="ln695">		else {</a>
+<a name="ln696">			// send the message</a>
+<a name="ln697">			bool success = (info-&gt;DeliverMessage() == B_OK);</a>
+<a name="ln698">			// reschedule the event</a>
+<a name="ln699">			if (success)</a>
+<a name="ln700">				success = _ScheduleEvent(info);</a>
+<a name="ln701"> </a>
+<a name="ln702">			// clean up, if the message delivery of the rescheduling failed</a>
+<a name="ln703">			// (or the runner had already fulfilled its job)</a>
+<a name="ln704">			if (!success) {</a>
+<a name="ln705">				deleteEvent = true;</a>
+<a name="ln706">				info-&gt;event = NULL;</a>
+<a name="ln707">				_RemoveInfo(info);</a>
+<a name="ln708">				delete info;</a>
+<a name="ln709">			}</a>
+<a name="ln710">		}</a>
+<a name="ln711">	} else {</a>
+<a name="ln712">		// The info is no more. That means it had been removed after the</a>
+<a name="ln713">		// event was removed from the event queue, but before we could acquire</a>
+<a name="ln714">		// the lock. Simply delete the event.</a>
+<a name="ln715">		deleteEvent = true;</a>
+<a name="ln716">	}</a>
+<a name="ln717"> </a>
+<a name="ln718">	FUNCTION_END();</a>
+<a name="ln719"> </a>
+<a name="ln720">	return deleteEvent;</a>
+<a name="ln721">}</a>
+<a name="ln722"> </a>
+<a name="ln723">// _ScheduleEvent</a>
+<a name="ln724">/*!	\brief Schedules the event for a message runner for the next time a</a>
+<a name="ln725">		   message has to be sent.</a>
+<a name="ln726"> </a>
+<a name="ln727">	\note The manager must be locked.</a>
+<a name="ln728"> </a>
+<a name="ln729">	\param info The message runner's info.</a>
+<a name="ln730">	\return \c true, if the event successfully been rescheduled, \c false,</a>
+<a name="ln731">			if either all messages have already been sent or the event queue</a>
+<a name="ln732">			doesn't allow adding the event (e.g. due to insufficient memory).</a>
+<a name="ln733">*/</a>
+<a name="ln734">bool</a>
+<a name="ln735">MessageRunnerManager::_ScheduleEvent(RunnerInfo *info)</a>
+<a name="ln736">{</a>
+<a name="ln737">	bool scheduled = false;</a>
+<a name="ln738">	// calculate next event time</a>
+<a name="ln739">	if (info-&gt;count != 0) {</a>
+<a name="ln740">		info-&gt;time = add_time(info-&gt;time, info-&gt;interval);</a>
+<a name="ln741"> </a>
+<a name="ln742">		// For runners without a count limit, we skip messages, if we're already</a>
+<a name="ln743">		// late.</a>
+<a name="ln744">		bigtime_t now = system_time();</a>
+<a name="ln745">		if (info-&gt;time &lt; now &amp;&amp; info-&gt;count &lt; 0) {</a>
+<a name="ln746">			// keep the remainder modulo interval</a>
+<a name="ln747">			info-&gt;time = add_time(now,</a>
+<a name="ln748">				info-&gt;interval - (now - info-&gt;time) % info-&gt;interval);</a>
+<a name="ln749">		}</a>
+<a name="ln750"> </a>
+<a name="ln751">		info-&gt;event-&gt;SetTime(info-&gt;time);</a>
+<a name="ln752">		scheduled = fEventQueue-&gt;AddEvent(info-&gt;event);</a>
+<a name="ln753"> </a>
+<a name="ln754">PRINT(&quot;runner %&quot; B_PRId32 &quot; (%&quot; B_PRId64 &quot;, %&quot; B_PRId32 &quot;) rescheduled: %d, &quot;</a>
+<a name="ln755">&quot;time: %&quot; B_PRId64 &quot;, now: %&quot; B_PRId64 &quot;\n&quot;, info-&gt;token, info-&gt;interval,</a>
+<a name="ln756">info-&gt;count, scheduled, info-&gt;time, system_time());</a>
+<a name="ln757">	}</a>
+<a name="ln758">	return scheduled;</a>
+<a name="ln759">}</a>
+<a name="ln760"> </a>
+<a name="ln761">// _NextToken</a>
+<a name="ln762">/*!	\brief Returns a new unused message runner token.</a>
+<a name="ln763"> </a>
+<a name="ln764">	\note The manager must be locked.</a>
+<a name="ln765"> </a>
+<a name="ln766">	\return A new unused message runner token.</a>
+<a name="ln767">*/</a>
+<a name="ln768">int32</a>
+<a name="ln769">MessageRunnerManager::_NextToken()</a>
+<a name="ln770">{</a>
+<a name="ln771">	return fNextToken++;</a>
+<a name="ln772">}</a>
+<a name="ln773"> </a>
+
+</code></pre>
+<div class="balloon" rel="302"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v595/" target="_blank">V595</a> The 'info' pointer was utilized before it was verified against nullptr. Check lines: 302, 311.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

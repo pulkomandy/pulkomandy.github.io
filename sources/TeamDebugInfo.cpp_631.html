@@ -1,0 +1,946 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>TeamDebugInfo.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2009, Ingo Weinhold, ingo_weinhold@gmx.de.</a>
+<a name="ln3"> * Copyright 2012-2016, Rene Gollent, rene@gollent.com.</a>
+<a name="ln4"> * Distributed under the terms of the MIT License.</a>
+<a name="ln5"> */</a>
+<a name="ln6"> </a>
+<a name="ln7"> </a>
+<a name="ln8">#include &quot;TeamDebugInfo.h&quot;</a>
+<a name="ln9"> </a>
+<a name="ln10">#include &lt;stdio.h&gt;</a>
+<a name="ln11"> </a>
+<a name="ln12">#include &lt;new&gt;</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &lt;AutoDeleter.h&gt;</a>
+<a name="ln15">#include &lt;AutoLocker.h&gt;</a>
+<a name="ln16"> </a>
+<a name="ln17">#include &quot;Architecture.h&quot;</a>
+<a name="ln18">#include &quot;DebuggerInterface.h&quot;</a>
+<a name="ln19">#include &quot;DebuggerTeamDebugInfo.h&quot;</a>
+<a name="ln20">#include &quot;DisassembledCode.h&quot;</a>
+<a name="ln21">#include &quot;DwarfTeamDebugInfo.h&quot;</a>
+<a name="ln22">#include &quot;FileManager.h&quot;</a>
+<a name="ln23">#include &quot;FileSourceCode.h&quot;</a>
+<a name="ln24">#include &quot;Function.h&quot;</a>
+<a name="ln25">#include &quot;FunctionID.h&quot;</a>
+<a name="ln26">#include &quot;ImageDebugInfo.h&quot;</a>
+<a name="ln27">#include &quot;ImageDebugInfoLoadingState.h&quot;</a>
+<a name="ln28">#include &quot;LocatableFile.h&quot;</a>
+<a name="ln29">#include &quot;SourceFile.h&quot;</a>
+<a name="ln30">#include &quot;SourceLanguage.h&quot;</a>
+<a name="ln31">#include &quot;SpecificImageDebugInfo.h&quot;</a>
+<a name="ln32">#include &quot;StringUtils.h&quot;</a>
+<a name="ln33">#include &quot;Type.h&quot;</a>
+<a name="ln34">#include &quot;TypeLookupConstraints.h&quot;</a>
+<a name="ln35"> </a>
+<a name="ln36"> </a>
+<a name="ln37">// #pragma mark - FunctionHashDefinition</a>
+<a name="ln38"> </a>
+<a name="ln39"> </a>
+<a name="ln40">struct TeamDebugInfo::FunctionHashDefinition {</a>
+<a name="ln41">	typedef const FunctionInstance*	KeyType;</a>
+<a name="ln42">	typedef	Function				ValueType;</a>
+<a name="ln43"> </a>
+<a name="ln44">	size_t HashKey(const FunctionInstance* key) const</a>
+<a name="ln45">	{</a>
+<a name="ln46">		// Instances without source file only equal themselves.</a>
+<a name="ln47">		if (key-&gt;SourceFile() == NULL)</a>
+<a name="ln48">			return (uint32)(addr_t)key;</a>
+<a name="ln49"> </a>
+<a name="ln50">		uint32 hash = StringUtils::HashValue(key-&gt;Name());</a>
+<a name="ln51">		hash = hash * 17 + (uint32)(addr_t)key-&gt;SourceFile();</a>
+<a name="ln52">		SourceLocation location = key-&gt;GetSourceLocation();</a>
+<a name="ln53">		hash = hash * 17 + location.Line();</a>
+<a name="ln54">		hash = hash * 17 + location.Column();</a>
+<a name="ln55"> </a>
+<a name="ln56">		return hash;</a>
+<a name="ln57">	}</a>
+<a name="ln58"> </a>
+<a name="ln59">	size_t Hash(const Function* value) const</a>
+<a name="ln60">	{</a>
+<a name="ln61">		return HashKey(value-&gt;FirstInstance());</a>
+<a name="ln62">	}</a>
+<a name="ln63"> </a>
+<a name="ln64">	bool Compare(const FunctionInstance* key, const Function* value) const</a>
+<a name="ln65">	{</a>
+<a name="ln66">		// source file must be the same</a>
+<a name="ln67">		if (key-&gt;SourceFile() != value-&gt;SourceFile())</a>
+<a name="ln68">			return false;</a>
+<a name="ln69"> </a>
+<a name="ln70">		// Instances without source file only equal themselves.</a>
+<a name="ln71">		if (key-&gt;SourceFile() == NULL)</a>
+<a name="ln72">			return key == value-&gt;FirstInstance();</a>
+<a name="ln73"> </a>
+<a name="ln74">		// Source location and function name must also match.</a>
+<a name="ln75">		return key-&gt;GetSourceLocation() == value-&gt;GetSourceLocation()</a>
+<a name="ln76">			&amp;&amp; key-&gt;Name() == value-&gt;Name();</a>
+<a name="ln77">	}</a>
+<a name="ln78"> </a>
+<a name="ln79">	Function*&amp; GetLink(Function* value) const</a>
+<a name="ln80">	{</a>
+<a name="ln81">		return value-&gt;fNext;</a>
+<a name="ln82">	}</a>
+<a name="ln83">};</a>
+<a name="ln84"> </a>
+<a name="ln85"> </a>
+<a name="ln86">// #pragma mark - SourceFileEntry</a>
+<a name="ln87"> </a>
+<a name="ln88"> </a>
+<a name="ln89">struct TeamDebugInfo::SourceFileEntry {</a>
+<a name="ln90">	SourceFileEntry(LocatableFile* sourceFile)</a>
+<a name="ln91">		:</a>
+<a name="ln92">		fSourceFile(sourceFile),</a>
+<a name="ln93">		fSourceCode(NULL)</a>
+<a name="ln94">	{</a>
+<a name="ln95">		fSourceFile-&gt;AcquireReference();</a>
+<a name="ln96">	}</a>
+<a name="ln97"> </a>
+<a name="ln98">	~SourceFileEntry()</a>
+<a name="ln99">	{</a>
+<a name="ln100">		SetSourceCode(NULL);</a>
+<a name="ln101">		fSourceFile-&gt;ReleaseReference();</a>
+<a name="ln102">	}</a>
+<a name="ln103"> </a>
+<a name="ln104">	status_t Init()</a>
+<a name="ln105">	{</a>
+<a name="ln106">		return B_OK;</a>
+<a name="ln107">	}</a>
+<a name="ln108"> </a>
+<a name="ln109">	LocatableFile* SourceFile() const</a>
+<a name="ln110">	{</a>
+<a name="ln111">		return fSourceFile;</a>
+<a name="ln112">	}</a>
+<a name="ln113"> </a>
+<a name="ln114">	FileSourceCode* GetSourceCode() const</a>
+<a name="ln115">	{</a>
+<a name="ln116">		return fSourceCode;</a>
+<a name="ln117">	}</a>
+<a name="ln118"> </a>
+<a name="ln119">	void SetSourceCode(FileSourceCode* sourceCode)</a>
+<a name="ln120">	{</a>
+<a name="ln121">		if (sourceCode == fSourceCode)</a>
+<a name="ln122">			return;</a>
+<a name="ln123"> </a>
+<a name="ln124">		if (fSourceCode != NULL)</a>
+<a name="ln125">			fSourceCode-&gt;ReleaseReference();</a>
+<a name="ln126"> </a>
+<a name="ln127">		fSourceCode = sourceCode;</a>
+<a name="ln128"> </a>
+<a name="ln129">		if (fSourceCode != NULL)</a>
+<a name="ln130">			fSourceCode-&gt;AcquireReference();</a>
+<a name="ln131">	}</a>
+<a name="ln132"> </a>
+<a name="ln133"> </a>
+<a name="ln134">	bool IsUnused() const</a>
+<a name="ln135">	{</a>
+<a name="ln136">		return fFunctions.IsEmpty();</a>
+<a name="ln137">	}</a>
+<a name="ln138"> </a>
+<a name="ln139">	status_t AddFunction(Function* function)</a>
+<a name="ln140">	{</a>
+<a name="ln141">		if (!fFunctions.BinaryInsert(function, &amp;_CompareFunctions))</a>
+<a name="ln142">			return B_NO_MEMORY;</a>
+<a name="ln143"> </a>
+<a name="ln144">		return B_OK;</a>
+<a name="ln145">	}</a>
+<a name="ln146"> </a>
+<a name="ln147">	void RemoveFunction(Function* function)</a>
+<a name="ln148">	{</a>
+<a name="ln149">		int32 index = fFunctions.BinarySearchIndex(*function,</a>
+<a name="ln150">			&amp;_CompareFunctions);</a>
+<a name="ln151">		if (index &gt;= 0)</a>
+<a name="ln152">			fFunctions.RemoveItemAt(index);</a>
+<a name="ln153">	}</a>
+<a name="ln154"> </a>
+<a name="ln155">	Function* FunctionAtLocation(const SourceLocation&amp; location) const</a>
+<a name="ln156">	{</a>
+<a name="ln157">		int32 index = fFunctions.BinarySearchIndexByKey(location,</a>
+<a name="ln158">			&amp;_CompareLocationFunction);</a>
+<a name="ln159">		if (index &gt;= 0)</a>
+<a name="ln160">			return fFunctions.ItemAt(index);</a>
+<a name="ln161"> </a>
+<a name="ln162">		// No exact match, so we return the previous function which might still</a>
+<a name="ln163">		// contain the location.</a>
+<a name="ln164">		index = -index - 1;</a>
+<a name="ln165"> </a>
+<a name="ln166">		if (index == 0)</a>
+<a name="ln167">			return NULL;</a>
+<a name="ln168"> </a>
+<a name="ln169">		return fFunctions.ItemAt(index - 1);</a>
+<a name="ln170">	}</a>
+<a name="ln171"> </a>
+<a name="ln172">	Function* FunctionAt(int32 index) const</a>
+<a name="ln173">	{</a>
+<a name="ln174">		return fFunctions.ItemAt(index);</a>
+<a name="ln175">	}</a>
+<a name="ln176"> </a>
+<a name="ln177">	Function* FunctionByName(const BString&amp; name) const</a>
+<a name="ln178">	{</a>
+<a name="ln179">		// TODO: That's not exactly optimal.</a>
+<a name="ln180">		for (int32 i = 0; Function* function = fFunctions.ItemAt(i); i++) {</a>
+<a name="ln181">			if (name == function-&gt;Name())</a>
+<a name="ln182">				return function;</a>
+<a name="ln183">		}</a>
+<a name="ln184">		return NULL;</a>
+<a name="ln185">	}</a>
+<a name="ln186"> </a>
+<a name="ln187">private:</a>
+<a name="ln188">	typedef BObjectList&lt;Function&gt; FunctionList;</a>
+<a name="ln189"> </a>
+<a name="ln190">private:</a>
+<a name="ln191">	static int _CompareFunctions(const Function* a, const Function* b)</a>
+<a name="ln192">	{</a>
+<a name="ln193">		SourceLocation locationA = a-&gt;GetSourceLocation();</a>
+<a name="ln194">		SourceLocation locationB = b-&gt;GetSourceLocation();</a>
+<a name="ln195"> </a>
+<a name="ln196">		if (locationA &lt; locationB)</a>
+<a name="ln197">			return -1;</a>
+<a name="ln198"> </a>
+<a name="ln199">		if (locationA != locationB )</a>
+<a name="ln200">			return 1;</a>
+<a name="ln201"> </a>
+<a name="ln202">		// if the locations match we still need to compare by name to be</a>
+<a name="ln203">		// certain, since differently typed instantiations of template</a>
+<a name="ln204">		// functions will have the same source file and location</a>
+<a name="ln205">		return a-&gt;Name().Compare(b-&gt;Name());</a>
+<a name="ln206">	}</a>
+<a name="ln207"> </a>
+<a name="ln208">	static int _CompareLocationFunction(const SourceLocation* location,</a>
+<a name="ln209">		const Function* function)</a>
+<a name="ln210">	{</a>
+<a name="ln211">		SourceLocation functionLocation = function-&gt;GetSourceLocation();</a>
+<a name="ln212"> </a>
+<a name="ln213">		if (*location &lt; functionLocation)</a>
+<a name="ln214">			return -1;</a>
+<a name="ln215"> </a>
+<a name="ln216">		return *location == functionLocation ? 0 : 1;</a>
+<a name="ln217">	}</a>
+<a name="ln218"> </a>
+<a name="ln219">private:</a>
+<a name="ln220">	LocatableFile*		fSourceFile;</a>
+<a name="ln221">	FileSourceCode*		fSourceCode;</a>
+<a name="ln222">	FunctionList		fFunctions;</a>
+<a name="ln223"> </a>
+<a name="ln224">public:</a>
+<a name="ln225">	SourceFileEntry*	fNext;</a>
+<a name="ln226">};</a>
+<a name="ln227"> </a>
+<a name="ln228"> </a>
+<a name="ln229">// #pragma mark - SourceFileHashDefinition</a>
+<a name="ln230"> </a>
+<a name="ln231"> </a>
+<a name="ln232">struct TeamDebugInfo::SourceFileHashDefinition {</a>
+<a name="ln233">	typedef const LocatableFile*	KeyType;</a>
+<a name="ln234">	typedef	SourceFileEntry			ValueType;</a>
+<a name="ln235"> </a>
+<a name="ln236">	size_t HashKey(const LocatableFile* key) const</a>
+<a name="ln237">	{</a>
+<a name="ln238">		return (size_t)(addr_t)key;</a>
+<a name="ln239">	}</a>
+<a name="ln240"> </a>
+<a name="ln241">	size_t Hash(const SourceFileEntry* value) const</a>
+<a name="ln242">	{</a>
+<a name="ln243">		return HashKey(value-&gt;SourceFile());</a>
+<a name="ln244">	}</a>
+<a name="ln245"> </a>
+<a name="ln246">	bool Compare(const LocatableFile* key, const SourceFileEntry* value) const</a>
+<a name="ln247">	{</a>
+<a name="ln248">		return key == value-&gt;SourceFile();</a>
+<a name="ln249">	}</a>
+<a name="ln250"> </a>
+<a name="ln251">	SourceFileEntry*&amp; GetLink(SourceFileEntry* value) const</a>
+<a name="ln252">	{</a>
+<a name="ln253">		return value-&gt;fNext;</a>
+<a name="ln254">	}</a>
+<a name="ln255">};</a>
+<a name="ln256"> </a>
+<a name="ln257"> </a>
+<a name="ln258">// #pragma mark - TeamDebugInfo</a>
+<a name="ln259"> </a>
+<a name="ln260"> </a>
+<a name="ln261">TeamDebugInfo::TeamDebugInfo(DebuggerInterface* debuggerInterface,</a>
+<a name="ln262">	Architecture* architecture, FileManager* fileManager)</a>
+<a name="ln263">	:</a>
+<a name="ln264">	fLock(&quot;team debug info&quot;),</a>
+<a name="ln265">	fDebuggerInterface(debuggerInterface),</a>
+<a name="ln266">	fArchitecture(architecture),</a>
+<a name="ln267">	fFileManager(fileManager),</a>
+<a name="ln268">	fSpecificInfos(10, true),</a>
+<a name="ln269">	fFunctions(NULL),</a>
+<a name="ln270">	fSourceFiles(NULL),</a>
+<a name="ln271">	fTypeCache(NULL),</a>
+<a name="ln272">	fMainFunction(NULL)</a>
+<a name="ln273">{</a>
+<a name="ln274">	fDebuggerInterface-&gt;AcquireReference();</a>
+<a name="ln275">}</a>
+<a name="ln276"> </a>
+<a name="ln277"> </a>
+<a name="ln278">TeamDebugInfo::~TeamDebugInfo()</a>
+<a name="ln279">{</a>
+<a name="ln280">	if (fTypeCache != NULL)</a>
+<a name="ln281">		fTypeCache-&gt;ReleaseReference();</a>
+<a name="ln282"> </a>
+<a name="ln283">	if (fSourceFiles != NULL) {</a>
+<a name="ln284">		SourceFileEntry* entry = fSourceFiles-&gt;Clear(true);</a>
+<a name="ln285">		while (entry != NULL) {</a>
+<a name="ln286">			SourceFileEntry* next = entry-&gt;fNext;</a>
+<a name="ln287">			delete entry;</a>
+<a name="ln288">			entry = next;</a>
+<a name="ln289">		}</a>
+<a name="ln290"> </a>
+<a name="ln291">		delete fSourceFiles;</a>
+<a name="ln292">	}</a>
+<a name="ln293"> </a>
+<a name="ln294">	if (fFunctions != NULL) {</a>
+<a name="ln295">		Function* function = fFunctions-&gt;Clear(true);</a>
+<a name="ln296">		while (function != NULL) {</a>
+<a name="ln297">			Function* next = function-&gt;fNext;</a>
+<a name="ln298">			function-&gt;ReleaseReference();</a>
+<a name="ln299">			function = next;</a>
+<a name="ln300">		}</a>
+<a name="ln301"> </a>
+<a name="ln302">		delete fFunctions;</a>
+<a name="ln303">	}</a>
+<a name="ln304"> </a>
+<a name="ln305">	fDebuggerInterface-&gt;ReleaseReference();</a>
+<a name="ln306">}</a>
+<a name="ln307"> </a>
+<a name="ln308"> </a>
+<a name="ln309">status_t</a>
+<a name="ln310">TeamDebugInfo::Init()</a>
+<a name="ln311">{</a>
+<a name="ln312">	// check the lock</a>
+<a name="ln313">	status_t error = fLock.InitCheck();</a>
+<a name="ln314">	if (error != B_OK)</a>
+<a name="ln315">		return error;</a>
+<a name="ln316"> </a>
+<a name="ln317">	// create function hash table</a>
+<a name="ln318">	fFunctions = new(std::nothrow) FunctionTable;</a>
+<a name="ln319">	if (fFunctions == NULL)</a>
+<a name="ln320">		return B_NO_MEMORY;</a>
+<a name="ln321"> </a>
+<a name="ln322">	error = fFunctions-&gt;Init();</a>
+<a name="ln323">	if (error != B_OK)</a>
+<a name="ln324">		return error;</a>
+<a name="ln325"> </a>
+<a name="ln326">	// create source file hash table</a>
+<a name="ln327">	fSourceFiles = new(std::nothrow) SourceFileTable;</a>
+<a name="ln328">	if (fSourceFiles == NULL)</a>
+<a name="ln329">		return B_NO_MEMORY;</a>
+<a name="ln330"> </a>
+<a name="ln331">	error = fSourceFiles-&gt;Init();</a>
+<a name="ln332">	if (error != B_OK)</a>
+<a name="ln333">		return error;</a>
+<a name="ln334"> </a>
+<a name="ln335">	// create a type cache</a>
+<a name="ln336">	fTypeCache = new(std::nothrow) GlobalTypeCache;</a>
+<a name="ln337">	if (fTypeCache == NULL)</a>
+<a name="ln338">		return B_NO_MEMORY;</a>
+<a name="ln339"> </a>
+<a name="ln340">	error = fTypeCache-&gt;Init();</a>
+<a name="ln341">	if (error != B_OK)</a>
+<a name="ln342">		return error;</a>
+<a name="ln343"> </a>
+<a name="ln344">	// Create specific infos for all types of debug info we support, in</a>
+<a name="ln345">	// descending order of expressiveness.</a>
+<a name="ln346"> </a>
+<a name="ln347">	// DWARF</a>
+<a name="ln348">	DwarfTeamDebugInfo* dwarfInfo = new(std::nothrow) DwarfTeamDebugInfo(</a>
+<a name="ln349">		fArchitecture, fDebuggerInterface, fFileManager, this, this,</a>
+<a name="ln350">		fTypeCache);</a>
+<a name="ln351">	if (dwarfInfo == NULL || !fSpecificInfos.AddItem(dwarfInfo)) {</a>
+<a name="ln352">		delete dwarfInfo;</a>
+<a name="ln353">		return B_NO_MEMORY;</a>
+<a name="ln354">	}</a>
+<a name="ln355"> </a>
+<a name="ln356">	error = dwarfInfo-&gt;Init();</a>
+<a name="ln357">	if (error != B_OK)</a>
+<a name="ln358">		return error;</a>
+<a name="ln359"> </a>
+<a name="ln360">	// debugger based info</a>
+<a name="ln361">	DebuggerTeamDebugInfo* debuggerInfo</a>
+<a name="ln362">		= new(std::nothrow) DebuggerTeamDebugInfo(fDebuggerInterface,</a>
+<a name="ln363">			fArchitecture);</a>
+<a name="ln364">	if (debuggerInfo == NULL || !fSpecificInfos.AddItem(debuggerInfo)) {</a>
+<a name="ln365">		delete debuggerInfo;</a>
+<a name="ln366">		return B_NO_MEMORY;</a>
+<a name="ln367">	}</a>
+<a name="ln368"> </a>
+<a name="ln369">	error = debuggerInfo-&gt;Init();</a>
+<a name="ln370">	if (error != B_OK)</a>
+<a name="ln371">		return error;</a>
+<a name="ln372"> </a>
+<a name="ln373">	return B_OK;</a>
+<a name="ln374">}</a>
+<a name="ln375"> </a>
+<a name="ln376"> </a>
+<a name="ln377">status_t</a>
+<a name="ln378">TeamDebugInfo::LookupTypeByName(const BString&amp; name,</a>
+<a name="ln379">	const TypeLookupConstraints&amp; constraints, Type*&amp; _type)</a>
+<a name="ln380">{</a>
+<a name="ln381">	return GetType(fTypeCache, name, constraints, _type);</a>
+<a name="ln382">}</a>
+<a name="ln383"> </a>
+<a name="ln384"> </a>
+<a name="ln385">bool</a>
+<a name="ln386">TeamDebugInfo::TypeExistsByName(const BString&amp; name,</a>
+<a name="ln387">	const TypeLookupConstraints&amp; constraints)</a>
+<a name="ln388">{</a>
+<a name="ln389">	return HasType(fTypeCache, name, constraints);</a>
+<a name="ln390">}</a>
+<a name="ln391"> </a>
+<a name="ln392"> </a>
+<a name="ln393">status_t</a>
+<a name="ln394">TeamDebugInfo::GetType(GlobalTypeCache* cache, const BString&amp; name,</a>
+<a name="ln395">	const TypeLookupConstraints&amp; constraints, Type*&amp; _type)</a>
+<a name="ln396">{</a>
+<a name="ln397">	// maybe the type is already cached</a>
+<a name="ln398">	AutoLocker&lt;GlobalTypeCache&gt; cacheLocker(cache);</a>
+<a name="ln399"> </a>
+<a name="ln400">	Type* type = cache-&gt;GetType(name, constraints);</a>
+<a name="ln401">	if (type != NULL) {</a>
+<a name="ln402">		type-&gt;AcquireReference();</a>
+<a name="ln403">		_type = type;</a>
+<a name="ln404">		return B_OK;</a>
+<a name="ln405">	}</a>
+<a name="ln406"> </a>
+<a name="ln407">	cacheLocker.Unlock();</a>
+<a name="ln408"> </a>
+<a name="ln409">	// Clone the image list and get references to the images, so we can iterate</a>
+<a name="ln410">	// through them without locking.</a>
+<a name="ln411">	AutoLocker&lt;BLocker&gt; locker(fLock);</a>
+<a name="ln412"> </a>
+<a name="ln413">	ImageList images;</a>
+<a name="ln414">	for (int32 i = 0; ImageDebugInfo* imageDebugInfo = fImages.ItemAt(i); i++) {</a>
+<a name="ln415">		if (images.AddItem(imageDebugInfo))</a>
+<a name="ln416">			imageDebugInfo-&gt;AcquireReference();</a>
+<a name="ln417">	}</a>
+<a name="ln418"> </a>
+<a name="ln419">	locker.Unlock();</a>
+<a name="ln420"> </a>
+<a name="ln421">	// get the type</a>
+<a name="ln422">	status_t error = B_ENTRY_NOT_FOUND;</a>
+<a name="ln423">	for (int32 i = 0; ImageDebugInfo* imageDebugInfo = images.ItemAt(i); i++) {</a>
+<a name="ln424">		error = imageDebugInfo-&gt;GetType(cache, name, constraints, type);</a>
+<a name="ln425">		if (error == B_OK) {</a>
+<a name="ln426">			_type = type;</a>
+<a name="ln427">			break;</a>
+<a name="ln428">		}</a>
+<a name="ln429">	}</a>
+<a name="ln430"> </a>
+<a name="ln431">	// release the references</a>
+<a name="ln432">	for (int32 i = 0; ImageDebugInfo* imageDebugInfo = images.ItemAt(i); i++)</a>
+<a name="ln433">		imageDebugInfo-&gt;ReleaseReference();</a>
+<a name="ln434"> </a>
+<a name="ln435">	return error;</a>
+<a name="ln436">}</a>
+<a name="ln437"> </a>
+<a name="ln438"> </a>
+<a name="ln439">bool</a>
+<a name="ln440">TeamDebugInfo::HasType(GlobalTypeCache* cache, const BString&amp; name,</a>
+<a name="ln441">	const TypeLookupConstraints&amp; constraints)</a>
+<a name="ln442">{</a>
+<a name="ln443">	// maybe the type is already cached</a>
+<a name="ln444">	AutoLocker&lt;GlobalTypeCache&gt; cacheLocker(cache);</a>
+<a name="ln445"> </a>
+<a name="ln446">	Type* type = cache-&gt;GetType(name, constraints);</a>
+<a name="ln447">	if (type != NULL)</a>
+<a name="ln448">		return true;</a>
+<a name="ln449"> </a>
+<a name="ln450">	cacheLocker.Unlock();</a>
+<a name="ln451"> </a>
+<a name="ln452">	// Clone the image list and get references to the images, so we can iterate</a>
+<a name="ln453">	// through them without locking.</a>
+<a name="ln454">	AutoLocker&lt;BLocker&gt; locker(fLock);</a>
+<a name="ln455"> </a>
+<a name="ln456">	ImageList images;</a>
+<a name="ln457">	for (int32 i = 0; ImageDebugInfo* imageDebugInfo = fImages.ItemAt(i); i++) {</a>
+<a name="ln458">		if (images.AddItem(imageDebugInfo))</a>
+<a name="ln459">			imageDebugInfo-&gt;AcquireReference();</a>
+<a name="ln460">	}</a>
+<a name="ln461"> </a>
+<a name="ln462">	locker.Unlock();</a>
+<a name="ln463"> </a>
+<a name="ln464">	bool found = false;</a>
+<a name="ln465">	for (int32 i = 0; ImageDebugInfo* imageDebugInfo = images.ItemAt(i); i++) {</a>
+<a name="ln466">		if (imageDebugInfo-&gt;HasType(name, constraints)) {</a>
+<a name="ln467">			found = true;</a>
+<a name="ln468">			break;</a>
+<a name="ln469">		}</a>
+<a name="ln470">	}</a>
+<a name="ln471"> </a>
+<a name="ln472">	// release the references</a>
+<a name="ln473">	for (int32 i = 0; ImageDebugInfo* imageDebugInfo = images.ItemAt(i); i++)</a>
+<a name="ln474">		imageDebugInfo-&gt;ReleaseReference();</a>
+<a name="ln475"> </a>
+<a name="ln476">	return found;</a>
+<a name="ln477">}</a>
+<a name="ln478"> </a>
+<a name="ln479"> </a>
+<a name="ln480">status_t</a>
+<a name="ln481">TeamDebugInfo::GetActiveSourceCode(FunctionDebugInfo* info, SourceCode*&amp; _code)</a>
+<a name="ln482">{</a>
+<a name="ln483">	AutoLocker&lt;BLocker&gt; locker(fLock);</a>
+<a name="ln484"> </a>
+<a name="ln485">	LocatableFile* file = info-&gt;SourceFile();</a>
+<a name="ln486">	if (file != NULL) {</a>
+<a name="ln487">		Function* function = FunctionAtSourceLocation(file,</a>
+<a name="ln488">			info-&gt;SourceStartLocation());</a>
+<a name="ln489">		if (function != NULL) {</a>
+<a name="ln490">			function_source_state state = function-&gt;SourceCodeState();</a>
+<a name="ln491">			if (function-&gt;SourceCodeState() == FUNCTION_SOURCE_LOADED) {</a>
+<a name="ln492">				_code = function-&gt;GetSourceCode();</a>
+<a name="ln493">				_code-&gt;AcquireReference();</a>
+<a name="ln494">				return B_OK;</a>
+<a name="ln495">			} else if (state == FUNCTION_SOURCE_NOT_LOADED) {</a>
+<a name="ln496">				// if the function's source state is not loaded, check</a>
+<a name="ln497">				// if we already know the file anyways. Currently, when</a>
+<a name="ln498">				// a source code job runs, it does so on behalf of a specific</a>
+<a name="ln499">				// function, and consequently only sets the loaded source code</a>
+<a name="ln500">				// on that particular function at that point in time, rather</a>
+<a name="ln501">				// than all others sharing that same file. Consequently,</a>
+<a name="ln502">				// set it lazily here.</a>
+<a name="ln503">				SourceFileEntry* entry = fSourceFiles-&gt;Lookup(file);</a>
+<a name="ln504">				if (entry != NULL) {</a>
+<a name="ln505">					FileSourceCode* sourceCode = entry-&gt;GetSourceCode();</a>
+<a name="ln506">					if (sourceCode != NULL) {</a>
+<a name="ln507">						function-&gt;SetSourceCode(sourceCode,</a>
+<a name="ln508">							FUNCTION_SOURCE_LOADED);</a>
+<a name="ln509">						_code = sourceCode;</a>
+<a name="ln510">						_code-&gt;AcquireReference();</a>
+<a name="ln511">						return B_OK;</a>
+<a name="ln512">					}</a>
+<a name="ln513">				}</a>
+<a name="ln514">			}</a>
+<a name="ln515">		}</a>
+<a name="ln516">	}</a>
+<a name="ln517"> </a>
+<a name="ln518">	for (int32 i = 0; i &lt; fImages.CountItems(); i++) {</a>
+<a name="ln519">		ImageDebugInfo* imageInfo = fImages.ItemAt(i);</a>
+<a name="ln520">		FunctionInstance* instance = imageInfo-&gt;FunctionAtAddress(</a>
+<a name="ln521">			info-&gt;Address());</a>
+<a name="ln522">		if (instance != NULL &amp;&amp; instance-&gt;SourceCodeState()</a>
+<a name="ln523">				== FUNCTION_SOURCE_LOADED) {</a>
+<a name="ln524">			_code = instance-&gt;GetSourceCode();</a>
+<a name="ln525">			_code-&gt;AcquireReference();</a>
+<a name="ln526">			return B_OK;</a>
+<a name="ln527">		}</a>
+<a name="ln528">	}</a>
+<a name="ln529"> </a>
+<a name="ln530">	return B_ENTRY_NOT_FOUND;</a>
+<a name="ln531">}</a>
+<a name="ln532"> </a>
+<a name="ln533"> </a>
+<a name="ln534">status_t</a>
+<a name="ln535">TeamDebugInfo::LoadImageDebugInfo(const ImageInfo&amp; imageInfo,</a>
+<a name="ln536">	LocatableFile* imageFile, ImageDebugInfoLoadingState&amp; _state,</a>
+<a name="ln537">	ImageDebugInfo*&amp; _imageDebugInfo)</a>
+<a name="ln538">{</a>
+<a name="ln539">	ImageDebugInfo* imageDebugInfo = new(std::nothrow) ImageDebugInfo(</a>
+<a name="ln540">		imageInfo);</a>
+<a name="ln541">	if (imageDebugInfo == NULL)</a>
+<a name="ln542">		return B_NO_MEMORY;</a>
+<a name="ln543">	BReference&lt;ImageDebugInfo&gt; imageDebugInfoReference(imageDebugInfo, true);</a>
+<a name="ln544"> </a>
+<a name="ln545">	for (int32 i = 0; SpecificTeamDebugInfo* specificTeamInfo</a>
+<a name="ln546">			= fSpecificInfos.ItemAt(i); i++) {</a>
+<a name="ln547">		SpecificImageDebugInfo* specificImageInfo;</a>
+<a name="ln548">		status_t error = specificTeamInfo-&gt;CreateImageDebugInfo(imageInfo,</a>
+<a name="ln549">			imageFile, _state, specificImageInfo);</a>
+<a name="ln550">		if (error == B_OK) {</a>
+<a name="ln551">			if (!imageDebugInfo-&gt;AddSpecificInfo(specificImageInfo)) {</a>
+<a name="ln552">				delete specificImageInfo;</a>
+<a name="ln553">				return B_NO_MEMORY;</a>
+<a name="ln554">			}</a>
+<a name="ln555">		} else if (_state.UserInputRequired()) {</a>
+<a name="ln556">			_state.SetSpecificInfoIndex(i);</a>
+<a name="ln557">			return error;</a>
+<a name="ln558">		} else if (error == B_NO_MEMORY)</a>
+<a name="ln559">			return error;</a>
+<a name="ln560">				// fail only when out of memory</a>
+<a name="ln561"> </a>
+<a name="ln562">		_state.ClearSpecificDebugInfoLoadingState();</a>
+<a name="ln563">			// if we made it this far, then we're done with current specific</a>
+<a name="ln564">			// info, and its corresponding state object, if any, is no longer</a>
+<a name="ln565">			// needed</a>
+<a name="ln566">	}</a>
+<a name="ln567"> </a>
+<a name="ln568">	status_t error = imageDebugInfo-&gt;FinishInit(fDebuggerInterface);</a>
+<a name="ln569">	if (error != B_OK)</a>
+<a name="ln570">		return error;</a>
+<a name="ln571"> </a>
+<a name="ln572">	if (fMainFunction == NULL) {</a>
+<a name="ln573">		FunctionInstance* instance = imageDebugInfo-&gt;MainFunction();</a>
+<a name="ln574">		if (instance != NULL)</a>
+<a name="ln575">			fMainFunction = instance;</a>
+<a name="ln576">	}</a>
+<a name="ln577"> </a>
+<a name="ln578">	_imageDebugInfo = imageDebugInfoReference.Detach();</a>
+<a name="ln579">	return B_OK;</a>
+<a name="ln580">}</a>
+<a name="ln581"> </a>
+<a name="ln582"> </a>
+<a name="ln583">status_t</a>
+<a name="ln584">TeamDebugInfo::LoadSourceCode(LocatableFile* file, FileSourceCode*&amp; _sourceCode)</a>
+<a name="ln585">{</a>
+<a name="ln586">	AutoLocker&lt;BLocker&gt; locker(fLock);</a>
+<a name="ln587"> </a>
+<a name="ln588">	// If we don't know the source file, there's nothing we can do.</a>
+<a name="ln589">	SourceFileEntry* entry = fSourceFiles-&gt;Lookup(file);</a>
+<a name="ln590">	if (entry == NULL)</a>
+<a name="ln591">		return B_ENTRY_NOT_FOUND;</a>
+<a name="ln592"> </a>
+<a name="ln593">	// the source might already be loaded</a>
+<a name="ln594">	FileSourceCode* sourceCode = entry-&gt;GetSourceCode();</a>
+<a name="ln595">	if (sourceCode != NULL) {</a>
+<a name="ln596">		sourceCode-&gt;AcquireReference();</a>
+<a name="ln597">		_sourceCode = sourceCode;</a>
+<a name="ln598">		return B_OK;</a>
+<a name="ln599">	}</a>
+<a name="ln600"> </a>
+<a name="ln601">	// get the source language from some function's image debug info</a>
+<a name="ln602">	Function* function = entry-&gt;FunctionAt(0);</a>
+<a name="ln603">	if (function == NULL)</a>
+<a name="ln604">		return B_ENTRY_NOT_FOUND;</a>
+<a name="ln605"> </a>
+<a name="ln606">	FunctionDebugInfo* functionDebugInfo</a>
+<a name="ln607">		= function-&gt;FirstInstance()-&gt;GetFunctionDebugInfo();</a>
+<a name="ln608">	SourceLanguage* language;</a>
+<a name="ln609">	status_t error = functionDebugInfo-&gt;GetSpecificImageDebugInfo()</a>
+<a name="ln610">		-&gt;GetSourceLanguage(functionDebugInfo, language);</a>
+<a name="ln611">	if (error != B_OK)</a>
+<a name="ln612">		return error;</a>
+<a name="ln613">	BReference&lt;SourceLanguage&gt; languageReference(language, true);</a>
+<a name="ln614"> </a>
+<a name="ln615">	// no source code yet</a>
+<a name="ln616">//	locker.Unlock();</a>
+<a name="ln617">	// TODO: It would be nice to unlock here, but we need to iterate through</a>
+<a name="ln618">	// the images below. We could clone the list, acquire references, and</a>
+<a name="ln619">	// unlock. Then we have to compare the list with the then current list when</a>
+<a name="ln620">	// we're done loading.</a>
+<a name="ln621"> </a>
+<a name="ln622">	// load the source file</a>
+<a name="ln623">	SourceFile* sourceFile;</a>
+<a name="ln624">	error = fFileManager-&gt;LoadSourceFile(file, sourceFile);</a>
+<a name="ln625">	if (error != B_OK)</a>
+<a name="ln626">		return error;</a>
+<a name="ln627"> </a>
+<a name="ln628">	// create the source code</a>
+<a name="ln629">	sourceCode = new(std::nothrow) FileSourceCode(file, sourceFile, language);</a>
+<a name="ln630">	sourceFile-&gt;ReleaseReference();</a>
+<a name="ln631">	if (sourceCode == NULL)</a>
+<a name="ln632">		return B_NO_MEMORY;</a>
+<a name="ln633">	BReference&lt;FileSourceCode&gt; sourceCodeReference(sourceCode, true);</a>
+<a name="ln634"> </a>
+<a name="ln635">	error = sourceCode-&gt;Init();</a>
+<a name="ln636">	if (error != B_OK)</a>
+<a name="ln637">		return error;</a>
+<a name="ln638"> </a>
+<a name="ln639">	// Iterate through all images that know the source file and ask them to add</a>
+<a name="ln640">	// information.</a>
+<a name="ln641">	bool anyInfo = false;</a>
+<a name="ln642">	for (int32 i = 0; ImageDebugInfo* imageDebugInfo = fImages.ItemAt(i); i++)</a>
+<a name="ln643">		anyInfo |= imageDebugInfo-&gt;AddSourceCodeInfo(file, sourceCode) == B_OK;</a>
+<a name="ln644"> </a>
+<a name="ln645">	if (!anyInfo)</a>
+<a name="ln646">		return B_ENTRY_NOT_FOUND;</a>
+<a name="ln647"> </a>
+<a name="ln648">	entry-&gt;SetSourceCode(sourceCode);</a>
+<a name="ln649"> </a>
+<a name="ln650">	_sourceCode = sourceCodeReference.Detach();</a>
+<a name="ln651">	return B_OK;</a>
+<a name="ln652">}</a>
+<a name="ln653"> </a>
+<a name="ln654"> </a>
+<a name="ln655">void</a>
+<a name="ln656">TeamDebugInfo::ClearSourceCode(LocatableFile* sourceFile)</a>
+<a name="ln657">{</a>
+<a name="ln658">	AutoLocker&lt;BLocker&gt; locker(fLock);</a>
+<a name="ln659"> </a>
+<a name="ln660">	SourceFileEntry* entry = fSourceFiles-&gt;Lookup(sourceFile);</a>
+<a name="ln661">	if (entry != NULL)</a>
+<a name="ln662">		entry-&gt;SetSourceCode(NULL);</a>
+<a name="ln663">}</a>
+<a name="ln664"> </a>
+<a name="ln665"> </a>
+<a name="ln666">status_t</a>
+<a name="ln667">TeamDebugInfo::DisassembleFunction(FunctionInstance* functionInstance,</a>
+<a name="ln668">	DisassembledCode*&amp; _sourceCode)</a>
+<a name="ln669">{</a>
+<a name="ln670">	// allocate a buffer for the function code</a>
+<a name="ln671">	static const target_size_t kMaxBufferSize = 64 * 1024;</a>
+<a name="ln672">	target_size_t bufferSize = std::min(functionInstance-&gt;Size(),</a>
+<a name="ln673">		kMaxBufferSize);</a>
+<a name="ln674">	void* buffer = malloc(bufferSize);</a>
+<a name="ln675">	if (buffer == NULL)</a>
+<a name="ln676">		return B_NO_MEMORY;</a>
+<a name="ln677">	MemoryDeleter bufferDeleter(buffer);</a>
+<a name="ln678"> </a>
+<a name="ln679">	// read the function code</a>
+<a name="ln680">	FunctionDebugInfo* functionDebugInfo</a>
+<a name="ln681">		= functionInstance-&gt;GetFunctionDebugInfo();</a>
+<a name="ln682">	ssize_t bytesRead = functionDebugInfo-&gt;GetSpecificImageDebugInfo()</a>
+<a name="ln683">		-&gt;ReadCode(functionInstance-&gt;Address(), buffer, bufferSize);</a>
+<a name="ln684">	if (bytesRead &lt; 0)</a>
+<a name="ln685">		return bytesRead;</a>
+<a name="ln686"> </a>
+<a name="ln687">	return fArchitecture-&gt;DisassembleCode(functionDebugInfo, buffer, bytesRead,</a>
+<a name="ln688">		_sourceCode);</a>
+<a name="ln689">}</a>
+<a name="ln690"> </a>
+<a name="ln691"> </a>
+<a name="ln692">status_t</a>
+<a name="ln693">TeamDebugInfo::AddImageDebugInfo(ImageDebugInfo* imageDebugInfo)</a>
+<a name="ln694">{</a>
+<a name="ln695">	AutoLocker&lt;BLocker&gt; locker(fLock);</a>
+<a name="ln696">		// We have both locks now, so that for read-only access either lock</a>
+<a name="ln697">		// suffices.</a>
+<a name="ln698"> </a>
+<a name="ln699">	if (!fImages.AddItem(imageDebugInfo))</a>
+<a name="ln700">		return B_NO_MEMORY;</a>
+<a name="ln701"> </a>
+<a name="ln702">	// Match all of the image debug info's functions instances with functions.</a>
+<a name="ln703">	BObjectList&lt;SourceFileEntry&gt; sourceFileEntries;</a>
+<a name="ln704">	for (int32 i = 0;</a>
+<a name="ln705">		FunctionInstance* instance = imageDebugInfo-&gt;FunctionAt(i); i++) {</a>
+<a name="ln706">		// lookup the function or create it, if it doesn't exist yet</a>
+<a name="ln707">		Function* function = fFunctions-&gt;Lookup(instance);</a>
+<a name="ln708">		if (function != NULL) {</a>
+<a name="ln709">// TODO: Also update possible user breakpoints in this function!</a>
+<a name="ln710">			function-&gt;AddInstance(instance);</a>
+<a name="ln711">			instance-&gt;SetFunction(function);</a>
+<a name="ln712"> </a>
+<a name="ln713">			// The new image debug info might have additional information about</a>
+<a name="ln714">			// the source file of the function, so remember the source file</a>
+<a name="ln715">			// entry.</a>
+<a name="ln716">			if (LocatableFile* sourceFile = function-&gt;SourceFile()) {</a>
+<a name="ln717">				SourceFileEntry* entry = fSourceFiles-&gt;Lookup(sourceFile);</a>
+<a name="ln718">				if (entry != NULL &amp;&amp; entry-&gt;GetSourceCode() != NULL)</a>
+<a name="ln719">					sourceFileEntries.AddItem(entry);</a>
+<a name="ln720">			}</a>
+<a name="ln721">		} else {</a>
+<a name="ln722">			function = new(std::nothrow) Function;</a>
+<a name="ln723">			if (function == NULL) {</a>
+<a name="ln724">				RemoveImageDebugInfo(imageDebugInfo);</a>
+<a name="ln725">				return B_NO_MEMORY;</a>
+<a name="ln726">			}</a>
+<a name="ln727">			function-&gt;AddInstance(instance);</a>
+<a name="ln728">			instance-&gt;SetFunction(function);</a>
+<a name="ln729"> </a>
+<a name="ln730">			status_t error = _AddFunction(function);</a>
+<a name="ln731">				// Insert after adding the instance. Otherwise the function</a>
+<a name="ln732">				// wouldn't be hashable/comparable.</a>
+<a name="ln733">			if (error != B_OK) {</a>
+<a name="ln734">				function-&gt;RemoveInstance(instance);</a>
+<a name="ln735">				instance-&gt;SetFunction(NULL);</a>
+<a name="ln736">				RemoveImageDebugInfo(imageDebugInfo);</a>
+<a name="ln737">				return error;</a>
+<a name="ln738">			}</a>
+<a name="ln739">		}</a>
+<a name="ln740">	}</a>
+<a name="ln741"> </a>
+<a name="ln742">	// update the source files the image debug info knows about</a>
+<a name="ln743">	for (int32 i = 0; SourceFileEntry* entry = sourceFileEntries.ItemAt(i);</a>
+<a name="ln744">			i++) {</a>
+<a name="ln745">		FileSourceCode* sourceCode = entry-&gt;GetSourceCode();</a>
+<a name="ln746">		sourceCode-&gt;Lock();</a>
+<a name="ln747">		if (imageDebugInfo-&gt;AddSourceCodeInfo(entry-&gt;SourceFile(),</a>
+<a name="ln748">				sourceCode) == B_OK) {</a>
+<a name="ln749">			// TODO: Notify interesting parties! Iterate through all functions</a>
+<a name="ln750">			// for this source file?</a>
+<a name="ln751">		}</a>
+<a name="ln752">		sourceCode-&gt;Unlock();</a>
+<a name="ln753">	}</a>
+<a name="ln754"> </a>
+<a name="ln755">	return B_OK;</a>
+<a name="ln756">}</a>
+<a name="ln757"> </a>
+<a name="ln758"> </a>
+<a name="ln759">void</a>
+<a name="ln760">TeamDebugInfo::RemoveImageDebugInfo(ImageDebugInfo* imageDebugInfo)</a>
+<a name="ln761">{</a>
+<a name="ln762">	AutoLocker&lt;BLocker&gt; locker(fLock);</a>
+<a name="ln763">		// We have both locks now, so that for read-only access either lock</a>
+<a name="ln764">		// suffices.</a>
+<a name="ln765"> </a>
+<a name="ln766">	// Remove the functions from all of the image debug info's functions</a>
+<a name="ln767">	// instances.</a>
+<a name="ln768">	for (int32 i = 0;</a>
+<a name="ln769">		FunctionInstance* instance = imageDebugInfo-&gt;FunctionAt(i); i++) {</a>
+<a name="ln770">		if (Function* function = instance-&gt;GetFunction()) {</a>
+<a name="ln771">// TODO: Also update possible user breakpoints in this function!</a>
+<a name="ln772">			if (function-&gt;FirstInstance() == function-&gt;LastInstance()) {</a>
+<a name="ln773">				// function unused -- remove it</a>
+<a name="ln774">				// Note, that we have to remove it from the hash before removing</a>
+<a name="ln775">				// the instance, since otherwise the function cannot be compared</a>
+<a name="ln776">				// anymore.</a>
+<a name="ln777">				_RemoveFunction(function);</a>
+<a name="ln778">				function-&gt;ReleaseReference();</a>
+<a name="ln779">					// The instance still has a reference.</a>
+<a name="ln780">			}</a>
+<a name="ln781"> </a>
+<a name="ln782">			function-&gt;RemoveInstance(instance);</a>
+<a name="ln783">			instance-&gt;SetFunction(NULL);</a>
+<a name="ln784">				// If this was the last instance, it will remove the last</a>
+<a name="ln785">				// reference to the function.</a>
+<a name="ln786">		}</a>
+<a name="ln787">	}</a>
+<a name="ln788"> </a>
+<a name="ln789">	// remove cached types from that image</a>
+<a name="ln790">	fTypeCache-&gt;RemoveTypes(imageDebugInfo-&gt;GetImageInfo().ImageID());</a>
+<a name="ln791"> </a>
+<a name="ln792">	fImages.RemoveItem(imageDebugInfo);</a>
+<a name="ln793">}</a>
+<a name="ln794"> </a>
+<a name="ln795"> </a>
+<a name="ln796">ImageDebugInfo*</a>
+<a name="ln797">TeamDebugInfo::ImageDebugInfoByName(const char* name) const</a>
+<a name="ln798">{</a>
+<a name="ln799">	for (int32 i = 0; ImageDebugInfo* imageDebugInfo = fImages.ItemAt(i); i++) {</a>
+<a name="ln800">		if (imageDebugInfo-&gt;GetImageInfo().Name() == name)</a>
+<a name="ln801">			return imageDebugInfo;</a>
+<a name="ln802">	}</a>
+<a name="ln803"> </a>
+<a name="ln804">	return NULL;</a>
+<a name="ln805">}</a>
+<a name="ln806"> </a>
+<a name="ln807"> </a>
+<a name="ln808">Function*</a>
+<a name="ln809">TeamDebugInfo::FunctionAtSourceLocation(LocatableFile* file,</a>
+<a name="ln810">	const SourceLocation&amp; location) const</a>
+<a name="ln811">{</a>
+<a name="ln812">	if (SourceFileEntry* entry = fSourceFiles-&gt;Lookup(file))</a>
+<a name="ln813">		return entry-&gt;FunctionAtLocation(location);</a>
+<a name="ln814">	return NULL;</a>
+<a name="ln815">}</a>
+<a name="ln816"> </a>
+<a name="ln817"> </a>
+<a name="ln818">Function*</a>
+<a name="ln819">TeamDebugInfo::FunctionByID(FunctionID* functionID) const</a>
+<a name="ln820">{</a>
+<a name="ln821">	if (SourceFunctionID* sourceFunctionID</a>
+<a name="ln822">			= dynamic_cast&lt;SourceFunctionID*&gt;(functionID)) {</a>
+<a name="ln823">		// get the source file</a>
+<a name="ln824">		LocatableFile* file = fFileManager-&gt;GetSourceFile(</a>
+<a name="ln825">			sourceFunctionID-&gt;SourceFilePath());</a>
+<a name="ln826">		if (file == NULL)</a>
+<a name="ln827">			return NULL;</a>
+<a name="ln828">		BReference&lt;LocatableFile&gt; fileReference(file, true);</a>
+<a name="ln829"> </a>
+<a name="ln830">		if (SourceFileEntry* entry = fSourceFiles-&gt;Lookup(file))</a>
+<a name="ln831">			return entry-&gt;FunctionByName(functionID-&gt;FunctionName());</a>
+<a name="ln832">		return NULL;</a>
+<a name="ln833">	}</a>
+<a name="ln834"> </a>
+<a name="ln835">	ImageFunctionID* imageFunctionID</a>
+<a name="ln836">		= dynamic_cast&lt;ImageFunctionID*&gt;(functionID);</a>
+<a name="ln837">	if (imageFunctionID == NULL)</a>
+<a name="ln838">		return NULL;</a>
+<a name="ln839"> </a>
+<a name="ln840">	ImageDebugInfo* imageDebugInfo</a>
+<a name="ln841">		= ImageDebugInfoByName(imageFunctionID-&gt;ImageName());</a>
+<a name="ln842">	if (imageDebugInfo == NULL)</a>
+<a name="ln843">		return NULL;</a>
+<a name="ln844"> </a>
+<a name="ln845">	FunctionInstance* functionInstance = imageDebugInfo-&gt;FunctionByName(</a>
+<a name="ln846">		functionID-&gt;FunctionName());</a>
+<a name="ln847">	return functionInstance != NULL ? functionInstance-&gt;GetFunction() : NULL;</a>
+<a name="ln848">}</a>
+<a name="ln849"> </a>
+<a name="ln850"> </a>
+<a name="ln851">status_t</a>
+<a name="ln852">TeamDebugInfo::_AddFunction(Function* function)</a>
+<a name="ln853">{</a>
+<a name="ln854">	// If the function refers to a source file, add it to the respective entry.</a>
+<a name="ln855">	if (LocatableFile* sourceFile = function-&gt;SourceFile()) {</a>
+<a name="ln856">		SourceFileEntry* entry = fSourceFiles-&gt;Lookup(sourceFile);</a>
+<a name="ln857">		if (entry == NULL) {</a>
+<a name="ln858">			// no entry for the source file yet -- create on</a>
+<a name="ln859">			entry = new(std::nothrow) SourceFileEntry(sourceFile);</a>
+<a name="ln860">			if (entry == NULL)</a>
+<a name="ln861">				return B_NO_MEMORY;</a>
+<a name="ln862"> </a>
+<a name="ln863">			status_t error = entry-&gt;Init();</a>
+<a name="ln864">			if (error != B_OK) {</a>
+<a name="ln865">				delete entry;</a>
+<a name="ln866">				return error;</a>
+<a name="ln867">			}</a>
+<a name="ln868"> </a>
+<a name="ln869">			fSourceFiles-&gt;Insert(entry);</a>
+<a name="ln870">		}</a>
+<a name="ln871"> </a>
+<a name="ln872">		// add the function</a>
+<a name="ln873">		status_t error = entry-&gt;AddFunction(function);</a>
+<a name="ln874">		if (error != B_OK) {</a>
+<a name="ln875">			if (entry-&gt;IsUnused()) {</a>
+<a name="ln876">				fSourceFiles-&gt;Remove(entry);</a>
+<a name="ln877">				delete entry;</a>
+<a name="ln878">			}</a>
+<a name="ln879">			return error;</a>
+<a name="ln880">		}</a>
+<a name="ln881">	}</a>
+<a name="ln882"> </a>
+<a name="ln883">	fFunctions-&gt;Insert(function);</a>
+<a name="ln884"> </a>
+<a name="ln885">	return B_OK;</a>
+<a name="ln886">}</a>
+<a name="ln887"> </a>
+<a name="ln888"> </a>
+<a name="ln889">void</a>
+<a name="ln890">TeamDebugInfo::_RemoveFunction(Function* function)</a>
+<a name="ln891">{</a>
+<a name="ln892">	fFunctions-&gt;Remove(function);</a>
+<a name="ln893"> </a>
+<a name="ln894">	// If the function refers to a source file, remove it from the respective</a>
+<a name="ln895">	// entry.</a>
+<a name="ln896">	if (LocatableFile* sourceFile = function-&gt;SourceFile()) {</a>
+<a name="ln897">		if (SourceFileEntry* entry = fSourceFiles-&gt;Lookup(sourceFile))</a>
+<a name="ln898">			entry-&gt;RemoveFunction(function);</a>
+<a name="ln899">	}</a>
+<a name="ln900">}</a>
+
+</code></pre>
+<div class="balloon" rel="90"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fNext.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

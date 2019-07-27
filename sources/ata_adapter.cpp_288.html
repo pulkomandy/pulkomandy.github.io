@@ -1,0 +1,941 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>ata_adapter.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2002-04, Thomas Kurschel. All rights reserved.</a>
+<a name="ln3"> * Distributed under the terms of the MIT License.</a>
+<a name="ln4"> */</a>
+<a name="ln5"> </a>
+<a name="ln6">/*</a>
+<a name="ln7">	Generic ATA adapter library.</a>
+<a name="ln8">*/</a>
+<a name="ln9"> </a>
+<a name="ln10">#include &lt;KernelExport.h&gt;</a>
+<a name="ln11">#include &lt;malloc.h&gt;</a>
+<a name="ln12">#include &lt;stdio.h&gt;</a>
+<a name="ln13">#include &lt;string.h&gt;</a>
+<a name="ln14"> </a>
+<a name="ln15">#include &lt;ata_adapter.h&gt;</a>
+<a name="ln16">#include &lt;tracing.h&gt;</a>
+<a name="ln17"> </a>
+<a name="ln18">#define debug_level_flow 0</a>
+<a name="ln19">#define debug_level_error 3</a>
+<a name="ln20">#define debug_level_info 3</a>
+<a name="ln21"> </a>
+<a name="ln22">#define DEBUG_MSG_PREFIX &quot;ATA PCI -- &quot;</a>
+<a name="ln23"> </a>
+<a name="ln24">#include &quot;wrapper.h&quot;</a>
+<a name="ln25"> </a>
+<a name="ln26">#define TRACE dprintf</a>
+<a name="ln27"> </a>
+<a name="ln28">#define INTERRUPT_TRACING 0</a>
+<a name="ln29">#if INTERRUPT_TRACING</a>
+<a name="ln30">	#define TRACE_INT(a...) 	ktrace_printf(a)</a>
+<a name="ln31">#else</a>
+<a name="ln32">	#define TRACE_INT(a...)</a>
+<a name="ln33">#endif</a>
+<a name="ln34"> </a>
+<a name="ln35"> </a>
+<a name="ln36">#if ATA_DMA_TRACING</a>
+<a name="ln37">	#define TRACE_DMA(x...)		ktrace_printf(x)</a>
+<a name="ln38">#else</a>
+<a name="ln39">	#define TRACE_DMA(x...)</a>
+<a name="ln40">#endif</a>
+<a name="ln41"> </a>
+<a name="ln42">static ata_for_controller_interface *sATA;</a>
+<a name="ln43">static device_manager_info *sDeviceManager;</a>
+<a name="ln44"> </a>
+<a name="ln45"> </a>
+<a name="ln46">static void</a>
+<a name="ln47">set_channel(ata_adapter_channel_info *channel, ata_channel ataChannel)</a>
+<a name="ln48">{</a>
+<a name="ln49">	channel-&gt;ataChannel = ataChannel;</a>
+<a name="ln50">}</a>
+<a name="ln51"> </a>
+<a name="ln52"> </a>
+<a name="ln53">static status_t</a>
+<a name="ln54">ata_adapter_write_command_block_regs(ata_adapter_channel_info *channel,</a>
+<a name="ln55">	ata_task_file *tf, ata_reg_mask mask)</a>
+<a name="ln56">{</a>
+<a name="ln57">	pci_device_module_info *pci = channel-&gt;pci;</a>
+<a name="ln58">	pci_device *device = channel-&gt;device;</a>
+<a name="ln59">	int i;</a>
+<a name="ln60"> </a>
+<a name="ln61">	uint16 ioaddr = channel-&gt;command_block_base;</a>
+<a name="ln62"> </a>
+<a name="ln63">	if (channel-&gt;lost)</a>
+<a name="ln64">		return B_ERROR;</a>
+<a name="ln65"> </a>
+<a name="ln66">	for (i = 0; i &lt; 7; i++) {</a>
+<a name="ln67">		// LBA48 registers must be written twice</a>
+<a name="ln68">		if (((1 &lt;&lt; (i + 7)) &amp; mask) != 0) {</a>
+<a name="ln69">			SHOW_FLOW( 4, &quot;%x-&gt;HI(%x)&quot;, tf-&gt;raw.r[i + 7], i );</a>
+<a name="ln70">			pci-&gt;write_io_8(device, ioaddr + 1 + i, tf-&gt;raw.r[i + 7]);</a>
+<a name="ln71">		}</a>
+<a name="ln72"> </a>
+<a name="ln73">		if (((1 &lt;&lt; i) &amp; mask) != 0) {</a>
+<a name="ln74">			SHOW_FLOW( 4, &quot;%x-&gt;LO(%x)&quot;, tf-&gt;raw.r[i], i );</a>
+<a name="ln75">			pci-&gt;write_io_8(device, ioaddr + 1 + i, tf-&gt;raw.r[i]);</a>
+<a name="ln76">		}</a>
+<a name="ln77">	}</a>
+<a name="ln78"> </a>
+<a name="ln79">	return B_OK;</a>
+<a name="ln80">}</a>
+<a name="ln81"> </a>
+<a name="ln82"> </a>
+<a name="ln83">static status_t</a>
+<a name="ln84">ata_adapter_read_command_block_regs(ata_adapter_channel_info *channel,</a>
+<a name="ln85">	ata_task_file *tf, ata_reg_mask mask)</a>
+<a name="ln86">{</a>
+<a name="ln87">	pci_device_module_info *pci = channel-&gt;pci;</a>
+<a name="ln88">	pci_device *device = channel-&gt;device;</a>
+<a name="ln89">	int i;</a>
+<a name="ln90"> </a>
+<a name="ln91">	uint16 ioaddr = channel-&gt;command_block_base;</a>
+<a name="ln92"> </a>
+<a name="ln93">	if (channel-&gt;lost)</a>
+<a name="ln94">		return B_ERROR;</a>
+<a name="ln95"> </a>
+<a name="ln96">	for (i = 0; i &lt; 7; i++) {</a>
+<a name="ln97">		if (((1 &lt;&lt; i) &amp; mask) != 0) {</a>
+<a name="ln98">			tf-&gt;raw.r[i] = pci-&gt;read_io_8(device, ioaddr + 1 + i);</a>
+<a name="ln99">			SHOW_FLOW( 4, &quot;%x: %x&quot;, i, (int)tf-&gt;raw.r[i] );</a>
+<a name="ln100">		}</a>
+<a name="ln101">	}</a>
+<a name="ln102"> </a>
+<a name="ln103">	return B_OK;</a>
+<a name="ln104">}</a>
+<a name="ln105"> </a>
+<a name="ln106"> </a>
+<a name="ln107">static uint8</a>
+<a name="ln108">ata_adapter_get_altstatus(ata_adapter_channel_info *channel)</a>
+<a name="ln109">{</a>
+<a name="ln110">	pci_device_module_info *pci = channel-&gt;pci;</a>
+<a name="ln111">	pci_device *device = channel-&gt;device;</a>
+<a name="ln112">	uint16 altstatusaddr = channel-&gt;control_block_base;</a>
+<a name="ln113"> </a>
+<a name="ln114">	if (channel-&gt;lost)</a>
+<a name="ln115">		return 0x01; // Error bit</a>
+<a name="ln116"> </a>
+<a name="ln117">	return pci-&gt;read_io_8(device, altstatusaddr);</a>
+<a name="ln118">}</a>
+<a name="ln119"> </a>
+<a name="ln120"> </a>
+<a name="ln121">static status_t</a>
+<a name="ln122">ata_adapter_write_device_control(ata_adapter_channel_info *channel, uint8 val)</a>
+<a name="ln123">{</a>
+<a name="ln124">	pci_device_module_info *pci = channel-&gt;pci;</a>
+<a name="ln125">	pci_device *device = channel-&gt;device;</a>
+<a name="ln126">	uint16 device_control_addr = channel-&gt;control_block_base;</a>
+<a name="ln127"> </a>
+<a name="ln128">	SHOW_FLOW(3, &quot;%x&quot;, (int)val);</a>
+<a name="ln129"> </a>
+<a name="ln130">	if (channel-&gt;lost)</a>
+<a name="ln131">		return B_ERROR;</a>
+<a name="ln132"> </a>
+<a name="ln133">	pci-&gt;write_io_8(device, device_control_addr, val);</a>
+<a name="ln134"> </a>
+<a name="ln135">	return B_OK;</a>
+<a name="ln136">}</a>
+<a name="ln137"> </a>
+<a name="ln138"> </a>
+<a name="ln139">static status_t</a>
+<a name="ln140">ata_adapter_write_pio(ata_adapter_channel_info *channel, uint16 *data,</a>
+<a name="ln141">	int count, bool force_16bit)</a>
+<a name="ln142">{</a>
+<a name="ln143">	pci_device_module_info *pci = channel-&gt;pci;</a>
+<a name="ln144">	pci_device *device = channel-&gt;device;</a>
+<a name="ln145"> </a>
+<a name="ln146">	uint16 ioaddr = channel-&gt;command_block_base;</a>
+<a name="ln147"> </a>
+<a name="ln148">	if (channel-&gt;lost)</a>
+<a name="ln149">		return B_ERROR;</a>
+<a name="ln150"> </a>
+<a name="ln151">	force_16bit = true;</a>
+<a name="ln152"> </a>
+<a name="ln153">	if ((count &amp; 1) != 0 || force_16bit) {</a>
+<a name="ln154">		for (; count &gt; 0; --count)</a>
+<a name="ln155">			pci-&gt;write_io_16(device, ioaddr, *(data++));</a>
+<a name="ln156">	} else {</a>
+<a name="ln157">		uint32 *cur_data = (uint32 *)data;</a>
+<a name="ln158"> </a>
+<a name="ln159">		for (; count &gt; 0; count -= 2)</a>
+<a name="ln160">			pci-&gt;write_io_32(device, ioaddr, *(cur_data++));</a>
+<a name="ln161">	}</a>
+<a name="ln162"> </a>
+<a name="ln163">	return B_OK;</a>
+<a name="ln164">}</a>
+<a name="ln165"> </a>
+<a name="ln166"> </a>
+<a name="ln167">static status_t</a>
+<a name="ln168">ata_adapter_read_pio(ata_adapter_channel_info *channel, uint16 *data,</a>
+<a name="ln169">	int count, bool force_16bit)</a>
+<a name="ln170">{</a>
+<a name="ln171">	pci_device_module_info *pci = channel-&gt;pci;</a>
+<a name="ln172">	pci_device *device = channel-&gt;device;</a>
+<a name="ln173"> </a>
+<a name="ln174">	uint16 ioaddr = channel-&gt;command_block_base;</a>
+<a name="ln175"> </a>
+<a name="ln176">	if (channel-&gt;lost)</a>
+<a name="ln177">		return B_ERROR;</a>
+<a name="ln178"> </a>
+<a name="ln179">	force_16bit = true;</a>
+<a name="ln180"> </a>
+<a name="ln181">	if ((count &amp; 1) != 0 || force_16bit) {</a>
+<a name="ln182">		for (; count &gt; 0; --count)</a>
+<a name="ln183">			*(data++) = pci-&gt;read_io_16(device, ioaddr );</a>
+<a name="ln184">	} else {</a>
+<a name="ln185">		uint32 *cur_data = (uint32 *)data;</a>
+<a name="ln186"> </a>
+<a name="ln187">		for (; count &gt; 0; count -= 2)</a>
+<a name="ln188">			*(cur_data++) = pci-&gt;read_io_32(device, ioaddr);</a>
+<a name="ln189">	}</a>
+<a name="ln190"> </a>
+<a name="ln191">	return B_OK;</a>
+<a name="ln192">}</a>
+<a name="ln193"> </a>
+<a name="ln194"> </a>
+<a name="ln195">static int32</a>
+<a name="ln196">ata_adapter_inthand(void *arg)</a>
+<a name="ln197">{</a>
+<a name="ln198">	ata_adapter_channel_info *channel = (ata_adapter_channel_info *)arg;</a>
+<a name="ln199">	pci_device_module_info *pci = channel-&gt;pci;</a>
+<a name="ln200">	pci_device *device = channel-&gt;device;</a>
+<a name="ln201">	uint8 statusATA, statusBM;</a>
+<a name="ln202"> </a>
+<a name="ln203">	TRACE_INT(&quot;ata_adapter_inthand\n&quot;);</a>
+<a name="ln204"> </a>
+<a name="ln205">	// need to read bus master status first, because some controllers</a>
+<a name="ln206">	// will clear the interrupt status bit once ATA status is read</a>
+<a name="ln207">	statusBM = pci-&gt;read_io_8(device, channel-&gt;bus_master_base</a>
+<a name="ln208">		+ ATA_BM_STATUS_REG);</a>
+<a name="ln209">	TRACE_INT(&quot;ata_adapter_inthand: BM-status 0x%02x\n&quot;, statusBM);</a>
+<a name="ln210"> </a>
+<a name="ln211">	// test if the interrupt was really generated by our controller</a>
+<a name="ln212">	if (statusBM &amp; ATA_BM_STATUS_INTERRUPT) {</a>
+<a name="ln213">		// read ATA status register to acknowledge interrupt</a>
+<a name="ln214">		statusATA = pci-&gt;read_io_8(device, channel-&gt;command_block_base + 7);</a>
+<a name="ln215">		TRACE_INT(&quot;ata_adapter_inthand: ATA-status 0x%02x\n&quot;, statusATA);</a>
+<a name="ln216"> </a>
+<a name="ln217">		// clear pending PCI bus master DMA interrupt, for those</a>
+<a name="ln218">		// controllers who don't clear it themselves</a>
+<a name="ln219">		pci-&gt;write_io_8(device, channel-&gt;bus_master_base + ATA_BM_STATUS_REG,</a>
+<a name="ln220">			(statusBM &amp; 0xf8) | ATA_BM_STATUS_INTERRUPT);</a>
+<a name="ln221"> </a>
+<a name="ln222">		if (!channel-&gt;dmaing) {</a>
+<a name="ln223">			// we check this late so that potential spurious interrupts</a>
+<a name="ln224">			// are acknoledged above</a>
+<a name="ln225">			TRACE_INT(&quot;ata_adapter_inthand: no DMA transfer active\n&quot;);</a>
+<a name="ln226">			return B_UNHANDLED_INTERRUPT;</a>
+<a name="ln227">		}</a>
+<a name="ln228"> </a>
+<a name="ln229">		// signal interrupt to ATA stack</a>
+<a name="ln230">		return sATA-&gt;interrupt_handler(channel-&gt;ataChannel, statusATA);</a>
+<a name="ln231">	} else {</a>
+<a name="ln232">		TRACE_INT(&quot;ata_adapter_inthand: not BM\n&quot;);</a>
+<a name="ln233">		return B_UNHANDLED_INTERRUPT;</a>
+<a name="ln234">	}</a>
+<a name="ln235">}</a>
+<a name="ln236"> </a>
+<a name="ln237"> </a>
+<a name="ln238">static status_t</a>
+<a name="ln239">ata_adapter_prepare_dma(ata_adapter_channel_info *channel,</a>
+<a name="ln240">	const physical_entry *sgList, size_t sgListCount, bool writeToDevice)</a>
+<a name="ln241">{</a>
+<a name="ln242">	pci_device_module_info *pci = channel-&gt;pci;</a>
+<a name="ln243">	pci_device *device = channel-&gt;device;</a>
+<a name="ln244">	uint8 command;</a>
+<a name="ln245">	uint8 status;</a>
+<a name="ln246">	prd_entry *prd = channel-&gt;prdt;</a>
+<a name="ln247">	int i;</a>
+<a name="ln248"> </a>
+<a name="ln249">	TRACE_DMA(&quot;ata_adapter: prepare_dma (%s) %lu entrys:\n&quot;,</a>
+<a name="ln250">		writeToDevice ? &quot;write&quot; : &quot;read&quot;, sgListCount);</a>
+<a name="ln251"> </a>
+<a name="ln252">	for (i = sgListCount - 1, prd = channel-&gt;prdt; i &gt;= 0; --i, ++prd, ++sgList) {</a>
+<a name="ln253">		prd-&gt;address = B_HOST_TO_LENDIAN_INT32((uint32)pci-&gt;ram_address(</a>
+<a name="ln254">			device, sgList-&gt;address));</a>
+<a name="ln255">		// 0 means 64K - this is done automatically be discarding upper 16 bits</a>
+<a name="ln256">		prd-&gt;count = B_HOST_TO_LENDIAN_INT16((uint16)sgList-&gt;size);</a>
+<a name="ln257">		prd-&gt;EOT = i == 0;</a>
+<a name="ln258"> </a>
+<a name="ln259">		TRACE_DMA(&quot;ata_adapter: %#&quot; B_PRIxPHYSADDR &quot;, %&quot; B_PRIuPHYSADDR &quot; =&gt; &quot;</a>
+<a name="ln260">			&quot;%#010&quot; B_PRIx32 &quot;, %&quot; B_PRIu16 &quot;, %d\n&quot;,</a>
+<a name="ln261">			sgList-&gt;address, sgList-&gt;size,</a>
+<a name="ln262">			prd-&gt;address, prd-&gt;count, prd-&gt;EOT);</a>
+<a name="ln263">		SHOW_FLOW( 4, &quot;%#010&quot; B_PRIx32 &quot;, %&quot; B_PRIu16 &quot;, %d&quot;,</a>
+<a name="ln264">			prd-&gt;address, prd-&gt;count, prd-&gt;EOT);</a>
+<a name="ln265">	}</a>
+<a name="ln266"> </a>
+<a name="ln267">	pci-&gt;write_io_32(device, channel-&gt;bus_master_base + ATA_BM_PRDT_ADDRESS,</a>
+<a name="ln268">		(pci-&gt;read_io_32(device, channel-&gt;bus_master_base + ATA_BM_PRDT_ADDRESS) &amp; 3)</a>
+<a name="ln269">		| (B_HOST_TO_LENDIAN_INT32((uint32)pci-&gt;ram_address(device,</a>
+<a name="ln270">			channel-&gt;prdt_phys)) &amp; ~3));</a>
+<a name="ln271"> </a>
+<a name="ln272">	// reset interrupt and error signal</a>
+<a name="ln273">	status = pci-&gt;read_io_8(device, channel-&gt;bus_master_base</a>
+<a name="ln274">		+ ATA_BM_STATUS_REG) | ATA_BM_STATUS_INTERRUPT | ATA_BM_STATUS_ERROR;</a>
+<a name="ln275">	pci-&gt;write_io_8(device,</a>
+<a name="ln276">		channel-&gt;bus_master_base + ATA_BM_STATUS_REG, status);</a>
+<a name="ln277"> </a>
+<a name="ln278">	// set data direction</a>
+<a name="ln279">	command = pci-&gt;read_io_8(device, channel-&gt;bus_master_base</a>
+<a name="ln280">		+ ATA_BM_COMMAND_REG);</a>
+<a name="ln281">	if (writeToDevice)</a>
+<a name="ln282">		command &amp;= ~ATA_BM_COMMAND_READ_FROM_DEVICE;</a>
+<a name="ln283">	else</a>
+<a name="ln284">		command |= ATA_BM_COMMAND_READ_FROM_DEVICE;</a>
+<a name="ln285"> </a>
+<a name="ln286">	pci-&gt;write_io_8(device, channel-&gt;bus_master_base + ATA_BM_COMMAND_REG,</a>
+<a name="ln287">		command);</a>
+<a name="ln288"> </a>
+<a name="ln289">	return B_OK;</a>
+<a name="ln290">}</a>
+<a name="ln291"> </a>
+<a name="ln292"> </a>
+<a name="ln293">static status_t</a>
+<a name="ln294">ata_adapter_start_dma(ata_adapter_channel_info *channel)</a>
+<a name="ln295">{</a>
+<a name="ln296">	pci_device_module_info *pci = channel-&gt;pci;</a>
+<a name="ln297">	pci_device *device = channel-&gt;device;</a>
+<a name="ln298">	uint8 command;</a>
+<a name="ln299"> </a>
+<a name="ln300">	command = pci-&gt;read_io_8(device, channel-&gt;bus_master_base</a>
+<a name="ln301">		+ ATA_BM_COMMAND_REG);</a>
+<a name="ln302"> </a>
+<a name="ln303">	command |= ATA_BM_COMMAND_START_STOP;</a>
+<a name="ln304"> </a>
+<a name="ln305">	channel-&gt;dmaing = true;</a>
+<a name="ln306"> </a>
+<a name="ln307">	pci-&gt;write_io_8(device, channel-&gt;bus_master_base + ATA_BM_COMMAND_REG,</a>
+<a name="ln308">		command);</a>
+<a name="ln309"> </a>
+<a name="ln310">	return B_OK;</a>
+<a name="ln311">}</a>
+<a name="ln312"> </a>
+<a name="ln313"> </a>
+<a name="ln314">static status_t</a>
+<a name="ln315">ata_adapter_finish_dma(ata_adapter_channel_info *channel)</a>
+<a name="ln316">{</a>
+<a name="ln317">	pci_device_module_info *pci = channel-&gt;pci;</a>
+<a name="ln318">	pci_device *device = channel-&gt;device;</a>
+<a name="ln319">	uint8 command;</a>
+<a name="ln320">	uint8 status;</a>
+<a name="ln321"> </a>
+<a name="ln322">	// read BM status first</a>
+<a name="ln323">	status = pci-&gt;read_io_8(device, channel-&gt;bus_master_base</a>
+<a name="ln324">		+ ATA_BM_STATUS_REG);</a>
+<a name="ln325"> </a>
+<a name="ln326">	// stop DMA engine, this also clears ATA_BM_STATUS_ACTIVE</a>
+<a name="ln327">	// in the BM status register</a>
+<a name="ln328">	command = pci-&gt;read_io_8(device, channel-&gt;bus_master_base</a>
+<a name="ln329">		+ ATA_BM_COMMAND_REG);</a>
+<a name="ln330">	pci-&gt;write_io_8(device, channel-&gt;bus_master_base + ATA_BM_COMMAND_REG,</a>
+<a name="ln331">		command &amp; ~ATA_BM_COMMAND_START_STOP);</a>
+<a name="ln332">	channel-&gt;dmaing = false;</a>
+<a name="ln333"> </a>
+<a name="ln334">	// reset error flag</a>
+<a name="ln335">	pci-&gt;write_io_8(device, channel-&gt;bus_master_base + ATA_BM_STATUS_REG,</a>
+<a name="ln336">		status | ATA_BM_STATUS_ERROR);</a>
+<a name="ln337"> </a>
+<a name="ln338">	if ((status &amp; ATA_BM_STATUS_ACTIVE) != 0)</a>
+<a name="ln339">		return B_DEV_DATA_OVERRUN;</a>
+<a name="ln340"> </a>
+<a name="ln341">	if ((status &amp; ATA_BM_STATUS_ERROR) != 0)</a>
+<a name="ln342">		return B_ERROR;</a>
+<a name="ln343"> </a>
+<a name="ln344">	return B_OK;</a>
+<a name="ln345">}</a>
+<a name="ln346"> </a>
+<a name="ln347"> </a>
+<a name="ln348">static status_t</a>
+<a name="ln349">ata_adapter_init_channel(device_node *node,</a>
+<a name="ln350">	ata_adapter_channel_info **cookie, size_t total_data_size,</a>
+<a name="ln351">	int32 (*inthand)(void *arg))</a>
+<a name="ln352">{</a>
+<a name="ln353">	ata_adapter_controller_info *controller;</a>
+<a name="ln354">	ata_adapter_channel_info *channel;</a>
+<a name="ln355">	uint16 command_block_base, control_block_base;</a>
+<a name="ln356">	uint8 intnum;</a>
+<a name="ln357">	int prdt_size;</a>
+<a name="ln358">	physical_entry pe[1];</a>
+<a name="ln359">	uint8 channel_index;</a>
+<a name="ln360">	status_t res;</a>
+<a name="ln361"> </a>
+<a name="ln362">	TRACE(&quot;PCI-ATA: init channel...\n&quot;);</a>
+<a name="ln363"> </a>
+<a name="ln364">#if 0</a>
+<a name="ln365">	if (1 /* debug */){</a>
+<a name="ln366">		uint8 bus, device, function;</a>
+<a name="ln367">		uint16 vendorID, deviceID;</a>
+<a name="ln368">		sDeviceManager-&gt;get_attr_uint8(node, PCI_DEVICE_BUS_ITEM, &amp;bus, true);</a>
+<a name="ln369">		sDeviceManager-&gt;get_attr_uint8(node, PCI_DEVICE_DEVICE_ITEM, &amp;device, true);</a>
+<a name="ln370">		sDeviceManager-&gt;get_attr_uint8(node, PCI_DEVICE_FUNCTION_ITEM, &amp;function, true);</a>
+<a name="ln371">		sDeviceManager-&gt;get_attr_uint16(node, PCI_DEVICE_VENDOR_ID_ITEM, &amp;vendorID, true);</a>
+<a name="ln372">		sDeviceManager-&gt;get_attr_uint16(node, PCI_DEVICE_DEVICE_ID_ITEM, &amp;deviceID, true);</a>
+<a name="ln373">		TRACE(&quot;PCI-ATA: bus %3d, device %2d, function %2d: vendor %04x, device %04x\n&quot;,</a>
+<a name="ln374">			bus, device, function, vendorID, deviceID);</a>
+<a name="ln375">	}</a>
+<a name="ln376">#endif</a>
+<a name="ln377"> </a>
+<a name="ln378">	// get device data</a>
+<a name="ln379">	if (sDeviceManager-&gt;get_attr_uint16(node, ATA_ADAPTER_COMMAND_BLOCK_BASE, &amp;command_block_base, false) != B_OK</a>
+<a name="ln380">		|| sDeviceManager-&gt;get_attr_uint16(node, ATA_ADAPTER_CONTROL_BLOCK_BASE, &amp;control_block_base, false) != B_OK</a>
+<a name="ln381">		|| sDeviceManager-&gt;get_attr_uint8(node, ATA_ADAPTER_INTNUM, &amp;intnum, true) != B_OK</a>
+<a name="ln382">		|| sDeviceManager-&gt;get_attr_uint8(node, ATA_ADAPTER_CHANNEL_INDEX, &amp;channel_index, false) != B_OK)</a>
+<a name="ln383">		return B_ERROR;</a>
+<a name="ln384"> </a>
+<a name="ln385">	{</a>
+<a name="ln386">		device_node *parent = sDeviceManager-&gt;get_parent_node(node);</a>
+<a name="ln387">		sDeviceManager-&gt;get_driver(parent, NULL, (void **)&amp;controller);</a>
+<a name="ln388">		sDeviceManager-&gt;put_node(parent);</a>
+<a name="ln389">	}</a>
+<a name="ln390"> </a>
+<a name="ln391">	channel = (ata_adapter_channel_info *)malloc(total_data_size);</a>
+<a name="ln392">	if (channel == NULL) {</a>
+<a name="ln393">		res = B_NO_MEMORY;</a>
+<a name="ln394">		goto err;</a>
+<a name="ln395">	}</a>
+<a name="ln396"> </a>
+<a name="ln397">	TRACE(&quot;PCI-ATA: channel index %d\n&quot;, channel_index);</a>
+<a name="ln398"> </a>
+<a name="ln399">	channel-&gt;node = node;</a>
+<a name="ln400">	channel-&gt;pci = controller-&gt;pci;</a>
+<a name="ln401">	channel-&gt;device = controller-&gt;device;</a>
+<a name="ln402">	channel-&gt;lost = false;</a>
+<a name="ln403">	channel-&gt;command_block_base = command_block_base;</a>
+<a name="ln404">	channel-&gt;control_block_base = control_block_base;</a>
+<a name="ln405">	channel-&gt;bus_master_base = controller-&gt;bus_master_base + (channel_index * 8);</a>
+<a name="ln406">	channel-&gt;intnum = intnum;</a>
+<a name="ln407">	channel-&gt;dmaing = false;</a>
+<a name="ln408">	channel-&gt;inthand = inthand;</a>
+<a name="ln409"> </a>
+<a name="ln410">	TRACE(&quot;PCI-ATA: bus master base %#x\n&quot;, channel-&gt;bus_master_base);</a>
+<a name="ln411"> </a>
+<a name="ln412">	// PRDT must be contiguous, dword-aligned and must not cross 64K boundary</a>
+<a name="ln413">// TODO: Where's the handling for the 64 K boundary? create_area_etc() can be</a>
+<a name="ln414">// used.</a>
+<a name="ln415">	prdt_size = (ATA_ADAPTER_MAX_SG_COUNT * sizeof( prd_entry ) + (B_PAGE_SIZE - 1)) &amp; ~(B_PAGE_SIZE - 1);</a>
+<a name="ln416">	channel-&gt;prd_area = create_area(&quot;prd&quot;, (void **)&amp;channel-&gt;prdt, B_ANY_KERNEL_ADDRESS,</a>
+<a name="ln417">		prdt_size, B_32_BIT_CONTIGUOUS, 0);</a>
+<a name="ln418">	if (channel-&gt;prd_area &lt; B_OK) {</a>
+<a name="ln419">		res = channel-&gt;prd_area;</a>
+<a name="ln420">		goto err2;</a>
+<a name="ln421">	}</a>
+<a name="ln422"> </a>
+<a name="ln423">	get_memory_map(channel-&gt;prdt, prdt_size, pe, 1);</a>
+<a name="ln424">	channel-&gt;prdt_phys = pe[0].address;</a>
+<a name="ln425"> </a>
+<a name="ln426">	SHOW_FLOW(3, &quot;virt=%p, phys=%x&quot;, channel-&gt;prdt, (int)channel-&gt;prdt_phys);</a>
+<a name="ln427"> </a>
+<a name="ln428">	res = install_io_interrupt_handler(channel-&gt;intnum,</a>
+<a name="ln429">		inthand, channel, 0);</a>
+<a name="ln430"> </a>
+<a name="ln431">	if (res &lt; 0) {</a>
+<a name="ln432">		SHOW_ERROR(0, &quot;couldn't install irq handler @%d&quot;, channel-&gt;intnum);</a>
+<a name="ln433">		goto err3;</a>
+<a name="ln434">	}</a>
+<a name="ln435"> </a>
+<a name="ln436">	TRACE(&quot;PCI-ATA: init channel done\n&quot;);</a>
+<a name="ln437"> </a>
+<a name="ln438">	// disable interrupts</a>
+<a name="ln439">	ata_adapter_write_device_control(channel, ATA_DEVICE_CONTROL_BIT3 | ATA_DEVICE_CONTROL_DISABLE_INTS);</a>
+<a name="ln440"> </a>
+<a name="ln441">	*cookie = channel;</a>
+<a name="ln442"> </a>
+<a name="ln443">	return B_OK;</a>
+<a name="ln444"> </a>
+<a name="ln445">err3:</a>
+<a name="ln446">	delete_area(channel-&gt;prd_area);</a>
+<a name="ln447">err2:</a>
+<a name="ln448">err:</a>
+<a name="ln449">	free(channel);</a>
+<a name="ln450"> </a>
+<a name="ln451">	return res;</a>
+<a name="ln452">}</a>
+<a name="ln453"> </a>
+<a name="ln454"> </a>
+<a name="ln455">static void</a>
+<a name="ln456">ata_adapter_uninit_channel(ata_adapter_channel_info *channel)</a>
+<a name="ln457">{</a>
+<a name="ln458">	// disable IRQs</a>
+<a name="ln459">	ata_adapter_write_device_control(channel, ATA_DEVICE_CONTROL_BIT3 | ATA_DEVICE_CONTROL_DISABLE_INTS);</a>
+<a name="ln460"> </a>
+<a name="ln461">	// catch spurious interrupt</a>
+<a name="ln462">	// (some controllers generate an IRQ when you _disable_ interrupts,</a>
+<a name="ln463">	//  they are delayed by less then 40 µs, so 1 ms is safe)</a>
+<a name="ln464">	snooze(1000);</a>
+<a name="ln465"> </a>
+<a name="ln466">	remove_io_interrupt_handler(channel-&gt;intnum, channel-&gt;inthand, channel);</a>
+<a name="ln467"> </a>
+<a name="ln468">	delete_area(channel-&gt;prd_area);</a>
+<a name="ln469">	free(channel);</a>
+<a name="ln470">}</a>
+<a name="ln471"> </a>
+<a name="ln472"> </a>
+<a name="ln473">static void</a>
+<a name="ln474">ata_adapter_channel_removed(ata_adapter_channel_info *channel)</a>
+<a name="ln475">{</a>
+<a name="ln476">	SHOW_FLOW0( 3, &quot;&quot; );</a>
+<a name="ln477"> </a>
+<a name="ln478">	if (channel != NULL)</a>
+<a name="ln479">		// disable access instantly</a>
+<a name="ln480">		atomic_or((int32*)&amp;channel-&gt;lost, 1);</a>
+<a name="ln481">}</a>
+<a name="ln482"> </a>
+<a name="ln483"> </a>
+<a name="ln484">/** publish node of ata channel */</a>
+<a name="ln485"> </a>
+<a name="ln486">static status_t</a>
+<a name="ln487">ata_adapter_publish_channel(device_node *controller_node,</a>
+<a name="ln488">	const char *channel_module_name, uint16 command_block_base,</a>
+<a name="ln489">	uint16 control_block_base, uint8 intnum, bool can_dma,</a>
+<a name="ln490">	uint8 channel_index, const char *name, const io_resource *resources,</a>
+<a name="ln491">	device_node **node)</a>
+<a name="ln492">{</a>
+<a name="ln493">	char prettyName[25];</a>
+<a name="ln494">	sprintf(prettyName, &quot;ATA Channel %&quot; B_PRIu8, channel_index);</a>
+<a name="ln495"> </a>
+<a name="ln496">	device_attr attrs[] = {</a>
+<a name="ln497">		// info about ourself and our consumer</a>
+<a name="ln498">		{ B_DEVICE_PRETTY_NAME, B_STRING_TYPE,</a>
+<a name="ln499">			{ string: prettyName }},</a>
+<a name="ln500">		{ B_DEVICE_FIXED_CHILD, B_STRING_TYPE,</a>
+<a name="ln501">			{ string: ATA_FOR_CONTROLLER_MODULE_NAME }},</a>
+<a name="ln502"> </a>
+<a name="ln503">		// private data to identify channel</a>
+<a name="ln504">		{ ATA_ADAPTER_COMMAND_BLOCK_BASE, B_UINT16_TYPE,</a>
+<a name="ln505">			{ ui16: command_block_base }},</a>
+<a name="ln506">		{ ATA_ADAPTER_CONTROL_BLOCK_BASE, B_UINT16_TYPE,</a>
+<a name="ln507">			{ ui16: control_block_base }},</a>
+<a name="ln508">		{ ATA_CONTROLLER_CAN_DMA_ITEM, B_UINT8_TYPE, { ui8: can_dma }},</a>
+<a name="ln509">		{ ATA_ADAPTER_INTNUM, B_UINT8_TYPE, { ui8: intnum }},</a>
+<a name="ln510">		{ ATA_ADAPTER_CHANNEL_INDEX, B_UINT8_TYPE, { ui8: channel_index }},</a>
+<a name="ln511">		{ NULL }</a>
+<a name="ln512">	};</a>
+<a name="ln513"> </a>
+<a name="ln514">	SHOW_FLOW0(2, &quot;&quot;);</a>
+<a name="ln515"> </a>
+<a name="ln516">	return sDeviceManager-&gt;register_node(controller_node, channel_module_name, attrs,</a>
+<a name="ln517">		resources, node);</a>
+<a name="ln518">}</a>
+<a name="ln519"> </a>
+<a name="ln520"> </a>
+<a name="ln521">/** detect IDE channel */</a>
+<a name="ln522"> </a>
+<a name="ln523">static status_t</a>
+<a name="ln524">ata_adapter_detect_channel(pci_device_module_info *pci, pci_device *pci_device,</a>
+<a name="ln525">	device_node *controller_node, const char *channel_module_name,</a>
+<a name="ln526">	bool controller_can_dma, uint16 command_block_base, uint16 control_block_base,</a>
+<a name="ln527">	uint16 bus_master_base, uint8 intnum, uint8 channel_index, const char *name,</a>
+<a name="ln528">	device_node **node, bool supports_compatibility_mode)</a>
+<a name="ln529">{</a>
+<a name="ln530">	uint8 api;</a>
+<a name="ln531">	uint16 pcicmdOld;</a>
+<a name="ln532">	uint16 pcicmdNew;</a>
+<a name="ln533">	uint16 pciVendor;</a>
+<a name="ln534"> </a>
+<a name="ln535">	SHOW_FLOW0( 3, &quot;&quot; );</a>
+<a name="ln536"> </a>
+<a name="ln537">	// if channel works in compatibility mode, addresses and interrupt are fixed</a>
+<a name="ln538">	api = pci-&gt;read_pci_config(pci_device, PCI_class_api, 1);</a>
+<a name="ln539"> </a>
+<a name="ln540">	if (supports_compatibility_mode</a>
+<a name="ln541">		&amp;&amp; channel_index == 0 &amp;&amp; (api &amp; PCI_ide_primary_native) == 0) {</a>
+<a name="ln542">		command_block_base = 0x1f0;</a>
+<a name="ln543">		control_block_base = 0x3f6;</a>
+<a name="ln544">		intnum = 14;</a>
+<a name="ln545">		TRACE(&quot;PCI-ATA: Controller in legacy mode: cmd %#x, ctrl %#x, irq %d\n&quot;,</a>
+<a name="ln546">			  command_block_base, control_block_base, intnum);</a>
+<a name="ln547">	} else if (supports_compatibility_mode</a>
+<a name="ln548">		&amp;&amp; channel_index == 1 &amp;&amp; (api &amp; PCI_ide_secondary_native) == 0) {</a>
+<a name="ln549">		command_block_base = 0x170;</a>
+<a name="ln550">		control_block_base = 0x376;</a>
+<a name="ln551">		intnum = 15;</a>
+<a name="ln552">		TRACE(&quot;PCI-ATA: Controller in legacy mode: cmd %#x, ctrl %#x, irq %d\n&quot;,</a>
+<a name="ln553">			  command_block_base, control_block_base, intnum);</a>
+<a name="ln554">	} else {</a>
+<a name="ln555">		if (command_block_base == 0 || control_block_base == 0) {</a>
+<a name="ln556">			TRACE(&quot;PCI-ATA: Command/Control Block base is not configured\n&quot;);</a>
+<a name="ln557">			return B_ERROR;</a>
+<a name="ln558">		}</a>
+<a name="ln559">		if (intnum == 0 || intnum == 0xff) {</a>
+<a name="ln560">			TRACE(&quot;PCI-ATA: Interrupt is not configured\n&quot;);</a>
+<a name="ln561">			return B_ERROR;</a>
+<a name="ln562">		}</a>
+<a name="ln563"> </a>
+<a name="ln564">		// historically, they start at 3f6h/376h, but PCI spec requires registers</a>
+<a name="ln565">		// to be aligned at 4 bytes, so only 3f4h/374h can be specified; thus</a>
+<a name="ln566">		// PCI IDE defines that control block starts at offset 2</a>
+<a name="ln567">		control_block_base += 2;</a>
+<a name="ln568">		TRACE(&quot;PCI-ATA: Controller in native mode: cmd %#x, ctrl %#x, irq %d\n&quot;,</a>
+<a name="ln569">			  command_block_base, control_block_base, intnum);</a>
+<a name="ln570">	}</a>
+<a name="ln571"> </a>
+<a name="ln572"> </a>
+<a name="ln573">	// this should be done in ata_adapter_init_controller but there is crashes</a>
+<a name="ln574">	pcicmdOld = pcicmdNew = pci-&gt;read_pci_config(pci_device, PCI_command, 2);</a>
+<a name="ln575">	if ((pcicmdNew &amp; (1 &lt;&lt; 10)) != 0) {</a>
+<a name="ln576">		TRACE(&quot;PCI-ATA: enabling interrupts\n&quot;);</a>
+<a name="ln577">		pcicmdNew &amp;= ~(1 &lt;&lt; 10);</a>
+<a name="ln578">	}</a>
+<a name="ln579">	if ((pcicmdNew &amp; PCI_command_io) == 0) {</a>
+<a name="ln580">		TRACE(&quot;PCI-ATA: enabling io decoder\n&quot;);</a>
+<a name="ln581">		pcicmdNew |= PCI_command_io;</a>
+<a name="ln582">	}</a>
+<a name="ln583">	if ((pcicmdNew &amp; PCI_command_master) == 0) {</a>
+<a name="ln584">		TRACE(&quot;PCI-ATA: enabling bus mastering\n&quot;);</a>
+<a name="ln585">		pcicmdNew |= PCI_command_master;</a>
+<a name="ln586">	}</a>
+<a name="ln587">	if (pcicmdOld != pcicmdNew) {</a>
+<a name="ln588">		pci-&gt;write_pci_config(pci_device, PCI_command, 2, pcicmdNew);</a>
+<a name="ln589">		TRACE(&quot;PCI-ATA: pcicmd changed from 0x%04x to 0x%04x\n&quot;,</a>
+<a name="ln590">			pcicmdOld, pcicmdNew);</a>
+<a name="ln591">	}</a>
+<a name="ln592"> </a>
+<a name="ln593"> </a>
+<a name="ln594">	if (supports_compatibility_mode) {</a>
+<a name="ln595">		// read status of primary(!) channel to detect simplex</a>
+<a name="ln596">		uint8 status = pci-&gt;read_io_8(pci_device, bus_master_base</a>
+<a name="ln597">			+ ATA_BM_STATUS_REG);</a>
+<a name="ln598"> </a>
+<a name="ln599">		if (status &amp; ATA_BM_STATUS_SIMPLEX_DMA &amp;&amp; channel_index != 0) {</a>
+<a name="ln600">			// in simplex mode, channels cannot operate independantly of each other;</a>
+<a name="ln601">			// we simply disable bus mastering of second channel to satisfy that;</a>
+<a name="ln602">			// better were to use a controller lock, but this had to be done in the IDE</a>
+<a name="ln603">			// bus manager, and I don't see any reason to add extra code for old</a>
+<a name="ln604">			// simplex controllers</a>
+<a name="ln605"> </a>
+<a name="ln606">			// Intel controllers use this bit for something else and are not simplex.</a>
+<a name="ln607">			pciVendor = pci-&gt;read_pci_config(pci_device, PCI_vendor_id, 2);</a>
+<a name="ln608"> </a>
+<a name="ln609">			if (pciVendor != 0x8086) {</a>
+<a name="ln610">				TRACE(&quot;PCI-ATA: Simplex controller - disabling DMA of secondary channel\n&quot;);</a>
+<a name="ln611">				controller_can_dma = false;</a>
+<a name="ln612">			} else {</a>
+<a name="ln613">				TRACE(&quot;PCI-ATA: Simplex bit ignored - Intel controller\n&quot;);</a>
+<a name="ln614">			}</a>
+<a name="ln615">		}</a>
+<a name="ln616">	}</a>
+<a name="ln617"> </a>
+<a name="ln618">	{</a>
+<a name="ln619">		io_resource resources[3] = {</a>
+<a name="ln620">			{ B_IO_PORT, command_block_base, 8 },</a>
+<a name="ln621">			{ B_IO_PORT, control_block_base, 1 },</a>
+<a name="ln622">			{}</a>
+<a name="ln623">		};</a>
+<a name="ln624"> </a>
+<a name="ln625">		return ata_adapter_publish_channel(controller_node, channel_module_name,</a>
+<a name="ln626">			command_block_base, control_block_base, intnum, controller_can_dma,</a>
+<a name="ln627">			channel_index, name, resources, node);</a>
+<a name="ln628">	}</a>
+<a name="ln629">}</a>
+<a name="ln630"> </a>
+<a name="ln631"> </a>
+<a name="ln632">static status_t</a>
+<a name="ln633">ata_adapter_init_controller(device_node *node,</a>
+<a name="ln634">	ata_adapter_controller_info **cookie, size_t total_data_size)</a>
+<a name="ln635">{</a>
+<a name="ln636">	pci_device_module_info *pci;</a>
+<a name="ln637">	pci_device *device;</a>
+<a name="ln638">	ata_adapter_controller_info *controller;</a>
+<a name="ln639">	uint16 bus_master_base;</a>
+<a name="ln640"> </a>
+<a name="ln641">	// get device data</a>
+<a name="ln642">	if (sDeviceManager-&gt;get_attr_uint16(node, ATA_ADAPTER_BUS_MASTER_BASE, &amp;bus_master_base, false) != B_OK)</a>
+<a name="ln643">		return B_ERROR;</a>
+<a name="ln644"> </a>
+<a name="ln645">	{</a>
+<a name="ln646">		device_node *parent = sDeviceManager-&gt;get_parent_node(node);</a>
+<a name="ln647">		sDeviceManager-&gt;get_driver(parent, (driver_module_info **)&amp;pci, (void **)&amp;device);</a>
+<a name="ln648">		sDeviceManager-&gt;put_node(parent);</a>
+<a name="ln649">	}</a>
+<a name="ln650"> </a>
+<a name="ln651">	controller = (ata_adapter_controller_info *)malloc(total_data_size);</a>
+<a name="ln652">	if (controller == NULL)</a>
+<a name="ln653">		return B_NO_MEMORY;</a>
+<a name="ln654"> </a>
+<a name="ln655">#if 0</a>
+<a name="ln656">	pcicmdOld = pcicmdNew = pci-&gt;read_pci_config(node, PCI_command, 2);</a>
+<a name="ln657">	if ((pcicmdNew &amp; PCI_command_io) == 0) {</a>
+<a name="ln658">		TRACE(&quot;PCI-ATA: adapter init: enabling io decoder\n&quot;);</a>
+<a name="ln659">		pcicmdNew |= PCI_command_io;</a>
+<a name="ln660">	}</a>
+<a name="ln661">	if ((pcicmdNew &amp; PCI_command_master) == 0) {</a>
+<a name="ln662">		TRACE(&quot;PCI-ATA: adapter init: enabling bus mastering\n&quot;);</a>
+<a name="ln663">		pcicmdNew |= PCI_command_master;</a>
+<a name="ln664">	}</a>
+<a name="ln665">	if (pcicmdOld != pcicmdNew) {</a>
+<a name="ln666">		pci-&gt;write_pci_config(node, PCI_command, 2, pcicmdNew);</a>
+<a name="ln667">		TRACE(&quot;PCI-ATA: adapter init: pcicmd old 0x%04x, new 0x%04x\n&quot;,</a>
+<a name="ln668">			pcicmdOld, pcicmdNew);</a>
+<a name="ln669">	}</a>
+<a name="ln670">#endif</a>
+<a name="ln671"> </a>
+<a name="ln672">	controller-&gt;node = node;</a>
+<a name="ln673">	controller-&gt;pci = pci;</a>
+<a name="ln674">	controller-&gt;device = device;</a>
+<a name="ln675">	controller-&gt;lost = false;</a>
+<a name="ln676">	controller-&gt;bus_master_base = bus_master_base;</a>
+<a name="ln677"> </a>
+<a name="ln678">	*cookie = controller;</a>
+<a name="ln679"> </a>
+<a name="ln680">	return B_OK;</a>
+<a name="ln681">}</a>
+<a name="ln682"> </a>
+<a name="ln683"> </a>
+<a name="ln684">static void</a>
+<a name="ln685">ata_adapter_uninit_controller(ata_adapter_controller_info *controller)</a>
+<a name="ln686">{</a>
+<a name="ln687">	free(controller);</a>
+<a name="ln688">}</a>
+<a name="ln689"> </a>
+<a name="ln690"> </a>
+<a name="ln691">static void</a>
+<a name="ln692">ata_adapter_controller_removed(ata_adapter_controller_info *controller)</a>
+<a name="ln693">{</a>
+<a name="ln694">	SHOW_FLOW0(3, &quot;&quot;);</a>
+<a name="ln695"> </a>
+<a name="ln696">	if (controller != NULL) {</a>
+<a name="ln697">		// disable access instantly; unit_device takes care of unregistering ioports</a>
+<a name="ln698">		atomic_or((int32*)&amp;controller-&gt;lost, 1);</a>
+<a name="ln699">	}</a>
+<a name="ln700">}</a>
+<a name="ln701"> </a>
+<a name="ln702"> </a>
+<a name="ln703">/** publish node of ata controller */</a>
+<a name="ln704"> </a>
+<a name="ln705">static status_t</a>
+<a name="ln706">ata_adapter_publish_controller(device_node *parent, uint16 bus_master_base,</a>
+<a name="ln707">	io_resource *resources, const char *controller_driver,</a>
+<a name="ln708">	const char *controller_driver_type, const char *controller_name, bool can_dma,</a>
+<a name="ln709">	bool can_cq, uint32 dma_alignment, uint32 dma_boundary, uint32 max_sg_block_size,</a>
+<a name="ln710">	device_node **node)</a>
+<a name="ln711">{</a>
+<a name="ln712">	device_attr attrs[] = {</a>
+<a name="ln713">		// properties of this controller for ata bus manager</a>
+<a name="ln714">		// there are always max. 2 devices</a>
+<a name="ln715">		// (unless this is a Compact Flash Card with a built-in IDE controller,</a>
+<a name="ln716">		//  which has exactly 1 device)</a>
+<a name="ln717">		{ ATA_CONTROLLER_MAX_DEVICES_ITEM, B_UINT8_TYPE, { ui8: 2 }},</a>
+<a name="ln718">		// of course we can DMA</a>
+<a name="ln719">		{ ATA_CONTROLLER_CAN_DMA_ITEM, B_UINT8_TYPE, { ui8: can_dma }},</a>
+<a name="ln720">		// choose any name here</a>
+<a name="ln721">		{ ATA_CONTROLLER_CONTROLLER_NAME_ITEM, B_STRING_TYPE,</a>
+<a name="ln722">			{ string: controller_name }},</a>
+<a name="ln723"> </a>
+<a name="ln724">		// DMA properties</a>
+<a name="ln725">		// data must be word-aligned;</a>
+<a name="ln726">		// warning: some controllers are more picky!</a>
+<a name="ln727">		{ B_DMA_ALIGNMENT, B_UINT32_TYPE, { ui32: dma_alignment /*1*/}},</a>
+<a name="ln728">		// one S/G block must not cross 64K boundary</a>
+<a name="ln729">		{ B_DMA_BOUNDARY, B_UINT32_TYPE, { ui32: dma_boundary/*0xffff*/ }},</a>
+<a name="ln730">		// max size of S/G block is 16 bits with zero being 64K</a>
+<a name="ln731">		{ B_DMA_MAX_SEGMENT_BLOCKS, B_UINT32_TYPE,</a>
+<a name="ln732">			{ ui32: max_sg_block_size/*0x10000*/ }},</a>
+<a name="ln733">		{ B_DMA_MAX_SEGMENT_COUNT, B_UINT32_TYPE,</a>
+<a name="ln734">			{ ui32: ATA_ADAPTER_MAX_SG_COUNT }},</a>
+<a name="ln735">		{ B_DMA_HIGH_ADDRESS, B_UINT64_TYPE, { ui64: 0x100000000LL }},</a>
+<a name="ln736"> </a>
+<a name="ln737">		// private data to find controller</a>
+<a name="ln738">		{ ATA_ADAPTER_BUS_MASTER_BASE, B_UINT16_TYPE, { ui16: bus_master_base }},</a>
+<a name="ln739">		{ NULL }</a>
+<a name="ln740">	};</a>
+<a name="ln741"> </a>
+<a name="ln742">	SHOW_FLOW0( 2, &quot;&quot; );</a>
+<a name="ln743"> </a>
+<a name="ln744">	return sDeviceManager-&gt;register_node(parent, controller_driver, attrs, resources, node);</a>
+<a name="ln745">}</a>
+<a name="ln746"> </a>
+<a name="ln747"> </a>
+<a name="ln748">/** detect pure IDE controller, i.e. without channels */</a>
+<a name="ln749"> </a>
+<a name="ln750">static status_t</a>
+<a name="ln751">ata_adapter_detect_controller(pci_device_module_info *pci, pci_device *pci_device,</a>
+<a name="ln752">	device_node *parent, uint16 bus_master_base, const char *controller_driver,</a>
+<a name="ln753">	const char *controller_driver_type, const char *controller_name, bool can_dma,</a>
+<a name="ln754">	bool can_cq, uint32 dma_alignment, uint32 dma_boundary, uint32 max_sg_block_size,</a>
+<a name="ln755">	device_node **node)</a>
+<a name="ln756">{</a>
+<a name="ln757">	io_resource resources[2] = {</a>
+<a name="ln758">		{ B_IO_PORT, bus_master_base, 16 },</a>
+<a name="ln759">		{}</a>
+<a name="ln760">	};</a>
+<a name="ln761"> </a>
+<a name="ln762">	SHOW_FLOW0( 3, &quot;&quot; );</a>
+<a name="ln763"> </a>
+<a name="ln764">	if (bus_master_base == 0) {</a>
+<a name="ln765">		TRACE(&quot;PCI-ATA: Controller detection failed! bus master base not configured\n&quot;);</a>
+<a name="ln766">		return B_ERROR;</a>
+<a name="ln767">	}</a>
+<a name="ln768"> </a>
+<a name="ln769">	return ata_adapter_publish_controller(parent, bus_master_base, resources,</a>
+<a name="ln770">		controller_driver, controller_driver_type, controller_name, can_dma, can_cq,</a>
+<a name="ln771">		dma_alignment, dma_boundary, max_sg_block_size, node);</a>
+<a name="ln772">}</a>
+<a name="ln773"> </a>
+<a name="ln774"> </a>
+<a name="ln775">static status_t</a>
+<a name="ln776">ata_adapter_probe_controller(device_node *parent, const char *controller_driver,</a>
+<a name="ln777">	const char *controller_driver_type, const char *controller_name,</a>
+<a name="ln778">	const char *channel_module_name, bool can_dma, bool can_cq, uint32 dma_alignment,</a>
+<a name="ln779">	uint32 dma_boundary, uint32 max_sg_block_size, bool supports_compatibility_mode)</a>
+<a name="ln780">{</a>
+<a name="ln781">	pci_device_module_info *pci;</a>
+<a name="ln782">	pci_device *device;</a>
+<a name="ln783">	uint16 command_block_base[2];</a>
+<a name="ln784">	uint16 control_block_base[2];</a>
+<a name="ln785">	uint16 bus_master_base;</a>
+<a name="ln786">	device_node *controller_node;</a>
+<a name="ln787">	device_node *channels[2];</a>
+<a name="ln788">	uint8 intnum;</a>
+<a name="ln789">	status_t res;</a>
+<a name="ln790"> </a>
+<a name="ln791">	SHOW_FLOW0( 3, &quot;&quot; );</a>
+<a name="ln792"> </a>
+<a name="ln793">	sDeviceManager-&gt;get_driver(parent, (driver_module_info **)&amp;pci, (void **)&amp;device);</a>
+<a name="ln794"> </a>
+<a name="ln795">	command_block_base[0] = pci-&gt;read_pci_config(device, PCI_base_registers, 4 );</a>
+<a name="ln796">	control_block_base[0] = pci-&gt;read_pci_config(device, PCI_base_registers + 4, 4);</a>
+<a name="ln797">	command_block_base[1] = pci-&gt;read_pci_config(device, PCI_base_registers + 8, 4);</a>
+<a name="ln798">	control_block_base[1] = pci-&gt;read_pci_config(device, PCI_base_registers + 12, 4);</a>
+<a name="ln799">	bus_master_base = pci-&gt;read_pci_config(device, PCI_base_registers + 16, 4);</a>
+<a name="ln800">	intnum = pci-&gt;read_pci_config(device, PCI_interrupt_line, 1);</a>
+<a name="ln801"> </a>
+<a name="ln802">	command_block_base[0] &amp;= PCI_address_io_mask;</a>
+<a name="ln803">	control_block_base[0] &amp;= PCI_address_io_mask;</a>
+<a name="ln804">	command_block_base[1] &amp;= PCI_address_io_mask;</a>
+<a name="ln805">	control_block_base[1] &amp;= PCI_address_io_mask;</a>
+<a name="ln806">	bus_master_base &amp;= PCI_address_io_mask;</a>
+<a name="ln807"> </a>
+<a name="ln808">	res = ata_adapter_detect_controller(pci, device, parent, bus_master_base,</a>
+<a name="ln809">		controller_driver, controller_driver_type, controller_name, can_dma,</a>
+<a name="ln810">		can_cq, dma_alignment, dma_boundary, max_sg_block_size, &amp;controller_node);</a>
+<a name="ln811">	// don't register if controller is already registered!</a>
+<a name="ln812">	// (happens during rescan; registering new channels would kick out old channels)</a>
+<a name="ln813">	if (res != B_OK || controller_node == NULL)</a>
+<a name="ln814">		return res;</a>
+<a name="ln815"> </a>
+<a name="ln816">	// ignore errors during registration of channels - could be a simple rescan collision</a>
+<a name="ln817">	ata_adapter_detect_channel(pci, device, controller_node, channel_module_name,</a>
+<a name="ln818">		can_dma, command_block_base[0], control_block_base[0], bus_master_base,</a>
+<a name="ln819">		intnum, 0, &quot;Primary Channel&quot;, &amp;channels[0], supports_compatibility_mode);</a>
+<a name="ln820"> </a>
+<a name="ln821">	ata_adapter_detect_channel(pci, device, controller_node, channel_module_name,</a>
+<a name="ln822">		can_dma, command_block_base[1], control_block_base[1], bus_master_base,</a>
+<a name="ln823">		intnum, 1, &quot;Secondary Channel&quot;, &amp;channels[1], supports_compatibility_mode);</a>
+<a name="ln824"> </a>
+<a name="ln825">	return B_OK;</a>
+<a name="ln826">}</a>
+<a name="ln827"> </a>
+<a name="ln828"> </a>
+<a name="ln829">static status_t</a>
+<a name="ln830">std_ops(int32 op, ...)</a>
+<a name="ln831">{</a>
+<a name="ln832">	switch (op) {</a>
+<a name="ln833">		case B_MODULE_INIT:</a>
+<a name="ln834">		case B_MODULE_UNINIT:</a>
+<a name="ln835">			return B_OK;</a>
+<a name="ln836"> </a>
+<a name="ln837">		default:</a>
+<a name="ln838">			return B_ERROR;</a>
+<a name="ln839">	}</a>
+<a name="ln840">}</a>
+<a name="ln841"> </a>
+<a name="ln842"> </a>
+<a name="ln843">module_dependency module_dependencies[] = {</a>
+<a name="ln844">	{ ATA_FOR_CONTROLLER_MODULE_NAME, (module_info **)&amp;sATA },</a>
+<a name="ln845">	{ B_DEVICE_MANAGER_MODULE_NAME, (module_info **)&amp;sDeviceManager },</a>
+<a name="ln846">	{}</a>
+<a name="ln847">};</a>
+<a name="ln848"> </a>
+<a name="ln849"> </a>
+<a name="ln850">static ata_adapter_interface adapter_interface = {</a>
+<a name="ln851">	{</a>
+<a name="ln852">		ATA_ADAPTER_MODULE_NAME,</a>
+<a name="ln853">		0,</a>
+<a name="ln854">		std_ops</a>
+<a name="ln855">	},</a>
+<a name="ln856"> </a>
+<a name="ln857">	set_channel,</a>
+<a name="ln858"> </a>
+<a name="ln859">	ata_adapter_write_command_block_regs,</a>
+<a name="ln860">	ata_adapter_read_command_block_regs,</a>
+<a name="ln861"> </a>
+<a name="ln862">	ata_adapter_get_altstatus,</a>
+<a name="ln863">	ata_adapter_write_device_control,</a>
+<a name="ln864"> </a>
+<a name="ln865">	ata_adapter_write_pio,</a>
+<a name="ln866">	ata_adapter_read_pio,</a>
+<a name="ln867"> </a>
+<a name="ln868">	ata_adapter_prepare_dma,</a>
+<a name="ln869">	ata_adapter_start_dma,</a>
+<a name="ln870">	ata_adapter_finish_dma,</a>
+<a name="ln871"> </a>
+<a name="ln872">	ata_adapter_inthand,</a>
+<a name="ln873"> </a>
+<a name="ln874">	ata_adapter_init_channel,</a>
+<a name="ln875">	ata_adapter_uninit_channel,</a>
+<a name="ln876">	ata_adapter_channel_removed,</a>
+<a name="ln877"> </a>
+<a name="ln878">	ata_adapter_publish_channel,</a>
+<a name="ln879">	ata_adapter_detect_channel,</a>
+<a name="ln880"> </a>
+<a name="ln881">	ata_adapter_init_controller,</a>
+<a name="ln882">	ata_adapter_uninit_controller,</a>
+<a name="ln883">	ata_adapter_controller_removed,</a>
+<a name="ln884"> </a>
+<a name="ln885">	ata_adapter_publish_controller,</a>
+<a name="ln886">	ata_adapter_detect_controller,</a>
+<a name="ln887"> </a>
+<a name="ln888">	ata_adapter_probe_controller</a>
+<a name="ln889">};</a>
+<a name="ln890"> </a>
+<a name="ln891">module_info *modules[] = {</a>
+<a name="ln892">	&amp;adapter_interface.info,</a>
+<a name="ln893">	NULL</a>
+<a name="ln894">};</a>
+
+</code></pre>
+<div class="balloon" rel="151"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v763/" target="_blank">V763</a> Parameter 'force_16bit' is always rewritten in function body before being used.</p></div>
+<div class="balloon" rel="179"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v763/" target="_blank">V763</a> Parameter 'force_16bit' is always rewritten in function body before being used.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

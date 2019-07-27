@@ -1,0 +1,352 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>PCI_GART.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2">	Copyright (c) 2002, Thomas Kurschel</a>
+<a name="ln3"> </a>
+<a name="ln4">	Part of Radeon kernel driver</a>
+<a name="ln5"> </a>
+<a name="ln6">	PCI GART.</a>
+<a name="ln7"> </a>
+<a name="ln8">	Currently, we use PCI DMA. Changing to AGP would</a>
+<a name="ln9">	only affect this file, but AGP-GART is specific to</a>
+<a name="ln10">	the chipset of the motherboard, and as DMA is really</a>
+<a name="ln11">	overkill for 2D, I cannot bother writing a dozen</a>
+<a name="ln12">	of AGP drivers just to gain little extra speedup.</a>
+<a name="ln13">*/</a>
+<a name="ln14"> </a>
+<a name="ln15"> </a>
+<a name="ln16">#include &quot;radeon_driver.h&quot;</a>
+<a name="ln17">#include &quot;mmio.h&quot;</a>
+<a name="ln18">#include &quot;buscntrl_regs.h&quot;</a>
+<a name="ln19">#include &quot;memcntrl_regs.h&quot;</a>
+<a name="ln20">#include &quot;cp_regs.h&quot;</a>
+<a name="ln21"> </a>
+<a name="ln22">#include &lt;image.h&gt;</a>
+<a name="ln23"> </a>
+<a name="ln24">#include &lt;stdlib.h&gt;</a>
+<a name="ln25">#include &lt;string.h&gt;</a>
+<a name="ln26"> </a>
+<a name="ln27"> </a>
+<a name="ln28">#if 1</a>
+<a name="ln29">//! create actual GART buffer</a>
+<a name="ln30">static status_t</a>
+<a name="ln31">createGARTBuffer(GART_info *gart, size_t size)</a>
+<a name="ln32">{</a>
+<a name="ln33">	SHOW_FLOW0( 3, &quot;&quot; );</a>
+<a name="ln34"> </a>
+<a name="ln35">	gart-&gt;buffer.size = size = (size + B_PAGE_SIZE - 1) &amp; ~(B_PAGE_SIZE - 1);</a>
+<a name="ln36"> </a>
+<a name="ln37">	// if this buffer is used for PCI BM, cache snooping</a>
+<a name="ln38">	// takes care of syncing memory accesses; if used for AGP,</a>
+<a name="ln39">	// we'll have to access via AGP aperture (and mark aperture</a>
+<a name="ln40">	// as write-combined) as cache consistency doesn't need to</a>
+<a name="ln41">	// be guaranteed</a>
+<a name="ln42"> </a>
+<a name="ln43">	// the specs say that some chipsets do kind of lazy flushing</a>
+<a name="ln44">	// so the graphics card may read obsolete data; up to now</a>
+<a name="ln45">	// we use PCI only where this shouldn't happen by design;</a>
+<a name="ln46">	// if we change to AGP we may tweak the pre-charge time of</a>
+<a name="ln47">	// the write buffer pointer</a>
+<a name="ln48"> </a>
+<a name="ln49">	// as some variables in accelerant point directly into</a>
+<a name="ln50">	// the DMA buffer, we have to grant access for all apps</a>
+<a name="ln51">	gart-&gt;buffer.area = create_area(&quot;Radeon PCI GART buffer&quot;,</a>
+<a name="ln52">		&amp;gart-&gt;buffer.ptr, B_ANY_KERNEL_ADDRESS,</a>
+<a name="ln53">		size, B_FULL_LOCK,</a>
+<a name="ln54">		// TODO: really user read/write?</a>
+<a name="ln55">		B_READ_AREA | B_WRITE_AREA | B_USER_CLONEABLE_AREA);</a>
+<a name="ln56">	if (gart-&gt;buffer.area &lt; 0) {</a>
+<a name="ln57">		SHOW_ERROR(1, &quot;cannot create PCI GART buffer (%s)&quot;,</a>
+<a name="ln58">			strerror(gart-&gt;buffer.area));</a>
+<a name="ln59">		return gart-&gt;buffer.area;</a>
+<a name="ln60">	}</a>
+<a name="ln61"> </a>
+<a name="ln62">	gart-&gt;buffer.unaligned_area = -1;</a>
+<a name="ln63"> </a>
+<a name="ln64">	memset( gart-&gt;buffer.ptr, 0, size );</a>
+<a name="ln65"> </a>
+<a name="ln66">	return B_OK;</a>
+<a name="ln67">}</a>
+<a name="ln68"> </a>
+<a name="ln69">#else</a>
+<a name="ln70"> </a>
+<a name="ln71">static status_t createGARTBuffer( GART_info *gart, size_t size )</a>
+<a name="ln72">{</a>
+<a name="ln73">	physical_entry map[1];</a>
+<a name="ln74">	void *unaligned_addr, *aligned_phys;</a>
+<a name="ln75"> </a>
+<a name="ln76">	SHOW_FLOW0( 3, &quot;&quot; );</a>
+<a name="ln77"> </a>
+<a name="ln78">	gart-&gt;buffer.size = size = (size + B_PAGE_SIZE - 1) &amp; ~(B_PAGE_SIZE - 1);</a>
+<a name="ln79"> </a>
+<a name="ln80">	// we allocate an contiguous area having twice the size</a>
+<a name="ln81">	// to be able to find an aligned, contiguous range within it;</a>
+<a name="ln82">	// the graphics card doesn't care, but the CPU cannot</a>
+<a name="ln83">	// make an arbitrary area WC'ed, at least elder ones</a>
+<a name="ln84">	// question: is this necessary for a PCI GART because of bus snooping?</a>
+<a name="ln85">	gart-&gt;buffer.unaligned_area = create_area( &quot;Radeon PCI GART buffer&quot;,</a>
+<a name="ln86">		&amp;unaligned_addr, B_ANY_KERNEL_ADDRESS,</a>
+<a name="ln87">		2 * size, B_CONTIGUOUS/*B_FULL_LOCK*/, B_READ_AREA | B_WRITE_AREA | B_USER_CLONEABLE_AREA );</a>
+<a name="ln88">		// TODO: Physical aligning can be done without waste using the</a>
+<a name="ln89">		// private create_area_etc().</a>
+<a name="ln90">	if (gart-&gt;buffer.unaligned_area &lt; 0) {</a>
+<a name="ln91">		SHOW_ERROR( 1, &quot;cannot create PCI GART buffer (%s)&quot;,</a>
+<a name="ln92">			strerror( gart-&gt;buffer.unaligned_area ));</a>
+<a name="ln93">		return gart-&gt;buffer.unaligned_area;</a>
+<a name="ln94">	}</a>
+<a name="ln95"> </a>
+<a name="ln96">	get_memory_map( unaligned_addr, B_PAGE_SIZE, map, 1 );</a>
+<a name="ln97"> </a>
+<a name="ln98">	aligned_phys =</a>
+<a name="ln99">		(void **)((map[0].address + size - 1) &amp; ~(size - 1));</a>
+<a name="ln100"> </a>
+<a name="ln101">	SHOW_FLOW( 3, &quot;aligned_phys=%p&quot;, aligned_phys );</a>
+<a name="ln102"> </a>
+<a name="ln103">	gart-&gt;buffer.area = map_physical_memory( &quot;Radeon aligned PCI GART buffer&quot;,</a>
+<a name="ln104">		(addr_t)aligned_phys,</a>
+<a name="ln105">		size, B_ANY_KERNEL_BLOCK_ADDRESS | B_MTR_WC,</a>
+<a name="ln106">		B_READ_AREA | B_WRITE_AREA, &amp;gart-&gt;buffer.ptr );</a>
+<a name="ln107"> </a>
+<a name="ln108">	if( gart-&gt;buffer.area &lt; 0 ) {</a>
+<a name="ln109">		SHOW_ERROR0( 3, &quot;cannot map buffer with WC&quot; );</a>
+<a name="ln110">		gart-&gt;buffer.area = map_physical_memory( &quot;Radeon aligned PCI GART buffer&quot;,</a>
+<a name="ln111">			(addr_t)aligned_phys,</a>
+<a name="ln112">			size, B_ANY_KERNEL_BLOCK_ADDRESS,</a>
+<a name="ln113">			B_READ_AREA | B_WRITE_AREA, &amp;gart-&gt;buffer.ptr );</a>
+<a name="ln114">	}</a>
+<a name="ln115"> </a>
+<a name="ln116">	if( gart-&gt;buffer.area &lt; 0 ) {</a>
+<a name="ln117">		SHOW_ERROR0( 1, &quot;cannot map GART buffer&quot; );</a>
+<a name="ln118">		delete_area( gart-&gt;buffer.unaligned_area );</a>
+<a name="ln119">		gart-&gt;buffer.unaligned_area = -1;</a>
+<a name="ln120">		return gart-&gt;buffer.area;</a>
+<a name="ln121">	}</a>
+<a name="ln122"> </a>
+<a name="ln123">	memset( gart-&gt;buffer.ptr, 0, size );</a>
+<a name="ln124"> </a>
+<a name="ln125">	return B_OK;</a>
+<a name="ln126">}</a>
+<a name="ln127"> </a>
+<a name="ln128">#endif</a>
+<a name="ln129"> </a>
+<a name="ln130">// init GATT (could be used for both PCI and AGP)</a>
+<a name="ln131">static status_t initGATT( GART_info *gart )</a>
+<a name="ln132">{</a>
+<a name="ln133">	area_id map_area;</a>
+<a name="ln134">	uint32 map_area_size;</a>
+<a name="ln135">	physical_entry *map;</a>
+<a name="ln136">	physical_entry PTB_map[1];</a>
+<a name="ln137">	size_t map_count;</a>
+<a name="ln138">	uint32 i;</a>
+<a name="ln139">	uint32 *gatt_entry;</a>
+<a name="ln140">	size_t num_pages;</a>
+<a name="ln141"> </a>
+<a name="ln142">	SHOW_FLOW0( 3, &quot;&quot; );</a>
+<a name="ln143"> </a>
+<a name="ln144">	num_pages = (gart-&gt;buffer.size + B_PAGE_SIZE - 1) &amp; ~(B_PAGE_SIZE - 1);</a>
+<a name="ln145"> </a>
+<a name="ln146">	// GART must be contiguous</a>
+<a name="ln147">	gart-&gt;GATT.area = create_area(&quot;Radeon GATT&quot;, (void **)&amp;gart-&gt;GATT.ptr,</a>
+<a name="ln148">		B_ANY_KERNEL_ADDRESS,</a>
+<a name="ln149">		(num_pages * sizeof( uint32 ) + B_PAGE_SIZE - 1) &amp; ~(B_PAGE_SIZE - 1),</a>
+<a name="ln150">		B_32_BIT_CONTIGUOUS,</a>
+<a name="ln151">			// TODO: Physical address is cast to 32 bit below! Use B_CONTIGUOUS,</a>
+<a name="ln152">			// when that is (/can be) fixed!</a>
+<a name="ln153">		// TODO: really user read/write?</a>
+<a name="ln154">		B_READ_AREA | B_WRITE_AREA | B_USER_CLONEABLE_AREA);</a>
+<a name="ln155"> </a>
+<a name="ln156">	if (gart-&gt;GATT.area &lt; 0) {</a>
+<a name="ln157">		SHOW_ERROR(1, &quot;cannot create GATT table (%s)&quot;,</a>
+<a name="ln158">			strerror(gart-&gt;GATT.area));</a>
+<a name="ln159">		return gart-&gt;GATT.area;</a>
+<a name="ln160">	}</a>
+<a name="ln161"> </a>
+<a name="ln162">	get_memory_map(gart-&gt;GATT.ptr, B_PAGE_SIZE, PTB_map, 1);</a>
+<a name="ln163">	gart-&gt;GATT.phys = PTB_map[0].address;</a>
+<a name="ln164"> </a>
+<a name="ln165">	SHOW_INFO(3, &quot;GATT_ptr=%p, GATT_phys=%p&quot;, gart-&gt;GATT.ptr,</a>
+<a name="ln166">		(void *)gart-&gt;GATT.phys);</a>
+<a name="ln167"> </a>
+<a name="ln168">	// get address mapping</a>
+<a name="ln169">	memset(gart-&gt;GATT.ptr, 0, num_pages * sizeof(uint32));</a>
+<a name="ln170"> </a>
+<a name="ln171">	map_count = num_pages + 1;</a>
+<a name="ln172"> </a>
+<a name="ln173">	// align size to B_PAGE_SIZE</a>
+<a name="ln174">	map_area_size = map_count * sizeof(physical_entry);</a>
+<a name="ln175">	if ((map_area_size / B_PAGE_SIZE) * B_PAGE_SIZE != map_area_size)</a>
+<a name="ln176">		map_area_size = ((map_area_size / B_PAGE_SIZE) + 1) * B_PAGE_SIZE;</a>
+<a name="ln177"> </a>
+<a name="ln178">	// temporary area where we fill in the memory map (deleted below)</a>
+<a name="ln179">	map_area = create_area(&quot;pci_gart_map_area&quot;, (void **)&amp;map, B_ANY_ADDRESS,</a>
+<a name="ln180">		map_area_size, B_FULL_LOCK, B_READ_AREA | B_WRITE_AREA);</a>
+<a name="ln181">		// TODO: We actually have a working malloc() in the kernel. Why create</a>
+<a name="ln182">		// an area?</a>
+<a name="ln183">	dprintf(&quot;pci_gart_map_area: %ld\n&quot;, map_area);</a>
+<a name="ln184"> </a>
+<a name="ln185">	get_memory_map( gart-&gt;buffer.ptr, gart-&gt;buffer.size, map, map_count );</a>
+<a name="ln186"> </a>
+<a name="ln187">	// the following looks a bit strange as the kernel</a>
+<a name="ln188">	// combines successive entries</a>
+<a name="ln189">	gatt_entry = gart-&gt;GATT.ptr;</a>
+<a name="ln190"> </a>
+<a name="ln191">	for( i = 0; i &lt; map_count; ++i ) {</a>
+<a name="ln192">		phys_addr_t addr = map[i].address;</a>
+<a name="ln193">		size_t size = map[i].size;</a>
+<a name="ln194"> </a>
+<a name="ln195">		if( size == 0 )</a>
+<a name="ln196">			break;</a>
+<a name="ln197"> </a>
+<a name="ln198">		while( size &gt; 0 ) {</a>
+<a name="ln199">			*gatt_entry++ = addr;</a>
+<a name="ln200">			//SHOW_FLOW( 3, &quot;%lx&quot;, *(gart_entry-1) );</a>
+<a name="ln201">			addr += ATI_PCIGART_PAGE_SIZE;</a>
+<a name="ln202">			size -= ATI_PCIGART_PAGE_SIZE;</a>
+<a name="ln203">		}</a>
+<a name="ln204">	}</a>
+<a name="ln205"> </a>
+<a name="ln206">	delete_area(map_area);</a>
+<a name="ln207"> </a>
+<a name="ln208">	if( i == map_count ) {</a>
+<a name="ln209">		// this case should never happen</a>
+<a name="ln210">		SHOW_ERROR0( 0, &quot;memory map of GART buffer too large!&quot; );</a>
+<a name="ln211">		delete_area( gart-&gt;GATT.area );</a>
+<a name="ln212">		gart-&gt;GATT.area = -1;</a>
+<a name="ln213">		return B_ERROR;</a>
+<a name="ln214">	}</a>
+<a name="ln215"> </a>
+<a name="ln216">	// this might be a bit more than needed, as</a>
+<a name="ln217">	// 1. Intel CPUs have &quot;processor order&quot;, i.e. writes appear to external</a>
+<a name="ln218">	//    devices in program order, so a simple final write should be sufficient</a>
+<a name="ln219">	// 2. if it is a PCI GART, bus snooping should provide cache coherence</a>
+<a name="ln220">	// 3. this function is a no-op :(</a>
+<a name="ln221">	clear_caches( gart-&gt;GATT.ptr, num_pages * sizeof( uint32 ),</a>
+<a name="ln222">		B_FLUSH_DCACHE );</a>
+<a name="ln223"> </a>
+<a name="ln224">	// back to real live - some chipsets have write buffers that</a>
+<a name="ln225">	// proove all previous assumptions wrong</a>
+<a name="ln226">	// (don't know whether this really helps though)</a>
+<a name="ln227">	#if defined(__i386__)</a>
+<a name="ln228">	asm volatile ( &quot;wbinvd&quot; ::: &quot;memory&quot; );</a>
+<a name="ln229">	#elif defined(__POWERPC__)</a>
+<a name="ln230">	// TODO : icbi on PowerPC to flush instruction cache?</a>
+<a name="ln231">	#endif</a>
+<a name="ln232">	return B_OK;</a>
+<a name="ln233">}</a>
+<a name="ln234"> </a>
+<a name="ln235">// destroy GART buffer</a>
+<a name="ln236">static void destroyGARTBuffer( GART_info *gart )</a>
+<a name="ln237">{</a>
+<a name="ln238">	if( gart-&gt;buffer.area &gt; 0 )</a>
+<a name="ln239">		delete_area( gart-&gt;buffer.area );</a>
+<a name="ln240"> </a>
+<a name="ln241">	if( gart-&gt;buffer.unaligned_area &gt; 0 )</a>
+<a name="ln242">		delete_area( gart-&gt;buffer.unaligned_area );</a>
+<a name="ln243"> </a>
+<a name="ln244">	gart-&gt;buffer.area = gart-&gt;buffer.unaligned_area = -1;</a>
+<a name="ln245">}</a>
+<a name="ln246"> </a>
+<a name="ln247"> </a>
+<a name="ln248">// destroy GATT</a>
+<a name="ln249">static void destroyGATT( GART_info *gart )</a>
+<a name="ln250">{</a>
+<a name="ln251">	if( gart-&gt;GATT.area &gt; 0 )</a>
+<a name="ln252">		delete_area( gart-&gt;GATT.area );</a>
+<a name="ln253"> </a>
+<a name="ln254">	gart-&gt;GATT.area = -1;</a>
+<a name="ln255">}</a>
+<a name="ln256"> </a>
+<a name="ln257"> </a>
+<a name="ln258">// init PCI GART</a>
+<a name="ln259">status_t Radeon_InitPCIGART( device_info *di )</a>
+<a name="ln260">{</a>
+<a name="ln261">	status_t result;</a>
+<a name="ln262"> </a>
+<a name="ln263">	result = createGARTBuffer( &amp;di-&gt;pci_gart, PCI_GART_SIZE );</a>
+<a name="ln264">	if( result &lt; 0 )</a>
+<a name="ln265">		goto err1;</a>
+<a name="ln266"> </a>
+<a name="ln267">	result = initGATT( &amp;di-&gt;pci_gart );</a>
+<a name="ln268">	if( result &lt; 0 )</a>
+<a name="ln269">		goto err2;</a>
+<a name="ln270"> </a>
+<a name="ln271">	return B_OK;</a>
+<a name="ln272"> </a>
+<a name="ln273">err2:</a>
+<a name="ln274">	destroyGARTBuffer( &amp;di-&gt;pci_gart );</a>
+<a name="ln275"> </a>
+<a name="ln276">err1:</a>
+<a name="ln277">	return result;</a>
+<a name="ln278">}</a>
+<a name="ln279"> </a>
+<a name="ln280"> </a>
+<a name="ln281">// cleanup PCI GART</a>
+<a name="ln282">void Radeon_CleanupPCIGART( device_info *di )</a>
+<a name="ln283">{</a>
+<a name="ln284">	vuint8 *regs = di-&gt;regs;</a>
+<a name="ln285"> </a>
+<a name="ln286">	SHOW_FLOW0( 3, &quot;&quot; );</a>
+<a name="ln287"> </a>
+<a name="ln288">	// perhaps we should wait for FIFO space before messing around with registers, but</a>
+<a name="ln289">	// 1. I don't want to add all the sync stuff to the kernel driver</a>
+<a name="ln290">	// 2. I doubt that these regs are buffered by FIFO</a>
+<a name="ln291">	// but still: in worst case CP has written some commands to register FIFO,</a>
+<a name="ln292">	// which can do any kind of nasty things</a>
+<a name="ln293"> </a>
+<a name="ln294">	// disable CP BM</a>
+<a name="ln295">	OUTREG( regs, RADEON_CP_CSQ_CNTL, RADEON_CSQ_PRIDIS_INDDIS );</a>
+<a name="ln296">	// read-back for flushing</a>
+<a name="ln297">	INREG( regs, RADEON_CP_CSQ_CNTL );</a>
+<a name="ln298"> </a>
+<a name="ln299">	// disable bus mastering</a>
+<a name="ln300">	OUTREGP( regs, RADEON_BUS_CNTL, RADEON_BUS_MASTER_DIS, ~RADEON_BUS_MASTER_DIS );</a>
+<a name="ln301">	// disable PCI GART</a>
+<a name="ln302">	OUTREGP( regs, RADEON_AIC_CNTL, 0, ~RADEON_PCIGART_TRANSLATE_EN );</a>
+<a name="ln303"> </a>
+<a name="ln304">	destroyGATT( &amp;di-&gt;pci_gart );</a>
+<a name="ln305">	destroyGARTBuffer( &amp;di-&gt;pci_gart );</a>
+<a name="ln306">}</a>
+
+</code></pre>
+<div class="balloon" rel="183"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'dprintf' function. The memsize type argument is expected.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

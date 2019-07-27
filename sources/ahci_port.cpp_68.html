@@ -1,0 +1,1468 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>ahci_port.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2008-2015 Haiku, Inc. All rights reserved.</a>
+<a name="ln3"> * Copyright 2007-2009, Marcus Overhagen. All rights reserved.</a>
+<a name="ln4"> * Distributed under the terms of the MIT License.</a>
+<a name="ln5"> *</a>
+<a name="ln6"> * Authors:</a>
+<a name="ln7"> *		Axel Dörfler, axeld@pinc-software.de</a>
+<a name="ln8"> *		Michael Lotz, mmlr@mlotz.ch</a>
+<a name="ln9"> *		Alexander von Gluck IV, kallisti5@unixzen.com</a>
+<a name="ln10"> */</a>
+<a name="ln11"> </a>
+<a name="ln12"> </a>
+<a name="ln13">#include &quot;ahci_port.h&quot;</a>
+<a name="ln14"> </a>
+<a name="ln15">#include &lt;new&gt;</a>
+<a name="ln16">#include &lt;stdio.h&gt;</a>
+<a name="ln17">#include &lt;string.h&gt;</a>
+<a name="ln18"> </a>
+<a name="ln19">#include &lt;ByteOrder.h&gt;</a>
+<a name="ln20">#include &lt;KernelExport.h&gt;</a>
+<a name="ln21"> </a>
+<a name="ln22">#include &lt;ATACommands.h&gt;</a>
+<a name="ln23">#include &lt;ATAInfoBlock.h&gt;</a>
+<a name="ln24">#include &lt;AutoDeleter.h&gt;</a>
+<a name="ln25"> </a>
+<a name="ln26">#include &quot;ahci_controller.h&quot;</a>
+<a name="ln27">#include &quot;ahci_tracing.h&quot;</a>
+<a name="ln28">#include &quot;sata_request.h&quot;</a>
+<a name="ln29">#include &quot;scsi_cmds.h&quot;</a>
+<a name="ln30">#include &quot;util.h&quot;</a>
+<a name="ln31"> </a>
+<a name="ln32"> </a>
+<a name="ln33">//#define TRACE_AHCI</a>
+<a name="ln34">#ifdef TRACE_AHCI</a>
+<a name="ln35">#	define TRACE(a...) dprintf(&quot;ahci: &quot; a)</a>
+<a name="ln36">#else</a>
+<a name="ln37">#	define TRACE(a...)</a>
+<a name="ln38">#endif</a>
+<a name="ln39"> </a>
+<a name="ln40">#define ERROR(a...) dprintf(&quot;ahci: &quot; a)</a>
+<a name="ln41">//#define FLOW(a...)	dprintf(&quot;ahci: &quot; a)</a>
+<a name="ln42">//#define RWTRACE(a...) dprintf(&quot;ahci: &quot; a)</a>
+<a name="ln43">#define FLOW(a...)</a>
+<a name="ln44">#define RWTRACE(a...)</a>
+<a name="ln45"> </a>
+<a name="ln46"> </a>
+<a name="ln47">#define INQUIRY_BASE_LENGTH 36</a>
+<a name="ln48"> </a>
+<a name="ln49"> </a>
+<a name="ln50">AHCIPort::AHCIPort(AHCIController* controller, int index)</a>
+<a name="ln51">	:</a>
+<a name="ln52">	fController(controller),</a>
+<a name="ln53">	fIndex(index),</a>
+<a name="ln54">	fRegs(&amp;controller-&gt;fRegs-&gt;port[index]),</a>
+<a name="ln55">	fArea(-1),</a>
+<a name="ln56">	fCommandsActive(0),</a>
+<a name="ln57">	fRequestSem(-1),</a>
+<a name="ln58">	fResponseSem(-1),</a>
+<a name="ln59">	fDevicePresent(false),</a>
+<a name="ln60">	fUse48BitCommands(false),</a>
+<a name="ln61">	fSectorSize(0),</a>
+<a name="ln62">	fSectorCount(0),</a>
+<a name="ln63">	fIsATAPI(false),</a>
+<a name="ln64">	fTestUnitReadyActive(false),</a>
+<a name="ln65">	fPortReset(false),</a>
+<a name="ln66">	fError(false),</a>
+<a name="ln67">	fTrimSupported(false)</a>
+<a name="ln68">{</a>
+<a name="ln69">	B_INITIALIZE_SPINLOCK(&amp;fSpinlock);</a>
+<a name="ln70">	fRequestSem = create_sem(1, &quot;ahci request&quot;);</a>
+<a name="ln71">	fResponseSem = create_sem(0, &quot;ahci response&quot;);</a>
+<a name="ln72">}</a>
+<a name="ln73"> </a>
+<a name="ln74"> </a>
+<a name="ln75">AHCIPort::~AHCIPort()</a>
+<a name="ln76">{</a>
+<a name="ln77">	delete_sem(fRequestSem);</a>
+<a name="ln78">	delete_sem(fResponseSem);</a>
+<a name="ln79">}</a>
+<a name="ln80"> </a>
+<a name="ln81"> </a>
+<a name="ln82">status_t</a>
+<a name="ln83">AHCIPort::Init1()</a>
+<a name="ln84">{</a>
+<a name="ln85">	TRACE(&quot;AHCIPort::Init1 port %d\n&quot;, fIndex);</a>
+<a name="ln86"> </a>
+<a name="ln87">	size_t size = sizeof(command_list_entry) * COMMAND_LIST_ENTRY_COUNT</a>
+<a name="ln88">		+ sizeof(fis) + sizeof(command_table)</a>
+<a name="ln89">		+ sizeof(prd) * PRD_TABLE_ENTRY_COUNT;</a>
+<a name="ln90"> </a>
+<a name="ln91">	char* virtAddr;</a>
+<a name="ln92">	phys_addr_t physAddr;</a>
+<a name="ln93">	char name[32];</a>
+<a name="ln94">	snprintf(name, sizeof(name), &quot;AHCI port %d&quot;, fIndex);</a>
+<a name="ln95"> </a>
+<a name="ln96">	fArea = alloc_mem((void**)&amp;virtAddr, &amp;physAddr, size, 0, name);</a>
+<a name="ln97">	if (fArea &lt; B_OK) {</a>
+<a name="ln98">		TRACE(&quot;failed allocating memory for port %d\n&quot;, fIndex);</a>
+<a name="ln99">		return fArea;</a>
+<a name="ln100">	}</a>
+<a name="ln101">	memset(virtAddr, 0, size);</a>
+<a name="ln102"> </a>
+<a name="ln103">	fCommandList = (command_list_entry*)virtAddr;</a>
+<a name="ln104">	virtAddr += sizeof(command_list_entry) * COMMAND_LIST_ENTRY_COUNT;</a>
+<a name="ln105">	fFIS = (fis*)virtAddr;</a>
+<a name="ln106">	virtAddr += sizeof(fis);</a>
+<a name="ln107">	fCommandTable = (command_table*)virtAddr;</a>
+<a name="ln108">	virtAddr += sizeof(command_table);</a>
+<a name="ln109">	fPRDTable = (prd*)virtAddr;</a>
+<a name="ln110">	TRACE(&quot;PRD table is at %p\n&quot;, fPRDTable);</a>
+<a name="ln111"> </a>
+<a name="ln112">	fRegs-&gt;clb  = LO32(physAddr);</a>
+<a name="ln113">	fRegs-&gt;clbu = HI32(physAddr);</a>
+<a name="ln114">	physAddr += sizeof(command_list_entry) * COMMAND_LIST_ENTRY_COUNT;</a>
+<a name="ln115">	fRegs-&gt;fb   = LO32(physAddr);</a>
+<a name="ln116">	fRegs-&gt;fbu  = HI32(physAddr);</a>
+<a name="ln117">	physAddr += sizeof(fis);</a>
+<a name="ln118">	fCommandList[0].ctba  = LO32(physAddr);</a>
+<a name="ln119">	fCommandList[0].ctbau = HI32(physAddr);</a>
+<a name="ln120">	// prdt follows after command table</a>
+<a name="ln121"> </a>
+<a name="ln122">	// disable transitions to partial or slumber state</a>
+<a name="ln123">	fRegs-&gt;sctl |= (SCTL_PORT_IPM_NOPART | SCTL_PORT_IPM_NOSLUM);</a>
+<a name="ln124"> </a>
+<a name="ln125">	// clear IRQ status bits</a>
+<a name="ln126">	fRegs-&gt;is = fRegs-&gt;is;</a>
+<a name="ln127"> </a>
+<a name="ln128">	// clear error bits</a>
+<a name="ln129">	_ClearErrorRegister();</a>
+<a name="ln130"> </a>
+<a name="ln131">	// power up device</a>
+<a name="ln132">	fRegs-&gt;cmd |= PORT_CMD_POD;</a>
+<a name="ln133"> </a>
+<a name="ln134">	// spin up device</a>
+<a name="ln135">	fRegs-&gt;cmd |= PORT_CMD_SUD;</a>
+<a name="ln136"> </a>
+<a name="ln137">	// activate link</a>
+<a name="ln138">	fRegs-&gt;cmd = (fRegs-&gt;cmd &amp; ~PORT_CMD_ICC_MASK) | PORT_CMD_ICC_ACTIVE;</a>
+<a name="ln139"> </a>
+<a name="ln140">	// enable FIS receive (enabled when fb set, only to be disabled when unset)</a>
+<a name="ln141">	fRegs-&gt;cmd |= PORT_CMD_FRE;</a>
+<a name="ln142"> </a>
+<a name="ln143">	FlushPostedWrites();</a>
+<a name="ln144"> </a>
+<a name="ln145">	return B_OK;</a>
+<a name="ln146">}</a>
+<a name="ln147"> </a>
+<a name="ln148"> </a>
+<a name="ln149">// called with global interrupts enabled</a>
+<a name="ln150">status_t</a>
+<a name="ln151">AHCIPort::Init2()</a>
+<a name="ln152">{</a>
+<a name="ln153">	TRACE(&quot;AHCIPort::Init2 port %d\n&quot;, fIndex);</a>
+<a name="ln154"> </a>
+<a name="ln155">	// enable port</a>
+<a name="ln156">	Enable();</a>
+<a name="ln157"> </a>
+<a name="ln158">	// enable interrupts</a>
+<a name="ln159">	fRegs-&gt;ie = PORT_INT_MASK;</a>
+<a name="ln160"> </a>
+<a name="ln161">	FlushPostedWrites();</a>
+<a name="ln162"> </a>
+<a name="ln163">	// reset port and probe info</a>
+<a name="ln164">	ResetDevice();</a>
+<a name="ln165"> </a>
+<a name="ln166">	DumpHBAState();</a>
+<a name="ln167"> </a>
+<a name="ln168">	TRACE(&quot;%s: port %d, device %s\n&quot;, __func__, fIndex,</a>
+<a name="ln169">		fDevicePresent ? &quot;present&quot; : &quot;absent&quot;);</a>
+<a name="ln170"> </a>
+<a name="ln171">	return B_OK;</a>
+<a name="ln172">}</a>
+<a name="ln173"> </a>
+<a name="ln174"> </a>
+<a name="ln175">void</a>
+<a name="ln176">AHCIPort::Uninit()</a>
+<a name="ln177">{</a>
+<a name="ln178">	TRACE(&quot;AHCIPort::Uninit port %d\n&quot;, fIndex);</a>
+<a name="ln179"> </a>
+<a name="ln180">	// Spec v1.3.1, §10.3.2 - Shut down port before unsetting FRE</a>
+<a name="ln181"> </a>
+<a name="ln182">	// shutdown the port</a>
+<a name="ln183">	if (!Disable()) {</a>
+<a name="ln184">		ERROR(&quot;%s: port %d error, unable to shutdown before FRE clear!\n&quot;,</a>
+<a name="ln185">			__func__, fIndex);</a>
+<a name="ln186">		return;</a>
+<a name="ln187">	}</a>
+<a name="ln188"> </a>
+<a name="ln189">	// Clear FRE and wait for completion</a>
+<a name="ln190">	fRegs-&gt;cmd &amp;= ~PORT_CMD_FRE;</a>
+<a name="ln191">	if (wait_until_clear(&amp;fRegs-&gt;cmd, PORT_CMD_FR, 500000) &lt; B_OK)</a>
+<a name="ln192">		ERROR(&quot;%s: port %d error FIS rx still running\n&quot;, __func__, fIndex);</a>
+<a name="ln193"> </a>
+<a name="ln194">	// disable interrupts</a>
+<a name="ln195">	fRegs-&gt;ie = 0;</a>
+<a name="ln196"> </a>
+<a name="ln197">	// clear pending interrupts</a>
+<a name="ln198">	fRegs-&gt;is = fRegs-&gt;is;</a>
+<a name="ln199"> </a>
+<a name="ln200">	// invalidate DMA addresses</a>
+<a name="ln201">	fRegs-&gt;clb  = 0;</a>
+<a name="ln202">	fRegs-&gt;clbu = 0;</a>
+<a name="ln203">	fRegs-&gt;fb   = 0;</a>
+<a name="ln204">	fRegs-&gt;fbu  = 0;</a>
+<a name="ln205"> </a>
+<a name="ln206">	delete_area(fArea);</a>
+<a name="ln207">}</a>
+<a name="ln208"> </a>
+<a name="ln209"> </a>
+<a name="ln210">void</a>
+<a name="ln211">AHCIPort::ResetDevice()</a>
+<a name="ln212">{</a>
+<a name="ln213">	// perform a hard reset</a>
+<a name="ln214">	if (PortReset() != B_OK) {</a>
+<a name="ln215">		ERROR(&quot;%s: port %d unable to hard reset device\n&quot;, __func__, fIndex);</a>
+<a name="ln216">		return;</a>
+<a name="ln217">	}</a>
+<a name="ln218"> </a>
+<a name="ln219">	if (wait_until_set(&amp;fRegs-&gt;ssts, SSTS_PORT_DET_NODEV, 100000) &lt; B_OK)</a>
+<a name="ln220">		TRACE(&quot;AHCIPort::ResetDevice port %d no device detected\n&quot;, fIndex);</a>
+<a name="ln221"> </a>
+<a name="ln222">	_ClearErrorRegister();</a>
+<a name="ln223"> </a>
+<a name="ln224">	if (fRegs-&gt;ssts &amp; SSTS_PORT_DET_NOPHY) {</a>
+<a name="ln225">		if (wait_until_set(&amp;fRegs-&gt;ssts, 0x3, 500000) &lt; B_OK) {</a>
+<a name="ln226">			TRACE(&quot;AHCIPort::ResetDevice port %d device present but no phy &quot;</a>
+<a name="ln227">				&quot;communication\n&quot;, fIndex);</a>
+<a name="ln228">		}</a>
+<a name="ln229">	}</a>
+<a name="ln230"> </a>
+<a name="ln231">	_ClearErrorRegister();</a>
+<a name="ln232">}</a>
+<a name="ln233"> </a>
+<a name="ln234"> </a>
+<a name="ln235">status_t</a>
+<a name="ln236">AHCIPort::PortReset()</a>
+<a name="ln237">{</a>
+<a name="ln238">	TRACE(&quot;AHCIPort::PortReset port %d\n&quot;, fIndex);</a>
+<a name="ln239"> </a>
+<a name="ln240">	if (!Disable()) {</a>
+<a name="ln241">		ERROR(&quot;%s: port %d unable to shutdown!\n&quot;, __func__, fIndex);</a>
+<a name="ln242">		return B_ERROR;</a>
+<a name="ln243">	}</a>
+<a name="ln244"> </a>
+<a name="ln245">	_ClearErrorRegister();</a>
+<a name="ln246"> </a>
+<a name="ln247">	// Wait for BSY and DRQ to clear (idle port)</a>
+<a name="ln248">	if (wait_until_clear(&amp;fRegs-&gt;tfd, ATA_STATUS_BUSY | ATA_STATUS_DATA_REQUEST,</a>
+<a name="ln249">		1000000) &lt; B_OK) {</a>
+<a name="ln250">		// If we can't clear busy, do a full comreset</a>
+<a name="ln251"> </a>
+<a name="ln252">		// Spec v1.3.1, §10.4.2 Port Reset</a>
+<a name="ln253">		// Physical comm between HBA and port disabled. More Intrusive</a>
+<a name="ln254">		ERROR(&quot;%s: port %d undergoing COMRESET\n&quot;, __func__, fIndex);</a>
+<a name="ln255"> </a>
+<a name="ln256">		// Notice we're throwing out all other control flags.</a>
+<a name="ln257">		fRegs-&gt;sctl = (SSTS_PORT_IPM_ACTIVE | SSTS_PORT_IPM_PARTIAL</a>
+<a name="ln258">			| SCTL_PORT_DET_INIT);</a>
+<a name="ln259">		FlushPostedWrites();</a>
+<a name="ln260">		spin(1100);</a>
+<a name="ln261">		// You must wait 1ms at minimum</a>
+<a name="ln262">		fRegs-&gt;sctl = (fRegs-&gt;sctl &amp; ~HBA_PORT_DET_MASK) | SCTL_PORT_DET_NOINIT;</a>
+<a name="ln263">		FlushPostedWrites();</a>
+<a name="ln264">	}</a>
+<a name="ln265"> </a>
+<a name="ln266">	Enable();</a>
+<a name="ln267"> </a>
+<a name="ln268">	if (wait_until_set(&amp;fRegs-&gt;ssts, SSTS_PORT_DET_PRESENT, 500000) &lt; B_OK) {</a>
+<a name="ln269">		TRACE(&quot;%s: port %d: no device detected\n&quot;, __func__, fIndex);</a>
+<a name="ln270">		fDevicePresent = false;</a>
+<a name="ln271">		return B_OK;</a>
+<a name="ln272">	}</a>
+<a name="ln273"> </a>
+<a name="ln274">	return Probe();</a>
+<a name="ln275">}</a>
+<a name="ln276"> </a>
+<a name="ln277"> </a>
+<a name="ln278">status_t</a>
+<a name="ln279">AHCIPort::Probe()</a>
+<a name="ln280">{</a>
+<a name="ln281">	if ((fRegs-&gt;tfd &amp; 0xff) == 0xff)</a>
+<a name="ln282">		snooze(200000);</a>
+<a name="ln283"> </a>
+<a name="ln284">	if ((fRegs-&gt;tfd &amp; 0xff) == 0xff) {</a>
+<a name="ln285">		TRACE(&quot;%s: port %d: invalid task file status 0xff\n&quot;, __func__,</a>
+<a name="ln286">			fIndex);</a>
+<a name="ln287">		return B_ERROR;</a>
+<a name="ln288">	}</a>
+<a name="ln289"> </a>
+<a name="ln290">	if (!fTestUnitReadyActive) {</a>
+<a name="ln291">		switch (fRegs-&gt;ssts &amp; HBA_PORT_SPD_MASK) {</a>
+<a name="ln292">			case 0x10:</a>
+<a name="ln293">				ERROR(&quot;%s: port %d link speed 1.5Gb/s\n&quot;, __func__, fIndex);</a>
+<a name="ln294">				break;</a>
+<a name="ln295">			case 0x20:</a>
+<a name="ln296">				ERROR(&quot;%s: port %d link speed 3.0Gb/s\n&quot;, __func__, fIndex);</a>
+<a name="ln297">				break;</a>
+<a name="ln298">			case 0x30:</a>
+<a name="ln299">				ERROR(&quot;%s: port %d link speed 6.0Gb/s\n&quot;, __func__, fIndex);</a>
+<a name="ln300">				break;</a>
+<a name="ln301">			default:</a>
+<a name="ln302">				ERROR(&quot;%s: port %d link speed unrestricted\n&quot;, __func__, fIndex);</a>
+<a name="ln303">				break;</a>
+<a name="ln304">		}</a>
+<a name="ln305">	}</a>
+<a name="ln306"> </a>
+<a name="ln307">	wait_until_clear(&amp;fRegs-&gt;tfd, ATA_STATUS_BUSY, 31000000);</a>
+<a name="ln308"> </a>
+<a name="ln309">	fDevicePresent = (fRegs-&gt;ssts &amp; HBA_PORT_DET_MASK) == SSTS_PORT_DET_PRESENT;</a>
+<a name="ln310">	fIsATAPI = fRegs-&gt;sig == SATA_SIG_ATAPI;</a>
+<a name="ln311"> </a>
+<a name="ln312">	if (fIsATAPI)</a>
+<a name="ln313">		fRegs-&gt;cmd |= PORT_CMD_ATAPI;</a>
+<a name="ln314">	else</a>
+<a name="ln315">		fRegs-&gt;cmd &amp;= ~PORT_CMD_ATAPI;</a>
+<a name="ln316">	FlushPostedWrites();</a>
+<a name="ln317"> </a>
+<a name="ln318">	TRACE(&quot;device signature 0x%08&quot; B_PRIx32 &quot; (%s)\n&quot;, fRegs-&gt;sig,</a>
+<a name="ln319">		fRegs-&gt;sig == SATA_SIG_ATAPI ? &quot;ATAPI&quot; : fRegs-&gt;sig == SATA_SIG_ATA</a>
+<a name="ln320">			? &quot;ATA&quot; : &quot;unknown&quot;);</a>
+<a name="ln321"> </a>
+<a name="ln322">	return B_OK;</a>
+<a name="ln323">}</a>
+<a name="ln324"> </a>
+<a name="ln325"> </a>
+<a name="ln326">void</a>
+<a name="ln327">AHCIPort::DumpD2HFis()</a>
+<a name="ln328">{</a>
+<a name="ln329">	TRACE(&quot;D2H FIS:\n&quot;);</a>
+<a name="ln330">	TRACE(&quot;  DW0  %02x %02x %02x %02x\n&quot;, fFIS-&gt;rfis[3], fFIS-&gt;rfis[2],</a>
+<a name="ln331">		fFIS-&gt;rfis[1], fFIS-&gt;rfis[0]);</a>
+<a name="ln332">	TRACE(&quot;  DW1  %02x %02x %02x %02x\n&quot;, fFIS-&gt;rfis[7], fFIS-&gt;rfis[6],</a>
+<a name="ln333">		fFIS-&gt;rfis[5], fFIS-&gt;rfis[4]);</a>
+<a name="ln334">	TRACE(&quot;  DW2  %02x %02x %02x %02x\n&quot;, fFIS-&gt;rfis[11], fFIS-&gt;rfis[10],</a>
+<a name="ln335">		fFIS-&gt;rfis[9], fFIS-&gt;rfis[8]);</a>
+<a name="ln336">	TRACE(&quot;  DW3  %02x %02x %02x %02x\n&quot;, fFIS-&gt;rfis[15], fFIS-&gt;rfis[14],</a>
+<a name="ln337">		fFIS-&gt;rfis[13], fFIS-&gt;rfis[12]);</a>
+<a name="ln338">	TRACE(&quot;  DW4  %02x %02x %02x %02x\n&quot;, fFIS-&gt;rfis[19], fFIS-&gt;rfis[18],</a>
+<a name="ln339">		fFIS-&gt;rfis[17], fFIS-&gt;rfis[16]);</a>
+<a name="ln340">}</a>
+<a name="ln341"> </a>
+<a name="ln342"> </a>
+<a name="ln343">void</a>
+<a name="ln344">AHCIPort::DumpHBAState()</a>
+<a name="ln345">{</a>
+<a name="ln346">	TRACE(&quot;Port %d state:\n&quot;, fIndex);</a>
+<a name="ln347">	TRACE(&quot;  ie   0x%08&quot; B_PRIx32 &quot;\n&quot;, fRegs-&gt;ie);</a>
+<a name="ln348">	TRACE(&quot;  is   0x%08&quot; B_PRIx32 &quot;\n&quot;, fRegs-&gt;is);</a>
+<a name="ln349">	TRACE(&quot;  cmd  0x%08&quot; B_PRIx32 &quot;\n&quot;, fRegs-&gt;cmd);</a>
+<a name="ln350">	TRACE(&quot;  ssts 0x%08&quot; B_PRIx32 &quot;\n&quot;, fRegs-&gt;ssts);</a>
+<a name="ln351">	TRACE(&quot;  sctl 0x%08&quot; B_PRIx32 &quot;\n&quot;, fRegs-&gt;sctl);</a>
+<a name="ln352">	TRACE(&quot;  serr 0x%08&quot; B_PRIx32 &quot;\n&quot;, fRegs-&gt;serr);</a>
+<a name="ln353">	TRACE(&quot;  sact 0x%08&quot; B_PRIx32 &quot;\n&quot;, fRegs-&gt;sact);</a>
+<a name="ln354">	TRACE(&quot;  tfd  0x%08&quot; B_PRIx32 &quot;\n&quot;, fRegs-&gt;tfd);</a>
+<a name="ln355">}</a>
+<a name="ln356"> </a>
+<a name="ln357"> </a>
+<a name="ln358">void</a>
+<a name="ln359">AHCIPort::Interrupt()</a>
+<a name="ln360">{</a>
+<a name="ln361">	uint32 is = fRegs-&gt;is;</a>
+<a name="ln362">	fRegs-&gt;is = is; // clear interrupts</a>
+<a name="ln363"> </a>
+<a name="ln364">	if (is &amp; PORT_INT_ERROR) {</a>
+<a name="ln365">		InterruptErrorHandler(is);</a>
+<a name="ln366">		return;</a>
+<a name="ln367">	}</a>
+<a name="ln368"> </a>
+<a name="ln369">	uint32 ci = fRegs-&gt;ci;</a>
+<a name="ln370"> </a>
+<a name="ln371">	RWTRACE(&quot;[%lld] %ld AHCIPort::Interrupt port %d, fCommandsActive 0x%08&quot;</a>
+<a name="ln372">		B_PRIx32 &quot;, is 0x%08&quot; B_PRIx32 &quot;, ci 0x%08&quot; B_PRIx32 &quot;\n&quot;,</a>
+<a name="ln373">		system_time(), find_thread(NULL), fIndex, fCommandsActive, is, ci);</a>
+<a name="ln374"> </a>
+<a name="ln375">	acquire_spinlock(&amp;fSpinlock);</a>
+<a name="ln376">	if ((fCommandsActive &amp; 1) &amp;&amp; !(ci &amp; 1)) {</a>
+<a name="ln377">		fCommandsActive &amp;= ~1;</a>
+<a name="ln378">		release_sem_etc(fResponseSem, 1, B_DO_NOT_RESCHEDULE);</a>
+<a name="ln379">	}</a>
+<a name="ln380">	release_spinlock(&amp;fSpinlock);</a>
+<a name="ln381">}</a>
+<a name="ln382"> </a>
+<a name="ln383"> </a>
+<a name="ln384">void</a>
+<a name="ln385">AHCIPort::InterruptErrorHandler(uint32 is)</a>
+<a name="ln386">{</a>
+<a name="ln387">	TRACE(&quot;AHCIPort::InterruptErrorHandler port %d, fCommandsActive 0x%08&quot;</a>
+<a name="ln388">		B_PRIx32 &quot;, is 0x%08&quot; B_PRIx32 &quot;, ci 0x%08&quot; B_PRIx32 &quot;\n&quot;, fIndex,</a>
+<a name="ln389">		fCommandsActive, is, fRegs-&gt;ci);</a>
+<a name="ln390">	TRACE(&quot;ssts 0x%08&quot; B_PRIx32 &quot;\n&quot;, fRegs-&gt;ssts);</a>
+<a name="ln391">	TRACE(&quot;sctl 0x%08&quot; B_PRIx32 &quot;\n&quot;, fRegs-&gt;sctl);</a>
+<a name="ln392">	TRACE(&quot;serr 0x%08&quot; B_PRIx32 &quot;\n&quot;, fRegs-&gt;serr);</a>
+<a name="ln393">	TRACE(&quot;sact 0x%08&quot; B_PRIx32 &quot;\n&quot;, fRegs-&gt;sact);</a>
+<a name="ln394"> </a>
+<a name="ln395">	// read and clear SError</a>
+<a name="ln396">	_ClearErrorRegister();</a>
+<a name="ln397"> </a>
+<a name="ln398">	if (is &amp; PORT_INT_TFE) {</a>
+<a name="ln399">		TRACE(&quot;Task File Error\n&quot;);</a>
+<a name="ln400"> </a>
+<a name="ln401">		fPortReset = true;</a>
+<a name="ln402">		fError = true;</a>
+<a name="ln403">	}</a>
+<a name="ln404">	if (is &amp; PORT_INT_HBF) {</a>
+<a name="ln405">		ERROR(&quot;Host Bus Fatal Error\n&quot;);</a>
+<a name="ln406">		fPortReset = true;</a>
+<a name="ln407">		fError = true;</a>
+<a name="ln408">	}</a>
+<a name="ln409">	if (is &amp; PORT_INT_HBD) {</a>
+<a name="ln410">		ERROR(&quot;Host Bus Data Error\n&quot;);</a>
+<a name="ln411">		fPortReset = true;</a>
+<a name="ln412">		fError = true;</a>
+<a name="ln413">	}</a>
+<a name="ln414">	if (is &amp; PORT_INT_IF) {</a>
+<a name="ln415">		ERROR(&quot;Interface Fatal Error\n&quot;);</a>
+<a name="ln416">		fPortReset = true;</a>
+<a name="ln417">		fError = true;</a>
+<a name="ln418">	}</a>
+<a name="ln419">	if (is &amp; PORT_INT_INF) {</a>
+<a name="ln420">		TRACE(&quot;Interface Non Fatal Error\n&quot;);</a>
+<a name="ln421">	}</a>
+<a name="ln422">	if (is &amp; PORT_INT_OF) {</a>
+<a name="ln423">		TRACE(&quot;Overflow\n&quot;);</a>
+<a name="ln424">		fPortReset = true;</a>
+<a name="ln425">		fError = true;</a>
+<a name="ln426">	}</a>
+<a name="ln427">	if (is &amp; PORT_INT_IPM) {</a>
+<a name="ln428">		TRACE(&quot;Incorrect Port Multiplier Status\n&quot;);</a>
+<a name="ln429">	}</a>
+<a name="ln430">	if (is &amp; PORT_INT_PRC) {</a>
+<a name="ln431">		TRACE(&quot;PhyReady Change\n&quot;);</a>
+<a name="ln432">		//fPortReset = true;</a>
+<a name="ln433">	}</a>
+<a name="ln434">	if (is &amp; PORT_INT_PC) {</a>
+<a name="ln435">		TRACE(&quot;Port Connect Change\n&quot;);</a>
+<a name="ln436">		// Unsolicited when we had a port connect change without us requesting</a>
+<a name="ln437">		// Spec v1.3, §6.2.2.3 Recovery of Unsolicited COMINIT</a>
+<a name="ln438"> </a>
+<a name="ln439">		// XXX: This shouldn't be needed here... but we can loop without it</a>
+<a name="ln440">		//_ClearErrorRegister();</a>
+<a name="ln441">	}</a>
+<a name="ln442">	if (is &amp; PORT_INT_UF) {</a>
+<a name="ln443">		TRACE(&quot;Unknown FIS\n&quot;);</a>
+<a name="ln444">		fPortReset = true;</a>
+<a name="ln445">	}</a>
+<a name="ln446"> </a>
+<a name="ln447">	if (fError) {</a>
+<a name="ln448">		acquire_spinlock(&amp;fSpinlock);</a>
+<a name="ln449">		if ((fCommandsActive &amp; 1)) {</a>
+<a name="ln450">			fCommandsActive &amp;= ~1;</a>
+<a name="ln451">			release_sem_etc(fResponseSem, 1, B_DO_NOT_RESCHEDULE);</a>
+<a name="ln452">		}</a>
+<a name="ln453">		release_spinlock(&amp;fSpinlock);</a>
+<a name="ln454">	}</a>
+<a name="ln455">}</a>
+<a name="ln456"> </a>
+<a name="ln457"> </a>
+<a name="ln458">status_t</a>
+<a name="ln459">AHCIPort::FillPrdTable(volatile prd* prdTable, int* prdCount, int prdMax,</a>
+<a name="ln460">	const void* data, size_t dataSize)</a>
+<a name="ln461">{</a>
+<a name="ln462">	int maxEntries = prdMax + 1;</a>
+<a name="ln463">	physical_entry entries[maxEntries];</a>
+<a name="ln464">	uint32 entriesUsed = maxEntries;</a>
+<a name="ln465"> </a>
+<a name="ln466">	status_t status = get_memory_map_etc(B_CURRENT_TEAM, data, dataSize,</a>
+<a name="ln467">		entries, &amp;entriesUsed);</a>
+<a name="ln468">	if (status != B_OK) {</a>
+<a name="ln469">		ERROR(&quot;%s: get_memory_map() failed: %s\n&quot;, __func__, strerror(status));</a>
+<a name="ln470">		return B_ERROR;</a>
+<a name="ln471">	}</a>
+<a name="ln472"> </a>
+<a name="ln473">	return FillPrdTable(prdTable, prdCount, prdMax, entries, entriesUsed,</a>
+<a name="ln474">		dataSize);</a>
+<a name="ln475">}</a>
+<a name="ln476"> </a>
+<a name="ln477"> </a>
+<a name="ln478">status_t</a>
+<a name="ln479">AHCIPort::FillPrdTable(volatile prd* prdTable, int* prdCount, int prdMax,</a>
+<a name="ln480">	const physical_entry* sgTable, int sgCount, size_t dataSize)</a>
+<a name="ln481">{</a>
+<a name="ln482">	*prdCount = 0;</a>
+<a name="ln483">	while (sgCount &gt; 0 &amp;&amp; dataSize &gt; 0) {</a>
+<a name="ln484">		size_t size = min_c(sgTable-&gt;size, dataSize);</a>
+<a name="ln485">		phys_addr_t address = sgTable-&gt;address;</a>
+<a name="ln486">		T_PORT(AHCIPortPrdTable(fController, fIndex, address, size));</a>
+<a name="ln487">		FLOW(&quot;FillPrdTable: sg-entry addr %#&quot; B_PRIxPHYSADDR &quot;, size %lu\n&quot;,</a>
+<a name="ln488">			address, size);</a>
+<a name="ln489">		if (address &amp; 1) {</a>
+<a name="ln490">			ERROR(&quot;AHCIPort::FillPrdTable: data alignment error\n&quot;);</a>
+<a name="ln491">			return B_ERROR;</a>
+<a name="ln492">		}</a>
+<a name="ln493">		dataSize -= size;</a>
+<a name="ln494">		while (size &gt; 0) {</a>
+<a name="ln495">			size_t bytes = min_c(size, PRD_MAX_DATA_LENGTH);</a>
+<a name="ln496">			if (*prdCount == prdMax) {</a>
+<a name="ln497">				ERROR(&quot;AHCIPort::FillPrdTable: prd table exhausted\n&quot;);</a>
+<a name="ln498">				return B_ERROR;</a>
+<a name="ln499">			}</a>
+<a name="ln500">			FLOW(&quot;FillPrdTable: prd-entry %u, addr %p, size %lu\n&quot;,</a>
+<a name="ln501">				*prdCount, address, bytes);</a>
+<a name="ln502"> </a>
+<a name="ln503">			prdTable-&gt;dba = LO32(address);</a>
+<a name="ln504">			prdTable-&gt;dbau = HI32(address);</a>
+<a name="ln505">			prdTable-&gt;res = 0;</a>
+<a name="ln506">			prdTable-&gt;dbc = bytes - 1;</a>
+<a name="ln507">			*prdCount += 1;</a>
+<a name="ln508">			prdTable++;</a>
+<a name="ln509">			address = address + bytes;</a>
+<a name="ln510">			size -= bytes;</a>
+<a name="ln511">		}</a>
+<a name="ln512">		sgTable++;</a>
+<a name="ln513">		sgCount--;</a>
+<a name="ln514">	}</a>
+<a name="ln515">	if (*prdCount == 0) {</a>
+<a name="ln516">		ERROR(&quot;%s: count is 0\n&quot;, __func__);</a>
+<a name="ln517">		return B_ERROR;</a>
+<a name="ln518">	}</a>
+<a name="ln519">	if (dataSize &gt; 0) {</a>
+<a name="ln520">		ERROR(&quot;AHCIPort::FillPrdTable: sg table %ld bytes too small\n&quot;,</a>
+<a name="ln521">			dataSize);</a>
+<a name="ln522">		return B_ERROR;</a>
+<a name="ln523">	}</a>
+<a name="ln524">	return B_OK;</a>
+<a name="ln525">}</a>
+<a name="ln526"> </a>
+<a name="ln527"> </a>
+<a name="ln528">void</a>
+<a name="ln529">AHCIPort::StartTransfer()</a>
+<a name="ln530">{</a>
+<a name="ln531">	acquire_sem(fRequestSem);</a>
+<a name="ln532">}</a>
+<a name="ln533"> </a>
+<a name="ln534"> </a>
+<a name="ln535">status_t</a>
+<a name="ln536">AHCIPort::WaitForTransfer(int* tfd, bigtime_t timeout)</a>
+<a name="ln537">{</a>
+<a name="ln538">	status_t result = acquire_sem_etc(fResponseSem, 1, B_RELATIVE_TIMEOUT,</a>
+<a name="ln539">		timeout);</a>
+<a name="ln540">	if (result &lt; B_OK) {</a>
+<a name="ln541">		cpu_status cpu = disable_interrupts();</a>
+<a name="ln542">		acquire_spinlock(&amp;fSpinlock);</a>
+<a name="ln543">		fCommandsActive &amp;= ~1;</a>
+<a name="ln544">		release_spinlock(&amp;fSpinlock);</a>
+<a name="ln545">		restore_interrupts(cpu);</a>
+<a name="ln546"> </a>
+<a name="ln547">		result = B_TIMED_OUT;</a>
+<a name="ln548">	} else if (fError) {</a>
+<a name="ln549">		*tfd = fRegs-&gt;tfd;</a>
+<a name="ln550">		result = B_ERROR;</a>
+<a name="ln551">		fError = false;</a>
+<a name="ln552">	} else {</a>
+<a name="ln553">		*tfd = fRegs-&gt;tfd;</a>
+<a name="ln554">	}</a>
+<a name="ln555">	return result;</a>
+<a name="ln556">}</a>
+<a name="ln557"> </a>
+<a name="ln558"> </a>
+<a name="ln559">void</a>
+<a name="ln560">AHCIPort::FinishTransfer()</a>
+<a name="ln561">{</a>
+<a name="ln562">	release_sem(fRequestSem);</a>
+<a name="ln563">}</a>
+<a name="ln564"> </a>
+<a name="ln565"> </a>
+<a name="ln566">void</a>
+<a name="ln567">AHCIPort::ScsiTestUnitReady(scsi_ccb* request)</a>
+<a name="ln568">{</a>
+<a name="ln569">	TRACE(&quot;AHCIPort::ScsiTestUnitReady port %d\n&quot;, fIndex);</a>
+<a name="ln570">	request-&gt;subsys_status = SCSI_REQ_CMP;</a>
+<a name="ln571">	gSCSI-&gt;finished(request, 1);</a>
+<a name="ln572">}</a>
+<a name="ln573"> </a>
+<a name="ln574"> </a>
+<a name="ln575">void</a>
+<a name="ln576">AHCIPort::ScsiVPDInquiry(scsi_ccb* request, ata_device_infoblock* ataData)</a>
+<a name="ln577">{</a>
+<a name="ln578">	TRACE(&quot;AHCIPort::ScsiVPDInquiry port %d\n&quot;, fIndex);</a>
+<a name="ln579"> </a>
+<a name="ln580">	const scsi_cmd_inquiry* cmd = (const scsi_cmd_inquiry*)request-&gt;cdb;</a>
+<a name="ln581"> </a>
+<a name="ln582">	size_t vpdDataLength = 0;</a>
+<a name="ln583">	status_t transactionResult = B_ERROR;</a>
+<a name="ln584"> </a>
+<a name="ln585">	switch (cmd-&gt;page_code) {</a>
+<a name="ln586">		case SCSI_PAGE_SUPPORTED_VPD:</a>
+<a name="ln587">		{</a>
+<a name="ln588">			scsi_page_list vpdPageData;</a>
+<a name="ln589">			vpdDataLength = sizeof(vpdPageData);</a>
+<a name="ln590"> </a>
+<a name="ln591">			vpdPageData.page_code = cmd-&gt;page_code;</a>
+<a name="ln592">			// Our supported pages</a>
+<a name="ln593">			vpdPageData.page_length = 1;</a>
+<a name="ln594">			vpdPageData.pages[0] = SCSI_PAGE_BLOCK_LIMITS;</a>
+<a name="ln595"> </a>
+<a name="ln596">			transactionResult = sg_memcpy(request-&gt;sg_list, request-&gt;sg_count,</a>
+<a name="ln597">				&amp;vpdPageData, vpdDataLength);</a>
+<a name="ln598">			break;</a>
+<a name="ln599">		}</a>
+<a name="ln600">		case SCSI_PAGE_BLOCK_LIMITS:</a>
+<a name="ln601">		{</a>
+<a name="ln602">			scsi_page_block_limits vpdPageData;</a>
+<a name="ln603">			vpdDataLength = sizeof(vpdPageData);</a>
+<a name="ln604"> </a>
+<a name="ln605">			vpdPageData.page_code = cmd-&gt;page_code;</a>
+<a name="ln606">			vpdPageData.max_unmap_lba_count</a>
+<a name="ln607">				= ataData-&gt;max_data_set_management_lba_range_blocks;</a>
+<a name="ln608"> </a>
+<a name="ln609">			transactionResult = sg_memcpy(request-&gt;sg_list, request-&gt;sg_count,</a>
+<a name="ln610">				&amp;vpdPageData, vpdDataLength);</a>
+<a name="ln611">			break;</a>
+<a name="ln612">		}</a>
+<a name="ln613">		case SCSI_PAGE_USN:</a>
+<a name="ln614">		case SCSI_PAGE_BLOCK_DEVICE_CHARS:</a>
+<a name="ln615">		case SCSI_PAGE_LB_PROVISIONING:</a>
+<a name="ln616">		case SCSI_PAGE_REFERRALS:</a>
+<a name="ln617">			ERROR(&quot;VPD AHCI page %d not yet implemented!\n&quot;,</a>
+<a name="ln618">				cmd-&gt;page_code);</a>
+<a name="ln619">			//request-&gt;subsys_status = SCSI_REQ_CMP;</a>
+<a name="ln620">			request-&gt;subsys_status = SCSI_REQ_ABORTED;</a>
+<a name="ln621">			return;</a>
+<a name="ln622">		default:</a>
+<a name="ln623">			ERROR(&quot;unknown VPD page code!\n&quot;);</a>
+<a name="ln624">			request-&gt;subsys_status = SCSI_REQ_ABORTED;</a>
+<a name="ln625">			return;</a>
+<a name="ln626">	}</a>
+<a name="ln627"> </a>
+<a name="ln628">	if (transactionResult &lt; B_OK) {</a>
+<a name="ln629">		request-&gt;subsys_status = SCSI_DATA_RUN_ERR;</a>
+<a name="ln630">	} else {</a>
+<a name="ln631">		request-&gt;subsys_status = SCSI_REQ_CMP;</a>
+<a name="ln632">		request-&gt;data_resid = request-&gt;data_length</a>
+<a name="ln633">			- vpdDataLength;</a>
+<a name="ln634">	}</a>
+<a name="ln635">}</a>
+<a name="ln636"> </a>
+<a name="ln637"> </a>
+<a name="ln638">void</a>
+<a name="ln639">AHCIPort::ScsiInquiry(scsi_ccb* request)</a>
+<a name="ln640">{</a>
+<a name="ln641">	TRACE(&quot;AHCIPort::ScsiInquiry port %d\n&quot;, fIndex);</a>
+<a name="ln642"> </a>
+<a name="ln643">	const scsi_cmd_inquiry* cmd = (const scsi_cmd_inquiry*)request-&gt;cdb;</a>
+<a name="ln644">	scsi_res_inquiry scsiData;</a>
+<a name="ln645">	ata_device_infoblock ataData;</a>
+<a name="ln646"> </a>
+<a name="ln647">	ASSERT(sizeof(ataData) == 512);</a>
+<a name="ln648"> </a>
+<a name="ln649">	if (cmd-&gt;evpd) {</a>
+<a name="ln650">		TRACE(&quot;VPD inquiry page 0x%X\n&quot;, cmd-&gt;page_code);</a>
+<a name="ln651">		if (!request-&gt;data || request-&gt;data_length == 0) {</a>
+<a name="ln652">			ERROR(&quot;invalid VPD request\n&quot;);</a>
+<a name="ln653">			request-&gt;subsys_status = SCSI_REQ_ABORTED;</a>
+<a name="ln654">			gSCSI-&gt;finished(request, 1);</a>
+<a name="ln655">			return;</a>
+<a name="ln656">		}</a>
+<a name="ln657">	} else if (cmd-&gt;page_code) {</a>
+<a name="ln658">		// page_code without evpd is invalid per SCSI spec</a>
+<a name="ln659">		ERROR(&quot;page code 0x%X on non-VPD request\n&quot;, cmd-&gt;page_code);</a>
+<a name="ln660">		request-&gt;subsys_status = SCSI_REQ_ABORTED;</a>
+<a name="ln661">		request-&gt;device_status = SCSI_STATUS_CHECK_CONDITION;</a>
+<a name="ln662">		// TODO: Sense ILLEGAL REQUEST + INVALID FIELD IN CDB?</a>
+<a name="ln663">		gSCSI-&gt;finished(request, 1);</a>
+<a name="ln664">		return;</a>
+<a name="ln665">	} else if (request-&gt;data_length &lt; INQUIRY_BASE_LENGTH) {</a>
+<a name="ln666">		ERROR(&quot;invalid request %&quot; B_PRIu32 &quot;\n&quot;, request-&gt;data_length);</a>
+<a name="ln667">		request-&gt;subsys_status = SCSI_REQ_ABORTED;</a>
+<a name="ln668">		gSCSI-&gt;finished(request, 1);</a>
+<a name="ln669">		return;</a>
+<a name="ln670">	}</a>
+<a name="ln671"> </a>
+<a name="ln672">	sata_request sreq;</a>
+<a name="ln673">	sreq.SetData(&amp;ataData, sizeof(ataData));</a>
+<a name="ln674">	sreq.SetATACommand(fIsATAPI</a>
+<a name="ln675">		? ATA_COMMAND_IDENTIFY_PACKET_DEVICE : ATA_COMMAND_IDENTIFY_DEVICE);</a>
+<a name="ln676">	ExecuteSataRequest(&amp;sreq);</a>
+<a name="ln677">	sreq.WaitForCompletion();</a>
+<a name="ln678"> </a>
+<a name="ln679">	if ((sreq.CompletionStatus() &amp; ATA_STATUS_ERROR) != 0) {</a>
+<a name="ln680">		ERROR(&quot;identify device failed\n&quot;);</a>
+<a name="ln681">		request-&gt;subsys_status = SCSI_REQ_CMP_ERR;</a>
+<a name="ln682">		gSCSI-&gt;finished(request, 1);</a>
+<a name="ln683">		return;</a>
+<a name="ln684">	}</a>
+<a name="ln685"> </a>
+<a name="ln686">	if (cmd-&gt;evpd) {</a>
+<a name="ln687">		// Simulate SCSI VPD data.</a>
+<a name="ln688">		ScsiVPDInquiry(request, &amp;ataData);</a>
+<a name="ln689">		gSCSI-&gt;finished(request, 1);</a>
+<a name="ln690">		return;</a>
+<a name="ln691">	}</a>
+<a name="ln692"> </a>
+<a name="ln693">/*</a>
+<a name="ln694">	uint8* data = (uint8*)&amp;ataData;</a>
+<a name="ln695">	for (int i = 0; i &lt; 512; i += 8) {</a>
+<a name="ln696">		TRACE(&quot;  %02x %02x %02x %02x %02x %02x %02x %02x\n&quot;, data[i], data[i+1],</a>
+<a name="ln697">			data[i+2], data[i+3], data[i+4], data[i+5], data[i+6], data[i+7]);</a>
+<a name="ln698">	}</a>
+<a name="ln699">*/</a>
+<a name="ln700"> </a>
+<a name="ln701">	scsiData.device_type = fIsATAPI</a>
+<a name="ln702">		? ataData.word_0.atapi.command_packet_set : scsi_dev_direct_access;</a>
+<a name="ln703">	scsiData.device_qualifier = scsi_periph_qual_connected;</a>
+<a name="ln704">	scsiData.device_type_modifier = 0;</a>
+<a name="ln705">	scsiData.removable_medium = ataData.word_0.ata.removable_media_device;</a>
+<a name="ln706">	scsiData.ansi_version = 2;</a>
+<a name="ln707">	scsiData.ecma_version = 0;</a>
+<a name="ln708">	scsiData.iso_version = 0;</a>
+<a name="ln709">	scsiData.response_data_format = 2;</a>
+<a name="ln710">	scsiData.term_iop = false;</a>
+<a name="ln711">	scsiData.additional_length = sizeof(scsi_res_inquiry) - 4;</a>
+<a name="ln712">	scsiData.soft_reset = false;</a>
+<a name="ln713">	scsiData.cmd_queue = false;</a>
+<a name="ln714">	scsiData.linked = false;</a>
+<a name="ln715">	scsiData.sync = false;</a>
+<a name="ln716">	scsiData.write_bus16 = true;</a>
+<a name="ln717">	scsiData.write_bus32 = false;</a>
+<a name="ln718">	scsiData.relative_address = false;</a>
+<a name="ln719"> </a>
+<a name="ln720">	if (!fIsATAPI) {</a>
+<a name="ln721">		fSectorCount = ataData.SectorCount(fUse48BitCommands, true);</a>
+<a name="ln722">		fSectorSize = ataData.SectorSize();</a>
+<a name="ln723">		fTrimSupported = ataData.data_set_management_support;</a>
+<a name="ln724">		fMaxTrimRangeBlocks = B_LENDIAN_TO_HOST_INT16(</a>
+<a name="ln725">			ataData.max_data_set_management_lba_range_blocks);</a>
+<a name="ln726">		TRACE(&quot;lba %d, lba48 %d, fUse48BitCommands %d, sectors %&quot; B_PRIu32</a>
+<a name="ln727">			&quot;, sectors48 %&quot; B_PRIu64 &quot;, size %&quot; B_PRIu64 &quot;\n&quot;,</a>
+<a name="ln728">			ataData.dma_supported != 0, ataData.lba48_supported != 0,</a>
+<a name="ln729">			fUse48BitCommands, ataData.lba_sector_count,</a>
+<a name="ln730">			ataData.lba48_sector_count, fSectorCount * fSectorSize);</a>
+<a name="ln731">		if (fTrimSupported) {</a>
+<a name="ln732">			if (fMaxTrimRangeBlocks == 0)</a>
+<a name="ln733">				fMaxTrimRangeBlocks = 1;</a>
+<a name="ln734"> </a>
+<a name="ln735">			#ifdef TRACE_AHCI</a>
+<a name="ln736">			bool deterministic = ataData.supports_deterministic_read_after_trim;</a>
+<a name="ln737">			TRACE(&quot;trim supported, %&quot; B_PRIu32 &quot; ranges blocks, reads are &quot;</a>
+<a name="ln738">				&quot;%sdeterministic%s.\n&quot;, fMaxTrimRangeBlocks,</a>
+<a name="ln739">				deterministic ? &quot;&quot; : &quot;non-&quot;, deterministic</a>
+<a name="ln740">					? (ataData.supports_read_zero_after_trim</a>
+<a name="ln741">						? &quot;, zero&quot; : &quot;, random&quot;) : &quot;&quot;);</a>
+<a name="ln742">			#endif</a>
+<a name="ln743">		}</a>
+<a name="ln744">	}</a>
+<a name="ln745"> </a>
+<a name="ln746">#if 0</a>
+<a name="ln747">	if (fSectorCount &lt; 0x0fffffff) {</a>
+<a name="ln748">		TRACE(&quot;disabling 48 bit commands\n&quot;);</a>
+<a name="ln749">		fUse48BitCommands = 0;</a>
+<a name="ln750">	}</a>
+<a name="ln751">#endif</a>
+<a name="ln752"> </a>
+<a name="ln753">	char modelNumber[sizeof(ataData.model_number) + 1];</a>
+<a name="ln754">	char serialNumber[sizeof(ataData.serial_number) + 1];</a>
+<a name="ln755">	char firmwareRev[sizeof(ataData.firmware_revision) + 1];</a>
+<a name="ln756"> </a>
+<a name="ln757">	strlcpy(modelNumber, ataData.model_number, sizeof(modelNumber));</a>
+<a name="ln758">	strlcpy(serialNumber, ataData.serial_number, sizeof(serialNumber));</a>
+<a name="ln759">	strlcpy(firmwareRev, ataData.firmware_revision, sizeof(firmwareRev));</a>
+<a name="ln760"> </a>
+<a name="ln761">	swap_words(modelNumber, sizeof(modelNumber) - 1);</a>
+<a name="ln762">	swap_words(serialNumber, sizeof(serialNumber) - 1);</a>
+<a name="ln763">	swap_words(firmwareRev, sizeof(firmwareRev) - 1);</a>
+<a name="ln764"> </a>
+<a name="ln765">	TRACE(&quot;model number: %s\n&quot;, modelNumber);</a>
+<a name="ln766">	TRACE(&quot;serial number: %s\n&quot;, serialNumber);</a>
+<a name="ln767">	TRACE(&quot;firmware rev.: %s\n&quot;, firmwareRev);</a>
+<a name="ln768"> </a>
+<a name="ln769">	// There's not enough space to fit all of the data in. ATA has 40 bytes for</a>
+<a name="ln770">	// the model number, 20 for the serial number and another 8 for the</a>
+<a name="ln771">	// firmware revision. SCSI has room for 8 for vendor ident, 16 for product</a>
+<a name="ln772">	// ident and another 4 for product revision.</a>
+<a name="ln773">	size_t vendorLen = strcspn(modelNumber, &quot; &quot;);</a>
+<a name="ln774">	if (vendorLen &gt;= sizeof(scsiData.vendor_ident))</a>
+<a name="ln775">		vendorLen = strcspn(modelNumber, &quot;-&quot;);</a>
+<a name="ln776">	if (vendorLen &lt; sizeof(scsiData.vendor_ident)) {</a>
+<a name="ln777">		// First we try to break things apart smartly.</a>
+<a name="ln778">		snprintf(scsiData.vendor_ident, vendorLen + 1, &quot;%s&quot;, modelNumber);</a>
+<a name="ln779">		size_t modelRemain = (sizeof(modelNumber) - vendorLen);</a>
+<a name="ln780">		if (modelRemain &gt; sizeof(scsiData.product_ident))</a>
+<a name="ln781">			modelRemain = sizeof(scsiData.product_ident);</a>
+<a name="ln782">		memcpy(scsiData.product_ident, modelNumber + (vendorLen + 1),</a>
+<a name="ln783">			modelRemain);</a>
+<a name="ln784">	} else {</a>
+<a name="ln785">		// If we're unable to smartly break apart the vendor and model, just</a>
+<a name="ln786">		// dumbly squeeze as much in as possible.</a>
+<a name="ln787">		memcpy(scsiData.vendor_ident, modelNumber, sizeof(scsiData.vendor_ident));</a>
+<a name="ln788">		memcpy(scsiData.product_ident, modelNumber + 8,</a>
+<a name="ln789">			sizeof(scsiData.product_ident));</a>
+<a name="ln790">	}</a>
+<a name="ln791">	// Take the last 4 digits of the serial number as product rev</a>
+<a name="ln792">	size_t serialLen = sizeof(scsiData.product_rev);</a>
+<a name="ln793">	size_t serialOff = sizeof(serialNumber) - serialLen;</a>
+<a name="ln794">	memcpy(scsiData.product_rev, serialNumber + serialOff, serialLen);</a>
+<a name="ln795"> </a>
+<a name="ln796">	if (sg_memcpy(request-&gt;sg_list, request-&gt;sg_count, &amp;scsiData,</a>
+<a name="ln797">			sizeof(scsiData)) &lt; B_OK) {</a>
+<a name="ln798">		request-&gt;subsys_status = SCSI_DATA_RUN_ERR;</a>
+<a name="ln799">	} else {</a>
+<a name="ln800">		request-&gt;subsys_status = SCSI_REQ_CMP;</a>
+<a name="ln801">		request-&gt;data_resid = request-&gt;data_length - sizeof(scsiData);</a>
+<a name="ln802">	}</a>
+<a name="ln803">	gSCSI-&gt;finished(request, 1);</a>
+<a name="ln804">}</a>
+<a name="ln805"> </a>
+<a name="ln806"> </a>
+<a name="ln807">void</a>
+<a name="ln808">AHCIPort::ScsiSynchronizeCache(scsi_ccb* request)</a>
+<a name="ln809">{</a>
+<a name="ln810">	//TRACE(&quot;AHCIPort::ScsiSynchronizeCache port %d\n&quot;, fIndex);</a>
+<a name="ln811"> </a>
+<a name="ln812">	sata_request* sreq = new(std::nothrow) sata_request(request);</a>
+<a name="ln813">	if (sreq == NULL) {</a>
+<a name="ln814">		ERROR(&quot;out of memory when allocating sync request\n&quot;);</a>
+<a name="ln815">		request-&gt;subsys_status = SCSI_REQ_ABORTED;</a>
+<a name="ln816">		gSCSI-&gt;finished(request, 1);</a>
+<a name="ln817">		return;</a>
+<a name="ln818">	}</a>
+<a name="ln819"> </a>
+<a name="ln820">	sreq-&gt;SetATACommand(fUse48BitCommands</a>
+<a name="ln821">		? ATA_COMMAND_FLUSH_CACHE_EXT : ATA_COMMAND_FLUSH_CACHE);</a>
+<a name="ln822">	ExecuteSataRequest(sreq);</a>
+<a name="ln823">}</a>
+<a name="ln824"> </a>
+<a name="ln825"> </a>
+<a name="ln826">void</a>
+<a name="ln827">AHCIPort::ScsiReadCapacity(scsi_ccb* request)</a>
+<a name="ln828">{</a>
+<a name="ln829">	TRACE(&quot;AHCIPort::ScsiReadCapacity port %d\n&quot;, fIndex);</a>
+<a name="ln830"> </a>
+<a name="ln831">	const scsi_cmd_read_capacity* cmd</a>
+<a name="ln832">		= (const scsi_cmd_read_capacity*)request-&gt;cdb;</a>
+<a name="ln833">	scsi_res_read_capacity scsiData;</a>
+<a name="ln834"> </a>
+<a name="ln835">	if (cmd-&gt;pmi || cmd-&gt;lba || request-&gt;data_length &lt; sizeof(scsiData)) {</a>
+<a name="ln836">		TRACE(&quot;invalid request\n&quot;);</a>
+<a name="ln837">		request-&gt;subsys_status = SCSI_REQ_ABORTED;</a>
+<a name="ln838">		gSCSI-&gt;finished(request, 1);</a>
+<a name="ln839">		return;</a>
+<a name="ln840">	}</a>
+<a name="ln841"> </a>
+<a name="ln842">	TRACE(&quot;SectorSize %&quot; B_PRIu32 &quot;, SectorCount 0x%&quot; B_PRIx64 &quot;\n&quot;,</a>
+<a name="ln843">		fSectorSize, fSectorCount);</a>
+<a name="ln844"> </a>
+<a name="ln845">	scsiData.block_size = B_HOST_TO_BENDIAN_INT32(fSectorSize);</a>
+<a name="ln846"> </a>
+<a name="ln847">	if (fSectorCount &lt;= 0xffffffff)</a>
+<a name="ln848">		scsiData.lba = B_HOST_TO_BENDIAN_INT32(fSectorCount - 1);</a>
+<a name="ln849">	else</a>
+<a name="ln850">		scsiData.lba = 0xffffffff;</a>
+<a name="ln851"> </a>
+<a name="ln852">	if (sg_memcpy(request-&gt;sg_list, request-&gt;sg_count, &amp;scsiData,</a>
+<a name="ln853">			sizeof(scsiData)) &lt; B_OK) {</a>
+<a name="ln854">		request-&gt;subsys_status = SCSI_DATA_RUN_ERR;</a>
+<a name="ln855">	} else {</a>
+<a name="ln856">		request-&gt;subsys_status = SCSI_REQ_CMP;</a>
+<a name="ln857">		request-&gt;data_resid = request-&gt;data_length - sizeof(scsiData);</a>
+<a name="ln858">	}</a>
+<a name="ln859">	gSCSI-&gt;finished(request, 1);</a>
+<a name="ln860">}</a>
+<a name="ln861"> </a>
+<a name="ln862"> </a>
+<a name="ln863">void</a>
+<a name="ln864">AHCIPort::ScsiReadCapacity16(scsi_ccb* request)</a>
+<a name="ln865">{</a>
+<a name="ln866">	TRACE(&quot;AHCIPort::ScsiReadCapacity16 port %d\n&quot;, fIndex);</a>
+<a name="ln867"> </a>
+<a name="ln868">	scsi_res_read_capacity_long scsiData;</a>
+<a name="ln869"> </a>
+<a name="ln870">	TRACE(&quot;SectorSize %&quot; B_PRIu32 &quot;, SectorCount 0x%&quot; B_PRIx64 &quot;\n&quot;,</a>
+<a name="ln871">		fSectorSize, fSectorCount);</a>
+<a name="ln872"> </a>
+<a name="ln873">	scsiData.block_size = B_HOST_TO_BENDIAN_INT32(fSectorSize);</a>
+<a name="ln874">	scsiData.lba = B_HOST_TO_BENDIAN_INT64(fSectorCount - 1);</a>
+<a name="ln875"> </a>
+<a name="ln876">	if (sg_memcpy(request-&gt;sg_list, request-&gt;sg_count, &amp;scsiData,</a>
+<a name="ln877">			sizeof(scsiData)) &lt; B_OK) {</a>
+<a name="ln878">		request-&gt;subsys_status = SCSI_DATA_RUN_ERR;</a>
+<a name="ln879">	} else {</a>
+<a name="ln880">		request-&gt;subsys_status = SCSI_REQ_CMP;</a>
+<a name="ln881">		request-&gt;data_resid = request-&gt;data_length - sizeof(scsiData);</a>
+<a name="ln882">	}</a>
+<a name="ln883">	gSCSI-&gt;finished(request, 1);</a>
+<a name="ln884">}</a>
+<a name="ln885"> </a>
+<a name="ln886"> </a>
+<a name="ln887">void</a>
+<a name="ln888">AHCIPort::ScsiReadWrite(scsi_ccb* request, uint64 lba, size_t sectorCount,</a>
+<a name="ln889">	bool isWrite)</a>
+<a name="ln890">{</a>
+<a name="ln891">	RWTRACE(&quot;[%lld] %ld ScsiReadWrite: position %llu, size %lu, isWrite %d\n&quot;,</a>
+<a name="ln892">		system_time(), find_thread(NULL), lba * 512, sectorCount * 512,</a>
+<a name="ln893">		isWrite);</a>
+<a name="ln894"> </a>
+<a name="ln895">#if 0</a>
+<a name="ln896">	if (isWrite) {</a>
+<a name="ln897">		TRACE(&quot;write request ignored\n&quot;);</a>
+<a name="ln898">		request-&gt;subsys_status = SCSI_REQ_CMP;</a>
+<a name="ln899">		request-&gt;data_resid = 0;</a>
+<a name="ln900">		gSCSI-&gt;finished(request, 1);</a>
+<a name="ln901">		return;</a>
+<a name="ln902">	}</a>
+<a name="ln903">#endif</a>
+<a name="ln904"> </a>
+<a name="ln905">	ASSERT(request-&gt;data_length == sectorCount * 512);</a>
+<a name="ln906">	sata_request* sreq = new(std::nothrow) sata_request(request);</a>
+<a name="ln907">	if (sreq == NULL) {</a>
+<a name="ln908">		TRACE(&quot;out of memory when allocating read/write request\n&quot;);</a>
+<a name="ln909">		request-&gt;subsys_status = SCSI_REQ_ABORTED;</a>
+<a name="ln910">		gSCSI-&gt;finished(request, 1);</a>
+<a name="ln911">		return;</a>
+<a name="ln912">	}</a>
+<a name="ln913"> </a>
+<a name="ln914">	if (fUse48BitCommands) {</a>
+<a name="ln915">		if (sectorCount &gt; 65536) {</a>
+<a name="ln916">			panic(&quot;ahci: ScsiReadWrite length too large, %lu sectors&quot;,</a>
+<a name="ln917">				sectorCount);</a>
+<a name="ln918">		}</a>
+<a name="ln919">		if (lba &gt; MAX_SECTOR_LBA_48)</a>
+<a name="ln920">			panic(&quot;achi: ScsiReadWrite position too large for 48-bit LBA\n&quot;);</a>
+<a name="ln921">		sreq-&gt;SetATA48Command(</a>
+<a name="ln922">			isWrite ? ATA_COMMAND_WRITE_DMA_EXT : ATA_COMMAND_READ_DMA_EXT,</a>
+<a name="ln923">			lba, sectorCount);</a>
+<a name="ln924">	} else {</a>
+<a name="ln925">		if (sectorCount &gt; 256) {</a>
+<a name="ln926">			panic(&quot;ahci: ScsiReadWrite length too large, %lu sectors&quot;,</a>
+<a name="ln927">				sectorCount);</a>
+<a name="ln928">		}</a>
+<a name="ln929">		if (lba &gt; MAX_SECTOR_LBA_28)</a>
+<a name="ln930">			panic(&quot;achi: ScsiReadWrite position too large for normal LBA\n&quot;);</a>
+<a name="ln931">		sreq-&gt;SetATA28Command(isWrite</a>
+<a name="ln932">			? ATA_COMMAND_WRITE_DMA : ATA_COMMAND_READ_DMA, lba, sectorCount);</a>
+<a name="ln933">	}</a>
+<a name="ln934"> </a>
+<a name="ln935">	ExecuteSataRequest(sreq, isWrite);</a>
+<a name="ln936">}</a>
+<a name="ln937"> </a>
+<a name="ln938"> </a>
+<a name="ln939">void</a>
+<a name="ln940">AHCIPort::ScsiUnmap(scsi_ccb* request, scsi_unmap_parameter_list* unmapBlocks)</a>
+<a name="ln941">{</a>
+<a name="ln942">	// Determine how many blocks are supposed to be trimmed in total</a>
+<a name="ln943">	uint32 scsiRangeCount = B_BENDIAN_TO_HOST_INT16(</a>
+<a name="ln944">		unmapBlocks-&gt;block_data_length) / sizeof(scsi_unmap_block_descriptor);</a>
+<a name="ln945"> </a>
+<a name="ln946">dprintf(&quot;TRIM SCSI:\n&quot;);</a>
+<a name="ln947">for (uint32 i = 0; i &lt; scsiRangeCount; i++) {</a>
+<a name="ln948">	dprintf(&quot;[%3&quot; B_PRIu32 &quot;] %&quot; B_PRIu64 &quot; : %&quot; B_PRIu32 &quot;\n&quot;, i,</a>
+<a name="ln949">		(uint64)B_BENDIAN_TO_HOST_INT64(unmapBlocks-&gt;blocks[i].lba),</a>
+<a name="ln950">		(uint32)B_BENDIAN_TO_HOST_INT32(unmapBlocks-&gt;blocks[i].block_count));</a>
+<a name="ln951">}</a>
+<a name="ln952"> </a>
+<a name="ln953">	uint32 scsiIndex = 0;</a>
+<a name="ln954">	uint32 scsiLastBlocks = 0;</a>
+<a name="ln955">	uint32 maxLBARangeCount = fMaxTrimRangeBlocks * 512 / 8;</a>
+<a name="ln956">		// 512 bytes per range block, 8 bytes per range</a>
+<a name="ln957"> </a>
+<a name="ln958">	// Split the SCSI ranges into ATA ranges as large as allowed.</a>
+<a name="ln959">	// We assume that the SCSI unmap ranges cannot be merged together</a>
+<a name="ln960"> </a>
+<a name="ln961">	while (scsiIndex &lt; scsiRangeCount) {</a>
+<a name="ln962">		// Determine how many LBA ranges we need for the next chunk</a>
+<a name="ln963">		uint32 lbaRangeCount = 0;</a>
+<a name="ln964">		for (uint32 i = scsiIndex; i &lt; scsiRangeCount; i++) {</a>
+<a name="ln965">			uint32 scsiBlocks = B_BENDIAN_TO_HOST_INT32(</a>
+<a name="ln966">				unmapBlocks-&gt;blocks[i].block_count);</a>
+<a name="ln967">			if (scsiBlocks == 0)</a>
+<a name="ln968">				break;</a>
+<a name="ln969">			if (i == scsiIndex)</a>
+<a name="ln970">				scsiBlocks -= scsiLastBlocks;</a>
+<a name="ln971"> </a>
+<a name="ln972">			lbaRangeCount += (scsiBlocks + 65534) / 65535;</a>
+<a name="ln973">			if (lbaRangeCount &gt;= maxLBARangeCount) {</a>
+<a name="ln974">				lbaRangeCount = maxLBARangeCount;</a>
+<a name="ln975">				break;</a>
+<a name="ln976">			}</a>
+<a name="ln977">		}</a>
+<a name="ln978">		if (lbaRangeCount == 0)</a>
+<a name="ln979">			break;</a>
+<a name="ln980"> </a>
+<a name="ln981">		uint32 lbaRangesSize = lbaRangeCount * sizeof(uint64);</a>
+<a name="ln982">		uint64* lbaRanges = (uint64*)malloc(lbaRangesSize);</a>
+<a name="ln983">		if (lbaRanges == NULL) {</a>
+<a name="ln984">			ERROR(&quot;out of memory when allocating %&quot; B_PRIu32 &quot; unmap ranges\n&quot;,</a>
+<a name="ln985">				lbaRangeCount);</a>
+<a name="ln986">			request-&gt;subsys_status = SCSI_REQ_ABORTED;</a>
+<a name="ln987">			gSCSI-&gt;finished(request, 1);</a>
+<a name="ln988">			return;</a>
+<a name="ln989">		}</a>
+<a name="ln990"> </a>
+<a name="ln991">		MemoryDeleter deleter(lbaRanges);</a>
+<a name="ln992"> </a>
+<a name="ln993">		for (uint32 lbaIndex = 0;</a>
+<a name="ln994">				scsiIndex &lt; scsiRangeCount &amp;&amp; lbaIndex &lt; lbaRangeCount;) {</a>
+<a name="ln995">			uint64 scsiOffset = B_BENDIAN_TO_HOST_INT64(</a>
+<a name="ln996">				unmapBlocks-&gt;blocks[scsiIndex].lba) + scsiLastBlocks;</a>
+<a name="ln997">			uint32 scsiBlocksLeft = B_BENDIAN_TO_HOST_INT32(</a>
+<a name="ln998">				unmapBlocks-&gt;blocks[scsiIndex].block_count) - scsiLastBlocks;</a>
+<a name="ln999"> </a>
+<a name="ln1000">			if (scsiBlocksLeft == 0) {</a>
+<a name="ln1001">				// Ignore the rest of the ranges (they are empty)</a>
+<a name="ln1002">				scsiIndex = scsiRangeCount;</a>
+<a name="ln1003">				break;</a>
+<a name="ln1004">			}</a>
+<a name="ln1005"> </a>
+<a name="ln1006">			while (scsiBlocksLeft &gt; 0 &amp;&amp; lbaIndex &lt; lbaRangeCount) {</a>
+<a name="ln1007">				uint16 blocks = scsiBlocksLeft &gt; 65535</a>
+<a name="ln1008">					? 65535 : (uint16)scsiBlocksLeft;</a>
+<a name="ln1009">				lbaRanges[lbaIndex++] = B_HOST_TO_LENDIAN_INT64(</a>
+<a name="ln1010">					((uint64)blocks &lt;&lt; 48) | scsiOffset);</a>
+<a name="ln1011"> </a>
+<a name="ln1012">				scsiOffset += blocks;</a>
+<a name="ln1013">				scsiLastBlocks += blocks;</a>
+<a name="ln1014">				scsiBlocksLeft -= blocks;</a>
+<a name="ln1015">			}</a>
+<a name="ln1016"> </a>
+<a name="ln1017">			if (scsiBlocksLeft == 0) {</a>
+<a name="ln1018">				scsiLastBlocks = 0;</a>
+<a name="ln1019">				scsiIndex++;</a>
+<a name="ln1020">			}</a>
+<a name="ln1021">		}</a>
+<a name="ln1022"> </a>
+<a name="ln1023">dprintf(&quot;TRIM AHCI:\n&quot;);</a>
+<a name="ln1024">for (uint32 i = 0; i &lt; lbaRangeCount; i++) {</a>
+<a name="ln1025">	uint64 value = B_HOST_TO_LENDIAN_INT64(lbaRanges[i]);</a>
+<a name="ln1026">	dprintf(&quot;[%3&quot; B_PRIu32 &quot;] %&quot; B_PRIu64 &quot; : %&quot; B_PRIu64 &quot;\n&quot;, i,</a>
+<a name="ln1027">		value &amp; (((uint64)1 &lt;&lt; 48) - 1), value &gt;&gt; 48);</a>
+<a name="ln1028">}</a>
+<a name="ln1029"> </a>
+<a name="ln1030">		sata_request sreq;</a>
+<a name="ln1031">		sreq.SetATA48Command(ATA_COMMAND_DATA_SET_MANAGEMENT, 0,</a>
+<a name="ln1032">			(lbaRangesSize + 511) / 512);</a>
+<a name="ln1033">		sreq.SetFeature(1);</a>
+<a name="ln1034">		sreq.SetData(lbaRanges, lbaRangesSize);</a>
+<a name="ln1035"> </a>
+<a name="ln1036">		ExecuteSataRequest(&amp;sreq);</a>
+<a name="ln1037">		sreq.WaitForCompletion();</a>
+<a name="ln1038"> </a>
+<a name="ln1039">		if ((sreq.CompletionStatus() &amp; ATA_STATUS_ERROR) != 0) {</a>
+<a name="ln1040">			ERROR(&quot;trim failed (%&quot; B_PRIu32 &quot; ranges)!\n&quot;, lbaRangeCount);</a>
+<a name="ln1041">			request-&gt;subsys_status = SCSI_REQ_CMP_ERR;</a>
+<a name="ln1042">		} else</a>
+<a name="ln1043">			request-&gt;subsys_status = SCSI_REQ_CMP;</a>
+<a name="ln1044">	}</a>
+<a name="ln1045"> </a>
+<a name="ln1046">	request-&gt;data_resid = 0;</a>
+<a name="ln1047">	request-&gt;device_status = SCSI_STATUS_GOOD;</a>
+<a name="ln1048">	gSCSI-&gt;finished(request, 1);</a>
+<a name="ln1049">}</a>
+<a name="ln1050"> </a>
+<a name="ln1051"> </a>
+<a name="ln1052">void</a>
+<a name="ln1053">AHCIPort::ExecuteSataRequest(sata_request* request, bool isWrite)</a>
+<a name="ln1054">{</a>
+<a name="ln1055">	FLOW(&quot;ExecuteAtaRequest port %d\n&quot;, fIndex);</a>
+<a name="ln1056"> </a>
+<a name="ln1057">	StartTransfer();</a>
+<a name="ln1058"> </a>
+<a name="ln1059">	int prdEntrys;</a>
+<a name="ln1060"> </a>
+<a name="ln1061">	if (request-&gt;CCB() &amp;&amp; request-&gt;CCB()-&gt;data_length) {</a>
+<a name="ln1062">		FillPrdTable(fPRDTable, &amp;prdEntrys, PRD_TABLE_ENTRY_COUNT,</a>
+<a name="ln1063">			request-&gt;CCB()-&gt;sg_list, request-&gt;CCB()-&gt;sg_count,</a>
+<a name="ln1064">			request-&gt;CCB()-&gt;data_length);</a>
+<a name="ln1065">	} else if (request-&gt;Data() &amp;&amp; request-&gt;Size()) {</a>
+<a name="ln1066">		FillPrdTable(fPRDTable, &amp;prdEntrys, PRD_TABLE_ENTRY_COUNT,</a>
+<a name="ln1067">			request-&gt;Data(), request-&gt;Size());</a>
+<a name="ln1068">	} else</a>
+<a name="ln1069">		prdEntrys = 0;</a>
+<a name="ln1070"> </a>
+<a name="ln1071">	FLOW(&quot;prdEntrys %d\n&quot;, prdEntrys);</a>
+<a name="ln1072"> </a>
+<a name="ln1073">	fCommandList-&gt;prdtl_flags_cfl = 0;</a>
+<a name="ln1074">	fCommandList-&gt;cfl = 5; // 20 bytes, length in DWORDS</a>
+<a name="ln1075">	memcpy((char*)fCommandTable-&gt;cfis, request-&gt;FIS(), 20);</a>
+<a name="ln1076"> </a>
+<a name="ln1077">	// We some hide messages when the test unit ready active is clear</a>
+<a name="ln1078">	// as empty removeable media resets constantly.</a>
+<a name="ln1079">	fTestUnitReadyActive = request-&gt;IsTestUnitReady();</a>
+<a name="ln1080"> </a>
+<a name="ln1081">	if (request-&gt;IsATAPI()) {</a>
+<a name="ln1082">		// ATAPI PACKET is a 12 or 16 byte SCSI command</a>
+<a name="ln1083">		memset((char*)fCommandTable-&gt;acmd, 0, 32);</a>
+<a name="ln1084">		memcpy((char*)fCommandTable-&gt;acmd, request-&gt;CCB()-&gt;cdb,</a>
+<a name="ln1085">			request-&gt;CCB()-&gt;cdb_length);</a>
+<a name="ln1086">		fCommandList-&gt;a = 1;</a>
+<a name="ln1087">	}</a>
+<a name="ln1088"> </a>
+<a name="ln1089">	if (isWrite)</a>
+<a name="ln1090">		fCommandList-&gt;w = 1;</a>
+<a name="ln1091">	fCommandList-&gt;prdtl = prdEntrys;</a>
+<a name="ln1092">	fCommandList-&gt;prdbc = 0;</a>
+<a name="ln1093"> </a>
+<a name="ln1094">	if (wait_until_clear(&amp;fRegs-&gt;tfd, ATA_STATUS_BUSY | ATA_STATUS_DATA_REQUEST,</a>
+<a name="ln1095">			1000000) &lt; B_OK) {</a>
+<a name="ln1096">		ERROR(&quot;ExecuteAtaRequest port %d: device is busy\n&quot;, fIndex);</a>
+<a name="ln1097">		PortReset();</a>
+<a name="ln1098">		FinishTransfer();</a>
+<a name="ln1099">		request-&gt;Abort();</a>
+<a name="ln1100">		return;</a>
+<a name="ln1101">	}</a>
+<a name="ln1102"> </a>
+<a name="ln1103">	cpu_status cpu = disable_interrupts();</a>
+<a name="ln1104">	acquire_spinlock(&amp;fSpinlock);</a>
+<a name="ln1105">	fCommandsActive |= 1;</a>
+<a name="ln1106">	fRegs-&gt;ci = 1;</a>
+<a name="ln1107">	FlushPostedWrites();</a>
+<a name="ln1108">	release_spinlock(&amp;fSpinlock);</a>
+<a name="ln1109">	restore_interrupts(cpu);</a>
+<a name="ln1110"> </a>
+<a name="ln1111">	int tfd;</a>
+<a name="ln1112">	status_t status = WaitForTransfer(&amp;tfd, 20000000);</a>
+<a name="ln1113"> </a>
+<a name="ln1114">	FLOW(&quot;Port %d sata request flow:\n&quot;, fIndex);</a>
+<a name="ln1115">	FLOW(&quot;  tfd %#x\n&quot;, tfd);</a>
+<a name="ln1116">	FLOW(&quot;  prdbc %ld\n&quot;, fCommandList-&gt;prdbc);</a>
+<a name="ln1117">	FLOW(&quot;  ci   0x%08&quot; B_PRIx32 &quot;\n&quot;, fRegs-&gt;ci);</a>
+<a name="ln1118">	FLOW(&quot;  is   0x%08&quot; B_PRIx32 &quot;\n&quot;, fRegs-&gt;is);</a>
+<a name="ln1119">	FLOW(&quot;  serr 0x%08&quot; B_PRIx32 &quot;\n&quot;, fRegs-&gt;serr);</a>
+<a name="ln1120"> </a>
+<a name="ln1121">/*</a>
+<a name="ln1122">	TRACE(&quot;ci   0x%08&quot; B_PRIx32 &quot;\n&quot;, fRegs-&gt;ci);</a>
+<a name="ln1123">	TRACE(&quot;ie   0x%08&quot; B_PRIx32 &quot;\n&quot;, fRegs-&gt;ie);</a>
+<a name="ln1124">	TRACE(&quot;is   0x%08&quot; B_PRIx32 &quot;\n&quot;, fRegs-&gt;is);</a>
+<a name="ln1125">	TRACE(&quot;cmd  0x%08&quot; B_PRIx32 &quot;\n&quot;, fRegs-&gt;cmd);</a>
+<a name="ln1126">	TRACE(&quot;ssts 0x%08&quot; B_PRIx32 &quot;\n&quot;, fRegs-&gt;ssts);</a>
+<a name="ln1127">	TRACE(&quot;sctl 0x%08&quot; B_PRIx32 &quot;\n&quot;, fRegs-&gt;sctl);</a>
+<a name="ln1128">	TRACE(&quot;serr 0x%08&quot; B_PRIx32 &quot;\n&quot;, fRegs-&gt;serr);</a>
+<a name="ln1129">	TRACE(&quot;sact 0x%08&quot; B_PRIx32 &quot;\n&quot;, fRegs-&gt;sact);</a>
+<a name="ln1130">	TRACE(&quot;tfd  0x%08&quot; B_PRIx32 &quot;\n&quot;, fRegs-&gt;tfd);</a>
+<a name="ln1131">*/</a>
+<a name="ln1132"> </a>
+<a name="ln1133">	if (fPortReset || status == B_TIMED_OUT) {</a>
+<a name="ln1134">		fPortReset = false;</a>
+<a name="ln1135">		PortReset();</a>
+<a name="ln1136">	}</a>
+<a name="ln1137"> </a>
+<a name="ln1138">	size_t bytesTransfered = fCommandList-&gt;prdbc;</a>
+<a name="ln1139"> </a>
+<a name="ln1140">	FinishTransfer();</a>
+<a name="ln1141"> </a>
+<a name="ln1142">	if (status == B_TIMED_OUT) {</a>
+<a name="ln1143">		ERROR(&quot;ExecuteAtaRequest port %d: device timeout\n&quot;, fIndex);</a>
+<a name="ln1144">		request-&gt;Abort();</a>
+<a name="ln1145">		return;</a>
+<a name="ln1146">	}</a>
+<a name="ln1147"> </a>
+<a name="ln1148">	request-&gt;Finish(tfd, bytesTransfered);</a>
+<a name="ln1149">}</a>
+<a name="ln1150"> </a>
+<a name="ln1151"> </a>
+<a name="ln1152">void</a>
+<a name="ln1153">AHCIPort::ScsiExecuteRequest(scsi_ccb* request)</a>
+<a name="ln1154">{</a>
+<a name="ln1155">//	TRACE(&quot;AHCIPort::ScsiExecuteRequest port %d, opcode 0x%02x, length %u\n&quot;, fIndex, request-&gt;cdb[0], request-&gt;cdb_length);</a>
+<a name="ln1156"> </a>
+<a name="ln1157">	if (fIsATAPI) {</a>
+<a name="ln1158">		bool isWrite = false;</a>
+<a name="ln1159">		switch (request-&gt;flags &amp; SCSI_DIR_MASK) {</a>
+<a name="ln1160">			case SCSI_DIR_NONE:</a>
+<a name="ln1161">				ASSERT(request-&gt;data_length == 0);</a>
+<a name="ln1162">				break;</a>
+<a name="ln1163">			case SCSI_DIR_IN:</a>
+<a name="ln1164">				break;</a>
+<a name="ln1165">			case SCSI_DIR_OUT:</a>
+<a name="ln1166">				isWrite = true;</a>
+<a name="ln1167">				ASSERT(request-&gt;data_length &gt; 0);</a>
+<a name="ln1168">				break;</a>
+<a name="ln1169">			default:</a>
+<a name="ln1170">				panic(&quot;CDB has invalid direction mask&quot;);</a>
+<a name="ln1171">		}</a>
+<a name="ln1172"> </a>
+<a name="ln1173">//		TRACE(&quot;AHCIPort::ScsiExecuteRequest ATAPI: port %d, opcode 0x%02x, length %u\n&quot;, fIndex, request-&gt;cdb[0], request-&gt;cdb_length);</a>
+<a name="ln1174"> </a>
+<a name="ln1175">		sata_request* sreq = new(std::nothrow) sata_request(request);</a>
+<a name="ln1176">		if (sreq == NULL) {</a>
+<a name="ln1177">			ERROR(&quot;out of memory when allocating atapi request\n&quot;);</a>
+<a name="ln1178">			request-&gt;subsys_status = SCSI_REQ_ABORTED;</a>
+<a name="ln1179">			gSCSI-&gt;finished(request, 1);</a>
+<a name="ln1180">			return;</a>
+<a name="ln1181">		}</a>
+<a name="ln1182"> </a>
+<a name="ln1183">		sreq-&gt;SetATAPICommand(request-&gt;data_length);</a>
+<a name="ln1184">//		uint8* data = (uint8*) sreq-&gt;ccb()-&gt;cdb;</a>
+<a name="ln1185">//		for (int i = 0; i &lt; 16; i += 8) {</a>
+<a name="ln1186">//			TRACE(&quot;  %02x %02x %02x %02x %02x %02x %02x %02x\n&quot;, data[i], data[i+1], data[i+2], data[i+3], data[i+4], data[i+5], data[i+6], data[i+7]);</a>
+<a name="ln1187">//		}</a>
+<a name="ln1188">		ExecuteSataRequest(sreq, isWrite);</a>
+<a name="ln1189">		return;</a>
+<a name="ln1190">	}</a>
+<a name="ln1191"> </a>
+<a name="ln1192">	if (request-&gt;cdb[0] == SCSI_OP_REQUEST_SENSE) {</a>
+<a name="ln1193">		panic(&quot;ahci: SCSI_OP_REQUEST_SENSE not yet supported\n&quot;);</a>
+<a name="ln1194">		return;</a>
+<a name="ln1195">	}</a>
+<a name="ln1196"> </a>
+<a name="ln1197">	if (!fDevicePresent) {</a>
+<a name="ln1198">		TRACE(&quot;no device present on port %d\n&quot;, fIndex);</a>
+<a name="ln1199">		request-&gt;subsys_status = SCSI_DEV_NOT_THERE;</a>
+<a name="ln1200">		gSCSI-&gt;finished(request, 1);</a>
+<a name="ln1201">		return;</a>
+<a name="ln1202">	}</a>
+<a name="ln1203"> </a>
+<a name="ln1204">	request-&gt;subsys_status = SCSI_REQ_CMP;</a>
+<a name="ln1205"> </a>
+<a name="ln1206">	switch (request-&gt;cdb[0]) {</a>
+<a name="ln1207">		case SCSI_OP_TEST_UNIT_READY:</a>
+<a name="ln1208">			ScsiTestUnitReady(request);</a>
+<a name="ln1209">			break;</a>
+<a name="ln1210">		case SCSI_OP_INQUIRY:</a>
+<a name="ln1211">			ScsiInquiry(request);</a>
+<a name="ln1212">			break;</a>
+<a name="ln1213">		case SCSI_OP_READ_CAPACITY:</a>
+<a name="ln1214">			ScsiReadCapacity(request);</a>
+<a name="ln1215">			break;</a>
+<a name="ln1216">		case SCSI_OP_SERVICE_ACTION_IN:</a>
+<a name="ln1217">			if ((request-&gt;cdb[1] &amp; 0x1f) == SCSI_SAI_READ_CAPACITY_16)</a>
+<a name="ln1218">				ScsiReadCapacity16(request);</a>
+<a name="ln1219">			else {</a>
+<a name="ln1220">				request-&gt;subsys_status = SCSI_REQ_INVALID;</a>
+<a name="ln1221">				gSCSI-&gt;finished(request, 1);</a>
+<a name="ln1222">			}</a>
+<a name="ln1223">			break;</a>
+<a name="ln1224">		case SCSI_OP_SYNCHRONIZE_CACHE:</a>
+<a name="ln1225">			ScsiSynchronizeCache(request);</a>
+<a name="ln1226">			break;</a>
+<a name="ln1227">		case SCSI_OP_READ_6:</a>
+<a name="ln1228">		case SCSI_OP_WRITE_6:</a>
+<a name="ln1229">		{</a>
+<a name="ln1230">			const scsi_cmd_rw_6* cmd = (const scsi_cmd_rw_6*)request-&gt;cdb;</a>
+<a name="ln1231">			uint32 position = ((uint32)cmd-&gt;high_lba &lt;&lt; 16)</a>
+<a name="ln1232">				| ((uint32)cmd-&gt;mid_lba &lt;&lt; 8) | (uint32)cmd-&gt;low_lba;</a>
+<a name="ln1233">			size_t length = cmd-&gt;length != 0 ? cmd-&gt;length : 256;</a>
+<a name="ln1234">			bool isWrite = request-&gt;cdb[0] == SCSI_OP_WRITE_6;</a>
+<a name="ln1235">			ScsiReadWrite(request, position, length, isWrite);</a>
+<a name="ln1236">			break;</a>
+<a name="ln1237">		}</a>
+<a name="ln1238">		case SCSI_OP_READ_10:</a>
+<a name="ln1239">		case SCSI_OP_WRITE_10:</a>
+<a name="ln1240">		{</a>
+<a name="ln1241">			const scsi_cmd_rw_10* cmd = (const scsi_cmd_rw_10*)request-&gt;cdb;</a>
+<a name="ln1242">			uint32 position = B_BENDIAN_TO_HOST_INT32(cmd-&gt;lba);</a>
+<a name="ln1243">			size_t length = B_BENDIAN_TO_HOST_INT16(cmd-&gt;length);</a>
+<a name="ln1244">			bool isWrite = request-&gt;cdb[0] == SCSI_OP_WRITE_10;</a>
+<a name="ln1245">			if (length) {</a>
+<a name="ln1246">				ScsiReadWrite(request, position, length, isWrite);</a>
+<a name="ln1247">			} else {</a>
+<a name="ln1248">				ERROR(&quot;AHCIPort::ScsiExecuteRequest error: transfer without &quot;</a>
+<a name="ln1249">					&quot;data!\n&quot;);</a>
+<a name="ln1250">				request-&gt;subsys_status = SCSI_REQ_INVALID;</a>
+<a name="ln1251">				gSCSI-&gt;finished(request, 1);</a>
+<a name="ln1252">			}</a>
+<a name="ln1253">			break;</a>
+<a name="ln1254">		}</a>
+<a name="ln1255">		case SCSI_OP_READ_12:</a>
+<a name="ln1256">		case SCSI_OP_WRITE_12:</a>
+<a name="ln1257">		{</a>
+<a name="ln1258">			const scsi_cmd_rw_12* cmd = (const scsi_cmd_rw_12*)request-&gt;cdb;</a>
+<a name="ln1259">			uint32 position = B_BENDIAN_TO_HOST_INT32(cmd-&gt;lba);</a>
+<a name="ln1260">			size_t length = B_BENDIAN_TO_HOST_INT32(cmd-&gt;length);</a>
+<a name="ln1261">			bool isWrite = request-&gt;cdb[0] == SCSI_OP_WRITE_12;</a>
+<a name="ln1262">			if (length) {</a>
+<a name="ln1263">				ScsiReadWrite(request, position, length, isWrite);</a>
+<a name="ln1264">			} else {</a>
+<a name="ln1265">				ERROR(&quot;AHCIPort::ScsiExecuteRequest error: transfer without &quot;</a>
+<a name="ln1266">					&quot;data!\n&quot;);</a>
+<a name="ln1267">				request-&gt;subsys_status = SCSI_REQ_INVALID;</a>
+<a name="ln1268">				gSCSI-&gt;finished(request, 1);</a>
+<a name="ln1269">			}</a>
+<a name="ln1270">			break;</a>
+<a name="ln1271">		}</a>
+<a name="ln1272">		case SCSI_OP_READ_16:</a>
+<a name="ln1273">		case SCSI_OP_WRITE_16:</a>
+<a name="ln1274">		{</a>
+<a name="ln1275">			const scsi_cmd_rw_16* cmd = (const scsi_cmd_rw_16*)request-&gt;cdb;</a>
+<a name="ln1276">			uint64 position = B_BENDIAN_TO_HOST_INT64(cmd-&gt;lba);</a>
+<a name="ln1277">			size_t length = B_BENDIAN_TO_HOST_INT32(cmd-&gt;length);</a>
+<a name="ln1278">			bool isWrite = request-&gt;cdb[0] == SCSI_OP_WRITE_16;</a>
+<a name="ln1279">			if (length) {</a>
+<a name="ln1280">				ScsiReadWrite(request, position, length, isWrite);</a>
+<a name="ln1281">			} else {</a>
+<a name="ln1282">				ERROR(&quot;AHCIPort::ScsiExecuteRequest error: transfer without &quot;</a>
+<a name="ln1283">					&quot;data!\n&quot;);</a>
+<a name="ln1284">				request-&gt;subsys_status = SCSI_REQ_INVALID;</a>
+<a name="ln1285">				gSCSI-&gt;finished(request, 1);</a>
+<a name="ln1286">			}</a>
+<a name="ln1287">			break;</a>
+<a name="ln1288">		}</a>
+<a name="ln1289">		case SCSI_OP_UNMAP:</a>
+<a name="ln1290">		{</a>
+<a name="ln1291">			const scsi_cmd_unmap* cmd = (const scsi_cmd_unmap*)request-&gt;cdb;</a>
+<a name="ln1292"> </a>
+<a name="ln1293">			if (!fTrimSupported) {</a>
+<a name="ln1294">				ERROR(&quot;%s port %d: unsupported request opcode 0x%02x\n&quot;,</a>
+<a name="ln1295">					__func__, fIndex, request-&gt;cdb[0]);</a>
+<a name="ln1296">				request-&gt;subsys_status = SCSI_REQ_ABORTED;</a>
+<a name="ln1297">				gSCSI-&gt;finished(request, 1);</a>
+<a name="ln1298">				break;</a>
+<a name="ln1299">			}</a>
+<a name="ln1300"> </a>
+<a name="ln1301">			scsi_unmap_parameter_list* unmapBlocks</a>
+<a name="ln1302">				= (scsi_unmap_parameter_list*)request-&gt;data;</a>
+<a name="ln1303">			if (unmapBlocks == NULL</a>
+<a name="ln1304">				|| B_BENDIAN_TO_HOST_INT16(cmd-&gt;length) != request-&gt;data_length</a>
+<a name="ln1305">				|| B_BENDIAN_TO_HOST_INT16(unmapBlocks-&gt;data_length)</a>
+<a name="ln1306">					!= request-&gt;data_length - 1) {</a>
+<a name="ln1307">				ERROR(&quot;%s port %d: invalid unmap parameter data length\n&quot;,</a>
+<a name="ln1308">					__func__, fIndex);</a>
+<a name="ln1309">				request-&gt;subsys_status = SCSI_REQ_ABORTED;</a>
+<a name="ln1310">				gSCSI-&gt;finished(request, 1);</a>
+<a name="ln1311">			} else {</a>
+<a name="ln1312">				ScsiUnmap(request, unmapBlocks);</a>
+<a name="ln1313">			}</a>
+<a name="ln1314">			break;</a>
+<a name="ln1315">		}</a>
+<a name="ln1316">		default:</a>
+<a name="ln1317">			ERROR(&quot;AHCIPort::ScsiExecuteRequest port %d unsupported request &quot;</a>
+<a name="ln1318">				&quot;opcode 0x%02x\n&quot;, fIndex, request-&gt;cdb[0]);</a>
+<a name="ln1319">			request-&gt;subsys_status = SCSI_REQ_ABORTED;</a>
+<a name="ln1320">			gSCSI-&gt;finished(request, 1);</a>
+<a name="ln1321">	}</a>
+<a name="ln1322">}</a>
+<a name="ln1323"> </a>
+<a name="ln1324"> </a>
+<a name="ln1325">uchar</a>
+<a name="ln1326">AHCIPort::ScsiAbortRequest(scsi_ccb* request)</a>
+<a name="ln1327">{</a>
+<a name="ln1328">	return SCSI_REQ_CMP;</a>
+<a name="ln1329">}</a>
+<a name="ln1330"> </a>
+<a name="ln1331"> </a>
+<a name="ln1332">uchar</a>
+<a name="ln1333">AHCIPort::ScsiTerminateRequest(scsi_ccb* request)</a>
+<a name="ln1334">{</a>
+<a name="ln1335">	return SCSI_REQ_CMP;</a>
+<a name="ln1336">}</a>
+<a name="ln1337"> </a>
+<a name="ln1338"> </a>
+<a name="ln1339">uchar</a>
+<a name="ln1340">AHCIPort::ScsiResetDevice()</a>
+<a name="ln1341">{</a>
+<a name="ln1342">	return SCSI_REQ_CMP;</a>
+<a name="ln1343">}</a>
+<a name="ln1344"> </a>
+<a name="ln1345"> </a>
+<a name="ln1346">void</a>
+<a name="ln1347">AHCIPort::ScsiGetRestrictions(bool* isATAPI, bool* noAutoSense,</a>
+<a name="ln1348">	uint32* maxBlocks)</a>
+<a name="ln1349">{</a>
+<a name="ln1350">	*isATAPI = fIsATAPI;</a>
+<a name="ln1351">	*noAutoSense = fIsATAPI; // emulated auto sense for ATA, but not ATAPI</a>
+<a name="ln1352">	*maxBlocks = fUse48BitCommands ? 65536 : 256;</a>
+<a name="ln1353">	TRACE(&quot;AHCIPort::ScsiGetRestrictions port %d: isATAPI %d, noAutoSense %d, &quot;</a>
+<a name="ln1354">		&quot;maxBlocks %&quot; B_PRIu32 &quot;\n&quot;, fIndex, *isATAPI, *noAutoSense,</a>
+<a name="ln1355">		*maxBlocks);</a>
+<a name="ln1356">}</a>
+<a name="ln1357"> </a>
+<a name="ln1358"> </a>
+<a name="ln1359">bool</a>
+<a name="ln1360">AHCIPort::Enable()</a>
+<a name="ln1361">{</a>
+<a name="ln1362">	// Spec v1.3.1, §10.3.1 Start (PxCMD.ST)</a>
+<a name="ln1363">	TRACE(&quot;%s: port %d\n&quot;, __func__, fIndex);</a>
+<a name="ln1364"> </a>
+<a name="ln1365">	if ((fRegs-&gt;cmd &amp; PORT_CMD_ST) != 0) {</a>
+<a name="ln1366">		ERROR(&quot;%s: Starting port already running!\n&quot;, __func__);</a>
+<a name="ln1367">		return false;</a>
+<a name="ln1368">	}</a>
+<a name="ln1369"> </a>
+<a name="ln1370">	if ((fRegs-&gt;cmd &amp; PORT_CMD_FRE) == 0) {</a>
+<a name="ln1371">		ERROR(&quot;%s: Unable to start port without FRE enabled!\n&quot;, __func__);</a>
+<a name="ln1372">		return false;</a>
+<a name="ln1373">	}</a>
+<a name="ln1374"> </a>
+<a name="ln1375">	// Clear DMA engine and wait for completion</a>
+<a name="ln1376">	if (wait_until_clear(&amp;fRegs-&gt;cmd, PORT_CMD_CR, 500000) &lt; B_OK) {</a>
+<a name="ln1377">		ERROR(&quot;%s: port %d error DMA engine still running\n&quot;, __func__,</a>
+<a name="ln1378">			fIndex);</a>
+<a name="ln1379">		return false;</a>
+<a name="ln1380">	}</a>
+<a name="ln1381">	// Start port</a>
+<a name="ln1382">	fRegs-&gt;cmd |= PORT_CMD_ST;</a>
+<a name="ln1383">	FlushPostedWrites();</a>
+<a name="ln1384">	return true;</a>
+<a name="ln1385">}</a>
+<a name="ln1386"> </a>
+<a name="ln1387"> </a>
+<a name="ln1388">bool</a>
+<a name="ln1389">AHCIPort::Disable()</a>
+<a name="ln1390">{</a>
+<a name="ln1391">	TRACE(&quot;%s: port %d\n&quot;, __func__, fIndex);</a>
+<a name="ln1392"> </a>
+<a name="ln1393">	if ((fRegs-&gt;cmd &amp; PORT_CMD_ST) == 0) {</a>
+<a name="ln1394">		// Port already disabled, carry on.</a>
+<a name="ln1395">		TRACE(&quot;%s: port %d attempting to disable stopped port.\n&quot;,</a>
+<a name="ln1396">			__func__, fIndex);</a>
+<a name="ln1397">	} else {</a>
+<a name="ln1398">		// Disable port</a>
+<a name="ln1399">		fRegs-&gt;cmd &amp;= ~PORT_CMD_ST;</a>
+<a name="ln1400">		FlushPostedWrites();</a>
+<a name="ln1401">	}</a>
+<a name="ln1402"> </a>
+<a name="ln1403">	// Spec v1.3.1, §10.4.2 Port Reset - assume hung after 500 mil.</a>
+<a name="ln1404">	// Clear DMA engine and wait for completion</a>
+<a name="ln1405">	if (wait_until_clear(&amp;fRegs-&gt;cmd, PORT_CMD_CR, 500000) &lt; B_OK) {</a>
+<a name="ln1406">		ERROR(&quot;%s: port %d error DMA engine still running\n&quot;, __func__,</a>
+<a name="ln1407">			fIndex);</a>
+<a name="ln1408">		return false;</a>
+<a name="ln1409">	}</a>
+<a name="ln1410"> </a>
+<a name="ln1411">	return true;</a>
+<a name="ln1412">}</a>
+<a name="ln1413"> </a>
+<a name="ln1414"> </a>
+<a name="ln1415">void</a>
+<a name="ln1416">AHCIPort::_ClearErrorRegister()</a>
+<a name="ln1417">{</a>
+<a name="ln1418">	// clear error bits</a>
+<a name="ln1419">	fRegs-&gt;serr = fRegs-&gt;serr;</a>
+<a name="ln1420">	FlushPostedWrites();</a>
+<a name="ln1421">}</a>
+
+</code></pre>
+<div class="balloon" rel="50"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fSpinlock, fMaxTrimRangeBlocks, fFIS, fCommandList, fCommandTable, fPRDTable.</p></div>
+<div class="balloon" rel="1075"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v512/" target="_blank">V512</a> A call of the 'memcpy' function will lead to underflow of the buffer 'fCommandTable->cfis'.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

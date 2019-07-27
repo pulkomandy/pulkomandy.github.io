@@ -1,0 +1,1401 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>sem.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2008-2011, Ingo Weinhold, ingo_weinhold@gmx.de.</a>
+<a name="ln3"> * Copyright 2002-2010, Axel Dörfler, axeld@pinc-software.de.</a>
+<a name="ln4"> * Distributed under the terms of the MIT License.</a>
+<a name="ln5"> *</a>
+<a name="ln6"> * Copyright 2001, Travis Geiselbrecht. All rights reserved.</a>
+<a name="ln7"> * Distributed under the terms of the NewOS License.</a>
+<a name="ln8"> */</a>
+<a name="ln9"> </a>
+<a name="ln10"> </a>
+<a name="ln11">/*! Semaphore code */</a>
+<a name="ln12"> </a>
+<a name="ln13"> </a>
+<a name="ln14">#include &lt;sem.h&gt;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &lt;stdlib.h&gt;</a>
+<a name="ln17">#include &lt;string.h&gt;</a>
+<a name="ln18"> </a>
+<a name="ln19">#include &lt;OS.h&gt;</a>
+<a name="ln20"> </a>
+<a name="ln21">#include &lt;arch/int.h&gt;</a>
+<a name="ln22">#include &lt;boot/kernel_args.h&gt;</a>
+<a name="ln23">#include &lt;cpu.h&gt;</a>
+<a name="ln24">#include &lt;debug.h&gt;</a>
+<a name="ln25">#include &lt;int.h&gt;</a>
+<a name="ln26">#include &lt;kernel.h&gt;</a>
+<a name="ln27">#include &lt;ksignal.h&gt;</a>
+<a name="ln28">#include &lt;kscheduler.h&gt;</a>
+<a name="ln29">#include &lt;listeners.h&gt;</a>
+<a name="ln30">#include &lt;scheduling_analysis.h&gt;</a>
+<a name="ln31">#include &lt;smp.h&gt;</a>
+<a name="ln32">#include &lt;syscall_restart.h&gt;</a>
+<a name="ln33">#include &lt;team.h&gt;</a>
+<a name="ln34">#include &lt;thread.h&gt;</a>
+<a name="ln35">#include &lt;util/AutoLock.h&gt;</a>
+<a name="ln36">#include &lt;util/DoublyLinkedList.h&gt;</a>
+<a name="ln37">#include &lt;vfs.h&gt;</a>
+<a name="ln38">#include &lt;vm/vm_page.h&gt;</a>
+<a name="ln39">#include &lt;wait_for_objects.h&gt;</a>
+<a name="ln40"> </a>
+<a name="ln41">#include &quot;kernel_debug_config.h&quot;</a>
+<a name="ln42"> </a>
+<a name="ln43"> </a>
+<a name="ln44">//#define TRACE_SEM</a>
+<a name="ln45">#ifdef TRACE_SEM</a>
+<a name="ln46">#	define TRACE(x) dprintf_no_syslog x</a>
+<a name="ln47">#else</a>
+<a name="ln48">#	define TRACE(x) ;</a>
+<a name="ln49">#endif</a>
+<a name="ln50"> </a>
+<a name="ln51">//#define KTRACE_SEM</a>
+<a name="ln52">#ifdef KTRACE_SEM</a>
+<a name="ln53">#	define KTRACE(x...) ktrace_printf(x)</a>
+<a name="ln54">#else</a>
+<a name="ln55">#	define KTRACE(x...) do {} while (false)</a>
+<a name="ln56">#endif</a>
+<a name="ln57"> </a>
+<a name="ln58"> </a>
+<a name="ln59">// Locking:</a>
+<a name="ln60">// * sSemsSpinlock: Protects the semaphore free list (sFreeSemsHead,</a>
+<a name="ln61">//   sFreeSemsTail), Team::sem_list, and together with sem_entry::lock</a>
+<a name="ln62">//   write access to sem_entry::owner/team_link.</a>
+<a name="ln63">// * sem_entry::lock: Protects all sem_entry members. owner, team_link</a>
+<a name="ln64">//   additional need sSemsSpinlock for write access.</a>
+<a name="ln65">//   lock itself doesn't need protection -- sem_entry objects are never deleted.</a>
+<a name="ln66">//</a>
+<a name="ln67">// The locking order is sSemsSpinlock -&gt; sem_entry::lock -&gt; scheduler lock. All</a>
+<a name="ln68">// semaphores are in the sSems array (sem_entry[]). Access by sem_id requires</a>
+<a name="ln69">// computing the object index (id % sMaxSems), locking the respective</a>
+<a name="ln70">// sem_entry::lock and verifying that sem_entry::id matches afterwards.</a>
+<a name="ln71"> </a>
+<a name="ln72"> </a>
+<a name="ln73">struct queued_thread : DoublyLinkedListLinkImpl&lt;queued_thread&gt; {</a>
+<a name="ln74">	queued_thread(Thread *thread, int32 count)</a>
+<a name="ln75">		:</a>
+<a name="ln76">		thread(thread),</a>
+<a name="ln77">		count(count),</a>
+<a name="ln78">		queued(false)</a>
+<a name="ln79">	{</a>
+<a name="ln80">	}</a>
+<a name="ln81"> </a>
+<a name="ln82">	Thread	*thread;</a>
+<a name="ln83">	int32	count;</a>
+<a name="ln84">	bool	queued;</a>
+<a name="ln85">};</a>
+<a name="ln86"> </a>
+<a name="ln87">typedef DoublyLinkedList&lt;queued_thread&gt; ThreadQueue;</a>
+<a name="ln88"> </a>
+<a name="ln89">struct sem_entry {</a>
+<a name="ln90">	union {</a>
+<a name="ln91">		// when slot in use</a>
+<a name="ln92">		struct {</a>
+<a name="ln93">			struct list_link	team_link;</a>
+<a name="ln94">			int32				count;</a>
+<a name="ln95">			int32				net_count;</a>
+<a name="ln96">									// count + acquisition count of all blocked</a>
+<a name="ln97">									// threads</a>
+<a name="ln98">			char*				name;</a>
+<a name="ln99">			team_id				owner;</a>
+<a name="ln100">			select_info*		select_infos;</a>
+<a name="ln101">			thread_id			last_acquirer;</a>
+<a name="ln102">#if DEBUG_SEM_LAST_ACQUIRER</a>
+<a name="ln103">			int32				last_acquire_count;</a>
+<a name="ln104">			thread_id			last_releaser;</a>
+<a name="ln105">			int32				last_release_count;</a>
+<a name="ln106">#endif</a>
+<a name="ln107">		} used;</a>
+<a name="ln108"> </a>
+<a name="ln109">		// when slot unused</a>
+<a name="ln110">		struct {</a>
+<a name="ln111">			sem_id				next_id;</a>
+<a name="ln112">			struct sem_entry*	next;</a>
+<a name="ln113">		} unused;</a>
+<a name="ln114">	} u;</a>
+<a name="ln115"> </a>
+<a name="ln116">	sem_id				id;</a>
+<a name="ln117">	spinlock			lock;	// protects only the id field when unused</a>
+<a name="ln118">	ThreadQueue			queue;	// should be in u.used, but has a constructor</a>
+<a name="ln119">};</a>
+<a name="ln120"> </a>
+<a name="ln121">static const int32 kMaxSemaphores = 65536;</a>
+<a name="ln122">static int32 sMaxSems = 4096;</a>
+<a name="ln123">	// Final value is computed based on the amount of available memory</a>
+<a name="ln124">static int32 sUsedSems = 0;</a>
+<a name="ln125"> </a>
+<a name="ln126">static struct sem_entry *sSems = NULL;</a>
+<a name="ln127">static bool sSemsActive = false;</a>
+<a name="ln128">static struct sem_entry	*sFreeSemsHead = NULL;</a>
+<a name="ln129">static struct sem_entry	*sFreeSemsTail = NULL;</a>
+<a name="ln130"> </a>
+<a name="ln131">static spinlock sSemsSpinlock = B_SPINLOCK_INITIALIZER;</a>
+<a name="ln132">#define GRAB_SEM_LIST_LOCK()     acquire_spinlock(&amp;sSemsSpinlock)</a>
+<a name="ln133">#define RELEASE_SEM_LIST_LOCK()  release_spinlock(&amp;sSemsSpinlock)</a>
+<a name="ln134">#define GRAB_SEM_LOCK(s)         acquire_spinlock(&amp;(s).lock)</a>
+<a name="ln135">#define RELEASE_SEM_LOCK(s)      release_spinlock(&amp;(s).lock)</a>
+<a name="ln136"> </a>
+<a name="ln137"> </a>
+<a name="ln138">static int</a>
+<a name="ln139">dump_sem_list(int argc, char** argv)</a>
+<a name="ln140">{</a>
+<a name="ln141">	const char* name = NULL;</a>
+<a name="ln142">	team_id owner = -1;</a>
+<a name="ln143">	thread_id last = -1;</a>
+<a name="ln144">	int32 i;</a>
+<a name="ln145"> </a>
+<a name="ln146">	if (argc &gt; 2) {</a>
+<a name="ln147">		if (!strcmp(argv[1], &quot;team&quot;) || !strcmp(argv[1], &quot;owner&quot;))</a>
+<a name="ln148">			owner = strtoul(argv[2], NULL, 0);</a>
+<a name="ln149">		else if (!strcmp(argv[1], &quot;name&quot;))</a>
+<a name="ln150">			name = argv[2];</a>
+<a name="ln151">		else if (!strcmp(argv[1], &quot;last&quot;))</a>
+<a name="ln152">			last = strtoul(argv[2], NULL, 0);</a>
+<a name="ln153">	} else if (argc &gt; 1)</a>
+<a name="ln154">		owner = strtoul(argv[1], NULL, 0);</a>
+<a name="ln155"> </a>
+<a name="ln156">	kprintf(&quot;%-*s       id count   team   last  name\n&quot;, B_PRINTF_POINTER_WIDTH,</a>
+<a name="ln157">		&quot;sem&quot;);</a>
+<a name="ln158"> </a>
+<a name="ln159">	for (i = 0; i &lt; sMaxSems; i++) {</a>
+<a name="ln160">		struct sem_entry* sem = &amp;sSems[i];</a>
+<a name="ln161">		if (sem-&gt;id &lt; 0</a>
+<a name="ln162">			|| (last != -1 &amp;&amp; sem-&gt;u.used.last_acquirer != last)</a>
+<a name="ln163">			|| (name != NULL &amp;&amp; strstr(sem-&gt;u.used.name, name) == NULL)</a>
+<a name="ln164">			|| (owner != -1 &amp;&amp; sem-&gt;u.used.owner != owner))</a>
+<a name="ln165">			continue;</a>
+<a name="ln166"> </a>
+<a name="ln167">		kprintf(&quot;%p %6&quot; B_PRId32 &quot; %5&quot; B_PRId32 &quot; %6&quot; B_PRId32 &quot; &quot;</a>
+<a name="ln168">			&quot;%6&quot; B_PRId32 &quot; &quot;</a>
+<a name="ln169">			&quot; %s\n&quot;, sem, sem-&gt;id, sem-&gt;u.used.count,</a>
+<a name="ln170">			sem-&gt;u.used.owner,</a>
+<a name="ln171">			sem-&gt;u.used.last_acquirer &gt; 0 ? sem-&gt;u.used.last_acquirer : 0,</a>
+<a name="ln172">			sem-&gt;u.used.name);</a>
+<a name="ln173">	}</a>
+<a name="ln174"> </a>
+<a name="ln175">	return 0;</a>
+<a name="ln176">}</a>
+<a name="ln177"> </a>
+<a name="ln178"> </a>
+<a name="ln179">static void</a>
+<a name="ln180">dump_sem(struct sem_entry* sem)</a>
+<a name="ln181">{</a>
+<a name="ln182">	kprintf(&quot;SEM: %p\n&quot;, sem);</a>
+<a name="ln183">	kprintf(&quot;id:      %&quot; B_PRId32 &quot; (%#&quot; B_PRIx32 &quot;)\n&quot;, sem-&gt;id, sem-&gt;id);</a>
+<a name="ln184">	if (sem-&gt;id &gt;= 0) {</a>
+<a name="ln185">		kprintf(&quot;name:    '%s'\n&quot;, sem-&gt;u.used.name);</a>
+<a name="ln186">		kprintf(&quot;owner:   %&quot; B_PRId32 &quot;\n&quot;, sem-&gt;u.used.owner);</a>
+<a name="ln187">		kprintf(&quot;count:   %&quot; B_PRId32 &quot;\n&quot;, sem-&gt;u.used.count);</a>
+<a name="ln188">		kprintf(&quot;queue:  &quot;);</a>
+<a name="ln189">		if (!sem-&gt;queue.IsEmpty()) {</a>
+<a name="ln190">			ThreadQueue::Iterator it = sem-&gt;queue.GetIterator();</a>
+<a name="ln191">			while (queued_thread* entry = it.Next())</a>
+<a name="ln192">				kprintf(&quot; %&quot; B_PRId32, entry-&gt;thread-&gt;id);</a>
+<a name="ln193">			kprintf(&quot;\n&quot;);</a>
+<a name="ln194">		} else</a>
+<a name="ln195">			kprintf(&quot; -\n&quot;);</a>
+<a name="ln196"> </a>
+<a name="ln197">		set_debug_variable(&quot;_sem&quot;, (addr_t)sem);</a>
+<a name="ln198">		set_debug_variable(&quot;_semID&quot;, sem-&gt;id);</a>
+<a name="ln199">		set_debug_variable(&quot;_owner&quot;, sem-&gt;u.used.owner);</a>
+<a name="ln200"> </a>
+<a name="ln201">#if DEBUG_SEM_LAST_ACQUIRER</a>
+<a name="ln202">		kprintf(&quot;last acquired by: %&quot; B_PRId32 &quot;, count: %&quot; B_PRId32 &quot;\n&quot;,</a>
+<a name="ln203">			sem-&gt;u.used.last_acquirer, sem-&gt;u.used.last_acquire_count);</a>
+<a name="ln204">		kprintf(&quot;last released by: %&quot; B_PRId32 &quot;, count: %&quot; B_PRId32 &quot;\n&quot;,</a>
+<a name="ln205">			sem-&gt;u.used.last_releaser, sem-&gt;u.used.last_release_count);</a>
+<a name="ln206"> </a>
+<a name="ln207">		if (sem-&gt;u.used.last_releaser != 0)</a>
+<a name="ln208">			set_debug_variable(&quot;_releaser&quot;, sem-&gt;u.used.last_releaser);</a>
+<a name="ln209">		else</a>
+<a name="ln210">			unset_debug_variable(&quot;_releaser&quot;);</a>
+<a name="ln211">#else</a>
+<a name="ln212">		kprintf(&quot;last acquired by: %&quot; B_PRId32 &quot;\n&quot;, sem-&gt;u.used.last_acquirer);</a>
+<a name="ln213">#endif</a>
+<a name="ln214"> </a>
+<a name="ln215">		if (sem-&gt;u.used.last_acquirer != 0)</a>
+<a name="ln216">			set_debug_variable(&quot;_acquirer&quot;, sem-&gt;u.used.last_acquirer);</a>
+<a name="ln217">		else</a>
+<a name="ln218">			unset_debug_variable(&quot;_acquirer&quot;);</a>
+<a name="ln219">	} else {</a>
+<a name="ln220">		kprintf(&quot;next:    %p\n&quot;, sem-&gt;u.unused.next);</a>
+<a name="ln221">		kprintf(&quot;next_id: %&quot; B_PRId32 &quot;\n&quot;, sem-&gt;u.unused.next_id);</a>
+<a name="ln222">	}</a>
+<a name="ln223">}</a>
+<a name="ln224"> </a>
+<a name="ln225"> </a>
+<a name="ln226">static int</a>
+<a name="ln227">dump_sem_info(int argc, char **argv)</a>
+<a name="ln228">{</a>
+<a name="ln229">	bool found = false;</a>
+<a name="ln230">	addr_t num;</a>
+<a name="ln231">	int32 i;</a>
+<a name="ln232"> </a>
+<a name="ln233">	if (argc &lt; 2) {</a>
+<a name="ln234">		print_debugger_command_usage(argv[0]);</a>
+<a name="ln235">		return 0;</a>
+<a name="ln236">	}</a>
+<a name="ln237"> </a>
+<a name="ln238">	num = strtoul(argv[1], NULL, 0);</a>
+<a name="ln239"> </a>
+<a name="ln240">	if (IS_KERNEL_ADDRESS(num)) {</a>
+<a name="ln241">		dump_sem((struct sem_entry *)num);</a>
+<a name="ln242">		return 0;</a>
+<a name="ln243">	} else if (num &gt;= 0) {</a>
+<a name="ln244">		uint32 slot = num % sMaxSems;</a>
+<a name="ln245">		if (sSems[slot].id != (int)num) {</a>
+<a name="ln246">			kprintf(&quot;sem %ld (%#lx) doesn't exist!\n&quot;, num, num);</a>
+<a name="ln247">			return 0;</a>
+<a name="ln248">		}</a>
+<a name="ln249"> </a>
+<a name="ln250">		dump_sem(&amp;sSems[slot]);</a>
+<a name="ln251">		return 0;</a>
+<a name="ln252">	}</a>
+<a name="ln253"> </a>
+<a name="ln254">	// walk through the sem list, trying to match name</a>
+<a name="ln255">	for (i = 0; i &lt; sMaxSems; i++) {</a>
+<a name="ln256">		if (sSems[i].u.used.name != NULL</a>
+<a name="ln257">			&amp;&amp; strcmp(argv[1], sSems[i].u.used.name) == 0) {</a>
+<a name="ln258">			dump_sem(&amp;sSems[i]);</a>
+<a name="ln259">			found = true;</a>
+<a name="ln260">		}</a>
+<a name="ln261">	}</a>
+<a name="ln262"> </a>
+<a name="ln263">	if (!found)</a>
+<a name="ln264">		kprintf(&quot;sem \&quot;%s\&quot; doesn't exist!\n&quot;, argv[1]);</a>
+<a name="ln265">	return 0;</a>
+<a name="ln266">}</a>
+<a name="ln267"> </a>
+<a name="ln268"> </a>
+<a name="ln269">/*!	\brief Appends a semaphore slot to the free list.</a>
+<a name="ln270"> </a>
+<a name="ln271">	The semaphore list must be locked.</a>
+<a name="ln272">	The slot's id field is not changed. It should already be set to -1.</a>
+<a name="ln273"> </a>
+<a name="ln274">	\param slot The index of the semaphore slot.</a>
+<a name="ln275">	\param nextID The ID the slot will get when reused. If &lt; 0 the \a slot</a>
+<a name="ln276">		   is used.</a>
+<a name="ln277">*/</a>
+<a name="ln278">static void</a>
+<a name="ln279">free_sem_slot(int slot, sem_id nextID)</a>
+<a name="ln280">{</a>
+<a name="ln281">	struct sem_entry *sem = sSems + slot;</a>
+<a name="ln282">	// set next_id to the next possible value; for sanity check the current ID</a>
+<a name="ln283">	if (nextID &lt; 0)</a>
+<a name="ln284">		sem-&gt;u.unused.next_id = slot;</a>
+<a name="ln285">	else</a>
+<a name="ln286">		sem-&gt;u.unused.next_id = nextID;</a>
+<a name="ln287">	// append the entry to the list</a>
+<a name="ln288">	if (sFreeSemsTail)</a>
+<a name="ln289">		sFreeSemsTail-&gt;u.unused.next = sem;</a>
+<a name="ln290">	else</a>
+<a name="ln291">		sFreeSemsHead = sem;</a>
+<a name="ln292">	sFreeSemsTail = sem;</a>
+<a name="ln293">	sem-&gt;u.unused.next = NULL;</a>
+<a name="ln294">}</a>
+<a name="ln295"> </a>
+<a name="ln296"> </a>
+<a name="ln297">static inline void</a>
+<a name="ln298">notify_sem_select_events(struct sem_entry* sem, uint16 events)</a>
+<a name="ln299">{</a>
+<a name="ln300">	if (sem-&gt;u.used.select_infos)</a>
+<a name="ln301">		notify_select_events_list(sem-&gt;u.used.select_infos, events);</a>
+<a name="ln302">}</a>
+<a name="ln303"> </a>
+<a name="ln304"> </a>
+<a name="ln305">/*!	Fills the sem_info structure with information from the given semaphore.</a>
+<a name="ln306">	The semaphore's lock must be held when called.</a>
+<a name="ln307">*/</a>
+<a name="ln308">static void</a>
+<a name="ln309">fill_sem_info(struct sem_entry* sem, sem_info* info, size_t size)</a>
+<a name="ln310">{</a>
+<a name="ln311">	info-&gt;sem = sem-&gt;id;</a>
+<a name="ln312">	info-&gt;team = sem-&gt;u.used.owner;</a>
+<a name="ln313">	strlcpy(info-&gt;name, sem-&gt;u.used.name, sizeof(info-&gt;name));</a>
+<a name="ln314">	info-&gt;count = sem-&gt;u.used.count;</a>
+<a name="ln315">	info-&gt;latest_holder = sem-&gt;u.used.last_acquirer;</a>
+<a name="ln316">}</a>
+<a name="ln317"> </a>
+<a name="ln318"> </a>
+<a name="ln319">/*!	You must call this function with interrupts disabled, and the semaphore's</a>
+<a name="ln320">	spinlock held. Note that it will unlock the spinlock itself.</a>
+<a name="ln321">	Since it cannot free() the semaphore's name with interrupts turned off, it</a>
+<a name="ln322">	will return that one in \a name.</a>
+<a name="ln323">*/</a>
+<a name="ln324">static void</a>
+<a name="ln325">uninit_sem_locked(struct sem_entry&amp; sem, char** _name)</a>
+<a name="ln326">{</a>
+<a name="ln327">	KTRACE(&quot;delete_sem(sem: %ld)&quot;, sem.u.used.id);</a>
+<a name="ln328"> </a>
+<a name="ln329">	notify_sem_select_events(&amp;sem, B_EVENT_INVALID);</a>
+<a name="ln330">	sem.u.used.select_infos = NULL;</a>
+<a name="ln331"> </a>
+<a name="ln332">	// free any threads waiting for this semaphore</a>
+<a name="ln333">	while (queued_thread* entry = sem.queue.RemoveHead()) {</a>
+<a name="ln334">		entry-&gt;queued = false;</a>
+<a name="ln335">		thread_unblock(entry-&gt;thread, B_BAD_SEM_ID);</a>
+<a name="ln336">	}</a>
+<a name="ln337"> </a>
+<a name="ln338">	int32 id = sem.id;</a>
+<a name="ln339">	sem.id = -1;</a>
+<a name="ln340">	*_name = sem.u.used.name;</a>
+<a name="ln341">	sem.u.used.name = NULL;</a>
+<a name="ln342"> </a>
+<a name="ln343">	RELEASE_SEM_LOCK(sem);</a>
+<a name="ln344"> </a>
+<a name="ln345">	// append slot to the free list</a>
+<a name="ln346">	GRAB_SEM_LIST_LOCK();</a>
+<a name="ln347">	free_sem_slot(id % sMaxSems, id + sMaxSems);</a>
+<a name="ln348">	atomic_add(&amp;sUsedSems, -1);</a>
+<a name="ln349">	RELEASE_SEM_LIST_LOCK();</a>
+<a name="ln350">}</a>
+<a name="ln351"> </a>
+<a name="ln352"> </a>
+<a name="ln353">static status_t</a>
+<a name="ln354">delete_sem_internal(sem_id id, bool checkPermission)</a>
+<a name="ln355">{</a>
+<a name="ln356">	if (sSemsActive == false)</a>
+<a name="ln357">		return B_NO_MORE_SEMS;</a>
+<a name="ln358">	if (id &lt; 0)</a>
+<a name="ln359">		return B_BAD_SEM_ID;</a>
+<a name="ln360"> </a>
+<a name="ln361">	int32 slot = id % sMaxSems;</a>
+<a name="ln362"> </a>
+<a name="ln363">	cpu_status state = disable_interrupts();</a>
+<a name="ln364">	GRAB_SEM_LIST_LOCK();</a>
+<a name="ln365">	GRAB_SEM_LOCK(sSems[slot]);</a>
+<a name="ln366"> </a>
+<a name="ln367">	if (sSems[slot].id != id) {</a>
+<a name="ln368">		RELEASE_SEM_LOCK(sSems[slot]);</a>
+<a name="ln369">		RELEASE_SEM_LIST_LOCK();</a>
+<a name="ln370">		restore_interrupts(state);</a>
+<a name="ln371">		TRACE((&quot;delete_sem: invalid sem_id %ld\n&quot;, id));</a>
+<a name="ln372">		return B_BAD_SEM_ID;</a>
+<a name="ln373">	}</a>
+<a name="ln374"> </a>
+<a name="ln375">	if (checkPermission</a>
+<a name="ln376">		&amp;&amp; sSems[slot].u.used.owner == team_get_kernel_team_id()) {</a>
+<a name="ln377">		RELEASE_SEM_LOCK(sSems[slot]);</a>
+<a name="ln378">		RELEASE_SEM_LIST_LOCK();</a>
+<a name="ln379">		restore_interrupts(state);</a>
+<a name="ln380">		dprintf(&quot;thread %&quot; B_PRId32 &quot; tried to delete kernel semaphore &quot;</a>
+<a name="ln381">			&quot;%&quot; B_PRId32 &quot;.\n&quot;, thread_get_current_thread_id(), id);</a>
+<a name="ln382">		return B_NOT_ALLOWED;</a>
+<a name="ln383">	}</a>
+<a name="ln384"> </a>
+<a name="ln385">	if (sSems[slot].u.used.owner &gt;= 0) {</a>
+<a name="ln386">		list_remove_link(&amp;sSems[slot].u.used.team_link);</a>
+<a name="ln387">		sSems[slot].u.used.owner = -1;</a>
+<a name="ln388">	} else</a>
+<a name="ln389">		panic(&quot;sem %&quot; B_PRId32 &quot; has no owner&quot;, id);</a>
+<a name="ln390"> </a>
+<a name="ln391">	RELEASE_SEM_LIST_LOCK();</a>
+<a name="ln392"> </a>
+<a name="ln393">	char* name;</a>
+<a name="ln394">	uninit_sem_locked(sSems[slot], &amp;name);</a>
+<a name="ln395"> </a>
+<a name="ln396">	SpinLocker schedulerLocker(thread_get_current_thread()-&gt;scheduler_lock);</a>
+<a name="ln397">	scheduler_reschedule_if_necessary_locked();</a>
+<a name="ln398">	schedulerLocker.Unlock();</a>
+<a name="ln399"> </a>
+<a name="ln400">	restore_interrupts(state);</a>
+<a name="ln401"> </a>
+<a name="ln402">	free(name);</a>
+<a name="ln403">	return B_OK;</a>
+<a name="ln404">}</a>
+<a name="ln405"> </a>
+<a name="ln406"> </a>
+<a name="ln407">//	#pragma mark - Private Kernel API</a>
+<a name="ln408"> </a>
+<a name="ln409"> </a>
+<a name="ln410">// TODO: Name clash with POSIX sem_init()... (we could just use C++)</a>
+<a name="ln411">status_t</a>
+<a name="ln412">haiku_sem_init(kernel_args *args)</a>
+<a name="ln413">{</a>
+<a name="ln414">	area_id area;</a>
+<a name="ln415">	int32 i;</a>
+<a name="ln416"> </a>
+<a name="ln417">	TRACE((&quot;sem_init: entry\n&quot;));</a>
+<a name="ln418"> </a>
+<a name="ln419">	// compute maximal number of semaphores depending on the available memory</a>
+<a name="ln420">	// 128 MB -&gt; 16384 semaphores, 448 kB fixed array size</a>
+<a name="ln421">	// 256 MB -&gt; 32768, 896 kB</a>
+<a name="ln422">	// 512 MB and more-&gt; 65536, 1.75 MB</a>
+<a name="ln423">	i = vm_page_num_pages() / 2;</a>
+<a name="ln424">	while (sMaxSems &lt; i &amp;&amp; sMaxSems &lt; kMaxSemaphores)</a>
+<a name="ln425">		sMaxSems &lt;&lt;= 1;</a>
+<a name="ln426"> </a>
+<a name="ln427">	// create and initialize semaphore table</a>
+<a name="ln428">	virtual_address_restrictions virtualRestrictions = {};</a>
+<a name="ln429">	virtualRestrictions.address_specification = B_ANY_KERNEL_ADDRESS;</a>
+<a name="ln430">	physical_address_restrictions physicalRestrictions = {};</a>
+<a name="ln431">	area = create_area_etc(B_SYSTEM_TEAM, &quot;sem_table&quot;,</a>
+<a name="ln432">		sizeof(struct sem_entry) * sMaxSems, B_FULL_LOCK,</a>
+<a name="ln433">		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, CREATE_AREA_DONT_WAIT, 0,</a>
+<a name="ln434">		&amp;virtualRestrictions, &amp;physicalRestrictions, (void**)&amp;sSems);</a>
+<a name="ln435">	if (area &lt; 0)</a>
+<a name="ln436">		panic(&quot;unable to allocate semaphore table!\n&quot;);</a>
+<a name="ln437"> </a>
+<a name="ln438">	memset(sSems, 0, sizeof(struct sem_entry) * sMaxSems);</a>
+<a name="ln439">	for (i = 0; i &lt; sMaxSems; i++) {</a>
+<a name="ln440">		sSems[i].id = -1;</a>
+<a name="ln441">		free_sem_slot(i, i);</a>
+<a name="ln442">	}</a>
+<a name="ln443"> </a>
+<a name="ln444">	// add debugger commands</a>
+<a name="ln445">	add_debugger_command_etc(&quot;sems&quot;, &amp;dump_sem_list,</a>
+<a name="ln446">		&quot;Dump a list of all active semaphores (for team, with name, etc.)&quot;,</a>
+<a name="ln447">		&quot;[ ([ \&quot;team\&quot; | \&quot;owner\&quot; ] &lt;team&gt;) | (\&quot;name\&quot; &lt;name&gt;) ]&quot;</a>
+<a name="ln448">			&quot; | (\&quot;last\&quot; &lt;last acquirer&gt;)\n&quot;</a>
+<a name="ln449">		&quot;Prints a list of all active semaphores meeting the given\n&quot;</a>
+<a name="ln450">		&quot;requirement. If no argument is given, all sems are listed.\n&quot;</a>
+<a name="ln451">		&quot;  &lt;team&gt;             - The team owning the semaphores.\n&quot;</a>
+<a name="ln452">		&quot;  &lt;name&gt;             - Part of the name of the semaphores.\n&quot;</a>
+<a name="ln453">		&quot;  &lt;last acquirer&gt;    - The thread that last acquired the semaphore.\n&quot;</a>
+<a name="ln454">		, 0);</a>
+<a name="ln455">	add_debugger_command_etc(&quot;sem&quot;, &amp;dump_sem_info,</a>
+<a name="ln456">		&quot;Dump info about a particular semaphore&quot;,</a>
+<a name="ln457">		&quot;&lt;sem&gt;\n&quot;</a>
+<a name="ln458">		&quot;Prints info about the specified semaphore.\n&quot;</a>
+<a name="ln459">		&quot;  &lt;sem&gt;  - pointer to the semaphore structure, semaphore ID, or name\n&quot;</a>
+<a name="ln460">		&quot;           of the semaphore to print info for.\n&quot;, 0);</a>
+<a name="ln461"> </a>
+<a name="ln462">	TRACE((&quot;sem_init: exit\n&quot;));</a>
+<a name="ln463"> </a>
+<a name="ln464">	sSemsActive = true;</a>
+<a name="ln465"> </a>
+<a name="ln466">	return 0;</a>
+<a name="ln467">}</a>
+<a name="ln468"> </a>
+<a name="ln469"> </a>
+<a name="ln470">/*!	Creates a semaphore with the given parameters.</a>
+<a name="ln471"> </a>
+<a name="ln472">	This function is only available from within the kernel, and</a>
+<a name="ln473">	should not be made public - if possible, we should remove it</a>
+<a name="ln474">	completely (and have only create_sem() exported).</a>
+<a name="ln475">*/</a>
+<a name="ln476">sem_id</a>
+<a name="ln477">create_sem_etc(int32 count, const char* name, team_id owner)</a>
+<a name="ln478">{</a>
+<a name="ln479">	struct sem_entry* sem = NULL;</a>
+<a name="ln480">	cpu_status state;</a>
+<a name="ln481">	sem_id id = B_NO_MORE_SEMS;</a>
+<a name="ln482">	char* tempName;</a>
+<a name="ln483">	size_t nameLength;</a>
+<a name="ln484"> </a>
+<a name="ln485">	if (sSemsActive == false || sUsedSems == sMaxSems)</a>
+<a name="ln486">		return B_NO_MORE_SEMS;</a>
+<a name="ln487"> </a>
+<a name="ln488">	if (name == NULL)</a>
+<a name="ln489">		name = &quot;unnamed semaphore&quot;;</a>
+<a name="ln490"> </a>
+<a name="ln491">	// get the owning team</a>
+<a name="ln492">	Team* team = Team::Get(owner);</a>
+<a name="ln493">	if (team == NULL)</a>
+<a name="ln494">		return B_BAD_TEAM_ID;</a>
+<a name="ln495">	BReference&lt;Team&gt; teamReference(team, true);</a>
+<a name="ln496"> </a>
+<a name="ln497">	// clone the name</a>
+<a name="ln498">	nameLength = strlen(name) + 1;</a>
+<a name="ln499">	nameLength = min_c(nameLength, B_OS_NAME_LENGTH);</a>
+<a name="ln500">	tempName = (char*)malloc(nameLength);</a>
+<a name="ln501">	if (tempName == NULL)</a>
+<a name="ln502">		return B_NO_MEMORY;</a>
+<a name="ln503"> </a>
+<a name="ln504">	strlcpy(tempName, name, nameLength);</a>
+<a name="ln505"> </a>
+<a name="ln506">	state = disable_interrupts();</a>
+<a name="ln507">	GRAB_SEM_LIST_LOCK();</a>
+<a name="ln508"> </a>
+<a name="ln509">	// get the first slot from the free list</a>
+<a name="ln510">	sem = sFreeSemsHead;</a>
+<a name="ln511">	if (sem) {</a>
+<a name="ln512">		// remove it from the free list</a>
+<a name="ln513">		sFreeSemsHead = sem-&gt;u.unused.next;</a>
+<a name="ln514">		if (!sFreeSemsHead)</a>
+<a name="ln515">			sFreeSemsTail = NULL;</a>
+<a name="ln516"> </a>
+<a name="ln517">		// init the slot</a>
+<a name="ln518">		GRAB_SEM_LOCK(*sem);</a>
+<a name="ln519">		sem-&gt;id = sem-&gt;u.unused.next_id;</a>
+<a name="ln520">		sem-&gt;u.used.count = count;</a>
+<a name="ln521">		sem-&gt;u.used.net_count = count;</a>
+<a name="ln522">		new(&amp;sem-&gt;queue) ThreadQueue;</a>
+<a name="ln523">		sem-&gt;u.used.name = tempName;</a>
+<a name="ln524">		sem-&gt;u.used.owner = team-&gt;id;</a>
+<a name="ln525">		sem-&gt;u.used.select_infos = NULL;</a>
+<a name="ln526">		id = sem-&gt;id;</a>
+<a name="ln527"> </a>
+<a name="ln528">		list_add_item(&amp;team-&gt;sem_list, &amp;sem-&gt;u.used.team_link);</a>
+<a name="ln529"> </a>
+<a name="ln530">		RELEASE_SEM_LOCK(*sem);</a>
+<a name="ln531"> </a>
+<a name="ln532">		atomic_add(&amp;sUsedSems, 1);</a>
+<a name="ln533"> </a>
+<a name="ln534">		KTRACE(&quot;create_sem_etc(count: %ld, name: %s, owner: %ld) -&gt; %ld&quot;,</a>
+<a name="ln535">			count, name, owner, id);</a>
+<a name="ln536"> </a>
+<a name="ln537">		T_SCHEDULING_ANALYSIS(CreateSemaphore(id, name));</a>
+<a name="ln538">		NotifyWaitObjectListeners(&amp;WaitObjectListener::SemaphoreCreated, id,</a>
+<a name="ln539">			name);</a>
+<a name="ln540">	}</a>
+<a name="ln541"> </a>
+<a name="ln542">	RELEASE_SEM_LIST_LOCK();</a>
+<a name="ln543">	restore_interrupts(state);</a>
+<a name="ln544"> </a>
+<a name="ln545">	if (sem == NULL)</a>
+<a name="ln546">		free(tempName);</a>
+<a name="ln547"> </a>
+<a name="ln548">	return id;</a>
+<a name="ln549">}</a>
+<a name="ln550"> </a>
+<a name="ln551"> </a>
+<a name="ln552">status_t</a>
+<a name="ln553">select_sem(int32 id, struct select_info* info, bool kernel)</a>
+<a name="ln554">{</a>
+<a name="ln555">	cpu_status state;</a>
+<a name="ln556">	int32 slot;</a>
+<a name="ln557">	status_t error = B_OK;</a>
+<a name="ln558"> </a>
+<a name="ln559">	if (id &lt; 0)</a>
+<a name="ln560">		return B_BAD_SEM_ID;</a>
+<a name="ln561"> </a>
+<a name="ln562">	slot = id % sMaxSems;</a>
+<a name="ln563"> </a>
+<a name="ln564">	state = disable_interrupts();</a>
+<a name="ln565">	GRAB_SEM_LOCK(sSems[slot]);</a>
+<a name="ln566"> </a>
+<a name="ln567">	if (sSems[slot].id != id) {</a>
+<a name="ln568">		// bad sem ID</a>
+<a name="ln569">		error = B_BAD_SEM_ID;</a>
+<a name="ln570">	} else if (!kernel</a>
+<a name="ln571">		&amp;&amp; sSems[slot].u.used.owner == team_get_kernel_team_id()) {</a>
+<a name="ln572">		// kernel semaphore, but call from userland</a>
+<a name="ln573">		error = B_NOT_ALLOWED;</a>
+<a name="ln574">	} else {</a>
+<a name="ln575">		info-&gt;selected_events &amp;= B_EVENT_ACQUIRE_SEMAPHORE | B_EVENT_INVALID;</a>
+<a name="ln576"> </a>
+<a name="ln577">		if (info-&gt;selected_events != 0) {</a>
+<a name="ln578">			info-&gt;next = sSems[slot].u.used.select_infos;</a>
+<a name="ln579">			sSems[slot].u.used.select_infos = info;</a>
+<a name="ln580"> </a>
+<a name="ln581">			if (sSems[slot].u.used.count &gt; 0)</a>
+<a name="ln582">				notify_select_events(info, B_EVENT_ACQUIRE_SEMAPHORE);</a>
+<a name="ln583">		}</a>
+<a name="ln584">	}</a>
+<a name="ln585"> </a>
+<a name="ln586">	RELEASE_SEM_LOCK(sSems[slot]);</a>
+<a name="ln587">	restore_interrupts(state);</a>
+<a name="ln588"> </a>
+<a name="ln589">	return error;</a>
+<a name="ln590">}</a>
+<a name="ln591"> </a>
+<a name="ln592"> </a>
+<a name="ln593">status_t</a>
+<a name="ln594">deselect_sem(int32 id, struct select_info* info, bool kernel)</a>
+<a name="ln595">{</a>
+<a name="ln596">	cpu_status state;</a>
+<a name="ln597">	int32 slot;</a>
+<a name="ln598"> </a>
+<a name="ln599">	if (id &lt; 0)</a>
+<a name="ln600">		return B_BAD_SEM_ID;</a>
+<a name="ln601"> </a>
+<a name="ln602">	if (info-&gt;selected_events == 0)</a>
+<a name="ln603">		return B_OK;</a>
+<a name="ln604"> </a>
+<a name="ln605">	slot = id % sMaxSems;</a>
+<a name="ln606"> </a>
+<a name="ln607">	state = disable_interrupts();</a>
+<a name="ln608">	GRAB_SEM_LOCK(sSems[slot]);</a>
+<a name="ln609"> </a>
+<a name="ln610">	if (sSems[slot].id == id) {</a>
+<a name="ln611">		select_info** infoLocation = &amp;sSems[slot].u.used.select_infos;</a>
+<a name="ln612">		while (*infoLocation != NULL &amp;&amp; *infoLocation != info)</a>
+<a name="ln613">			infoLocation = &amp;(*infoLocation)-&gt;next;</a>
+<a name="ln614"> </a>
+<a name="ln615">		if (*infoLocation == info)</a>
+<a name="ln616">			*infoLocation = info-&gt;next;</a>
+<a name="ln617">	}</a>
+<a name="ln618"> </a>
+<a name="ln619">	RELEASE_SEM_LOCK(sSems[slot]);</a>
+<a name="ln620">	restore_interrupts(state);</a>
+<a name="ln621"> </a>
+<a name="ln622">	return B_OK;</a>
+<a name="ln623">}</a>
+<a name="ln624"> </a>
+<a name="ln625"> </a>
+<a name="ln626">/*!	Forcibly removes a thread from a semaphores wait queue. May have to wake up</a>
+<a name="ln627">	other threads in the process.</a>
+<a name="ln628">	Must be called with semaphore lock held. The thread lock must not be held.</a>
+<a name="ln629">*/</a>
+<a name="ln630">static void</a>
+<a name="ln631">remove_thread_from_sem(queued_thread *entry, struct sem_entry *sem)</a>
+<a name="ln632">{</a>
+<a name="ln633">	if (!entry-&gt;queued)</a>
+<a name="ln634">		return;</a>
+<a name="ln635"> </a>
+<a name="ln636">	sem-&gt;queue.Remove(entry);</a>
+<a name="ln637">	entry-&gt;queued = false;</a>
+<a name="ln638">	sem-&gt;u.used.count += entry-&gt;count;</a>
+<a name="ln639"> </a>
+<a name="ln640">	// We're done with this entry. We only have to check, if other threads</a>
+<a name="ln641">	// need unblocking, too.</a>
+<a name="ln642"> </a>
+<a name="ln643">	// Now see if more threads need to be woken up. We get the scheduler lock</a>
+<a name="ln644">	// for that time, so the blocking state of threads won't change (due to</a>
+<a name="ln645">	// interruption or timeout). We need that lock anyway when unblocking a</a>
+<a name="ln646">	// thread.</a>
+<a name="ln647">	while ((entry = sem-&gt;queue.Head()) != NULL) {</a>
+<a name="ln648">		SpinLocker schedulerLocker(entry-&gt;thread-&gt;scheduler_lock);</a>
+<a name="ln649">		if (thread_is_blocked(entry-&gt;thread)) {</a>
+<a name="ln650">			// The thread is still waiting. If its count is satisfied, unblock</a>
+<a name="ln651">			// it. Otherwise we can't unblock any other thread.</a>
+<a name="ln652">			if (entry-&gt;count &gt; sem-&gt;u.used.net_count)</a>
+<a name="ln653">				break;</a>
+<a name="ln654"> </a>
+<a name="ln655">			thread_unblock_locked(entry-&gt;thread, B_OK);</a>
+<a name="ln656">			sem-&gt;u.used.net_count -= entry-&gt;count;</a>
+<a name="ln657">		} else {</a>
+<a name="ln658">			// The thread is no longer waiting, but still queued, which means</a>
+<a name="ln659">			// acquiration failed and we can just remove it.</a>
+<a name="ln660">			sem-&gt;u.used.count += entry-&gt;count;</a>
+<a name="ln661">		}</a>
+<a name="ln662"> </a>
+<a name="ln663">		sem-&gt;queue.Remove(entry);</a>
+<a name="ln664">		entry-&gt;queued = false;</a>
+<a name="ln665">	}</a>
+<a name="ln666"> </a>
+<a name="ln667">	// select notification, if the semaphore is now acquirable</a>
+<a name="ln668">	if (sem-&gt;u.used.count &gt; 0)</a>
+<a name="ln669">		notify_sem_select_events(sem, B_EVENT_ACQUIRE_SEMAPHORE);</a>
+<a name="ln670">}</a>
+<a name="ln671"> </a>
+<a name="ln672"> </a>
+<a name="ln673">/*!	This function deletes all semaphores belonging to a particular team.</a>
+<a name="ln674">*/</a>
+<a name="ln675">void</a>
+<a name="ln676">sem_delete_owned_sems(Team* team)</a>
+<a name="ln677">{</a>
+<a name="ln678">	while (true) {</a>
+<a name="ln679">		char* name;</a>
+<a name="ln680"> </a>
+<a name="ln681">		{</a>
+<a name="ln682">			// get the next semaphore from the team's sem list</a>
+<a name="ln683">			InterruptsLocker locker;</a>
+<a name="ln684">			SpinLocker semListLocker(sSemsSpinlock);</a>
+<a name="ln685">			sem_entry* sem = (sem_entry*)list_remove_head_item(&amp;team-&gt;sem_list);</a>
+<a name="ln686">			if (sem == NULL)</a>
+<a name="ln687">				break;</a>
+<a name="ln688"> </a>
+<a name="ln689">			// delete the semaphore</a>
+<a name="ln690">			GRAB_SEM_LOCK(*sem);</a>
+<a name="ln691">			semListLocker.Unlock();</a>
+<a name="ln692">			uninit_sem_locked(*sem, &amp;name);</a>
+<a name="ln693">		}</a>
+<a name="ln694"> </a>
+<a name="ln695">		free(name);</a>
+<a name="ln696">	}</a>
+<a name="ln697"> </a>
+<a name="ln698">	scheduler_reschedule_if_necessary();</a>
+<a name="ln699">}</a>
+<a name="ln700"> </a>
+<a name="ln701"> </a>
+<a name="ln702">int32</a>
+<a name="ln703">sem_max_sems(void)</a>
+<a name="ln704">{</a>
+<a name="ln705">	return sMaxSems;</a>
+<a name="ln706">}</a>
+<a name="ln707"> </a>
+<a name="ln708"> </a>
+<a name="ln709">int32</a>
+<a name="ln710">sem_used_sems(void)</a>
+<a name="ln711">{</a>
+<a name="ln712">	return sUsedSems;</a>
+<a name="ln713">}</a>
+<a name="ln714"> </a>
+<a name="ln715"> </a>
+<a name="ln716">//	#pragma mark - Public Kernel API</a>
+<a name="ln717"> </a>
+<a name="ln718"> </a>
+<a name="ln719">sem_id</a>
+<a name="ln720">create_sem(int32 count, const char* name)</a>
+<a name="ln721">{</a>
+<a name="ln722">	return create_sem_etc(count, name, team_get_kernel_team_id());</a>
+<a name="ln723">}</a>
+<a name="ln724"> </a>
+<a name="ln725"> </a>
+<a name="ln726">status_t</a>
+<a name="ln727">delete_sem(sem_id id)</a>
+<a name="ln728">{</a>
+<a name="ln729">	return delete_sem_internal(id, false);</a>
+<a name="ln730">}</a>
+<a name="ln731"> </a>
+<a name="ln732"> </a>
+<a name="ln733">status_t</a>
+<a name="ln734">acquire_sem(sem_id id)</a>
+<a name="ln735">{</a>
+<a name="ln736">	return switch_sem_etc(-1, id, 1, 0, 0);</a>
+<a name="ln737">}</a>
+<a name="ln738"> </a>
+<a name="ln739"> </a>
+<a name="ln740">status_t</a>
+<a name="ln741">acquire_sem_etc(sem_id id, int32 count, uint32 flags, bigtime_t timeout)</a>
+<a name="ln742">{</a>
+<a name="ln743">	return switch_sem_etc(-1, id, count, flags, timeout);</a>
+<a name="ln744">}</a>
+<a name="ln745"> </a>
+<a name="ln746"> </a>
+<a name="ln747">status_t</a>
+<a name="ln748">switch_sem(sem_id toBeReleased, sem_id toBeAcquired)</a>
+<a name="ln749">{</a>
+<a name="ln750">	return switch_sem_etc(toBeReleased, toBeAcquired, 1, 0, 0);</a>
+<a name="ln751">}</a>
+<a name="ln752"> </a>
+<a name="ln753"> </a>
+<a name="ln754">status_t</a>
+<a name="ln755">switch_sem_etc(sem_id semToBeReleased, sem_id id, int32 count,</a>
+<a name="ln756">	uint32 flags, bigtime_t timeout)</a>
+<a name="ln757">{</a>
+<a name="ln758">	int slot = id % sMaxSems;</a>
+<a name="ln759">	int state;</a>
+<a name="ln760">	status_t status = B_OK;</a>
+<a name="ln761"> </a>
+<a name="ln762">	if (gKernelStartup)</a>
+<a name="ln763">		return B_OK;</a>
+<a name="ln764">	if (sSemsActive == false)</a>
+<a name="ln765">		return B_NO_MORE_SEMS;</a>
+<a name="ln766">#if KDEBUG</a>
+<a name="ln767">	if (!are_interrupts_enabled()) {</a>
+<a name="ln768">		panic(&quot;switch_sem_etc: called with interrupts disabled for sem &quot;</a>
+<a name="ln769">			&quot;%&quot; B_PRId32 &quot;\n&quot;, id);</a>
+<a name="ln770">	}</a>
+<a name="ln771">#endif</a>
+<a name="ln772"> </a>
+<a name="ln773">	if (id &lt; 0)</a>
+<a name="ln774">		return B_BAD_SEM_ID;</a>
+<a name="ln775">	if (count &lt;= 0</a>
+<a name="ln776">		|| (flags &amp; (B_RELATIVE_TIMEOUT | B_ABSOLUTE_TIMEOUT)) == (B_RELATIVE_TIMEOUT | B_ABSOLUTE_TIMEOUT)) {</a>
+<a name="ln777">		return B_BAD_VALUE;</a>
+<a name="ln778">	}</a>
+<a name="ln779"> </a>
+<a name="ln780">	state = disable_interrupts();</a>
+<a name="ln781">	GRAB_SEM_LOCK(sSems[slot]);</a>
+<a name="ln782"> </a>
+<a name="ln783">	if (sSems[slot].id != id) {</a>
+<a name="ln784">		TRACE((&quot;switch_sem_etc: bad sem %ld\n&quot;, id));</a>
+<a name="ln785">		status = B_BAD_SEM_ID;</a>
+<a name="ln786">		goto err;</a>
+<a name="ln787">	}</a>
+<a name="ln788"> </a>
+<a name="ln789">	// TODO: the B_CHECK_PERMISSION flag should be made private, as it</a>
+<a name="ln790">	//	doesn't have any use outside the kernel</a>
+<a name="ln791">	if ((flags &amp; B_CHECK_PERMISSION) != 0</a>
+<a name="ln792">		&amp;&amp; sSems[slot].u.used.owner == team_get_kernel_team_id()) {</a>
+<a name="ln793">		dprintf(&quot;thread %&quot; B_PRId32 &quot; tried to acquire kernel semaphore &quot;</a>
+<a name="ln794">			&quot;%&quot; B_PRId32 &quot;.\n&quot;, thread_get_current_thread_id(), id);</a>
+<a name="ln795">		status = B_NOT_ALLOWED;</a>
+<a name="ln796">		goto err;</a>
+<a name="ln797">	}</a>
+<a name="ln798"> </a>
+<a name="ln799">	if (sSems[slot].u.used.count - count &lt; 0) {</a>
+<a name="ln800">		if ((flags &amp; B_RELATIVE_TIMEOUT) != 0 &amp;&amp; timeout &lt;= 0) {</a>
+<a name="ln801">			// immediate timeout</a>
+<a name="ln802">			status = B_WOULD_BLOCK;</a>
+<a name="ln803">			goto err;</a>
+<a name="ln804">		} else if ((flags &amp; B_ABSOLUTE_TIMEOUT) != 0 &amp;&amp; timeout &lt; 0) {</a>
+<a name="ln805">			// absolute negative timeout</a>
+<a name="ln806">			status = B_TIMED_OUT;</a>
+<a name="ln807">			goto err;</a>
+<a name="ln808">		}</a>
+<a name="ln809">	}</a>
+<a name="ln810"> </a>
+<a name="ln811">	KTRACE(&quot;switch_sem_etc(semToBeReleased: %ld, sem: %ld, count: %ld, &quot;</a>
+<a name="ln812">		&quot;flags: 0x%lx, timeout: %lld)&quot;, semToBeReleased, id, count, flags,</a>
+<a name="ln813">		timeout);</a>
+<a name="ln814"> </a>
+<a name="ln815">	if ((sSems[slot].u.used.count -= count) &lt; 0) {</a>
+<a name="ln816">		// we need to block</a>
+<a name="ln817">		Thread *thread = thread_get_current_thread();</a>
+<a name="ln818"> </a>
+<a name="ln819">		TRACE((&quot;switch_sem_etc(id = %ld): block name = %s, thread = %p,&quot;</a>
+<a name="ln820">			&quot; name = %s\n&quot;, id, sSems[slot].u.used.name, thread, thread-&gt;name));</a>
+<a name="ln821"> </a>
+<a name="ln822">		// do a quick check to see if the thread has any pending signals</a>
+<a name="ln823">		// this should catch most of the cases where the thread had a signal</a>
+<a name="ln824">		SpinLocker schedulerLocker(thread-&gt;scheduler_lock);</a>
+<a name="ln825">		if (thread_is_interrupted(thread, flags)) {</a>
+<a name="ln826">			schedulerLocker.Unlock();</a>
+<a name="ln827">			sSems[slot].u.used.count += count;</a>
+<a name="ln828">			status = B_INTERRUPTED;</a>
+<a name="ln829">				// the other semaphore will be released later</a>
+<a name="ln830">			goto err;</a>
+<a name="ln831">		}</a>
+<a name="ln832"> </a>
+<a name="ln833">		schedulerLocker.Unlock();</a>
+<a name="ln834"> </a>
+<a name="ln835">		if ((flags &amp; (B_RELATIVE_TIMEOUT | B_ABSOLUTE_TIMEOUT)) == 0)</a>
+<a name="ln836">			timeout = B_INFINITE_TIMEOUT;</a>
+<a name="ln837"> </a>
+<a name="ln838">		// enqueue in the semaphore queue and get ready to wait</a>
+<a name="ln839">		queued_thread queueEntry(thread, count);</a>
+<a name="ln840">		sSems[slot].queue.Add(&amp;queueEntry);</a>
+<a name="ln841">		queueEntry.queued = true;</a>
+<a name="ln842"> </a>
+<a name="ln843">		thread_prepare_to_block(thread, flags, THREAD_BLOCK_TYPE_SEMAPHORE,</a>
+<a name="ln844">			(void*)(addr_t)id);</a>
+<a name="ln845"> </a>
+<a name="ln846">		RELEASE_SEM_LOCK(sSems[slot]);</a>
+<a name="ln847"> </a>
+<a name="ln848">		// release the other semaphore, if any</a>
+<a name="ln849">		if (semToBeReleased &gt;= 0) {</a>
+<a name="ln850">			release_sem_etc(semToBeReleased, 1, B_DO_NOT_RESCHEDULE);</a>
+<a name="ln851">			semToBeReleased = -1;</a>
+<a name="ln852">		}</a>
+<a name="ln853"> </a>
+<a name="ln854">		status_t acquireStatus = timeout == B_INFINITE_TIMEOUT</a>
+<a name="ln855">			? thread_block() : thread_block_with_timeout(flags, timeout);</a>
+<a name="ln856"> </a>
+<a name="ln857">		GRAB_SEM_LOCK(sSems[slot]);</a>
+<a name="ln858"> </a>
+<a name="ln859">		// If we're still queued, this means the acquiration failed, and we</a>
+<a name="ln860">		// need to remove our entry and (potentially) wake up other threads.</a>
+<a name="ln861">		if (queueEntry.queued)</a>
+<a name="ln862">			remove_thread_from_sem(&amp;queueEntry, &amp;sSems[slot]);</a>
+<a name="ln863"> </a>
+<a name="ln864">		if (acquireStatus &gt;= B_OK) {</a>
+<a name="ln865">			sSems[slot].u.used.last_acquirer = thread_get_current_thread_id();</a>
+<a name="ln866">#if DEBUG_SEM_LAST_ACQUIRER</a>
+<a name="ln867">			sSems[slot].u.used.last_acquire_count = count;</a>
+<a name="ln868">#endif</a>
+<a name="ln869">		}</a>
+<a name="ln870"> </a>
+<a name="ln871">		RELEASE_SEM_LOCK(sSems[slot]);</a>
+<a name="ln872">		restore_interrupts(state);</a>
+<a name="ln873"> </a>
+<a name="ln874">		TRACE((&quot;switch_sem_etc(sem %ld): exit block name %s, &quot;</a>
+<a name="ln875">			&quot;thread %ld (%s)\n&quot;, id, sSems[slot].u.used.name, thread-&gt;id,</a>
+<a name="ln876">			thread-&gt;name));</a>
+<a name="ln877">		KTRACE(&quot;switch_sem_etc() done: 0x%lx&quot;, acquireStatus);</a>
+<a name="ln878">		return acquireStatus;</a>
+<a name="ln879">	} else {</a>
+<a name="ln880">		sSems[slot].u.used.net_count -= count;</a>
+<a name="ln881">		sSems[slot].u.used.last_acquirer = thread_get_current_thread_id();</a>
+<a name="ln882">#if DEBUG_SEM_LAST_ACQUIRER</a>
+<a name="ln883">		sSems[slot].u.used.last_acquire_count = count;</a>
+<a name="ln884">#endif</a>
+<a name="ln885">	}</a>
+<a name="ln886"> </a>
+<a name="ln887">err:</a>
+<a name="ln888">	RELEASE_SEM_LOCK(sSems[slot]);</a>
+<a name="ln889">	restore_interrupts(state);</a>
+<a name="ln890"> </a>
+<a name="ln891">	if (status == B_INTERRUPTED &amp;&amp; semToBeReleased &gt;= B_OK) {</a>
+<a name="ln892">		// depending on when we were interrupted, we need to still</a>
+<a name="ln893">		// release the semaphore to always leave in a consistent</a>
+<a name="ln894">		// state</a>
+<a name="ln895">		release_sem_etc(semToBeReleased, 1, B_DO_NOT_RESCHEDULE);</a>
+<a name="ln896">	}</a>
+<a name="ln897"> </a>
+<a name="ln898">#if 0</a>
+<a name="ln899">	if (status == B_NOT_ALLOWED)</a>
+<a name="ln900">	_user_debugger(&quot;Thread tried to acquire kernel semaphore.&quot;);</a>
+<a name="ln901">#endif</a>
+<a name="ln902"> </a>
+<a name="ln903">	KTRACE(&quot;switch_sem_etc() done: 0x%lx&quot;, status);</a>
+<a name="ln904"> </a>
+<a name="ln905">	return status;</a>
+<a name="ln906">}</a>
+<a name="ln907"> </a>
+<a name="ln908"> </a>
+<a name="ln909">status_t</a>
+<a name="ln910">release_sem(sem_id id)</a>
+<a name="ln911">{</a>
+<a name="ln912">	return release_sem_etc(id, 1, 0);</a>
+<a name="ln913">}</a>
+<a name="ln914"> </a>
+<a name="ln915"> </a>
+<a name="ln916">status_t</a>
+<a name="ln917">release_sem_etc(sem_id id, int32 count, uint32 flags)</a>
+<a name="ln918">{</a>
+<a name="ln919">	int32 slot = id % sMaxSems;</a>
+<a name="ln920"> </a>
+<a name="ln921">	if (gKernelStartup)</a>
+<a name="ln922">		return B_OK;</a>
+<a name="ln923">	if (sSemsActive == false)</a>
+<a name="ln924">		return B_NO_MORE_SEMS;</a>
+<a name="ln925">	if (id &lt; 0)</a>
+<a name="ln926">		return B_BAD_SEM_ID;</a>
+<a name="ln927">	if (count &lt;= 0 &amp;&amp; (flags &amp; B_RELEASE_ALL) == 0)</a>
+<a name="ln928">		return B_BAD_VALUE;</a>
+<a name="ln929">#if KDEBUG</a>
+<a name="ln930">	if ((flags &amp; B_DO_NOT_RESCHEDULE) == 0 &amp;&amp; !are_interrupts_enabled()) {</a>
+<a name="ln931">		panic(&quot;release_sem_etc(): called with interrupts disabled and &quot;</a>
+<a name="ln932">			&quot;rescheduling allowed for sem_id %&quot; B_PRId32, id);</a>
+<a name="ln933">	}</a>
+<a name="ln934">#endif</a>
+<a name="ln935"> </a>
+<a name="ln936">	InterruptsLocker _;</a>
+<a name="ln937">	SpinLocker semLocker(sSems[slot].lock);</a>
+<a name="ln938"> </a>
+<a name="ln939">	if (sSems[slot].id != id) {</a>
+<a name="ln940">		TRACE((&quot;sem_release_etc: invalid sem_id %ld\n&quot;, id));</a>
+<a name="ln941">		return B_BAD_SEM_ID;</a>
+<a name="ln942">	}</a>
+<a name="ln943"> </a>
+<a name="ln944">	// ToDo: the B_CHECK_PERMISSION flag should be made private, as it</a>
+<a name="ln945">	//	doesn't have any use outside the kernel</a>
+<a name="ln946">	if ((flags &amp; B_CHECK_PERMISSION) != 0</a>
+<a name="ln947">		&amp;&amp; sSems[slot].u.used.owner == team_get_kernel_team_id()) {</a>
+<a name="ln948">		dprintf(&quot;thread %&quot; B_PRId32 &quot; tried to release kernel semaphore.\n&quot;,</a>
+<a name="ln949">			thread_get_current_thread_id());</a>
+<a name="ln950">		return B_NOT_ALLOWED;</a>
+<a name="ln951">	}</a>
+<a name="ln952"> </a>
+<a name="ln953">	KTRACE(&quot;release_sem_etc(sem: %ld, count: %ld, flags: 0x%lx)&quot;, id, count,</a>
+<a name="ln954">		flags);</a>
+<a name="ln955"> </a>
+<a name="ln956">	sSems[slot].u.used.last_acquirer = -sSems[slot].u.used.last_acquirer;</a>
+<a name="ln957">#if DEBUG_SEM_LAST_ACQUIRER</a>
+<a name="ln958">	sSems[slot].u.used.last_releaser = thread_get_current_thread_id();</a>
+<a name="ln959">	sSems[slot].u.used.last_release_count = count;</a>
+<a name="ln960">#endif</a>
+<a name="ln961"> </a>
+<a name="ln962">	if (flags &amp; B_RELEASE_ALL) {</a>
+<a name="ln963">		count = sSems[slot].u.used.net_count - sSems[slot].u.used.count;</a>
+<a name="ln964"> </a>
+<a name="ln965">		// is there anything to do for us at all?</a>
+<a name="ln966">		if (count == 0)</a>
+<a name="ln967">			return B_OK;</a>
+<a name="ln968"> </a>
+<a name="ln969">		// Don't release more than necessary -- there might be interrupted/</a>
+<a name="ln970">		// timed out threads in the queue.</a>
+<a name="ln971">		flags |= B_RELEASE_IF_WAITING_ONLY;</a>
+<a name="ln972">	}</a>
+<a name="ln973"> </a>
+<a name="ln974">	// Grab the scheduler lock, so thread_is_blocked() is reliable (due to</a>
+<a name="ln975">	// possible interruptions or timeouts, it wouldn't be otherwise).</a>
+<a name="ln976">	while (count &gt; 0) {</a>
+<a name="ln977">		queued_thread* entry = sSems[slot].queue.Head();</a>
+<a name="ln978">		if (entry == NULL) {</a>
+<a name="ln979">			if ((flags &amp; B_RELEASE_IF_WAITING_ONLY) == 0) {</a>
+<a name="ln980">				sSems[slot].u.used.count += count;</a>
+<a name="ln981">				sSems[slot].u.used.net_count += count;</a>
+<a name="ln982">			}</a>
+<a name="ln983">			break;</a>
+<a name="ln984">		}</a>
+<a name="ln985"> </a>
+<a name="ln986">		SpinLocker schedulerLock(entry-&gt;thread-&gt;scheduler_lock);</a>
+<a name="ln987">		if (thread_is_blocked(entry-&gt;thread)) {</a>
+<a name="ln988">			// The thread is still waiting. If its count is satisfied,</a>
+<a name="ln989">			// unblock it. Otherwise we can't unblock any other thread.</a>
+<a name="ln990">			if (entry-&gt;count &gt; sSems[slot].u.used.net_count + count) {</a>
+<a name="ln991">				sSems[slot].u.used.count += count;</a>
+<a name="ln992">				sSems[slot].u.used.net_count += count;</a>
+<a name="ln993">				break;</a>
+<a name="ln994">			}</a>
+<a name="ln995"> </a>
+<a name="ln996">			thread_unblock_locked(entry-&gt;thread, B_OK);</a>
+<a name="ln997"> </a>
+<a name="ln998">			int delta = min_c(count, entry-&gt;count);</a>
+<a name="ln999">			sSems[slot].u.used.count += delta;</a>
+<a name="ln1000">			sSems[slot].u.used.net_count += delta - entry-&gt;count;</a>
+<a name="ln1001">			count -= delta;</a>
+<a name="ln1002">		} else {</a>
+<a name="ln1003">			// The thread is no longer waiting, but still queued, which</a>
+<a name="ln1004">			// means acquiration failed and we can just remove it.</a>
+<a name="ln1005">			sSems[slot].u.used.count += entry-&gt;count;</a>
+<a name="ln1006">		}</a>
+<a name="ln1007"> </a>
+<a name="ln1008">		sSems[slot].queue.Remove(entry);</a>
+<a name="ln1009">		entry-&gt;queued = false;</a>
+<a name="ln1010">	}</a>
+<a name="ln1011"> </a>
+<a name="ln1012">	if (sSems[slot].u.used.count &gt; 0)</a>
+<a name="ln1013">		notify_sem_select_events(&amp;sSems[slot], B_EVENT_ACQUIRE_SEMAPHORE);</a>
+<a name="ln1014"> </a>
+<a name="ln1015">	// If we've unblocked another thread reschedule, if we've not explicitly</a>
+<a name="ln1016">	// been told not to.</a>
+<a name="ln1017">	if ((flags &amp; B_DO_NOT_RESCHEDULE) == 0) {</a>
+<a name="ln1018">		semLocker.Unlock();</a>
+<a name="ln1019"> </a>
+<a name="ln1020">		SpinLocker _(thread_get_current_thread()-&gt;scheduler_lock);</a>
+<a name="ln1021">		scheduler_reschedule_if_necessary_locked();</a>
+<a name="ln1022">	}</a>
+<a name="ln1023"> </a>
+<a name="ln1024">	return B_OK;</a>
+<a name="ln1025">}</a>
+<a name="ln1026"> </a>
+<a name="ln1027"> </a>
+<a name="ln1028">status_t</a>
+<a name="ln1029">get_sem_count(sem_id id, int32 *_count)</a>
+<a name="ln1030">{</a>
+<a name="ln1031">	int slot;</a>
+<a name="ln1032">	int state;</a>
+<a name="ln1033"> </a>
+<a name="ln1034">	if (sSemsActive == false)</a>
+<a name="ln1035">		return B_NO_MORE_SEMS;</a>
+<a name="ln1036">	if (id &lt; 0)</a>
+<a name="ln1037">		return B_BAD_SEM_ID;</a>
+<a name="ln1038">	if (_count == NULL)</a>
+<a name="ln1039">		return B_BAD_VALUE;</a>
+<a name="ln1040"> </a>
+<a name="ln1041">	slot = id % sMaxSems;</a>
+<a name="ln1042"> </a>
+<a name="ln1043">	state = disable_interrupts();</a>
+<a name="ln1044">	GRAB_SEM_LOCK(sSems[slot]);</a>
+<a name="ln1045"> </a>
+<a name="ln1046">	if (sSems[slot].id != id) {</a>
+<a name="ln1047">		RELEASE_SEM_LOCK(sSems[slot]);</a>
+<a name="ln1048">		restore_interrupts(state);</a>
+<a name="ln1049">		TRACE((&quot;sem_get_count: invalid sem_id %ld\n&quot;, id));</a>
+<a name="ln1050">		return B_BAD_SEM_ID;</a>
+<a name="ln1051">	}</a>
+<a name="ln1052"> </a>
+<a name="ln1053">	*_count = sSems[slot].u.used.count;</a>
+<a name="ln1054"> </a>
+<a name="ln1055">	RELEASE_SEM_LOCK(sSems[slot]);</a>
+<a name="ln1056">	restore_interrupts(state);</a>
+<a name="ln1057"> </a>
+<a name="ln1058">	return B_OK;</a>
+<a name="ln1059">}</a>
+<a name="ln1060"> </a>
+<a name="ln1061"> </a>
+<a name="ln1062">/*!	Called by the get_sem_info() macro. */</a>
+<a name="ln1063">status_t</a>
+<a name="ln1064">_get_sem_info(sem_id id, struct sem_info *info, size_t size)</a>
+<a name="ln1065">{</a>
+<a name="ln1066">	status_t status = B_OK;</a>
+<a name="ln1067">	int state;</a>
+<a name="ln1068">	int slot;</a>
+<a name="ln1069"> </a>
+<a name="ln1070">	if (!sSemsActive)</a>
+<a name="ln1071">		return B_NO_MORE_SEMS;</a>
+<a name="ln1072">	if (id &lt; 0)</a>
+<a name="ln1073">		return B_BAD_SEM_ID;</a>
+<a name="ln1074">	if (info == NULL || size != sizeof(sem_info))</a>
+<a name="ln1075">		return B_BAD_VALUE;</a>
+<a name="ln1076"> </a>
+<a name="ln1077">	slot = id % sMaxSems;</a>
+<a name="ln1078"> </a>
+<a name="ln1079">	state = disable_interrupts();</a>
+<a name="ln1080">	GRAB_SEM_LOCK(sSems[slot]);</a>
+<a name="ln1081"> </a>
+<a name="ln1082">	if (sSems[slot].id != id) {</a>
+<a name="ln1083">		status = B_BAD_SEM_ID;</a>
+<a name="ln1084">		TRACE((&quot;get_sem_info: invalid sem_id %ld\n&quot;, id));</a>
+<a name="ln1085">	} else</a>
+<a name="ln1086">		fill_sem_info(&amp;sSems[slot], info, size);</a>
+<a name="ln1087"> </a>
+<a name="ln1088">	RELEASE_SEM_LOCK(sSems[slot]);</a>
+<a name="ln1089">	restore_interrupts(state);</a>
+<a name="ln1090"> </a>
+<a name="ln1091">	return status;</a>
+<a name="ln1092">}</a>
+<a name="ln1093"> </a>
+<a name="ln1094"> </a>
+<a name="ln1095">/*!	Called by the get_next_sem_info() macro. */</a>
+<a name="ln1096">status_t</a>
+<a name="ln1097">_get_next_sem_info(team_id teamID, int32 *_cookie, struct sem_info *info,</a>
+<a name="ln1098">	size_t size)</a>
+<a name="ln1099">{</a>
+<a name="ln1100">	if (!sSemsActive)</a>
+<a name="ln1101">		return B_NO_MORE_SEMS;</a>
+<a name="ln1102">	if (_cookie == NULL || info == NULL || size != sizeof(sem_info))</a>
+<a name="ln1103">		return B_BAD_VALUE;</a>
+<a name="ln1104">	if (teamID &lt; 0)</a>
+<a name="ln1105">		return B_BAD_TEAM_ID;</a>
+<a name="ln1106"> </a>
+<a name="ln1107">	Team* team = Team::Get(teamID);</a>
+<a name="ln1108">	if (team == NULL)</a>
+<a name="ln1109">		return B_BAD_TEAM_ID;</a>
+<a name="ln1110">	BReference&lt;Team&gt; teamReference(team, true);</a>
+<a name="ln1111"> </a>
+<a name="ln1112">	InterruptsSpinLocker semListLocker(sSemsSpinlock);</a>
+<a name="ln1113"> </a>
+<a name="ln1114">	// TODO: find a way to iterate the list that is more reliable</a>
+<a name="ln1115">	sem_entry* sem = (sem_entry*)list_get_first_item(&amp;team-&gt;sem_list);</a>
+<a name="ln1116">	int32 newIndex = *_cookie;</a>
+<a name="ln1117">	int32 index = 0;</a>
+<a name="ln1118">	bool found = false;</a>
+<a name="ln1119"> </a>
+<a name="ln1120">	while (!found) {</a>
+<a name="ln1121">		// find the next entry to be returned</a>
+<a name="ln1122">		while (sem != NULL &amp;&amp; index &lt; newIndex) {</a>
+<a name="ln1123">			sem = (sem_entry*)list_get_next_item(&amp;team-&gt;sem_list, sem);</a>
+<a name="ln1124">			index++;</a>
+<a name="ln1125">		}</a>
+<a name="ln1126"> </a>
+<a name="ln1127">		if (sem == NULL)</a>
+<a name="ln1128">			return B_BAD_VALUE;</a>
+<a name="ln1129"> </a>
+<a name="ln1130">		GRAB_SEM_LOCK(*sem);</a>
+<a name="ln1131"> </a>
+<a name="ln1132">		if (sem-&gt;id != -1 &amp;&amp; sem-&gt;u.used.owner == team-&gt;id) {</a>
+<a name="ln1133">			// found one!</a>
+<a name="ln1134">			fill_sem_info(sem, info, size);</a>
+<a name="ln1135">			newIndex = index + 1;</a>
+<a name="ln1136">			found = true;</a>
+<a name="ln1137">		} else</a>
+<a name="ln1138">			newIndex++;</a>
+<a name="ln1139"> </a>
+<a name="ln1140">		RELEASE_SEM_LOCK(*sem);</a>
+<a name="ln1141">	}</a>
+<a name="ln1142"> </a>
+<a name="ln1143">	if (!found)</a>
+<a name="ln1144">		return B_BAD_VALUE;</a>
+<a name="ln1145"> </a>
+<a name="ln1146">	*_cookie = newIndex;</a>
+<a name="ln1147">	return B_OK;</a>
+<a name="ln1148">}</a>
+<a name="ln1149"> </a>
+<a name="ln1150"> </a>
+<a name="ln1151">status_t</a>
+<a name="ln1152">set_sem_owner(sem_id id, team_id newTeamID)</a>
+<a name="ln1153">{</a>
+<a name="ln1154">	if (sSemsActive == false)</a>
+<a name="ln1155">		return B_NO_MORE_SEMS;</a>
+<a name="ln1156">	if (id &lt; 0)</a>
+<a name="ln1157">		return B_BAD_SEM_ID;</a>
+<a name="ln1158">	if (newTeamID &lt; 0)</a>
+<a name="ln1159">		return B_BAD_TEAM_ID;</a>
+<a name="ln1160"> </a>
+<a name="ln1161">	int32 slot = id % sMaxSems;</a>
+<a name="ln1162"> </a>
+<a name="ln1163">	// get the new team</a>
+<a name="ln1164">	Team* newTeam = Team::Get(newTeamID);</a>
+<a name="ln1165">	if (newTeam == NULL)</a>
+<a name="ln1166">		return B_BAD_TEAM_ID;</a>
+<a name="ln1167">	BReference&lt;Team&gt; newTeamReference(newTeam, true);</a>
+<a name="ln1168"> </a>
+<a name="ln1169">	InterruptsSpinLocker semListLocker(sSemsSpinlock);</a>
+<a name="ln1170">	SpinLocker semLocker(sSems[slot].lock);</a>
+<a name="ln1171"> </a>
+<a name="ln1172">	if (sSems[slot].id != id) {</a>
+<a name="ln1173">		TRACE((&quot;set_sem_owner: invalid sem_id %ld\n&quot;, id));</a>
+<a name="ln1174">		return B_BAD_SEM_ID;</a>
+<a name="ln1175">	}</a>
+<a name="ln1176"> </a>
+<a name="ln1177">	list_remove_link(&amp;sSems[slot].u.used.team_link);</a>
+<a name="ln1178">	list_add_item(&amp;newTeam-&gt;sem_list, &amp;sSems[slot].u.used.team_link);</a>
+<a name="ln1179"> </a>
+<a name="ln1180">	sSems[slot].u.used.owner = newTeam-&gt;id;</a>
+<a name="ln1181">	return B_OK;</a>
+<a name="ln1182">}</a>
+<a name="ln1183"> </a>
+<a name="ln1184"> </a>
+<a name="ln1185">/*!	Returns the name of the semaphore. The name is not copied, so the caller</a>
+<a name="ln1186">	must make sure that the semaphore remains alive as long as the name is used.</a>
+<a name="ln1187">*/</a>
+<a name="ln1188">const char*</a>
+<a name="ln1189">sem_get_name_unsafe(sem_id id)</a>
+<a name="ln1190">{</a>
+<a name="ln1191">	int slot = id % sMaxSems;</a>
+<a name="ln1192"> </a>
+<a name="ln1193">	if (sSemsActive == false || id &lt; 0 || sSems[slot].id != id)</a>
+<a name="ln1194">		return NULL;</a>
+<a name="ln1195"> </a>
+<a name="ln1196">	return sSems[slot].u.used.name;</a>
+<a name="ln1197">}</a>
+<a name="ln1198"> </a>
+<a name="ln1199"> </a>
+<a name="ln1200">//	#pragma mark - Syscalls</a>
+<a name="ln1201"> </a>
+<a name="ln1202"> </a>
+<a name="ln1203">sem_id</a>
+<a name="ln1204">_user_create_sem(int32 count, const char *userName)</a>
+<a name="ln1205">{</a>
+<a name="ln1206">	char name[B_OS_NAME_LENGTH];</a>
+<a name="ln1207"> </a>
+<a name="ln1208">	if (userName == NULL)</a>
+<a name="ln1209">		return create_sem_etc(count, NULL, team_get_current_team_id());</a>
+<a name="ln1210"> </a>
+<a name="ln1211">	if (!IS_USER_ADDRESS(userName)</a>
+<a name="ln1212">		|| user_strlcpy(name, userName, B_OS_NAME_LENGTH) &lt; B_OK)</a>
+<a name="ln1213">		return B_BAD_ADDRESS;</a>
+<a name="ln1214"> </a>
+<a name="ln1215">	return create_sem_etc(count, name, team_get_current_team_id());</a>
+<a name="ln1216">}</a>
+<a name="ln1217"> </a>
+<a name="ln1218"> </a>
+<a name="ln1219">status_t</a>
+<a name="ln1220">_user_delete_sem(sem_id id)</a>
+<a name="ln1221">{</a>
+<a name="ln1222">	return delete_sem_internal(id, true);</a>
+<a name="ln1223">}</a>
+<a name="ln1224"> </a>
+<a name="ln1225"> </a>
+<a name="ln1226">status_t</a>
+<a name="ln1227">_user_acquire_sem(sem_id id)</a>
+<a name="ln1228">{</a>
+<a name="ln1229">	status_t error = switch_sem_etc(-1, id, 1,</a>
+<a name="ln1230">		B_CAN_INTERRUPT | B_CHECK_PERMISSION, 0);</a>
+<a name="ln1231"> </a>
+<a name="ln1232">	return syscall_restart_handle_post(error);</a>
+<a name="ln1233">}</a>
+<a name="ln1234"> </a>
+<a name="ln1235"> </a>
+<a name="ln1236">status_t</a>
+<a name="ln1237">_user_acquire_sem_etc(sem_id id, int32 count, uint32 flags, bigtime_t timeout)</a>
+<a name="ln1238">{</a>
+<a name="ln1239">	syscall_restart_handle_timeout_pre(flags, timeout);</a>
+<a name="ln1240"> </a>
+<a name="ln1241">	status_t error = switch_sem_etc(-1, id, count,</a>
+<a name="ln1242">		flags | B_CAN_INTERRUPT | B_CHECK_PERMISSION, timeout);</a>
+<a name="ln1243"> </a>
+<a name="ln1244">	return syscall_restart_handle_timeout_post(error, timeout);</a>
+<a name="ln1245">}</a>
+<a name="ln1246"> </a>
+<a name="ln1247"> </a>
+<a name="ln1248">status_t</a>
+<a name="ln1249">_user_switch_sem(sem_id releaseSem, sem_id id)</a>
+<a name="ln1250">{</a>
+<a name="ln1251">	status_t error = switch_sem_etc(releaseSem, id, 1,</a>
+<a name="ln1252">		B_CAN_INTERRUPT | B_CHECK_PERMISSION, 0);</a>
+<a name="ln1253"> </a>
+<a name="ln1254">	if (releaseSem &lt; 0)</a>
+<a name="ln1255">		return syscall_restart_handle_post(error);</a>
+<a name="ln1256"> </a>
+<a name="ln1257">	return error;</a>
+<a name="ln1258">}</a>
+<a name="ln1259"> </a>
+<a name="ln1260"> </a>
+<a name="ln1261">status_t</a>
+<a name="ln1262">_user_switch_sem_etc(sem_id releaseSem, sem_id id, int32 count, uint32 flags,</a>
+<a name="ln1263">	bigtime_t timeout)</a>
+<a name="ln1264">{</a>
+<a name="ln1265">	if (releaseSem &lt; 0)</a>
+<a name="ln1266">		syscall_restart_handle_timeout_pre(flags, timeout);</a>
+<a name="ln1267"> </a>
+<a name="ln1268">	status_t error = switch_sem_etc(releaseSem, id, count,</a>
+<a name="ln1269">		flags | B_CAN_INTERRUPT | B_CHECK_PERMISSION, timeout);</a>
+<a name="ln1270"> </a>
+<a name="ln1271">	if (releaseSem &lt; 0)</a>
+<a name="ln1272">		return syscall_restart_handle_timeout_post(error, timeout);</a>
+<a name="ln1273"> </a>
+<a name="ln1274">	return error;</a>
+<a name="ln1275">}</a>
+<a name="ln1276"> </a>
+<a name="ln1277"> </a>
+<a name="ln1278">status_t</a>
+<a name="ln1279">_user_release_sem(sem_id id)</a>
+<a name="ln1280">{</a>
+<a name="ln1281">	return release_sem_etc(id, 1, B_CHECK_PERMISSION);</a>
+<a name="ln1282">}</a>
+<a name="ln1283"> </a>
+<a name="ln1284"> </a>
+<a name="ln1285">status_t</a>
+<a name="ln1286">_user_release_sem_etc(sem_id id, int32 count, uint32 flags)</a>
+<a name="ln1287">{</a>
+<a name="ln1288">	return release_sem_etc(id, count, flags | B_CHECK_PERMISSION);</a>
+<a name="ln1289">}</a>
+<a name="ln1290"> </a>
+<a name="ln1291"> </a>
+<a name="ln1292">status_t</a>
+<a name="ln1293">_user_get_sem_count(sem_id id, int32 *userCount)</a>
+<a name="ln1294">{</a>
+<a name="ln1295">	status_t status;</a>
+<a name="ln1296">	int32 count;</a>
+<a name="ln1297"> </a>
+<a name="ln1298">	if (userCount == NULL || !IS_USER_ADDRESS(userCount))</a>
+<a name="ln1299">		return B_BAD_ADDRESS;</a>
+<a name="ln1300"> </a>
+<a name="ln1301">	status = get_sem_count(id, &amp;count);</a>
+<a name="ln1302">	if (status == B_OK &amp;&amp; user_memcpy(userCount, &amp;count, sizeof(int32)) &lt; B_OK)</a>
+<a name="ln1303">		return B_BAD_ADDRESS;</a>
+<a name="ln1304"> </a>
+<a name="ln1305">	return status;</a>
+<a name="ln1306">}</a>
+<a name="ln1307"> </a>
+<a name="ln1308"> </a>
+<a name="ln1309">status_t</a>
+<a name="ln1310">_user_get_sem_info(sem_id id, struct sem_info *userInfo, size_t size)</a>
+<a name="ln1311">{</a>
+<a name="ln1312">	struct sem_info info;</a>
+<a name="ln1313">	status_t status;</a>
+<a name="ln1314"> </a>
+<a name="ln1315">	if (userInfo == NULL || !IS_USER_ADDRESS(userInfo))</a>
+<a name="ln1316">		return B_BAD_ADDRESS;</a>
+<a name="ln1317"> </a>
+<a name="ln1318">	status = _get_sem_info(id, &amp;info, size);</a>
+<a name="ln1319">	if (status == B_OK &amp;&amp; user_memcpy(userInfo, &amp;info, size) &lt; B_OK)</a>
+<a name="ln1320">		return B_BAD_ADDRESS;</a>
+<a name="ln1321"> </a>
+<a name="ln1322">	return status;</a>
+<a name="ln1323">}</a>
+<a name="ln1324"> </a>
+<a name="ln1325"> </a>
+<a name="ln1326">status_t</a>
+<a name="ln1327">_user_get_next_sem_info(team_id team, int32 *userCookie, struct sem_info *userInfo,</a>
+<a name="ln1328">	size_t size)</a>
+<a name="ln1329">{</a>
+<a name="ln1330">	struct sem_info info;</a>
+<a name="ln1331">	int32 cookie;</a>
+<a name="ln1332">	status_t status;</a>
+<a name="ln1333"> </a>
+<a name="ln1334">	if (userCookie == NULL || userInfo == NULL</a>
+<a name="ln1335">		|| !IS_USER_ADDRESS(userCookie) || !IS_USER_ADDRESS(userInfo)</a>
+<a name="ln1336">		|| user_memcpy(&amp;cookie, userCookie, sizeof(int32)) &lt; B_OK)</a>
+<a name="ln1337">		return B_BAD_ADDRESS;</a>
+<a name="ln1338"> </a>
+<a name="ln1339">	status = _get_next_sem_info(team, &amp;cookie, &amp;info, size);</a>
+<a name="ln1340"> </a>
+<a name="ln1341">	if (status == B_OK) {</a>
+<a name="ln1342">		if (user_memcpy(userInfo, &amp;info, size) &lt; B_OK</a>
+<a name="ln1343">			|| user_memcpy(userCookie, &amp;cookie, sizeof(int32)) &lt; B_OK)</a>
+<a name="ln1344">			return B_BAD_ADDRESS;</a>
+<a name="ln1345">	}</a>
+<a name="ln1346"> </a>
+<a name="ln1347">	return status;</a>
+<a name="ln1348">}</a>
+<a name="ln1349"> </a>
+<a name="ln1350"> </a>
+<a name="ln1351">status_t</a>
+<a name="ln1352">_user_set_sem_owner(sem_id id, team_id team)</a>
+<a name="ln1353">{</a>
+<a name="ln1354">	return set_sem_owner(id, team);</a>
+<a name="ln1355">}</a>
+
+</code></pre>
+<div class="balloon" rel="255"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v779/" target="_blank">V779</a> Unreachable code detected. It is possible that an error is present.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

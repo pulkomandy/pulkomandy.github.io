@@ -1,0 +1,916 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>BlockAllocator.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2001-2011, Haiku Inc. All rights reserved.</a>
+<a name="ln3"> * This file may be used under the terms of the MIT License.</a>
+<a name="ln4"> *</a>
+<a name="ln5"> * Authors:</a>
+<a name="ln6"> *		Janito V. Ferreira Filho</a>
+<a name="ln7"> *		Jérôme Duval</a>
+<a name="ln8"> */</a>
+<a name="ln9"> </a>
+<a name="ln10"> </a>
+<a name="ln11">#include &quot;BlockAllocator.h&quot;</a>
+<a name="ln12"> </a>
+<a name="ln13">#include &lt;util/AutoLock.h&gt;</a>
+<a name="ln14"> </a>
+<a name="ln15">#include &quot;BitmapBlock.h&quot;</a>
+<a name="ln16">#include &quot;Inode.h&quot;</a>
+<a name="ln17"> </a>
+<a name="ln18"> </a>
+<a name="ln19">#undef ASSERT</a>
+<a name="ln20">//#define TRACE_EXT2</a>
+<a name="ln21">#ifdef TRACE_EXT2</a>
+<a name="ln22">#	define TRACE(x...) dprintf(&quot;\33[34mext2:\33[0m &quot; x)</a>
+<a name="ln23">#	define ASSERT(x) { if (!(x)) kernel_debugger(&quot;ext2: assert failed: &quot; #x &quot;\n&quot;); }</a>
+<a name="ln24">#else</a>
+<a name="ln25">#	define TRACE(x...) ;</a>
+<a name="ln26">#	define ASSERT(x) ;</a>
+<a name="ln27">#endif</a>
+<a name="ln28">#define ERROR(x...) dprintf(&quot;\33[34mext2:\33[0m &quot; x)</a>
+<a name="ln29"> </a>
+<a name="ln30"> </a>
+<a name="ln31">class AllocationBlockGroup : public TransactionListener {</a>
+<a name="ln32">public:</a>
+<a name="ln33">						AllocationBlockGroup();</a>
+<a name="ln34">						~AllocationBlockGroup();</a>
+<a name="ln35"> </a>
+<a name="ln36">			status_t	Initialize(Volume* volume, uint32 blockGroup,</a>
+<a name="ln37">							uint32 numBits);</a>
+<a name="ln38"> </a>
+<a name="ln39">			bool		IsFull() const;</a>
+<a name="ln40"> </a>
+<a name="ln41">			status_t	Allocate(Transaction&amp; transaction, fsblock_t start,</a>
+<a name="ln42">							uint32 length);</a>
+<a name="ln43">			status_t	Free(Transaction&amp; transaction, uint32 start,</a>
+<a name="ln44">							uint32 length);</a>
+<a name="ln45">			status_t	FreeAll(Transaction&amp; transaction);</a>
+<a name="ln46">			status_t	Check(uint32 start, uint32 length);</a>
+<a name="ln47"> </a>
+<a name="ln48">			uint32		NumBits() const;</a>
+<a name="ln49">			uint32		FreeBits() const;</a>
+<a name="ln50">			fsblock_t	Start() const;</a>
+<a name="ln51"> </a>
+<a name="ln52">			fsblock_t	LargestStart() const;</a>
+<a name="ln53">			uint32		LargestLength() const;</a>
+<a name="ln54"> </a>
+<a name="ln55">			// TransactionListener implementation</a>
+<a name="ln56">			void		TransactionDone(bool success);</a>
+<a name="ln57">			void		RemovedFromTransaction();</a>
+<a name="ln58"> </a>
+<a name="ln59">private:</a>
+<a name="ln60">			status_t	_ScanFreeRanges();</a>
+<a name="ln61">			void		_AddFreeRange(uint32 start, uint32 length);</a>
+<a name="ln62">			void		_LockInTransaction(Transaction&amp; transaction);</a>
+<a name="ln63">			status_t	_InitGroup(Transaction&amp; transaction);</a>
+<a name="ln64">			bool		_IsSparse();</a>
+<a name="ln65">			uint32		_FirstFreeBlock();</a>
+<a name="ln66"> </a>
+<a name="ln67">			Volume*		fVolume;</a>
+<a name="ln68">			uint32		fBlockGroup;</a>
+<a name="ln69">			ext2_block_group* fGroupDescriptor;</a>
+<a name="ln70"> </a>
+<a name="ln71">			mutex		fLock;</a>
+<a name="ln72">			mutex		fTransactionLock;</a>
+<a name="ln73">			int32		fCurrentTransaction;</a>
+<a name="ln74"> </a>
+<a name="ln75">			fsblock_t	fStart;</a>
+<a name="ln76">			uint32		fNumBits;</a>
+<a name="ln77">			fsblock_t	fBitmapBlock;</a>
+<a name="ln78"> </a>
+<a name="ln79">			uint32		fFreeBits;</a>
+<a name="ln80">			uint32		fFirstFree;</a>
+<a name="ln81">			uint32		fLargestStart;</a>
+<a name="ln82">			uint32		fLargestLength;</a>
+<a name="ln83">			</a>
+<a name="ln84">			uint32		fPreviousFreeBits;</a>
+<a name="ln85">			uint32		fPreviousFirstFree;</a>
+<a name="ln86">			uint32		fPreviousLargestStart;</a>
+<a name="ln87">			uint32		fPreviousLargestLength;</a>
+<a name="ln88">};</a>
+<a name="ln89"> </a>
+<a name="ln90"> </a>
+<a name="ln91">AllocationBlockGroup::AllocationBlockGroup()</a>
+<a name="ln92">	:</a>
+<a name="ln93">	fVolume(NULL),</a>
+<a name="ln94">	fBlockGroup(0),</a>
+<a name="ln95">	fGroupDescriptor(NULL),</a>
+<a name="ln96">	fStart(0),</a>
+<a name="ln97">	fNumBits(0),</a>
+<a name="ln98">	fBitmapBlock(0),</a>
+<a name="ln99">	fFreeBits(0),</a>
+<a name="ln100">	fFirstFree(0),</a>
+<a name="ln101">	fLargestStart(0),</a>
+<a name="ln102">	fLargestLength(0),</a>
+<a name="ln103">	fPreviousFreeBits(0),</a>
+<a name="ln104">	fPreviousFirstFree(0),</a>
+<a name="ln105">	fPreviousLargestStart(0),</a>
+<a name="ln106">	fPreviousLargestLength(0)</a>
+<a name="ln107">{</a>
+<a name="ln108">	mutex_init(&amp;fLock, &quot;ext2 allocation block group&quot;);</a>
+<a name="ln109">	mutex_init(&amp;fTransactionLock, &quot;ext2 allocation block group transaction&quot;);</a>
+<a name="ln110">}</a>
+<a name="ln111"> </a>
+<a name="ln112"> </a>
+<a name="ln113">AllocationBlockGroup::~AllocationBlockGroup()</a>
+<a name="ln114">{</a>
+<a name="ln115">	mutex_destroy(&amp;fLock);</a>
+<a name="ln116">	mutex_destroy(&amp;fTransactionLock);</a>
+<a name="ln117">}</a>
+<a name="ln118"> </a>
+<a name="ln119"> </a>
+<a name="ln120">status_t</a>
+<a name="ln121">AllocationBlockGroup::Initialize(Volume* volume, uint32 blockGroup,</a>
+<a name="ln122">	uint32 numBits)</a>
+<a name="ln123">{</a>
+<a name="ln124">	fVolume = volume;</a>
+<a name="ln125">	fBlockGroup = blockGroup;</a>
+<a name="ln126">	fNumBits = numBits;</a>
+<a name="ln127">	fStart = blockGroup * numBits + fVolume-&gt;FirstDataBlock();</a>
+<a name="ln128"> </a>
+<a name="ln129">	status_t status = fVolume-&gt;GetBlockGroup(blockGroup, &amp;fGroupDescriptor);</a>
+<a name="ln130">	if (status != B_OK)</a>
+<a name="ln131">		return status;</a>
+<a name="ln132"> </a>
+<a name="ln133">	fBitmapBlock = fGroupDescriptor-&gt;BlockBitmap(fVolume-&gt;Has64bitFeature());</a>
+<a name="ln134"> </a>
+<a name="ln135">	if (fGroupDescriptor-&gt;Flags() &amp; EXT2_BLOCK_GROUP_BLOCK_UNINIT) {</a>
+<a name="ln136">		fFreeBits = fGroupDescriptor-&gt;FreeBlocks(fVolume-&gt;Has64bitFeature());</a>
+<a name="ln137">		fLargestLength = fFreeBits;</a>
+<a name="ln138">		fLargestStart = _FirstFreeBlock();</a>
+<a name="ln139">		TRACE(&quot;Group %&quot; B_PRIu32 &quot; is uninit\n&quot;, fBlockGroup);</a>
+<a name="ln140">		return B_OK;</a>
+<a name="ln141">	}</a>
+<a name="ln142">	</a>
+<a name="ln143">	status = _ScanFreeRanges();</a>
+<a name="ln144">	if (status != B_OK)</a>
+<a name="ln145">		return status;</a>
+<a name="ln146"> </a>
+<a name="ln147">	if (fGroupDescriptor-&gt;FreeBlocks(fVolume-&gt;Has64bitFeature())</a>
+<a name="ln148">		!= fFreeBits) {</a>
+<a name="ln149">		ERROR(&quot;AllocationBlockGroup(%&quot; B_PRIu32 &quot;,%&quot; B_PRIu64 &quot;)::Initialize()&quot;</a>
+<a name="ln150">			&quot;: Mismatch between counted free blocks (%&quot; B_PRIu32 &quot;/%&quot; B_PRIu32</a>
+<a name="ln151">			&quot;) and what is set on the group descriptor (%&quot; B_PRIu32 &quot;)\n&quot;,</a>
+<a name="ln152">			fBlockGroup, fBitmapBlock, fFreeBits, fNumBits,</a>
+<a name="ln153">			fGroupDescriptor-&gt;FreeBlocks(fVolume-&gt;Has64bitFeature()));</a>
+<a name="ln154">		return B_BAD_DATA;</a>
+<a name="ln155">	}</a>
+<a name="ln156"> </a>
+<a name="ln157">	fPreviousFreeBits = fFreeBits;</a>
+<a name="ln158">	fPreviousFirstFree = fFirstFree;</a>
+<a name="ln159">	fPreviousLargestStart = fLargestStart;</a>
+<a name="ln160">	fPreviousLargestLength = fLargestLength;</a>
+<a name="ln161">	</a>
+<a name="ln162">	return status;</a>
+<a name="ln163">}</a>
+<a name="ln164"> </a>
+<a name="ln165"> </a>
+<a name="ln166">status_t</a>
+<a name="ln167">AllocationBlockGroup::_ScanFreeRanges()</a>
+<a name="ln168">{</a>
+<a name="ln169">	TRACE(&quot;AllocationBlockGroup::_ScanFreeRanges() for group %&quot; B_PRIu32 &quot;\n&quot;,</a>
+<a name="ln170">		fBlockGroup);</a>
+<a name="ln171">	BitmapBlock block(fVolume, fNumBits);</a>
+<a name="ln172"> </a>
+<a name="ln173">	if (!block.SetTo(fBitmapBlock))</a>
+<a name="ln174">		return B_ERROR;</a>
+<a name="ln175"> </a>
+<a name="ln176">	fFreeBits = 0;</a>
+<a name="ln177">	uint32 start = 0;</a>
+<a name="ln178">	uint32 end = 0;</a>
+<a name="ln179"> </a>
+<a name="ln180">	while (end &lt; fNumBits) {</a>
+<a name="ln181">		block.FindNextUnmarked(start);</a>
+<a name="ln182">		ASSERT(block.CheckMarked(end, start - end));</a>
+<a name="ln183">		end = start;</a>
+<a name="ln184"> </a>
+<a name="ln185">		if (start != block.NumBits()) {</a>
+<a name="ln186">			block.FindNextMarked(end);</a>
+<a name="ln187">			_AddFreeRange(start, end - start);</a>
+<a name="ln188">			ASSERT(block.CheckUnmarked(fLargestStart, fLargestLength));</a>
+<a name="ln189">			start = end;</a>
+<a name="ln190">		}</a>
+<a name="ln191">	}</a>
+<a name="ln192"> </a>
+<a name="ln193">	return B_OK;</a>
+<a name="ln194">}</a>
+<a name="ln195"> </a>
+<a name="ln196"> </a>
+<a name="ln197">bool</a>
+<a name="ln198">AllocationBlockGroup::IsFull() const</a>
+<a name="ln199">{</a>
+<a name="ln200">	return fFreeBits == 0;</a>
+<a name="ln201">}</a>
+<a name="ln202"> </a>
+<a name="ln203"> </a>
+<a name="ln204">status_t</a>
+<a name="ln205">AllocationBlockGroup::Allocate(Transaction&amp; transaction, fsblock_t _start,</a>
+<a name="ln206">	uint32 length)</a>
+<a name="ln207">{</a>
+<a name="ln208">	uint32 start = _start - fStart;</a>
+<a name="ln209">	TRACE(&quot;AllocationBlockGroup::Allocate(%&quot; B_PRIu32 &quot;,%&quot; B_PRIu32 &quot;)\n&quot;,</a>
+<a name="ln210">		start, length);</a>
+<a name="ln211">	if (length == 0)</a>
+<a name="ln212">		return B_OK;</a>
+<a name="ln213"> </a>
+<a name="ln214">	uint32 end = start + length;</a>
+<a name="ln215">	if (end &gt; fNumBits)</a>
+<a name="ln216">		return B_BAD_VALUE;</a>
+<a name="ln217"> </a>
+<a name="ln218">	_LockInTransaction(transaction);</a>
+<a name="ln219">	_InitGroup(transaction);</a>
+<a name="ln220"> </a>
+<a name="ln221">	BitmapBlock block(fVolume, fNumBits);</a>
+<a name="ln222"> </a>
+<a name="ln223">	if (!block.SetToWritable(transaction, fBitmapBlock))</a>
+<a name="ln224">		return B_ERROR;</a>
+<a name="ln225"> </a>
+<a name="ln226">	TRACE(&quot;AllocationBlockGroup::Allocate(): Largest range in %&quot; B_PRIu32 &quot;-%&quot;</a>
+<a name="ln227">		B_PRIu32 &quot;\n&quot;, fLargestStart, fLargestStart + fLargestLength);</a>
+<a name="ln228">	ASSERT(block.CheckUnmarked(fLargestStart, fLargestLength));</a>
+<a name="ln229">	</a>
+<a name="ln230">	if (!block.Mark(start, length)) {</a>
+<a name="ln231">		ERROR(&quot;Failed to allocate blocks from %&quot; B_PRIu32 &quot; to %&quot; B_PRIu32</a>
+<a name="ln232">			&quot;. Some were already allocated.\n&quot;, start, start + length);</a>
+<a name="ln233">		return B_ERROR;</a>
+<a name="ln234">	}</a>
+<a name="ln235"> </a>
+<a name="ln236">	fFreeBits -= length;</a>
+<a name="ln237">	fGroupDescriptor-&gt;SetFreeBlocks(fFreeBits, fVolume-&gt;Has64bitFeature());</a>
+<a name="ln238">	fVolume-&gt;WriteBlockGroup(transaction, fBlockGroup);</a>
+<a name="ln239"> </a>
+<a name="ln240">	if (start == fLargestStart) {</a>
+<a name="ln241">		if (fFirstFree == fLargestStart)</a>
+<a name="ln242">			fFirstFree += length;</a>
+<a name="ln243"> </a>
+<a name="ln244">		fLargestStart += length;</a>
+<a name="ln245">		fLargestLength -= length;</a>
+<a name="ln246">	} else if (start + length == fLargestStart + fLargestLength) {</a>
+<a name="ln247">		fLargestLength -= length;</a>
+<a name="ln248">	} else if (start &lt; fLargestStart + fLargestLength</a>
+<a name="ln249">			&amp;&amp; start &gt; fLargestStart) {</a>
+<a name="ln250">		uint32 firstLength = start - fLargestStart;</a>
+<a name="ln251">		uint32 secondLength = fLargestStart + fLargestLength</a>
+<a name="ln252">			- (start + length);</a>
+<a name="ln253"> </a>
+<a name="ln254">		if (firstLength &gt;= secondLength) {</a>
+<a name="ln255">			fLargestLength = firstLength;</a>
+<a name="ln256">		} else {</a>
+<a name="ln257">			fLargestLength = secondLength;</a>
+<a name="ln258">			fLargestStart = start + length;</a>
+<a name="ln259">		}</a>
+<a name="ln260">	} else {</a>
+<a name="ln261">		// No need to revalidate the largest free range</a>
+<a name="ln262">		return B_OK;</a>
+<a name="ln263">	}</a>
+<a name="ln264"> </a>
+<a name="ln265">	TRACE(&quot;AllocationBlockGroup::Allocate(): Largest range in %&quot; B_PRIu32 &quot;-%&quot;</a>
+<a name="ln266">		B_PRIu32 &quot;\n&quot;, fLargestStart, fLargestStart + fLargestLength);</a>
+<a name="ln267">	ASSERT(block.CheckUnmarked(fLargestStart, fLargestLength));</a>
+<a name="ln268"> </a>
+<a name="ln269">	if (fLargestLength &lt; fNumBits / 2)</a>
+<a name="ln270">		block.FindLargestUnmarkedRange(fLargestStart, fLargestLength);</a>
+<a name="ln271">	ASSERT(block.CheckUnmarked(fLargestStart, fLargestLength));</a>
+<a name="ln272"> </a>
+<a name="ln273">	return B_OK;</a>
+<a name="ln274">}</a>
+<a name="ln275"> </a>
+<a name="ln276"> </a>
+<a name="ln277">status_t</a>
+<a name="ln278">AllocationBlockGroup::Free(Transaction&amp; transaction, uint32 start,</a>
+<a name="ln279">	uint32 length)</a>
+<a name="ln280">{</a>
+<a name="ln281">	TRACE(&quot;AllocationBlockGroup::Free(): start: %&quot; B_PRIu32 &quot;, length %&quot;</a>
+<a name="ln282">		B_PRIu32 &quot;\n&quot;, start, length);</a>
+<a name="ln283"> </a>
+<a name="ln284">	if (length == 0)</a>
+<a name="ln285">		return B_OK;</a>
+<a name="ln286"> </a>
+<a name="ln287">	uint32 end = start + length;</a>
+<a name="ln288">	if (end &gt; fNumBits)</a>
+<a name="ln289">		return B_BAD_VALUE;</a>
+<a name="ln290"> </a>
+<a name="ln291">	_LockInTransaction(transaction);</a>
+<a name="ln292">	if (fGroupDescriptor-&gt;Flags() &amp; EXT2_BLOCK_GROUP_BLOCK_UNINIT)</a>
+<a name="ln293">		panic(&quot;AllocationBlockGroup::Free() can't free blocks if uninit\n&quot;);</a>
+<a name="ln294"> </a>
+<a name="ln295">	BitmapBlock block(fVolume, fNumBits);</a>
+<a name="ln296"> </a>
+<a name="ln297">	if (!block.SetToWritable(transaction, fBitmapBlock))</a>
+<a name="ln298">		return B_ERROR;</a>
+<a name="ln299"> </a>
+<a name="ln300">	TRACE(&quot;AllocationBlockGroup::Free(): Largest range in %&quot; B_PRIu32 &quot;-%&quot;</a>
+<a name="ln301">		B_PRIu32 &quot;\n&quot;, fLargestStart, fLargestStart + fLargestLength);</a>
+<a name="ln302">	ASSERT(block.CheckUnmarked(fLargestStart, fLargestLength));</a>
+<a name="ln303"> </a>
+<a name="ln304">	if (!block.Unmark(start, length)) {</a>
+<a name="ln305">		ERROR(&quot;Failed to free blocks from %&quot; B_PRIu32 &quot; to %&quot; B_PRIu32</a>
+<a name="ln306">			&quot;. Some were already freed.\n&quot;, start, start + length);</a>
+<a name="ln307">		return B_ERROR;</a>
+<a name="ln308">	}</a>
+<a name="ln309"> </a>
+<a name="ln310">	TRACE(&quot;AllocationGroup::Free(): Unmarked bits in bitmap\n&quot;);</a>
+<a name="ln311"> </a>
+<a name="ln312">	if (fFirstFree &gt; start)</a>
+<a name="ln313">		fFirstFree = start;</a>
+<a name="ln314"> </a>
+<a name="ln315">	if (start + length == fLargestStart) {</a>
+<a name="ln316">		fLargestStart = start;</a>
+<a name="ln317">		fLargestLength += length;</a>
+<a name="ln318">	} else if (start == fLargestStart + fLargestLength) {</a>
+<a name="ln319">		fLargestLength += length;</a>
+<a name="ln320">	} else if (fLargestLength &lt;= fNumBits / 2) {</a>
+<a name="ln321">		// May have merged with some free blocks, becoming the largest</a>
+<a name="ln322">		uint32 newEnd = start + length;</a>
+<a name="ln323">		block.FindNextMarked(newEnd);</a>
+<a name="ln324"> </a>
+<a name="ln325">		uint32 newStart = start;</a>
+<a name="ln326">		block.FindPreviousMarked(newStart);</a>
+<a name="ln327">		newStart++;</a>
+<a name="ln328"> </a>
+<a name="ln329">		if (newEnd - newStart &gt; fLargestLength) {</a>
+<a name="ln330">			fLargestLength = newEnd - newStart;</a>
+<a name="ln331">			fLargestStart = newStart;</a>
+<a name="ln332">		}</a>
+<a name="ln333">	}</a>
+<a name="ln334"> </a>
+<a name="ln335">	TRACE(&quot;AllocationBlockGroup::Free(): Largest range in %&quot; B_PRIu32 &quot;-%&quot;</a>
+<a name="ln336">		B_PRIu32 &quot;\n&quot;, fLargestStart, fLargestStart + fLargestLength);</a>
+<a name="ln337">	ASSERT(block.CheckUnmarked(fLargestStart, fLargestLength));</a>
+<a name="ln338"> </a>
+<a name="ln339">	fFreeBits += length;</a>
+<a name="ln340">	fGroupDescriptor-&gt;SetFreeBlocks(fFreeBits, fVolume-&gt;Has64bitFeature());</a>
+<a name="ln341">	fVolume-&gt;WriteBlockGroup(transaction, fBlockGroup);</a>
+<a name="ln342"> </a>
+<a name="ln343">	return B_OK;</a>
+<a name="ln344">}</a>
+<a name="ln345"> </a>
+<a name="ln346"> </a>
+<a name="ln347">status_t</a>
+<a name="ln348">AllocationBlockGroup::FreeAll(Transaction&amp; transaction)</a>
+<a name="ln349">{</a>
+<a name="ln350">	return Free(transaction, 0, fNumBits);</a>
+<a name="ln351">}</a>
+<a name="ln352"> </a>
+<a name="ln353"> </a>
+<a name="ln354">uint32</a>
+<a name="ln355">AllocationBlockGroup::NumBits() const</a>
+<a name="ln356">{</a>
+<a name="ln357">	return fNumBits;</a>
+<a name="ln358">}</a>
+<a name="ln359"> </a>
+<a name="ln360"> </a>
+<a name="ln361">uint32</a>
+<a name="ln362">AllocationBlockGroup::FreeBits() const</a>
+<a name="ln363">{</a>
+<a name="ln364">	return fFreeBits;</a>
+<a name="ln365">}</a>
+<a name="ln366"> </a>
+<a name="ln367"> </a>
+<a name="ln368">fsblock_t</a>
+<a name="ln369">AllocationBlockGroup::Start() const</a>
+<a name="ln370">{</a>
+<a name="ln371">	return fStart;</a>
+<a name="ln372">}</a>
+<a name="ln373"> </a>
+<a name="ln374"> </a>
+<a name="ln375">fsblock_t</a>
+<a name="ln376">AllocationBlockGroup::LargestStart() const</a>
+<a name="ln377">{</a>
+<a name="ln378">	return fStart + fLargestStart;</a>
+<a name="ln379">}</a>
+<a name="ln380"> </a>
+<a name="ln381"> </a>
+<a name="ln382">uint32</a>
+<a name="ln383">AllocationBlockGroup::LargestLength() const</a>
+<a name="ln384">{</a>
+<a name="ln385">	return fLargestLength;</a>
+<a name="ln386">}</a>
+<a name="ln387"> </a>
+<a name="ln388"> </a>
+<a name="ln389">void</a>
+<a name="ln390">AllocationBlockGroup::_AddFreeRange(uint32 start, uint32 length)</a>
+<a name="ln391">{</a>
+<a name="ln392">	if (IsFull()) {</a>
+<a name="ln393">		fFirstFree = start;</a>
+<a name="ln394">		fLargestStart = start;</a>
+<a name="ln395">		fLargestLength = length;</a>
+<a name="ln396">	} else if (length &gt; fLargestLength) {</a>
+<a name="ln397">		fLargestStart = start;</a>
+<a name="ln398">		fLargestLength = length;</a>
+<a name="ln399">	}</a>
+<a name="ln400"> </a>
+<a name="ln401">	fFreeBits += length;</a>
+<a name="ln402">}</a>
+<a name="ln403"> </a>
+<a name="ln404"> </a>
+<a name="ln405">void</a>
+<a name="ln406">AllocationBlockGroup::_LockInTransaction(Transaction&amp; transaction)</a>
+<a name="ln407">{</a>
+<a name="ln408">	mutex_lock(&amp;fLock);</a>
+<a name="ln409"> </a>
+<a name="ln410">	if (transaction.ID() != fCurrentTransaction) {</a>
+<a name="ln411">		mutex_unlock(&amp;fLock);</a>
+<a name="ln412"> </a>
+<a name="ln413">		mutex_lock(&amp;fTransactionLock);</a>
+<a name="ln414">		mutex_lock(&amp;fLock);</a>
+<a name="ln415"> </a>
+<a name="ln416">		fCurrentTransaction = transaction.ID();</a>
+<a name="ln417">		transaction.AddListener(this);</a>
+<a name="ln418">	}</a>
+<a name="ln419"> </a>
+<a name="ln420">	mutex_unlock(&amp;fLock);</a>
+<a name="ln421">}</a>
+<a name="ln422"> </a>
+<a name="ln423"> </a>
+<a name="ln424">status_t</a>
+<a name="ln425">AllocationBlockGroup::_InitGroup(Transaction&amp; transaction)</a>
+<a name="ln426">{</a>
+<a name="ln427">	TRACE(&quot;AllocationBlockGroup::_InitGroup()\n&quot;);</a>
+<a name="ln428">	uint16 flags = fGroupDescriptor-&gt;Flags();</a>
+<a name="ln429">	if ((flags &amp; EXT2_BLOCK_GROUP_BLOCK_UNINIT) == 0)</a>
+<a name="ln430">		return B_OK;</a>
+<a name="ln431"> </a>
+<a name="ln432">	TRACE(&quot;AllocationBlockGroup::_InitGroup() initing\n&quot;);</a>
+<a name="ln433"> </a>
+<a name="ln434">	BitmapBlock blockBitmap(fVolume, fNumBits);</a>
+<a name="ln435">	if (!blockBitmap.SetToWritable(transaction, fBitmapBlock))</a>
+<a name="ln436">		return B_ERROR;</a>
+<a name="ln437">	blockBitmap.Mark(0, _FirstFreeBlock(), true);</a>
+<a name="ln438">	blockBitmap.Unmark(0, fNumBits, true);</a>
+<a name="ln439">	</a>
+<a name="ln440">	fGroupDescriptor-&gt;SetFlags(flags &amp; ~EXT2_BLOCK_GROUP_BLOCK_UNINIT);</a>
+<a name="ln441">	fVolume-&gt;WriteBlockGroup(transaction, fBlockGroup);</a>
+<a name="ln442"> </a>
+<a name="ln443">	status_t status = _ScanFreeRanges();</a>
+<a name="ln444">	if (status != B_OK)</a>
+<a name="ln445">		return status;</a>
+<a name="ln446"> </a>
+<a name="ln447">	if (fGroupDescriptor-&gt;FreeBlocks(fVolume-&gt;Has64bitFeature())</a>
+<a name="ln448">		!= fFreeBits) {</a>
+<a name="ln449">		ERROR(&quot;AllocationBlockGroup(%&quot; B_PRIu32 &quot;,%&quot; B_PRIu64 &quot;)::_InitGroup()&quot;</a>
+<a name="ln450">			&quot;: Mismatch between counted free blocks (%&quot; B_PRIu32 &quot;/%&quot; B_PRIu32</a>
+<a name="ln451">			&quot;) and what is set on the group descriptor (%&quot; B_PRIu32 &quot;)\n&quot;,</a>
+<a name="ln452">			fBlockGroup, fBitmapBlock, fFreeBits, fNumBits,</a>
+<a name="ln453">			fGroupDescriptor-&gt;FreeBlocks(fVolume-&gt;Has64bitFeature()));</a>
+<a name="ln454">		return B_BAD_DATA;</a>
+<a name="ln455">	}</a>
+<a name="ln456"> </a>
+<a name="ln457">	TRACE(&quot;AllocationBlockGroup::_InitGroup() init OK\n&quot;);</a>
+<a name="ln458"> </a>
+<a name="ln459">	return B_OK;</a>
+<a name="ln460">}</a>
+<a name="ln461"> </a>
+<a name="ln462"> </a>
+<a name="ln463">bool</a>
+<a name="ln464">AllocationBlockGroup::_IsSparse()</a>
+<a name="ln465">{</a>
+<a name="ln466">	if (fBlockGroup &lt;= 1)</a>
+<a name="ln467">		return true;</a>
+<a name="ln468">	if (fBlockGroup &amp; 0x1)</a>
+<a name="ln469">		return false;</a>
+<a name="ln470"> </a>
+<a name="ln471">	uint32 i = fBlockGroup;</a>
+<a name="ln472">	while (i % 7 == 0)</a>
+<a name="ln473">		i /= 7;</a>
+<a name="ln474">	if (i == 1)</a>
+<a name="ln475">		return true;</a>
+<a name="ln476"> </a>
+<a name="ln477">	i = fBlockGroup;</a>
+<a name="ln478">	while (i % 5 == 0)</a>
+<a name="ln479">		i /= 5;</a>
+<a name="ln480">	if (i == 1)</a>
+<a name="ln481">		return true;</a>
+<a name="ln482"> </a>
+<a name="ln483">	i = fBlockGroup;</a>
+<a name="ln484">	while (i % 3 == 0)</a>
+<a name="ln485">		i /= 3;</a>
+<a name="ln486">	if (i == 1)</a>
+<a name="ln487">		return true;</a>
+<a name="ln488"> </a>
+<a name="ln489">	return false;</a>
+<a name="ln490">}</a>
+<a name="ln491"> </a>
+<a name="ln492"> </a>
+<a name="ln493">uint32</a>
+<a name="ln494">AllocationBlockGroup::_FirstFreeBlock()</a>
+<a name="ln495">{</a>
+<a name="ln496">	uint32 first = 1;</a>
+<a name="ln497">	if (_IsSparse())</a>
+<a name="ln498">		first = 0;</a>
+<a name="ln499">	else if (!fVolume-&gt;HasMetaGroupFeature()) {</a>
+<a name="ln500">		first += fVolume-&gt;SuperBlock().ReservedGDTBlocks();</a>
+<a name="ln501">		first += fVolume-&gt;NumGroups();</a>
+<a name="ln502">	}</a>
+<a name="ln503">	return first;</a>
+<a name="ln504">}</a>
+<a name="ln505"> </a>
+<a name="ln506"> </a>
+<a name="ln507">void</a>
+<a name="ln508">AllocationBlockGroup::TransactionDone(bool success)</a>
+<a name="ln509">{</a>
+<a name="ln510">	if (success) {</a>
+<a name="ln511">		TRACE(&quot;AllocationBlockGroup::TransactionDone(): The transaction &quot;</a>
+<a name="ln512">			&quot;succeeded, discarding previous state\n&quot;);</a>
+<a name="ln513">		fPreviousFreeBits = fFreeBits;</a>
+<a name="ln514">		fPreviousFirstFree = fFirstFree;</a>
+<a name="ln515">		fPreviousLargestStart = fLargestStart;</a>
+<a name="ln516">		fPreviousLargestLength = fLargestLength;</a>
+<a name="ln517">	} else {</a>
+<a name="ln518">		TRACE(&quot;AllocationBlockGroup::TransactionDone(): The transaction &quot;</a>
+<a name="ln519">			&quot;failed, restoring to previous state\n&quot;);</a>
+<a name="ln520">		fFreeBits = fPreviousFreeBits;</a>
+<a name="ln521">		fFirstFree = fPreviousFirstFree;</a>
+<a name="ln522">		fLargestStart = fPreviousLargestStart;</a>
+<a name="ln523">		fLargestLength = fPreviousLargestLength;</a>
+<a name="ln524">	}</a>
+<a name="ln525">}</a>
+<a name="ln526"> </a>
+<a name="ln527"> </a>
+<a name="ln528">void</a>
+<a name="ln529">AllocationBlockGroup::RemovedFromTransaction()</a>
+<a name="ln530">{</a>
+<a name="ln531">	mutex_unlock(&amp;fTransactionLock);</a>
+<a name="ln532">	fCurrentTransaction = -1;</a>
+<a name="ln533">}</a>
+<a name="ln534"> </a>
+<a name="ln535"> </a>
+<a name="ln536">BlockAllocator::BlockAllocator(Volume* volume)</a>
+<a name="ln537">	:</a>
+<a name="ln538">	fVolume(volume),</a>
+<a name="ln539">	fGroups(NULL),</a>
+<a name="ln540">	fBlocksPerGroup(0),</a>
+<a name="ln541">	fNumBlocks(0),</a>
+<a name="ln542">	fNumGroups(0)</a>
+<a name="ln543">{</a>
+<a name="ln544">	mutex_init(&amp;fLock, &quot;ext2 block allocator&quot;);</a>
+<a name="ln545">}</a>
+<a name="ln546"> </a>
+<a name="ln547"> </a>
+<a name="ln548">BlockAllocator::~BlockAllocator()</a>
+<a name="ln549">{</a>
+<a name="ln550">	mutex_destroy(&amp;fLock);</a>
+<a name="ln551"> </a>
+<a name="ln552">	if (fGroups != NULL)</a>
+<a name="ln553">		delete [] fGroups;</a>
+<a name="ln554">}</a>
+<a name="ln555"> </a>
+<a name="ln556"> </a>
+<a name="ln557">status_t</a>
+<a name="ln558">BlockAllocator::Initialize()</a>
+<a name="ln559">{</a>
+<a name="ln560">	fBlocksPerGroup = fVolume-&gt;BlocksPerGroup();</a>
+<a name="ln561">	fNumGroups = fVolume-&gt;NumGroups();</a>
+<a name="ln562">	fFirstBlock = fVolume-&gt;FirstDataBlock();</a>
+<a name="ln563">	fNumBlocks = fVolume-&gt;NumBlocks();</a>
+<a name="ln564">	</a>
+<a name="ln565">	TRACE(&quot;BlockAllocator::Initialize(): blocks per group: %&quot; B_PRIu32</a>
+<a name="ln566">		&quot;, block groups: %&quot; B_PRIu32 &quot;, first block: %&quot; B_PRIu64</a>
+<a name="ln567">		&quot;, num blocks: %&quot; B_PRIu64 &quot;\n&quot;, fBlocksPerGroup, fNumGroups,</a>
+<a name="ln568">		fFirstBlock, fNumBlocks);</a>
+<a name="ln569"> </a>
+<a name="ln570">	fGroups = new(std::nothrow) AllocationBlockGroup[fNumGroups];</a>
+<a name="ln571">	if (fGroups == NULL)</a>
+<a name="ln572">		return B_NO_MEMORY;</a>
+<a name="ln573"> </a>
+<a name="ln574">	TRACE(&quot;BlockAllocator::Initialize(): allocated allocation block groups\n&quot;);</a>
+<a name="ln575"> </a>
+<a name="ln576">	mutex_lock(&amp;fLock);</a>
+<a name="ln577">		// Released by _Initialize</a>
+<a name="ln578"> </a>
+<a name="ln579">	thread_id id = -1; // spawn_kernel_thread(</a>
+<a name="ln580">		// (thread_func)BlockAllocator::_Initialize, &quot;ext2 block allocator&quot;,</a>
+<a name="ln581">		// B_LOW_PRIORITY, this);</a>
+<a name="ln582">	if (id &lt; B_OK)</a>
+<a name="ln583">		return _Initialize(this);</a>
+<a name="ln584"> </a>
+<a name="ln585">	// mutex_transfer_lock(&amp;fLock, id);</a>
+<a name="ln586"> </a>
+<a name="ln587">	// return resume_thread(id);</a>
+<a name="ln588">	panic(&quot;Failed to fall back to synchronous block allocator&quot;</a>
+<a name="ln589">		&quot;initialization.\n&quot;);</a>
+<a name="ln590">	return B_ERROR;</a>
+<a name="ln591">}</a>
+<a name="ln592"> </a>
+<a name="ln593"> </a>
+<a name="ln594">status_t</a>
+<a name="ln595">BlockAllocator::AllocateBlocks(Transaction&amp; transaction, uint32 minimum,</a>
+<a name="ln596">	uint32 maximum, uint32&amp; blockGroup, fsblock_t&amp; start, uint32&amp; length)</a>
+<a name="ln597">{</a>
+<a name="ln598">	TRACE(&quot;BlockAllocator::AllocateBlocks()\n&quot;);</a>
+<a name="ln599">	MutexLocker lock(fLock);</a>
+<a name="ln600">	TRACE(&quot;BlockAllocator::AllocateBlocks(): Acquired lock\n&quot;);</a>
+<a name="ln601"> </a>
+<a name="ln602">	TRACE(&quot;BlockAllocator::AllocateBlocks(): transaction: %&quot; B_PRId32 &quot;, min: &quot;</a>
+<a name="ln603">		&quot;%&quot; B_PRIu32 &quot;, max: %&quot; B_PRIu32 &quot;, block group: %&quot; B_PRIu32 &quot;, start:&quot;</a>
+<a name="ln604">		&quot; %&quot; B_PRIu64 &quot;, num groups: %&quot; B_PRIu32 &quot;\n&quot;, transaction.ID(),</a>
+<a name="ln605">		minimum, maximum, blockGroup, start, fNumGroups);</a>
+<a name="ln606"> </a>
+<a name="ln607">	fsblock_t bestStart = 0;</a>
+<a name="ln608">	uint32 bestLength = 0;</a>
+<a name="ln609">	uint32 bestGroup = 0;</a>
+<a name="ln610"> </a>
+<a name="ln611">	uint32 groupNum = blockGroup;</a>
+<a name="ln612"> </a>
+<a name="ln613">	AllocationBlockGroup* last = &amp;fGroups[fNumGroups];</a>
+<a name="ln614">	AllocationBlockGroup* group = &amp;fGroups[blockGroup];</a>
+<a name="ln615"> </a>
+<a name="ln616">	for (int32 iterations = 0; iterations &lt; 2; iterations++) {</a>
+<a name="ln617">		for (; group &lt; last; ++group, ++groupNum) {</a>
+<a name="ln618">			TRACE(&quot;BlockAllocator::AllocateBlocks(): Group %&quot; B_PRIu32</a>
+<a name="ln619">				&quot; has largest length of %&quot; B_PRIu32 &quot;\n&quot;, groupNum,</a>
+<a name="ln620">				group-&gt;LargestLength());</a>
+<a name="ln621"> </a>
+<a name="ln622">			if (group-&gt;LargestLength() &gt; bestLength) {</a>
+<a name="ln623">				if (start &lt;= group-&gt;LargestStart()) {</a>
+<a name="ln624">					bestStart = group-&gt;LargestStart();</a>
+<a name="ln625">					bestLength = group-&gt;LargestLength();</a>
+<a name="ln626">					bestGroup = groupNum;</a>
+<a name="ln627"> </a>
+<a name="ln628">					TRACE(&quot;BlockAllocator::AllocateBlocks(): Found a better &quot;</a>
+<a name="ln629">						&quot;range: block group: %&quot; B_PRIu32 &quot;, %&quot; B_PRIu64 &quot;-%&quot;</a>
+<a name="ln630">						B_PRIu64 &quot;\n&quot;, groupNum, bestStart,</a>
+<a name="ln631">						bestStart + bestLength);</a>
+<a name="ln632"> </a>
+<a name="ln633">					if (bestLength &gt;= maximum)</a>
+<a name="ln634">						break;</a>
+<a name="ln635">				}</a>
+<a name="ln636">			}</a>
+<a name="ln637"> </a>
+<a name="ln638">			start = 0;</a>
+<a name="ln639">		}</a>
+<a name="ln640"> </a>
+<a name="ln641">		if (bestLength &gt;= maximum)</a>
+<a name="ln642">			break;</a>
+<a name="ln643"> </a>
+<a name="ln644">		groupNum = 0;</a>
+<a name="ln645"> </a>
+<a name="ln646">		group = &amp;fGroups[0];</a>
+<a name="ln647">		last = &amp;fGroups[blockGroup + 1];</a>
+<a name="ln648">	}</a>
+<a name="ln649"> </a>
+<a name="ln650">	if (bestLength &lt; minimum) {</a>
+<a name="ln651">		TRACE(&quot;BlockAllocator::AllocateBlocks(): best range (length %&quot; B_PRIu32</a>
+<a name="ln652">			&quot;) doesn't have minimum length of %&quot; B_PRIu32 &quot;\n&quot;, bestLength,</a>
+<a name="ln653">			minimum);</a>
+<a name="ln654">		return B_DEVICE_FULL;</a>
+<a name="ln655">	}</a>
+<a name="ln656"> </a>
+<a name="ln657">	if (bestLength &gt; maximum)</a>
+<a name="ln658">		bestLength = maximum;</a>
+<a name="ln659"> </a>
+<a name="ln660">	TRACE(&quot;BlockAllocator::AllocateBlocks(): Selected range: block group %&quot;</a>
+<a name="ln661">		B_PRIu32 &quot;, %&quot; B_PRIu64 &quot;-%&quot; B_PRIu64 &quot;\n&quot;, bestGroup, bestStart,</a>
+<a name="ln662">		bestStart + bestLength);</a>
+<a name="ln663"> </a>
+<a name="ln664">	status_t status = fGroups[bestGroup].Allocate(transaction, bestStart,</a>
+<a name="ln665">		bestLength);</a>
+<a name="ln666">	if (status != B_OK) {</a>
+<a name="ln667">		TRACE(&quot;BlockAllocator::AllocateBlocks(): Failed to allocate %&quot; B_PRIu32</a>
+<a name="ln668">		&quot; blocks inside block group %&quot; B_PRIu32 &quot;.\n&quot;, bestLength, bestGroup);</a>
+<a name="ln669">		return status;</a>
+<a name="ln670">	}</a>
+<a name="ln671"> </a>
+<a name="ln672">	start = bestStart;</a>
+<a name="ln673">	length = bestLength;</a>
+<a name="ln674">	blockGroup = bestGroup;</a>
+<a name="ln675"> </a>
+<a name="ln676">	return B_OK;</a>
+<a name="ln677">}</a>
+<a name="ln678"> </a>
+<a name="ln679"> </a>
+<a name="ln680">status_t</a>
+<a name="ln681">BlockAllocator::Allocate(Transaction&amp; transaction, Inode* inode,</a>
+<a name="ln682">	off_t numBlocks, uint32 minimum, fsblock_t&amp; start, uint32&amp; allocated)</a>
+<a name="ln683">{</a>
+<a name="ln684">	if (numBlocks &lt;= 0)</a>
+<a name="ln685">		return B_ERROR;</a>
+<a name="ln686">	if (start &gt; fNumBlocks)</a>
+<a name="ln687">		return B_BAD_VALUE;</a>
+<a name="ln688"> </a>
+<a name="ln689">	uint32 group = inode-&gt;ID() / fVolume-&gt;InodesPerGroup();</a>
+<a name="ln690">	uint32 preferred = 0;</a>
+<a name="ln691"> </a>
+<a name="ln692">	if (inode-&gt;Size() &gt; 0) {</a>
+<a name="ln693">		// Try to allocate near it's last blocks</a>
+<a name="ln694">		ext2_data_stream* dataStream = &amp;inode-&gt;Node().stream;</a>
+<a name="ln695">		uint32 numBlocks = inode-&gt;Size() / fVolume-&gt;BlockSize() + 1;</a>
+<a name="ln696">		uint32 lastBlock = 0;</a>
+<a name="ln697"> </a>
+<a name="ln698">		// DANGER! What happens with sparse files?</a>
+<a name="ln699">		if (numBlocks &lt; EXT2_DIRECT_BLOCKS) {</a>
+<a name="ln700">			// Only direct blocks</a>
+<a name="ln701">			lastBlock = dataStream-&gt;direct[numBlocks];</a>
+<a name="ln702">		} else {</a>
+<a name="ln703">			numBlocks -= EXT2_DIRECT_BLOCKS - 1;</a>
+<a name="ln704">			uint32 numIndexes = fVolume-&gt;BlockSize() / 4;</a>
+<a name="ln705">				// block size / sizeof(int32)</a>
+<a name="ln706">			uint32 numIndexes2 = numIndexes * numIndexes;</a>
+<a name="ln707">			uint32 numIndexes3 = numIndexes2 * numIndexes;</a>
+<a name="ln708">			uint32 indexesInIndirect = numIndexes;</a>
+<a name="ln709">			uint32 indexesInDoubleIndirect = indexesInIndirect</a>
+<a name="ln710">				+ numIndexes2;</a>
+<a name="ln711">			// uint32 indexesInTripleIndirect = indexesInDoubleIndirect</a>
+<a name="ln712">				// + numIndexes3;</a>
+<a name="ln713"> </a>
+<a name="ln714">			uint32 doubleIndirectBlock = EXT2_DIRECT_BLOCKS + 1;</a>
+<a name="ln715">			uint32 indirectBlock = EXT2_DIRECT_BLOCKS;</a>
+<a name="ln716"> </a>
+<a name="ln717">			CachedBlock cached(fVolume);</a>
+<a name="ln718">			uint32* indirectData;</a>
+<a name="ln719"> </a>
+<a name="ln720">			if (numBlocks &gt; indexesInDoubleIndirect) {</a>
+<a name="ln721">				// Triple indirect blocks</a>
+<a name="ln722">				indirectData = (uint32*)cached.SetTo(EXT2_DIRECT_BLOCKS + 2);</a>
+<a name="ln723">				if (indirectData == NULL)</a>
+<a name="ln724">					return B_IO_ERROR;</a>
+<a name="ln725"> </a>
+<a name="ln726">				uint32 index = (numBlocks - indexesInDoubleIndirect)</a>
+<a name="ln727">					/ numIndexes3;</a>
+<a name="ln728">				doubleIndirectBlock = indirectData[index];</a>
+<a name="ln729">			}</a>
+<a name="ln730"> </a>
+<a name="ln731">			if (numBlocks &gt; indexesInIndirect) {</a>
+<a name="ln732">				// Double indirect blocks</a>
+<a name="ln733">				indirectData = (uint32*)cached.SetTo(doubleIndirectBlock);</a>
+<a name="ln734">				if (indirectData == NULL)</a>
+<a name="ln735">					return B_IO_ERROR;</a>
+<a name="ln736"> </a>
+<a name="ln737">				uint32 index = (numBlocks - indexesInIndirect) / numIndexes2;</a>
+<a name="ln738">				indirectBlock = indirectData[index];</a>
+<a name="ln739">			}</a>
+<a name="ln740"> </a>
+<a name="ln741">			indirectData = (uint32*)cached.SetTo(indirectBlock);</a>
+<a name="ln742">				if (indirectData == NULL)</a>
+<a name="ln743">					return B_IO_ERROR;</a>
+<a name="ln744"> </a>
+<a name="ln745">			uint32 index = numBlocks / numIndexes;</a>
+<a name="ln746">			lastBlock = indirectData[index];</a>
+<a name="ln747">		}</a>
+<a name="ln748"> </a>
+<a name="ln749">		group = (lastBlock - fFirstBlock) / fBlocksPerGroup;</a>
+<a name="ln750">		preferred = (lastBlock - fFirstBlock) % fBlocksPerGroup + 1;</a>
+<a name="ln751">	}</a>
+<a name="ln752"> </a>
+<a name="ln753">	// TODO: Apply some more policies</a>
+<a name="ln754"> </a>
+<a name="ln755">	return AllocateBlocks(transaction, minimum, minimum + 8, group, start,</a>
+<a name="ln756">		allocated);</a>
+<a name="ln757">}</a>
+<a name="ln758"> </a>
+<a name="ln759"> </a>
+<a name="ln760">status_t</a>
+<a name="ln761">BlockAllocator::Free(Transaction&amp; transaction, fsblock_t start, uint32 length)</a>
+<a name="ln762">{</a>
+<a name="ln763">	TRACE(&quot;BlockAllocator::Free(%&quot; B_PRIu64 &quot;, %&quot; B_PRIu32 &quot;)\n&quot;, start,</a>
+<a name="ln764">		length);</a>
+<a name="ln765">	MutexLocker lock(fLock);</a>
+<a name="ln766"> </a>
+<a name="ln767">	if (start &lt;= fFirstBlock) {</a>
+<a name="ln768">		panic(&quot;Trying to free superblock!\n&quot;);</a>
+<a name="ln769">		return B_BAD_VALUE;</a>
+<a name="ln770">	}</a>
+<a name="ln771"> </a>
+<a name="ln772">	if (length == 0)</a>
+<a name="ln773">		return B_OK;</a>
+<a name="ln774">	if (start &gt; fNumBlocks || length &gt; fNumBlocks)</a>
+<a name="ln775">		return B_BAD_VALUE;</a>
+<a name="ln776"> </a>
+<a name="ln777">	TRACE(&quot;BlockAllocator::Free(): first block: %&quot; B_PRIu64</a>
+<a name="ln778">		&quot;, blocks per group: %&quot; B_PRIu32 &quot;\n&quot;, fFirstBlock, fBlocksPerGroup);</a>
+<a name="ln779"> </a>
+<a name="ln780">	start -= fFirstBlock;</a>
+<a name="ln781">	off_t end = start + length - 1;</a>
+<a name="ln782"> </a>
+<a name="ln783">	uint32 group = start / fBlocksPerGroup;</a>
+<a name="ln784">	if (group &gt;= fNumGroups) {</a>
+<a name="ln785">		panic(&quot;BlockAllocator::Free() group %&quot; B_PRIu32 &quot; too big (fNumGroups &quot;</a>
+<a name="ln786">			&quot;%&quot; B_PRIu32 &quot;)\n&quot;, group, fNumGroups);</a>
+<a name="ln787">	}</a>
+<a name="ln788">	uint32 lastGroup = end / fBlocksPerGroup;</a>
+<a name="ln789">	start = start % fBlocksPerGroup;</a>
+<a name="ln790"> </a>
+<a name="ln791">	if (group == lastGroup)</a>
+<a name="ln792">		return fGroups[group].Free(transaction, start, length);</a>
+<a name="ln793"> </a>
+<a name="ln794">	TRACE(&quot;BlockAllocator::Free(): Freeing from group %&quot; B_PRIu32 &quot;: %&quot;</a>
+<a name="ln795">		B_PRIu64 &quot;, %&quot; B_PRIu64 &quot;\n&quot;, group,</a>
+<a name="ln796">		start, fGroups[group].NumBits() - start);</a>
+<a name="ln797"> </a>
+<a name="ln798">	status_t status = fGroups[group].Free(transaction, start,</a>
+<a name="ln799">		fGroups[group].NumBits() - start);</a>
+<a name="ln800">	if (status != B_OK)</a>
+<a name="ln801">		return status;</a>
+<a name="ln802"> </a>
+<a name="ln803">	for (++group; group &lt; lastGroup; ++group) {</a>
+<a name="ln804">		TRACE(&quot;BlockAllocator::Free(): Freeing all from group %&quot; B_PRIu32 &quot;\n&quot;,</a>
+<a name="ln805">			group);</a>
+<a name="ln806">		status = fGroups[group].FreeAll(transaction);</a>
+<a name="ln807">		if (status != B_OK)</a>
+<a name="ln808">			return status;</a>
+<a name="ln809">	}</a>
+<a name="ln810"> </a>
+<a name="ln811">	TRACE(&quot;BlockAllocator::Free(): Freeing from group %&quot; B_PRIu32 &quot;: 0-%&quot;</a>
+<a name="ln812">		B_PRIu64 &quot; \n&quot;, group, end % fBlocksPerGroup);</a>
+<a name="ln813">	return fGroups[group].Free(transaction, 0, (end + 1) % fBlocksPerGroup);</a>
+<a name="ln814">}</a>
+<a name="ln815"> </a>
+<a name="ln816"> </a>
+<a name="ln817">/*static*/ status_t</a>
+<a name="ln818">BlockAllocator::_Initialize(BlockAllocator* allocator)</a>
+<a name="ln819">{</a>
+<a name="ln820">	TRACE(&quot;BlockAllocator::_Initialize()\n&quot;);</a>
+<a name="ln821">	// fLock is already heald</a>
+<a name="ln822">	Volume* volume = allocator-&gt;fVolume;</a>
+<a name="ln823"> </a>
+<a name="ln824">	AllocationBlockGroup* groups = allocator-&gt;fGroups;</a>
+<a name="ln825">	uint32 numGroups = allocator-&gt;fNumGroups - 1;</a>
+<a name="ln826"> </a>
+<a name="ln827">	off_t freeBlocks = 0;</a>
+<a name="ln828">	TRACE(&quot;BlockAllocator::_Initialize(): free blocks: %&quot; B_PRIdOFF &quot;\n&quot;,</a>
+<a name="ln829">		freeBlocks);</a>
+<a name="ln830"> </a>
+<a name="ln831">	for (uint32 i = 0; i &lt; numGroups; ++i) {</a>
+<a name="ln832">		status_t status = groups[i].Initialize(volume, i, </a>
+<a name="ln833">			allocator-&gt;fBlocksPerGroup);</a>
+<a name="ln834">		if (status != B_OK) {</a>
+<a name="ln835">			mutex_unlock(&amp;allocator-&gt;fLock);</a>
+<a name="ln836">			return status;</a>
+<a name="ln837">		}</a>
+<a name="ln838"> </a>
+<a name="ln839">		freeBlocks += groups[i].FreeBits();</a>
+<a name="ln840">		TRACE(&quot;BlockAllocator::_Initialize(): free blocks: %&quot; B_PRIdOFF &quot;\n&quot;,</a>
+<a name="ln841">			freeBlocks);</a>
+<a name="ln842">	}</a>
+<a name="ln843">	</a>
+<a name="ln844">	// Last block group may have less blocks</a>
+<a name="ln845">	status_t status = groups[numGroups].Initialize(volume, numGroups,</a>
+<a name="ln846">		allocator-&gt;fNumBlocks - allocator-&gt;fBlocksPerGroup * numGroups</a>
+<a name="ln847">		- allocator-&gt;fFirstBlock);</a>
+<a name="ln848">	if (status != B_OK) {</a>
+<a name="ln849">		mutex_unlock(&amp;allocator-&gt;fLock);</a>
+<a name="ln850">		return status;</a>
+<a name="ln851">	}</a>
+<a name="ln852">	</a>
+<a name="ln853">	freeBlocks += groups[numGroups].FreeBits();</a>
+<a name="ln854"> </a>
+<a name="ln855">	TRACE(&quot;BlockAllocator::_Initialize(): free blocks: %&quot; B_PRIdOFF &quot;\n&quot;,</a>
+<a name="ln856">		freeBlocks);</a>
+<a name="ln857"> </a>
+<a name="ln858">	mutex_unlock(&amp;allocator-&gt;fLock);</a>
+<a name="ln859"> </a>
+<a name="ln860">	if (freeBlocks != volume-&gt;NumFreeBlocks()) {</a>
+<a name="ln861">		TRACE(&quot;Counted free blocks (%&quot; B_PRIdOFF &quot;) doesn't match value in the&quot;</a>
+<a name="ln862">			&quot; superblock (%&quot; B_PRIdOFF &quot;).\n&quot;, freeBlocks,</a>
+<a name="ln863">			volume-&gt;NumFreeBlocks());</a>
+<a name="ln864">		return B_BAD_DATA;</a>
+<a name="ln865">	}</a>
+<a name="ln866"> </a>
+<a name="ln867">	return B_OK;</a>
+<a name="ln868">}</a>
+
+</code></pre>
+<div class="balloon" rel="91"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fCurrentTransaction.</p></div>
+<div class="balloon" rel="536"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fFirstBlock.</p></div>
+<div class="balloon" rel="582"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v547/" target="_blank">V547</a> Expression 'id < ((int) 0)' is always true.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,1029 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>efi_gpt.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2009, Michael Lotz, mmlr@mlotz.ch. All rights reserved.</a>
+<a name="ln3"> * Copyright 2007-2013, Axel Dörfler, axeld@pinc-software.de.</a>
+<a name="ln4"> *</a>
+<a name="ln5"> * Distributed under the terms of the MIT License.</a>
+<a name="ln6"> */</a>
+<a name="ln7"> </a>
+<a name="ln8"> </a>
+<a name="ln9">#include &quot;efi_gpt.h&quot;</a>
+<a name="ln10"> </a>
+<a name="ln11">#include &lt;KernelExport.h&gt;</a>
+<a name="ln12">#include &lt;disk_device_manager/ddm_modules.h&gt;</a>
+<a name="ln13">#include &lt;disk_device_types.h&gt;</a>
+<a name="ln14">#ifdef _BOOT_MODE</a>
+<a name="ln15">#	include &lt;boot/partitions.h&gt;</a>
+<a name="ln16">#else</a>
+<a name="ln17">#	include &lt;DiskDeviceTypes.h&gt;</a>
+<a name="ln18">#	include &quot;PartitionLocker.h&quot;</a>
+<a name="ln19">#endif</a>
+<a name="ln20">#include &lt;util/kernel_cpp.h&gt;</a>
+<a name="ln21"> </a>
+<a name="ln22">#include &lt;errno.h&gt;</a>
+<a name="ln23">#include &lt;unistd.h&gt;</a>
+<a name="ln24">#include &lt;stdio.h&gt;</a>
+<a name="ln25">#include &lt;string.h&gt;</a>
+<a name="ln26"> </a>
+<a name="ln27">#ifndef _BOOT_MODE</a>
+<a name="ln28">#include &quot;uuid.h&quot;</a>
+<a name="ln29">#endif</a>
+<a name="ln30"> </a>
+<a name="ln31">#include &quot;Header.h&quot;</a>
+<a name="ln32">#include &quot;utility.h&quot;</a>
+<a name="ln33"> </a>
+<a name="ln34"> </a>
+<a name="ln35">#define TRACE_EFI_GPT</a>
+<a name="ln36">#ifdef TRACE_EFI_GPT</a>
+<a name="ln37">#	define TRACE(x) dprintf x</a>
+<a name="ln38">#else</a>
+<a name="ln39">#	define TRACE(x) ;</a>
+<a name="ln40">#endif</a>
+<a name="ln41"> </a>
+<a name="ln42"> </a>
+<a name="ln43">#define EFI_PARTITION_MODULE_NAME &quot;partitioning_systems/efi_gpt/v1&quot;</a>
+<a name="ln44"> </a>
+<a name="ln45"> </a>
+<a name="ln46">#ifndef _BOOT_MODE</a>
+<a name="ln47">static off_t</a>
+<a name="ln48">block_align(partition_data* partition, off_t offset, bool upwards)</a>
+<a name="ln49">{</a>
+<a name="ln50">	// Take HDs into account that hide the fact they are using a</a>
+<a name="ln51">	// block size of 4096 bytes, and round to that.</a>
+<a name="ln52">	uint32 blockSize = max_c(partition-&gt;block_size, 4096);</a>
+<a name="ln53">	if (upwards)</a>
+<a name="ln54">		return ((offset + blockSize - 1) / blockSize) * blockSize;</a>
+<a name="ln55"> </a>
+<a name="ln56">	return (offset / blockSize) * blockSize;</a>
+<a name="ln57">}</a>
+<a name="ln58">#endif // !_BOOT_MODE</a>
+<a name="ln59"> </a>
+<a name="ln60"> </a>
+<a name="ln61">//	#pragma mark - public module interface</a>
+<a name="ln62"> </a>
+<a name="ln63"> </a>
+<a name="ln64">static status_t</a>
+<a name="ln65">efi_gpt_std_ops(int32 op, ...)</a>
+<a name="ln66">{</a>
+<a name="ln67">	switch (op) {</a>
+<a name="ln68">		case B_MODULE_INIT:</a>
+<a name="ln69">		case B_MODULE_UNINIT:</a>
+<a name="ln70">			return B_OK;</a>
+<a name="ln71">	}</a>
+<a name="ln72"> </a>
+<a name="ln73">	return B_ERROR;</a>
+<a name="ln74">}</a>
+<a name="ln75"> </a>
+<a name="ln76"> </a>
+<a name="ln77">static float</a>
+<a name="ln78">efi_gpt_identify_partition(int fd, partition_data* partition, void** _cookie)</a>
+<a name="ln79">{</a>
+<a name="ln80">	EFI::Header* header = new (std::nothrow) EFI::Header(fd,</a>
+<a name="ln81">		(partition-&gt;size - 1) / partition-&gt;block_size, partition-&gt;block_size);</a>
+<a name="ln82">	status_t status = header-&gt;InitCheck();</a>
+<a name="ln83">	if (status != B_OK) {</a>
+<a name="ln84">		delete header;</a>
+<a name="ln85">		return -1;</a>
+<a name="ln86">	}</a>
+<a name="ln87"> </a>
+<a name="ln88">	*_cookie = header;</a>
+<a name="ln89">	if (header-&gt;IsDirty()) {</a>
+<a name="ln90">		// Either the main or the backup table is missing, it looks like someone</a>
+<a name="ln91">		// tried to erase the GPT with something else. Let's lower the priority,</a>
+<a name="ln92">		// so that other partitioning systems which use either only the start or</a>
+<a name="ln93">		// only the end of the drive, have a chance to run instead.</a>
+<a name="ln94">		return 0.75;</a>
+<a name="ln95">	}</a>
+<a name="ln96">	return 0.96;</a>
+<a name="ln97">		// This must be higher as Intel partitioning, as EFI can contain this</a>
+<a name="ln98">		// partitioning for compatibility</a>
+<a name="ln99">}</a>
+<a name="ln100"> </a>
+<a name="ln101"> </a>
+<a name="ln102">static status_t</a>
+<a name="ln103">efi_gpt_scan_partition(int fd, partition_data* partition, void* _cookie)</a>
+<a name="ln104">{</a>
+<a name="ln105">	TRACE((&quot;efi_gpt_scan_partition(cookie = %p)\n&quot;, _cookie));</a>
+<a name="ln106">	EFI::Header* header = (EFI::Header*)_cookie;</a>
+<a name="ln107"> </a>
+<a name="ln108">	partition-&gt;status = B_PARTITION_VALID;</a>
+<a name="ln109">	partition-&gt;flags |= B_PARTITION_PARTITIONING_SYSTEM;</a>
+<a name="ln110">	partition-&gt;content_size = partition-&gt;size;</a>
+<a name="ln111">	partition-&gt;content_cookie = header;</a>
+<a name="ln112"> </a>
+<a name="ln113">	// scan all children</a>
+<a name="ln114"> </a>
+<a name="ln115">	uint32 index = 0;</a>
+<a name="ln116"> </a>
+<a name="ln117">	for (uint32 i = 0; i &lt; header-&gt;EntryCount(); i++) {</a>
+<a name="ln118">		const efi_partition_entry&amp; entry = header-&gt;EntryAt(i);</a>
+<a name="ln119"> </a>
+<a name="ln120">		if (entry.partition_type == kEmptyGUID)</a>
+<a name="ln121">			continue;</a>
+<a name="ln122"> </a>
+<a name="ln123">		if (entry.EndBlock() * partition-&gt;block_size</a>
+<a name="ln124">				&gt; (uint64)partition-&gt;size) {</a>
+<a name="ln125">			TRACE((&quot;efi_gpt: child partition exceeds existing space (ends at &quot;</a>
+<a name="ln126">				&quot;block %&quot; B_PRIu64 &quot;)\n&quot;, entry.EndBlock()));</a>
+<a name="ln127">			continue;</a>
+<a name="ln128">		}</a>
+<a name="ln129"> </a>
+<a name="ln130">		if (entry.StartBlock() * partition-&gt;block_size == 0) {</a>
+<a name="ln131">			TRACE((&quot;efi_gpt: child partition starts at 0 (recursive entry)\n&quot;));</a>
+<a name="ln132">			continue;</a>
+<a name="ln133">		}</a>
+<a name="ln134"> </a>
+<a name="ln135">		partition_data* child = create_child_partition(partition-&gt;id, index++,</a>
+<a name="ln136">			partition-&gt;offset + entry.StartBlock() * partition-&gt;block_size,</a>
+<a name="ln137">			entry.BlockCount() * partition-&gt;block_size, -1);</a>
+<a name="ln138">		if (child == NULL) {</a>
+<a name="ln139">			TRACE((&quot;efi_gpt: Creating child at index %&quot; B_PRIu32 &quot; failed\n&quot;,</a>
+<a name="ln140">				index - 1));</a>
+<a name="ln141">			return B_ERROR;</a>
+<a name="ln142">		}</a>
+<a name="ln143"> </a>
+<a name="ln144">		char name[B_OS_NAME_LENGTH];</a>
+<a name="ln145">		to_utf8(entry.name, EFI_PARTITION_NAME_LENGTH, name, sizeof(name));</a>
+<a name="ln146">		child-&gt;name = strdup(name);</a>
+<a name="ln147">		child-&gt;type = strdup(get_partition_type(entry.partition_type));</a>
+<a name="ln148">		child-&gt;block_size = partition-&gt;block_size;</a>
+<a name="ln149">		child-&gt;cookie = (void*)(addr_t)i;</a>
+<a name="ln150">		child-&gt;content_cookie = header;</a>
+<a name="ln151">	}</a>
+<a name="ln152"> </a>
+<a name="ln153">	return B_OK;</a>
+<a name="ln154">}</a>
+<a name="ln155"> </a>
+<a name="ln156"> </a>
+<a name="ln157">static void</a>
+<a name="ln158">efi_gpt_free_identify_partition_cookie(partition_data* partition, void* _cookie)</a>
+<a name="ln159">{</a>
+<a name="ln160">	// Cookie is freed in efi_gpt_free_partition_content_cookie().</a>
+<a name="ln161">}</a>
+<a name="ln162"> </a>
+<a name="ln163"> </a>
+<a name="ln164">static void</a>
+<a name="ln165">efi_gpt_free_partition_content_cookie(partition_data* partition)</a>
+<a name="ln166">{</a>
+<a name="ln167">	delete (EFI::Header*)partition-&gt;content_cookie;</a>
+<a name="ln168">}</a>
+<a name="ln169"> </a>
+<a name="ln170"> </a>
+<a name="ln171">#ifndef _BOOT_MODE</a>
+<a name="ln172">static uint32</a>
+<a name="ln173">efi_gpt_get_supported_operations(partition_data* partition, uint32 mask)</a>
+<a name="ln174">{</a>
+<a name="ln175">	uint32 flags = B_DISK_SYSTEM_SUPPORTS_INITIALIZING</a>
+<a name="ln176">		| B_DISK_SYSTEM_SUPPORTS_SETTING_CONTENT_NAME</a>
+<a name="ln177">		| B_DISK_SYSTEM_SUPPORTS_MOVING</a>
+<a name="ln178">		| B_DISK_SYSTEM_SUPPORTS_RESIZING</a>
+<a name="ln179">		| B_DISK_SYSTEM_SUPPORTS_CREATING_CHILD;</a>
+<a name="ln180">		// TODO: check for available entries and partitionable space and only</a>
+<a name="ln181">		// add creating child support if both is valid</a>
+<a name="ln182"> </a>
+<a name="ln183">	return flags;</a>
+<a name="ln184">}</a>
+<a name="ln185"> </a>
+<a name="ln186"> </a>
+<a name="ln187">static uint32</a>
+<a name="ln188">efi_gpt_get_supported_child_operations(partition_data* partition,</a>
+<a name="ln189">	partition_data* child, uint32 mask)</a>
+<a name="ln190">{</a>
+<a name="ln191">	return B_DISK_SYSTEM_SUPPORTS_MOVING_CHILD</a>
+<a name="ln192">		| B_DISK_SYSTEM_SUPPORTS_RESIZING_CHILD</a>
+<a name="ln193">		| B_DISK_SYSTEM_SUPPORTS_SETTING_TYPE</a>
+<a name="ln194">		| B_DISK_SYSTEM_SUPPORTS_DELETING_CHILD;</a>
+<a name="ln195">}</a>
+<a name="ln196"> </a>
+<a name="ln197"> </a>
+<a name="ln198">static bool</a>
+<a name="ln199">efi_gpt_is_sub_system_for(partition_data* partition)</a>
+<a name="ln200">{</a>
+<a name="ln201">	// a GUID Partition Table doesn't usually live inside another partition</a>
+<a name="ln202">	return false;</a>
+<a name="ln203">}</a>
+<a name="ln204"> </a>
+<a name="ln205"> </a>
+<a name="ln206">static bool</a>
+<a name="ln207">efi_gpt_validate_resize(partition_data* partition, off_t* size)</a>
+<a name="ln208">{</a>
+<a name="ln209">	off_t newSize = *size;</a>
+<a name="ln210">	if (newSize == partition-&gt;size)</a>
+<a name="ln211">		return true;</a>
+<a name="ln212"> </a>
+<a name="ln213">	if (newSize &lt; 0)</a>
+<a name="ln214">		newSize = 0;</a>
+<a name="ln215">	else</a>
+<a name="ln216">		newSize = block_align(partition, newSize, false);</a>
+<a name="ln217"> </a>
+<a name="ln218">	// growing</a>
+<a name="ln219">	if (newSize &gt; partition-&gt;size) {</a>
+<a name="ln220">		*size = newSize;</a>
+<a name="ln221">		return true;</a>
+<a name="ln222">	}</a>
+<a name="ln223"> </a>
+<a name="ln224">	// shrinking, only so that no child would be truncated</a>
+<a name="ln225">	off_t newEnd = partition-&gt;offset + newSize;</a>
+<a name="ln226">	for (int32 i = 0; i &lt; partition-&gt;child_count; i++) {</a>
+<a name="ln227">		partition_data* child = get_child_partition(partition-&gt;id, i);</a>
+<a name="ln228">		if (child == NULL)</a>
+<a name="ln229">			continue;</a>
+<a name="ln230"> </a>
+<a name="ln231">		if (child-&gt;offset + child-&gt;size &gt; newEnd)</a>
+<a name="ln232">			newEnd = child-&gt;offset + child-&gt;size;</a>
+<a name="ln233">	}</a>
+<a name="ln234"> </a>
+<a name="ln235">	newSize = block_align(partition, newEnd - partition-&gt;offset, true);</a>
+<a name="ln236">	*size = newSize;</a>
+<a name="ln237">	return true;</a>
+<a name="ln238">}</a>
+<a name="ln239"> </a>
+<a name="ln240"> </a>
+<a name="ln241">static bool</a>
+<a name="ln242">efi_gpt_validate_resize_child(partition_data* partition, partition_data* child,</a>
+<a name="ln243">	off_t* size)</a>
+<a name="ln244">{</a>
+<a name="ln245">	off_t newSize = *size;</a>
+<a name="ln246">	if (newSize == child-&gt;size)</a>
+<a name="ln247">		return true;</a>
+<a name="ln248"> </a>
+<a name="ln249">	// shrinking</a>
+<a name="ln250">	if (newSize &lt; child-&gt;size) {</a>
+<a name="ln251">		if (newSize &lt; 0)</a>
+<a name="ln252">			newSize = 0;</a>
+<a name="ln253"> </a>
+<a name="ln254">		*size = block_align(partition, newSize, false);</a>
+<a name="ln255">		return true;</a>
+<a name="ln256">	}</a>
+<a name="ln257"> </a>
+<a name="ln258">	// growing, but only so much that the child doesn't get bigger than</a>
+<a name="ln259">	// the parent</a>
+<a name="ln260">	if (child-&gt;offset + newSize &gt; partition-&gt;offset + partition-&gt;size)</a>
+<a name="ln261">		newSize = partition-&gt;offset + partition-&gt;size - child-&gt;offset;</a>
+<a name="ln262"> </a>
+<a name="ln263">	// make sure that the child doesn't overlap any sibling partitions</a>
+<a name="ln264">	off_t newEnd = child-&gt;offset + newSize;</a>
+<a name="ln265">	for (int32 i = 0; i &lt; partition-&gt;child_count; i++) {</a>
+<a name="ln266">		partition_data* other = get_child_partition(partition-&gt;id, i);</a>
+<a name="ln267">		if (other == NULL || other-&gt;id == child-&gt;id</a>
+<a name="ln268">			|| other-&gt;offset &lt; child-&gt;offset)</a>
+<a name="ln269">			continue;</a>
+<a name="ln270"> </a>
+<a name="ln271">		if (newEnd &gt; other-&gt;offset)</a>
+<a name="ln272">			newEnd = other-&gt;offset;</a>
+<a name="ln273">	}</a>
+<a name="ln274"> </a>
+<a name="ln275">	*size = block_align(partition, newEnd - child-&gt;offset, false);</a>
+<a name="ln276">	return true;</a>
+<a name="ln277">}</a>
+<a name="ln278"> </a>
+<a name="ln279"> </a>
+<a name="ln280">static bool</a>
+<a name="ln281">efi_gpt_validate_move(partition_data* partition, off_t* start)</a>
+<a name="ln282">{</a>
+<a name="ln283">	// nothing to do</a>
+<a name="ln284">	return true;</a>
+<a name="ln285">}</a>
+<a name="ln286"> </a>
+<a name="ln287"> </a>
+<a name="ln288">static bool</a>
+<a name="ln289">efi_gpt_validate_move_child(partition_data* partition, partition_data* child,</a>
+<a name="ln290">	off_t* start)</a>
+<a name="ln291">{</a>
+<a name="ln292">	off_t newStart = *start;</a>
+<a name="ln293">	if (newStart &lt; 0)</a>
+<a name="ln294">		newStart = 0;</a>
+<a name="ln295"> </a>
+<a name="ln296">	if (newStart + child-&gt;size &gt; partition-&gt;size)</a>
+<a name="ln297">		newStart = partition-&gt;size - child-&gt;size;</a>
+<a name="ln298"> </a>
+<a name="ln299">	newStart = block_align(partition, newStart, false);</a>
+<a name="ln300">	if (newStart &gt; child-&gt;offset) {</a>
+<a name="ln301">		for (int32 i = 0; i &lt; partition-&gt;child_count; i++) {</a>
+<a name="ln302">			partition_data* other = get_child_partition(partition-&gt;id, i);</a>
+<a name="ln303">			if (other == NULL || other-&gt;id == child-&gt;id</a>
+<a name="ln304">				|| other-&gt;offset &lt; child-&gt;offset)</a>
+<a name="ln305">				continue;</a>
+<a name="ln306"> </a>
+<a name="ln307">			if (other-&gt;offset &lt; newStart + child-&gt;size)</a>
+<a name="ln308">				newStart = other-&gt;offset - child-&gt;size;</a>
+<a name="ln309">		}</a>
+<a name="ln310"> </a>
+<a name="ln311">		newStart = block_align(partition, newStart, false);</a>
+<a name="ln312">	} else {</a>
+<a name="ln313">		for (int32 i = 0; i &lt; partition-&gt;child_count; i++) {</a>
+<a name="ln314">			partition_data* other = get_child_partition(partition-&gt;id, i);</a>
+<a name="ln315">			if (other == NULL || other-&gt;id == child-&gt;id</a>
+<a name="ln316">				|| other-&gt;offset &gt; child-&gt;offset)</a>
+<a name="ln317">				continue;</a>
+<a name="ln318"> </a>
+<a name="ln319">			if (other-&gt;offset + other-&gt;size &gt; newStart)</a>
+<a name="ln320">				newStart = other-&gt;offset + other-&gt;size;</a>
+<a name="ln321">		}</a>
+<a name="ln322"> </a>
+<a name="ln323">		newStart = block_align(partition, newStart, true);</a>
+<a name="ln324">	}</a>
+<a name="ln325"> </a>
+<a name="ln326">	*start = newStart;</a>
+<a name="ln327">	return true;</a>
+<a name="ln328">}</a>
+<a name="ln329"> </a>
+<a name="ln330"> </a>
+<a name="ln331">static bool</a>
+<a name="ln332">efi_gpt_validate_set_name(partition_data* partition, char* name)</a>
+<a name="ln333">{</a>
+<a name="ln334">	// TODO: should validate that the utf-8 -&gt; ucs-2 is valid</a>
+<a name="ln335">	// TODO: should count actual utf-8 chars</a>
+<a name="ln336">	if (strlen(name) &gt; EFI_PARTITION_NAME_LENGTH)</a>
+<a name="ln337">		name[EFI_PARTITION_NAME_LENGTH - 1] = 0;</a>
+<a name="ln338">	return true;</a>
+<a name="ln339">}</a>
+<a name="ln340"> </a>
+<a name="ln341"> </a>
+<a name="ln342">static bool</a>
+<a name="ln343">efi_gpt_validate_set_type(partition_data* partition, const char* type)</a>
+<a name="ln344">{</a>
+<a name="ln345">	guid_t typeGUID;</a>
+<a name="ln346">	return get_guid_for_partition_type(type, typeGUID);</a>
+<a name="ln347">}</a>
+<a name="ln348"> </a>
+<a name="ln349"> </a>
+<a name="ln350">static bool</a>
+<a name="ln351">efi_gpt_validate_initialize(partition_data* partition, char* name,</a>
+<a name="ln352">	const char* parameters)</a>
+<a name="ln353">{</a>
+<a name="ln354">	if ((efi_gpt_get_supported_operations(partition, ~0)</a>
+<a name="ln355">		&amp; B_DISK_SYSTEM_SUPPORTS_INITIALIZING) == 0)</a>
+<a name="ln356">		return false;</a>
+<a name="ln357"> </a>
+<a name="ln358">	// name and parameters are ignored</a>
+<a name="ln359">	if (name != NULL)</a>
+<a name="ln360">		name[0] = 0;</a>
+<a name="ln361"> </a>
+<a name="ln362">	return true;</a>
+<a name="ln363">}</a>
+<a name="ln364"> </a>
+<a name="ln365"> </a>
+<a name="ln366">static bool</a>
+<a name="ln367">efi_gpt_validate_create_child(partition_data* partition, off_t* start,</a>
+<a name="ln368">	off_t* size, const char* type, const char* name, const char* parameters,</a>
+<a name="ln369">	int32* index)</a>
+<a name="ln370">{</a>
+<a name="ln371">	if ((efi_gpt_get_supported_operations(partition, ~0)</a>
+<a name="ln372">			&amp; B_DISK_SYSTEM_SUPPORTS_CREATING_CHILD) == 0)</a>
+<a name="ln373">		return false;</a>
+<a name="ln374"> </a>
+<a name="ln375">	if (!efi_gpt_validate_set_type(partition, type))</a>
+<a name="ln376">		return false;</a>
+<a name="ln377"> </a>
+<a name="ln378">	EFI::Header* header = (EFI::Header*)partition-&gt;content_cookie;</a>
+<a name="ln379">	int32 entryIndex = -1;</a>
+<a name="ln380">	for (uint32 i = 0; i &lt; header-&gt;EntryCount(); i++) {</a>
+<a name="ln381">		const efi_partition_entry&amp; entry = header-&gt;EntryAt(i);</a>
+<a name="ln382">		if (entry.partition_type == kEmptyGUID) {</a>
+<a name="ln383">			entryIndex = i;</a>
+<a name="ln384">			break;</a>
+<a name="ln385">		}</a>
+<a name="ln386">	}</a>
+<a name="ln387"> </a>
+<a name="ln388">	if (entryIndex &lt; 0)</a>
+<a name="ln389">		return false;</a>
+<a name="ln390"> </a>
+<a name="ln391">	*index = entryIndex;</a>
+<a name="ln392"> </a>
+<a name="ln393">	// ensure that child lies between first and last usable block</a>
+<a name="ln394">	off_t firstUsable = header-&gt;FirstUsableBlock() * partition-&gt;block_size;</a>
+<a name="ln395">	if (*start &lt; firstUsable)</a>
+<a name="ln396">		*start = firstUsable;</a>
+<a name="ln397"> </a>
+<a name="ln398">	off_t lastUsable = header-&gt;LastUsableBlock() * partition-&gt;block_size;</a>
+<a name="ln399">	if (*start + *size &gt; lastUsable) {</a>
+<a name="ln400">		if (*start &gt; lastUsable)</a>
+<a name="ln401">			return false;</a>
+<a name="ln402"> </a>
+<a name="ln403">		*size = lastUsable - *start;</a>
+<a name="ln404">	}</a>
+<a name="ln405"> </a>
+<a name="ln406">	// ensure that we don't overlap any siblings</a>
+<a name="ln407">	for (int32 i = 0; i &lt; partition-&gt;child_count; i++) {</a>
+<a name="ln408">		partition_data* other = get_child_partition(partition-&gt;id, i);</a>
+<a name="ln409">		if (other == NULL)</a>
+<a name="ln410">			continue;</a>
+<a name="ln411"> </a>
+<a name="ln412">		if (other-&gt;offset &lt; *start &amp;&amp; other-&gt;offset + other-&gt;size &gt; *start)</a>
+<a name="ln413">			*start = other-&gt;offset + other-&gt;size;</a>
+<a name="ln414"> </a>
+<a name="ln415">		if (other-&gt;offset &gt; *start &amp;&amp; other-&gt;offset &lt; *start + *size)</a>
+<a name="ln416">			*size = other-&gt;offset - *start;</a>
+<a name="ln417">	}</a>
+<a name="ln418"> </a>
+<a name="ln419">	*start = block_align(partition, *start, true);</a>
+<a name="ln420">	*size = block_align(partition, *size, false);</a>
+<a name="ln421"> </a>
+<a name="ln422">	// TODO: support parameters</a>
+<a name="ln423">	return true;</a>
+<a name="ln424">}</a>
+<a name="ln425"> </a>
+<a name="ln426"> </a>
+<a name="ln427">static status_t</a>
+<a name="ln428">efi_gpt_get_partitionable_spaces(partition_data* partition,</a>
+<a name="ln429">	partitionable_space_data* buffer, int32 count, int32* actualCount)</a>
+<a name="ln430">{</a>
+<a name="ln431">	// TODO: implement</a>
+<a name="ln432">	return B_ERROR;</a>
+<a name="ln433">}</a>
+<a name="ln434"> </a>
+<a name="ln435"> </a>
+<a name="ln436">static status_t</a>
+<a name="ln437">efi_gpt_get_next_supported_type(partition_data* partition, int32* cookie,</a>
+<a name="ln438">	char* type)</a>
+<a name="ln439">{</a>
+<a name="ln440">	// TODO: implement</a>
+<a name="ln441">	return B_ERROR;</a>
+<a name="ln442">}</a>
+<a name="ln443"> </a>
+<a name="ln444"> </a>
+<a name="ln445">static status_t</a>
+<a name="ln446">efi_gpt_shadow_changed(partition_data* partition, partition_data* child,</a>
+<a name="ln447">	uint32 operation)</a>
+<a name="ln448">{</a>
+<a name="ln449">	// TODO: implement</a>
+<a name="ln450">	return B_ERROR;</a>
+<a name="ln451">}</a>
+<a name="ln452"> </a>
+<a name="ln453"> </a>
+<a name="ln454">static status_t</a>
+<a name="ln455">efi_gpt_repair(int fd, partition_id partition, bool checkOnly, disk_job_id job)</a>
+<a name="ln456">{</a>
+<a name="ln457">	// TODO: implement, validate CRCs and restore from backup area if corrupt</a>
+<a name="ln458">	return B_ERROR;</a>
+<a name="ln459">}</a>
+<a name="ln460"> </a>
+<a name="ln461"> </a>
+<a name="ln462">static status_t</a>
+<a name="ln463">efi_gpt_resize(int fd, partition_id partitionID, off_t size, disk_job_id job)</a>
+<a name="ln464">{</a>
+<a name="ln465">	if (fd &lt; 0)</a>
+<a name="ln466">		return B_ERROR;</a>
+<a name="ln467"> </a>
+<a name="ln468">	PartitionWriteLocker locker(partitionID);</a>
+<a name="ln469">	if (!locker.IsLocked())</a>
+<a name="ln470">		return B_ERROR;</a>
+<a name="ln471"> </a>
+<a name="ln472">	partition_data* partition = get_partition(partitionID);</a>
+<a name="ln473">	if (partition == NULL)</a>
+<a name="ln474">		return B_BAD_VALUE;</a>
+<a name="ln475"> </a>
+<a name="ln476">	off_t validatedSize = size;</a>
+<a name="ln477">	if (!efi_gpt_validate_resize(partition, &amp;validatedSize))</a>
+<a name="ln478">		return B_BAD_VALUE;</a>
+<a name="ln479"> </a>
+<a name="ln480">	update_disk_device_job_progress(job, 0.0);</a>
+<a name="ln481"> </a>
+<a name="ln482">	partition-&gt;size = validatedSize;</a>
+<a name="ln483">	partition-&gt;content_size = validatedSize;</a>
+<a name="ln484"> </a>
+<a name="ln485">	update_disk_device_job_progress(job, 1.0);</a>
+<a name="ln486">	partition_modified(partitionID);</a>
+<a name="ln487">	return B_OK;</a>
+<a name="ln488">}</a>
+<a name="ln489"> </a>
+<a name="ln490"> </a>
+<a name="ln491">static status_t</a>
+<a name="ln492">efi_gpt_resize_child(int fd, partition_id partitionID, off_t size,</a>
+<a name="ln493">	disk_job_id job)</a>
+<a name="ln494">{</a>
+<a name="ln495">	if (fd &lt; 0)</a>
+<a name="ln496">		return B_ERROR;</a>
+<a name="ln497"> </a>
+<a name="ln498">	PartitionWriteLocker locker(partitionID);</a>
+<a name="ln499">	if (!locker.IsLocked())</a>
+<a name="ln500">		return B_ERROR;</a>
+<a name="ln501"> </a>
+<a name="ln502">	partition_data* child = get_partition(partitionID);</a>
+<a name="ln503">	if (child == NULL)</a>
+<a name="ln504">		return B_BAD_VALUE;</a>
+<a name="ln505"> </a>
+<a name="ln506">	partition_data* partition = get_parent_partition(partitionID);</a>
+<a name="ln507">	if (partition == NULL)</a>
+<a name="ln508">		return B_BAD_VALUE;</a>
+<a name="ln509"> </a>
+<a name="ln510">	EFI::Header* header = (EFI::Header*)partition-&gt;content_cookie;</a>
+<a name="ln511">	if (header == NULL)</a>
+<a name="ln512">		return B_BAD_VALUE;</a>
+<a name="ln513"> </a>
+<a name="ln514">	uint32 entryIndex = (uint32)(addr_t)child-&gt;cookie;</a>
+<a name="ln515">	if (entryIndex &gt;= header-&gt;EntryCount())</a>
+<a name="ln516">		return B_BAD_VALUE;</a>
+<a name="ln517"> </a>
+<a name="ln518">	off_t validatedSize = size;</a>
+<a name="ln519">	if (!efi_gpt_validate_resize_child(partition, child, &amp;validatedSize))</a>
+<a name="ln520">		return B_BAD_VALUE;</a>
+<a name="ln521"> </a>
+<a name="ln522">	if (child-&gt;size == validatedSize)</a>
+<a name="ln523">		return B_OK;</a>
+<a name="ln524"> </a>
+<a name="ln525">	update_disk_device_job_progress(job, 0.0);</a>
+<a name="ln526"> </a>
+<a name="ln527">	efi_partition_entry&amp; entry = header-&gt;EntryAt(entryIndex);</a>
+<a name="ln528">	entry.SetBlockCount(validatedSize / partition-&gt;block_size);</a>
+<a name="ln529"> </a>
+<a name="ln530">	status_t result = header-&gt;WriteEntry(fd, entryIndex);</a>
+<a name="ln531">	if (result != B_OK) {</a>
+<a name="ln532">		entry.SetBlockCount(child-&gt;size / partition-&gt;block_size);</a>
+<a name="ln533">		return result;</a>
+<a name="ln534">	}</a>
+<a name="ln535"> </a>
+<a name="ln536">	child-&gt;size = validatedSize;</a>
+<a name="ln537"> </a>
+<a name="ln538">	update_disk_device_job_progress(job, 1.0);</a>
+<a name="ln539">	partition_modified(partitionID);</a>
+<a name="ln540">	return B_OK;</a>
+<a name="ln541">}</a>
+<a name="ln542"> </a>
+<a name="ln543"> </a>
+<a name="ln544">static status_t</a>
+<a name="ln545">efi_gpt_move(int fd, partition_id partition, off_t offset, disk_job_id job)</a>
+<a name="ln546">{</a>
+<a name="ln547">	// nothing to do here</a>
+<a name="ln548">	return B_OK;</a>
+<a name="ln549">}</a>
+<a name="ln550"> </a>
+<a name="ln551"> </a>
+<a name="ln552">static status_t</a>
+<a name="ln553">efi_gpt_move_child(int fd, partition_id partitionID, partition_id childID,</a>
+<a name="ln554">	off_t offset, disk_job_id job)</a>
+<a name="ln555">{</a>
+<a name="ln556">	if (fd &lt; 0)</a>
+<a name="ln557">		return B_ERROR;</a>
+<a name="ln558"> </a>
+<a name="ln559">	PartitionWriteLocker locker(partitionID);</a>
+<a name="ln560">	if (!locker.IsLocked())</a>
+<a name="ln561">		return B_ERROR;</a>
+<a name="ln562"> </a>
+<a name="ln563">	partition_data* partition = get_partition(partitionID);</a>
+<a name="ln564">	if (partition == NULL)</a>
+<a name="ln565">		return B_BAD_VALUE;</a>
+<a name="ln566"> </a>
+<a name="ln567">	partition_data* child = get_partition(childID);</a>
+<a name="ln568">	if (child == NULL)</a>
+<a name="ln569">		return B_BAD_VALUE;</a>
+<a name="ln570"> </a>
+<a name="ln571">	EFI::Header* header = (EFI::Header*)partition-&gt;content_cookie;</a>
+<a name="ln572">	if (header == NULL)</a>
+<a name="ln573">		return B_BAD_VALUE;</a>
+<a name="ln574"> </a>
+<a name="ln575">	uint32 entryIndex = (uint32)(addr_t)child-&gt;cookie;</a>
+<a name="ln576">	if (entryIndex &gt;= header-&gt;EntryCount())</a>
+<a name="ln577">		return B_BAD_VALUE;</a>
+<a name="ln578"> </a>
+<a name="ln579">	off_t validatedOffset = offset;</a>
+<a name="ln580">	if (!efi_gpt_validate_move_child(partition, child, &amp;validatedOffset))</a>
+<a name="ln581">		return B_BAD_VALUE;</a>
+<a name="ln582"> </a>
+<a name="ln583">	if (child-&gt;offset == validatedOffset)</a>
+<a name="ln584">		return B_OK;</a>
+<a name="ln585"> </a>
+<a name="ln586">	// TODO: implement actual moving, need to move the partition content</a>
+<a name="ln587">	// (the raw data) here and need to take overlap into account</a>
+<a name="ln588">	return B_ERROR;</a>
+<a name="ln589"> </a>
+<a name="ln590">	update_disk_device_job_progress(job, 0.0);</a>
+<a name="ln591"> </a>
+<a name="ln592">	efi_partition_entry&amp; entry = header-&gt;EntryAt(entryIndex);</a>
+<a name="ln593">	uint64 blockCount = entry.BlockCount();</a>
+<a name="ln594">	entry.SetStartBlock((validatedOffset - partition-&gt;offset)</a>
+<a name="ln595">		/ partition-&gt;block_size);</a>
+<a name="ln596">	entry.SetBlockCount(blockCount);</a>
+<a name="ln597"> </a>
+<a name="ln598">	status_t result = header-&gt;WriteEntry(fd, entryIndex);</a>
+<a name="ln599">	if (result != B_OK) {</a>
+<a name="ln600">		// fatal error: the data has been moved but the partition table could</a>
+<a name="ln601">		// not be updated to reflect that change!</a>
+<a name="ln602">		return result;</a>
+<a name="ln603">	}</a>
+<a name="ln604"> </a>
+<a name="ln605">	child-&gt;offset = validatedOffset;</a>
+<a name="ln606"> </a>
+<a name="ln607">	update_disk_device_job_progress(job, 1.0);</a>
+<a name="ln608">	partition_modified(childID);</a>
+<a name="ln609">	return B_OK;</a>
+<a name="ln610">}</a>
+<a name="ln611"> </a>
+<a name="ln612"> </a>
+<a name="ln613">static status_t</a>
+<a name="ln614">efi_gpt_set_name(int fd, partition_id partitionID, const char* name,</a>
+<a name="ln615">	disk_job_id job)</a>
+<a name="ln616">{</a>
+<a name="ln617">	if (fd &lt; 0)</a>
+<a name="ln618">		return B_ERROR;</a>
+<a name="ln619"> </a>
+<a name="ln620">	PartitionWriteLocker locker(partitionID);</a>
+<a name="ln621">	if (!locker.IsLocked())</a>
+<a name="ln622">		return B_ERROR;</a>
+<a name="ln623"> </a>
+<a name="ln624">	partition_data* child = get_partition(partitionID);</a>
+<a name="ln625">	if (child == NULL)</a>
+<a name="ln626">		return B_BAD_VALUE;</a>
+<a name="ln627"> </a>
+<a name="ln628">	partition_data* partition = get_parent_partition(partitionID);</a>
+<a name="ln629">	if (partition == NULL)</a>
+<a name="ln630">		return B_BAD_VALUE;</a>
+<a name="ln631"> </a>
+<a name="ln632">	EFI::Header* header = (EFI::Header*)partition-&gt;content_cookie;</a>
+<a name="ln633">	if (header == NULL)</a>
+<a name="ln634">		return B_BAD_VALUE;</a>
+<a name="ln635"> </a>
+<a name="ln636">	uint32 entryIndex = (uint32)(addr_t)child-&gt;cookie;</a>
+<a name="ln637">	if (entryIndex &gt;= header-&gt;EntryCount())</a>
+<a name="ln638">		return B_BAD_VALUE;</a>
+<a name="ln639"> </a>
+<a name="ln640">	update_disk_device_job_progress(job, 0.0);</a>
+<a name="ln641"> </a>
+<a name="ln642">	efi_partition_entry&amp; entry = header-&gt;EntryAt(entryIndex);</a>
+<a name="ln643">	to_ucs2(name, strlen(name), entry.name, EFI_PARTITION_NAME_LENGTH);</a>
+<a name="ln644"> </a>
+<a name="ln645">	status_t result = header-&gt;WriteEntry(fd, entryIndex);</a>
+<a name="ln646">	if (result != B_OK)</a>
+<a name="ln647">		return result;</a>
+<a name="ln648"> </a>
+<a name="ln649">	char newName[B_OS_NAME_LENGTH];</a>
+<a name="ln650">	to_utf8(entry.name, EFI_PARTITION_NAME_LENGTH, newName, sizeof(newName));</a>
+<a name="ln651">	child-&gt;name = strdup(newName);</a>
+<a name="ln652"> </a>
+<a name="ln653">	update_disk_device_job_progress(job, 1.0);</a>
+<a name="ln654">	partition_modified(partitionID);</a>
+<a name="ln655">	return B_OK;</a>
+<a name="ln656">}</a>
+<a name="ln657"> </a>
+<a name="ln658"> </a>
+<a name="ln659">static status_t</a>
+<a name="ln660">efi_gpt_set_type(int fd, partition_id partitionID, const char* type,</a>
+<a name="ln661">	disk_job_id job)</a>
+<a name="ln662">{</a>
+<a name="ln663">	if (fd &lt; 0)</a>
+<a name="ln664">		return B_ERROR;</a>
+<a name="ln665"> </a>
+<a name="ln666">	PartitionWriteLocker locker(partitionID);</a>
+<a name="ln667">	if (!locker.IsLocked())</a>
+<a name="ln668">		return B_ERROR;</a>
+<a name="ln669"> </a>
+<a name="ln670">	partition_data* child = get_partition(partitionID);</a>
+<a name="ln671">	if (child == NULL)</a>
+<a name="ln672">		return B_BAD_VALUE;</a>
+<a name="ln673"> </a>
+<a name="ln674">	partition_data* partition = get_parent_partition(partitionID);</a>
+<a name="ln675">	if (partition == NULL)</a>
+<a name="ln676">		return B_BAD_VALUE;</a>
+<a name="ln677"> </a>
+<a name="ln678">	EFI::Header* header = (EFI::Header*)partition-&gt;content_cookie;</a>
+<a name="ln679">	if (header == NULL)</a>
+<a name="ln680">		return B_BAD_VALUE;</a>
+<a name="ln681"> </a>
+<a name="ln682">	uint32 entryIndex = (uint32)(addr_t)child-&gt;cookie;</a>
+<a name="ln683">	if (entryIndex &gt;= header-&gt;EntryCount())</a>
+<a name="ln684">		return B_BAD_VALUE;</a>
+<a name="ln685"> </a>
+<a name="ln686">	guid_t typeGUID;</a>
+<a name="ln687">	if (!get_guid_for_partition_type(type, typeGUID))</a>
+<a name="ln688">		return B_BAD_VALUE;</a>
+<a name="ln689"> </a>
+<a name="ln690">	update_disk_device_job_progress(job, 0.0);</a>
+<a name="ln691"> </a>
+<a name="ln692">	efi_partition_entry&amp; entry = header-&gt;EntryAt(entryIndex);</a>
+<a name="ln693">	entry.partition_type = typeGUID;</a>
+<a name="ln694"> </a>
+<a name="ln695">	status_t result = header-&gt;WriteEntry(fd, entryIndex);</a>
+<a name="ln696">	if (result != B_OK)</a>
+<a name="ln697">		return result;</a>
+<a name="ln698"> </a>
+<a name="ln699">	child-&gt;type = strdup(type);</a>
+<a name="ln700"> </a>
+<a name="ln701">	update_disk_device_job_progress(job, 1.0);</a>
+<a name="ln702">	partition_modified(partitionID);</a>
+<a name="ln703">	return B_OK;</a>
+<a name="ln704">}</a>
+<a name="ln705"> </a>
+<a name="ln706"> </a>
+<a name="ln707">static status_t</a>
+<a name="ln708">efi_gpt_initialize(int fd, partition_id partitionID, const char* name,</a>
+<a name="ln709">	const char* parameters, off_t partitionSize, disk_job_id job)</a>
+<a name="ln710">{</a>
+<a name="ln711">	if (fd &lt; 0)</a>
+<a name="ln712">		return B_ERROR;</a>
+<a name="ln713"> </a>
+<a name="ln714">	partition_data* partition = get_partition(partitionID);</a>
+<a name="ln715">	if (partition == NULL)</a>
+<a name="ln716">		return B_BAD_VALUE;</a>
+<a name="ln717"> </a>
+<a name="ln718">	update_disk_device_job_progress(job, 0.0);</a>
+<a name="ln719"> </a>
+<a name="ln720">	EFI::Header header((partitionSize - 1) / partition-&gt;block_size,</a>
+<a name="ln721">		partition-&gt;block_size);</a>
+<a name="ln722">	status_t result = header.InitCheck();</a>
+<a name="ln723">	if (result != B_OK)</a>
+<a name="ln724">		return result;</a>
+<a name="ln725"> </a>
+<a name="ln726">	result = header.Write(fd);</a>
+<a name="ln727">	if (result != B_OK)</a>
+<a name="ln728">		return result;</a>
+<a name="ln729"> </a>
+<a name="ln730">	result = scan_partition(partitionID);</a>
+<a name="ln731">	if (result != B_OK)</a>
+<a name="ln732">		return result;</a>
+<a name="ln733"> </a>
+<a name="ln734">	update_disk_device_job_progress(job, 1.0);</a>
+<a name="ln735">	partition_modified(partitionID);</a>
+<a name="ln736">	return B_OK;</a>
+<a name="ln737">}</a>
+<a name="ln738"> </a>
+<a name="ln739"> </a>
+<a name="ln740">static status_t</a>
+<a name="ln741">efi_gpt_uninitialize(int fd, partition_id partitionID, off_t partitionSize,</a>
+<a name="ln742">	uint32 blockSize, disk_job_id job)</a>
+<a name="ln743">{</a>
+<a name="ln744">	if (fd &lt; 0)</a>
+<a name="ln745">		return B_ERROR;</a>
+<a name="ln746"> </a>
+<a name="ln747">	partition_data* partition = get_partition(partitionID);</a>
+<a name="ln748">	if (partition == NULL)</a>
+<a name="ln749">		return B_BAD_VALUE;</a>
+<a name="ln750"> </a>
+<a name="ln751">	update_disk_device_job_progress(job, 0.0);</a>
+<a name="ln752"> </a>
+<a name="ln753">	const int headerSize = partition-&gt;block_size * 3;</a>
+<a name="ln754">	// The first block is the protective MBR</a>
+<a name="ln755">	// The second block is the GPT header</a>
+<a name="ln756">	// The third block is the start of the partition list (it can span more</a>
+<a name="ln757">	// blocks, but that doesn't matter as soon as the header is erased).</a>
+<a name="ln758"> </a>
+<a name="ln759">	uint8 buffer[headerSize];</a>
+<a name="ln760">	memset(buffer, 0xE5, sizeof(buffer));</a>
+<a name="ln761"> </a>
+<a name="ln762">	// Erase the first blocks</a>
+<a name="ln763">	if (write_pos(fd, 0, &amp;buffer, headerSize) &lt; 0)</a>
+<a name="ln764">		return errno;</a>
+<a name="ln765"> </a>
+<a name="ln766">	// Erase the last blocks</a>
+<a name="ln767">	// Only 2 blocks, as there is no protective MBR</a>
+<a name="ln768">	if (write_pos(fd, partitionSize - 2 * partition-&gt;block_size,</a>
+<a name="ln769">			&amp;buffer, 2 * partition-&gt;block_size) &lt; 0) {</a>
+<a name="ln770">		return errno;</a>
+<a name="ln771">	}</a>
+<a name="ln772"> </a>
+<a name="ln773">	update_disk_device_job_progress(job, 1.0);</a>
+<a name="ln774"> </a>
+<a name="ln775">	return B_OK;</a>
+<a name="ln776">}</a>
+<a name="ln777"> </a>
+<a name="ln778"> </a>
+<a name="ln779">static status_t</a>
+<a name="ln780">efi_gpt_create_child(int fd, partition_id partitionID, off_t offset,</a>
+<a name="ln781">	off_t size, const char* type, const char* name, const char* parameters,</a>
+<a name="ln782">	disk_job_id job, partition_id* childID)</a>
+<a name="ln783">{</a>
+<a name="ln784">	if (fd &lt; 0)</a>
+<a name="ln785">		return B_ERROR;</a>
+<a name="ln786"> </a>
+<a name="ln787">	PartitionWriteLocker locker(partitionID);</a>
+<a name="ln788">	if (!locker.IsLocked())</a>
+<a name="ln789">		return B_ERROR;</a>
+<a name="ln790"> </a>
+<a name="ln791">	partition_data* partition = get_partition(partitionID);</a>
+<a name="ln792">	if (partition == NULL)</a>
+<a name="ln793">		return B_BAD_VALUE;</a>
+<a name="ln794"> </a>
+<a name="ln795">	EFI::Header* header = (EFI::Header*)partition-&gt;content_cookie;</a>
+<a name="ln796">	if (header == NULL)</a>
+<a name="ln797">		return B_BAD_VALUE;</a>
+<a name="ln798"> </a>
+<a name="ln799">	off_t validatedOffset = offset;</a>
+<a name="ln800">	off_t validatedSize = size;</a>
+<a name="ln801">	uint32 entryIndex = 0;</a>
+<a name="ln802"> </a>
+<a name="ln803">	if (!efi_gpt_validate_create_child(partition, &amp;validatedOffset,</a>
+<a name="ln804">			&amp;validatedSize, type, name, parameters, (int32*)&amp;entryIndex))</a>
+<a name="ln805">		return B_BAD_VALUE;</a>
+<a name="ln806"> </a>
+<a name="ln807">	guid_t typeGUID;</a>
+<a name="ln808">	if (!get_guid_for_partition_type(type, typeGUID))</a>
+<a name="ln809">		return B_BAD_VALUE;</a>
+<a name="ln810"> </a>
+<a name="ln811">	update_disk_device_job_progress(job, 0.0);</a>
+<a name="ln812"> </a>
+<a name="ln813">	partition_data* child = create_child_partition(partition-&gt;id, entryIndex,</a>
+<a name="ln814">		validatedOffset, validatedSize, *childID);</a>
+<a name="ln815">	if (child == NULL)</a>
+<a name="ln816">		return B_ERROR;</a>
+<a name="ln817"> </a>
+<a name="ln818">	efi_partition_entry&amp; entry = header-&gt;EntryAt(entryIndex);</a>
+<a name="ln819">	entry.partition_type = typeGUID;</a>
+<a name="ln820">	uuid_t uuid;</a>
+<a name="ln821">	uuid_generate_random(uuid);</a>
+<a name="ln822">	memcpy((uint8*)&amp;entry.unique_guid, uuid, sizeof(guid_t));</a>
+<a name="ln823">	to_ucs2(name, strlen(name), entry.name, EFI_PARTITION_NAME_LENGTH);</a>
+<a name="ln824">	entry.SetStartBlock((validatedOffset - partition-&gt;offset)</a>
+<a name="ln825">		/ partition-&gt;block_size);</a>
+<a name="ln826">	entry.SetBlockCount(validatedSize / partition-&gt;block_size);</a>
+<a name="ln827">	entry.SetAttributes(0); // TODO</a>
+<a name="ln828"> </a>
+<a name="ln829">	status_t result = header-&gt;WriteEntry(fd, entryIndex);</a>
+<a name="ln830">	if (result != B_OK) {</a>
+<a name="ln831">		delete_partition(child-&gt;id);</a>
+<a name="ln832">		return result;</a>
+<a name="ln833">	}</a>
+<a name="ln834"> </a>
+<a name="ln835">	*childID = child-&gt;id;</a>
+<a name="ln836">	child-&gt;block_size = partition-&gt;block_size;</a>
+<a name="ln837">	child-&gt;name = strdup(name);</a>
+<a name="ln838">	child-&gt;type = strdup(type);</a>
+<a name="ln839">	child-&gt;parameters = strdup(parameters);</a>
+<a name="ln840">	child-&gt;cookie = (void*)(addr_t)entryIndex;</a>
+<a name="ln841"> </a>
+<a name="ln842">	if (child-&gt;type == NULL || child-&gt;parameters == NULL) {</a>
+<a name="ln843">		delete_partition(child-&gt;id);</a>
+<a name="ln844">		return B_NO_MEMORY;</a>
+<a name="ln845">	}</a>
+<a name="ln846"> </a>
+<a name="ln847">	update_disk_device_job_progress(job, 1.0);</a>
+<a name="ln848">	partition_modified(partitionID);</a>
+<a name="ln849">	return B_OK;</a>
+<a name="ln850">}</a>
+<a name="ln851"> </a>
+<a name="ln852"> </a>
+<a name="ln853">static status_t</a>
+<a name="ln854">efi_gpt_delete_child(int fd, partition_id partitionID, partition_id childID,</a>
+<a name="ln855">	disk_job_id job)</a>
+<a name="ln856">{</a>
+<a name="ln857">	if (fd &lt; 0)</a>
+<a name="ln858">		return B_ERROR;</a>
+<a name="ln859"> </a>
+<a name="ln860">	PartitionWriteLocker locker(partitionID);</a>
+<a name="ln861">	if (!locker.IsLocked())</a>
+<a name="ln862">		return B_ERROR;</a>
+<a name="ln863"> </a>
+<a name="ln864">	partition_data* partition = get_partition(partitionID);</a>
+<a name="ln865">	if (partition == NULL)</a>
+<a name="ln866">		return B_BAD_VALUE;</a>
+<a name="ln867"> </a>
+<a name="ln868">	partition_data* child = get_partition(childID);</a>
+<a name="ln869">	if (child == NULL)</a>
+<a name="ln870">		return B_BAD_VALUE;</a>
+<a name="ln871"> </a>
+<a name="ln872">	EFI::Header* header = (EFI::Header*)partition-&gt;content_cookie;</a>
+<a name="ln873">	if (header == NULL)</a>
+<a name="ln874">		return B_BAD_VALUE;</a>
+<a name="ln875"> </a>
+<a name="ln876">	uint32 entryIndex = (uint32)(addr_t)child-&gt;cookie;</a>
+<a name="ln877">	if (entryIndex &gt;= header-&gt;EntryCount())</a>
+<a name="ln878">		return B_BAD_VALUE;</a>
+<a name="ln879"> </a>
+<a name="ln880">	update_disk_device_job_progress(job, 0.0);</a>
+<a name="ln881"> </a>
+<a name="ln882">	if (!delete_partition(childID))</a>
+<a name="ln883">		return B_ERROR;</a>
+<a name="ln884"> </a>
+<a name="ln885">	efi_partition_entry&amp; entry = header-&gt;EntryAt(entryIndex);</a>
+<a name="ln886">	memset(&amp;entry, 0, sizeof(efi_partition_entry));</a>
+<a name="ln887">	entry.partition_type = kEmptyGUID;</a>
+<a name="ln888"> </a>
+<a name="ln889">	status_t result = header-&gt;WriteEntry(fd, entryIndex);</a>
+<a name="ln890">	if (result != B_OK)</a>
+<a name="ln891">		return result;</a>
+<a name="ln892"> </a>
+<a name="ln893">	update_disk_device_job_progress(job, 1.0);</a>
+<a name="ln894">	partition_modified(partitionID);</a>
+<a name="ln895">	return B_OK;</a>
+<a name="ln896">}</a>
+<a name="ln897">#endif // !_BOOT_MODE</a>
+<a name="ln898"> </a>
+<a name="ln899"> </a>
+<a name="ln900">#ifndef _BOOT_MODE</a>
+<a name="ln901">static partition_module_info sEFIPartitionModule = {</a>
+<a name="ln902">#else</a>
+<a name="ln903">partition_module_info gEFIPartitionModule = {</a>
+<a name="ln904">#endif</a>
+<a name="ln905">	{</a>
+<a name="ln906">		EFI_PARTITION_MODULE_NAME,</a>
+<a name="ln907">		0,</a>
+<a name="ln908">		efi_gpt_std_ops</a>
+<a name="ln909">	},</a>
+<a name="ln910">	&quot;gpt&quot;,									// short_name</a>
+<a name="ln911">	EFI_PARTITION_NAME,						// pretty_name</a>
+<a name="ln912">	0										// flags</a>
+<a name="ln913">	| B_DISK_SYSTEM_SUPPORTS_INITIALIZING</a>
+<a name="ln914">	| B_DISK_SYSTEM_SUPPORTS_MOVING</a>
+<a name="ln915">	| B_DISK_SYSTEM_SUPPORTS_RESIZING</a>
+<a name="ln916">	| B_DISK_SYSTEM_SUPPORTS_SETTING_TYPE</a>
+<a name="ln917">	| B_DISK_SYSTEM_SUPPORTS_MOVING_CHILD</a>
+<a name="ln918">	| B_DISK_SYSTEM_SUPPORTS_RESIZING_CHILD</a>
+<a name="ln919">	| B_DISK_SYSTEM_SUPPORTS_CREATING_CHILD</a>
+<a name="ln920">	| B_DISK_SYSTEM_SUPPORTS_DELETING_CHILD</a>
+<a name="ln921">	| B_DISK_SYSTEM_SUPPORTS_SETTING_NAME</a>
+<a name="ln922">	| B_DISK_SYSTEM_SUPPORTS_NAME</a>
+<a name="ln923">	,</a>
+<a name="ln924"> </a>
+<a name="ln925">	// scanning</a>
+<a name="ln926">	efi_gpt_identify_partition,</a>
+<a name="ln927">	efi_gpt_scan_partition,</a>
+<a name="ln928">	efi_gpt_free_identify_partition_cookie,</a>
+<a name="ln929">	NULL, // free_partition_cookie</a>
+<a name="ln930">	efi_gpt_free_partition_content_cookie,</a>
+<a name="ln931"> </a>
+<a name="ln932">#ifndef _BOOT_MODE</a>
+<a name="ln933">	// querying</a>
+<a name="ln934">	efi_gpt_get_supported_operations,</a>
+<a name="ln935">	efi_gpt_get_supported_child_operations,</a>
+<a name="ln936">	NULL, // supports_initializing_child</a>
+<a name="ln937">	efi_gpt_is_sub_system_for,</a>
+<a name="ln938"> </a>
+<a name="ln939">	efi_gpt_validate_resize,</a>
+<a name="ln940">	efi_gpt_validate_resize_child,</a>
+<a name="ln941">	efi_gpt_validate_move,</a>
+<a name="ln942">	efi_gpt_validate_move_child,</a>
+<a name="ln943">	efi_gpt_validate_set_name,</a>
+<a name="ln944">	NULL, // validate_set_content_name</a>
+<a name="ln945">	efi_gpt_validate_set_type,</a>
+<a name="ln946">	NULL, // validate_set_parameters</a>
+<a name="ln947">	NULL, // validate_set_content_parameters</a>
+<a name="ln948">	efi_gpt_validate_initialize,</a>
+<a name="ln949">	efi_gpt_validate_create_child,</a>
+<a name="ln950">	efi_gpt_get_partitionable_spaces,</a>
+<a name="ln951">	efi_gpt_get_next_supported_type,</a>
+<a name="ln952">	NULL, // get_type_for_content_type</a>
+<a name="ln953"> </a>
+<a name="ln954">	// shadow partition modification</a>
+<a name="ln955">	efi_gpt_shadow_changed,</a>
+<a name="ln956"> </a>
+<a name="ln957">	// writing</a>
+<a name="ln958">	efi_gpt_repair,</a>
+<a name="ln959">	efi_gpt_resize,</a>
+<a name="ln960">	efi_gpt_resize_child,</a>
+<a name="ln961">	efi_gpt_move,</a>
+<a name="ln962">	efi_gpt_move_child,</a>
+<a name="ln963">	efi_gpt_set_name,</a>
+<a name="ln964">	NULL, // set_content_name</a>
+<a name="ln965">	efi_gpt_set_type,</a>
+<a name="ln966">	NULL, // set_parameters</a>
+<a name="ln967">	NULL, // set_content_parameters</a>
+<a name="ln968">	efi_gpt_initialize,</a>
+<a name="ln969">	efi_gpt_uninitialize,</a>
+<a name="ln970">	efi_gpt_create_child,</a>
+<a name="ln971">	efi_gpt_delete_child</a>
+<a name="ln972">#else</a>
+<a name="ln973">	NULL</a>
+<a name="ln974">#endif // _BOOT_MODE</a>
+<a name="ln975">};</a>
+<a name="ln976"> </a>
+<a name="ln977">#ifndef _BOOT_MODE</a>
+<a name="ln978">partition_module_info* modules[] = {</a>
+<a name="ln979">	&amp;sEFIPartitionModule,</a>
+<a name="ln980">	NULL</a>
+<a name="ln981">};</a>
+<a name="ln982">#endif</a>
+
+</code></pre>
+<div class="balloon" rel="371"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v547/" target="_blank">V547</a> Expression is always false.</p></div>
+<div class="balloon" rel="354"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v547/" target="_blank">V547</a> Expression is always false.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

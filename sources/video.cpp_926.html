@@ -1,0 +1,1042 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>video.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2004-2009, Axel Dörfler, axeld@pinc-software.de.</a>
+<a name="ln3"> * Copyright 2008, Stephan Aßmus &lt;superstippi@gmx.de&gt;</a>
+<a name="ln4"> * Copyright 2008, Philippe Saint-Pierre &lt;stpere@gmail.com&gt;</a>
+<a name="ln5"> * Copyright 2011, Rene Gollent, rene@gollent.com.</a>
+<a name="ln6"> * Distributed under the terms of the MIT License.</a>
+<a name="ln7"> */</a>
+<a name="ln8"> </a>
+<a name="ln9"> </a>
+<a name="ln10">#include &quot;video.h&quot;</a>
+<a name="ln11">#include &quot;bios.h&quot;</a>
+<a name="ln12">#include &quot;vesa.h&quot;</a>
+<a name="ln13">#include &quot;vesa_info.h&quot;</a>
+<a name="ln14">#include &quot;vga.h&quot;</a>
+<a name="ln15">#include &quot;mmu.h&quot;</a>
+<a name="ln16"> </a>
+<a name="ln17">#include &lt;edid.h&gt;</a>
+<a name="ln18"> </a>
+<a name="ln19">#include &lt;arch/cpu.h&gt;</a>
+<a name="ln20">#include &lt;boot/stage2.h&gt;</a>
+<a name="ln21">#include &lt;boot/platform.h&gt;</a>
+<a name="ln22">#include &lt;boot/menu.h&gt;</a>
+<a name="ln23">#include &lt;boot/kernel_args.h&gt;</a>
+<a name="ln24">#include &lt;boot/platform/generic/video.h&gt;</a>
+<a name="ln25">#include &lt;util/list.h&gt;</a>
+<a name="ln26">#include &lt;drivers/driver_settings.h&gt;</a>
+<a name="ln27"> </a>
+<a name="ln28">#include &lt;stdio.h&gt;</a>
+<a name="ln29">#include &lt;stdlib.h&gt;</a>
+<a name="ln30">#include &lt;string.h&gt;</a>
+<a name="ln31"> </a>
+<a name="ln32"> </a>
+<a name="ln33">#define TRACE_VIDEO</a>
+<a name="ln34">#ifdef TRACE_VIDEO</a>
+<a name="ln35">#	define TRACE(x) dprintf x</a>
+<a name="ln36">#else</a>
+<a name="ln37">#	define TRACE(x) ;</a>
+<a name="ln38">#endif</a>
+<a name="ln39"> </a>
+<a name="ln40"> </a>
+<a name="ln41">struct video_mode {</a>
+<a name="ln42">	list_link	link;</a>
+<a name="ln43">	uint16		mode;</a>
+<a name="ln44">	uint16		width, height, bits_per_pixel;</a>
+<a name="ln45">	uint32		bytes_per_row;</a>
+<a name="ln46">	crtc_info_block* timing;</a>
+<a name="ln47">};</a>
+<a name="ln48"> </a>
+<a name="ln49">static vbe_info_block sInfo;</a>
+<a name="ln50">static video_mode *sMode, *sDefaultMode;</a>
+<a name="ln51">static bool sVesaCompatible;</a>
+<a name="ln52">static struct list sModeList;</a>
+<a name="ln53">static uint32 sModeCount;</a>
+<a name="ln54">static addr_t sFrameBuffer;</a>
+<a name="ln55">static bool sModeChosen;</a>
+<a name="ln56">static bool sSettingsLoaded;</a>
+<a name="ln57"> </a>
+<a name="ln58"> </a>
+<a name="ln59">static int</a>
+<a name="ln60">compare_video_modes(video_mode *a, video_mode *b)</a>
+<a name="ln61">{</a>
+<a name="ln62">	int compare = a-&gt;width - b-&gt;width;</a>
+<a name="ln63">	if (compare != 0)</a>
+<a name="ln64">		return compare;</a>
+<a name="ln65"> </a>
+<a name="ln66">	compare = a-&gt;height - b-&gt;height;</a>
+<a name="ln67">	if (compare != 0)</a>
+<a name="ln68">		return compare;</a>
+<a name="ln69"> </a>
+<a name="ln70">	// TODO: compare video_mode::mode?</a>
+<a name="ln71">	return a-&gt;bits_per_pixel - b-&gt;bits_per_pixel;</a>
+<a name="ln72">}</a>
+<a name="ln73"> </a>
+<a name="ln74"> </a>
+<a name="ln75">/*!	Insert the video mode into the list, sorted by resolution and bit depth.</a>
+<a name="ln76">	Higher resolutions/depths come first.</a>
+<a name="ln77">*/</a>
+<a name="ln78">static void</a>
+<a name="ln79">add_video_mode(video_mode *videoMode)</a>
+<a name="ln80">{</a>
+<a name="ln81">	video_mode *mode = NULL;</a>
+<a name="ln82">	while ((mode = (video_mode *)list_get_next_item(&amp;sModeList, mode))</a>
+<a name="ln83">			!= NULL) {</a>
+<a name="ln84">		int compare = compare_video_modes(videoMode, mode);</a>
+<a name="ln85">		if (compare == 0) {</a>
+<a name="ln86">			// mode already exists</a>
+<a name="ln87">			return;</a>
+<a name="ln88">		}</a>
+<a name="ln89"> </a>
+<a name="ln90">		if (compare &gt; 0)</a>
+<a name="ln91">			break;</a>
+<a name="ln92">	}</a>
+<a name="ln93"> </a>
+<a name="ln94">	list_insert_item_before(&amp;sModeList, mode, videoMode);</a>
+<a name="ln95">	sModeCount++;</a>
+<a name="ln96">}</a>
+<a name="ln97"> </a>
+<a name="ln98"> </a>
+<a name="ln99">/*! \brief Finds a video mode with the given resolution.</a>
+<a name="ln100">	If \a allowPalette is true, 8-bit modes are considered, too.</a>
+<a name="ln101">	If \a height is \c -1, the height is ignored, and only the width</a>
+<a name="ln102">	matters.</a>
+<a name="ln103">*/</a>
+<a name="ln104">static video_mode *</a>
+<a name="ln105">find_video_mode(int32 width, int32 height, bool allowPalette)</a>
+<a name="ln106">{</a>
+<a name="ln107">	video_mode *found = NULL;</a>
+<a name="ln108">	video_mode *mode = NULL;</a>
+<a name="ln109">	while ((mode = (video_mode *)list_get_next_item(&amp;sModeList, mode))</a>
+<a name="ln110">			!= NULL) {</a>
+<a name="ln111">		if (mode-&gt;width == width &amp;&amp; (height == -1 || mode-&gt;height == height)</a>
+<a name="ln112">			&amp;&amp; (mode-&gt;bits_per_pixel &gt; 8 || allowPalette)) {</a>
+<a name="ln113">			if (found == NULL || found-&gt;bits_per_pixel &lt; mode-&gt;bits_per_pixel)</a>
+<a name="ln114">				found = mode;</a>
+<a name="ln115">		}</a>
+<a name="ln116">	}</a>
+<a name="ln117"> </a>
+<a name="ln118">	return found;</a>
+<a name="ln119">}</a>
+<a name="ln120"> </a>
+<a name="ln121"> </a>
+<a name="ln122">/*! Returns the VESA mode closest to the one specified, with a width less or</a>
+<a name="ln123">	equal as specified.</a>
+<a name="ln124">	The height as well as the depth may vary in both directions, though.</a>
+<a name="ln125">*/</a>
+<a name="ln126">static video_mode *</a>
+<a name="ln127">closest_video_mode(int32 width, int32 height, int32 depth)</a>
+<a name="ln128">{</a>
+<a name="ln129">	video_mode *bestMode = NULL;</a>
+<a name="ln130">	uint32 bestDiff = 0;</a>
+<a name="ln131"> </a>
+<a name="ln132">	video_mode *mode = NULL;</a>
+<a name="ln133">	while ((mode = (video_mode *)list_get_next_item(&amp;sModeList, mode))</a>
+<a name="ln134">			!= NULL) {</a>
+<a name="ln135">		if (mode-&gt;width &gt; width) {</a>
+<a name="ln136">			// Only choose modes with a width less or equal than the searched</a>
+<a name="ln137">			// one; or else it might well be that the monitor cannot keep up.</a>
+<a name="ln138">			continue;</a>
+<a name="ln139">		}</a>
+<a name="ln140"> </a>
+<a name="ln141">		uint32 diff = 2 * abs(mode-&gt;width - width) + abs(mode-&gt;height - height)</a>
+<a name="ln142">			+ abs(mode-&gt;bits_per_pixel - depth);</a>
+<a name="ln143"> </a>
+<a name="ln144">		if (bestMode == NULL || bestDiff &gt; diff) {</a>
+<a name="ln145">			bestMode = mode;</a>
+<a name="ln146">			bestDiff = diff;</a>
+<a name="ln147">		}</a>
+<a name="ln148">	}</a>
+<a name="ln149"> </a>
+<a name="ln150">	return bestMode;</a>
+<a name="ln151">}</a>
+<a name="ln152"> </a>
+<a name="ln153"> </a>
+<a name="ln154">static crtc_info_block*</a>
+<a name="ln155">get_crtc_info_block(edid1_detailed_timing&amp; timing)</a>
+<a name="ln156">{</a>
+<a name="ln157">	// This feature is only available on chipsets supporting VBE3 and up</a>
+<a name="ln158">	if (sInfo.version.major &lt; 3)</a>
+<a name="ln159">		return NULL;</a>
+<a name="ln160"> </a>
+<a name="ln161">	// Copy timing structure to set the mode with</a>
+<a name="ln162">	crtc_info_block* crtcInfo = (crtc_info_block*)malloc(</a>
+<a name="ln163">		sizeof(crtc_info_block));</a>
+<a name="ln164">	if (crtcInfo == NULL)</a>
+<a name="ln165">		return NULL;</a>
+<a name="ln166"> </a>
+<a name="ln167">	memset(crtcInfo, 0, sizeof(crtc_info_block));</a>
+<a name="ln168">	crtcInfo-&gt;horizontal_sync_start = timing.h_active + timing.h_sync_off;</a>
+<a name="ln169">	crtcInfo-&gt;horizontal_sync_end = crtcInfo-&gt;horizontal_sync_start</a>
+<a name="ln170">		+ timing.h_sync_width;</a>
+<a name="ln171">	crtcInfo-&gt;horizontal_total = timing.h_active + timing.h_blank;</a>
+<a name="ln172">	crtcInfo-&gt;vertical_sync_start = timing.v_active + timing.v_sync_off;</a>
+<a name="ln173">	crtcInfo-&gt;vertical_sync_end = crtcInfo-&gt;vertical_sync_start</a>
+<a name="ln174">		+ timing.v_sync_width;</a>
+<a name="ln175">	crtcInfo-&gt;vertical_total = timing.v_active + timing.v_blank;</a>
+<a name="ln176">	crtcInfo-&gt;pixel_clock = timing.pixel_clock * 10000L;</a>
+<a name="ln177">	crtcInfo-&gt;refresh_rate = crtcInfo-&gt;pixel_clock</a>
+<a name="ln178">		/ (crtcInfo-&gt;horizontal_total / 10)</a>
+<a name="ln179">		/ (crtcInfo-&gt;vertical_total / 10);</a>
+<a name="ln180"> </a>
+<a name="ln181">	TRACE((&quot;crtc: h %u/%u/%u, v %u/%u/%u, pixel clock %lu, refresh %u\n&quot;,</a>
+<a name="ln182">		crtcInfo-&gt;horizontal_sync_start, crtcInfo-&gt;horizontal_sync_end,</a>
+<a name="ln183">		crtcInfo-&gt;horizontal_total, crtcInfo-&gt;vertical_sync_start,</a>
+<a name="ln184">		crtcInfo-&gt;vertical_sync_end, crtcInfo-&gt;vertical_total,</a>
+<a name="ln185">		crtcInfo-&gt;pixel_clock, crtcInfo-&gt;refresh_rate));</a>
+<a name="ln186"> </a>
+<a name="ln187">	crtcInfo-&gt;flags = 0;</a>
+<a name="ln188">	if (timing.sync == 3) {</a>
+<a name="ln189">		// TODO: this switches the default sync when sync != 3 (compared to</a>
+<a name="ln190">		// create_display_modes().</a>
+<a name="ln191">		if ((timing.misc &amp; 1) == 0)</a>
+<a name="ln192">			crtcInfo-&gt;flags |= CRTC_NEGATIVE_HSYNC;</a>
+<a name="ln193">		if ((timing.misc &amp; 2) == 0)</a>
+<a name="ln194">			crtcInfo-&gt;flags |= CRTC_NEGATIVE_VSYNC;</a>
+<a name="ln195">	}</a>
+<a name="ln196">	if (timing.interlaced)</a>
+<a name="ln197">		crtcInfo-&gt;flags |= CRTC_INTERLACED;</a>
+<a name="ln198"> </a>
+<a name="ln199">	return crtcInfo;</a>
+<a name="ln200">}</a>
+<a name="ln201"> </a>
+<a name="ln202"> </a>
+<a name="ln203">static crtc_info_block*</a>
+<a name="ln204">get_crtc_info_block(edid1_std_timing&amp; timing)</a>
+<a name="ln205">{</a>
+<a name="ln206">	// TODO: implement me!</a>
+<a name="ln207">	return NULL;</a>
+<a name="ln208">}</a>
+<a name="ln209"> </a>
+<a name="ln210"> </a>
+<a name="ln211">static video_mode*</a>
+<a name="ln212">find_edid_mode(edid1_info&amp; info, bool allowPalette)</a>
+<a name="ln213">{</a>
+<a name="ln214">	video_mode *mode = NULL;</a>
+<a name="ln215"> </a>
+<a name="ln216">	// try detailed timing first</a>
+<a name="ln217">	for (int32 i = 0; i &lt; EDID1_NUM_DETAILED_MONITOR_DESC; i++) {</a>
+<a name="ln218">		edid1_detailed_monitor&amp; monitor = info.detailed_monitor[i];</a>
+<a name="ln219"> </a>
+<a name="ln220">		if (monitor.monitor_desc_type == EDID1_IS_DETAILED_TIMING) {</a>
+<a name="ln221">			mode = find_video_mode(monitor.data.detailed_timing.h_active,</a>
+<a name="ln222">				monitor.data.detailed_timing.v_active, allowPalette);</a>
+<a name="ln223">			if (mode != NULL) {</a>
+<a name="ln224">				mode-&gt;timing</a>
+<a name="ln225">					= get_crtc_info_block(monitor.data.detailed_timing);</a>
+<a name="ln226">				return mode;</a>
+<a name="ln227">			}</a>
+<a name="ln228">		}</a>
+<a name="ln229">	}</a>
+<a name="ln230"> </a>
+<a name="ln231">	int32 best = -1;</a>
+<a name="ln232"> </a>
+<a name="ln233">	// try standard timings next</a>
+<a name="ln234">	for (int32 i = 0; i &lt; EDID1_NUM_STD_TIMING; i++) {</a>
+<a name="ln235">		if (info.std_timing[i].h_size &lt;= 256)</a>
+<a name="ln236">			continue;</a>
+<a name="ln237"> </a>
+<a name="ln238">		video_mode* found = find_video_mode(info.std_timing[i].h_size,</a>
+<a name="ln239">			info.std_timing[i].v_size, allowPalette);</a>
+<a name="ln240">		if (found != NULL) {</a>
+<a name="ln241">			if (mode != NULL) {</a>
+<a name="ln242">				// prefer higher resolutions</a>
+<a name="ln243">				if (found-&gt;width &gt; mode-&gt;width) {</a>
+<a name="ln244">					mode = found;</a>
+<a name="ln245">					best = i;</a>
+<a name="ln246">				}</a>
+<a name="ln247">			} else {</a>
+<a name="ln248">				mode = found;</a>
+<a name="ln249">				best = i;</a>
+<a name="ln250">			}</a>
+<a name="ln251">		}</a>
+<a name="ln252">	}</a>
+<a name="ln253"> </a>
+<a name="ln254">	if (best &gt;= 0)</a>
+<a name="ln255">		mode-&gt;timing = get_crtc_info_block(info.std_timing[best]);</a>
+<a name="ln256"> </a>
+<a name="ln257">	return mode;</a>
+<a name="ln258">}</a>
+<a name="ln259"> </a>
+<a name="ln260"> </a>
+<a name="ln261">static void</a>
+<a name="ln262">vesa_fixups(void *settings)</a>
+<a name="ln263">{</a>
+<a name="ln264">	const char *oem_string = (const char *)sInfo.oem_string;</a>
+<a name="ln265"> </a>
+<a name="ln266">	if (!strcmp(oem_string, &quot;NVIDIA&quot;)) {</a>
+<a name="ln267">		const char *arg = NULL;</a>
+<a name="ln268">		int32 scaling = -1;</a>
+<a name="ln269"> </a>
+<a name="ln270">		if (settings != NULL)</a>
+<a name="ln271">			arg = get_driver_parameter(settings, &quot;nvidia_scaling&quot;, NULL, &quot;1&quot;);</a>
+<a name="ln272">		if (arg != NULL)</a>
+<a name="ln273">			scaling = strtol(arg, NULL, 0);</a>
+<a name="ln274"> </a>
+<a name="ln275">		if (scaling &gt; -1) {</a>
+<a name="ln276">			dprintf(&quot;Setting nvidia scaling mode to %&quot; B_PRId32 &quot;\n&quot;, scaling);</a>
+<a name="ln277">			struct bios_regs regs;</a>
+<a name="ln278">			regs.eax = 0x4f14;</a>
+<a name="ln279">			regs.ebx = 0x0102;</a>
+<a name="ln280">			regs.ecx = scaling;</a>
+<a name="ln281">			call_bios(0x10, &amp;regs);</a>
+<a name="ln282">		}</a>
+<a name="ln283">	}</a>
+<a name="ln284"> </a>
+<a name="ln285">}</a>
+<a name="ln286"> </a>
+<a name="ln287"> </a>
+<a name="ln288">static bool</a>
+<a name="ln289">get_mode_from_settings(void)</a>
+<a name="ln290">{</a>
+<a name="ln291">	if (sSettingsLoaded)</a>
+<a name="ln292">		return true;</a>
+<a name="ln293"> </a>
+<a name="ln294">	void *handle = load_driver_settings(&quot;vesa&quot;);</a>
+<a name="ln295">	if (handle == NULL)</a>
+<a name="ln296">		return false;</a>
+<a name="ln297"> </a>
+<a name="ln298">	vesa_fixups(handle);</a>
+<a name="ln299"> </a>
+<a name="ln300">	bool found = false;</a>
+<a name="ln301"> </a>
+<a name="ln302">	const driver_settings *settings = get_driver_settings(handle);</a>
+<a name="ln303">	if (settings == NULL)</a>
+<a name="ln304">		goto out;</a>
+<a name="ln305"> </a>
+<a name="ln306">	sSettingsLoaded = true;</a>
+<a name="ln307"> </a>
+<a name="ln308">	for (int32 i = 0; i &lt; settings-&gt;parameter_count; i++) {</a>
+<a name="ln309">		driver_parameter &amp;parameter = settings-&gt;parameters[i];</a>
+<a name="ln310"> </a>
+<a name="ln311">		if (!strcmp(parameter.name, &quot;mode&quot;) &amp;&amp; parameter.value_count &gt; 2) {</a>
+<a name="ln312">			// parameter found, now get its values</a>
+<a name="ln313">			int32 width = strtol(parameter.values[0], NULL, 0);</a>
+<a name="ln314">			int32 height = strtol(parameter.values[1], NULL, 0);</a>
+<a name="ln315">			int32 depth = strtol(parameter.values[2], NULL, 0);</a>
+<a name="ln316"> </a>
+<a name="ln317">			// search mode that fits</a>
+<a name="ln318"> </a>
+<a name="ln319">			video_mode *mode = closest_video_mode(width, height, depth);</a>
+<a name="ln320">			if (mode != NULL) {</a>
+<a name="ln321">				found = true;</a>
+<a name="ln322">				sMode = mode;</a>
+<a name="ln323">			}</a>
+<a name="ln324">		}</a>
+<a name="ln325">	}</a>
+<a name="ln326"> </a>
+<a name="ln327">out:</a>
+<a name="ln328">	unload_driver_settings(handle);</a>
+<a name="ln329">	return found;</a>
+<a name="ln330">}</a>
+<a name="ln331"> </a>
+<a name="ln332"> </a>
+<a name="ln333">//	#pragma mark - vga</a>
+<a name="ln334"> </a>
+<a name="ln335"> </a>
+<a name="ln336">static void</a>
+<a name="ln337">vga_set_palette(const uint8 *palette, int32 firstIndex, int32 numEntries)</a>
+<a name="ln338">{</a>
+<a name="ln339">	out8(firstIndex, VGA_COLOR_WRITE_MODE);</a>
+<a name="ln340">	// write VGA palette</a>
+<a name="ln341">	for (int32 i = firstIndex; i &lt; numEntries; i++) {</a>
+<a name="ln342">		// VGA (usually) has only 6 bits per gun</a>
+<a name="ln343">		out8(palette[i * 3 + 0] &gt;&gt; 2, VGA_COLOR_DATA);</a>
+<a name="ln344">		out8(palette[i * 3 + 1] &gt;&gt; 2, VGA_COLOR_DATA);</a>
+<a name="ln345">		out8(palette[i * 3 + 2] &gt;&gt; 2, VGA_COLOR_DATA);</a>
+<a name="ln346">	}</a>
+<a name="ln347">}</a>
+<a name="ln348"> </a>
+<a name="ln349"> </a>
+<a name="ln350">static void</a>
+<a name="ln351">vga_enable_bright_background_colors(void)</a>
+<a name="ln352">{</a>
+<a name="ln353">	// reset attribute controller</a>
+<a name="ln354">	in8(VGA_INPUT_STATUS_1);</a>
+<a name="ln355"> </a>
+<a name="ln356">	// select mode control register</a>
+<a name="ln357">	out8(0x30, VGA_ATTRIBUTE_WRITE);</a>
+<a name="ln358"> </a>
+<a name="ln359">	// read mode control register, change it (we need to clear bit 3), and write it back</a>
+<a name="ln360">	uint8 mode = in8(VGA_ATTRIBUTE_READ) &amp; 0xf7;</a>
+<a name="ln361">	out8(mode, VGA_ATTRIBUTE_WRITE);</a>
+<a name="ln362">}</a>
+<a name="ln363"> </a>
+<a name="ln364"> </a>
+<a name="ln365">//	#pragma mark - vesa</a>
+<a name="ln366"> </a>
+<a name="ln367"> </a>
+<a name="ln368">static status_t</a>
+<a name="ln369">vesa_get_edid(edid1_info *info)</a>
+<a name="ln370">{</a>
+<a name="ln371">	struct bios_regs regs;</a>
+<a name="ln372">	regs.eax = 0x4f15;</a>
+<a name="ln373">	regs.ebx = 0;</a>
+<a name="ln374">		// report DDC service</a>
+<a name="ln375">	regs.ecx = 0;</a>
+<a name="ln376">	regs.es = 0;</a>
+<a name="ln377">	regs.edi = 0;</a>
+<a name="ln378">	call_bios(0x10, &amp;regs);</a>
+<a name="ln379"> </a>
+<a name="ln380">	TRACE((&quot;EDID1: %lx\n&quot;, regs.eax));</a>
+<a name="ln381">	// %ah contains the error code</a>
+<a name="ln382">	// %al determines whether or not the function is supported</a>
+<a name="ln383">	if (regs.eax != 0x4f)</a>
+<a name="ln384">		return B_NOT_SUPPORTED;</a>
+<a name="ln385"> </a>
+<a name="ln386">	TRACE((&quot;EDID2: ebx %lx\n&quot;, regs.ebx));</a>
+<a name="ln387">	// test if DDC is supported by the monitor</a>
+<a name="ln388">	if ((regs.ebx &amp; 3) == 0)</a>
+<a name="ln389">		return B_NOT_SUPPORTED;</a>
+<a name="ln390"> </a>
+<a name="ln391">	edid1_raw edidRaw;</a>
+<a name="ln392"> </a>
+<a name="ln393">	regs.eax = 0x4f15;</a>
+<a name="ln394">	regs.ebx = 1;</a>
+<a name="ln395">		// read EDID</a>
+<a name="ln396">	regs.ecx = 0;</a>
+<a name="ln397">	regs.edx = 0;</a>
+<a name="ln398">	regs.es = ADDRESS_SEGMENT(&amp;edidRaw);</a>
+<a name="ln399">	regs.edi = ADDRESS_OFFSET(&amp;edidRaw);</a>
+<a name="ln400">	call_bios(0x10, &amp;regs);</a>
+<a name="ln401">	TRACE((&quot;EDID3: %lx\n&quot;, regs.eax));</a>
+<a name="ln402"> </a>
+<a name="ln403">	if (regs.eax != 0x4f)</a>
+<a name="ln404">		return B_NOT_SUPPORTED;</a>
+<a name="ln405"> </a>
+<a name="ln406">	// retrieved EDID - now parse it</a>
+<a name="ln407">	edid_decode(info, &amp;edidRaw);</a>
+<a name="ln408"> </a>
+<a name="ln409">#ifdef TRACE_VIDEO</a>
+<a name="ln410">	edid_dump(info);</a>
+<a name="ln411">#endif</a>
+<a name="ln412">	return B_OK;</a>
+<a name="ln413">}</a>
+<a name="ln414"> </a>
+<a name="ln415"> </a>
+<a name="ln416">static status_t</a>
+<a name="ln417">vesa_get_mode_info(uint16 mode, struct vbe_mode_info *modeInfo)</a>
+<a name="ln418">{</a>
+<a name="ln419">	memset(modeInfo, 0, sizeof(vbe_mode_info));</a>
+<a name="ln420"> </a>
+<a name="ln421">	struct bios_regs regs;</a>
+<a name="ln422">	regs.eax = 0x4f01;</a>
+<a name="ln423">	regs.ecx = mode;</a>
+<a name="ln424">	regs.es = ADDRESS_SEGMENT(modeInfo);</a>
+<a name="ln425">	regs.edi = ADDRESS_OFFSET(modeInfo);</a>
+<a name="ln426">	call_bios(0x10, &amp;regs);</a>
+<a name="ln427"> </a>
+<a name="ln428">	// %ah contains the error code</a>
+<a name="ln429">	if ((regs.eax &amp; 0xff00) != 0)</a>
+<a name="ln430">		return B_ENTRY_NOT_FOUND;</a>
+<a name="ln431"> </a>
+<a name="ln432">	return B_OK;</a>
+<a name="ln433">}</a>
+<a name="ln434"> </a>
+<a name="ln435"> </a>
+<a name="ln436">static status_t</a>
+<a name="ln437">vesa_get_vbe_info_block(vbe_info_block *info)</a>
+<a name="ln438">{</a>
+<a name="ln439">	memset(info, 0, sizeof(vbe_info_block));</a>
+<a name="ln440">	info-&gt;signature = VBE2_SIGNATURE;</a>
+<a name="ln441"> </a>
+<a name="ln442">	struct bios_regs regs;</a>
+<a name="ln443">	regs.eax = 0x4f00;</a>
+<a name="ln444">	regs.es = ADDRESS_SEGMENT(info);</a>
+<a name="ln445">	regs.edi = ADDRESS_OFFSET(info);</a>
+<a name="ln446">	call_bios(0x10, &amp;regs);</a>
+<a name="ln447"> </a>
+<a name="ln448">	// %ah contains the error code</a>
+<a name="ln449">	if ((regs.eax &amp; 0xff00) != 0)</a>
+<a name="ln450">		return B_ERROR;</a>
+<a name="ln451"> </a>
+<a name="ln452">	if (info-&gt;signature != VESA_SIGNATURE)</a>
+<a name="ln453">		return B_ERROR;</a>
+<a name="ln454"> </a>
+<a name="ln455">	dprintf(&quot;VESA version = %d.%d, capabilities %lx\n&quot;, info-&gt;version.major,</a>
+<a name="ln456">		info-&gt;version.minor, info-&gt;capabilities);</a>
+<a name="ln457"> </a>
+<a name="ln458">	if (info-&gt;version.major &lt; 2) {</a>
+<a name="ln459">		dprintf(&quot;VESA support too old\n&quot;);</a>
+<a name="ln460">		return B_ERROR;</a>
+<a name="ln461">	}</a>
+<a name="ln462"> </a>
+<a name="ln463">	info-&gt;oem_string = SEGMENTED_TO_LINEAR(info-&gt;oem_string);</a>
+<a name="ln464">	info-&gt;mode_list = SEGMENTED_TO_LINEAR(info-&gt;mode_list);</a>
+<a name="ln465">	dprintf(&quot;OEM string: %s\n&quot;, (const char *)info-&gt;oem_string);</a>
+<a name="ln466"> </a>
+<a name="ln467">	return B_OK;</a>
+<a name="ln468">}</a>
+<a name="ln469"> </a>
+<a name="ln470"> </a>
+<a name="ln471">static status_t</a>
+<a name="ln472">vesa_init(vbe_info_block *info, video_mode **_standardMode)</a>
+<a name="ln473">{</a>
+<a name="ln474">	if (vesa_get_vbe_info_block(info) != B_OK)</a>
+<a name="ln475">		return B_ERROR;</a>
+<a name="ln476"> </a>
+<a name="ln477">	// fill mode list and find standard video mode</a>
+<a name="ln478"> </a>
+<a name="ln479">	video_mode *standardMode = NULL;</a>
+<a name="ln480"> </a>
+<a name="ln481">	for (int32 i = 0; true; i++) {</a>
+<a name="ln482">		uint16 mode = ((uint16 *)info-&gt;mode_list)[i];</a>
+<a name="ln483">		if (mode == 0xffff)</a>
+<a name="ln484">			break;</a>
+<a name="ln485"> </a>
+<a name="ln486">		struct vbe_mode_info modeInfo;</a>
+<a name="ln487">		if (vesa_get_mode_info(mode, &amp;modeInfo) == B_OK) {</a>
+<a name="ln488">			TRACE((&quot; 0x%03x: %u x %u x %u (a = %d, mem = %d, phy = %lx, p = %d, b = %d)\n&quot;, mode,</a>
+<a name="ln489">				   modeInfo.width, modeInfo.height, modeInfo.bits_per_pixel, modeInfo.attributes,</a>
+<a name="ln490">				   modeInfo.memory_model, modeInfo.physical_base, modeInfo.num_planes,</a>
+<a name="ln491">				   modeInfo.num_banks));</a>
+<a name="ln492">			TRACE((&quot;	mask: r: %d %d g: %d %d b: %d %d dcmi: %d\n&quot;,</a>
+<a name="ln493">				   modeInfo.red_mask_size, modeInfo.red_field_position,</a>
+<a name="ln494">				   modeInfo.green_mask_size, modeInfo.green_field_position,</a>
+<a name="ln495">				   modeInfo.blue_mask_size, modeInfo.blue_field_position,</a>
+<a name="ln496">				   modeInfo.direct_color_mode_info));</a>
+<a name="ln497"> </a>
+<a name="ln498">			const uint32 requiredAttributes = MODE_ATTR_AVAILABLE</a>
+<a name="ln499">				| MODE_ATTR_GRAPHICS_MODE | MODE_ATTR_COLOR_MODE</a>
+<a name="ln500">				| MODE_ATTR_LINEAR_BUFFER;</a>
+<a name="ln501"> </a>
+<a name="ln502">			if (modeInfo.width &gt;= 640</a>
+<a name="ln503">				&amp;&amp; modeInfo.physical_base != 0</a>
+<a name="ln504">				&amp;&amp; modeInfo.num_planes == 1</a>
+<a name="ln505">				&amp;&amp; (modeInfo.memory_model == MODE_MEMORY_PACKED_PIXEL</a>
+<a name="ln506">					|| modeInfo.memory_model == MODE_MEMORY_DIRECT_COLOR)</a>
+<a name="ln507">				&amp;&amp; (modeInfo.attributes &amp; requiredAttributes)</a>
+<a name="ln508">					== requiredAttributes) {</a>
+<a name="ln509">				// this mode fits our needs</a>
+<a name="ln510">				video_mode *videoMode = (video_mode *)malloc(</a>
+<a name="ln511">					sizeof(struct video_mode));</a>
+<a name="ln512">				if (videoMode == NULL)</a>
+<a name="ln513">					continue;</a>
+<a name="ln514"> </a>
+<a name="ln515">				videoMode-&gt;mode = mode;</a>
+<a name="ln516">				videoMode-&gt;bytes_per_row = modeInfo.bytes_per_row;</a>
+<a name="ln517">				videoMode-&gt;width = modeInfo.width;</a>
+<a name="ln518">				videoMode-&gt;height = modeInfo.height;</a>
+<a name="ln519">				videoMode-&gt;bits_per_pixel = modeInfo.bits_per_pixel;</a>
+<a name="ln520">				videoMode-&gt;timing = NULL;</a>
+<a name="ln521"> </a>
+<a name="ln522">				if (modeInfo.bits_per_pixel == 16</a>
+<a name="ln523">					&amp;&amp; modeInfo.red_mask_size + modeInfo.green_mask_size</a>
+<a name="ln524">						+ modeInfo.blue_mask_size == 15) {</a>
+<a name="ln525">					// this is really a 15-bit mode</a>
+<a name="ln526">					videoMode-&gt;bits_per_pixel = 15;</a>
+<a name="ln527">				}</a>
+<a name="ln528"> </a>
+<a name="ln529">				add_video_mode(videoMode);</a>
+<a name="ln530">			}</a>
+<a name="ln531">		} else</a>
+<a name="ln532">			TRACE((&quot; 0x%03x: (failed)\n&quot;, mode));</a>
+<a name="ln533">	}</a>
+<a name="ln534"> </a>
+<a name="ln535">	// Choose default resolution (when no EDID information is available)</a>
+<a name="ln536">	const uint32 kPreferredWidth = 1024;</a>
+<a name="ln537">	const uint32 kFallbackWidth = 800;</a>
+<a name="ln538"> </a>
+<a name="ln539">	standardMode = find_video_mode(kPreferredWidth, -1, false);</a>
+<a name="ln540">	if (standardMode == NULL) {</a>
+<a name="ln541">		standardMode = find_video_mode(kFallbackWidth, -1, false);</a>
+<a name="ln542">		if (standardMode == NULL) {</a>
+<a name="ln543">			standardMode = find_video_mode(kPreferredWidth, -1, true);</a>
+<a name="ln544">			if (standardMode == NULL)</a>
+<a name="ln545">				standardMode = find_video_mode(kFallbackWidth, -1, true);</a>
+<a name="ln546">		}</a>
+<a name="ln547">	}</a>
+<a name="ln548">	if (standardMode == NULL) {</a>
+<a name="ln549">		// just take any mode</a>
+<a name="ln550">		standardMode = (video_mode *)list_get_first_item(&amp;sModeList);</a>
+<a name="ln551">	}</a>
+<a name="ln552"> </a>
+<a name="ln553">	if (standardMode == NULL) {</a>
+<a name="ln554">		// no usable VESA mode found...</a>
+<a name="ln555">		return B_ERROR;</a>
+<a name="ln556">	}</a>
+<a name="ln557"> </a>
+<a name="ln558">	TRACE((&quot;Using mode 0x%03x\n&quot;, standardMode-&gt;mode));</a>
+<a name="ln559">	*_standardMode = standardMode;</a>
+<a name="ln560">	return B_OK;</a>
+<a name="ln561">}</a>
+<a name="ln562"> </a>
+<a name="ln563"> </a>
+<a name="ln564">#if 0</a>
+<a name="ln565">static status_t</a>
+<a name="ln566">vesa_get_mode(uint16 *_mode)</a>
+<a name="ln567">{</a>
+<a name="ln568">	struct bios_regs regs;</a>
+<a name="ln569">	regs.eax = 0x4f03;</a>
+<a name="ln570">	call_bios(0x10, &amp;regs);</a>
+<a name="ln571"> </a>
+<a name="ln572">	if ((regs.eax &amp; 0xffff) != 0x4f)</a>
+<a name="ln573">		return B_ERROR;</a>
+<a name="ln574"> </a>
+<a name="ln575">	*_mode = regs.ebx &amp; 0xffff;</a>
+<a name="ln576">	return B_OK;</a>
+<a name="ln577">}</a>
+<a name="ln578">#endif</a>
+<a name="ln579"> </a>
+<a name="ln580"> </a>
+<a name="ln581">static status_t</a>
+<a name="ln582">vesa_set_mode(video_mode* mode, bool useTiming)</a>
+<a name="ln583">{</a>
+<a name="ln584">	struct bios_regs regs;</a>
+<a name="ln585">	regs.eax = 0x4f02;</a>
+<a name="ln586">	regs.ebx = (mode-&gt;mode &amp; SET_MODE_MASK) | SET_MODE_LINEAR_BUFFER;</a>
+<a name="ln587"> </a>
+<a name="ln588">	if (useTiming &amp;&amp; mode-&gt;timing != NULL) {</a>
+<a name="ln589">		regs.ebx |= SET_MODE_SPECIFY_CRTC;</a>
+<a name="ln590">		regs.es = ADDRESS_SEGMENT(mode-&gt;timing);</a>
+<a name="ln591">		regs.edi = ADDRESS_OFFSET(mode-&gt;timing);</a>
+<a name="ln592">	}</a>
+<a name="ln593"> </a>
+<a name="ln594">	call_bios(0x10, &amp;regs);</a>
+<a name="ln595"> </a>
+<a name="ln596">	if ((regs.eax &amp; 0xffff) != 0x4f)</a>
+<a name="ln597">		return B_ERROR;</a>
+<a name="ln598"> </a>
+<a name="ln599">#if 0</a>
+<a name="ln600">	// make sure we have 8 bits per color channel</a>
+<a name="ln601">	regs.eax = 0x4f08;</a>
+<a name="ln602">	regs.ebx = 8 &lt;&lt; 8;</a>
+<a name="ln603">	call_bios(0x10, &amp;regs);</a>
+<a name="ln604">#endif</a>
+<a name="ln605"> </a>
+<a name="ln606">	return B_OK;</a>
+<a name="ln607">}</a>
+<a name="ln608"> </a>
+<a name="ln609"> </a>
+<a name="ln610">static status_t</a>
+<a name="ln611">vesa_set_palette(const uint8 *palette, int32 firstIndex, int32 numEntries)</a>
+<a name="ln612">{</a>
+<a name="ln613">	// is this an 8 bit indexed color mode?</a>
+<a name="ln614">	if (gKernelArgs.frame_buffer.depth != 8)</a>
+<a name="ln615">		return B_BAD_TYPE;</a>
+<a name="ln616"> </a>
+<a name="ln617">#if 0</a>
+<a name="ln618">	struct bios_regs regs;</a>
+<a name="ln619">	regs.eax = 0x4f09;</a>
+<a name="ln620">	regs.ebx = 0;</a>
+<a name="ln621">	regs.ecx = numEntries;</a>
+<a name="ln622">	regs.edx = firstIndex;</a>
+<a name="ln623">	regs.es = (addr_t)palette &gt;&gt; 4;</a>
+<a name="ln624">	regs.edi = (addr_t)palette &amp; 0xf;</a>
+<a name="ln625">	call_bios(0x10, &amp;regs);</a>
+<a name="ln626"> </a>
+<a name="ln627">	if ((regs.eax &amp; 0xffff) != 0x4f) {</a>
+<a name="ln628">#endif</a>
+<a name="ln629">		// the VESA call does not work, just try good old VGA mechanism</a>
+<a name="ln630">		vga_set_palette(palette, firstIndex, numEntries);</a>
+<a name="ln631">#if 0</a>
+<a name="ln632">		return B_ERROR;</a>
+<a name="ln633">	}</a>
+<a name="ln634">#endif</a>
+<a name="ln635">	return B_OK;</a>
+<a name="ln636">}</a>
+<a name="ln637"> </a>
+<a name="ln638"> </a>
+<a name="ln639">//	#pragma mark -</a>
+<a name="ln640"> </a>
+<a name="ln641"> </a>
+<a name="ln642">bool</a>
+<a name="ln643">video_mode_hook(Menu *menu, MenuItem *item)</a>
+<a name="ln644">{</a>
+<a name="ln645">	// find selected mode</a>
+<a name="ln646">	video_mode *mode = NULL;</a>
+<a name="ln647"> </a>
+<a name="ln648">	menu = item-&gt;Submenu();</a>
+<a name="ln649">	item = menu-&gt;FindMarked();</a>
+<a name="ln650">	if (item != NULL) {</a>
+<a name="ln651">		switch (menu-&gt;IndexOf(item)) {</a>
+<a name="ln652">			case 0:</a>
+<a name="ln653">				// &quot;Default&quot; mode special</a>
+<a name="ln654">				sMode = sDefaultMode;</a>
+<a name="ln655">				sModeChosen = false;</a>
+<a name="ln656">				return true;</a>
+<a name="ln657">			case 1:</a>
+<a name="ln658">				// &quot;Standard VGA&quot; mode special</a>
+<a name="ln659">				// sets sMode to NULL which triggers VGA mode</a>
+<a name="ln660">				break;</a>
+<a name="ln661">			default:</a>
+<a name="ln662">				mode = (video_mode *)item-&gt;Data();</a>
+<a name="ln663">				break;</a>
+<a name="ln664">		}</a>
+<a name="ln665">	}</a>
+<a name="ln666"> </a>
+<a name="ln667">	if (mode != sMode) {</a>
+<a name="ln668">		// update standard mode</a>
+<a name="ln669">		// ToDo: update fb settings!</a>
+<a name="ln670">		sMode = mode;</a>
+<a name="ln671">	}</a>
+<a name="ln672"> </a>
+<a name="ln673">	sModeChosen = true;</a>
+<a name="ln674">	return true;</a>
+<a name="ln675">}</a>
+<a name="ln676"> </a>
+<a name="ln677"> </a>
+<a name="ln678">Menu *</a>
+<a name="ln679">video_mode_menu()</a>
+<a name="ln680">{</a>
+<a name="ln681">	Menu *menu = new(nothrow) Menu(CHOICE_MENU, &quot;Select Video Mode&quot;);</a>
+<a name="ln682">	MenuItem *item;</a>
+<a name="ln683"> </a>
+<a name="ln684">	menu-&gt;AddItem(item = new(nothrow) MenuItem(&quot;Default&quot;));</a>
+<a name="ln685">	item-&gt;SetMarked(true);</a>
+<a name="ln686">	item-&gt;Select(true);</a>
+<a name="ln687">	item-&gt;SetHelpText(&quot;The Default video mode is the one currently configured &quot;</a>
+<a name="ln688">		&quot;in the system. If there is no mode configured yet, a viable mode will &quot;</a>
+<a name="ln689">		&quot;be chosen automatically.&quot;);</a>
+<a name="ln690"> </a>
+<a name="ln691">	menu-&gt;AddItem(new(nothrow) MenuItem(&quot;Standard VGA&quot;));</a>
+<a name="ln692"> </a>
+<a name="ln693">	video_mode *mode = NULL;</a>
+<a name="ln694">	while ((mode = (video_mode *)list_get_next_item(&amp;sModeList, mode)) != NULL) {</a>
+<a name="ln695">		char label[64];</a>
+<a name="ln696">		snprintf(label, sizeof(label), &quot;%ux%u %u bit&quot;, mode-&gt;width,</a>
+<a name="ln697">			mode-&gt;height, mode-&gt;bits_per_pixel);</a>
+<a name="ln698"> </a>
+<a name="ln699">		menu-&gt;AddItem(item = new(nothrow) MenuItem(label));</a>
+<a name="ln700">		item-&gt;SetData(mode);</a>
+<a name="ln701">	}</a>
+<a name="ln702"> </a>
+<a name="ln703">	menu-&gt;AddSeparatorItem();</a>
+<a name="ln704">	menu-&gt;AddItem(item = new(nothrow) MenuItem(&quot;Return to main menu&quot;));</a>
+<a name="ln705">	item-&gt;SetType(MENU_ITEM_NO_CHOICE);</a>
+<a name="ln706"> </a>
+<a name="ln707">	return menu;</a>
+<a name="ln708">}</a>
+<a name="ln709"> </a>
+<a name="ln710"> </a>
+<a name="ln711">static void</a>
+<a name="ln712">set_vga_mode(void)</a>
+<a name="ln713">{</a>
+<a name="ln714">	// sets 640x480 16 colors graphics mode</a>
+<a name="ln715">	bios_regs regs;</a>
+<a name="ln716">	regs.eax = 0x0012;</a>
+<a name="ln717">	call_bios(0x10, &amp;regs);</a>
+<a name="ln718">}</a>
+<a name="ln719"> </a>
+<a name="ln720"> </a>
+<a name="ln721">static void</a>
+<a name="ln722">set_text_mode(void)</a>
+<a name="ln723">{</a>
+<a name="ln724">	// sets 80x25 text console</a>
+<a name="ln725">	bios_regs regs;</a>
+<a name="ln726">	regs.eax = 0x0003;</a>
+<a name="ln727">	call_bios(0x10, &amp;regs);</a>
+<a name="ln728"> </a>
+<a name="ln729">	video_hide_text_cursor();</a>
+<a name="ln730">}</a>
+<a name="ln731"> </a>
+<a name="ln732"> </a>
+<a name="ln733">void</a>
+<a name="ln734">video_move_text_cursor(int x, int y)</a>
+<a name="ln735">{</a>
+<a name="ln736">	bios_regs regs;</a>
+<a name="ln737">	regs.eax = 0x0200;</a>
+<a name="ln738">	regs.ebx = 0;</a>
+<a name="ln739">	regs.edx = (y &lt;&lt; 8) | x;</a>
+<a name="ln740">	call_bios(0x10, &amp;regs);</a>
+<a name="ln741">}</a>
+<a name="ln742"> </a>
+<a name="ln743"> </a>
+<a name="ln744">void</a>
+<a name="ln745">video_show_text_cursor(void)</a>
+<a name="ln746">{</a>
+<a name="ln747">	bios_regs regs;</a>
+<a name="ln748">	regs.eax = 0x0100;</a>
+<a name="ln749">	regs.ecx = 0x0607;</a>
+<a name="ln750">	call_bios(0x10, &amp;regs);</a>
+<a name="ln751">}</a>
+<a name="ln752"> </a>
+<a name="ln753"> </a>
+<a name="ln754">void</a>
+<a name="ln755">video_hide_text_cursor(void)</a>
+<a name="ln756">{</a>
+<a name="ln757">	bios_regs regs;</a>
+<a name="ln758">	regs.eax = 0x0100;</a>
+<a name="ln759">	regs.ecx = 0x2000;</a>
+<a name="ln760">	call_bios(0x10, &amp;regs);</a>
+<a name="ln761">}</a>
+<a name="ln762"> </a>
+<a name="ln763"> </a>
+<a name="ln764">//	#pragma mark - blit</a>
+<a name="ln765"> </a>
+<a name="ln766"> </a>
+<a name="ln767">void</a>
+<a name="ln768">platform_blit4(addr_t frameBuffer, const uint8 *data,</a>
+<a name="ln769">	uint16 width, uint16 height, uint16 imageWidth, uint16 left, uint16 top)</a>
+<a name="ln770">{</a>
+<a name="ln771">	if (!data)</a>
+<a name="ln772">		return;</a>
+<a name="ln773">	// ToDo: no boot logo yet in VGA mode</a>
+<a name="ln774">#if 1</a>
+<a name="ln775">// this draws 16 big rectangles in all the available colors</a>
+<a name="ln776">	uint8 *bits = (uint8 *)frameBuffer;</a>
+<a name="ln777">	uint32 bytesPerRow = 80;</a>
+<a name="ln778">	for (int32 i = 0; i &lt; 32; i++) {</a>
+<a name="ln779">		bits[9 * bytesPerRow + i + 2] = 0x55;</a>
+<a name="ln780">		bits[30 * bytesPerRow + i + 2] = 0xaa;</a>
+<a name="ln781">	}</a>
+<a name="ln782"> </a>
+<a name="ln783">	for (int32 y = 10; y &lt; 30; y++) {</a>
+<a name="ln784">		for (int32 i = 0; i &lt; 16; i++) {</a>
+<a name="ln785">			out16((15 &lt;&lt; 8) | 0x02, VGA_SEQUENCER_INDEX);</a>
+<a name="ln786">			bits[32 * bytesPerRow + i*2 + 2] = i;</a>
+<a name="ln787"> </a>
+<a name="ln788">			if (i &amp; 1) {</a>
+<a name="ln789">				out16((1 &lt;&lt; 8) | 0x02, VGA_SEQUENCER_INDEX);</a>
+<a name="ln790">				bits[y * bytesPerRow + i*2 + 2] = 0xff;</a>
+<a name="ln791">				bits[y * bytesPerRow + i*2 + 3] = 0xff;</a>
+<a name="ln792">			}</a>
+<a name="ln793">			if (i &amp; 2) {</a>
+<a name="ln794">				out16((2 &lt;&lt; 8) | 0x02, VGA_SEQUENCER_INDEX);</a>
+<a name="ln795">				bits[y * bytesPerRow + i*2 + 2] = 0xff;</a>
+<a name="ln796">				bits[y * bytesPerRow + i*2 + 3] = 0xff;</a>
+<a name="ln797">			}</a>
+<a name="ln798">			if (i &amp; 4) {</a>
+<a name="ln799">				out16((4 &lt;&lt; 8) | 0x02, VGA_SEQUENCER_INDEX);</a>
+<a name="ln800">				bits[y * bytesPerRow + i*2 + 2] = 0xff;</a>
+<a name="ln801">				bits[y * bytesPerRow + i*2 + 3] = 0xff;</a>
+<a name="ln802">			}</a>
+<a name="ln803">			if (i &amp; 8) {</a>
+<a name="ln804">				out16((8 &lt;&lt; 8) | 0x02, VGA_SEQUENCER_INDEX);</a>
+<a name="ln805">				bits[y * bytesPerRow + i*2 + 2] = 0xff;</a>
+<a name="ln806">				bits[y * bytesPerRow + i*2 + 3] = 0xff;</a>
+<a name="ln807">			}</a>
+<a name="ln808">		}</a>
+<a name="ln809">	}</a>
+<a name="ln810"> </a>
+<a name="ln811">	// enable all planes again</a>
+<a name="ln812">	out16((15 &lt;&lt; 8) | 0x02, VGA_SEQUENCER_INDEX);</a>
+<a name="ln813">#endif</a>
+<a name="ln814">}</a>
+<a name="ln815"> </a>
+<a name="ln816"> </a>
+<a name="ln817">extern &quot;C&quot; void</a>
+<a name="ln818">platform_set_palette(const uint8 *palette)</a>
+<a name="ln819">{</a>
+<a name="ln820">	switch (gKernelArgs.frame_buffer.depth) {</a>
+<a name="ln821">		case 4:</a>
+<a name="ln822">			//vga_set_palette((const uint8 *)kPalette16, 0, 16);</a>
+<a name="ln823">			break;</a>
+<a name="ln824">		case 8:</a>
+<a name="ln825">			if (vesa_set_palette((const uint8 *)palette, 0, 256) != B_OK)</a>
+<a name="ln826">				dprintf(&quot;set palette failed!\n&quot;);</a>
+<a name="ln827"> </a>
+<a name="ln828">			break;</a>
+<a name="ln829">		default:</a>
+<a name="ln830">			break;</a>
+<a name="ln831">	}</a>
+<a name="ln832">}</a>
+<a name="ln833"> </a>
+<a name="ln834"> </a>
+<a name="ln835">//	#pragma mark -</a>
+<a name="ln836"> </a>
+<a name="ln837">extern &quot;C&quot; void</a>
+<a name="ln838">platform_switch_to_logo(void)</a>
+<a name="ln839">{</a>
+<a name="ln840">	// in debug mode, we'll never show the logo</a>
+<a name="ln841">	if ((platform_boot_options() &amp; BOOT_OPTION_DEBUG_OUTPUT) != 0)</a>
+<a name="ln842">		return;</a>
+<a name="ln843"> </a>
+<a name="ln844">	addr_t lastBase = gKernelArgs.frame_buffer.physical_buffer.start;</a>
+<a name="ln845">	size_t lastSize = gKernelArgs.frame_buffer.physical_buffer.size;</a>
+<a name="ln846"> </a>
+<a name="ln847">	if (sVesaCompatible &amp;&amp; sMode != NULL) {</a>
+<a name="ln848">		if (!sModeChosen)</a>
+<a name="ln849">			get_mode_from_settings();</a>
+<a name="ln850"> </a>
+<a name="ln851">		// On some BIOS / chipset / monitor combinations, there seems to be a</a>
+<a name="ln852">		// timing issue between getting the EDID data and setting the video</a>
+<a name="ln853">		// mode. As such we wait here briefly to give everything enough time</a>
+<a name="ln854">		// to settle.</a>
+<a name="ln855">		spin(1000);</a>
+<a name="ln856"> </a>
+<a name="ln857">		if ((sMode-&gt;timing == NULL || vesa_set_mode(sMode, true) != B_OK)</a>
+<a name="ln858">			&amp;&amp; vesa_set_mode(sMode, false) != B_OK)</a>
+<a name="ln859">			goto fallback;</a>
+<a name="ln860"> </a>
+<a name="ln861">		struct vbe_mode_info modeInfo;</a>
+<a name="ln862">		if (vesa_get_mode_info(sMode-&gt;mode, &amp;modeInfo) != B_OK)</a>
+<a name="ln863">			goto fallback;</a>
+<a name="ln864"> </a>
+<a name="ln865">		gKernelArgs.frame_buffer.width = modeInfo.width;</a>
+<a name="ln866">		gKernelArgs.frame_buffer.height = modeInfo.height;</a>
+<a name="ln867">		gKernelArgs.frame_buffer.bytes_per_row = modeInfo.bytes_per_row;</a>
+<a name="ln868">		gKernelArgs.frame_buffer.depth = modeInfo.bits_per_pixel;</a>
+<a name="ln869">		gKernelArgs.frame_buffer.physical_buffer.size</a>
+<a name="ln870">			= (phys_size_t)modeInfo.bytes_per_row</a>
+<a name="ln871">				* (phys_size_t)gKernelArgs.frame_buffer.height;</a>
+<a name="ln872">		gKernelArgs.frame_buffer.physical_buffer.start = modeInfo.physical_base;</a>
+<a name="ln873">	} else {</a>
+<a name="ln874">fallback:</a>
+<a name="ln875">		// use standard VGA mode 640x480x4</a>
+<a name="ln876">		set_vga_mode();</a>
+<a name="ln877"> </a>
+<a name="ln878">		gKernelArgs.frame_buffer.width = 640;</a>
+<a name="ln879">		gKernelArgs.frame_buffer.height = 480;</a>
+<a name="ln880">		gKernelArgs.frame_buffer.bytes_per_row = 80;</a>
+<a name="ln881">		gKernelArgs.frame_buffer.depth = 4;</a>
+<a name="ln882">		gKernelArgs.frame_buffer.physical_buffer.size</a>
+<a name="ln883">			= (phys_size_t)gKernelArgs.frame_buffer.width</a>
+<a name="ln884">				* (phys_size_t)gKernelArgs.frame_buffer.height / 2;</a>
+<a name="ln885">		gKernelArgs.frame_buffer.physical_buffer.start = 0xa0000;</a>
+<a name="ln886">	}</a>
+<a name="ln887"> </a>
+<a name="ln888">	dprintf(&quot;video mode: %ux%ux%u\n&quot;, gKernelArgs.frame_buffer.width,</a>
+<a name="ln889">		gKernelArgs.frame_buffer.height, gKernelArgs.frame_buffer.depth);</a>
+<a name="ln890"> </a>
+<a name="ln891">	gKernelArgs.frame_buffer.enabled = true;</a>
+<a name="ln892"> </a>
+<a name="ln893">	// If the new frame buffer is either larger than the old one or located at</a>
+<a name="ln894">	// a different address, we need to remap it, so we first have to throw</a>
+<a name="ln895">	// away its previous mapping</a>
+<a name="ln896">	if (lastBase != 0</a>
+<a name="ln897">		&amp;&amp; (lastBase != gKernelArgs.frame_buffer.physical_buffer.start</a>
+<a name="ln898">			|| lastSize &lt; gKernelArgs.frame_buffer.physical_buffer.size)) {</a>
+<a name="ln899">		mmu_free((void *)sFrameBuffer, lastSize);</a>
+<a name="ln900">		lastBase = 0;</a>
+<a name="ln901">	}</a>
+<a name="ln902">	if (lastBase == 0) {</a>
+<a name="ln903">		// the graphics memory has not been mapped yet!</a>
+<a name="ln904">		sFrameBuffer = mmu_map_physical_memory(</a>
+<a name="ln905">			gKernelArgs.frame_buffer.physical_buffer.start,</a>
+<a name="ln906">			gKernelArgs.frame_buffer.physical_buffer.size, kDefaultPageFlags);</a>
+<a name="ln907">	}</a>
+<a name="ln908"> </a>
+<a name="ln909">	video_display_splash(sFrameBuffer);</a>
+<a name="ln910">}</a>
+<a name="ln911"> </a>
+<a name="ln912"> </a>
+<a name="ln913">extern &quot;C&quot; void</a>
+<a name="ln914">platform_switch_to_text_mode(void)</a>
+<a name="ln915">{</a>
+<a name="ln916">	if (!gKernelArgs.frame_buffer.enabled) {</a>
+<a name="ln917">		vga_enable_bright_background_colors();</a>
+<a name="ln918">		return;</a>
+<a name="ln919">	}</a>
+<a name="ln920"> </a>
+<a name="ln921">	set_text_mode();</a>
+<a name="ln922">	gKernelArgs.frame_buffer.enabled = 0;</a>
+<a name="ln923"> </a>
+<a name="ln924">	vga_enable_bright_background_colors();</a>
+<a name="ln925">}</a>
+<a name="ln926"> </a>
+<a name="ln927"> </a>
+<a name="ln928">extern &quot;C&quot; status_t</a>
+<a name="ln929">platform_init_video(void)</a>
+<a name="ln930">{</a>
+<a name="ln931">	gKernelArgs.frame_buffer.enabled = 0;</a>
+<a name="ln932">	list_init(&amp;sModeList);</a>
+<a name="ln933"> </a>
+<a name="ln934">	set_text_mode();</a>
+<a name="ln935">		// You may wonder why we do this here:</a>
+<a name="ln936">		// Obviously, some graphics card BIOS implementations don't</a>
+<a name="ln937">		// report all available modes unless you've done this before</a>
+<a name="ln938">		// getting the VESA information.</a>
+<a name="ln939">		// One example of those is the SiS 630 chipset in my laptop.</a>
+<a name="ln940"> </a>
+<a name="ln941">	sVesaCompatible = vesa_init(&amp;sInfo, &amp;sDefaultMode) == B_OK;</a>
+<a name="ln942">	if (!sVesaCompatible) {</a>
+<a name="ln943">		TRACE((&quot;No VESA compatible graphics!\n&quot;));</a>
+<a name="ln944">		gKernelArgs.vesa_capabilities = 0;</a>
+<a name="ln945">		return B_ERROR;</a>
+<a name="ln946">	}</a>
+<a name="ln947"> </a>
+<a name="ln948">	gKernelArgs.vesa_capabilities = sInfo.capabilities;</a>
+<a name="ln949"> </a>
+<a name="ln950">	TRACE((&quot;VESA compatible graphics!\n&quot;));</a>
+<a name="ln951"> </a>
+<a name="ln952">	// store VESA modes into kernel args</a>
+<a name="ln953">	vesa_mode *modes = (vesa_mode *)kernel_args_malloc(</a>
+<a name="ln954">		sModeCount * sizeof(vesa_mode));</a>
+<a name="ln955">	if (modes != NULL) {</a>
+<a name="ln956">		video_mode *mode = NULL;</a>
+<a name="ln957">		uint32 i = 0;</a>
+<a name="ln958">		while ((mode = (video_mode *)list_get_next_item(&amp;sModeList, mode))</a>
+<a name="ln959">				!= NULL) {</a>
+<a name="ln960">			modes[i].mode = mode-&gt;mode;</a>
+<a name="ln961">			modes[i].width = mode-&gt;width;</a>
+<a name="ln962">			modes[i].height = mode-&gt;height;</a>
+<a name="ln963">			modes[i].bits_per_pixel = mode-&gt;bits_per_pixel;</a>
+<a name="ln964">			i++;</a>
+<a name="ln965">		}</a>
+<a name="ln966"> </a>
+<a name="ln967">		gKernelArgs.vesa_modes = modes;</a>
+<a name="ln968">		gKernelArgs.vesa_modes_size = sModeCount * sizeof(vesa_mode);</a>
+<a name="ln969">	}</a>
+<a name="ln970"> </a>
+<a name="ln971">	edid1_info info;</a>
+<a name="ln972">	// Note, we currently ignore EDID information for VBE2 - while the EDID</a>
+<a name="ln973">	// information itself seems to be reliable, older chips often seem to</a>
+<a name="ln974">	// use very strange default timings with higher modes.</a>
+<a name="ln975">	// TODO: Maybe add a setting to enable it anyway?</a>
+<a name="ln976">	if (sInfo.version.major &gt;= 3 &amp;&amp; vesa_get_edid(&amp;info) == B_OK) {</a>
+<a name="ln977">		// we got EDID information from the monitor, try to find a new default</a>
+<a name="ln978">		// mode</a>
+<a name="ln979">		video_mode *defaultMode = find_edid_mode(info, false);</a>
+<a name="ln980">		if (defaultMode == NULL)</a>
+<a name="ln981">			defaultMode = find_edid_mode(info, true);</a>
+<a name="ln982"> </a>
+<a name="ln983">		if (defaultMode != NULL) {</a>
+<a name="ln984">			// We found a new default mode to use!</a>
+<a name="ln985">			sDefaultMode = defaultMode;</a>
+<a name="ln986">		}</a>
+<a name="ln987"> </a>
+<a name="ln988">		gKernelArgs.edid_info = kernel_args_malloc(sizeof(edid1_info));</a>
+<a name="ln989">		if (gKernelArgs.edid_info != NULL)</a>
+<a name="ln990">			memcpy(gKernelArgs.edid_info, &amp;info, sizeof(edid1_info));</a>
+<a name="ln991">	}</a>
+<a name="ln992"> </a>
+<a name="ln993">	sMode = sDefaultMode;</a>
+<a name="ln994">	return B_OK;</a>
+<a name="ln995">}</a>
+<a name="ln996"> </a>
+
+</code></pre>
+<div class="balloon" rel="648"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v763/" target="_blank">V763</a> Parameter 'menu' is always rewritten in function body before being used.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

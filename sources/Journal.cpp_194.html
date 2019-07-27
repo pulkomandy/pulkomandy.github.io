@@ -1,0 +1,1328 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>Journal.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2010, Haiku Inc. All rights reserved.</a>
+<a name="ln3"> * Copyright 2001-2010, Axel Dörfler, axeld@pinc-software.de.</a>
+<a name="ln4"> * This file may be used under the terms of the MIT License.</a>
+<a name="ln5"> *</a>
+<a name="ln6"> * Authors:</a>
+<a name="ln7"> *		Janito V. Ferreira Filho</a>
+<a name="ln8"> */</a>
+<a name="ln9"> </a>
+<a name="ln10"> </a>
+<a name="ln11">#include &quot;Journal.h&quot;</a>
+<a name="ln12"> </a>
+<a name="ln13">#include &lt;new&gt;</a>
+<a name="ln14">#include &lt;string.h&gt;</a>
+<a name="ln15">#include &lt;unistd.h&gt;</a>
+<a name="ln16"> </a>
+<a name="ln17">#include &lt;fs_cache.h&gt;</a>
+<a name="ln18"> </a>
+<a name="ln19">#include &quot;CachedBlock.h&quot;</a>
+<a name="ln20">#include &quot;HashRevokeManager.h&quot;</a>
+<a name="ln21"> </a>
+<a name="ln22"> </a>
+<a name="ln23">//#define TRACE_EXT2</a>
+<a name="ln24">#ifdef TRACE_EXT2</a>
+<a name="ln25">#	define TRACE(x...) dprintf(&quot;\33[34mext2:\33[0m &quot; x)</a>
+<a name="ln26">#else</a>
+<a name="ln27">#	define TRACE(x...) ;</a>
+<a name="ln28">#endif</a>
+<a name="ln29">#define ERROR(x...) dprintf(&quot;\33[34mext2:\33[0m &quot; x)</a>
+<a name="ln30">#define WARN(x...) dprintf(&quot;\33[34mext2:\33[0m &quot; x)</a>
+<a name="ln31"> </a>
+<a name="ln32"> </a>
+<a name="ln33">class LogEntry : public DoublyLinkedListLinkImpl&lt;LogEntry&gt; {</a>
+<a name="ln34">public:</a>
+<a name="ln35">							LogEntry(Journal* journal, uint32 logStart,</a>
+<a name="ln36">								uint32 length);</a>
+<a name="ln37">							~LogEntry();</a>
+<a name="ln38"> </a>
+<a name="ln39">			uint32			Start() const { return fStart; }</a>
+<a name="ln40">			uint32			CommitID() const { return fCommitID; }</a>
+<a name="ln41"> </a>
+<a name="ln42">			Journal*		GetJournal() { return fJournal; }</a>
+<a name="ln43"> </a>
+<a name="ln44">private:</a>
+<a name="ln45">			Journal*		fJournal;</a>
+<a name="ln46">			uint32			fStart;</a>
+<a name="ln47">			uint32			fCommitID;</a>
+<a name="ln48">};</a>
+<a name="ln49"> </a>
+<a name="ln50"> </a>
+<a name="ln51">LogEntry::LogEntry(Journal* journal, uint32 logStart, uint32 commitID)</a>
+<a name="ln52">	:</a>
+<a name="ln53">	fJournal(journal),</a>
+<a name="ln54">	fStart(logStart),</a>
+<a name="ln55">	fCommitID(commitID)</a>
+<a name="ln56">{</a>
+<a name="ln57">}</a>
+<a name="ln58"> </a>
+<a name="ln59"> </a>
+<a name="ln60">LogEntry::~LogEntry()</a>
+<a name="ln61">{</a>
+<a name="ln62">}</a>
+<a name="ln63"> </a>
+<a name="ln64"> </a>
+<a name="ln65">void</a>
+<a name="ln66">JournalHeader::MakeDescriptor(uint32 sequence)</a>
+<a name="ln67">{</a>
+<a name="ln68">	this-&gt;magic = B_HOST_TO_BENDIAN_INT32(JOURNAL_MAGIC);</a>
+<a name="ln69">	this-&gt;sequence = B_HOST_TO_BENDIAN_INT32(sequence);</a>
+<a name="ln70">	this-&gt;block_type = B_HOST_TO_BENDIAN_INT32(JOURNAL_DESCRIPTOR_BLOCK);</a>
+<a name="ln71">}</a>
+<a name="ln72"> </a>
+<a name="ln73"> </a>
+<a name="ln74">void</a>
+<a name="ln75">JournalHeader::MakeCommit(uint32 sequence)</a>
+<a name="ln76">{</a>
+<a name="ln77">	this-&gt;magic = B_HOST_TO_BENDIAN_INT32(JOURNAL_MAGIC);</a>
+<a name="ln78">	this-&gt;sequence = B_HOST_TO_BENDIAN_INT32(sequence);</a>
+<a name="ln79">	this-&gt;block_type = B_HOST_TO_BENDIAN_INT32(JOURNAL_COMMIT_BLOCK);</a>
+<a name="ln80">}</a>
+<a name="ln81"> </a>
+<a name="ln82"> </a>
+<a name="ln83">Journal::Journal(Volume* fsVolume, Volume* jVolume)</a>
+<a name="ln84">	:</a>
+<a name="ln85">	fJournalVolume(jVolume),</a>
+<a name="ln86">	fJournalBlockCache(jVolume-&gt;BlockCache()),</a>
+<a name="ln87">	fFilesystemVolume(fsVolume),</a>
+<a name="ln88">	fFilesystemBlockCache(fsVolume-&gt;BlockCache()),</a>
+<a name="ln89">	fRevokeManager(NULL),</a>
+<a name="ln90">	fInitStatus(B_OK),</a>
+<a name="ln91">	fBlockSize(sizeof(JournalSuperBlock)),</a>
+<a name="ln92">	fFirstCommitID(0),</a>
+<a name="ln93">	fFirstCacheCommitID(0),</a>
+<a name="ln94">	fFirstLogBlock(1),</a>
+<a name="ln95">	fLogSize(0),</a>
+<a name="ln96">	fVersion(0),</a>
+<a name="ln97">	fLogStart(0),</a>
+<a name="ln98">	fLogEnd(0),</a>
+<a name="ln99">	fFreeBlocks(0),</a>
+<a name="ln100">	fMaxTransactionSize(0),</a>
+<a name="ln101">	fCurrentCommitID(0),</a>
+<a name="ln102">	fHasSubTransaction(false),</a>
+<a name="ln103">	fSeparateSubTransactions(false),</a>
+<a name="ln104">	fUnwrittenTransactions(0),</a>
+<a name="ln105">	fTransactionID(0)</a>
+<a name="ln106">{</a>
+<a name="ln107">	recursive_lock_init(&amp;fLock, &quot;ext2 journal&quot;);</a>
+<a name="ln108">	mutex_init(&amp;fLogEntriesLock, &quot;ext2 journal log entries&quot;);</a>
+<a name="ln109"> </a>
+<a name="ln110">	HashRevokeManager* revokeManager = new(std::nothrow) HashRevokeManager;</a>
+<a name="ln111">	TRACE(&quot;Journal::Journal(): Allocated a hash revoke manager at %p\n&quot;,</a>
+<a name="ln112">		revokeManager);</a>
+<a name="ln113"> </a>
+<a name="ln114">	if (revokeManager == NULL)</a>
+<a name="ln115">		fInitStatus = B_NO_MEMORY;</a>
+<a name="ln116">	else {</a>
+<a name="ln117">		fInitStatus = revokeManager-&gt;Init();</a>
+<a name="ln118"> </a>
+<a name="ln119">		if (fInitStatus == B_OK) {</a>
+<a name="ln120">			fRevokeManager = revokeManager;</a>
+<a name="ln121">			fInitStatus = _LoadSuperBlock();</a>
+<a name="ln122">		} else</a>
+<a name="ln123">			delete revokeManager;</a>
+<a name="ln124">	}</a>
+<a name="ln125">}</a>
+<a name="ln126"> </a>
+<a name="ln127"> </a>
+<a name="ln128">Journal::Journal()</a>
+<a name="ln129">	:</a>
+<a name="ln130">	fJournalVolume(NULL),</a>
+<a name="ln131">	fJournalBlockCache(NULL),</a>
+<a name="ln132">	fFilesystemVolume(NULL),</a>
+<a name="ln133">	fFilesystemBlockCache(NULL),</a>
+<a name="ln134">	fRevokeManager(NULL),</a>
+<a name="ln135">	fInitStatus(B_OK),</a>
+<a name="ln136">	fBlockSize(sizeof(JournalSuperBlock)),</a>
+<a name="ln137">	fFirstCommitID(0),</a>
+<a name="ln138">	fFirstCacheCommitID(0),</a>
+<a name="ln139">	fFirstLogBlock(1),</a>
+<a name="ln140">	fLogSize(0),</a>
+<a name="ln141">	fVersion(0),</a>
+<a name="ln142">	fIsStarted(false),</a>
+<a name="ln143">	fLogStart(0),</a>
+<a name="ln144">	fLogEnd(0),</a>
+<a name="ln145">	fFreeBlocks(0),</a>
+<a name="ln146">	fMaxTransactionSize(0),</a>
+<a name="ln147">	fCurrentCommitID(0),</a>
+<a name="ln148">	fHasSubTransaction(false),</a>
+<a name="ln149">	fSeparateSubTransactions(false),</a>
+<a name="ln150">	fUnwrittenTransactions(0),</a>
+<a name="ln151">	fTransactionID(0)</a>
+<a name="ln152">{</a>
+<a name="ln153">	recursive_lock_init(&amp;fLock, &quot;ext2 journal&quot;);</a>
+<a name="ln154">	mutex_init(&amp;fLogEntriesLock, &quot;ext2 journal log entries&quot;);</a>
+<a name="ln155">}</a>
+<a name="ln156"> </a>
+<a name="ln157"> </a>
+<a name="ln158">Journal::~Journal()</a>
+<a name="ln159">{</a>
+<a name="ln160">	TRACE(&quot;Journal destructor.\n&quot;);</a>
+<a name="ln161"> </a>
+<a name="ln162">	TRACE(&quot;Journal::~Journal(): Attempting to delete revoke manager at %p\n&quot;,</a>
+<a name="ln163">		fRevokeManager);</a>
+<a name="ln164">	delete fRevokeManager;</a>
+<a name="ln165"> </a>
+<a name="ln166">	recursive_lock_destroy(&amp;fLock);</a>
+<a name="ln167">	mutex_destroy(&amp;fLogEntriesLock);</a>
+<a name="ln168">}</a>
+<a name="ln169"> </a>
+<a name="ln170"> </a>
+<a name="ln171">status_t</a>
+<a name="ln172">Journal::InitCheck()</a>
+<a name="ln173">{</a>
+<a name="ln174">	return fInitStatus;</a>
+<a name="ln175">}</a>
+<a name="ln176"> </a>
+<a name="ln177"> </a>
+<a name="ln178">status_t</a>
+<a name="ln179">Journal::Uninit()</a>
+<a name="ln180">{</a>
+<a name="ln181">	if (!fIsStarted)</a>
+<a name="ln182">		return B_OK;</a>
+<a name="ln183"> </a>
+<a name="ln184">	status_t status = FlushLogAndBlocks();</a>
+<a name="ln185"> </a>
+<a name="ln186">	if (status == B_OK) {</a>
+<a name="ln187">		// Mark journal as clean</a>
+<a name="ln188">		fLogStart = 0;</a>
+<a name="ln189">		status = _SaveSuperBlock();</a>
+<a name="ln190">	}</a>
+<a name="ln191"> </a>
+<a name="ln192">	fIsStarted = false;</a>
+<a name="ln193"> </a>
+<a name="ln194">	return status;</a>
+<a name="ln195">}</a>
+<a name="ln196"> </a>
+<a name="ln197"> </a>
+<a name="ln198">/*virtual*/ status_t</a>
+<a name="ln199">Journal::StartLog()</a>
+<a name="ln200">{</a>
+<a name="ln201">	fLogStart = fFirstLogBlock;</a>
+<a name="ln202">	fLogEnd = fFirstLogBlock;</a>
+<a name="ln203">	fFreeBlocks = 0;</a>
+<a name="ln204">	fIsStarted = true;</a>
+<a name="ln205"> </a>
+<a name="ln206">	fCurrentCommitID = fFirstCommitID;</a>
+<a name="ln207"> </a>
+<a name="ln208">	return _SaveSuperBlock();</a>
+<a name="ln209">}</a>
+<a name="ln210"> </a>
+<a name="ln211"> </a>
+<a name="ln212">status_t</a>
+<a name="ln213">Journal::RestartLog()</a>
+<a name="ln214">{</a>
+<a name="ln215">	fFirstCommitID = 1;</a>
+<a name="ln216"> </a>
+<a name="ln217">	return B_OK;</a>
+<a name="ln218">}</a>
+<a name="ln219"> </a>
+<a name="ln220"> </a>
+<a name="ln221">/*virtual*/ status_t</a>
+<a name="ln222">Journal::Lock(Transaction* owner, bool separateSubTransactions)</a>
+<a name="ln223">{</a>
+<a name="ln224">	TRACE(&quot;Journal::Lock()\n&quot;);</a>
+<a name="ln225">	status_t status = recursive_lock_lock(&amp;fLock);</a>
+<a name="ln226">	if (status != B_OK)</a>
+<a name="ln227">		return status;</a>
+<a name="ln228"> </a>
+<a name="ln229">	TRACE(&quot;Journal::Lock(): Aquired lock\n&quot;);</a>
+<a name="ln230"> </a>
+<a name="ln231">	if (!fSeparateSubTransactions &amp;&amp; recursive_lock_get_recursion(&amp;fLock) &gt; 1) {</a>
+<a name="ln232">		// reuse current transaction</a>
+<a name="ln233">		TRACE(&quot;Journal::Lock(): Reusing current transaction\n&quot;);</a>
+<a name="ln234">		return B_OK;</a>
+<a name="ln235">	}</a>
+<a name="ln236"> </a>
+<a name="ln237">	if (separateSubTransactions)</a>
+<a name="ln238">		fSeparateSubTransactions = true;</a>
+<a name="ln239"> </a>
+<a name="ln240">	if (owner != NULL)</a>
+<a name="ln241">		owner-&gt;SetParent(fOwner);</a>
+<a name="ln242"> </a>
+<a name="ln243">	fOwner = owner;</a>
+<a name="ln244"> </a>
+<a name="ln245">	if (fOwner != NULL) {</a>
+<a name="ln246">		if (fUnwrittenTransactions &gt; 0) {</a>
+<a name="ln247">			// start a sub transaction</a>
+<a name="ln248">			TRACE(&quot;Journal::Lock(): Starting sub transaction\n&quot;);</a>
+<a name="ln249">			cache_start_sub_transaction(fFilesystemBlockCache, fTransactionID);</a>
+<a name="ln250">			fHasSubTransaction = true;</a>
+<a name="ln251">		} else {</a>
+<a name="ln252">			TRACE(&quot;Journal::Lock(): Starting new transaction\n&quot;);</a>
+<a name="ln253">			fTransactionID = cache_start_transaction(fFilesystemBlockCache);</a>
+<a name="ln254">		}</a>
+<a name="ln255"> </a>
+<a name="ln256">		if (fTransactionID &lt; B_OK) {</a>
+<a name="ln257">			recursive_lock_unlock(&amp;fLock);</a>
+<a name="ln258">			return fTransactionID;</a>
+<a name="ln259">		}</a>
+<a name="ln260"> </a>
+<a name="ln261">		cache_add_transaction_listener(fFilesystemBlockCache, fTransactionID,</a>
+<a name="ln262">			TRANSACTION_IDLE, _TransactionIdle, this);</a>
+<a name="ln263">	}</a>
+<a name="ln264"> </a>
+<a name="ln265">	return B_OK;</a>
+<a name="ln266">}</a>
+<a name="ln267"> </a>
+<a name="ln268"> </a>
+<a name="ln269">/*virtual*/ status_t</a>
+<a name="ln270">Journal::Unlock(Transaction* owner, bool success)</a>
+<a name="ln271">{</a>
+<a name="ln272">	TRACE(&quot;Journal::Unlock(): Lock recursion: %&quot; B_PRId32 &quot;\n&quot;,</a>
+<a name="ln273">		recursive_lock_get_recursion(&amp;fLock));</a>
+<a name="ln274">	if (fSeparateSubTransactions</a>
+<a name="ln275">		|| recursive_lock_get_recursion(&amp;fLock) == 1) {</a>
+<a name="ln276">		// we only end the transaction if we unlock it</a>
+<a name="ln277">		if (owner != NULL) {</a>
+<a name="ln278">			TRACE(&quot;Journal::Unlock(): Calling _TransactionDone\n&quot;);</a>
+<a name="ln279">			status_t status = _TransactionDone(success);</a>
+<a name="ln280">			if (status != B_OK)</a>
+<a name="ln281">				return status;</a>
+<a name="ln282"> </a>
+<a name="ln283">			TRACE(&quot;Journal::Unlock(): Returned from _TransactionDone\n&quot;);</a>
+<a name="ln284">			bool separateSubTransactions = fSeparateSubTransactions;</a>
+<a name="ln285">			fSeparateSubTransactions = true;</a>
+<a name="ln286">			TRACE(&quot;Journal::Unlock(): Notifying listeners for: %p\n&quot;, owner);</a>
+<a name="ln287">			owner-&gt;NotifyListeners(success);</a>
+<a name="ln288">			TRACE(&quot;Journal::Unlock(): Done notifying listeners\n&quot;);</a>
+<a name="ln289">			fSeparateSubTransactions = separateSubTransactions;</a>
+<a name="ln290"> </a>
+<a name="ln291">			fOwner = owner-&gt;Parent();</a>
+<a name="ln292">		} else</a>
+<a name="ln293">			fOwner = NULL;</a>
+<a name="ln294"> </a>
+<a name="ln295">		if (fSeparateSubTransactions</a>
+<a name="ln296">			&amp;&amp; recursive_lock_get_recursion(&amp;fLock) == 1)</a>
+<a name="ln297">			fSeparateSubTransactions = false;</a>
+<a name="ln298">	} else</a>
+<a name="ln299">		owner-&gt;MoveListenersTo(fOwner);</a>
+<a name="ln300"> </a>
+<a name="ln301">	TRACE(&quot;Journal::Unlock(): Unlocking the lock\n&quot;);</a>
+<a name="ln302"> </a>
+<a name="ln303">	recursive_lock_unlock(&amp;fLock);</a>
+<a name="ln304">	return B_OK;</a>
+<a name="ln305">}</a>
+<a name="ln306"> </a>
+<a name="ln307"> </a>
+<a name="ln308">status_t</a>
+<a name="ln309">Journal::MapBlock(off_t logical, fsblock_t&amp; physical)</a>
+<a name="ln310">{</a>
+<a name="ln311">	TRACE(&quot;Journal::MapBlock()\n&quot;);</a>
+<a name="ln312">	physical = logical;</a>
+<a name="ln313"> </a>
+<a name="ln314">	return B_OK;</a>
+<a name="ln315">}</a>
+<a name="ln316"> </a>
+<a name="ln317"> </a>
+<a name="ln318">inline uint32</a>
+<a name="ln319">Journal::FreeLogBlocks() const</a>
+<a name="ln320">{</a>
+<a name="ln321">	TRACE(&quot;Journal::FreeLogBlocks(): start: %&quot; B_PRIu32 &quot;, end: %&quot; B_PRIu32</a>
+<a name="ln322">		&quot;, size: %&quot; B_PRIu32 &quot;\n&quot;, fLogStart, fLogEnd, fLogSize);</a>
+<a name="ln323">	return fLogStart &lt;= fLogEnd</a>
+<a name="ln324">		? fLogSize - fLogEnd + fLogStart - 1</a>
+<a name="ln325">		: fLogStart - fLogEnd;</a>
+<a name="ln326">}</a>
+<a name="ln327"> </a>
+<a name="ln328"> </a>
+<a name="ln329">status_t</a>
+<a name="ln330">Journal::FlushLogAndBlocks()</a>
+<a name="ln331">{</a>
+<a name="ln332">	return _FlushLog(true, true);</a>
+<a name="ln333">}</a>
+<a name="ln334"> </a>
+<a name="ln335"> </a>
+<a name="ln336">int32</a>
+<a name="ln337">Journal::TransactionID() const</a>
+<a name="ln338">{</a>
+<a name="ln339">	return fTransactionID;</a>
+<a name="ln340">}</a>
+<a name="ln341"> </a>
+<a name="ln342"> </a>
+<a name="ln343">status_t</a>
+<a name="ln344">Journal::_WritePartialTransactionToLog(JournalHeader* descriptorBlock,</a>
+<a name="ln345">	bool detached, uint8** _escapedData, uint32 &amp;logBlock, off_t&amp; blockNumber,</a>
+<a name="ln346">	long&amp; cookie, ArrayDeleter&lt;uint8&gt;&amp; escapedDataDeleter, uint32&amp; blockCount,</a>
+<a name="ln347">	bool&amp; finished)</a>
+<a name="ln348">{</a>
+<a name="ln349">	TRACE(&quot;Journal::_WritePartialTransactionToLog()\n&quot;);</a>
+<a name="ln350"> </a>
+<a name="ln351">	uint32 descriptorBlockPos = logBlock;</a>
+<a name="ln352">	uint8* escapedData = *_escapedData;</a>
+<a name="ln353"> </a>
+<a name="ln354">	JournalBlockTag* tag = (JournalBlockTag*)descriptorBlock-&gt;data;</a>
+<a name="ln355">	JournalBlockTag* lastTag = (JournalBlockTag*)((uint8*)descriptorBlock</a>
+<a name="ln356">		+ fBlockSize - sizeof(JournalHeader));</a>
+<a name="ln357"> </a>
+<a name="ln358">	finished = false;</a>
+<a name="ln359">	status_t status = B_OK;</a>
+<a name="ln360"> </a>
+<a name="ln361">	while (tag &lt; lastTag &amp;&amp; status == B_OK) {</a>
+<a name="ln362">		tag-&gt;SetBlockNumber(blockNumber);</a>
+<a name="ln363">		tag-&gt;SetFlags(0);</a>
+<a name="ln364"> </a>
+<a name="ln365">		CachedBlock data(fFilesystemVolume);</a>
+<a name="ln366">		const JournalHeader* blockData = (JournalHeader*)data.SetTo(</a>
+<a name="ln367">			blockNumber);</a>
+<a name="ln368">		if (blockData == NULL) {</a>
+<a name="ln369">			panic(&quot;Got a NULL pointer while iterating through transaction &quot;</a>
+<a name="ln370">				&quot;blocks.\n&quot;);</a>
+<a name="ln371">			return B_ERROR;</a>
+<a name="ln372">		}</a>
+<a name="ln373"> </a>
+<a name="ln374">		void* finalData;</a>
+<a name="ln375"> </a>
+<a name="ln376">		if (blockData-&gt;CheckMagic()) {</a>
+<a name="ln377">			// The journaled block starts with the magic value</a>
+<a name="ln378">			// We must remove it to prevent confusion</a>
+<a name="ln379">			TRACE(&quot;Journal::_WritePartialTransactionToLog(): Block starts with &quot;</a>
+<a name="ln380">				&quot;magic number. Escaping it\n&quot;);</a>
+<a name="ln381">			tag-&gt;SetEscapedFlag();</a>
+<a name="ln382"> </a>
+<a name="ln383">			if (escapedData == NULL) {</a>
+<a name="ln384">				TRACE(&quot;Journal::_WritePartialTransactionToLog(): Allocating &quot;</a>
+<a name="ln385">					&quot;space for escaped block (%&quot; B_PRIu32 &quot;)\n&quot;, fBlockSize);</a>
+<a name="ln386">				escapedData = new(std::nothrow) uint8[fBlockSize];</a>
+<a name="ln387">				if (escapedData == NULL) {</a>
+<a name="ln388">					TRACE(&quot;Journal::_WritePartialTransactionToLof(): Failed to &quot;</a>
+<a name="ln389">						&quot;allocate buffer for escaped data block\n&quot;);</a>
+<a name="ln390">					return B_NO_MEMORY;</a>
+<a name="ln391">				}</a>
+<a name="ln392">				escapedDataDeleter.SetTo(escapedData);</a>
+<a name="ln393">				*_escapedData = escapedData;</a>
+<a name="ln394"> </a>
+<a name="ln395">				((int32*)escapedData)[0] = 0; // Remove magic</a>
+<a name="ln396">			}</a>
+<a name="ln397"> </a>
+<a name="ln398">			memcpy(escapedData + 4, blockData-&gt;data, fBlockSize - 4);</a>
+<a name="ln399">			finalData = escapedData;</a>
+<a name="ln400">		} else</a>
+<a name="ln401">			finalData = (void*)blockData;</a>
+<a name="ln402"> </a>
+<a name="ln403">		// TODO: use iovecs?</a>
+<a name="ln404"> </a>
+<a name="ln405">		logBlock = _WrapAroundLog(logBlock + 1);</a>
+<a name="ln406"> </a>
+<a name="ln407">		fsblock_t physicalBlock;</a>
+<a name="ln408">		status = MapBlock(logBlock, physicalBlock);</a>
+<a name="ln409">		if (status != B_OK)</a>
+<a name="ln410">			return status;</a>
+<a name="ln411"> </a>
+<a name="ln412">		off_t logOffset = physicalBlock * fBlockSize;</a>
+<a name="ln413"> </a>
+<a name="ln414">		TRACE(&quot;Journal::_WritePartialTransactionToLog(): Writing from memory: &quot;</a>
+<a name="ln415">			&quot;%p, to disk: %&quot; B_PRIdOFF &quot;\n&quot;, finalData, logOffset);</a>
+<a name="ln416">		size_t written = write_pos(fJournalVolume-&gt;Device(), logOffset,</a>
+<a name="ln417">			finalData, fBlockSize);</a>
+<a name="ln418">		if (written != fBlockSize) {</a>
+<a name="ln419">			TRACE(&quot;Failed to write journal block.\n&quot;);</a>
+<a name="ln420">			return B_IO_ERROR;</a>
+<a name="ln421">		}</a>
+<a name="ln422"> </a>
+<a name="ln423">		TRACE(&quot;Journal::_WritePartialTransactionToLog(): Wrote a journal block &quot;</a>
+<a name="ln424">			&quot;at: %&quot; B_PRIu32 &quot;\n&quot;, logBlock);</a>
+<a name="ln425"> </a>
+<a name="ln426">		blockCount++;</a>
+<a name="ln427">		tag++;</a>
+<a name="ln428"> </a>
+<a name="ln429">		status = cache_next_block_in_transaction(fFilesystemBlockCache,</a>
+<a name="ln430">			fTransactionID, detached, &amp;cookie, &amp;blockNumber, NULL, NULL);</a>
+<a name="ln431">	}</a>
+<a name="ln432"> </a>
+<a name="ln433">	finished = status != B_OK;</a>
+<a name="ln434"> </a>
+<a name="ln435">	// Write descriptor block</a>
+<a name="ln436">	--tag;</a>
+<a name="ln437">	tag-&gt;SetLastTagFlag();</a>
+<a name="ln438"> </a>
+<a name="ln439">	fsblock_t physicalBlock;</a>
+<a name="ln440">	status = MapBlock(descriptorBlockPos, physicalBlock);</a>
+<a name="ln441">	if (status != B_OK)</a>
+<a name="ln442">		return status;</a>
+<a name="ln443"> </a>
+<a name="ln444">	off_t descriptorBlockOffset = physicalBlock * fBlockSize;</a>
+<a name="ln445"> </a>
+<a name="ln446">	TRACE(&quot;Journal::_WritePartialTransactionToLog(): Writing to: %&quot; B_PRIdOFF</a>
+<a name="ln447">		&quot;\n&quot;, descriptorBlockOffset);</a>
+<a name="ln448">	size_t written = write_pos(fJournalVolume-&gt;Device(),</a>
+<a name="ln449">		descriptorBlockOffset, descriptorBlock, fBlockSize);</a>
+<a name="ln450">	if (written != fBlockSize) {</a>
+<a name="ln451">		TRACE(&quot;Failed to write journal descriptor block.\n&quot;);</a>
+<a name="ln452">		return B_IO_ERROR;</a>
+<a name="ln453">	}</a>
+<a name="ln454"> </a>
+<a name="ln455">	blockCount++;</a>
+<a name="ln456">	logBlock = _WrapAroundLog(logBlock + 1);</a>
+<a name="ln457"> </a>
+<a name="ln458">	return B_OK;</a>
+<a name="ln459">}</a>
+<a name="ln460"> </a>
+<a name="ln461"> </a>
+<a name="ln462">status_t</a>
+<a name="ln463">Journal::_WriteTransactionToLog()</a>
+<a name="ln464">{</a>
+<a name="ln465">	TRACE(&quot;Journal::_WriteTransactionToLog()\n&quot;);</a>
+<a name="ln466">	// Transaction enters the Flush state</a>
+<a name="ln467">	bool detached = false;</a>
+<a name="ln468">	TRACE(&quot;Journal::_WriteTransactionToLog(): Attempting to get transaction &quot;</a>
+<a name="ln469">		&quot;size\n&quot;);</a>
+<a name="ln470">	size_t size = _FullTransactionSize();</a>
+<a name="ln471">	TRACE(&quot;Journal::_WriteTransactionToLog(): transaction size: %&quot; B_PRIuSIZE</a>
+<a name="ln472">		&quot;\n&quot;, size);</a>
+<a name="ln473"> </a>
+<a name="ln474">	if (size &gt; fMaxTransactionSize) {</a>
+<a name="ln475">		TRACE(&quot;Journal::_WriteTransactionToLog(): not enough free space &quot;</a>
+<a name="ln476">			&quot;for the transaction. Attempting to free some space.\n&quot;);</a>
+<a name="ln477">		size = _MainTransactionSize();</a>
+<a name="ln478">		TRACE(&quot;Journal::_WriteTransactionToLog(): main transaction size: %&quot;</a>
+<a name="ln479">			B_PRIuSIZE &quot;\n&quot;, size);</a>
+<a name="ln480"> </a>
+<a name="ln481">		if (fHasSubTransaction &amp;&amp; size &lt; fMaxTransactionSize) {</a>
+<a name="ln482">			TRACE(&quot;Journal::_WriteTransactionToLog(): transaction doesn't fit, &quot;</a>
+<a name="ln483">				&quot;but it can be separated\n&quot;);</a>
+<a name="ln484">			detached = true;</a>
+<a name="ln485">		} else {</a>
+<a name="ln486">			// Error: transaction can't fit in log</a>
+<a name="ln487">			panic(&quot;transaction too large (size: %&quot; B_PRIuSIZE &quot;, max size: %&quot;</a>
+<a name="ln488">				B_PRIu32 &quot;, log size: %&quot; B_PRIu32 &quot;)\n&quot;, size,</a>
+<a name="ln489">				fMaxTransactionSize, fLogSize);</a>
+<a name="ln490">			return B_BUFFER_OVERFLOW;</a>
+<a name="ln491">		}</a>
+<a name="ln492">	}</a>
+<a name="ln493"> </a>
+<a name="ln494">	TRACE(&quot;Journal::_WriteTransactionToLog(): free log blocks: %&quot; B_PRIu32</a>
+<a name="ln495">		&quot;\n&quot;, FreeLogBlocks());</a>
+<a name="ln496">	if (size &gt; FreeLogBlocks()) {</a>
+<a name="ln497">		TRACE(&quot;Journal::_WriteTransactionToLog(): Syncing block cache\n&quot;);</a>
+<a name="ln498">		cache_sync_transaction(fFilesystemBlockCache, fTransactionID);</a>
+<a name="ln499"> </a>
+<a name="ln500">		if (size &gt; FreeLogBlocks()) {</a>
+<a name="ln501">			panic(&quot;Transaction fits, but sync didn't result in enough&quot;</a>
+<a name="ln502">				&quot;free space.\n\tGot %&quot; B_PRIu32 &quot; when at least %&quot; B_PRIuSIZE</a>
+<a name="ln503">				&quot; was expected.&quot;, FreeLogBlocks(), size);</a>
+<a name="ln504">		}</a>
+<a name="ln505">	}</a>
+<a name="ln506"> </a>
+<a name="ln507">	TRACE(&quot;Journal::_WriteTransactionToLog(): finished managing space for &quot;</a>
+<a name="ln508">		&quot;the transaction\n&quot;);</a>
+<a name="ln509"> </a>
+<a name="ln510">	fHasSubTransaction = false;</a>
+<a name="ln511">	if (!fIsStarted)</a>
+<a name="ln512">		StartLog();</a>
+<a name="ln513"> </a>
+<a name="ln514">	// Prepare Descriptor block</a>
+<a name="ln515">	TRACE(&quot;Journal::_WriteTransactionToLog(): attempting to allocate space for &quot;</a>
+<a name="ln516">		&quot;the descriptor block, block size %&quot; B_PRIu32 &quot;\n&quot;, fBlockSize);</a>
+<a name="ln517">	JournalHeader* descriptorBlock =</a>
+<a name="ln518">		(JournalHeader*)new(std::nothrow) uint8[fBlockSize];</a>
+<a name="ln519">	if (descriptorBlock == NULL) {</a>
+<a name="ln520">		TRACE(&quot;Journal::_WriteTransactionToLog(): Failed to allocate a buffer &quot;</a>
+<a name="ln521">			&quot;for the descriptor block\n&quot;);</a>
+<a name="ln522">		return B_NO_MEMORY;</a>
+<a name="ln523">	}</a>
+<a name="ln524">	ArrayDeleter&lt;uint8&gt; descriptorBlockDeleter((uint8*)descriptorBlock);</a>
+<a name="ln525"> </a>
+<a name="ln526">	descriptorBlock-&gt;MakeDescriptor(fCurrentCommitID);</a>
+<a name="ln527"> </a>
+<a name="ln528">	// Prepare Commit block</a>
+<a name="ln529">	TRACE(&quot;Journal::_WriteTransactionToLog(): attempting to allocate space for &quot;</a>
+<a name="ln530">		&quot;the commit block, block size %&quot; B_PRIu32 &quot;\n&quot;, fBlockSize);</a>
+<a name="ln531">	JournalHeader* commitBlock =</a>
+<a name="ln532">		(JournalHeader*)new(std::nothrow) uint8[fBlockSize];</a>
+<a name="ln533">	if (commitBlock == NULL) {</a>
+<a name="ln534">		TRACE(&quot;Journal::_WriteTransactionToLog(): Failed to allocate a buffer &quot;</a>
+<a name="ln535">			&quot;for the commit block\n&quot;);</a>
+<a name="ln536">		return B_NO_MEMORY;</a>
+<a name="ln537">	}</a>
+<a name="ln538">	ArrayDeleter&lt;uint8&gt; commitBlockDeleter((uint8*)commitBlock);</a>
+<a name="ln539"> </a>
+<a name="ln540">	commitBlock-&gt;MakeCommit(fCurrentCommitID + 1);</a>
+<a name="ln541">	memset(commitBlock-&gt;data, 0, fBlockSize - sizeof(JournalHeader));</a>
+<a name="ln542">		// TODO: This probably isn't necessary</a>
+<a name="ln543"> </a>
+<a name="ln544">	uint8* escapedData = NULL;</a>
+<a name="ln545">	ArrayDeleter&lt;uint8&gt; escapedDataDeleter;</a>
+<a name="ln546"> </a>
+<a name="ln547">	off_t blockNumber;</a>
+<a name="ln548">	long cookie = 0;</a>
+<a name="ln549"> </a>
+<a name="ln550">	status_t status = cache_next_block_in_transaction(fFilesystemBlockCache,</a>
+<a name="ln551">		fTransactionID, detached, &amp;cookie, &amp;blockNumber, NULL, NULL);</a>
+<a name="ln552">	if (status != B_OK) {</a>
+<a name="ln553">		TRACE(&quot;Journal::_WriteTransactionToLog(): Transaction has no blocks to &quot;</a>
+<a name="ln554">			&quot;write\n&quot;);</a>
+<a name="ln555">		return B_OK;</a>
+<a name="ln556">	}</a>
+<a name="ln557"> </a>
+<a name="ln558">	uint32 blockCount = 0;</a>
+<a name="ln559"> </a>
+<a name="ln560">	uint32 logBlock = _WrapAroundLog(fLogEnd);</a>
+<a name="ln561"> </a>
+<a name="ln562">	bool finished = false;</a>
+<a name="ln563"> </a>
+<a name="ln564">	status = _WritePartialTransactionToLog(descriptorBlock, detached,</a>
+<a name="ln565">		&amp;escapedData, logBlock, blockNumber, cookie, escapedDataDeleter,</a>
+<a name="ln566">		blockCount, finished);</a>
+<a name="ln567">	if (!finished &amp;&amp; status != B_OK)</a>
+<a name="ln568">		return status;</a>
+<a name="ln569"> </a>
+<a name="ln570">	uint32 commitBlockPos = logBlock;</a>
+<a name="ln571"> </a>
+<a name="ln572">	while (!finished) {</a>
+<a name="ln573">		descriptorBlock-&gt;IncrementSequence();</a>
+<a name="ln574"> </a>
+<a name="ln575">		status = _WritePartialTransactionToLog(descriptorBlock, detached,</a>
+<a name="ln576">			&amp;escapedData, logBlock, blockNumber, cookie, escapedDataDeleter,</a>
+<a name="ln577">			blockCount, finished);</a>
+<a name="ln578">		if (!finished &amp;&amp; status != B_OK)</a>
+<a name="ln579">			return status;</a>
+<a name="ln580"> </a>
+<a name="ln581">		// It is okay to write the commit blocks of the partial transactions</a>
+<a name="ln582">		// as long as the commit block of the first partial transaction isn't</a>
+<a name="ln583">		// written. When it recovery reaches where the first commit should be</a>
+<a name="ln584">		// and doesn't find it, it considers it found the end of the log.</a>
+<a name="ln585"> </a>
+<a name="ln586">		fsblock_t physicalBlock;</a>
+<a name="ln587">		status = MapBlock(logBlock, physicalBlock);</a>
+<a name="ln588">		if (status != B_OK)</a>
+<a name="ln589">			return status;</a>
+<a name="ln590"> </a>
+<a name="ln591">		off_t logOffset = physicalBlock * fBlockSize;</a>
+<a name="ln592"> </a>
+<a name="ln593">		TRACE(&quot;Journal::_WriteTransactionToLog(): Writting commit block to &quot;</a>
+<a name="ln594">			&quot;%&quot; B_PRIdOFF &quot;\n&quot;, logOffset);</a>
+<a name="ln595">		off_t written = write_pos(fJournalVolume-&gt;Device(), logOffset,</a>
+<a name="ln596">			commitBlock, fBlockSize);</a>
+<a name="ln597">		if (written != fBlockSize) {</a>
+<a name="ln598">			TRACE(&quot;Failed to write journal commit block.\n&quot;);</a>
+<a name="ln599">			return B_IO_ERROR;</a>
+<a name="ln600">		}</a>
+<a name="ln601"> </a>
+<a name="ln602">		commitBlock-&gt;IncrementSequence();</a>
+<a name="ln603">		blockCount++;</a>
+<a name="ln604"> </a>
+<a name="ln605">		logBlock = _WrapAroundLog(logBlock + 1);</a>
+<a name="ln606">	}</a>
+<a name="ln607"> </a>
+<a name="ln608">	// Transaction will enter the Commit state</a>
+<a name="ln609">	fsblock_t physicalBlock;</a>
+<a name="ln610">	status = MapBlock(commitBlockPos, physicalBlock);</a>
+<a name="ln611">	if (status != B_OK)</a>
+<a name="ln612">		return status;</a>
+<a name="ln613"> </a>
+<a name="ln614">	off_t logOffset = physicalBlock * fBlockSize;</a>
+<a name="ln615"> </a>
+<a name="ln616">	TRACE(&quot;Journal::_WriteTransactionToLog(): Writing to: %&quot; B_PRIdOFF &quot;\n&quot;,</a>
+<a name="ln617">		logOffset);</a>
+<a name="ln618">	off_t written = write_pos(fJournalVolume-&gt;Device(), logOffset, commitBlock,</a>
+<a name="ln619">		fBlockSize);</a>
+<a name="ln620">	if (written != fBlockSize) {</a>
+<a name="ln621">		TRACE(&quot;Failed to write journal commit block.\n&quot;);</a>
+<a name="ln622">		return B_IO_ERROR;</a>
+<a name="ln623">	}</a>
+<a name="ln624"> </a>
+<a name="ln625">	blockCount++;</a>
+<a name="ln626">	fLogEnd = _WrapAroundLog(fLogEnd + blockCount);</a>
+<a name="ln627"> </a>
+<a name="ln628">	status = _SaveSuperBlock();</a>
+<a name="ln629"> </a>
+<a name="ln630">	// Transaction will enter Finished state</a>
+<a name="ln631">	LogEntry *logEntry = new LogEntry(this, fLogEnd, fCurrentCommitID++);</a>
+<a name="ln632">	TRACE(&quot;Journal::_WriteTransactionToLog(): Allocating log entry at %p\n&quot;,</a>
+<a name="ln633">		logEntry);</a>
+<a name="ln634">	if (logEntry == NULL) {</a>
+<a name="ln635">		panic(&quot;no memory to allocate log entries!&quot;);</a>
+<a name="ln636">		return B_NO_MEMORY;</a>
+<a name="ln637">	}</a>
+<a name="ln638"> </a>
+<a name="ln639">	mutex_lock(&amp;fLogEntriesLock);</a>
+<a name="ln640">	fLogEntries.Add(logEntry);</a>
+<a name="ln641">	mutex_unlock(&amp;fLogEntriesLock);</a>
+<a name="ln642"> </a>
+<a name="ln643">	if (detached) {</a>
+<a name="ln644">		fTransactionID = cache_detach_sub_transaction(fFilesystemBlockCache,</a>
+<a name="ln645">			fTransactionID, _TransactionWritten, logEntry);</a>
+<a name="ln646">		fUnwrittenTransactions = 1;</a>
+<a name="ln647"> </a>
+<a name="ln648">		if (status == B_OK &amp;&amp; _FullTransactionSize() &gt; fLogSize) {</a>
+<a name="ln649">			// If the transaction is too large after writing, there is no way to</a>
+<a name="ln650">			// recover, so let this transaction fail.</a>
+<a name="ln651">			ERROR(&quot;transaction too large (%&quot; B_PRIuSIZE &quot; blocks, log size %&quot;</a>
+<a name="ln652">				B_PRIu32 &quot;)!\n&quot;, _FullTransactionSize(), fLogSize);</a>
+<a name="ln653">			return B_BUFFER_OVERFLOW;</a>
+<a name="ln654">		}</a>
+<a name="ln655">	} else {</a>
+<a name="ln656">		cache_end_transaction(fFilesystemBlockCache, fTransactionID,</a>
+<a name="ln657">			_TransactionWritten, logEntry);</a>
+<a name="ln658">		fUnwrittenTransactions = 0;</a>
+<a name="ln659">	}</a>
+<a name="ln660"> </a>
+<a name="ln661">	return B_OK;</a>
+<a name="ln662">}</a>
+<a name="ln663"> </a>
+<a name="ln664"> </a>
+<a name="ln665">status_t</a>
+<a name="ln666">Journal::_SaveSuperBlock()</a>
+<a name="ln667">{</a>
+<a name="ln668">	TRACE(&quot;Journal::_SaveSuperBlock()\n&quot;);</a>
+<a name="ln669">	fsblock_t physicalBlock;</a>
+<a name="ln670">	status_t status = MapBlock(0, physicalBlock);</a>
+<a name="ln671">	if (status != B_OK)</a>
+<a name="ln672">		return status;</a>
+<a name="ln673"> </a>
+<a name="ln674">	off_t superblockPos = physicalBlock * fBlockSize;</a>
+<a name="ln675"> </a>
+<a name="ln676">	JournalSuperBlock superblock;</a>
+<a name="ln677">	size_t bytesRead = read_pos(fJournalVolume-&gt;Device(), superblockPos,</a>
+<a name="ln678">		&amp;superblock, sizeof(superblock));</a>
+<a name="ln679"> </a>
+<a name="ln680">	if (bytesRead != sizeof(superblock))</a>
+<a name="ln681">		return B_IO_ERROR;</a>
+<a name="ln682"> </a>
+<a name="ln683">	superblock.SetFirstCommitID(fFirstCommitID);</a>
+<a name="ln684">	superblock.SetLogStart(fLogStart);</a>
+<a name="ln685"> </a>
+<a name="ln686">	TRACE(&quot;Journal::SaveSuperBlock(): Write to %&quot; B_PRIdOFF &quot;\n&quot;,</a>
+<a name="ln687">		superblockPos);</a>
+<a name="ln688">	size_t bytesWritten = write_pos(fJournalVolume-&gt;Device(), superblockPos,</a>
+<a name="ln689">		&amp;superblock, sizeof(superblock));</a>
+<a name="ln690"> </a>
+<a name="ln691">	if (bytesWritten != sizeof(superblock))</a>
+<a name="ln692">		return B_IO_ERROR;</a>
+<a name="ln693"> </a>
+<a name="ln694">	TRACE(&quot;Journal::_SaveSuperBlock(): Done\n&quot;);</a>
+<a name="ln695"> </a>
+<a name="ln696">	return B_OK;</a>
+<a name="ln697">}</a>
+<a name="ln698"> </a>
+<a name="ln699"> </a>
+<a name="ln700">status_t</a>
+<a name="ln701">Journal::_LoadSuperBlock()</a>
+<a name="ln702">{</a>
+<a name="ln703">	TRACE(&quot;Journal::_LoadSuperBlock()\n&quot;);</a>
+<a name="ln704">	fsblock_t superblockPos;</a>
+<a name="ln705"> </a>
+<a name="ln706">	status_t status = MapBlock(0, superblockPos);</a>
+<a name="ln707">	if (status != B_OK)</a>
+<a name="ln708">		return status;</a>
+<a name="ln709"> </a>
+<a name="ln710">	TRACE(&quot;Journal::_LoadSuperBlock(): superblock physical block: %&quot; B_PRIu64</a>
+<a name="ln711">		&quot;\n&quot;, superblockPos);</a>
+<a name="ln712"> </a>
+<a name="ln713">	JournalSuperBlock superblock;</a>
+<a name="ln714">	size_t bytesRead = read_pos(fJournalVolume-&gt;Device(), superblockPos</a>
+<a name="ln715">		* fJournalVolume-&gt;BlockSize(), &amp;superblock, sizeof(superblock));</a>
+<a name="ln716"> </a>
+<a name="ln717">	if (bytesRead != sizeof(superblock)) {</a>
+<a name="ln718">		ERROR(&quot;Journal::_LoadSuperBlock(): failed to read superblock\n&quot;);</a>
+<a name="ln719">		return B_IO_ERROR;</a>
+<a name="ln720">	}</a>
+<a name="ln721"> </a>
+<a name="ln722">	if (!superblock.header.CheckMagic()) {</a>
+<a name="ln723">		ERROR(&quot;Journal::_LoadSuperBlock(): Invalid superblock magic %&quot; B_PRIx32</a>
+<a name="ln724">			&quot;\n&quot;, superblock.header.Magic());</a>
+<a name="ln725">		return B_BAD_VALUE;</a>
+<a name="ln726">	}</a>
+<a name="ln727"> </a>
+<a name="ln728">	if (superblock.header.BlockType() == JOURNAL_SUPERBLOCK_V1) {</a>
+<a name="ln729">		TRACE(&quot;Journal::_LoadSuperBlock(): Journal superblock version 1\n&quot;);</a>
+<a name="ln730">		fVersion = 1;</a>
+<a name="ln731">	} else if (superblock.header.BlockType() == JOURNAL_SUPERBLOCK_V2) {</a>
+<a name="ln732">		TRACE(&quot;Journal::_LoadSuperBlock(): Journal superblock version 2\n&quot;);</a>
+<a name="ln733">		fVersion = 2;</a>
+<a name="ln734">	} else {</a>
+<a name="ln735">		ERROR(&quot;Journal::_LoadSuperBlock(): Invalid superblock version\n&quot;);</a>
+<a name="ln736">		return B_BAD_VALUE;</a>
+<a name="ln737">	}</a>
+<a name="ln738"> </a>
+<a name="ln739">	if (fVersion &gt;= 2) {</a>
+<a name="ln740">		status = _CheckFeatures(&amp;superblock);</a>
+<a name="ln741"> </a>
+<a name="ln742">		if (status != B_OK) {</a>
+<a name="ln743">			ERROR(&quot;Journal::_LoadSuperBlock(): Unsupported features\n&quot;);</a>
+<a name="ln744">			return status;</a>
+<a name="ln745">		}</a>
+<a name="ln746">	}</a>
+<a name="ln747"> </a>
+<a name="ln748">	fBlockSize = superblock.BlockSize();</a>
+<a name="ln749">	fFirstCommitID = superblock.FirstCommitID();</a>
+<a name="ln750">	fFirstLogBlock = superblock.FirstLogBlock();</a>
+<a name="ln751">	fLogStart = superblock.LogStart();</a>
+<a name="ln752">	fLogSize = superblock.NumBlocks();</a>
+<a name="ln753"> </a>
+<a name="ln754">	uint32 descriptorTags = (fBlockSize - sizeof(JournalHeader))</a>
+<a name="ln755">		/ sizeof(JournalBlockTag);</a>
+<a name="ln756">		// Maximum tags per descriptor block</a>
+<a name="ln757">	uint32 maxDescriptors = (fLogSize - 1) / (descriptorTags + 2);</a>
+<a name="ln758">		// Maximum number of full journal transactions</a>
+<a name="ln759">	fMaxTransactionSize = maxDescriptors * descriptorTags;</a>
+<a name="ln760">	fMaxTransactionSize += (fLogSize - 1) - fMaxTransactionSize - 2;</a>
+<a name="ln761">		// Maximum size of a &quot;logical&quot; transaction</a>
+<a name="ln762">		// TODO: Why is &quot;superblock.MaxTransactionBlocks();&quot; zero?</a>
+<a name="ln763">	//fFirstCacheCommitID = fFirstCommitID - fTransactionID /*+ 1*/;</a>
+<a name="ln764"> </a>
+<a name="ln765">	TRACE(&quot;Journal::_LoadSuperBlock(): block size: %&quot; B_PRIu32 &quot;, first commit&quot;</a>
+<a name="ln766">		&quot; id: %&quot; B_PRIu32 &quot;, first log block: %&quot; B_PRIu32 &quot;, log start: %&quot;</a>
+<a name="ln767">		B_PRIu32 &quot;, log size: %&quot; B_PRIu32 &quot;, max transaction size: %&quot; B_PRIu32</a>
+<a name="ln768">		&quot;\n&quot;, fBlockSize, fFirstCommitID, fFirstLogBlock, fLogStart,</a>
+<a name="ln769">		fLogSize, fMaxTransactionSize);</a>
+<a name="ln770"> </a>
+<a name="ln771">	return B_OK;</a>
+<a name="ln772">}</a>
+<a name="ln773"> </a>
+<a name="ln774"> </a>
+<a name="ln775">status_t</a>
+<a name="ln776">Journal::_CheckFeatures(JournalSuperBlock* superblock)</a>
+<a name="ln777">{</a>
+<a name="ln778">	if ((superblock-&gt;ReadOnlyCompatibleFeatures()</a>
+<a name="ln779">			&amp; ~JOURNAL_KNOWN_READ_ONLY_COMPATIBLE_FEATURES) != 0</a>
+<a name="ln780">		|| (superblock-&gt;IncompatibleFeatures()</a>
+<a name="ln781">			&amp; ~JOURNAL_KNOWN_INCOMPATIBLE_FEATURES) != 0)</a>
+<a name="ln782">		return B_UNSUPPORTED;</a>
+<a name="ln783"> </a>
+<a name="ln784">	return B_OK;</a>
+<a name="ln785">}</a>
+<a name="ln786"> </a>
+<a name="ln787"> </a>
+<a name="ln788">uint32</a>
+<a name="ln789">Journal::_CountTags(JournalHeader* descriptorBlock)</a>
+<a name="ln790">{</a>
+<a name="ln791">	uint32 count = 0;</a>
+<a name="ln792"> </a>
+<a name="ln793">	JournalBlockTag* tags = (JournalBlockTag*)descriptorBlock-&gt;data;</a>
+<a name="ln794">		// Skip the header</a>
+<a name="ln795">	JournalBlockTag* lastTag = (JournalBlockTag*)</a>
+<a name="ln796">		(descriptorBlock + fBlockSize - sizeof(JournalBlockTag));</a>
+<a name="ln797"> </a>
+<a name="ln798">	while (tags &lt; lastTag &amp;&amp; (tags-&gt;Flags() &amp; JOURNAL_FLAG_LAST_TAG) == 0) {</a>
+<a name="ln799">		if ((tags-&gt;Flags() &amp; JOURNAL_FLAG_SAME_UUID) == 0) {</a>
+<a name="ln800">			// sizeof(UUID) = 16 = 2*sizeof(JournalBlockTag)</a>
+<a name="ln801">			tags += 2;	// Skip new UUID</a>
+<a name="ln802">		}</a>
+<a name="ln803"> </a>
+<a name="ln804">		TRACE(&quot;Journal::_CountTags(): Tag block: %&quot; B_PRIu32 &quot;\n&quot;,</a>
+<a name="ln805">			tags-&gt;BlockNumber());</a>
+<a name="ln806"> </a>
+<a name="ln807">		tags++; // Go to next tag</a>
+<a name="ln808">		count++;</a>
+<a name="ln809">	}</a>
+<a name="ln810"> </a>
+<a name="ln811">	if ((tags-&gt;Flags() &amp; JOURNAL_FLAG_LAST_TAG) != 0)</a>
+<a name="ln812">		count++;</a>
+<a name="ln813"> </a>
+<a name="ln814">	TRACE(&quot;Journal::_CountTags(): counted tags: %&quot; B_PRIu32 &quot;\n&quot;, count);</a>
+<a name="ln815"> </a>
+<a name="ln816">	return count;</a>
+<a name="ln817">}</a>
+<a name="ln818"> </a>
+<a name="ln819"> </a>
+<a name="ln820">/*virtual*/ status_t</a>
+<a name="ln821">Journal::Recover()</a>
+<a name="ln822">{</a>
+<a name="ln823">	TRACE(&quot;Journal::Recover()\n&quot;);</a>
+<a name="ln824">	if (fLogStart == 0) // Journal was cleanly unmounted</a>
+<a name="ln825">		return B_OK;</a>
+<a name="ln826"> </a>
+<a name="ln827">	TRACE(&quot;Journal::Recover(): Journal needs recovery\n&quot;);</a>
+<a name="ln828"> </a>
+<a name="ln829">	uint32 lastCommitID;</a>
+<a name="ln830"> </a>
+<a name="ln831">	status_t status = _RecoverPassScan(lastCommitID);</a>
+<a name="ln832">	if (status != B_OK)</a>
+<a name="ln833">		return status;</a>
+<a name="ln834"> </a>
+<a name="ln835">	status = _RecoverPassRevoke(lastCommitID);</a>
+<a name="ln836">	if (status != B_OK)</a>
+<a name="ln837">		return status;</a>
+<a name="ln838"> </a>
+<a name="ln839">	return _RecoverPassReplay(lastCommitID);</a>
+<a name="ln840">}</a>
+<a name="ln841"> </a>
+<a name="ln842"> </a>
+<a name="ln843">// First pass: Find the end of the log</a>
+<a name="ln844">status_t</a>
+<a name="ln845">Journal::_RecoverPassScan(uint32&amp; lastCommitID)</a>
+<a name="ln846">{</a>
+<a name="ln847">	TRACE(&quot;Journal Recover: 1st Pass: Scan\n&quot;);</a>
+<a name="ln848"> </a>
+<a name="ln849">	CachedBlock cached(fJournalVolume);</a>
+<a name="ln850">	JournalHeader* header;</a>
+<a name="ln851">	uint32 nextCommitID = fFirstCommitID;</a>
+<a name="ln852">	uint32 nextBlock = fLogStart;</a>
+<a name="ln853">	fsblock_t nextBlockPos;</a>
+<a name="ln854"> </a>
+<a name="ln855">	status_t status = MapBlock(nextBlock, nextBlockPos);</a>
+<a name="ln856">	if (status != B_OK)</a>
+<a name="ln857">		return status;</a>
+<a name="ln858"> </a>
+<a name="ln859">	header = (JournalHeader*)cached.SetTo(nextBlockPos);</a>
+<a name="ln860"> </a>
+<a name="ln861">	while (header-&gt;CheckMagic() &amp;&amp; header-&gt;Sequence() == nextCommitID) {</a>
+<a name="ln862">		uint32 blockType = header-&gt;BlockType();</a>
+<a name="ln863"> </a>
+<a name="ln864">		if (blockType == JOURNAL_DESCRIPTOR_BLOCK) {</a>
+<a name="ln865">			uint32 tags = _CountTags(header);</a>
+<a name="ln866">			nextBlock += tags;</a>
+<a name="ln867">			TRACE(&quot;Journal recover pass scan: Found a descriptor block with &quot;</a>
+<a name="ln868">				&quot;%&quot; B_PRIu32 &quot; tags\n&quot;, tags);</a>
+<a name="ln869">		} else if (blockType == JOURNAL_COMMIT_BLOCK) {</a>
+<a name="ln870">			nextCommitID++;</a>
+<a name="ln871">			TRACE(&quot;Journal recover pass scan: Found a commit block. Next &quot;</a>
+<a name="ln872">				&quot;commit ID: %&quot; B_PRIu32 &quot;\n&quot;, nextCommitID);</a>
+<a name="ln873">		} else if (blockType != JOURNAL_REVOKE_BLOCK) {</a>
+<a name="ln874">			TRACE(&quot;Journal recover pass scan: Reached an unrecognized block, &quot;</a>
+<a name="ln875">				&quot;assuming as log's end.\n&quot;);</a>
+<a name="ln876">			break;</a>
+<a name="ln877">		} else {</a>
+<a name="ln878">			TRACE(&quot;Journal recover pass scan: Found a revoke block, &quot;</a>
+<a name="ln879">				&quot;skipping it\n&quot;);</a>
+<a name="ln880">		}</a>
+<a name="ln881"> </a>
+<a name="ln882">		nextBlock = _WrapAroundLog(nextBlock + 1);</a>
+<a name="ln883"> </a>
+<a name="ln884">		status = MapBlock(nextBlock, nextBlockPos);</a>
+<a name="ln885">		if (status != B_OK)</a>
+<a name="ln886">			return status;</a>
+<a name="ln887"> </a>
+<a name="ln888">		header = (JournalHeader*)cached.SetTo(nextBlockPos);</a>
+<a name="ln889">	}</a>
+<a name="ln890"> </a>
+<a name="ln891">	TRACE(&quot;Journal Recovery pass scan: Last detected transaction ID: %&quot;</a>
+<a name="ln892">		B_PRIu32 &quot;\n&quot;, nextCommitID);</a>
+<a name="ln893"> </a>
+<a name="ln894">	lastCommitID = nextCommitID;</a>
+<a name="ln895">	return B_OK;</a>
+<a name="ln896">}</a>
+<a name="ln897"> </a>
+<a name="ln898"> </a>
+<a name="ln899">// Second pass: Collect all revoked blocks</a>
+<a name="ln900">status_t</a>
+<a name="ln901">Journal::_RecoverPassRevoke(uint32 lastCommitID)</a>
+<a name="ln902">{</a>
+<a name="ln903">	TRACE(&quot;Journal Recover: 2nd Pass: Revoke\n&quot;);</a>
+<a name="ln904"> </a>
+<a name="ln905">	CachedBlock cached(fJournalVolume);</a>
+<a name="ln906">	JournalHeader* header;</a>
+<a name="ln907">	uint32 nextCommitID = fFirstCommitID;</a>
+<a name="ln908">	uint32 nextBlock = fLogStart;</a>
+<a name="ln909">	fsblock_t nextBlockPos;</a>
+<a name="ln910"> </a>
+<a name="ln911">	status_t status = MapBlock(nextBlock, nextBlockPos);</a>
+<a name="ln912">	if (status != B_OK)</a>
+<a name="ln913">		return status;</a>
+<a name="ln914"> </a>
+<a name="ln915">	header = (JournalHeader*)cached.SetTo(nextBlockPos);</a>
+<a name="ln916"> </a>
+<a name="ln917">	while (nextCommitID &lt; lastCommitID) {</a>
+<a name="ln918">		if (!header-&gt;CheckMagic() || header-&gt;Sequence() != nextCommitID) {</a>
+<a name="ln919">			// Somehow the log is different than the expexted</a>
+<a name="ln920">			return B_ERROR;</a>
+<a name="ln921">		}</a>
+<a name="ln922"> </a>
+<a name="ln923">		uint32 blockType = header-&gt;BlockType();</a>
+<a name="ln924"> </a>
+<a name="ln925">		if (blockType == JOURNAL_DESCRIPTOR_BLOCK)</a>
+<a name="ln926">			nextBlock += _CountTags(header);</a>
+<a name="ln927">		else if (blockType == JOURNAL_COMMIT_BLOCK)</a>
+<a name="ln928">			nextCommitID++;</a>
+<a name="ln929">		else if (blockType == JOURNAL_REVOKE_BLOCK) {</a>
+<a name="ln930">			TRACE(&quot;Journal::_RecoverPassRevoke(): Found a revoke block\n&quot;);</a>
+<a name="ln931">			status = fRevokeManager-&gt;ScanRevokeBlock(</a>
+<a name="ln932">				(JournalRevokeHeader*)header, nextCommitID);</a>
+<a name="ln933"> </a>
+<a name="ln934">			if (status != B_OK)</a>
+<a name="ln935">				return status;</a>
+<a name="ln936">		} else {</a>
+<a name="ln937">			WARN(&quot;Journal::_RecoverPassRevoke(): Found an unrecognized block\n&quot;);</a>
+<a name="ln938">			break;</a>
+<a name="ln939">		}</a>
+<a name="ln940"> </a>
+<a name="ln941">		nextBlock = _WrapAroundLog(nextBlock + 1);</a>
+<a name="ln942"> </a>
+<a name="ln943">		status = MapBlock(nextBlock, nextBlockPos);</a>
+<a name="ln944">		if (status != B_OK)</a>
+<a name="ln945">			return status;</a>
+<a name="ln946"> </a>
+<a name="ln947">		header = (JournalHeader*)cached.SetTo(nextBlockPos);</a>
+<a name="ln948">	}</a>
+<a name="ln949"> </a>
+<a name="ln950">	if (nextCommitID != lastCommitID) {</a>
+<a name="ln951">		// Possibly because of some sort of IO error</a>
+<a name="ln952">		TRACE(&quot;Journal::_RecoverPassRevoke(): Incompatible commit IDs\n&quot;);</a>
+<a name="ln953">		return B_ERROR;</a>
+<a name="ln954">	}</a>
+<a name="ln955"> </a>
+<a name="ln956">	TRACE(&quot;Journal recovery pass revoke: Revoked blocks: %&quot; B_PRIu32 &quot;\n&quot;,</a>
+<a name="ln957">		fRevokeManager-&gt;NumRevokes());</a>
+<a name="ln958"> </a>
+<a name="ln959">	return B_OK;</a>
+<a name="ln960">}</a>
+<a name="ln961"> </a>
+<a name="ln962"> </a>
+<a name="ln963">// Third pass: Replay log</a>
+<a name="ln964">status_t</a>
+<a name="ln965">Journal::_RecoverPassReplay(uint32 lastCommitID)</a>
+<a name="ln966">{</a>
+<a name="ln967">	TRACE(&quot;Journal Recover: 3rd Pass: Replay\n&quot;);</a>
+<a name="ln968"> </a>
+<a name="ln969">	uint32 nextCommitID = fFirstCommitID;</a>
+<a name="ln970">	uint32 nextBlock = fLogStart;</a>
+<a name="ln971">	fsblock_t nextBlockPos;</a>
+<a name="ln972"> </a>
+<a name="ln973">	status_t status = MapBlock(nextBlock, nextBlockPos);</a>
+<a name="ln974">	if (status != B_OK)</a>
+<a name="ln975">		return status;</a>
+<a name="ln976"> </a>
+<a name="ln977">	CachedBlock cached(fJournalVolume);</a>
+<a name="ln978">	JournalHeader* header = (JournalHeader*)cached.SetTo(nextBlockPos);</a>
+<a name="ln979"> </a>
+<a name="ln980">	int count = 0;</a>
+<a name="ln981"> </a>
+<a name="ln982">	uint8* data = new(std::nothrow) uint8[fBlockSize];</a>
+<a name="ln983">	if (data == NULL) {</a>
+<a name="ln984">		TRACE(&quot;Journal::_RecoverPassReplay(): Failed to allocate memory for &quot;</a>
+<a name="ln985">			&quot;data\n&quot;);</a>
+<a name="ln986">		return B_NO_MEMORY;</a>
+<a name="ln987">	}</a>
+<a name="ln988"> </a>
+<a name="ln989">	ArrayDeleter&lt;uint8&gt; dataDeleter(data);</a>
+<a name="ln990"> </a>
+<a name="ln991">	while (nextCommitID &lt; lastCommitID) {</a>
+<a name="ln992">		if (!header-&gt;CheckMagic() || header-&gt;Sequence() != nextCommitID) {</a>
+<a name="ln993">			// Somehow the log is different than the expected</a>
+<a name="ln994">			ERROR(&quot;Journal::_RecoverPassReplay(): Weird problem with block\n&quot;);</a>
+<a name="ln995">			return B_ERROR;</a>
+<a name="ln996">		}</a>
+<a name="ln997"> </a>
+<a name="ln998">		uint32 blockType = header-&gt;BlockType();</a>
+<a name="ln999"> </a>
+<a name="ln1000">		if (blockType == JOURNAL_DESCRIPTOR_BLOCK) {</a>
+<a name="ln1001">			JournalBlockTag* last_tag = (JournalBlockTag*)((uint8*)header</a>
+<a name="ln1002">				+ fBlockSize - sizeof(JournalBlockTag));</a>
+<a name="ln1003"> </a>
+<a name="ln1004">			for (JournalBlockTag* tag = (JournalBlockTag*)header-&gt;data;</a>
+<a name="ln1005">				tag &lt;= last_tag; ++tag) {</a>
+<a name="ln1006">				nextBlock = _WrapAroundLog(nextBlock + 1);</a>
+<a name="ln1007"> </a>
+<a name="ln1008">				status = MapBlock(nextBlock, nextBlockPos);</a>
+<a name="ln1009">				if (status != B_OK)</a>
+<a name="ln1010">					return status;</a>
+<a name="ln1011"> </a>
+<a name="ln1012">				if (!fRevokeManager-&gt;Lookup(tag-&gt;BlockNumber(),</a>
+<a name="ln1013">						nextCommitID)) {</a>
+<a name="ln1014">					// Block isn't revoked</a>
+<a name="ln1015">					size_t read = read_pos(fJournalVolume-&gt;Device(),</a>
+<a name="ln1016">						nextBlockPos * fBlockSize, data, fBlockSize);</a>
+<a name="ln1017">					if (read != fBlockSize)</a>
+<a name="ln1018">						return B_IO_ERROR;</a>
+<a name="ln1019"> </a>
+<a name="ln1020">					if ((tag-&gt;Flags() &amp; JOURNAL_FLAG_ESCAPED) != 0) {</a>
+<a name="ln1021">						// Block is escaped</a>
+<a name="ln1022">						((int32*)data)[0]</a>
+<a name="ln1023">							= B_HOST_TO_BENDIAN_INT32(JOURNAL_MAGIC);</a>
+<a name="ln1024">					}</a>
+<a name="ln1025"> </a>
+<a name="ln1026">					TRACE(&quot;Journal::_RevoverPassReplay(): Write to %&quot; B_PRIu32</a>
+<a name="ln1027">						&quot;\n&quot;, tag-&gt;BlockNumber() * fBlockSize);</a>
+<a name="ln1028">					size_t written = write_pos(fFilesystemVolume-&gt;Device(),</a>
+<a name="ln1029">						tag-&gt;BlockNumber() * fBlockSize, data, fBlockSize);</a>
+<a name="ln1030"> </a>
+<a name="ln1031">					if (written != fBlockSize)</a>
+<a name="ln1032">						return B_IO_ERROR;</a>
+<a name="ln1033"> </a>
+<a name="ln1034">					++count;</a>
+<a name="ln1035">				}</a>
+<a name="ln1036"> </a>
+<a name="ln1037">				if ((tag-&gt;Flags() &amp; JOURNAL_FLAG_LAST_TAG) != 0)</a>
+<a name="ln1038">					break;</a>
+<a name="ln1039">				if ((tag-&gt;Flags() &amp; JOURNAL_FLAG_SAME_UUID) == 0) {</a>
+<a name="ln1040">					// TODO: Check new UUID with file system UUID</a>
+<a name="ln1041">					tag += 2;</a>
+<a name="ln1042">						// sizeof(JournalBlockTag) = 8</a>
+<a name="ln1043">						// sizeof(UUID) = 16</a>
+<a name="ln1044">				}</a>
+<a name="ln1045">			}</a>
+<a name="ln1046">		} else if (blockType == JOURNAL_COMMIT_BLOCK)</a>
+<a name="ln1047">			nextCommitID++;</a>
+<a name="ln1048">		else if (blockType != JOURNAL_REVOKE_BLOCK) {</a>
+<a name="ln1049">			WARN(&quot;Journal::_RecoverPassReplay(): Found an unrecognized block\n&quot;);</a>
+<a name="ln1050">			break;</a>
+<a name="ln1051">		} // If blockType == JOURNAL_REVOKE_BLOCK we just skip it</a>
+<a name="ln1052"> </a>
+<a name="ln1053">		nextBlock = _WrapAroundLog(nextBlock + 1);</a>
+<a name="ln1054"> </a>
+<a name="ln1055">		status = MapBlock(nextBlock, nextBlockPos);</a>
+<a name="ln1056">		if (status != B_OK)</a>
+<a name="ln1057">			return status;</a>
+<a name="ln1058"> </a>
+<a name="ln1059">		header = (JournalHeader*)cached.SetTo(nextBlockPos);</a>
+<a name="ln1060">	}</a>
+<a name="ln1061"> </a>
+<a name="ln1062">	if (nextCommitID != lastCommitID) {</a>
+<a name="ln1063">		// Possibly because of some sort of IO error</a>
+<a name="ln1064">		return B_ERROR;</a>
+<a name="ln1065">	}</a>
+<a name="ln1066"> </a>
+<a name="ln1067">	TRACE(&quot;Journal recovery pass replay: Replayed blocks: %u\n&quot;, count);</a>
+<a name="ln1068"> </a>
+<a name="ln1069">	return B_OK;</a>
+<a name="ln1070">}</a>
+<a name="ln1071"> </a>
+<a name="ln1072"> </a>
+<a name="ln1073">status_t</a>
+<a name="ln1074">Journal::_FlushLog(bool canWait, bool flushBlocks)</a>
+<a name="ln1075">{</a>
+<a name="ln1076">	TRACE(&quot;Journal::_FlushLog()\n&quot;);</a>
+<a name="ln1077">	status_t status = canWait ? recursive_lock_lock(&amp;fLock)</a>
+<a name="ln1078">		: recursive_lock_trylock(&amp;fLock);</a>
+<a name="ln1079"> </a>
+<a name="ln1080">	TRACE(&quot;Journal::_FlushLog(): Acquired fLock, recursion: %&quot; B_PRId32 &quot;\n&quot;,</a>
+<a name="ln1081">		recursive_lock_get_recursion(&amp;fLock));</a>
+<a name="ln1082">	if (status != B_OK)</a>
+<a name="ln1083">		return status;</a>
+<a name="ln1084"> </a>
+<a name="ln1085">	if (recursive_lock_get_recursion(&amp;fLock) &gt; 1) {</a>
+<a name="ln1086">		// Called from inside a transaction</a>
+<a name="ln1087">		recursive_lock_unlock(&amp;fLock);</a>
+<a name="ln1088">		TRACE(&quot;Journal::_FlushLog(): Called from a transaction. Leaving...\n&quot;);</a>
+<a name="ln1089">		return B_OK;</a>
+<a name="ln1090">	}</a>
+<a name="ln1091"> </a>
+<a name="ln1092">	if (fUnwrittenTransactions != 0 &amp;&amp; _FullTransactionSize() != 0) {</a>
+<a name="ln1093">		status = _WriteTransactionToLog();</a>
+<a name="ln1094">		if (status &lt; B_OK)</a>
+<a name="ln1095">			panic(&quot;Failed flushing transaction: %s\n&quot;, strerror(status));</a>
+<a name="ln1096">	}</a>
+<a name="ln1097"> </a>
+<a name="ln1098">	TRACE(&quot;Journal::_FlushLog(): Attempting to flush journal volume at %p\n&quot;,</a>
+<a name="ln1099">		fJournalVolume);</a>
+<a name="ln1100"> </a>
+<a name="ln1101">	// TODO: Not sure this is correct. Need to review...</a>
+<a name="ln1102">	// NOTE: Not correct. Causes double lock of a block cache mutex</a>
+<a name="ln1103">	// TODO: Need some other way to synchronize the journal...</a>
+<a name="ln1104">	/*status = fJournalVolume-&gt;FlushDevice();</a>
+<a name="ln1105">	if (status != B_OK)</a>
+<a name="ln1106">		return status;*/</a>
+<a name="ln1107"> </a>
+<a name="ln1108">	TRACE(&quot;Journal::_FlushLog(): Flushed journal volume\n&quot;);</a>
+<a name="ln1109"> </a>
+<a name="ln1110">	if (flushBlocks) {</a>
+<a name="ln1111">		TRACE(&quot;Journal::_FlushLog(): Attempting to flush file system volume &quot;</a>
+<a name="ln1112">			&quot;at %p\n&quot;, fFilesystemVolume);</a>
+<a name="ln1113">		status = fFilesystemVolume-&gt;FlushDevice();</a>
+<a name="ln1114">		if (status == B_OK)</a>
+<a name="ln1115">			TRACE(&quot;Journal::_FlushLog(): Flushed file system volume\n&quot;);</a>
+<a name="ln1116">	}</a>
+<a name="ln1117"> </a>
+<a name="ln1118">	TRACE(&quot;Journal::_FlushLog(): Finished. Releasing lock\n&quot;);</a>
+<a name="ln1119"> </a>
+<a name="ln1120">	recursive_lock_unlock(&amp;fLock);</a>
+<a name="ln1121"> </a>
+<a name="ln1122">	TRACE(&quot;Journal::_FlushLog(): Done, final status: %s\n&quot;, strerror(status));</a>
+<a name="ln1123">	return status;</a>
+<a name="ln1124">}</a>
+<a name="ln1125"> </a>
+<a name="ln1126"> </a>
+<a name="ln1127">inline uint32</a>
+<a name="ln1128">Journal::_WrapAroundLog(uint32 block)</a>
+<a name="ln1129">{</a>
+<a name="ln1130">	TRACE(&quot;Journal::_WrapAroundLog()\n&quot;);</a>
+<a name="ln1131">	if (block &gt;= fLogSize)</a>
+<a name="ln1132">		return block - fLogSize + fFirstLogBlock;</a>
+<a name="ln1133">	else</a>
+<a name="ln1134">		return block;</a>
+<a name="ln1135">}</a>
+<a name="ln1136"> </a>
+<a name="ln1137"> </a>
+<a name="ln1138">size_t</a>
+<a name="ln1139">Journal::_CurrentTransactionSize() const</a>
+<a name="ln1140">{</a>
+<a name="ln1141">	TRACE(&quot;Journal::_CurrentTransactionSize(): transaction %&quot; B_PRIu32 &quot;\n&quot;,</a>
+<a name="ln1142">		fTransactionID);</a>
+<a name="ln1143"> </a>
+<a name="ln1144">	size_t count;</a>
+<a name="ln1145"> </a>
+<a name="ln1146">	if (fHasSubTransaction) {</a>
+<a name="ln1147">		count = cache_blocks_in_sub_transaction(fFilesystemBlockCache,</a>
+<a name="ln1148">			fTransactionID);</a>
+<a name="ln1149"> </a>
+<a name="ln1150">		TRACE(&quot;\tSub transaction size: %&quot; B_PRIuSIZE &quot;\n&quot;, count);</a>
+<a name="ln1151">	} else {</a>
+<a name="ln1152">		count =  cache_blocks_in_transaction(fFilesystemBlockCache,</a>
+<a name="ln1153">			fTransactionID);</a>
+<a name="ln1154"> </a>
+<a name="ln1155">		TRACE(&quot;\tTransaction size: %&quot; B_PRIuSIZE &quot;\n&quot;, count);</a>
+<a name="ln1156">	}</a>
+<a name="ln1157"> </a>
+<a name="ln1158">	return count;</a>
+<a name="ln1159">}</a>
+<a name="ln1160"> </a>
+<a name="ln1161"> </a>
+<a name="ln1162">size_t</a>
+<a name="ln1163">Journal::_FullTransactionSize() const</a>
+<a name="ln1164">{</a>
+<a name="ln1165">	TRACE(&quot;Journal::_FullTransactionSize(): transaction %&quot; B_PRIu32 &quot;\n&quot;,</a>
+<a name="ln1166">		fTransactionID);</a>
+<a name="ln1167">	TRACE(&quot;\tFile sytem block cache: %p\n&quot;, fFilesystemBlockCache);</a>
+<a name="ln1168"> </a>
+<a name="ln1169">	size_t count = cache_blocks_in_transaction(fFilesystemBlockCache,</a>
+<a name="ln1170">		 fTransactionID);</a>
+<a name="ln1171"> </a>
+<a name="ln1172">	TRACE(&quot;\tFull transaction size: %&quot; B_PRIuSIZE &quot;\n&quot;, count);</a>
+<a name="ln1173"> </a>
+<a name="ln1174">	return count;</a>
+<a name="ln1175">}</a>
+<a name="ln1176"> </a>
+<a name="ln1177"> </a>
+<a name="ln1178">size_t</a>
+<a name="ln1179">Journal::_MainTransactionSize() const</a>
+<a name="ln1180">{</a>
+<a name="ln1181">	TRACE(&quot;Journal::_MainTransactionSize(): transaction %&quot; B_PRIu32 &quot;\n&quot;,</a>
+<a name="ln1182">		fTransactionID);</a>
+<a name="ln1183"> </a>
+<a name="ln1184">	size_t count =  cache_blocks_in_main_transaction(fFilesystemBlockCache,</a>
+<a name="ln1185">		fTransactionID);</a>
+<a name="ln1186"> </a>
+<a name="ln1187">	TRACE(&quot;\tMain transaction size: %&quot; B_PRIuSIZE &quot;\n&quot;, count);</a>
+<a name="ln1188"> </a>
+<a name="ln1189">	return count;</a>
+<a name="ln1190">}</a>
+<a name="ln1191"> </a>
+<a name="ln1192"> </a>
+<a name="ln1193">status_t</a>
+<a name="ln1194">Journal::_TransactionDone(bool success)</a>
+<a name="ln1195">{</a>
+<a name="ln1196">	if (!success) {</a>
+<a name="ln1197">		if (fHasSubTransaction) {</a>
+<a name="ln1198">			TRACE(&quot;Journal::_TransactionDone(): transaction %&quot; B_PRIu32</a>
+<a name="ln1199">				&quot; failed, aborting subtransaction\n&quot;, fTransactionID);</a>
+<a name="ln1200">			cache_abort_sub_transaction(fFilesystemBlockCache, fTransactionID);</a>
+<a name="ln1201">			// parent is unaffected</a>
+<a name="ln1202">		} else {</a>
+<a name="ln1203">			TRACE(&quot;Journal::_TransactionDone(): transaction %&quot; B_PRIu32</a>
+<a name="ln1204">				&quot; failed, aborting\n&quot;, fTransactionID);</a>
+<a name="ln1205">			cache_abort_transaction(fFilesystemBlockCache, fTransactionID);</a>
+<a name="ln1206">			fUnwrittenTransactions = 0;</a>
+<a name="ln1207">		}</a>
+<a name="ln1208"> </a>
+<a name="ln1209">		TRACE(&quot;Journal::_TransactionDone(): returning B_OK\n&quot;);</a>
+<a name="ln1210">		return B_OK;</a>
+<a name="ln1211">	}</a>
+<a name="ln1212"> </a>
+<a name="ln1213">	// If possible, delay flushing the transaction</a>
+<a name="ln1214">	uint32 size = _FullTransactionSize();</a>
+<a name="ln1215">	TRACE(&quot;Journal::_TransactionDone(): full transaction size: %&quot; B_PRIu32</a>
+<a name="ln1216">		&quot;, max transaction size: %&quot; B_PRIu32 &quot;, free log blocks: %&quot; B_PRIu32</a>
+<a name="ln1217">		&quot;\n&quot;, size, fMaxTransactionSize, FreeLogBlocks());</a>
+<a name="ln1218">	if (fMaxTransactionSize &gt; 0 &amp;&amp; size &lt; fMaxTransactionSize) {</a>
+<a name="ln1219">		TRACE(&quot;Journal::_TransactionDone(): delaying flush of transaction &quot;</a>
+<a name="ln1220">			&quot;%&quot; B_PRIu32 &quot;\n&quot;, fTransactionID);</a>
+<a name="ln1221"> </a>
+<a name="ln1222">		// Make sure the transaction fits in the log</a>
+<a name="ln1223">		if (size &lt; FreeLogBlocks())</a>
+<a name="ln1224">			cache_sync_transaction(fFilesystemBlockCache, fTransactionID);</a>
+<a name="ln1225"> </a>
+<a name="ln1226">		fUnwrittenTransactions++;</a>
+<a name="ln1227">		TRACE(&quot;Journal::_TransactionDone(): returning B_OK\n&quot;);</a>
+<a name="ln1228">		return B_OK;</a>
+<a name="ln1229">	}</a>
+<a name="ln1230"> </a>
+<a name="ln1231">	return _WriteTransactionToLog();</a>
+<a name="ln1232">}</a>
+<a name="ln1233"> </a>
+<a name="ln1234"> </a>
+<a name="ln1235">/*static*/ void</a>
+<a name="ln1236">Journal::_TransactionWritten(int32 transactionID, int32 event, void* _logEntry)</a>
+<a name="ln1237">{</a>
+<a name="ln1238">	LogEntry* logEntry = (LogEntry*)_logEntry;</a>
+<a name="ln1239"> </a>
+<a name="ln1240">	TRACE(&quot;Journal::_TransactionWritten(): Transaction %&quot; B_PRIu32</a>
+<a name="ln1241">		&quot; checkpointed\n&quot;, transactionID);</a>
+<a name="ln1242"> </a>
+<a name="ln1243">	Journal* journal = logEntry-&gt;GetJournal();</a>
+<a name="ln1244"> </a>
+<a name="ln1245">	TRACE(&quot;Journal::_TransactionWritten(): log entry: %p, journal: %p\n&quot;,</a>
+<a name="ln1246">		logEntry, journal);</a>
+<a name="ln1247">	TRACE(&quot;Journal::_TransactionWritten(): log entries: %p\n&quot;,</a>
+<a name="ln1248">		&amp;journal-&gt;fLogEntries);</a>
+<a name="ln1249"> </a>
+<a name="ln1250">	mutex_lock(&amp;journal-&gt;fLogEntriesLock);</a>
+<a name="ln1251"> </a>
+<a name="ln1252">	TRACE(&quot;Journal::_TransactionWritten(): first log entry: %p\n&quot;,</a>
+<a name="ln1253">		journal-&gt;fLogEntries.First());</a>
+<a name="ln1254">	if (logEntry == journal-&gt;fLogEntries.First()) {</a>
+<a name="ln1255">		TRACE(&quot;Journal::_TransactionWritten(): Moving start of log to %&quot;</a>
+<a name="ln1256">			B_PRIu32 &quot;\n&quot;, logEntry-&gt;Start());</a>
+<a name="ln1257">		journal-&gt;fLogStart = logEntry-&gt;Start();</a>
+<a name="ln1258">		journal-&gt;fFirstCommitID = logEntry-&gt;CommitID();</a>
+<a name="ln1259">		TRACE(&quot;Journal::_TransactionWritten(): Setting commit ID to %&quot; B_PRIu32</a>
+<a name="ln1260">			&quot;\n&quot;, logEntry-&gt;CommitID());</a>
+<a name="ln1261"> </a>
+<a name="ln1262">		if (journal-&gt;_SaveSuperBlock() != B_OK)</a>
+<a name="ln1263">			panic(&quot;ext2: Failed to write journal superblock\n&quot;);</a>
+<a name="ln1264">	}</a>
+<a name="ln1265"> </a>
+<a name="ln1266">	TRACE(&quot;Journal::_TransactionWritten(): Removing log entry\n&quot;);</a>
+<a name="ln1267">	journal-&gt;fLogEntries.Remove(logEntry);</a>
+<a name="ln1268"> </a>
+<a name="ln1269">	TRACE(&quot;Journal::_TransactionWritten(): Unlocking entries list\n&quot;);</a>
+<a name="ln1270">	mutex_unlock(&amp;journal-&gt;fLogEntriesLock);</a>
+<a name="ln1271"> </a>
+<a name="ln1272">	TRACE(&quot;Journal::_TransactionWritten(): Deleting log entry at %p\n&quot;, logEntry);</a>
+<a name="ln1273">	delete logEntry;</a>
+<a name="ln1274">}</a>
+<a name="ln1275"> </a>
+<a name="ln1276"> </a>
+<a name="ln1277">/*static*/ void</a>
+<a name="ln1278">Journal::_TransactionIdle(int32 transactionID, int32 event, void* _journal)</a>
+<a name="ln1279">{</a>
+<a name="ln1280">	Journal* journal = (Journal*)_journal;</a>
+<a name="ln1281">	journal-&gt;_FlushLog(false, false);</a>
+<a name="ln1282">}</a>
+
+</code></pre>
+<div class="balloon" rel="128"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fOwner.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

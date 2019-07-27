@@ -1,0 +1,2601 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>heap.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2008-2010, Michael Lotz, mmlr@mlotz.ch.</a>
+<a name="ln3"> * Copyright 2002-2010, Axel Dörfler, axeld@pinc-software.de.</a>
+<a name="ln4"> * Distributed under the terms of the MIT License.</a>
+<a name="ln5"> *</a>
+<a name="ln6"> * Copyright 2001, Travis Geiselbrecht. All rights reserved.</a>
+<a name="ln7"> * Distributed under the terms of the NewOS License.</a>
+<a name="ln8"> */</a>
+<a name="ln9"> </a>
+<a name="ln10"> </a>
+<a name="ln11">#include &lt;arch/debug.h&gt;</a>
+<a name="ln12">#include &lt;debug.h&gt;</a>
+<a name="ln13">#include &lt;elf.h&gt;</a>
+<a name="ln14">#include &lt;heap.h&gt;</a>
+<a name="ln15">#include &lt;int.h&gt;</a>
+<a name="ln16">#include &lt;kernel.h&gt;</a>
+<a name="ln17">#include &lt;lock.h&gt;</a>
+<a name="ln18">#include &lt;string.h&gt;</a>
+<a name="ln19">#include &lt;team.h&gt;</a>
+<a name="ln20">#include &lt;thread.h&gt;</a>
+<a name="ln21">#include &lt;tracing.h&gt;</a>
+<a name="ln22">#include &lt;util/AutoLock.h&gt;</a>
+<a name="ln23">#include &lt;vm/vm.h&gt;</a>
+<a name="ln24">#include &lt;vm/vm_page.h&gt;</a>
+<a name="ln25"> </a>
+<a name="ln26"> </a>
+<a name="ln27">//#define TRACE_HEAP</a>
+<a name="ln28">#ifdef TRACE_HEAP</a>
+<a name="ln29">#	define TRACE(x) dprintf x</a>
+<a name="ln30">#else</a>
+<a name="ln31">#	define TRACE(x) ;</a>
+<a name="ln32">#endif</a>
+<a name="ln33"> </a>
+<a name="ln34"> </a>
+<a name="ln35">#if !USE_DEBUG_HEAP_FOR_MALLOC</a>
+<a name="ln36">#	undef KERNEL_HEAP_LEAK_CHECK</a>
+<a name="ln37">#endif</a>
+<a name="ln38"> </a>
+<a name="ln39"> </a>
+<a name="ln40">#if KERNEL_HEAP_LEAK_CHECK</a>
+<a name="ln41">typedef struct heap_leak_check_info_s {</a>
+<a name="ln42">	addr_t		caller;</a>
+<a name="ln43">	size_t		size;</a>
+<a name="ln44">	thread_id	thread;</a>
+<a name="ln45">	team_id		team;</a>
+<a name="ln46">} heap_leak_check_info;</a>
+<a name="ln47"> </a>
+<a name="ln48">struct caller_info {</a>
+<a name="ln49">	addr_t		caller;</a>
+<a name="ln50">	uint32		count;</a>
+<a name="ln51">	uint32		size;</a>
+<a name="ln52">};</a>
+<a name="ln53"> </a>
+<a name="ln54">static const int32 kCallerInfoTableSize = 1024;</a>
+<a name="ln55">static caller_info sCallerInfoTable[kCallerInfoTableSize];</a>
+<a name="ln56">static int32 sCallerInfoCount = 0;</a>
+<a name="ln57">#endif	// KERNEL_HEAP_LEAK_CHECK</a>
+<a name="ln58"> </a>
+<a name="ln59"> </a>
+<a name="ln60">typedef struct heap_page_s heap_page;</a>
+<a name="ln61"> </a>
+<a name="ln62"> </a>
+<a name="ln63">typedef struct heap_area_s {</a>
+<a name="ln64">	area_id			area;</a>
+<a name="ln65"> </a>
+<a name="ln66">	addr_t			base;</a>
+<a name="ln67">	size_t			size;</a>
+<a name="ln68"> </a>
+<a name="ln69">	uint32			page_count;</a>
+<a name="ln70">	uint32			free_page_count;</a>
+<a name="ln71"> </a>
+<a name="ln72">	heap_page *		free_pages;</a>
+<a name="ln73">	heap_page *		page_table;</a>
+<a name="ln74"> </a>
+<a name="ln75">	heap_area_s *	prev;</a>
+<a name="ln76">	heap_area_s *	next;</a>
+<a name="ln77">	heap_area_s *	all_next;</a>
+<a name="ln78">} heap_area;</a>
+<a name="ln79"> </a>
+<a name="ln80"> </a>
+<a name="ln81">#define MAX_BIN_COUNT	31	// depends on the size of the bin_index field</a>
+<a name="ln82"> </a>
+<a name="ln83">typedef struct heap_page_s {</a>
+<a name="ln84">	heap_area *		area;</a>
+<a name="ln85">	uint16			index;</a>
+<a name="ln86">	uint16			bin_index : 5;</a>
+<a name="ln87">	uint16			free_count : 10;</a>
+<a name="ln88">	uint16			in_use : 1;</a>
+<a name="ln89">	heap_page_s *	next;</a>
+<a name="ln90">	heap_page_s *	prev;</a>
+<a name="ln91">	union {</a>
+<a name="ln92">		uint16			empty_index;</a>
+<a name="ln93">		uint16			allocation_id; // used for bin == bin_count allocations</a>
+<a name="ln94">	};</a>
+<a name="ln95">	addr_t *		free_list;</a>
+<a name="ln96">} heap_page;</a>
+<a name="ln97"> </a>
+<a name="ln98"> </a>
+<a name="ln99">typedef struct heap_bin_s {</a>
+<a name="ln100">	mutex		lock;</a>
+<a name="ln101">	uint32		element_size;</a>
+<a name="ln102">	uint16		max_free_count;</a>
+<a name="ln103">	heap_page *	page_list; // sorted so that the desired page is always first</a>
+<a name="ln104">} heap_bin;</a>
+<a name="ln105"> </a>
+<a name="ln106"> </a>
+<a name="ln107">struct heap_allocator_s {</a>
+<a name="ln108">	rw_lock		area_lock;</a>
+<a name="ln109">	mutex		page_lock;</a>
+<a name="ln110"> </a>
+<a name="ln111">	const char *name;</a>
+<a name="ln112">	uint32		bin_count;</a>
+<a name="ln113">	uint32		page_size;</a>
+<a name="ln114"> </a>
+<a name="ln115">	uint32		total_pages;</a>
+<a name="ln116">	uint32		total_free_pages;</a>
+<a name="ln117">	uint32		empty_areas;</a>
+<a name="ln118"> </a>
+<a name="ln119">#if KERNEL_HEAP_LEAK_CHECK</a>
+<a name="ln120">	addr_t		(*get_caller)();</a>
+<a name="ln121">#endif</a>
+<a name="ln122"> </a>
+<a name="ln123">	heap_bin *	bins;</a>
+<a name="ln124">	heap_area *	areas; // sorted so that the desired area is always first</a>
+<a name="ln125">	heap_area *	all_areas; // all areas including full ones</a>
+<a name="ln126">};</a>
+<a name="ln127"> </a>
+<a name="ln128"> </a>
+<a name="ln129">static const uint32 kAreaAllocationMagic = 'AAMG';</a>
+<a name="ln130">typedef struct area_allocation_info_s {</a>
+<a name="ln131">	area_id		area;</a>
+<a name="ln132">	void *		base;</a>
+<a name="ln133">	uint32		magic;</a>
+<a name="ln134">	size_t		size;</a>
+<a name="ln135">	size_t		allocation_size;</a>
+<a name="ln136">	size_t		allocation_alignment;</a>
+<a name="ln137">	void *		allocation_base;</a>
+<a name="ln138">} area_allocation_info;</a>
+<a name="ln139"> </a>
+<a name="ln140"> </a>
+<a name="ln141">struct DeferredFreeListEntry : SinglyLinkedListLinkImpl&lt;DeferredFreeListEntry&gt; {</a>
+<a name="ln142">};</a>
+<a name="ln143"> </a>
+<a name="ln144"> </a>
+<a name="ln145">typedef SinglyLinkedList&lt;DeferredFreeListEntry&gt; DeferredFreeList;</a>
+<a name="ln146">typedef SinglyLinkedList&lt;DeferredDeletable&gt; DeferredDeletableList;</a>
+<a name="ln147"> </a>
+<a name="ln148"> </a>
+<a name="ln149">#if USE_DEBUG_HEAP_FOR_MALLOC</a>
+<a name="ln150"> </a>
+<a name="ln151">#define VIP_HEAP_SIZE	1024 * 1024</a>
+<a name="ln152"> </a>
+<a name="ln153">// Heap class configuration</a>
+<a name="ln154">#define HEAP_CLASS_COUNT 3</a>
+<a name="ln155">static const heap_class sHeapClasses[HEAP_CLASS_COUNT] = {</a>
+<a name="ln156">	{</a>
+<a name="ln157">		&quot;small&quot;,					/* name */</a>
+<a name="ln158">		50,							/* initial percentage */</a>
+<a name="ln159">		B_PAGE_SIZE / 8,			/* max allocation size */</a>
+<a name="ln160">		B_PAGE_SIZE,				/* page size */</a>
+<a name="ln161">		8,							/* min bin size */</a>
+<a name="ln162">		4,							/* bin alignment */</a>
+<a name="ln163">		8,							/* min count per page */</a>
+<a name="ln164">		16							/* max waste per page */</a>
+<a name="ln165">	},</a>
+<a name="ln166">	{</a>
+<a name="ln167">		&quot;medium&quot;,					/* name */</a>
+<a name="ln168">		30,							/* initial percentage */</a>
+<a name="ln169">		B_PAGE_SIZE * 2,			/* max allocation size */</a>
+<a name="ln170">		B_PAGE_SIZE * 8,			/* page size */</a>
+<a name="ln171">		B_PAGE_SIZE / 8,			/* min bin size */</a>
+<a name="ln172">		32,							/* bin alignment */</a>
+<a name="ln173">		4,							/* min count per page */</a>
+<a name="ln174">		64							/* max waste per page */</a>
+<a name="ln175">	},</a>
+<a name="ln176">	{</a>
+<a name="ln177">		&quot;large&quot;,					/* name */</a>
+<a name="ln178">		20,							/* initial percentage */</a>
+<a name="ln179">		HEAP_AREA_USE_THRESHOLD,	/* max allocation size */</a>
+<a name="ln180">		B_PAGE_SIZE * 16,			/* page size */</a>
+<a name="ln181">		B_PAGE_SIZE * 2,			/* min bin size */</a>
+<a name="ln182">		128,						/* bin alignment */</a>
+<a name="ln183">		1,							/* min count per page */</a>
+<a name="ln184">		256							/* max waste per page */</a>
+<a name="ln185">	}</a>
+<a name="ln186">};</a>
+<a name="ln187"> </a>
+<a name="ln188"> </a>
+<a name="ln189">static uint32 sHeapCount;</a>
+<a name="ln190">static heap_allocator *sHeaps[HEAP_CLASS_COUNT * SMP_MAX_CPUS];</a>
+<a name="ln191">static uint32 *sLastGrowRequest[HEAP_CLASS_COUNT * SMP_MAX_CPUS];</a>
+<a name="ln192">static uint32 *sLastHandledGrowRequest[HEAP_CLASS_COUNT * SMP_MAX_CPUS];</a>
+<a name="ln193"> </a>
+<a name="ln194">static heap_allocator *sVIPHeap;</a>
+<a name="ln195">static heap_allocator *sGrowHeap = NULL;</a>
+<a name="ln196">static thread_id sHeapGrowThread = -1;</a>
+<a name="ln197">static sem_id sHeapGrowSem = -1;</a>
+<a name="ln198">static sem_id sHeapGrownNotify = -1;</a>
+<a name="ln199">static bool sAddGrowHeap = false;</a>
+<a name="ln200"> </a>
+<a name="ln201">#endif	// USE_DEBUG_HEAP_FOR_MALLOC</a>
+<a name="ln202"> </a>
+<a name="ln203">static DeferredFreeList sDeferredFreeList;</a>
+<a name="ln204">static DeferredDeletableList sDeferredDeletableList;</a>
+<a name="ln205">static spinlock sDeferredFreeListLock;</a>
+<a name="ln206"> </a>
+<a name="ln207"> </a>
+<a name="ln208"> </a>
+<a name="ln209">// #pragma mark - Tracing</a>
+<a name="ln210"> </a>
+<a name="ln211">#if KERNEL_HEAP_TRACING</a>
+<a name="ln212">namespace KernelHeapTracing {</a>
+<a name="ln213"> </a>
+<a name="ln214">class Allocate : public AbstractTraceEntry {</a>
+<a name="ln215">	public:</a>
+<a name="ln216">		Allocate(addr_t address, size_t size)</a>
+<a name="ln217">			:	fAddress(address),</a>
+<a name="ln218">				fSize(size)</a>
+<a name="ln219">		{</a>
+<a name="ln220">			Initialized();</a>
+<a name="ln221">		}</a>
+<a name="ln222"> </a>
+<a name="ln223">		virtual void AddDump(TraceOutput &amp;out)</a>
+<a name="ln224">		{</a>
+<a name="ln225">			out.Print(&quot;heap allocate: 0x%08lx (%lu bytes)&quot;, fAddress, fSize);</a>
+<a name="ln226">		}</a>
+<a name="ln227"> </a>
+<a name="ln228">	private:</a>
+<a name="ln229">		addr_t	fAddress;</a>
+<a name="ln230">		size_t	fSize;</a>
+<a name="ln231">};</a>
+<a name="ln232"> </a>
+<a name="ln233"> </a>
+<a name="ln234">class Reallocate : public AbstractTraceEntry {</a>
+<a name="ln235">	public:</a>
+<a name="ln236">		Reallocate(addr_t oldAddress, addr_t newAddress, size_t newSize)</a>
+<a name="ln237">			:	fOldAddress(oldAddress),</a>
+<a name="ln238">				fNewAddress(newAddress),</a>
+<a name="ln239">				fNewSize(newSize)</a>
+<a name="ln240">		{</a>
+<a name="ln241">			Initialized();</a>
+<a name="ln242">		};</a>
+<a name="ln243"> </a>
+<a name="ln244">		virtual void AddDump(TraceOutput &amp;out)</a>
+<a name="ln245">		{</a>
+<a name="ln246">			out.Print(&quot;heap reallocate: 0x%08lx -&gt; 0x%08lx (%lu bytes)&quot;,</a>
+<a name="ln247">				fOldAddress, fNewAddress, fNewSize);</a>
+<a name="ln248">		}</a>
+<a name="ln249"> </a>
+<a name="ln250">	private:</a>
+<a name="ln251">		addr_t	fOldAddress;</a>
+<a name="ln252">		addr_t	fNewAddress;</a>
+<a name="ln253">		size_t	fNewSize;</a>
+<a name="ln254">};</a>
+<a name="ln255"> </a>
+<a name="ln256"> </a>
+<a name="ln257">class Free : public AbstractTraceEntry {</a>
+<a name="ln258">	public:</a>
+<a name="ln259">		Free(addr_t address)</a>
+<a name="ln260">			:	fAddress(address)</a>
+<a name="ln261">		{</a>
+<a name="ln262">			Initialized();</a>
+<a name="ln263">		};</a>
+<a name="ln264"> </a>
+<a name="ln265">		virtual void AddDump(TraceOutput &amp;out)</a>
+<a name="ln266">		{</a>
+<a name="ln267">			out.Print(&quot;heap free: 0x%08lx&quot;, fAddress);</a>
+<a name="ln268">		}</a>
+<a name="ln269"> </a>
+<a name="ln270">	private:</a>
+<a name="ln271">		addr_t	fAddress;</a>
+<a name="ln272">};</a>
+<a name="ln273"> </a>
+<a name="ln274"> </a>
+<a name="ln275">} // namespace KernelHeapTracing</a>
+<a name="ln276"> </a>
+<a name="ln277">#	define T(x)	if (!gKernelStartup) new(std::nothrow) KernelHeapTracing::x;</a>
+<a name="ln278">#else</a>
+<a name="ln279">#	define T(x)	;</a>
+<a name="ln280">#endif</a>
+<a name="ln281"> </a>
+<a name="ln282"> </a>
+<a name="ln283">// #pragma mark - Debug functions</a>
+<a name="ln284"> </a>
+<a name="ln285"> </a>
+<a name="ln286">#if KERNEL_HEAP_LEAK_CHECK</a>
+<a name="ln287">static addr_t</a>
+<a name="ln288">get_caller()</a>
+<a name="ln289">{</a>
+<a name="ln290">	// Find the first return address outside of the allocator code. Note, that</a>
+<a name="ln291">	// this makes certain assumptions about how the code for the functions</a>
+<a name="ln292">	// ends up in the kernel object.</a>
+<a name="ln293">	addr_t returnAddresses[5];</a>
+<a name="ln294">	int32 depth = arch_debug_get_stack_trace(returnAddresses, 5, 0, 1,</a>
+<a name="ln295">		STACK_TRACE_KERNEL);</a>
+<a name="ln296">	for (int32 i = 0; i &lt; depth; i++) {</a>
+<a name="ln297">		if (returnAddresses[i] &lt; (addr_t)&amp;get_caller</a>
+<a name="ln298">			|| returnAddresses[i] &gt; (addr_t)&amp;malloc_referenced_release) {</a>
+<a name="ln299">			return returnAddresses[i];</a>
+<a name="ln300">		}</a>
+<a name="ln301">	}</a>
+<a name="ln302"> </a>
+<a name="ln303">	return 0;</a>
+<a name="ln304">}</a>
+<a name="ln305">#endif</a>
+<a name="ln306"> </a>
+<a name="ln307"> </a>
+<a name="ln308">static void</a>
+<a name="ln309">dump_page(heap_page *page)</a>
+<a name="ln310">{</a>
+<a name="ln311">	uint32 count = 0;</a>
+<a name="ln312">	for (addr_t *temp = page-&gt;free_list; temp != NULL; temp = (addr_t *)*temp)</a>
+<a name="ln313">		count++;</a>
+<a name="ln314"> </a>
+<a name="ln315">	kprintf(&quot;\t\tpage %p: bin_index: %u; free_count: %u; empty_index: %u; &quot;</a>
+<a name="ln316">		&quot;free_list %p (%&quot; B_PRIu32 &quot; entr%s)\n&quot;, page, page-&gt;bin_index,</a>
+<a name="ln317">		page-&gt;free_count, page-&gt;empty_index, page-&gt;free_list, count,</a>
+<a name="ln318">		count == 1 ? &quot;y&quot; : &quot;ies&quot;);</a>
+<a name="ln319">}</a>
+<a name="ln320"> </a>
+<a name="ln321"> </a>
+<a name="ln322">static void</a>
+<a name="ln323">dump_bin(heap_bin *bin)</a>
+<a name="ln324">{</a>
+<a name="ln325">	uint32 count = 0;</a>
+<a name="ln326">	for (heap_page *page = bin-&gt;page_list; page != NULL; page = page-&gt;next)</a>
+<a name="ln327">		count++;</a>
+<a name="ln328"> </a>
+<a name="ln329">	kprintf(&quot;\telement_size: %&quot; B_PRIu32 &quot;; max_free_count: %u; page_list %p &quot;</a>
+<a name="ln330">		&quot;(%&quot; B_PRIu32 &quot; pages);\n&quot;, bin-&gt;element_size, bin-&gt;max_free_count,</a>
+<a name="ln331">		bin-&gt;page_list, count);</a>
+<a name="ln332"> </a>
+<a name="ln333">	for (heap_page *page = bin-&gt;page_list; page != NULL; page = page-&gt;next)</a>
+<a name="ln334">		dump_page(page);</a>
+<a name="ln335">}</a>
+<a name="ln336"> </a>
+<a name="ln337"> </a>
+<a name="ln338">static void</a>
+<a name="ln339">dump_bin_list(heap_allocator *heap)</a>
+<a name="ln340">{</a>
+<a name="ln341">	for (uint32 i = 0; i &lt; heap-&gt;bin_count; i++)</a>
+<a name="ln342">		dump_bin(&amp;heap-&gt;bins[i]);</a>
+<a name="ln343">	kprintf(&quot;\n&quot;);</a>
+<a name="ln344">}</a>
+<a name="ln345"> </a>
+<a name="ln346"> </a>
+<a name="ln347">static void</a>
+<a name="ln348">dump_allocator_areas(heap_allocator *heap)</a>
+<a name="ln349">{</a>
+<a name="ln350">	heap_area *area = heap-&gt;all_areas;</a>
+<a name="ln351">	while (area) {</a>
+<a name="ln352">		kprintf(&quot;\tarea %p: area: %&quot; B_PRId32 &quot;; base: %p; size: %zu; page_count: &quot;</a>
+<a name="ln353">			&quot;%&quot; B_PRIu32 &quot;; free_pages: %p (%&quot; B_PRIu32 &quot; entr%s)\n&quot;, area,</a>
+<a name="ln354">			area-&gt;area, (void *)area-&gt;base, area-&gt;size, area-&gt;page_count,</a>
+<a name="ln355">			area-&gt;free_pages, area-&gt;free_page_count,</a>
+<a name="ln356">			area-&gt;free_page_count == 1 ? &quot;y&quot; : &quot;ies&quot;);</a>
+<a name="ln357">		area = area-&gt;all_next;</a>
+<a name="ln358">	}</a>
+<a name="ln359"> </a>
+<a name="ln360">	kprintf(&quot;\n&quot;);</a>
+<a name="ln361">}</a>
+<a name="ln362"> </a>
+<a name="ln363"> </a>
+<a name="ln364">static void</a>
+<a name="ln365">dump_allocator(heap_allocator *heap, bool areas, bool bins)</a>
+<a name="ln366">{</a>
+<a name="ln367">	kprintf(&quot;allocator %p: name: %s; page_size: %&quot; B_PRIu32 &quot;; bin_count: &quot;</a>
+<a name="ln368">		&quot;%&quot; B_PRIu32 &quot;; pages: %&quot; B_PRIu32 &quot;; free_pages: %&quot; B_PRIu32 &quot;; &quot;</a>
+<a name="ln369">		&quot;empty_areas: %&quot; B_PRIu32 &quot;\n&quot;, heap, heap-&gt;name, heap-&gt;page_size,</a>
+<a name="ln370">		heap-&gt;bin_count, heap-&gt;total_pages, heap-&gt;total_free_pages,</a>
+<a name="ln371">		heap-&gt;empty_areas);</a>
+<a name="ln372"> </a>
+<a name="ln373">	if (areas)</a>
+<a name="ln374">		dump_allocator_areas(heap);</a>
+<a name="ln375">	if (bins)</a>
+<a name="ln376">		dump_bin_list(heap);</a>
+<a name="ln377">}</a>
+<a name="ln378"> </a>
+<a name="ln379"> </a>
+<a name="ln380">static int</a>
+<a name="ln381">dump_heap_list(int argc, char **argv)</a>
+<a name="ln382">{</a>
+<a name="ln383">#if USE_DEBUG_HEAP_FOR_MALLOC</a>
+<a name="ln384">	if (argc == 2 &amp;&amp; strcmp(argv[1], &quot;grow&quot;) == 0) {</a>
+<a name="ln385">		// only dump dedicated grow heap info</a>
+<a name="ln386">		kprintf(&quot;dedicated grow heap:\n&quot;);</a>
+<a name="ln387">		dump_allocator(sGrowHeap, true, true);</a>
+<a name="ln388">		return 0;</a>
+<a name="ln389">	}</a>
+<a name="ln390">#endif</a>
+<a name="ln391"> </a>
+<a name="ln392">	bool stats = false;</a>
+<a name="ln393">	int i = 1;</a>
+<a name="ln394"> </a>
+<a name="ln395">	if (strcmp(argv[1], &quot;stats&quot;) == 0) {</a>
+<a name="ln396">		stats = true;</a>
+<a name="ln397">		i++;</a>
+<a name="ln398">	}</a>
+<a name="ln399"> </a>
+<a name="ln400">	uint64 heapAddress = 0;</a>
+<a name="ln401">	if (i &lt; argc &amp;&amp; !evaluate_debug_expression(argv[i], &amp;heapAddress, true)) {</a>
+<a name="ln402">		print_debugger_command_usage(argv[0]);</a>
+<a name="ln403">		return 0;</a>
+<a name="ln404">	}</a>
+<a name="ln405"> </a>
+<a name="ln406">	if (heapAddress == 0) {</a>
+<a name="ln407">#if USE_DEBUG_HEAP_FOR_MALLOC</a>
+<a name="ln408">		// dump default kernel heaps</a>
+<a name="ln409">		for (uint32 i = 0; i &lt; sHeapCount; i++)</a>
+<a name="ln410">			dump_allocator(sHeaps[i], !stats, !stats);</a>
+<a name="ln411">#else</a>
+<a name="ln412">		print_debugger_command_usage(argv[0]);</a>
+<a name="ln413">#endif</a>
+<a name="ln414">	} else {</a>
+<a name="ln415">		// dump specified heap</a>
+<a name="ln416">		dump_allocator((heap_allocator*)(addr_t)heapAddress, !stats, !stats);</a>
+<a name="ln417">	}</a>
+<a name="ln418"> </a>
+<a name="ln419">	return 0;</a>
+<a name="ln420">}</a>
+<a name="ln421"> </a>
+<a name="ln422"> </a>
+<a name="ln423">#if !KERNEL_HEAP_LEAK_CHECK</a>
+<a name="ln424"> </a>
+<a name="ln425">static int</a>
+<a name="ln426">dump_allocations(int argc, char **argv)</a>
+<a name="ln427">{</a>
+<a name="ln428">	uint64 heapAddress = 0;</a>
+<a name="ln429">	bool statsOnly = false;</a>
+<a name="ln430">	for (int32 i = 1; i &lt; argc; i++) {</a>
+<a name="ln431">		if (strcmp(argv[i], &quot;stats&quot;) == 0)</a>
+<a name="ln432">			statsOnly = true;</a>
+<a name="ln433">		else if (!evaluate_debug_expression(argv[i], &amp;heapAddress, true)) {</a>
+<a name="ln434">			print_debugger_command_usage(argv[0]);</a>
+<a name="ln435">			return 0;</a>
+<a name="ln436">		}</a>
+<a name="ln437">	}</a>
+<a name="ln438"> </a>
+<a name="ln439">	size_t totalSize = 0;</a>
+<a name="ln440">	uint32 totalCount = 0;</a>
+<a name="ln441">#if USE_DEBUG_HEAP_FOR_MALLOC</a>
+<a name="ln442">	for (uint32 heapIndex = 0; heapIndex &lt; sHeapCount; heapIndex++) {</a>
+<a name="ln443">		heap_allocator *heap = sHeaps[heapIndex];</a>
+<a name="ln444">		if (heapAddress != 0)</a>
+<a name="ln445">			heap = (heap_allocator *)(addr_t)heapAddress;</a>
+<a name="ln446">#else</a>
+<a name="ln447">	while (true) {</a>
+<a name="ln448">		heap_allocator *heap = (heap_allocator *)(addr_t)heapAddress;</a>
+<a name="ln449">		if (heap == NULL) {</a>
+<a name="ln450">			print_debugger_command_usage(argv[0]);</a>
+<a name="ln451">			return 0;</a>
+<a name="ln452">		}</a>
+<a name="ln453">#endif</a>
+<a name="ln454">#if 0</a>
+<a name="ln455">	}</a>
+<a name="ln456">#endif</a>
+<a name="ln457"> </a>
+<a name="ln458">		// go through all the pages in all the areas</a>
+<a name="ln459">		heap_area *area = heap-&gt;all_areas;</a>
+<a name="ln460">		while (area) {</a>
+<a name="ln461">			for (uint32 i = 0; i &lt; area-&gt;page_count; i++) {</a>
+<a name="ln462">				heap_page *page = &amp;area-&gt;page_table[i];</a>
+<a name="ln463">				if (!page-&gt;in_use)</a>
+<a name="ln464">					continue;</a>
+<a name="ln465"> </a>
+<a name="ln466">				addr_t base = area-&gt;base + i * heap-&gt;page_size;</a>
+<a name="ln467">				if (page-&gt;bin_index &lt; heap-&gt;bin_count) {</a>
+<a name="ln468">					// page is used by a small allocation bin</a>
+<a name="ln469">					uint32 elementCount = page-&gt;empty_index;</a>
+<a name="ln470">					size_t elementSize</a>
+<a name="ln471">						= heap-&gt;bins[page-&gt;bin_index].element_size;</a>
+<a name="ln472">					for (uint32 j = 0; j &lt; elementCount;</a>
+<a name="ln473">							j++, base += elementSize) {</a>
+<a name="ln474">						// walk the free list to see if this element is in use</a>
+<a name="ln475">						bool elementInUse = true;</a>
+<a name="ln476">						for (addr_t *temp = page-&gt;free_list; temp != NULL;</a>
+<a name="ln477">								temp = (addr_t *)*temp) {</a>
+<a name="ln478">							if ((addr_t)temp == base) {</a>
+<a name="ln479">								elementInUse = false;</a>
+<a name="ln480">								break;</a>
+<a name="ln481">							}</a>
+<a name="ln482">						}</a>
+<a name="ln483"> </a>
+<a name="ln484">						if (!elementInUse)</a>
+<a name="ln485">							continue;</a>
+<a name="ln486"> </a>
+<a name="ln487">						if (!statsOnly) {</a>
+<a name="ln488">							kprintf(&quot;address: 0x%p; size: %lu bytes\n&quot;,</a>
+<a name="ln489">								(void *)base, elementSize);</a>
+<a name="ln490">						}</a>
+<a name="ln491"> </a>
+<a name="ln492">						totalSize += elementSize;</a>
+<a name="ln493">						totalCount++;</a>
+<a name="ln494">					}</a>
+<a name="ln495">				} else {</a>
+<a name="ln496">					// page is used by a big allocation, find the page count</a>
+<a name="ln497">					uint32 pageCount = 1;</a>
+<a name="ln498">					while (i + pageCount &lt; area-&gt;page_count</a>
+<a name="ln499">						&amp;&amp; area-&gt;page_table[i + pageCount].in_use</a>
+<a name="ln500">						&amp;&amp; area-&gt;page_table[i + pageCount].bin_index</a>
+<a name="ln501">							== heap-&gt;bin_count</a>
+<a name="ln502">						&amp;&amp; area-&gt;page_table[i + pageCount].allocation_id</a>
+<a name="ln503">							== page-&gt;allocation_id)</a>
+<a name="ln504">						pageCount++;</a>
+<a name="ln505"> </a>
+<a name="ln506">					size_t size = pageCount * heap-&gt;page_size;</a>
+<a name="ln507"> </a>
+<a name="ln508">					if (!statsOnly) {</a>
+<a name="ln509">						kprintf(&quot;address: %p; size: %lu bytes\n&quot;, (void *)base,</a>
+<a name="ln510">							size);</a>
+<a name="ln511">					}</a>
+<a name="ln512"> </a>
+<a name="ln513">					totalSize += size;</a>
+<a name="ln514">					totalCount++;</a>
+<a name="ln515"> </a>
+<a name="ln516">					// skip the allocated pages</a>
+<a name="ln517">					i += pageCount - 1;</a>
+<a name="ln518">				}</a>
+<a name="ln519">			}</a>
+<a name="ln520"> </a>
+<a name="ln521">			area = area-&gt;all_next;</a>
+<a name="ln522">		}</a>
+<a name="ln523"> </a>
+<a name="ln524">		if (heapAddress != 0)</a>
+<a name="ln525">			break;</a>
+<a name="ln526">	}</a>
+<a name="ln527"> </a>
+<a name="ln528">	kprintf(&quot;total allocations: %&quot; B_PRIu32 &quot;; total bytes: %zu\n&quot;, totalCount, totalSize);</a>
+<a name="ln529">	return 0;</a>
+<a name="ln530">}</a>
+<a name="ln531"> </a>
+<a name="ln532">#else // !KERNEL_HEAP_LEAK_CHECK</a>
+<a name="ln533"> </a>
+<a name="ln534">static int</a>
+<a name="ln535">dump_allocations(int argc, char **argv)</a>
+<a name="ln536">{</a>
+<a name="ln537">	team_id team = -1;</a>
+<a name="ln538">	thread_id thread = -1;</a>
+<a name="ln539">	addr_t caller = 0;</a>
+<a name="ln540">	addr_t address = 0;</a>
+<a name="ln541">	bool statsOnly = false;</a>
+<a name="ln542"> </a>
+<a name="ln543">	for (int32 i = 1; i &lt; argc; i++) {</a>
+<a name="ln544">		if (strcmp(argv[i], &quot;team&quot;) == 0)</a>
+<a name="ln545">			team = parse_expression(argv[++i]);</a>
+<a name="ln546">		else if (strcmp(argv[i], &quot;thread&quot;) == 0)</a>
+<a name="ln547">			thread = parse_expression(argv[++i]);</a>
+<a name="ln548">		else if (strcmp(argv[i], &quot;caller&quot;) == 0)</a>
+<a name="ln549">			caller = parse_expression(argv[++i]);</a>
+<a name="ln550">		else if (strcmp(argv[i], &quot;address&quot;) == 0)</a>
+<a name="ln551">			address = parse_expression(argv[++i]);</a>
+<a name="ln552">		else if (strcmp(argv[i], &quot;stats&quot;) == 0)</a>
+<a name="ln553">			statsOnly = true;</a>
+<a name="ln554">		else {</a>
+<a name="ln555">			print_debugger_command_usage(argv[0]);</a>
+<a name="ln556">			return 0;</a>
+<a name="ln557">		}</a>
+<a name="ln558">	}</a>
+<a name="ln559"> </a>
+<a name="ln560">	size_t totalSize = 0;</a>
+<a name="ln561">	uint32 totalCount = 0;</a>
+<a name="ln562">	for (uint32 heapIndex = 0; heapIndex &lt; sHeapCount; heapIndex++) {</a>
+<a name="ln563">		heap_allocator *heap = sHeaps[heapIndex];</a>
+<a name="ln564"> </a>
+<a name="ln565">		// go through all the pages in all the areas</a>
+<a name="ln566">		heap_area *area = heap-&gt;all_areas;</a>
+<a name="ln567">		while (area) {</a>
+<a name="ln568">			heap_leak_check_info *info = NULL;</a>
+<a name="ln569">			for (uint32 i = 0; i &lt; area-&gt;page_count; i++) {</a>
+<a name="ln570">				heap_page *page = &amp;area-&gt;page_table[i];</a>
+<a name="ln571">				if (!page-&gt;in_use)</a>
+<a name="ln572">					continue;</a>
+<a name="ln573"> </a>
+<a name="ln574">				addr_t base = area-&gt;base + i * heap-&gt;page_size;</a>
+<a name="ln575">				if (page-&gt;bin_index &lt; heap-&gt;bin_count) {</a>
+<a name="ln576">					// page is used by a small allocation bin</a>
+<a name="ln577">					uint32 elementCount = page-&gt;empty_index;</a>
+<a name="ln578">					size_t elementSize</a>
+<a name="ln579">						= heap-&gt;bins[page-&gt;bin_index].element_size;</a>
+<a name="ln580">					for (uint32 j = 0; j &lt; elementCount;</a>
+<a name="ln581">							j++, base += elementSize) {</a>
+<a name="ln582">						// walk the free list to see if this element is in use</a>
+<a name="ln583">						bool elementInUse = true;</a>
+<a name="ln584">						for (addr_t *temp = page-&gt;free_list; temp != NULL;</a>
+<a name="ln585">								temp = (addr_t *)*temp) {</a>
+<a name="ln586">							if ((addr_t)temp == base) {</a>
+<a name="ln587">								elementInUse = false;</a>
+<a name="ln588">								break;</a>
+<a name="ln589">							}</a>
+<a name="ln590">						}</a>
+<a name="ln591"> </a>
+<a name="ln592">						if (!elementInUse)</a>
+<a name="ln593">							continue;</a>
+<a name="ln594"> </a>
+<a name="ln595">						info = (heap_leak_check_info *)(base + elementSize</a>
+<a name="ln596">							- sizeof(heap_leak_check_info));</a>
+<a name="ln597"> </a>
+<a name="ln598">						if ((team == -1 || info-&gt;team == team)</a>
+<a name="ln599">							&amp;&amp; (thread == -1 || info-&gt;thread == thread)</a>
+<a name="ln600">							&amp;&amp; (caller == 0 || info-&gt;caller == caller)</a>
+<a name="ln601">							&amp;&amp; (address == 0 || base == address)) {</a>
+<a name="ln602">							// interesting...</a>
+<a name="ln603">							if (!statsOnly) {</a>
+<a name="ln604">								kprintf(&quot;team: % 6ld; thread: % 6ld; &quot;</a>
+<a name="ln605">									&quot;address: 0x%08lx; size: %lu bytes; &quot;</a>
+<a name="ln606">									&quot;caller: %#lx\n&quot;, info-&gt;team, info-&gt;thread,</a>
+<a name="ln607">									base, info-&gt;size, info-&gt;caller);</a>
+<a name="ln608">							}</a>
+<a name="ln609"> </a>
+<a name="ln610">							totalSize += info-&gt;size;</a>
+<a name="ln611">							totalCount++;</a>
+<a name="ln612">						}</a>
+<a name="ln613">					}</a>
+<a name="ln614">				} else {</a>
+<a name="ln615">					// page is used by a big allocation, find the page count</a>
+<a name="ln616">					uint32 pageCount = 1;</a>
+<a name="ln617">					while (i + pageCount &lt; area-&gt;page_count</a>
+<a name="ln618">						&amp;&amp; area-&gt;page_table[i + pageCount].in_use</a>
+<a name="ln619">						&amp;&amp; area-&gt;page_table[i + pageCount].bin_index</a>
+<a name="ln620">							== heap-&gt;bin_count</a>
+<a name="ln621">						&amp;&amp; area-&gt;page_table[i + pageCount].allocation_id</a>
+<a name="ln622">							== page-&gt;allocation_id)</a>
+<a name="ln623">						pageCount++;</a>
+<a name="ln624"> </a>
+<a name="ln625">					info = (heap_leak_check_info *)(base + pageCount</a>
+<a name="ln626">						* heap-&gt;page_size - sizeof(heap_leak_check_info));</a>
+<a name="ln627"> </a>
+<a name="ln628">					if ((team == -1 || info-&gt;team == team)</a>
+<a name="ln629">						&amp;&amp; (thread == -1 || info-&gt;thread == thread)</a>
+<a name="ln630">						&amp;&amp; (caller == 0 || info-&gt;caller == caller)</a>
+<a name="ln631">						&amp;&amp; (address == 0 || base == address)) {</a>
+<a name="ln632">						// interesting...</a>
+<a name="ln633">						if (!statsOnly) {</a>
+<a name="ln634">							kprintf(&quot;team: % 6ld; thread: % 6ld;&quot;</a>
+<a name="ln635">								&quot; address: 0x%08lx; size: %lu bytes;&quot;</a>
+<a name="ln636">								&quot; caller: %#lx\n&quot;, info-&gt;team, info-&gt;thread,</a>
+<a name="ln637">								base, info-&gt;size, info-&gt;caller);</a>
+<a name="ln638">						}</a>
+<a name="ln639"> </a>
+<a name="ln640">						totalSize += info-&gt;size;</a>
+<a name="ln641">						totalCount++;</a>
+<a name="ln642">					}</a>
+<a name="ln643"> </a>
+<a name="ln644">					// skip the allocated pages</a>
+<a name="ln645">					i += pageCount - 1;</a>
+<a name="ln646">				}</a>
+<a name="ln647">			}</a>
+<a name="ln648"> </a>
+<a name="ln649">			area = area-&gt;all_next;</a>
+<a name="ln650">		}</a>
+<a name="ln651">	}</a>
+<a name="ln652"> </a>
+<a name="ln653">	kprintf(&quot;total allocations: %lu; total bytes: %lu\n&quot;, totalCount,</a>
+<a name="ln654">		totalSize);</a>
+<a name="ln655">	return 0;</a>
+<a name="ln656">}</a>
+<a name="ln657"> </a>
+<a name="ln658"> </a>
+<a name="ln659">static caller_info*</a>
+<a name="ln660">get_caller_info(addr_t caller)</a>
+<a name="ln661">{</a>
+<a name="ln662">	// find the caller info</a>
+<a name="ln663">	for (int32 i = 0; i &lt; sCallerInfoCount; i++) {</a>
+<a name="ln664">		if (caller == sCallerInfoTable[i].caller)</a>
+<a name="ln665">			return &amp;sCallerInfoTable[i];</a>
+<a name="ln666">	}</a>
+<a name="ln667"> </a>
+<a name="ln668">	// not found, add a new entry, if there are free slots</a>
+<a name="ln669">	if (sCallerInfoCount &gt;= kCallerInfoTableSize)</a>
+<a name="ln670">		return NULL;</a>
+<a name="ln671"> </a>
+<a name="ln672">	caller_info* info = &amp;sCallerInfoTable[sCallerInfoCount++];</a>
+<a name="ln673">	info-&gt;caller = caller;</a>
+<a name="ln674">	info-&gt;count = 0;</a>
+<a name="ln675">	info-&gt;size = 0;</a>
+<a name="ln676"> </a>
+<a name="ln677">	return info;</a>
+<a name="ln678">}</a>
+<a name="ln679"> </a>
+<a name="ln680"> </a>
+<a name="ln681">static int</a>
+<a name="ln682">caller_info_compare_size(const void* _a, const void* _b)</a>
+<a name="ln683">{</a>
+<a name="ln684">	const caller_info* a = (const caller_info*)_a;</a>
+<a name="ln685">	const caller_info* b = (const caller_info*)_b;</a>
+<a name="ln686">	return (int)(b-&gt;size - a-&gt;size);</a>
+<a name="ln687">}</a>
+<a name="ln688"> </a>
+<a name="ln689"> </a>
+<a name="ln690">static int</a>
+<a name="ln691">caller_info_compare_count(const void* _a, const void* _b)</a>
+<a name="ln692">{</a>
+<a name="ln693">	const caller_info* a = (const caller_info*)_a;</a>
+<a name="ln694">	const caller_info* b = (const caller_info*)_b;</a>
+<a name="ln695">	return (int)(b-&gt;count - a-&gt;count);</a>
+<a name="ln696">}</a>
+<a name="ln697"> </a>
+<a name="ln698"> </a>
+<a name="ln699">static bool</a>
+<a name="ln700">analyze_allocation_callers(heap_allocator *heap)</a>
+<a name="ln701">{</a>
+<a name="ln702">	// go through all the pages in all the areas</a>
+<a name="ln703">	heap_area *area = heap-&gt;all_areas;</a>
+<a name="ln704">	while (area) {</a>
+<a name="ln705">		heap_leak_check_info *info = NULL;</a>
+<a name="ln706">		for (uint32 i = 0; i &lt; area-&gt;page_count; i++) {</a>
+<a name="ln707">			heap_page *page = &amp;area-&gt;page_table[i];</a>
+<a name="ln708">			if (!page-&gt;in_use)</a>
+<a name="ln709">				continue;</a>
+<a name="ln710"> </a>
+<a name="ln711">			addr_t base = area-&gt;base + i * heap-&gt;page_size;</a>
+<a name="ln712">			if (page-&gt;bin_index &lt; heap-&gt;bin_count) {</a>
+<a name="ln713">				// page is used by a small allocation bin</a>
+<a name="ln714">				uint32 elementCount = page-&gt;empty_index;</a>
+<a name="ln715">				size_t elementSize = heap-&gt;bins[page-&gt;bin_index].element_size;</a>
+<a name="ln716">				for (uint32 j = 0; j &lt; elementCount; j++, base += elementSize) {</a>
+<a name="ln717">					// walk the free list to see if this element is in use</a>
+<a name="ln718">					bool elementInUse = true;</a>
+<a name="ln719">					for (addr_t *temp = page-&gt;free_list; temp != NULL;</a>
+<a name="ln720">						temp = (addr_t *)*temp) {</a>
+<a name="ln721">						if ((addr_t)temp == base) {</a>
+<a name="ln722">							elementInUse = false;</a>
+<a name="ln723">							break;</a>
+<a name="ln724">						}</a>
+<a name="ln725">					}</a>
+<a name="ln726"> </a>
+<a name="ln727">					if (!elementInUse)</a>
+<a name="ln728">						continue;</a>
+<a name="ln729"> </a>
+<a name="ln730">					info = (heap_leak_check_info *)(base + elementSize</a>
+<a name="ln731">						- sizeof(heap_leak_check_info));</a>
+<a name="ln732"> </a>
+<a name="ln733">					caller_info *callerInfo = get_caller_info(info-&gt;caller);</a>
+<a name="ln734">					if (callerInfo == NULL) {</a>
+<a name="ln735">						kprintf(&quot;out of space for caller infos\n&quot;);</a>
+<a name="ln736">						return false;</a>
+<a name="ln737">					}</a>
+<a name="ln738"> </a>
+<a name="ln739">					callerInfo-&gt;count++;</a>
+<a name="ln740">					callerInfo-&gt;size += info-&gt;size;</a>
+<a name="ln741">				}</a>
+<a name="ln742">			} else {</a>
+<a name="ln743">				// page is used by a big allocation, find the page count</a>
+<a name="ln744">				uint32 pageCount = 1;</a>
+<a name="ln745">				while (i + pageCount &lt; area-&gt;page_count</a>
+<a name="ln746">					&amp;&amp; area-&gt;page_table[i + pageCount].in_use</a>
+<a name="ln747">					&amp;&amp; area-&gt;page_table[i + pageCount].bin_index</a>
+<a name="ln748">						== heap-&gt;bin_count</a>
+<a name="ln749">					&amp;&amp; area-&gt;page_table[i + pageCount].allocation_id</a>
+<a name="ln750">						== page-&gt;allocation_id) {</a>
+<a name="ln751">					pageCount++;</a>
+<a name="ln752">				}</a>
+<a name="ln753"> </a>
+<a name="ln754">				info = (heap_leak_check_info *)(base + pageCount</a>
+<a name="ln755">					* heap-&gt;page_size - sizeof(heap_leak_check_info));</a>
+<a name="ln756"> </a>
+<a name="ln757">				caller_info *callerInfo = get_caller_info(info-&gt;caller);</a>
+<a name="ln758">				if (callerInfo == NULL) {</a>
+<a name="ln759">					kprintf(&quot;out of space for caller infos\n&quot;);</a>
+<a name="ln760">					return false;</a>
+<a name="ln761">				}</a>
+<a name="ln762"> </a>
+<a name="ln763">				callerInfo-&gt;count++;</a>
+<a name="ln764">				callerInfo-&gt;size += info-&gt;size;</a>
+<a name="ln765"> </a>
+<a name="ln766">				// skip the allocated pages</a>
+<a name="ln767">				i += pageCount - 1;</a>
+<a name="ln768">			}</a>
+<a name="ln769">		}</a>
+<a name="ln770"> </a>
+<a name="ln771">		area = area-&gt;all_next;</a>
+<a name="ln772">	}</a>
+<a name="ln773"> </a>
+<a name="ln774">	return true;</a>
+<a name="ln775">}</a>
+<a name="ln776"> </a>
+<a name="ln777"> </a>
+<a name="ln778">static int</a>
+<a name="ln779">dump_allocations_per_caller(int argc, char **argv)</a>
+<a name="ln780">{</a>
+<a name="ln781">	bool sortBySize = true;</a>
+<a name="ln782">	heap_allocator *heap = NULL;</a>
+<a name="ln783"> </a>
+<a name="ln784">	for (int32 i = 1; i &lt; argc; i++) {</a>
+<a name="ln785">		if (strcmp(argv[i], &quot;-c&quot;) == 0) {</a>
+<a name="ln786">			sortBySize = false;</a>
+<a name="ln787">		} else if (strcmp(argv[i], &quot;-h&quot;) == 0) {</a>
+<a name="ln788">			uint64 heapAddress;</a>
+<a name="ln789">			if (++i &gt;= argc</a>
+<a name="ln790">				|| !evaluate_debug_expression(argv[i], &amp;heapAddress, true)) {</a>
+<a name="ln791">				print_debugger_command_usage(argv[0]);</a>
+<a name="ln792">				return 0;</a>
+<a name="ln793">			}</a>
+<a name="ln794"> </a>
+<a name="ln795">			heap = (heap_allocator*)(addr_t)heapAddress;</a>
+<a name="ln796">		} else {</a>
+<a name="ln797">			print_debugger_command_usage(argv[0]);</a>
+<a name="ln798">			return 0;</a>
+<a name="ln799">		}</a>
+<a name="ln800">	}</a>
+<a name="ln801"> </a>
+<a name="ln802">	sCallerInfoCount = 0;</a>
+<a name="ln803"> </a>
+<a name="ln804">	if (heap != NULL) {</a>
+<a name="ln805">		if (!analyze_allocation_callers(heap))</a>
+<a name="ln806">			return 0;</a>
+<a name="ln807">	} else {</a>
+<a name="ln808">		for (uint32 heapIndex = 0; heapIndex &lt; sHeapCount; heapIndex++) {</a>
+<a name="ln809">			if (!analyze_allocation_callers(sHeaps[heapIndex]))</a>
+<a name="ln810">				return 0;</a>
+<a name="ln811">		}</a>
+<a name="ln812">	}</a>
+<a name="ln813"> </a>
+<a name="ln814">	// sort the array</a>
+<a name="ln815">	qsort(sCallerInfoTable, sCallerInfoCount, sizeof(caller_info),</a>
+<a name="ln816">		sortBySize ? &amp;caller_info_compare_size : &amp;caller_info_compare_count);</a>
+<a name="ln817"> </a>
+<a name="ln818">	kprintf(&quot;%ld different callers, sorted by %s...\n\n&quot;, sCallerInfoCount,</a>
+<a name="ln819">		sortBySize ? &quot;size&quot; : &quot;count&quot;);</a>
+<a name="ln820"> </a>
+<a name="ln821">	kprintf(&quot;     count        size      caller\n&quot;);</a>
+<a name="ln822">	kprintf(&quot;----------------------------------\n&quot;);</a>
+<a name="ln823">	for (int32 i = 0; i &lt; sCallerInfoCount; i++) {</a>
+<a name="ln824">		caller_info&amp; info = sCallerInfoTable[i];</a>
+<a name="ln825">		kprintf(&quot;%10ld  %10ld  %#08lx&quot;, info.count, info.size, info.caller);</a>
+<a name="ln826"> </a>
+<a name="ln827">		const char *symbol;</a>
+<a name="ln828">		const char *imageName;</a>
+<a name="ln829">		bool exactMatch;</a>
+<a name="ln830">		addr_t baseAddress;</a>
+<a name="ln831"> </a>
+<a name="ln832">		if (elf_debug_lookup_symbol_address(info.caller, &amp;baseAddress, &amp;symbol,</a>
+<a name="ln833">				&amp;imageName, &amp;exactMatch) == B_OK) {</a>
+<a name="ln834">			kprintf(&quot;  %s + 0x%lx (%s)%s\n&quot;, symbol,</a>
+<a name="ln835">				info.caller - baseAddress, imageName,</a>
+<a name="ln836">				exactMatch ? &quot;&quot; : &quot; (nearest)&quot;);</a>
+<a name="ln837">		} else</a>
+<a name="ln838">			kprintf(&quot;\n&quot;);</a>
+<a name="ln839">	}</a>
+<a name="ln840"> </a>
+<a name="ln841">	return 0;</a>
+<a name="ln842">}</a>
+<a name="ln843"> </a>
+<a name="ln844">#endif // KERNEL_HEAP_LEAK_CHECK</a>
+<a name="ln845"> </a>
+<a name="ln846"> </a>
+<a name="ln847">#if PARANOID_HEAP_VALIDATION</a>
+<a name="ln848">static void</a>
+<a name="ln849">heap_validate_heap(heap_allocator *heap)</a>
+<a name="ln850">{</a>
+<a name="ln851">	ReadLocker areaReadLocker(heap-&gt;area_lock);</a>
+<a name="ln852">	for (uint32 i = 0; i &lt; heap-&gt;bin_count; i++)</a>
+<a name="ln853">		mutex_lock(&amp;heap-&gt;bins[i].lock);</a>
+<a name="ln854">	MutexLocker pageLocker(heap-&gt;page_lock);</a>
+<a name="ln855"> </a>
+<a name="ln856">	uint32 totalPageCount = 0;</a>
+<a name="ln857">	uint32 totalFreePageCount = 0;</a>
+<a name="ln858">	heap_area *area = heap-&gt;all_areas;</a>
+<a name="ln859">	while (area != NULL) {</a>
+<a name="ln860">		// validate the free pages list</a>
+<a name="ln861">		uint32 freePageCount = 0;</a>
+<a name="ln862">		heap_page *lastPage = NULL;</a>
+<a name="ln863">		heap_page *page = area-&gt;free_pages;</a>
+<a name="ln864">		while (page) {</a>
+<a name="ln865">			if ((addr_t)page &lt; (addr_t)&amp;area-&gt;page_table[0]</a>
+<a name="ln866">				|| (addr_t)page &gt;= (addr_t)&amp;area-&gt;page_table[area-&gt;page_count])</a>
+<a name="ln867">				panic(&quot;free page is not part of the page table\n&quot;);</a>
+<a name="ln868"> </a>
+<a name="ln869">			if (page-&gt;index &gt;= area-&gt;page_count)</a>
+<a name="ln870">				panic(&quot;free page has invalid index\n&quot;);</a>
+<a name="ln871"> </a>
+<a name="ln872">			if ((addr_t)&amp;area-&gt;page_table[page-&gt;index] != (addr_t)page)</a>
+<a name="ln873">				panic(&quot;free page index does not lead to target page\n&quot;);</a>
+<a name="ln874"> </a>
+<a name="ln875">			if (page-&gt;prev != lastPage)</a>
+<a name="ln876">				panic(&quot;free page entry has invalid prev link\n&quot;);</a>
+<a name="ln877"> </a>
+<a name="ln878">			if (page-&gt;in_use)</a>
+<a name="ln879">				panic(&quot;free page marked as in use\n&quot;);</a>
+<a name="ln880"> </a>
+<a name="ln881">			lastPage = page;</a>
+<a name="ln882">			page = page-&gt;next;</a>
+<a name="ln883">			freePageCount++;</a>
+<a name="ln884">		}</a>
+<a name="ln885"> </a>
+<a name="ln886">		totalPageCount += freePageCount;</a>
+<a name="ln887">		totalFreePageCount += freePageCount;</a>
+<a name="ln888">		if (area-&gt;free_page_count != freePageCount)</a>
+<a name="ln889">			panic(&quot;free page count doesn't match free page list\n&quot;);</a>
+<a name="ln890"> </a>
+<a name="ln891">		// validate the page table</a>
+<a name="ln892">		uint32 usedPageCount = 0;</a>
+<a name="ln893">		for (uint32 i = 0; i &lt; area-&gt;page_count; i++) {</a>
+<a name="ln894">			if (area-&gt;page_table[i].in_use)</a>
+<a name="ln895">				usedPageCount++;</a>
+<a name="ln896">		}</a>
+<a name="ln897"> </a>
+<a name="ln898">		totalPageCount += usedPageCount;</a>
+<a name="ln899">		if (freePageCount + usedPageCount != area-&gt;page_count) {</a>
+<a name="ln900">			panic(&quot;free pages and used pages do not add up (%lu + %lu != %lu)\n&quot;,</a>
+<a name="ln901">				freePageCount, usedPageCount, area-&gt;page_count);</a>
+<a name="ln902">		}</a>
+<a name="ln903"> </a>
+<a name="ln904">		area = area-&gt;all_next;</a>
+<a name="ln905">	}</a>
+<a name="ln906"> </a>
+<a name="ln907">	// validate the areas</a>
+<a name="ln908">	area = heap-&gt;areas;</a>
+<a name="ln909">	heap_area *lastArea = NULL;</a>
+<a name="ln910">	uint32 lastFreeCount = 0;</a>
+<a name="ln911">	while (area != NULL) {</a>
+<a name="ln912">		if (area-&gt;free_page_count &lt; lastFreeCount)</a>
+<a name="ln913">			panic(&quot;size ordering of area list broken\n&quot;);</a>
+<a name="ln914"> </a>
+<a name="ln915">		if (area-&gt;prev != lastArea)</a>
+<a name="ln916">			panic(&quot;area list entry has invalid prev link\n&quot;);</a>
+<a name="ln917"> </a>
+<a name="ln918">		lastArea = area;</a>
+<a name="ln919">		lastFreeCount = area-&gt;free_page_count;</a>
+<a name="ln920">		area = area-&gt;next;</a>
+<a name="ln921">	}</a>
+<a name="ln922"> </a>
+<a name="ln923">	lastArea = NULL;</a>
+<a name="ln924">	area = heap-&gt;all_areas;</a>
+<a name="ln925">	while (area != NULL) {</a>
+<a name="ln926">		if (lastArea != NULL &amp;&amp; lastArea-&gt;base &lt; area-&gt;base)</a>
+<a name="ln927">			panic(&quot;base ordering of all_areas list broken\n&quot;);</a>
+<a name="ln928"> </a>
+<a name="ln929">		lastArea = area;</a>
+<a name="ln930">		area = area-&gt;all_next;</a>
+<a name="ln931">	}</a>
+<a name="ln932"> </a>
+<a name="ln933">	// validate the bins</a>
+<a name="ln934">	for (uint32 i = 0; i &lt; heap-&gt;bin_count; i++) {</a>
+<a name="ln935">		heap_bin *bin = &amp;heap-&gt;bins[i];</a>
+<a name="ln936">		heap_page *lastPage = NULL;</a>
+<a name="ln937">		heap_page *page = bin-&gt;page_list;</a>
+<a name="ln938">		lastFreeCount = 0;</a>
+<a name="ln939">		while (page) {</a>
+<a name="ln940">			area = heap-&gt;all_areas;</a>
+<a name="ln941">			while (area) {</a>
+<a name="ln942">				if (area == page-&gt;area)</a>
+<a name="ln943">					break;</a>
+<a name="ln944">				area = area-&gt;all_next;</a>
+<a name="ln945">			}</a>
+<a name="ln946"> </a>
+<a name="ln947">			if (area == NULL) {</a>
+<a name="ln948">				panic(&quot;page area not present in area list\n&quot;);</a>
+<a name="ln949">				page = page-&gt;next;</a>
+<a name="ln950">				continue;</a>
+<a name="ln951">			}</a>
+<a name="ln952"> </a>
+<a name="ln953">			if ((addr_t)page &lt; (addr_t)&amp;area-&gt;page_table[0]</a>
+<a name="ln954">				|| (addr_t)page &gt;= (addr_t)&amp;area-&gt;page_table[area-&gt;page_count])</a>
+<a name="ln955">				panic(&quot;used page is not part of the page table\n&quot;);</a>
+<a name="ln956"> </a>
+<a name="ln957">			if (page-&gt;index &gt;= area-&gt;page_count)</a>
+<a name="ln958">				panic(&quot;used page has invalid index\n&quot;);</a>
+<a name="ln959"> </a>
+<a name="ln960">			if ((addr_t)&amp;area-&gt;page_table[page-&gt;index] != (addr_t)page)</a>
+<a name="ln961">				panic(&quot;used page index does not lead to target page\n&quot;);</a>
+<a name="ln962"> </a>
+<a name="ln963">			if (page-&gt;prev != lastPage) {</a>
+<a name="ln964">				panic(&quot;used page entry has invalid prev link (%p vs %p bin &quot;</a>
+<a name="ln965">					&quot;%lu)\n&quot;, page-&gt;prev, lastPage, i);</a>
+<a name="ln966">			}</a>
+<a name="ln967"> </a>
+<a name="ln968">			if (!page-&gt;in_use)</a>
+<a name="ln969">				panic(&quot;used page marked as not in use\n&quot;);</a>
+<a name="ln970"> </a>
+<a name="ln971">			if (page-&gt;bin_index != i) {</a>
+<a name="ln972">				panic(&quot;used page with bin index %u in page list of bin %lu\n&quot;,</a>
+<a name="ln973">					page-&gt;bin_index, i);</a>
+<a name="ln974">			}</a>
+<a name="ln975"> </a>
+<a name="ln976">			if (page-&gt;free_count &lt; lastFreeCount)</a>
+<a name="ln977">				panic(&quot;ordering of bin page list broken\n&quot;);</a>
+<a name="ln978"> </a>
+<a name="ln979">			// validate the free list</a>
+<a name="ln980">			uint32 freeSlotsCount = 0;</a>
+<a name="ln981">			addr_t *element = page-&gt;free_list;</a>
+<a name="ln982">			addr_t pageBase = area-&gt;base + page-&gt;index * heap-&gt;page_size;</a>
+<a name="ln983">			while (element) {</a>
+<a name="ln984">				if ((addr_t)element &lt; pageBase</a>
+<a name="ln985">					|| (addr_t)element &gt;= pageBase + heap-&gt;page_size)</a>
+<a name="ln986">					panic(&quot;free list entry out of page range\n&quot;);</a>
+<a name="ln987"> </a>
+<a name="ln988">				if (((addr_t)element - pageBase) % bin-&gt;element_size != 0)</a>
+<a name="ln989">					panic(&quot;free list entry not on a element boundary\n&quot;);</a>
+<a name="ln990"> </a>
+<a name="ln991">				element = (addr_t *)*element;</a>
+<a name="ln992">				freeSlotsCount++;</a>
+<a name="ln993">			}</a>
+<a name="ln994"> </a>
+<a name="ln995">			uint32 slotCount = bin-&gt;max_free_count;</a>
+<a name="ln996">			if (page-&gt;empty_index &gt; slotCount) {</a>
+<a name="ln997">				panic(&quot;empty index beyond slot count (%u with %lu slots)\n&quot;,</a>
+<a name="ln998">					page-&gt;empty_index, slotCount);</a>
+<a name="ln999">			}</a>
+<a name="ln1000"> </a>
+<a name="ln1001">			freeSlotsCount += (slotCount - page-&gt;empty_index);</a>
+<a name="ln1002">			if (freeSlotsCount &gt; slotCount)</a>
+<a name="ln1003">				panic(&quot;more free slots than fit into the page\n&quot;);</a>
+<a name="ln1004"> </a>
+<a name="ln1005">			lastPage = page;</a>
+<a name="ln1006">			lastFreeCount = page-&gt;free_count;</a>
+<a name="ln1007">			page = page-&gt;next;</a>
+<a name="ln1008">		}</a>
+<a name="ln1009">	}</a>
+<a name="ln1010"> </a>
+<a name="ln1011">	pageLocker.Unlock();</a>
+<a name="ln1012">	for (uint32 i = 0; i &lt; heap-&gt;bin_count; i++)</a>
+<a name="ln1013">		mutex_unlock(&amp;heap-&gt;bins[i].lock);</a>
+<a name="ln1014">	areaReadLocker.Unlock();</a>
+<a name="ln1015">}</a>
+<a name="ln1016">#endif // PARANOID_HEAP_VALIDATION</a>
+<a name="ln1017"> </a>
+<a name="ln1018"> </a>
+<a name="ln1019">// #pragma mark - Heap functions</a>
+<a name="ln1020"> </a>
+<a name="ln1021"> </a>
+<a name="ln1022">void</a>
+<a name="ln1023">heap_add_area(heap_allocator *heap, area_id areaID, addr_t base, size_t size)</a>
+<a name="ln1024">{</a>
+<a name="ln1025">	heap_area *area = (heap_area *)base;</a>
+<a name="ln1026">	area-&gt;area = areaID;</a>
+<a name="ln1027"> </a>
+<a name="ln1028">	base += sizeof(heap_area);</a>
+<a name="ln1029">	size -= sizeof(heap_area);</a>
+<a name="ln1030"> </a>
+<a name="ln1031">	uint32 pageCount = size / heap-&gt;page_size;</a>
+<a name="ln1032">	size_t pageTableSize = pageCount * sizeof(heap_page);</a>
+<a name="ln1033">	area-&gt;page_table = (heap_page *)base;</a>
+<a name="ln1034">	base += pageTableSize;</a>
+<a name="ln1035">	size -= pageTableSize;</a>
+<a name="ln1036"> </a>
+<a name="ln1037">	// the rest is now actually usable memory (rounded to the next page)</a>
+<a name="ln1038">	area-&gt;base = ROUNDUP(base, B_PAGE_SIZE);</a>
+<a name="ln1039">	area-&gt;size = size &amp; ~(B_PAGE_SIZE - 1);</a>
+<a name="ln1040"> </a>
+<a name="ln1041">	// now we know the real page count</a>
+<a name="ln1042">	pageCount = area-&gt;size / heap-&gt;page_size;</a>
+<a name="ln1043">	area-&gt;page_count = pageCount;</a>
+<a name="ln1044"> </a>
+<a name="ln1045">	// zero out the page table and fill in page indexes</a>
+<a name="ln1046">	memset((void *)area-&gt;page_table, 0, pageTableSize);</a>
+<a name="ln1047">	for (uint32 i = 0; i &lt; pageCount; i++) {</a>
+<a name="ln1048">		area-&gt;page_table[i].area = area;</a>
+<a name="ln1049">		area-&gt;page_table[i].index = i;</a>
+<a name="ln1050">	}</a>
+<a name="ln1051"> </a>
+<a name="ln1052">	// add all pages up into the free pages list</a>
+<a name="ln1053">	for (uint32 i = 1; i &lt; pageCount; i++) {</a>
+<a name="ln1054">		area-&gt;page_table[i - 1].next = &amp;area-&gt;page_table[i];</a>
+<a name="ln1055">		area-&gt;page_table[i].prev = &amp;area-&gt;page_table[i - 1];</a>
+<a name="ln1056">	}</a>
+<a name="ln1057">	area-&gt;free_pages = &amp;area-&gt;page_table[0];</a>
+<a name="ln1058">	area-&gt;free_page_count = pageCount;</a>
+<a name="ln1059">	area-&gt;page_table[0].prev = NULL;</a>
+<a name="ln1060">	area-&gt;next = NULL;</a>
+<a name="ln1061"> </a>
+<a name="ln1062">	WriteLocker areaWriteLocker(heap-&gt;area_lock);</a>
+<a name="ln1063">	MutexLocker pageLocker(heap-&gt;page_lock);</a>
+<a name="ln1064">	if (heap-&gt;areas == NULL) {</a>
+<a name="ln1065">		// it's the only (empty) area in that heap</a>
+<a name="ln1066">		area-&gt;prev = NULL;</a>
+<a name="ln1067">		heap-&gt;areas = area;</a>
+<a name="ln1068">	} else {</a>
+<a name="ln1069">		// link in this area as the last one as it is completely empty</a>
+<a name="ln1070">		heap_area *lastArea = heap-&gt;areas;</a>
+<a name="ln1071">		while (lastArea-&gt;next != NULL)</a>
+<a name="ln1072">			lastArea = lastArea-&gt;next;</a>
+<a name="ln1073"> </a>
+<a name="ln1074">		lastArea-&gt;next = area;</a>
+<a name="ln1075">		area-&gt;prev = lastArea;</a>
+<a name="ln1076">	}</a>
+<a name="ln1077"> </a>
+<a name="ln1078">	// insert this area in the all_areas list so it stays ordered by base</a>
+<a name="ln1079">	if (heap-&gt;all_areas == NULL || heap-&gt;all_areas-&gt;base &lt; area-&gt;base) {</a>
+<a name="ln1080">		area-&gt;all_next = heap-&gt;all_areas;</a>
+<a name="ln1081">		heap-&gt;all_areas = area;</a>
+<a name="ln1082">	} else {</a>
+<a name="ln1083">		heap_area *insert = heap-&gt;all_areas;</a>
+<a name="ln1084">		while (insert-&gt;all_next &amp;&amp; insert-&gt;all_next-&gt;base &gt; area-&gt;base)</a>
+<a name="ln1085">			insert = insert-&gt;all_next;</a>
+<a name="ln1086"> </a>
+<a name="ln1087">		area-&gt;all_next = insert-&gt;all_next;</a>
+<a name="ln1088">		insert-&gt;all_next = area;</a>
+<a name="ln1089">	}</a>
+<a name="ln1090"> </a>
+<a name="ln1091">	heap-&gt;total_pages += area-&gt;page_count;</a>
+<a name="ln1092">	heap-&gt;total_free_pages += area-&gt;free_page_count;</a>
+<a name="ln1093"> </a>
+<a name="ln1094">	if (areaID &gt;= 0) {</a>
+<a name="ln1095">		// this later on deletable area is yet empty - the empty count will be</a>
+<a name="ln1096">		// decremented as soon as this area is used for the first time</a>
+<a name="ln1097">		heap-&gt;empty_areas++;</a>
+<a name="ln1098">	}</a>
+<a name="ln1099"> </a>
+<a name="ln1100">	pageLocker.Unlock();</a>
+<a name="ln1101">	areaWriteLocker.Unlock();</a>
+<a name="ln1102"> </a>
+<a name="ln1103">	dprintf(&quot;heap_add_area: area %&quot; B_PRId32 &quot; added to %s heap %p - usable &quot;</a>
+<a name="ln1104">		&quot;range %p - %p\n&quot;, area-&gt;area, heap-&gt;name, heap, (void *)area-&gt;base,</a>
+<a name="ln1105">		(void *)(area-&gt;base + area-&gt;size));</a>
+<a name="ln1106">}</a>
+<a name="ln1107"> </a>
+<a name="ln1108"> </a>
+<a name="ln1109">static status_t</a>
+<a name="ln1110">heap_remove_area(heap_allocator *heap, heap_area *area)</a>
+<a name="ln1111">{</a>
+<a name="ln1112">	if (area-&gt;free_page_count != area-&gt;page_count) {</a>
+<a name="ln1113">		panic(&quot;tried removing heap area that has still pages in use&quot;);</a>
+<a name="ln1114">		return B_ERROR;</a>
+<a name="ln1115">	}</a>
+<a name="ln1116"> </a>
+<a name="ln1117">	if (area-&gt;prev == NULL &amp;&amp; area-&gt;next == NULL) {</a>
+<a name="ln1118">		panic(&quot;tried removing the last non-full heap area&quot;);</a>
+<a name="ln1119">		return B_ERROR;</a>
+<a name="ln1120">	}</a>
+<a name="ln1121"> </a>
+<a name="ln1122">	if (heap-&gt;areas == area)</a>
+<a name="ln1123">		heap-&gt;areas = area-&gt;next;</a>
+<a name="ln1124">	if (area-&gt;prev != NULL)</a>
+<a name="ln1125">		area-&gt;prev-&gt;next = area-&gt;next;</a>
+<a name="ln1126">	if (area-&gt;next != NULL)</a>
+<a name="ln1127">		area-&gt;next-&gt;prev = area-&gt;prev;</a>
+<a name="ln1128"> </a>
+<a name="ln1129">	if (heap-&gt;all_areas == area)</a>
+<a name="ln1130">		heap-&gt;all_areas = area-&gt;all_next;</a>
+<a name="ln1131">	else {</a>
+<a name="ln1132">		heap_area *previous = heap-&gt;all_areas;</a>
+<a name="ln1133">		while (previous) {</a>
+<a name="ln1134">			if (previous-&gt;all_next == area) {</a>
+<a name="ln1135">				previous-&gt;all_next = area-&gt;all_next;</a>
+<a name="ln1136">				break;</a>
+<a name="ln1137">			}</a>
+<a name="ln1138"> </a>
+<a name="ln1139">			previous = previous-&gt;all_next;</a>
+<a name="ln1140">		}</a>
+<a name="ln1141"> </a>
+<a name="ln1142">		if (previous == NULL)</a>
+<a name="ln1143">			panic(&quot;removing heap area that is not in all list&quot;);</a>
+<a name="ln1144">	}</a>
+<a name="ln1145"> </a>
+<a name="ln1146">	heap-&gt;total_pages -= area-&gt;page_count;</a>
+<a name="ln1147">	heap-&gt;total_free_pages -= area-&gt;free_page_count;</a>
+<a name="ln1148"> </a>
+<a name="ln1149">	dprintf(&quot;heap_remove_area: area %&quot; B_PRId32 &quot; with range %p - %p removed &quot;</a>
+<a name="ln1150">		&quot;from %s heap %p\n&quot;, area-&gt;area, (void *)area-&gt;base,</a>
+<a name="ln1151">		(void *)(area-&gt;base + area-&gt;size), heap-&gt;name, heap);</a>
+<a name="ln1152"> </a>
+<a name="ln1153">	return B_OK;</a>
+<a name="ln1154">}</a>
+<a name="ln1155"> </a>
+<a name="ln1156"> </a>
+<a name="ln1157">heap_allocator *</a>
+<a name="ln1158">heap_create_allocator(const char *name, addr_t base, size_t size,</a>
+<a name="ln1159">	const heap_class *heapClass, bool allocateOnHeap)</a>
+<a name="ln1160">{</a>
+<a name="ln1161">	heap_allocator *heap;</a>
+<a name="ln1162">	if (allocateOnHeap) {</a>
+<a name="ln1163">		// allocate seperately on the heap</a>
+<a name="ln1164">		heap = (heap_allocator *)malloc(sizeof(heap_allocator)</a>
+<a name="ln1165">			+ sizeof(heap_bin) * MAX_BIN_COUNT);</a>
+<a name="ln1166">	} else {</a>
+<a name="ln1167">		// use up the first part of the area</a>
+<a name="ln1168">		heap = (heap_allocator *)base;</a>
+<a name="ln1169">		base += sizeof(heap_allocator);</a>
+<a name="ln1170">		size -= sizeof(heap_allocator);</a>
+<a name="ln1171">	}</a>
+<a name="ln1172"> </a>
+<a name="ln1173">	heap-&gt;name = name;</a>
+<a name="ln1174">	heap-&gt;page_size = heapClass-&gt;page_size;</a>
+<a name="ln1175">	heap-&gt;total_pages = heap-&gt;total_free_pages = heap-&gt;empty_areas = 0;</a>
+<a name="ln1176">	heap-&gt;areas = heap-&gt;all_areas = NULL;</a>
+<a name="ln1177">	heap-&gt;bins = (heap_bin *)((addr_t)heap + sizeof(heap_allocator));</a>
+<a name="ln1178"> </a>
+<a name="ln1179">#if KERNEL_HEAP_LEAK_CHECK</a>
+<a name="ln1180">	heap-&gt;get_caller = &amp;get_caller;</a>
+<a name="ln1181">#endif</a>
+<a name="ln1182"> </a>
+<a name="ln1183">	heap-&gt;bin_count = 0;</a>
+<a name="ln1184">	size_t binSize = 0, lastSize = 0;</a>
+<a name="ln1185">	uint32 count = heap-&gt;page_size / heapClass-&gt;min_bin_size;</a>
+<a name="ln1186">	for (; count &gt;= heapClass-&gt;min_count_per_page; count--, lastSize = binSize) {</a>
+<a name="ln1187">		if (heap-&gt;bin_count &gt;= MAX_BIN_COUNT)</a>
+<a name="ln1188">			panic(&quot;heap configuration invalid - max bin count reached\n&quot;);</a>
+<a name="ln1189"> </a>
+<a name="ln1190">		binSize = (heap-&gt;page_size / count) &amp; ~(heapClass-&gt;bin_alignment - 1);</a>
+<a name="ln1191">		if (binSize == lastSize)</a>
+<a name="ln1192">			continue;</a>
+<a name="ln1193">		if (heap-&gt;page_size - count * binSize &gt; heapClass-&gt;max_waste_per_page)</a>
+<a name="ln1194">			continue;</a>
+<a name="ln1195"> </a>
+<a name="ln1196">		heap_bin *bin = &amp;heap-&gt;bins[heap-&gt;bin_count];</a>
+<a name="ln1197">		mutex_init(&amp;bin-&gt;lock, &quot;heap bin lock&quot;);</a>
+<a name="ln1198">		bin-&gt;element_size = binSize;</a>
+<a name="ln1199">		bin-&gt;max_free_count = heap-&gt;page_size / binSize;</a>
+<a name="ln1200">		bin-&gt;page_list = NULL;</a>
+<a name="ln1201">		heap-&gt;bin_count++;</a>
+<a name="ln1202">	};</a>
+<a name="ln1203"> </a>
+<a name="ln1204">	if (!allocateOnHeap) {</a>
+<a name="ln1205">		base += heap-&gt;bin_count * sizeof(heap_bin);</a>
+<a name="ln1206">		size -= heap-&gt;bin_count * sizeof(heap_bin);</a>
+<a name="ln1207">	}</a>
+<a name="ln1208"> </a>
+<a name="ln1209">	rw_lock_init(&amp;heap-&gt;area_lock, &quot;heap area rw lock&quot;);</a>
+<a name="ln1210">	mutex_init(&amp;heap-&gt;page_lock, &quot;heap page lock&quot;);</a>
+<a name="ln1211"> </a>
+<a name="ln1212">	heap_add_area(heap, -1, base, size);</a>
+<a name="ln1213">	return heap;</a>
+<a name="ln1214">}</a>
+<a name="ln1215"> </a>
+<a name="ln1216"> </a>
+<a name="ln1217">static inline void</a>
+<a name="ln1218">heap_free_pages_added(heap_allocator *heap, heap_area *area, uint32 pageCount)</a>
+<a name="ln1219">{</a>
+<a name="ln1220">	area-&gt;free_page_count += pageCount;</a>
+<a name="ln1221">	heap-&gt;total_free_pages += pageCount;</a>
+<a name="ln1222"> </a>
+<a name="ln1223">	if (area-&gt;free_page_count == pageCount) {</a>
+<a name="ln1224">		// we need to add ourselfs to the area list of the heap</a>
+<a name="ln1225">		area-&gt;prev = NULL;</a>
+<a name="ln1226">		area-&gt;next = heap-&gt;areas;</a>
+<a name="ln1227">		if (area-&gt;next)</a>
+<a name="ln1228">			area-&gt;next-&gt;prev = area;</a>
+<a name="ln1229">		heap-&gt;areas = area;</a>
+<a name="ln1230">	} else {</a>
+<a name="ln1231">		// we might need to move back in the area list</a>
+<a name="ln1232">		if (area-&gt;next &amp;&amp; area-&gt;next-&gt;free_page_count &lt; area-&gt;free_page_count) {</a>
+<a name="ln1233">			// move ourselfs so the list stays ordered</a>
+<a name="ln1234">			heap_area *insert = area-&gt;next;</a>
+<a name="ln1235">			while (insert-&gt;next</a>
+<a name="ln1236">				&amp;&amp; insert-&gt;next-&gt;free_page_count &lt; area-&gt;free_page_count)</a>
+<a name="ln1237">				insert = insert-&gt;next;</a>
+<a name="ln1238"> </a>
+<a name="ln1239">			if (area-&gt;prev)</a>
+<a name="ln1240">				area-&gt;prev-&gt;next = area-&gt;next;</a>
+<a name="ln1241">			if (area-&gt;next)</a>
+<a name="ln1242">				area-&gt;next-&gt;prev = area-&gt;prev;</a>
+<a name="ln1243">			if (heap-&gt;areas == area)</a>
+<a name="ln1244">				heap-&gt;areas = area-&gt;next;</a>
+<a name="ln1245"> </a>
+<a name="ln1246">			area-&gt;prev = insert;</a>
+<a name="ln1247">			area-&gt;next = insert-&gt;next;</a>
+<a name="ln1248">			if (area-&gt;next)</a>
+<a name="ln1249">				area-&gt;next-&gt;prev = area;</a>
+<a name="ln1250">			insert-&gt;next = area;</a>
+<a name="ln1251">		}</a>
+<a name="ln1252">	}</a>
+<a name="ln1253"> </a>
+<a name="ln1254">	if (area-&gt;free_page_count == area-&gt;page_count &amp;&amp; area-&gt;area &gt;= 0)</a>
+<a name="ln1255">		heap-&gt;empty_areas++;</a>
+<a name="ln1256">}</a>
+<a name="ln1257"> </a>
+<a name="ln1258"> </a>
+<a name="ln1259">static inline void</a>
+<a name="ln1260">heap_free_pages_removed(heap_allocator *heap, heap_area *area, uint32 pageCount)</a>
+<a name="ln1261">{</a>
+<a name="ln1262">	if (area-&gt;free_page_count == area-&gt;page_count &amp;&amp; area-&gt;area &gt;= 0) {</a>
+<a name="ln1263">		// this area was completely empty</a>
+<a name="ln1264">		heap-&gt;empty_areas--;</a>
+<a name="ln1265">	}</a>
+<a name="ln1266"> </a>
+<a name="ln1267">	area-&gt;free_page_count -= pageCount;</a>
+<a name="ln1268">	heap-&gt;total_free_pages -= pageCount;</a>
+<a name="ln1269"> </a>
+<a name="ln1270">	if (area-&gt;free_page_count == 0) {</a>
+<a name="ln1271">		// the area is now full so we remove it from the area list</a>
+<a name="ln1272">		if (area-&gt;prev)</a>
+<a name="ln1273">			area-&gt;prev-&gt;next = area-&gt;next;</a>
+<a name="ln1274">		if (area-&gt;next)</a>
+<a name="ln1275">			area-&gt;next-&gt;prev = area-&gt;prev;</a>
+<a name="ln1276">		if (heap-&gt;areas == area)</a>
+<a name="ln1277">			heap-&gt;areas = area-&gt;next;</a>
+<a name="ln1278">		area-&gt;next = area-&gt;prev = NULL;</a>
+<a name="ln1279">	} else {</a>
+<a name="ln1280">		// we might need to move forward in the area list</a>
+<a name="ln1281">		if (area-&gt;prev &amp;&amp; area-&gt;prev-&gt;free_page_count &gt; area-&gt;free_page_count) {</a>
+<a name="ln1282">			// move ourselfs so the list stays ordered</a>
+<a name="ln1283">			heap_area *insert = area-&gt;prev;</a>
+<a name="ln1284">			while (insert-&gt;prev</a>
+<a name="ln1285">				&amp;&amp; insert-&gt;prev-&gt;free_page_count &gt; area-&gt;free_page_count)</a>
+<a name="ln1286">				insert = insert-&gt;prev;</a>
+<a name="ln1287"> </a>
+<a name="ln1288">			if (area-&gt;prev)</a>
+<a name="ln1289">				area-&gt;prev-&gt;next = area-&gt;next;</a>
+<a name="ln1290">			if (area-&gt;next)</a>
+<a name="ln1291">				area-&gt;next-&gt;prev = area-&gt;prev;</a>
+<a name="ln1292"> </a>
+<a name="ln1293">			area-&gt;prev = insert-&gt;prev;</a>
+<a name="ln1294">			area-&gt;next = insert;</a>
+<a name="ln1295">			if (area-&gt;prev)</a>
+<a name="ln1296">				area-&gt;prev-&gt;next = area;</a>
+<a name="ln1297">			if (heap-&gt;areas == insert)</a>
+<a name="ln1298">				heap-&gt;areas = area;</a>
+<a name="ln1299">			insert-&gt;prev = area;</a>
+<a name="ln1300">		}</a>
+<a name="ln1301">	}</a>
+<a name="ln1302">}</a>
+<a name="ln1303"> </a>
+<a name="ln1304"> </a>
+<a name="ln1305">static inline void</a>
+<a name="ln1306">heap_link_page(heap_page *page, heap_page **list)</a>
+<a name="ln1307">{</a>
+<a name="ln1308">	page-&gt;prev = NULL;</a>
+<a name="ln1309">	page-&gt;next = *list;</a>
+<a name="ln1310">	if (page-&gt;next)</a>
+<a name="ln1311">		page-&gt;next-&gt;prev = page;</a>
+<a name="ln1312">	*list = page;</a>
+<a name="ln1313">}</a>
+<a name="ln1314"> </a>
+<a name="ln1315"> </a>
+<a name="ln1316">static inline void</a>
+<a name="ln1317">heap_unlink_page(heap_page *page, heap_page **list)</a>
+<a name="ln1318">{</a>
+<a name="ln1319">	if (page-&gt;prev)</a>
+<a name="ln1320">		page-&gt;prev-&gt;next = page-&gt;next;</a>
+<a name="ln1321">	if (page-&gt;next)</a>
+<a name="ln1322">		page-&gt;next-&gt;prev = page-&gt;prev;</a>
+<a name="ln1323">	if (list &amp;&amp; *list == page) {</a>
+<a name="ln1324">		*list = page-&gt;next;</a>
+<a name="ln1325">		if (page-&gt;next)</a>
+<a name="ln1326">			page-&gt;next-&gt;prev = NULL;</a>
+<a name="ln1327">	}</a>
+<a name="ln1328">}</a>
+<a name="ln1329"> </a>
+<a name="ln1330"> </a>
+<a name="ln1331">static heap_page *</a>
+<a name="ln1332">heap_allocate_contiguous_pages(heap_allocator *heap, uint32 pageCount,</a>
+<a name="ln1333">	size_t alignment)</a>
+<a name="ln1334">{</a>
+<a name="ln1335">	MutexLocker pageLocker(heap-&gt;page_lock);</a>
+<a name="ln1336">	heap_area *area = heap-&gt;areas;</a>
+<a name="ln1337">	while (area) {</a>
+<a name="ln1338">		if (area-&gt;free_page_count &lt; pageCount) {</a>
+<a name="ln1339">			area = area-&gt;next;</a>
+<a name="ln1340">			continue;</a>
+<a name="ln1341">		}</a>
+<a name="ln1342"> </a>
+<a name="ln1343">		uint32 step = 1;</a>
+<a name="ln1344">		uint32 firstValid = 0;</a>
+<a name="ln1345">		const uint32 lastValid = area-&gt;page_count - pageCount + 1;</a>
+<a name="ln1346"> </a>
+<a name="ln1347">		if (alignment &gt; heap-&gt;page_size) {</a>
+<a name="ln1348">			firstValid = (ROUNDUP(area-&gt;base, alignment) - area-&gt;base)</a>
+<a name="ln1349">				/ heap-&gt;page_size;</a>
+<a name="ln1350">			step = alignment / heap-&gt;page_size;</a>
+<a name="ln1351">		}</a>
+<a name="ln1352"> </a>
+<a name="ln1353">		int32 first = -1;</a>
+<a name="ln1354">		for (uint32 i = firstValid; i &lt; lastValid; i += step) {</a>
+<a name="ln1355">			if (area-&gt;page_table[i].in_use)</a>
+<a name="ln1356">				continue;</a>
+<a name="ln1357"> </a>
+<a name="ln1358">			first = i;</a>
+<a name="ln1359"> </a>
+<a name="ln1360">			for (uint32 j = 1; j &lt; pageCount; j++) {</a>
+<a name="ln1361">				if (area-&gt;page_table[i + j].in_use) {</a>
+<a name="ln1362">					first = -1;</a>
+<a name="ln1363">					i += j / step * step;</a>
+<a name="ln1364">					break;</a>
+<a name="ln1365">				}</a>
+<a name="ln1366">			}</a>
+<a name="ln1367"> </a>
+<a name="ln1368">			if (first &gt;= 0)</a>
+<a name="ln1369">				break;</a>
+<a name="ln1370">		}</a>
+<a name="ln1371"> </a>
+<a name="ln1372">		if (first &lt; 0) {</a>
+<a name="ln1373">			area = area-&gt;next;</a>
+<a name="ln1374">			continue;</a>
+<a name="ln1375">		}</a>
+<a name="ln1376"> </a>
+<a name="ln1377">		for (uint32 i = first; i &lt; first + pageCount; i++) {</a>
+<a name="ln1378">			heap_page *page = &amp;area-&gt;page_table[i];</a>
+<a name="ln1379">			page-&gt;in_use = 1;</a>
+<a name="ln1380">			page-&gt;bin_index = heap-&gt;bin_count;</a>
+<a name="ln1381"> </a>
+<a name="ln1382">			heap_unlink_page(page, &amp;area-&gt;free_pages);</a>
+<a name="ln1383"> </a>
+<a name="ln1384">			page-&gt;next = page-&gt;prev = NULL;</a>
+<a name="ln1385">			page-&gt;free_list = NULL;</a>
+<a name="ln1386">			page-&gt;allocation_id = (uint16)first;</a>
+<a name="ln1387">		}</a>
+<a name="ln1388"> </a>
+<a name="ln1389">		heap_free_pages_removed(heap, area, pageCount);</a>
+<a name="ln1390">		return &amp;area-&gt;page_table[first];</a>
+<a name="ln1391">	}</a>
+<a name="ln1392"> </a>
+<a name="ln1393">	return NULL;</a>
+<a name="ln1394">}</a>
+<a name="ln1395"> </a>
+<a name="ln1396"> </a>
+<a name="ln1397">#if KERNEL_HEAP_LEAK_CHECK</a>
+<a name="ln1398">static void</a>
+<a name="ln1399">heap_add_leak_check_info(heap_allocator *heap, addr_t address, size_t allocated,</a>
+<a name="ln1400">	size_t size)</a>
+<a name="ln1401">{</a>
+<a name="ln1402">	heap_leak_check_info *info = (heap_leak_check_info *)(address + allocated</a>
+<a name="ln1403">		- sizeof(heap_leak_check_info));</a>
+<a name="ln1404">	info-&gt;size = size - sizeof(heap_leak_check_info);</a>
+<a name="ln1405">	info-&gt;thread = (gKernelStartup ? 0 : thread_get_current_thread_id());</a>
+<a name="ln1406">	info-&gt;team = (gKernelStartup ? 0 : team_get_current_team_id());</a>
+<a name="ln1407">	info-&gt;caller = heap-&gt;get_caller();</a>
+<a name="ln1408">}</a>
+<a name="ln1409">#endif</a>
+<a name="ln1410"> </a>
+<a name="ln1411"> </a>
+<a name="ln1412">static void *</a>
+<a name="ln1413">heap_raw_alloc(heap_allocator *heap, size_t size, size_t alignment)</a>
+<a name="ln1414">{</a>
+<a name="ln1415">	TRACE((&quot;heap %p: allocate %lu bytes from raw pages with alignment %lu\n&quot;,</a>
+<a name="ln1416">		heap, size, alignment));</a>
+<a name="ln1417"> </a>
+<a name="ln1418">	uint32 pageCount = (size + heap-&gt;page_size - 1) / heap-&gt;page_size;</a>
+<a name="ln1419">	heap_page *firstPage = heap_allocate_contiguous_pages(heap, pageCount,</a>
+<a name="ln1420">		alignment);</a>
+<a name="ln1421">	if (firstPage == NULL) {</a>
+<a name="ln1422">		TRACE((&quot;heap %p: found no contiguous pages to allocate %ld bytes\n&quot;,</a>
+<a name="ln1423">			heap, size));</a>
+<a name="ln1424">		return NULL;</a>
+<a name="ln1425">	}</a>
+<a name="ln1426"> </a>
+<a name="ln1427">	addr_t address = firstPage-&gt;area-&gt;base + firstPage-&gt;index * heap-&gt;page_size;</a>
+<a name="ln1428">#if KERNEL_HEAP_LEAK_CHECK</a>
+<a name="ln1429">	heap_add_leak_check_info(heap, address, pageCount * heap-&gt;page_size, size);</a>
+<a name="ln1430">#endif</a>
+<a name="ln1431">	return (void *)address;</a>
+<a name="ln1432">}</a>
+<a name="ln1433"> </a>
+<a name="ln1434"> </a>
+<a name="ln1435">static void *</a>
+<a name="ln1436">heap_allocate_from_bin(heap_allocator *heap, uint32 binIndex, size_t size)</a>
+<a name="ln1437">{</a>
+<a name="ln1438">	heap_bin *bin = &amp;heap-&gt;bins[binIndex];</a>
+<a name="ln1439">	TRACE((&quot;heap %p: allocate %lu bytes from bin %lu with element_size %lu\n&quot;,</a>
+<a name="ln1440">		heap, size, binIndex, bin-&gt;element_size));</a>
+<a name="ln1441"> </a>
+<a name="ln1442">	MutexLocker binLocker(bin-&gt;lock);</a>
+<a name="ln1443">	heap_page *page = bin-&gt;page_list;</a>
+<a name="ln1444">	if (page == NULL) {</a>
+<a name="ln1445">		MutexLocker pageLocker(heap-&gt;page_lock);</a>
+<a name="ln1446">		heap_area *area = heap-&gt;areas;</a>
+<a name="ln1447">		if (area == NULL) {</a>
+<a name="ln1448">			TRACE((&quot;heap %p: no free pages to allocate %lu bytes\n&quot;, heap,</a>
+<a name="ln1449">				size));</a>
+<a name="ln1450">			return NULL;</a>
+<a name="ln1451">		}</a>
+<a name="ln1452"> </a>
+<a name="ln1453">		// by design there are only areas in the list that still have</a>
+<a name="ln1454">		// free pages available</a>
+<a name="ln1455">		page = area-&gt;free_pages;</a>
+<a name="ln1456">		area-&gt;free_pages = page-&gt;next;</a>
+<a name="ln1457">		if (page-&gt;next)</a>
+<a name="ln1458">			page-&gt;next-&gt;prev = NULL;</a>
+<a name="ln1459"> </a>
+<a name="ln1460">		heap_free_pages_removed(heap, area, 1);</a>
+<a name="ln1461"> </a>
+<a name="ln1462">		if (page-&gt;in_use)</a>
+<a name="ln1463">			panic(&quot;got an in use page %p from the free pages list\n&quot;, page);</a>
+<a name="ln1464">		page-&gt;in_use = 1;</a>
+<a name="ln1465"> </a>
+<a name="ln1466">		pageLocker.Unlock();</a>
+<a name="ln1467"> </a>
+<a name="ln1468">		page-&gt;bin_index = binIndex;</a>
+<a name="ln1469">		page-&gt;free_count = bin-&gt;max_free_count;</a>
+<a name="ln1470">		page-&gt;empty_index = 0;</a>
+<a name="ln1471">		page-&gt;free_list = NULL;</a>
+<a name="ln1472">		page-&gt;next = page-&gt;prev = NULL;</a>
+<a name="ln1473">		bin-&gt;page_list = page;</a>
+<a name="ln1474">	}</a>
+<a name="ln1475"> </a>
+<a name="ln1476">	// we have a page where we have a free slot</a>
+<a name="ln1477">	void *address = NULL;</a>
+<a name="ln1478">	if (page-&gt;free_list) {</a>
+<a name="ln1479">		// there's a previously freed entry we can use</a>
+<a name="ln1480">		address = page-&gt;free_list;</a>
+<a name="ln1481">		page-&gt;free_list = (addr_t *)*page-&gt;free_list;</a>
+<a name="ln1482">	} else {</a>
+<a name="ln1483">		// the page hasn't been fully allocated so use the next empty_index</a>
+<a name="ln1484">		address = (void *)(page-&gt;area-&gt;base + page-&gt;index * heap-&gt;page_size</a>
+<a name="ln1485">			+ page-&gt;empty_index * bin-&gt;element_size);</a>
+<a name="ln1486">		page-&gt;empty_index++;</a>
+<a name="ln1487">	}</a>
+<a name="ln1488"> </a>
+<a name="ln1489">	page-&gt;free_count--;</a>
+<a name="ln1490">	if (page-&gt;free_count == 0) {</a>
+<a name="ln1491">		// the page is now full so we remove it from the page_list</a>
+<a name="ln1492">		bin-&gt;page_list = page-&gt;next;</a>
+<a name="ln1493">		if (page-&gt;next)</a>
+<a name="ln1494">			page-&gt;next-&gt;prev = NULL;</a>
+<a name="ln1495">		page-&gt;next = page-&gt;prev = NULL;</a>
+<a name="ln1496">	}</a>
+<a name="ln1497"> </a>
+<a name="ln1498">#if KERNEL_HEAP_LEAK_CHECK</a>
+<a name="ln1499">	binLocker.Unlock();</a>
+<a name="ln1500">	heap_add_leak_check_info(heap, (addr_t)address, bin-&gt;element_size, size);</a>
+<a name="ln1501">#endif</a>
+<a name="ln1502">	return address;</a>
+<a name="ln1503">}</a>
+<a name="ln1504"> </a>
+<a name="ln1505"> </a>
+<a name="ln1506">static bool</a>
+<a name="ln1507">is_valid_alignment(size_t number)</a>
+<a name="ln1508">{</a>
+<a name="ln1509">	// this cryptic line accepts zero and all powers of two</a>
+<a name="ln1510">	return ((~number + 1) | ((number &lt;&lt; 1) - 1)) == ~0UL;</a>
+<a name="ln1511">}</a>
+<a name="ln1512"> </a>
+<a name="ln1513"> </a>
+<a name="ln1514">inline bool</a>
+<a name="ln1515">heap_should_grow(heap_allocator *heap)</a>
+<a name="ln1516">{</a>
+<a name="ln1517">	// suggest growing if there is less than 20% of a grow size available</a>
+<a name="ln1518">	return heap-&gt;total_free_pages * heap-&gt;page_size &lt; HEAP_GROW_SIZE / 5;</a>
+<a name="ln1519">}</a>
+<a name="ln1520"> </a>
+<a name="ln1521"> </a>
+<a name="ln1522">void *</a>
+<a name="ln1523">heap_memalign(heap_allocator *heap, size_t alignment, size_t size)</a>
+<a name="ln1524">{</a>
+<a name="ln1525">	TRACE((&quot;memalign(alignment = %lu, size = %lu)\n&quot;, alignment, size));</a>
+<a name="ln1526"> </a>
+<a name="ln1527">#if DEBUG</a>
+<a name="ln1528">	if (!is_valid_alignment(alignment))</a>
+<a name="ln1529">		panic(&quot;memalign() with an alignment which is not a power of 2\n&quot;);</a>
+<a name="ln1530">#endif</a>
+<a name="ln1531"> </a>
+<a name="ln1532">#if KERNEL_HEAP_LEAK_CHECK</a>
+<a name="ln1533">	size += sizeof(heap_leak_check_info);</a>
+<a name="ln1534">#endif</a>
+<a name="ln1535"> </a>
+<a name="ln1536">	void *address = NULL;</a>
+<a name="ln1537">	if (alignment &lt; B_PAGE_SIZE) {</a>
+<a name="ln1538">		if (alignment != 0) {</a>
+<a name="ln1539">			// TODO: The alignment is done by ensuring that the element size</a>
+<a name="ln1540">			// of the target bin is aligned with the requested alignment. This</a>
+<a name="ln1541">			// has the problem that it wastes space because a better (smaller)</a>
+<a name="ln1542">			// bin could possibly be selected. We should pick the best bin and</a>
+<a name="ln1543">			// check if there is an aligned block in the free list or if a new</a>
+<a name="ln1544">			// (page aligned) page has to be allocated anyway.</a>
+<a name="ln1545">			size = ROUNDUP(size, alignment);</a>
+<a name="ln1546">			for (uint32 i = 0; i &lt; heap-&gt;bin_count; i++) {</a>
+<a name="ln1547">				if (size &lt;= heap-&gt;bins[i].element_size</a>
+<a name="ln1548">					&amp;&amp; is_valid_alignment(heap-&gt;bins[i].element_size)) {</a>
+<a name="ln1549">					address = heap_allocate_from_bin(heap, i, size);</a>
+<a name="ln1550">					break;</a>
+<a name="ln1551">				}</a>
+<a name="ln1552">			}</a>
+<a name="ln1553">		} else {</a>
+<a name="ln1554">			for (uint32 i = 0; i &lt; heap-&gt;bin_count; i++) {</a>
+<a name="ln1555">				if (size &lt;= heap-&gt;bins[i].element_size) {</a>
+<a name="ln1556">					address = heap_allocate_from_bin(heap, i, size);</a>
+<a name="ln1557">					break;</a>
+<a name="ln1558">				}</a>
+<a name="ln1559">			}</a>
+<a name="ln1560">		}</a>
+<a name="ln1561">	}</a>
+<a name="ln1562"> </a>
+<a name="ln1563">	if (address == NULL)</a>
+<a name="ln1564">		address = heap_raw_alloc(heap, size, alignment);</a>
+<a name="ln1565"> </a>
+<a name="ln1566">#if KERNEL_HEAP_LEAK_CHECK</a>
+<a name="ln1567">	size -= sizeof(heap_leak_check_info);</a>
+<a name="ln1568">#endif</a>
+<a name="ln1569"> </a>
+<a name="ln1570">	TRACE((&quot;memalign(): asked to allocate %lu bytes, returning pointer %p\n&quot;,</a>
+<a name="ln1571">		size, address));</a>
+<a name="ln1572"> </a>
+<a name="ln1573">	T(Allocate((addr_t)address, size));</a>
+<a name="ln1574">	if (address == NULL)</a>
+<a name="ln1575">		return address;</a>
+<a name="ln1576"> </a>
+<a name="ln1577">#if PARANOID_KERNEL_MALLOC</a>
+<a name="ln1578">	memset(address, 0xcc, size);</a>
+<a name="ln1579">#endif</a>
+<a name="ln1580"> </a>
+<a name="ln1581">#if PARANOID_KERNEL_FREE</a>
+<a name="ln1582">	// make sure 0xdeadbeef is cleared if we do not overwrite the memory</a>
+<a name="ln1583">	// and the user does not clear it</a>
+<a name="ln1584">	if (((uint32 *)address)[1] == 0xdeadbeef)</a>
+<a name="ln1585">		((uint32 *)address)[1] = 0xcccccccc;</a>
+<a name="ln1586">#endif</a>
+<a name="ln1587"> </a>
+<a name="ln1588">	return address;</a>
+<a name="ln1589">}</a>
+<a name="ln1590"> </a>
+<a name="ln1591"> </a>
+<a name="ln1592">status_t</a>
+<a name="ln1593">heap_free(heap_allocator *heap, void *address)</a>
+<a name="ln1594">{</a>
+<a name="ln1595">	if (address == NULL)</a>
+<a name="ln1596">		return B_OK;</a>
+<a name="ln1597"> </a>
+<a name="ln1598">	ReadLocker areaReadLocker(heap-&gt;area_lock);</a>
+<a name="ln1599">	heap_area *area = heap-&gt;all_areas;</a>
+<a name="ln1600">	while (area) {</a>
+<a name="ln1601">		// since the all_areas list is ordered by base with the biggest</a>
+<a name="ln1602">		// base at the top, we need only find the first area with a base</a>
+<a name="ln1603">		// smaller than our address to become our only candidate for freeing</a>
+<a name="ln1604">		if (area-&gt;base &lt;= (addr_t)address) {</a>
+<a name="ln1605">			if ((addr_t)address &gt;= area-&gt;base + area-&gt;size) {</a>
+<a name="ln1606">				// none of the other areas can contain the address as the list</a>
+<a name="ln1607">				// is ordered</a>
+<a name="ln1608">				return B_ENTRY_NOT_FOUND;</a>
+<a name="ln1609">			}</a>
+<a name="ln1610"> </a>
+<a name="ln1611">			// this area contains the allocation, we're done searching</a>
+<a name="ln1612">			break;</a>
+<a name="ln1613">		}</a>
+<a name="ln1614"> </a>
+<a name="ln1615">		area = area-&gt;all_next;</a>
+<a name="ln1616">	}</a>
+<a name="ln1617"> </a>
+<a name="ln1618">	if (area == NULL) {</a>
+<a name="ln1619">		// this address does not belong to us</a>
+<a name="ln1620">		return B_ENTRY_NOT_FOUND;</a>
+<a name="ln1621">	}</a>
+<a name="ln1622"> </a>
+<a name="ln1623">	TRACE((&quot;free(): asked to free pointer %p\n&quot;, address));</a>
+<a name="ln1624"> </a>
+<a name="ln1625">	heap_page *page = &amp;area-&gt;page_table[((addr_t)address - area-&gt;base)</a>
+<a name="ln1626">		/ heap-&gt;page_size];</a>
+<a name="ln1627"> </a>
+<a name="ln1628">	TRACE((&quot;free(): page %p: bin_index %d, free_count %d\n&quot;, page,</a>
+<a name="ln1629">		page-&gt;bin_index, page-&gt;free_count));</a>
+<a name="ln1630"> </a>
+<a name="ln1631">	if (page-&gt;bin_index &gt; heap-&gt;bin_count) {</a>
+<a name="ln1632">		panic(&quot;free(): page %p: invalid bin_index %d\n&quot;, page, page-&gt;bin_index);</a>
+<a name="ln1633">		return B_ERROR;</a>
+<a name="ln1634">	}</a>
+<a name="ln1635"> </a>
+<a name="ln1636">	if (page-&gt;bin_index &lt; heap-&gt;bin_count) {</a>
+<a name="ln1637">		// small allocation</a>
+<a name="ln1638">		heap_bin *bin = &amp;heap-&gt;bins[page-&gt;bin_index];</a>
+<a name="ln1639"> </a>
+<a name="ln1640">#if PARANOID_KERNEL_FREE</a>
+<a name="ln1641">		if (((uint32 *)address)[1] == 0xdeadbeef) {</a>
+<a name="ln1642">			// This block looks like it was freed already, walk the free list</a>
+<a name="ln1643">			// on this page to make sure this address doesn't exist.</a>
+<a name="ln1644">			MutexLocker binLocker(bin-&gt;lock);</a>
+<a name="ln1645">			for (addr_t *temp = page-&gt;free_list; temp != NULL;</a>
+<a name="ln1646">					temp = (addr_t *)*temp) {</a>
+<a name="ln1647">				if (temp == address) {</a>
+<a name="ln1648">					panic(&quot;free(): address %p already exists in page free &quot;</a>
+<a name="ln1649">						&quot;list\n&quot;, address);</a>
+<a name="ln1650">					return B_ERROR;</a>
+<a name="ln1651">				}</a>
+<a name="ln1652">			}</a>
+<a name="ln1653">		}</a>
+<a name="ln1654"> </a>
+<a name="ln1655">		// the first 4 bytes are overwritten with the next free list pointer</a>
+<a name="ln1656">		// later</a>
+<a name="ln1657">		uint32 *dead = (uint32 *)address;</a>
+<a name="ln1658">		for (uint32 i = 1; i &lt; bin-&gt;element_size / sizeof(uint32); i++)</a>
+<a name="ln1659">			dead[i] = 0xdeadbeef;</a>
+<a name="ln1660">#endif</a>
+<a name="ln1661"> </a>
+<a name="ln1662">		MutexLocker binLocker(bin-&gt;lock);</a>
+<a name="ln1663">		if (((addr_t)address - area-&gt;base - page-&gt;index</a>
+<a name="ln1664">			* heap-&gt;page_size) % bin-&gt;element_size != 0) {</a>
+<a name="ln1665">			panic(&quot;free(): passed invalid pointer %p supposed to be in bin for &quot;</a>
+<a name="ln1666">				&quot;element size %&quot; B_PRIu32 &quot;\n&quot;, address, bin-&gt;element_size);</a>
+<a name="ln1667">			return B_ERROR;</a>
+<a name="ln1668">		}</a>
+<a name="ln1669"> </a>
+<a name="ln1670">		// add the address to the page free list</a>
+<a name="ln1671">		*(addr_t *)address = (addr_t)page-&gt;free_list;</a>
+<a name="ln1672">		page-&gt;free_list = (addr_t *)address;</a>
+<a name="ln1673">		page-&gt;free_count++;</a>
+<a name="ln1674"> </a>
+<a name="ln1675">		if (page-&gt;free_count == bin-&gt;max_free_count) {</a>
+<a name="ln1676">			// we are now empty, remove the page from the bin list</a>
+<a name="ln1677">			MutexLocker pageLocker(heap-&gt;page_lock);</a>
+<a name="ln1678">			heap_unlink_page(page, &amp;bin-&gt;page_list);</a>
+<a name="ln1679">			page-&gt;in_use = 0;</a>
+<a name="ln1680">			heap_link_page(page, &amp;area-&gt;free_pages);</a>
+<a name="ln1681">			heap_free_pages_added(heap, area, 1);</a>
+<a name="ln1682">		} else if (page-&gt;free_count == 1) {</a>
+<a name="ln1683">			// we need to add ourselfs to the page list of the bin</a>
+<a name="ln1684">			heap_link_page(page, &amp;bin-&gt;page_list);</a>
+<a name="ln1685">		} else {</a>
+<a name="ln1686">			// we might need to move back in the free pages list</a>
+<a name="ln1687">			if (page-&gt;next &amp;&amp; page-&gt;next-&gt;free_count &lt; page-&gt;free_count) {</a>
+<a name="ln1688">				// move ourselfs so the list stays ordered</a>
+<a name="ln1689">				heap_page *insert = page-&gt;next;</a>
+<a name="ln1690">				while (insert-&gt;next</a>
+<a name="ln1691">					&amp;&amp; insert-&gt;next-&gt;free_count &lt; page-&gt;free_count)</a>
+<a name="ln1692">					insert = insert-&gt;next;</a>
+<a name="ln1693"> </a>
+<a name="ln1694">				heap_unlink_page(page, &amp;bin-&gt;page_list);</a>
+<a name="ln1695"> </a>
+<a name="ln1696">				page-&gt;prev = insert;</a>
+<a name="ln1697">				page-&gt;next = insert-&gt;next;</a>
+<a name="ln1698">				if (page-&gt;next)</a>
+<a name="ln1699">					page-&gt;next-&gt;prev = page;</a>
+<a name="ln1700">				insert-&gt;next = page;</a>
+<a name="ln1701">			}</a>
+<a name="ln1702">		}</a>
+<a name="ln1703">	} else {</a>
+<a name="ln1704">		// large allocation, just return the pages to the page free list</a>
+<a name="ln1705">		uint32 allocationID = page-&gt;allocation_id;</a>
+<a name="ln1706">		uint32 maxPages = area-&gt;page_count - page-&gt;index;</a>
+<a name="ln1707">		uint32 pageCount = 0;</a>
+<a name="ln1708"> </a>
+<a name="ln1709">		MutexLocker pageLocker(heap-&gt;page_lock);</a>
+<a name="ln1710">		for (uint32 i = 0; i &lt; maxPages; i++) {</a>
+<a name="ln1711">			// loop until we find the end of this allocation</a>
+<a name="ln1712">			if (!page[i].in_use || page[i].bin_index != heap-&gt;bin_count</a>
+<a name="ln1713">				|| page[i].allocation_id != allocationID)</a>
+<a name="ln1714">				break;</a>
+<a name="ln1715"> </a>
+<a name="ln1716">			// this page still belongs to the same allocation</a>
+<a name="ln1717">			page[i].in_use = 0;</a>
+<a name="ln1718">			page[i].allocation_id = 0;</a>
+<a name="ln1719"> </a>
+<a name="ln1720">			// return it to the free list</a>
+<a name="ln1721">			heap_link_page(&amp;page[i], &amp;area-&gt;free_pages);</a>
+<a name="ln1722">			pageCount++;</a>
+<a name="ln1723">		}</a>
+<a name="ln1724"> </a>
+<a name="ln1725">		heap_free_pages_added(heap, area, pageCount);</a>
+<a name="ln1726">	}</a>
+<a name="ln1727"> </a>
+<a name="ln1728">	T(Free((addr_t)address));</a>
+<a name="ln1729">	areaReadLocker.Unlock();</a>
+<a name="ln1730"> </a>
+<a name="ln1731">	if (heap-&gt;empty_areas &gt; 1) {</a>
+<a name="ln1732">		WriteLocker areaWriteLocker(heap-&gt;area_lock);</a>
+<a name="ln1733">		MutexLocker pageLocker(heap-&gt;page_lock);</a>
+<a name="ln1734"> </a>
+<a name="ln1735">		area_id areasToDelete[heap-&gt;empty_areas - 1];</a>
+<a name="ln1736">		int32 areasToDeleteIndex = 0;</a>
+<a name="ln1737"> </a>
+<a name="ln1738">		area = heap-&gt;areas;</a>
+<a name="ln1739">		while (area != NULL &amp;&amp; heap-&gt;empty_areas &gt; 1) {</a>
+<a name="ln1740">			heap_area *next = area-&gt;next;</a>
+<a name="ln1741">			if (area-&gt;area &gt;= 0</a>
+<a name="ln1742">				&amp;&amp; area-&gt;free_page_count == area-&gt;page_count</a>
+<a name="ln1743">				&amp;&amp; heap_remove_area(heap, area) == B_OK) {</a>
+<a name="ln1744">				areasToDelete[areasToDeleteIndex++] = area-&gt;area;</a>
+<a name="ln1745">				heap-&gt;empty_areas--;</a>
+<a name="ln1746">			}</a>
+<a name="ln1747"> </a>
+<a name="ln1748">			area = next;</a>
+<a name="ln1749">		}</a>
+<a name="ln1750"> </a>
+<a name="ln1751">		pageLocker.Unlock();</a>
+<a name="ln1752">		areaWriteLocker.Unlock();</a>
+<a name="ln1753"> </a>
+<a name="ln1754">		for (int32 i = 0; i &lt; areasToDeleteIndex; i++)</a>
+<a name="ln1755">			delete_area(areasToDelete[i]);</a>
+<a name="ln1756">	}</a>
+<a name="ln1757"> </a>
+<a name="ln1758">	return B_OK;</a>
+<a name="ln1759">}</a>
+<a name="ln1760"> </a>
+<a name="ln1761"> </a>
+<a name="ln1762">#if KERNEL_HEAP_LEAK_CHECK</a>
+<a name="ln1763">extern &quot;C&quot; void</a>
+<a name="ln1764">heap_set_get_caller(heap_allocator* heap, addr_t (*getCaller)())</a>
+<a name="ln1765">{</a>
+<a name="ln1766">	heap-&gt;get_caller = getCaller;</a>
+<a name="ln1767">}</a>
+<a name="ln1768">#endif</a>
+<a name="ln1769"> </a>
+<a name="ln1770"> </a>
+<a name="ln1771">#if USE_DEBUG_HEAP_FOR_MALLOC</a>
+<a name="ln1772"> </a>
+<a name="ln1773"> </a>
+<a name="ln1774">static status_t</a>
+<a name="ln1775">heap_realloc(heap_allocator *heap, void *address, void **newAddress,</a>
+<a name="ln1776">	size_t newSize)</a>
+<a name="ln1777">{</a>
+<a name="ln1778">	ReadLocker areaReadLocker(heap-&gt;area_lock);</a>
+<a name="ln1779">	heap_area *area = heap-&gt;all_areas;</a>
+<a name="ln1780">	while (area) {</a>
+<a name="ln1781">		// since the all_areas list is ordered by base with the biggest</a>
+<a name="ln1782">		// base at the top, we need only find the first area with a base</a>
+<a name="ln1783">		// smaller than our address to become our only candidate for</a>
+<a name="ln1784">		// reallocating</a>
+<a name="ln1785">		if (area-&gt;base &lt;= (addr_t)address) {</a>
+<a name="ln1786">			if ((addr_t)address &gt;= area-&gt;base + area-&gt;size) {</a>
+<a name="ln1787">				// none of the other areas can contain the address as the list</a>
+<a name="ln1788">				// is ordered</a>
+<a name="ln1789">				return B_ENTRY_NOT_FOUND;</a>
+<a name="ln1790">			}</a>
+<a name="ln1791"> </a>
+<a name="ln1792">			// this area contains the allocation, we're done searching</a>
+<a name="ln1793">			break;</a>
+<a name="ln1794">		}</a>
+<a name="ln1795"> </a>
+<a name="ln1796">		area = area-&gt;all_next;</a>
+<a name="ln1797">	}</a>
+<a name="ln1798"> </a>
+<a name="ln1799">	if (area == NULL) {</a>
+<a name="ln1800">		// this address does not belong to us</a>
+<a name="ln1801">		return B_ENTRY_NOT_FOUND;</a>
+<a name="ln1802">	}</a>
+<a name="ln1803"> </a>
+<a name="ln1804">	TRACE((&quot;realloc(address = %p, newSize = %lu)\n&quot;, address, newSize));</a>
+<a name="ln1805"> </a>
+<a name="ln1806">	heap_page *page = &amp;area-&gt;page_table[((addr_t)address - area-&gt;base)</a>
+<a name="ln1807">		/ heap-&gt;page_size];</a>
+<a name="ln1808">	if (page-&gt;bin_index &gt; heap-&gt;bin_count) {</a>
+<a name="ln1809">		panic(&quot;realloc(): page %p: invalid bin_index %d\n&quot;, page,</a>
+<a name="ln1810">			page-&gt;bin_index);</a>
+<a name="ln1811">		return B_ERROR;</a>
+<a name="ln1812">	}</a>
+<a name="ln1813"> </a>
+<a name="ln1814">	// find out the size of the old allocation first</a>
+<a name="ln1815">	size_t minSize = 0;</a>
+<a name="ln1816">	size_t maxSize = 0;</a>
+<a name="ln1817">	if (page-&gt;bin_index &lt; heap-&gt;bin_count) {</a>
+<a name="ln1818">		// this was a small allocation</a>
+<a name="ln1819">		heap_bin *bin = &amp;heap-&gt;bins[page-&gt;bin_index];</a>
+<a name="ln1820">		maxSize = bin-&gt;element_size;</a>
+<a name="ln1821">		if (page-&gt;bin_index &gt; 0)</a>
+<a name="ln1822">			minSize = heap-&gt;bins[page-&gt;bin_index - 1].element_size + 1;</a>
+<a name="ln1823">	} else {</a>
+<a name="ln1824">		// this was a large allocation</a>
+<a name="ln1825">		uint32 allocationID = page-&gt;allocation_id;</a>
+<a name="ln1826">		uint32 maxPages = area-&gt;page_count - page-&gt;index;</a>
+<a name="ln1827">		maxSize = heap-&gt;page_size;</a>
+<a name="ln1828"> </a>
+<a name="ln1829">		MutexLocker pageLocker(heap-&gt;page_lock);</a>
+<a name="ln1830">		for (uint32 i = 1; i &lt; maxPages; i++) {</a>
+<a name="ln1831">			if (!page[i].in_use || page[i].bin_index != heap-&gt;bin_count</a>
+<a name="ln1832">				|| page[i].allocation_id != allocationID)</a>
+<a name="ln1833">				break;</a>
+<a name="ln1834"> </a>
+<a name="ln1835">			minSize += heap-&gt;page_size;</a>
+<a name="ln1836">			maxSize += heap-&gt;page_size;</a>
+<a name="ln1837">		}</a>
+<a name="ln1838">	}</a>
+<a name="ln1839"> </a>
+<a name="ln1840">	areaReadLocker.Unlock();</a>
+<a name="ln1841"> </a>
+<a name="ln1842">#if KERNEL_HEAP_LEAK_CHECK</a>
+<a name="ln1843">	newSize += sizeof(heap_leak_check_info);</a>
+<a name="ln1844">#endif</a>
+<a name="ln1845"> </a>
+<a name="ln1846">	// does the new allocation simply fit in the old allocation?</a>
+<a name="ln1847">	if (newSize &gt; minSize &amp;&amp; newSize &lt;= maxSize) {</a>
+<a name="ln1848">#if KERNEL_HEAP_LEAK_CHECK</a>
+<a name="ln1849">		// update the size info (the info is at the end so stays where it is)</a>
+<a name="ln1850">		heap_leak_check_info *info = (heap_leak_check_info *)((addr_t)address</a>
+<a name="ln1851">			+ maxSize - sizeof(heap_leak_check_info));</a>
+<a name="ln1852">		info-&gt;size = newSize - sizeof(heap_leak_check_info);</a>
+<a name="ln1853">		newSize -= sizeof(heap_leak_check_info);</a>
+<a name="ln1854">#endif</a>
+<a name="ln1855"> </a>
+<a name="ln1856">		T(Reallocate((addr_t)address, (addr_t)address, newSize));</a>
+<a name="ln1857">		*newAddress = address;</a>
+<a name="ln1858">		return B_OK;</a>
+<a name="ln1859">	}</a>
+<a name="ln1860"> </a>
+<a name="ln1861">#if KERNEL_HEAP_LEAK_CHECK</a>
+<a name="ln1862">	// new leak check info will be created with the malloc below</a>
+<a name="ln1863">	newSize -= sizeof(heap_leak_check_info);</a>
+<a name="ln1864">#endif</a>
+<a name="ln1865"> </a>
+<a name="ln1866">	// if not, allocate a new chunk of memory</a>
+<a name="ln1867">	*newAddress = memalign(0, newSize);</a>
+<a name="ln1868">	T(Reallocate((addr_t)address, (addr_t)*newAddress, newSize));</a>
+<a name="ln1869">	if (*newAddress == NULL) {</a>
+<a name="ln1870">		// we tried but it didn't work out, but still the operation is done</a>
+<a name="ln1871">		return B_OK;</a>
+<a name="ln1872">	}</a>
+<a name="ln1873"> </a>
+<a name="ln1874">	// copy the old data and free the old allocation</a>
+<a name="ln1875">	memcpy(*newAddress, address, min_c(maxSize, newSize));</a>
+<a name="ln1876">	heap_free(heap, address);</a>
+<a name="ln1877">	return B_OK;</a>
+<a name="ln1878">}</a>
+<a name="ln1879"> </a>
+<a name="ln1880"> </a>
+<a name="ln1881">inline uint32</a>
+<a name="ln1882">heap_index_for(size_t size, int32 cpu)</a>
+<a name="ln1883">{</a>
+<a name="ln1884">#if KERNEL_HEAP_LEAK_CHECK</a>
+<a name="ln1885">	// take the extra info size into account</a>
+<a name="ln1886">	size += sizeof(heap_leak_check_info_s);</a>
+<a name="ln1887">#endif</a>
+<a name="ln1888"> </a>
+<a name="ln1889">	uint32 index = 0;</a>
+<a name="ln1890">	for (; index &lt; HEAP_CLASS_COUNT - 1; index++) {</a>
+<a name="ln1891">		if (size &lt;= sHeapClasses[index].max_allocation_size)</a>
+<a name="ln1892">			break;</a>
+<a name="ln1893">	}</a>
+<a name="ln1894"> </a>
+<a name="ln1895">	return (index + cpu * HEAP_CLASS_COUNT) % sHeapCount;</a>
+<a name="ln1896">}</a>
+<a name="ln1897"> </a>
+<a name="ln1898"> </a>
+<a name="ln1899">static void *</a>
+<a name="ln1900">memalign_nogrow(size_t alignment, size_t size)</a>
+<a name="ln1901">{</a>
+<a name="ln1902">	// use dedicated memory in the grow thread by default</a>
+<a name="ln1903">	if (thread_get_current_thread_id() == sHeapGrowThread) {</a>
+<a name="ln1904">		void *result = heap_memalign(sGrowHeap, alignment, size);</a>
+<a name="ln1905">		if (!sAddGrowHeap &amp;&amp; heap_should_grow(sGrowHeap)) {</a>
+<a name="ln1906">			// hopefully the heap grower will manage to create a new heap</a>
+<a name="ln1907">			// before running out of private memory...</a>
+<a name="ln1908">			dprintf(&quot;heap: requesting new grow heap\n&quot;);</a>
+<a name="ln1909">			sAddGrowHeap = true;</a>
+<a name="ln1910">			release_sem_etc(sHeapGrowSem, 1, B_DO_NOT_RESCHEDULE);</a>
+<a name="ln1911">		}</a>
+<a name="ln1912"> </a>
+<a name="ln1913">		if (result != NULL)</a>
+<a name="ln1914">			return result;</a>
+<a name="ln1915">	}</a>
+<a name="ln1916"> </a>
+<a name="ln1917">	// try public memory, there might be something available</a>
+<a name="ln1918">	void *result = NULL;</a>
+<a name="ln1919">	int32 cpuCount = MIN(smp_get_num_cpus(),</a>
+<a name="ln1920">		(int32)sHeapCount / HEAP_CLASS_COUNT);</a>
+<a name="ln1921">	int32 cpuNumber = smp_get_current_cpu();</a>
+<a name="ln1922">	for (int32 i = 0; i &lt; cpuCount; i++) {</a>
+<a name="ln1923">		uint32 heapIndex = heap_index_for(size, cpuNumber++ % cpuCount);</a>
+<a name="ln1924">		heap_allocator *heap = sHeaps[heapIndex];</a>
+<a name="ln1925">		result = heap_memalign(heap, alignment, size);</a>
+<a name="ln1926">		if (result != NULL)</a>
+<a name="ln1927">			return result;</a>
+<a name="ln1928">	}</a>
+<a name="ln1929"> </a>
+<a name="ln1930">	// no memory available</a>
+<a name="ln1931">	if (thread_get_current_thread_id() == sHeapGrowThread)</a>
+<a name="ln1932">		panic(&quot;heap: all heaps have run out of memory while growing\n&quot;);</a>
+<a name="ln1933">	else</a>
+<a name="ln1934">		dprintf(&quot;heap: all heaps have run out of memory\n&quot;);</a>
+<a name="ln1935"> </a>
+<a name="ln1936">	return NULL;</a>
+<a name="ln1937">}</a>
+<a name="ln1938"> </a>
+<a name="ln1939"> </a>
+<a name="ln1940">static status_t</a>
+<a name="ln1941">heap_create_new_heap_area(heap_allocator *heap, const char *name, size_t size)</a>
+<a name="ln1942">{</a>
+<a name="ln1943">	void *address = NULL;</a>
+<a name="ln1944">	area_id heapArea = create_area(name, &amp;address,</a>
+<a name="ln1945">		B_ANY_KERNEL_BLOCK_ADDRESS, size, B_FULL_LOCK,</a>
+<a name="ln1946">		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);</a>
+<a name="ln1947">	if (heapArea &lt; B_OK) {</a>
+<a name="ln1948">		TRACE((&quot;heap: couldn't allocate heap area \&quot;%s\&quot;\n&quot;, name));</a>
+<a name="ln1949">		return heapArea;</a>
+<a name="ln1950">	}</a>
+<a name="ln1951"> </a>
+<a name="ln1952">	heap_add_area(heap, heapArea, (addr_t)address, size);</a>
+<a name="ln1953">#if PARANOID_HEAP_VALIDATION</a>
+<a name="ln1954">	heap_validate_heap(heap);</a>
+<a name="ln1955">#endif</a>
+<a name="ln1956">	return B_OK;</a>
+<a name="ln1957">}</a>
+<a name="ln1958"> </a>
+<a name="ln1959"> </a>
+<a name="ln1960">static int32</a>
+<a name="ln1961">heap_grow_thread(void *)</a>
+<a name="ln1962">{</a>
+<a name="ln1963">	while (true) {</a>
+<a name="ln1964">		// wait for a request to grow the heap list</a>
+<a name="ln1965">		if (acquire_sem(sHeapGrowSem) &lt; B_OK)</a>
+<a name="ln1966">			continue;</a>
+<a name="ln1967"> </a>
+<a name="ln1968">		if (sAddGrowHeap) {</a>
+<a name="ln1969">			// the grow heap is going to run full soon, try to allocate a new</a>
+<a name="ln1970">			// one to make some room.</a>
+<a name="ln1971">			TRACE((&quot;heap_grower: grow heaps will run out of memory soon\n&quot;));</a>
+<a name="ln1972">			if (heap_create_new_heap_area(sGrowHeap, &quot;additional grow heap&quot;,</a>
+<a name="ln1973">					HEAP_DEDICATED_GROW_SIZE) != B_OK)</a>
+<a name="ln1974">				dprintf(&quot;heap_grower: failed to create new grow heap area\n&quot;);</a>
+<a name="ln1975">		}</a>
+<a name="ln1976"> </a>
+<a name="ln1977">		for (uint32 i = 0; i &lt; sHeapCount; i++) {</a>
+<a name="ln1978">			heap_allocator *heap = sHeaps[i];</a>
+<a name="ln1979">			if (sLastGrowRequest[i] &gt; sLastHandledGrowRequest[i]</a>
+<a name="ln1980">				|| heap_should_grow(heap)) {</a>
+<a name="ln1981">				// grow this heap if it is nearly full or if a grow was</a>
+<a name="ln1982">				// explicitly requested for this heap (happens when a large</a>
+<a name="ln1983">				// allocation cannot be fulfilled due to lack of contiguous</a>
+<a name="ln1984">				// pages)</a>
+<a name="ln1985">				if (heap_create_new_heap_area(heap, &quot;additional heap&quot;,</a>
+<a name="ln1986">						HEAP_GROW_SIZE) != B_OK)</a>
+<a name="ln1987">					dprintf(&quot;heap_grower: failed to create new heap area\n&quot;);</a>
+<a name="ln1988">				sLastHandledGrowRequest[i] = sLastGrowRequest[i];</a>
+<a name="ln1989">			}</a>
+<a name="ln1990">		}</a>
+<a name="ln1991"> </a>
+<a name="ln1992">		// notify anyone waiting for this request</a>
+<a name="ln1993">		release_sem_etc(sHeapGrownNotify, -1, B_RELEASE_ALL);</a>
+<a name="ln1994">	}</a>
+<a name="ln1995"> </a>
+<a name="ln1996">	return 0;</a>
+<a name="ln1997">}</a>
+<a name="ln1998"> </a>
+<a name="ln1999"> </a>
+<a name="ln2000">#endif	// USE_DEBUG_HEAP_FOR_MALLOC</a>
+<a name="ln2001"> </a>
+<a name="ln2002"> </a>
+<a name="ln2003">static void</a>
+<a name="ln2004">deferred_deleter(void *arg, int iteration)</a>
+<a name="ln2005">{</a>
+<a name="ln2006">	// move entries and deletables to on-stack lists</a>
+<a name="ln2007">	InterruptsSpinLocker locker(sDeferredFreeListLock);</a>
+<a name="ln2008">	if (sDeferredFreeList.IsEmpty() &amp;&amp; sDeferredDeletableList.IsEmpty())</a>
+<a name="ln2009">		return;</a>
+<a name="ln2010"> </a>
+<a name="ln2011">	DeferredFreeList entries;</a>
+<a name="ln2012">	entries.MoveFrom(&amp;sDeferredFreeList);</a>
+<a name="ln2013"> </a>
+<a name="ln2014">	DeferredDeletableList deletables;</a>
+<a name="ln2015">	deletables.MoveFrom(&amp;sDeferredDeletableList);</a>
+<a name="ln2016"> </a>
+<a name="ln2017">	locker.Unlock();</a>
+<a name="ln2018"> </a>
+<a name="ln2019">	// free the entries</a>
+<a name="ln2020">	while (DeferredFreeListEntry* entry = entries.RemoveHead())</a>
+<a name="ln2021">		free(entry);</a>
+<a name="ln2022"> </a>
+<a name="ln2023">	// delete the deletables</a>
+<a name="ln2024">	while (DeferredDeletable* deletable = deletables.RemoveHead())</a>
+<a name="ln2025">		delete deletable;</a>
+<a name="ln2026">}</a>
+<a name="ln2027"> </a>
+<a name="ln2028"> </a>
+<a name="ln2029">//	#pragma mark -</a>
+<a name="ln2030"> </a>
+<a name="ln2031"> </a>
+<a name="ln2032">#if USE_DEBUG_HEAP_FOR_MALLOC</a>
+<a name="ln2033"> </a>
+<a name="ln2034"> </a>
+<a name="ln2035">status_t</a>
+<a name="ln2036">heap_init(addr_t base, size_t size)</a>
+<a name="ln2037">{</a>
+<a name="ln2038">	for (uint32 i = 0; i &lt; HEAP_CLASS_COUNT; i++) {</a>
+<a name="ln2039">		size_t partSize = size * sHeapClasses[i].initial_percentage / 100;</a>
+<a name="ln2040">		sHeaps[i] = heap_create_allocator(sHeapClasses[i].name, base, partSize,</a>
+<a name="ln2041">			&amp;sHeapClasses[i], false);</a>
+<a name="ln2042">		sLastGrowRequest[i] = sLastHandledGrowRequest[i] = 0;</a>
+<a name="ln2043">		base += partSize;</a>
+<a name="ln2044">		sHeapCount++;</a>
+<a name="ln2045">	}</a>
+<a name="ln2046"> </a>
+<a name="ln2047">	// set up some debug commands</a>
+<a name="ln2048">	add_debugger_command_etc(&quot;heap&quot;, &amp;dump_heap_list,</a>
+<a name="ln2049">		&quot;Dump infos about the kernel heap(s)&quot;,</a>
+<a name="ln2050">		&quot;[(\&quot;grow\&quot; | \&quot;stats\&quot; | &lt;heap&gt;)]\n&quot;</a>
+<a name="ln2051">		&quot;Dump infos about the kernel heap(s). If \&quot;grow\&quot; is specified, only\n&quot;</a>
+<a name="ln2052">		&quot;infos about the dedicated grow heap are printed. If \&quot;stats\&quot; is\n&quot;</a>
+<a name="ln2053">		&quot;given as the argument, currently only the heap count is printed.\n&quot;</a>
+<a name="ln2054">		&quot;If &lt;heap&gt; is given, it is interpreted as the address of the heap to\n&quot;</a>
+<a name="ln2055">		&quot;print infos about.\n&quot;, 0);</a>
+<a name="ln2056">#if !KERNEL_HEAP_LEAK_CHECK</a>
+<a name="ln2057">	add_debugger_command_etc(&quot;allocations&quot;, &amp;dump_allocations,</a>
+<a name="ln2058">		&quot;Dump current heap allocations&quot;,</a>
+<a name="ln2059">		&quot;[\&quot;stats\&quot;] [&lt;heap&gt;]\n&quot;</a>
+<a name="ln2060">		&quot;If no parameters are given, all current alloactions are dumped.\n&quot;</a>
+<a name="ln2061">		&quot;If the optional argument \&quot;stats\&quot; is specified, only the allocation\n&quot;</a>
+<a name="ln2062">		&quot;counts and no individual allocations are printed\n&quot;</a>
+<a name="ln2063">		&quot;If a specific heap address is given, only allocations of this\n&quot;</a>
+<a name="ln2064">		&quot;allocator are dumped\n&quot;, 0);</a>
+<a name="ln2065">#else // !KERNEL_HEAP_LEAK_CHECK</a>
+<a name="ln2066">	add_debugger_command_etc(&quot;allocations&quot;, &amp;dump_allocations,</a>
+<a name="ln2067">		&quot;Dump current heap allocations&quot;,</a>
+<a name="ln2068">		&quot;[(\&quot;team\&quot; | \&quot;thread\&quot;) &lt;id&gt;] [\&quot;caller\&quot; &lt;address&gt;] [\&quot;address\&quot; &lt;address&gt;] [\&quot;stats\&quot;]\n&quot;</a>
+<a name="ln2069">		&quot;If no parameters are given, all current alloactions are dumped.\n&quot;</a>
+<a name="ln2070">		&quot;If \&quot;team\&quot;, \&quot;thread\&quot;, \&quot;caller\&quot;, and/or \&quot;address\&quot; is specified as the first\n&quot;</a>
+<a name="ln2071">		&quot;argument, only allocations matching the team ID, thread ID, caller\n&quot;</a>
+<a name="ln2072">		&quot;address or allocated address given in the second argument are printed.\n&quot;</a>
+<a name="ln2073">		&quot;If the optional argument \&quot;stats\&quot; is specified, only the allocation\n&quot;</a>
+<a name="ln2074">		&quot;counts and no individual allocations are printed.\n&quot;, 0);</a>
+<a name="ln2075">	add_debugger_command_etc(&quot;allocations_per_caller&quot;,</a>
+<a name="ln2076">		&amp;dump_allocations_per_caller,</a>
+<a name="ln2077">		&quot;Dump current heap allocations summed up per caller&quot;,</a>
+<a name="ln2078">		&quot;[ \&quot;-c\&quot; ] [ -h &lt;heap&gt; ]\n&quot;</a>
+<a name="ln2079">		&quot;The current allocations will by summed up by caller (their count and\n&quot;</a>
+<a name="ln2080">		&quot;size) printed in decreasing order by size or, if \&quot;-c\&quot; is\n&quot;</a>
+<a name="ln2081">		&quot;specified, by allocation count. If given &lt;heap&gt; specifies the\n&quot;</a>
+<a name="ln2082">		&quot;address of the heap for which to print the allocations.\n&quot;, 0);</a>
+<a name="ln2083">#endif // KERNEL_HEAP_LEAK_CHECK</a>
+<a name="ln2084">	return B_OK;</a>
+<a name="ln2085">}</a>
+<a name="ln2086"> </a>
+<a name="ln2087"> </a>
+<a name="ln2088">status_t</a>
+<a name="ln2089">heap_init_post_area()</a>
+<a name="ln2090">{</a>
+<a name="ln2091">	void *address = NULL;</a>
+<a name="ln2092">	area_id growHeapArea = create_area(&quot;dedicated grow heap&quot;, &amp;address,</a>
+<a name="ln2093">		B_ANY_KERNEL_BLOCK_ADDRESS, HEAP_DEDICATED_GROW_SIZE, B_FULL_LOCK,</a>
+<a name="ln2094">		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);</a>
+<a name="ln2095">	if (growHeapArea &lt; 0) {</a>
+<a name="ln2096">		panic(&quot;heap_init_post_area(): couldn't allocate dedicate grow heap &quot;</a>
+<a name="ln2097">			&quot;area&quot;);</a>
+<a name="ln2098">		return growHeapArea;</a>
+<a name="ln2099">	}</a>
+<a name="ln2100"> </a>
+<a name="ln2101">	sGrowHeap = heap_create_allocator(&quot;grow&quot;, (addr_t)address,</a>
+<a name="ln2102">		HEAP_DEDICATED_GROW_SIZE, &amp;sHeapClasses[0], false);</a>
+<a name="ln2103">	if (sGrowHeap == NULL) {</a>
+<a name="ln2104">		panic(&quot;heap_init_post_area(): failed to create dedicated grow heap\n&quot;);</a>
+<a name="ln2105">		return B_ERROR;</a>
+<a name="ln2106">	}</a>
+<a name="ln2107"> </a>
+<a name="ln2108">	// create the VIP heap</a>
+<a name="ln2109">	static const heap_class heapClass = {</a>
+<a name="ln2110">		&quot;VIP I/O&quot;,					/* name */</a>
+<a name="ln2111">		100,						/* initial percentage */</a>
+<a name="ln2112">		B_PAGE_SIZE / 8,			/* max allocation size */</a>
+<a name="ln2113">		B_PAGE_SIZE,				/* page size */</a>
+<a name="ln2114">		8,							/* min bin size */</a>
+<a name="ln2115">		4,							/* bin alignment */</a>
+<a name="ln2116">		8,							/* min count per page */</a>
+<a name="ln2117">		16							/* max waste per page */</a>
+<a name="ln2118">	};</a>
+<a name="ln2119"> </a>
+<a name="ln2120">	area_id vipHeapArea = create_area(&quot;VIP heap&quot;, &amp;address,</a>
+<a name="ln2121">		B_ANY_KERNEL_ADDRESS, VIP_HEAP_SIZE, B_FULL_LOCK,</a>
+<a name="ln2122">		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);</a>
+<a name="ln2123">	if (vipHeapArea &lt; 0) {</a>
+<a name="ln2124">		panic(&quot;heap_init_post_area(): couldn't allocate VIP heap area&quot;);</a>
+<a name="ln2125">		return B_ERROR;</a>
+<a name="ln2126">	}</a>
+<a name="ln2127"> </a>
+<a name="ln2128">	sVIPHeap = heap_create_allocator(&quot;VIP heap&quot;, (addr_t)address,</a>
+<a name="ln2129">		VIP_HEAP_SIZE, &amp;heapClass, false);</a>
+<a name="ln2130">	if (sVIPHeap == NULL) {</a>
+<a name="ln2131">		panic(&quot;heap_init_post_area(): failed to create VIP heap\n&quot;);</a>
+<a name="ln2132">		return B_ERROR;</a>
+<a name="ln2133">	}</a>
+<a name="ln2134"> </a>
+<a name="ln2135">	dprintf(&quot;heap_init_post_area(): created VIP heap: %p\n&quot;, sVIPHeap);</a>
+<a name="ln2136"> </a>
+<a name="ln2137">	return B_OK;</a>
+<a name="ln2138">}</a>
+<a name="ln2139"> </a>
+<a name="ln2140"> </a>
+<a name="ln2141">status_t</a>
+<a name="ln2142">heap_init_post_sem()</a>
+<a name="ln2143">{</a>
+<a name="ln2144">	sHeapGrowSem = create_sem(0, &quot;heap_grow_sem&quot;);</a>
+<a name="ln2145">	if (sHeapGrowSem &lt; 0) {</a>
+<a name="ln2146">		panic(&quot;heap_init_post_sem(): failed to create heap grow sem\n&quot;);</a>
+<a name="ln2147">		return B_ERROR;</a>
+<a name="ln2148">	}</a>
+<a name="ln2149"> </a>
+<a name="ln2150">	sHeapGrownNotify = create_sem(0, &quot;heap_grown_notify&quot;);</a>
+<a name="ln2151">	if (sHeapGrownNotify &lt; 0) {</a>
+<a name="ln2152">		panic(&quot;heap_init_post_sem(): failed to create heap grown notify sem\n&quot;);</a>
+<a name="ln2153">		return B_ERROR;</a>
+<a name="ln2154">	}</a>
+<a name="ln2155"> </a>
+<a name="ln2156">	return B_OK;</a>
+<a name="ln2157">}</a>
+<a name="ln2158"> </a>
+<a name="ln2159"> </a>
+<a name="ln2160">#endif	// USE_DEBUG_HEAP_FOR_MALLOC</a>
+<a name="ln2161"> </a>
+<a name="ln2162"> </a>
+<a name="ln2163">status_t</a>
+<a name="ln2164">heap_init_post_thread()</a>
+<a name="ln2165">{</a>
+<a name="ln2166">#if	USE_DEBUG_HEAP_FOR_MALLOC</a>
+<a name="ln2167">	sHeapGrowThread = spawn_kernel_thread(heap_grow_thread, &quot;heap grower&quot;,</a>
+<a name="ln2168">		B_URGENT_PRIORITY, NULL);</a>
+<a name="ln2169">	if (sHeapGrowThread &lt; 0) {</a>
+<a name="ln2170">		panic(&quot;heap_init_post_thread(): cannot create heap grow thread\n&quot;);</a>
+<a name="ln2171">		return sHeapGrowThread;</a>
+<a name="ln2172">	}</a>
+<a name="ln2173"> </a>
+<a name="ln2174">	// create per-cpu heaps if there's enough memory</a>
+<a name="ln2175">	int32 heapCount = MIN(smp_get_num_cpus(),</a>
+<a name="ln2176">		(int32)vm_page_num_pages() / 60 / 1024);</a>
+<a name="ln2177">	for (int32 i = 1; i &lt; heapCount; i++) {</a>
+<a name="ln2178">		addr_t base = 0;</a>
+<a name="ln2179">		size_t size = HEAP_GROW_SIZE * HEAP_CLASS_COUNT;</a>
+<a name="ln2180">		area_id perCPUHeapArea = create_area(&quot;per cpu initial heap&quot;,</a>
+<a name="ln2181">			(void **)&amp;base, B_ANY_KERNEL_ADDRESS, size, B_FULL_LOCK,</a>
+<a name="ln2182">			B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);</a>
+<a name="ln2183">		if (perCPUHeapArea &lt; 0)</a>
+<a name="ln2184">			break;</a>
+<a name="ln2185"> </a>
+<a name="ln2186">		for (uint32 j = 0; j &lt; HEAP_CLASS_COUNT; j++) {</a>
+<a name="ln2187">			int32 heapIndex = i * HEAP_CLASS_COUNT + j;</a>
+<a name="ln2188">			size_t partSize = size * sHeapClasses[j].initial_percentage / 100;</a>
+<a name="ln2189">			sHeaps[heapIndex] = heap_create_allocator(sHeapClasses[j].name,</a>
+<a name="ln2190">				base, partSize, &amp;sHeapClasses[j], false);</a>
+<a name="ln2191">			sLastGrowRequest[heapIndex] = 0;</a>
+<a name="ln2192">			sLastHandledGrowRequest[heapIndex] = 0;</a>
+<a name="ln2193">			base += partSize;</a>
+<a name="ln2194">			sHeapCount++;</a>
+<a name="ln2195">		}</a>
+<a name="ln2196">	}</a>
+<a name="ln2197"> </a>
+<a name="ln2198">	resume_thread(sHeapGrowThread);</a>
+<a name="ln2199"> </a>
+<a name="ln2200">#else	// USE_DEBUG_HEAP_FOR_MALLOC</a>
+<a name="ln2201"> </a>
+<a name="ln2202">	// set up some debug commands</a>
+<a name="ln2203">	add_debugger_command_etc(&quot;heap&quot;, &amp;dump_heap_list,</a>
+<a name="ln2204">		&quot;Dump infos about a specific heap&quot;,</a>
+<a name="ln2205">		&quot;[\&quot;stats\&quot;] &lt;heap&gt;\n&quot;</a>
+<a name="ln2206">		&quot;Dump infos about the specified kernel heap. If \&quot;stats\&quot; is given\n&quot;</a>
+<a name="ln2207">		&quot;as the argument, currently only the heap count is printed.\n&quot;, 0);</a>
+<a name="ln2208">#if !KERNEL_HEAP_LEAK_CHECK</a>
+<a name="ln2209">	add_debugger_command_etc(&quot;heap_allocations&quot;, &amp;dump_allocations,</a>
+<a name="ln2210">		&quot;Dump current heap allocations&quot;,</a>
+<a name="ln2211">		&quot;[\&quot;stats\&quot;] &lt;heap&gt;\n&quot;</a>
+<a name="ln2212">		&quot;If the optional argument \&quot;stats\&quot; is specified, only the allocation\n&quot;</a>
+<a name="ln2213">		&quot;counts and no individual allocations are printed.\n&quot;, 0);</a>
+<a name="ln2214">#endif	// KERNEL_HEAP_LEAK_CHECK</a>
+<a name="ln2215">#endif	// !USE_DEBUG_HEAP_FOR_MALLOC</a>
+<a name="ln2216"> </a>
+<a name="ln2217">	// run the deferred deleter roughly once a second</a>
+<a name="ln2218">	if (register_kernel_daemon(deferred_deleter, NULL, 10) != B_OK)</a>
+<a name="ln2219">		panic(&quot;heap_init_post_thread(): failed to init deferred deleter&quot;);</a>
+<a name="ln2220"> </a>
+<a name="ln2221">	return B_OK;</a>
+<a name="ln2222">}</a>
+<a name="ln2223"> </a>
+<a name="ln2224"> </a>
+<a name="ln2225">//	#pragma mark - Public API</a>
+<a name="ln2226"> </a>
+<a name="ln2227"> </a>
+<a name="ln2228">#if USE_DEBUG_HEAP_FOR_MALLOC</a>
+<a name="ln2229"> </a>
+<a name="ln2230"> </a>
+<a name="ln2231">void *</a>
+<a name="ln2232">memalign(size_t alignment, size_t size)</a>
+<a name="ln2233">{</a>
+<a name="ln2234">	if (!gKernelStartup &amp;&amp; !are_interrupts_enabled()) {</a>
+<a name="ln2235">		panic(&quot;memalign(): called with interrupts disabled\n&quot;);</a>
+<a name="ln2236">		return NULL;</a>
+<a name="ln2237">	}</a>
+<a name="ln2238"> </a>
+<a name="ln2239">	if (!gKernelStartup &amp;&amp; size &gt; HEAP_AREA_USE_THRESHOLD) {</a>
+<a name="ln2240">		// don't even attempt such a huge allocation - use areas instead</a>
+<a name="ln2241">		size_t areaSize = ROUNDUP(size + sizeof(area_allocation_info)</a>
+<a name="ln2242">			+ alignment, B_PAGE_SIZE);</a>
+<a name="ln2243">		if (areaSize &lt; size) {</a>
+<a name="ln2244">			// the size overflowed</a>
+<a name="ln2245">			return NULL;</a>
+<a name="ln2246">		}</a>
+<a name="ln2247"> </a>
+<a name="ln2248">		void *address = NULL;</a>
+<a name="ln2249">		area_id allocationArea = create_area(&quot;memalign area&quot;, &amp;address,</a>
+<a name="ln2250">			B_ANY_KERNEL_BLOCK_ADDRESS, areaSize, B_FULL_LOCK,</a>
+<a name="ln2251">			B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);</a>
+<a name="ln2252">		if (allocationArea &lt; B_OK) {</a>
+<a name="ln2253">			dprintf(&quot;heap: failed to create area for huge allocation\n&quot;);</a>
+<a name="ln2254">			return NULL;</a>
+<a name="ln2255">		}</a>
+<a name="ln2256"> </a>
+<a name="ln2257">		area_allocation_info *info = (area_allocation_info *)address;</a>
+<a name="ln2258">		info-&gt;magic = kAreaAllocationMagic;</a>
+<a name="ln2259">		info-&gt;area = allocationArea;</a>
+<a name="ln2260">		info-&gt;base = address;</a>
+<a name="ln2261">		info-&gt;size = areaSize;</a>
+<a name="ln2262">		info-&gt;allocation_size = size;</a>
+<a name="ln2263">		info-&gt;allocation_alignment = alignment;</a>
+<a name="ln2264"> </a>
+<a name="ln2265">		address = (void *)((addr_t)address + sizeof(area_allocation_info));</a>
+<a name="ln2266">		if (alignment != 0) {</a>
+<a name="ln2267">			address = (void *)ROUNDUP((addr_t)address, alignment);</a>
+<a name="ln2268">			ASSERT((addr_t)address % alignment == 0);</a>
+<a name="ln2269">			ASSERT((addr_t)address + size - 1 &lt; (addr_t)info + areaSize - 1);</a>
+<a name="ln2270">		}</a>
+<a name="ln2271"> </a>
+<a name="ln2272">		TRACE((&quot;heap: allocated area %ld for huge allocation of %lu bytes\n&quot;,</a>
+<a name="ln2273">			allocationArea, size));</a>
+<a name="ln2274"> </a>
+<a name="ln2275">		info-&gt;allocation_base = address;</a>
+<a name="ln2276"> </a>
+<a name="ln2277">#if PARANOID_KERNEL_MALLOC</a>
+<a name="ln2278">		memset(address, 0xcc, size);</a>
+<a name="ln2279">#endif</a>
+<a name="ln2280">		return address;</a>
+<a name="ln2281">	}</a>
+<a name="ln2282"> </a>
+<a name="ln2283">	void *result = NULL;</a>
+<a name="ln2284">	bool shouldGrow = false;</a>
+<a name="ln2285">	int32 cpuCount = MIN(smp_get_num_cpus(),</a>
+<a name="ln2286">		(int32)sHeapCount / HEAP_CLASS_COUNT);</a>
+<a name="ln2287">	int32 cpuNumber = smp_get_current_cpu();</a>
+<a name="ln2288">	for (int32 i = 0; i &lt; cpuCount; i++) {</a>
+<a name="ln2289">		uint32 heapIndex = heap_index_for(size, cpuNumber++ % cpuCount);</a>
+<a name="ln2290">		heap_allocator *heap = sHeaps[heapIndex];</a>
+<a name="ln2291">		result = heap_memalign(heap, alignment, size);</a>
+<a name="ln2292">		if (result != NULL) {</a>
+<a name="ln2293">			shouldGrow = heap_should_grow(heap);</a>
+<a name="ln2294">			break;</a>
+<a name="ln2295">		}</a>
+<a name="ln2296"> </a>
+<a name="ln2297">#if PARANOID_HEAP_VALIDATION</a>
+<a name="ln2298">		heap_validate_heap(heap);</a>
+<a name="ln2299">#endif</a>
+<a name="ln2300">	}</a>
+<a name="ln2301"> </a>
+<a name="ln2302">	if (result == NULL) {</a>
+<a name="ln2303">		// request an urgent grow and wait - we don't do it ourselfs here to</a>
+<a name="ln2304">		// serialize growing through the grow thread, as otherwise multiple</a>
+<a name="ln2305">		// threads hitting this situation (likely when memory ran out) would</a>
+<a name="ln2306">		// all add areas</a>
+<a name="ln2307">		uint32 heapIndex = heap_index_for(size, smp_get_current_cpu());</a>
+<a name="ln2308">		sLastGrowRequest[heapIndex]++;</a>
+<a name="ln2309">		switch_sem(sHeapGrowSem, sHeapGrownNotify);</a>
+<a name="ln2310"> </a>
+<a name="ln2311">		// and then try again</a>
+<a name="ln2312">		result = heap_memalign(sHeaps[heapIndex], alignment, size);</a>
+<a name="ln2313">	} else if (shouldGrow) {</a>
+<a name="ln2314">		// should grow sometime soon, notify the grower</a>
+<a name="ln2315">		release_sem_etc(sHeapGrowSem, 1, B_DO_NOT_RESCHEDULE);</a>
+<a name="ln2316">	}</a>
+<a name="ln2317"> </a>
+<a name="ln2318">	if (result == NULL)</a>
+<a name="ln2319">		panic(&quot;heap: kernel heap has run out of memory\n&quot;);</a>
+<a name="ln2320">	return result;</a>
+<a name="ln2321">}</a>
+<a name="ln2322"> </a>
+<a name="ln2323"> </a>
+<a name="ln2324">void *</a>
+<a name="ln2325">memalign_etc(size_t alignment, size_t size, uint32 flags)</a>
+<a name="ln2326">{</a>
+<a name="ln2327">	if ((flags &amp; HEAP_PRIORITY_VIP) != 0)</a>
+<a name="ln2328">		return heap_memalign(sVIPHeap, alignment, size);</a>
+<a name="ln2329"> </a>
+<a name="ln2330">	if ((flags &amp; (HEAP_DONT_WAIT_FOR_MEMORY | HEAP_DONT_LOCK_KERNEL_SPACE))</a>
+<a name="ln2331">			!= 0) {</a>
+<a name="ln2332">		return memalign_nogrow(alignment, size);</a>
+<a name="ln2333">	}</a>
+<a name="ln2334"> </a>
+<a name="ln2335">	return memalign(alignment, size);</a>
+<a name="ln2336">}</a>
+<a name="ln2337"> </a>
+<a name="ln2338"> </a>
+<a name="ln2339">void</a>
+<a name="ln2340">free_etc(void *address, uint32 flags)</a>
+<a name="ln2341">{</a>
+<a name="ln2342">	if ((flags &amp; HEAP_PRIORITY_VIP) != 0)</a>
+<a name="ln2343">		heap_free(sVIPHeap, address);</a>
+<a name="ln2344">	else</a>
+<a name="ln2345">		free(address);</a>
+<a name="ln2346">}</a>
+<a name="ln2347"> </a>
+<a name="ln2348"> </a>
+<a name="ln2349">void *</a>
+<a name="ln2350">malloc(size_t size)</a>
+<a name="ln2351">{</a>
+<a name="ln2352">	return memalign(0, size);</a>
+<a name="ln2353">}</a>
+<a name="ln2354"> </a>
+<a name="ln2355"> </a>
+<a name="ln2356">void</a>
+<a name="ln2357">free(void *address)</a>
+<a name="ln2358">{</a>
+<a name="ln2359">	if (!gKernelStartup &amp;&amp; !are_interrupts_enabled()) {</a>
+<a name="ln2360">		panic(&quot;free(): called with interrupts disabled\n&quot;);</a>
+<a name="ln2361">		return;</a>
+<a name="ln2362">	}</a>
+<a name="ln2363"> </a>
+<a name="ln2364">	int32 offset = smp_get_current_cpu() * HEAP_CLASS_COUNT;</a>
+<a name="ln2365">	for (uint32 i = 0; i &lt; sHeapCount; i++) {</a>
+<a name="ln2366">		heap_allocator *heap = sHeaps[(i + offset) % sHeapCount];</a>
+<a name="ln2367">		if (heap_free(heap, address) == B_OK) {</a>
+<a name="ln2368">#if PARANOID_HEAP_VALIDATION</a>
+<a name="ln2369">			heap_validate_heap(heap);</a>
+<a name="ln2370">#endif</a>
+<a name="ln2371">			return;</a>
+<a name="ln2372">		}</a>
+<a name="ln2373">	}</a>
+<a name="ln2374"> </a>
+<a name="ln2375">	// maybe it was allocated from the dedicated grow heap</a>
+<a name="ln2376">	if (heap_free(sGrowHeap, address) == B_OK)</a>
+<a name="ln2377">		return;</a>
+<a name="ln2378"> </a>
+<a name="ln2379">	// or maybe it was allocated from the VIP heap</a>
+<a name="ln2380">	if (heap_free(sVIPHeap, address) == B_OK)</a>
+<a name="ln2381">		return;</a>
+<a name="ln2382"> </a>
+<a name="ln2383">	// or maybe it was a huge allocation using an area</a>
+<a name="ln2384">	area_info areaInfo;</a>
+<a name="ln2385">	area_id area = area_for(address);</a>
+<a name="ln2386">	if (area &gt;= B_OK &amp;&amp; get_area_info(area, &amp;areaInfo) == B_OK) {</a>
+<a name="ln2387">		area_allocation_info *info = (area_allocation_info *)areaInfo.address;</a>
+<a name="ln2388"> </a>
+<a name="ln2389">		// just make extra sure it was allocated by us</a>
+<a name="ln2390">		if (info-&gt;magic == kAreaAllocationMagic &amp;&amp; info-&gt;area == area</a>
+<a name="ln2391">			&amp;&amp; info-&gt;size == areaInfo.size &amp;&amp; info-&gt;base == areaInfo.address</a>
+<a name="ln2392">			&amp;&amp; info-&gt;allocation_size &lt; areaInfo.size) {</a>
+<a name="ln2393">			delete_area(area);</a>
+<a name="ln2394">			TRACE((&quot;free(): freed huge allocation by deleting area %ld\n&quot;,</a>
+<a name="ln2395">				area));</a>
+<a name="ln2396">			return;</a>
+<a name="ln2397">		}</a>
+<a name="ln2398">	}</a>
+<a name="ln2399"> </a>
+<a name="ln2400">	panic(&quot;free(): free failed for address %p\n&quot;, address);</a>
+<a name="ln2401">}</a>
+<a name="ln2402"> </a>
+<a name="ln2403"> </a>
+<a name="ln2404">void *</a>
+<a name="ln2405">realloc(void *address, size_t newSize)</a>
+<a name="ln2406">{</a>
+<a name="ln2407">	if (!gKernelStartup &amp;&amp; !are_interrupts_enabled()) {</a>
+<a name="ln2408">		panic(&quot;realloc(): called with interrupts disabled\n&quot;);</a>
+<a name="ln2409">		return NULL;</a>
+<a name="ln2410">	}</a>
+<a name="ln2411"> </a>
+<a name="ln2412">	if (address == NULL)</a>
+<a name="ln2413">		return memalign(0, newSize);</a>
+<a name="ln2414"> </a>
+<a name="ln2415">	if (newSize == 0) {</a>
+<a name="ln2416">		free(address);</a>
+<a name="ln2417">		return NULL;</a>
+<a name="ln2418">	}</a>
+<a name="ln2419"> </a>
+<a name="ln2420">	void *newAddress = NULL;</a>
+<a name="ln2421">	int32 offset = smp_get_current_cpu() * HEAP_CLASS_COUNT;</a>
+<a name="ln2422">	for (uint32 i = 0; i &lt; sHeapCount; i++) {</a>
+<a name="ln2423">		heap_allocator *heap = sHeaps[(i + offset) % sHeapCount];</a>
+<a name="ln2424">		if (heap_realloc(heap, address, &amp;newAddress, newSize) == B_OK) {</a>
+<a name="ln2425">#if PARANOID_HEAP_VALIDATION</a>
+<a name="ln2426">			heap_validate_heap(heap);</a>
+<a name="ln2427">#endif</a>
+<a name="ln2428">			return newAddress;</a>
+<a name="ln2429">		}</a>
+<a name="ln2430">	}</a>
+<a name="ln2431"> </a>
+<a name="ln2432">	// maybe it was allocated from the dedicated grow heap</a>
+<a name="ln2433">	if (heap_realloc(sGrowHeap, address, &amp;newAddress, newSize) == B_OK)</a>
+<a name="ln2434">		return newAddress;</a>
+<a name="ln2435"> </a>
+<a name="ln2436">	// or maybe it was a huge allocation using an area</a>
+<a name="ln2437">	area_info areaInfo;</a>
+<a name="ln2438">	area_id area = area_for(address);</a>
+<a name="ln2439">	if (area &gt;= B_OK &amp;&amp; get_area_info(area, &amp;areaInfo) == B_OK) {</a>
+<a name="ln2440">		area_allocation_info *info = (area_allocation_info *)areaInfo.address;</a>
+<a name="ln2441"> </a>
+<a name="ln2442">		// just make extra sure it was allocated by us</a>
+<a name="ln2443">		if (info-&gt;magic == kAreaAllocationMagic &amp;&amp; info-&gt;area == area</a>
+<a name="ln2444">			&amp;&amp; info-&gt;size == areaInfo.size &amp;&amp; info-&gt;base == areaInfo.address</a>
+<a name="ln2445">			&amp;&amp; info-&gt;allocation_size &lt; areaInfo.size) {</a>
+<a name="ln2446">			size_t available = info-&gt;size - ((addr_t)info-&gt;allocation_base</a>
+<a name="ln2447">				- (addr_t)info-&gt;base);</a>
+<a name="ln2448"> </a>
+<a name="ln2449">			if (available &gt;= newSize) {</a>
+<a name="ln2450">				// there is enough room available for the newSize</a>
+<a name="ln2451">				TRACE((&quot;realloc(): new size %ld fits in old area %ld with %ld &quot;</a>
+<a name="ln2452">					&quot;available\n&quot;, newSize, area, available));</a>
+<a name="ln2453">				info-&gt;allocation_size = newSize;</a>
+<a name="ln2454">				return address;</a>
+<a name="ln2455">			}</a>
+<a name="ln2456"> </a>
+<a name="ln2457">			// have to allocate/copy/free - TODO maybe resize the area instead?</a>
+<a name="ln2458">			newAddress = memalign(0, newSize);</a>
+<a name="ln2459">			if (newAddress == NULL) {</a>
+<a name="ln2460">				dprintf(&quot;realloc(): failed to allocate new block of %ld bytes\n&quot;,</a>
+<a name="ln2461">					newSize);</a>
+<a name="ln2462">				return NULL;</a>
+<a name="ln2463">			}</a>
+<a name="ln2464"> </a>
+<a name="ln2465">			memcpy(newAddress, address, min_c(newSize, info-&gt;allocation_size));</a>
+<a name="ln2466">			delete_area(area);</a>
+<a name="ln2467">			TRACE((&quot;realloc(): allocated new block %p for size %ld and deleted &quot;</a>
+<a name="ln2468">				&quot;old area %ld\n&quot;, newAddress, newSize, area));</a>
+<a name="ln2469">			return newAddress;</a>
+<a name="ln2470">		}</a>
+<a name="ln2471">	}</a>
+<a name="ln2472"> </a>
+<a name="ln2473">	panic(&quot;realloc(): failed to realloc address %p to size %lu\n&quot;, address,</a>
+<a name="ln2474">		newSize);</a>
+<a name="ln2475">	return NULL;</a>
+<a name="ln2476">}</a>
+<a name="ln2477"> </a>
+<a name="ln2478"> </a>
+<a name="ln2479">#endif	// USE_DEBUG_HEAP_FOR_MALLOC</a>
+<a name="ln2480"> </a>
+<a name="ln2481"> </a>
+<a name="ln2482">void *</a>
+<a name="ln2483">calloc(size_t numElements, size_t size)</a>
+<a name="ln2484">{</a>
+<a name="ln2485">	void *address = memalign(0, numElements * size);</a>
+<a name="ln2486">	if (address != NULL)</a>
+<a name="ln2487">		memset(address, 0, numElements * size);</a>
+<a name="ln2488"> </a>
+<a name="ln2489">	return address;</a>
+<a name="ln2490">}</a>
+<a name="ln2491"> </a>
+<a name="ln2492"> </a>
+<a name="ln2493">void</a>
+<a name="ln2494">deferred_free(void *block)</a>
+<a name="ln2495">{</a>
+<a name="ln2496">	if (block == NULL)</a>
+<a name="ln2497">		return;</a>
+<a name="ln2498"> </a>
+<a name="ln2499">	DeferredFreeListEntry *entry = new(block) DeferredFreeListEntry;</a>
+<a name="ln2500"> </a>
+<a name="ln2501">	InterruptsSpinLocker _(sDeferredFreeListLock);</a>
+<a name="ln2502">	sDeferredFreeList.Add(entry);</a>
+<a name="ln2503">}</a>
+<a name="ln2504"> </a>
+<a name="ln2505"> </a>
+<a name="ln2506">void *</a>
+<a name="ln2507">malloc_referenced(size_t size)</a>
+<a name="ln2508">{</a>
+<a name="ln2509">	int32 *referencedData = (int32 *)malloc(size + 4);</a>
+<a name="ln2510">	if (referencedData == NULL)</a>
+<a name="ln2511">		return NULL;</a>
+<a name="ln2512"> </a>
+<a name="ln2513">	*referencedData = 1;</a>
+<a name="ln2514">	return referencedData + 1;</a>
+<a name="ln2515">}</a>
+<a name="ln2516"> </a>
+<a name="ln2517"> </a>
+<a name="ln2518">void *</a>
+<a name="ln2519">malloc_referenced_acquire(void *data)</a>
+<a name="ln2520">{</a>
+<a name="ln2521">	if (data != NULL) {</a>
+<a name="ln2522">		int32 *referencedData = (int32 *)data - 1;</a>
+<a name="ln2523">		atomic_add(referencedData, 1);</a>
+<a name="ln2524">	}</a>
+<a name="ln2525"> </a>
+<a name="ln2526">	return data;</a>
+<a name="ln2527">}</a>
+<a name="ln2528"> </a>
+<a name="ln2529"> </a>
+<a name="ln2530">void</a>
+<a name="ln2531">malloc_referenced_release(void *data)</a>
+<a name="ln2532">{</a>
+<a name="ln2533">	if (data == NULL)</a>
+<a name="ln2534">		return;</a>
+<a name="ln2535"> </a>
+<a name="ln2536">	int32 *referencedData = (int32 *)data - 1;</a>
+<a name="ln2537">	if (atomic_add(referencedData, -1) &lt; 1)</a>
+<a name="ln2538">		free(referencedData);</a>
+<a name="ln2539">}</a>
+<a name="ln2540"> </a>
+<a name="ln2541"> </a>
+<a name="ln2542">DeferredDeletable::~DeferredDeletable()</a>
+<a name="ln2543">{</a>
+<a name="ln2544">}</a>
+<a name="ln2545"> </a>
+<a name="ln2546"> </a>
+<a name="ln2547">void</a>
+<a name="ln2548">deferred_delete(DeferredDeletable *deletable)</a>
+<a name="ln2549">{</a>
+<a name="ln2550">	if (deletable == NULL)</a>
+<a name="ln2551">		return;</a>
+<a name="ln2552"> </a>
+<a name="ln2553">	InterruptsSpinLocker _(sDeferredFreeListLock);</a>
+<a name="ln2554">	sDeferredDeletableList.Add(deletable);</a>
+<a name="ln2555">}</a>
+
+</code></pre>
+<div class="balloon" rel="2485"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v575/" target="_blank">V575</a> The 'memalign' function processes '0' elements. Inspect the first argument.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

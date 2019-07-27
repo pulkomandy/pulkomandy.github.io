@@ -1,0 +1,597 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>Inode.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2017, Chế Vũ Gia Hy, cvghy116@gmail.com.</a>
+<a name="ln3"> * Copyright 2011, Jérôme Duval, korli@users.berlios.de.</a>
+<a name="ln4"> * Copyright 2008-2014, Axel Dörfler, axeld@pinc-software.de.</a>
+<a name="ln5"> * Copyright 2005-2007, Ingo Weinhold, bonefish@cs.tu-berlin.de.</a>
+<a name="ln6"> * This file may be used under the terms of the MIT License.</a>
+<a name="ln7"> */</a>
+<a name="ln8"> </a>
+<a name="ln9"> </a>
+<a name="ln10">#include &quot;Inode.h&quot;</a>
+<a name="ln11">#include &quot;CachedBlock.h&quot;</a>
+<a name="ln12">#include &quot;CRCTable.h&quot;</a>
+<a name="ln13">#include &quot;Utility.h&quot;</a>
+<a name="ln14"> </a>
+<a name="ln15"> </a>
+<a name="ln16">#undef ASSERT</a>
+<a name="ln17">//#define TRACE_BTRFS</a>
+<a name="ln18">#ifdef TRACE_BTRFS</a>
+<a name="ln19">#	define TRACE(x...) dprintf(&quot;\33[34mbtrfs:\33[0m &quot; x)</a>
+<a name="ln20">#	define ASSERT(x) { if (!(x)) kernel_debugger(&quot;btrfs: assert failed: &quot; #x &quot;\n&quot;); }</a>
+<a name="ln21">#else</a>
+<a name="ln22">#	define TRACE(x...) ;</a>
+<a name="ln23">#	define ASSERT(x) ;</a>
+<a name="ln24">#endif</a>
+<a name="ln25">#define ERROR(x...) dprintf(&quot;\33[34mbtrfs:\33[0m &quot; x)</a>
+<a name="ln26"> </a>
+<a name="ln27"> </a>
+<a name="ln28">Inode::Inode(Volume* volume, ino_t id)</a>
+<a name="ln29">	:</a>
+<a name="ln30">	fVolume(volume),</a>
+<a name="ln31">	fID(id),</a>
+<a name="ln32">	fCache(NULL),</a>
+<a name="ln33">	fMap(NULL)</a>
+<a name="ln34">{</a>
+<a name="ln35">	rw_lock_init(&amp;fLock, &quot;btrfs inode&quot;);</a>
+<a name="ln36"> </a>
+<a name="ln37">	fInitStatus = UpdateNodeFromDisk();</a>
+<a name="ln38">	if (fInitStatus == B_OK) {</a>
+<a name="ln39">		if (!IsDirectory() &amp;&amp; !IsSymLink()) {</a>
+<a name="ln40">			fCache = file_cache_create(fVolume-&gt;ID(), ID(), Size());</a>
+<a name="ln41">			fMap = file_map_create(fVolume-&gt;ID(), ID(), Size());</a>
+<a name="ln42">		}</a>
+<a name="ln43">	}</a>
+<a name="ln44">}</a>
+<a name="ln45"> </a>
+<a name="ln46"> </a>
+<a name="ln47">Inode::Inode(Volume* volume, ino_t id, const btrfs_inode&amp; item)</a>
+<a name="ln48">	:</a>
+<a name="ln49">	fVolume(volume),</a>
+<a name="ln50">	fID(id),</a>
+<a name="ln51">	fCache(NULL),</a>
+<a name="ln52">	fMap(NULL),</a>
+<a name="ln53">	fInitStatus(B_OK),</a>
+<a name="ln54">	fNode(item)</a>
+<a name="ln55">{</a>
+<a name="ln56">	if (!IsDirectory() &amp;&amp; !IsSymLink()) {</a>
+<a name="ln57">		fCache = file_cache_create(fVolume-&gt;ID(), ID(), Size());</a>
+<a name="ln58">		fMap = file_map_create(fVolume-&gt;ID(), ID(), Size());</a>
+<a name="ln59">	}</a>
+<a name="ln60">}</a>
+<a name="ln61"> </a>
+<a name="ln62"> </a>
+<a name="ln63">Inode::Inode(Volume* volume)</a>
+<a name="ln64">	:</a>
+<a name="ln65">	fVolume(volume),</a>
+<a name="ln66">	fID(0),</a>
+<a name="ln67">	fCache(NULL),</a>
+<a name="ln68">	fMap(NULL),</a>
+<a name="ln69">	fInitStatus(B_NO_INIT)</a>
+<a name="ln70">{</a>
+<a name="ln71">	rw_lock_init(&amp;fLock, &quot;btrfs inode&quot;);</a>
+<a name="ln72">}</a>
+<a name="ln73"> </a>
+<a name="ln74"> </a>
+<a name="ln75">Inode::~Inode()</a>
+<a name="ln76">{</a>
+<a name="ln77">	TRACE(&quot;Inode destructor\n&quot;);</a>
+<a name="ln78">	file_cache_delete(FileCache());</a>
+<a name="ln79">	file_map_delete(Map());</a>
+<a name="ln80">	TRACE(&quot;Inode destructor: Done\n&quot;);</a>
+<a name="ln81">}</a>
+<a name="ln82"> </a>
+<a name="ln83"> </a>
+<a name="ln84">status_t</a>
+<a name="ln85">Inode::InitCheck()</a>
+<a name="ln86">{</a>
+<a name="ln87">	return fInitStatus;</a>
+<a name="ln88">}</a>
+<a name="ln89"> </a>
+<a name="ln90"> </a>
+<a name="ln91">status_t</a>
+<a name="ln92">Inode::UpdateNodeFromDisk()</a>
+<a name="ln93">{</a>
+<a name="ln94">	btrfs_key search_key;</a>
+<a name="ln95">	search_key.SetType(BTRFS_KEY_TYPE_INODE_ITEM);</a>
+<a name="ln96">	search_key.SetObjectID(fID);</a>
+<a name="ln97">	search_key.SetOffset(0);</a>
+<a name="ln98">	BTree::Path path(fVolume-&gt;FSTree());</a>
+<a name="ln99"> </a>
+<a name="ln100">	btrfs_inode* node;</a>
+<a name="ln101">	if (fVolume-&gt;FSTree()-&gt;FindExact(&amp;path, search_key, (void**)&amp;node)</a>
+<a name="ln102">		!= B_OK) {</a>
+<a name="ln103">		ERROR(&quot;Inode::UpdateNodeFromDisk(): Couldn't find inode %&quot;</a>
+<a name="ln104">			B_PRIdINO &quot;\n&quot;, fID);</a>
+<a name="ln105">		return B_ENTRY_NOT_FOUND;</a>
+<a name="ln106">	}</a>
+<a name="ln107"> </a>
+<a name="ln108">	memcpy(&amp;fNode, node, sizeof(btrfs_inode));</a>
+<a name="ln109">	free(node);</a>
+<a name="ln110">	return B_OK;</a>
+<a name="ln111">}</a>
+<a name="ln112"> </a>
+<a name="ln113"> </a>
+<a name="ln114">/*</a>
+<a name="ln115"> * Create new Inode object with inode_item</a>
+<a name="ln116"> */</a>
+<a name="ln117">Inode*</a>
+<a name="ln118">Inode::Create(Transaction&amp; transaction, ino_t id, Inode* parent, int32 mode,</a>
+<a name="ln119">	uint64 size, uint64 flags)</a>
+<a name="ln120">{</a>
+<a name="ln121">	TRACE(&quot;Inode::Create() id % &quot; B_PRIu64 &quot; mode %&quot; B_PRId32 &quot; flags %&quot;</a>
+<a name="ln122">		B_PRIu64&quot;\n&quot;, id, flags, mode);</a>
+<a name="ln123"> </a>
+<a name="ln124">	Volume* volume = parent != NULL ?</a>
+<a name="ln125">		parent-&gt;GetVolume() : transaction.GetJournal()-&gt;GetVolume();</a>
+<a name="ln126">	uint64 nbytes = size;	// allocated size</a>
+<a name="ln127">	if (size &gt; volume-&gt;MaxInlineSize())</a>
+<a name="ln128">		nbytes = (size / volume-&gt;SectorSize() + 1) * volume-&gt;SectorSize();</a>
+<a name="ln129"> </a>
+<a name="ln130">	btrfs_inode inode;</a>
+<a name="ln131"> </a>
+<a name="ln132">	inode.generation = B_HOST_TO_LENDIAN_INT64(transaction.SystemID());</a>
+<a name="ln133">	inode.transaction_id = B_HOST_TO_LENDIAN_INT64(transaction.SystemID());</a>
+<a name="ln134">	inode.size = B_HOST_TO_LENDIAN_INT64(size);</a>
+<a name="ln135">	inode.nbytes = B_HOST_TO_LENDIAN_INT64(nbytes);</a>
+<a name="ln136">	inode.blockgroup = 0;	// normal inode only</a>
+<a name="ln137">	inode.num_links = B_HOST_TO_LENDIAN_INT32(1);</a>
+<a name="ln138">	inode.uid = B_HOST_TO_LENDIAN_INT32(geteuid());</a>
+<a name="ln139">	inode.gid = B_HOST_TO_LENDIAN_INT32(parent != NULL ?</a>
+<a name="ln140">		parent-&gt;GroupID() : getegid());</a>
+<a name="ln141">	inode.mode = B_HOST_TO_LENDIAN_INT32(mode);;</a>
+<a name="ln142">	inode.rdev = 0;	// normal file only</a>
+<a name="ln143">	inode.flags = B_HOST_TO_LENDIAN_INT64(flags);</a>
+<a name="ln144">	inode.sequence = 0;	// incremented each time mtime value is changed</a>
+<a name="ln145"> </a>
+<a name="ln146">	uint64 now = real_time_clock_usecs();</a>
+<a name="ln147">	struct timespec timespec;</a>
+<a name="ln148">	timespec.tv_sec = now / 1000000;</a>
+<a name="ln149">	timespec.tv_nsec = (now % 1000000) * 1000;</a>
+<a name="ln150">	btrfs_inode::SetTime(inode.access_time, timespec);</a>
+<a name="ln151">	btrfs_inode::SetTime(inode.creation_time, timespec);</a>
+<a name="ln152">	btrfs_inode::SetTime(inode.change_time, timespec);</a>
+<a name="ln153">	btrfs_inode::SetTime(inode.modification_time, timespec);</a>
+<a name="ln154"> </a>
+<a name="ln155">	return new Inode(volume, id, inode);</a>
+<a name="ln156">}</a>
+<a name="ln157"> </a>
+<a name="ln158"> </a>
+<a name="ln159">status_t</a>
+<a name="ln160">Inode::CheckPermissions(int accessMode) const</a>
+<a name="ln161">{</a>
+<a name="ln162">	// you never have write access to a read-only volume</a>
+<a name="ln163">	if ((accessMode &amp; W_OK) != 0 &amp;&amp; fVolume-&gt;IsReadOnly())</a>
+<a name="ln164">		return B_READ_ONLY_DEVICE;</a>
+<a name="ln165"> </a>
+<a name="ln166">	return check_access_permissions(accessMode, Mode(), (gid_t)fNode.GroupID(),</a>
+<a name="ln167">		(uid_t)fNode.UserID());</a>
+<a name="ln168">}</a>
+<a name="ln169"> </a>
+<a name="ln170"> </a>
+<a name="ln171">status_t</a>
+<a name="ln172">Inode::FindBlock(off_t pos, off_t&amp; physical, off_t* _length)</a>
+<a name="ln173">{</a>
+<a name="ln174">	btrfs_key search_key;</a>
+<a name="ln175">	search_key.SetType(BTRFS_KEY_TYPE_EXTENT_DATA);</a>
+<a name="ln176">	search_key.SetObjectID(fID);</a>
+<a name="ln177">	search_key.SetOffset(pos + 1);</a>
+<a name="ln178">	BTree::Path path(fVolume-&gt;FSTree());</a>
+<a name="ln179"> </a>
+<a name="ln180">	btrfs_extent_data* extent_data;</a>
+<a name="ln181">	status_t status = fVolume-&gt;FSTree()-&gt;FindPrevious(&amp;path, search_key,</a>
+<a name="ln182">		(void**)&amp;extent_data);</a>
+<a name="ln183">	if (status != B_OK) {</a>
+<a name="ln184">		ERROR(&quot;Inode::FindBlock(): Couldn't find extent_data 0x%&quot; B_PRIx32</a>
+<a name="ln185">			&quot;\n&quot;, status);</a>
+<a name="ln186">		return status;</a>
+<a name="ln187">	}</a>
+<a name="ln188"> </a>
+<a name="ln189">	TRACE(&quot;Inode::FindBlock(%&quot; B_PRIdINO &quot;) key.Offset() %&quot; B_PRId64 &quot;\n&quot;,</a>
+<a name="ln190">		ID(), search_key.Offset());</a>
+<a name="ln191"> </a>
+<a name="ln192">	off_t diff = pos - search_key.Offset();</a>
+<a name="ln193">	off_t logical = 0;</a>
+<a name="ln194">	if (extent_data-&gt;Type() == BTRFS_EXTENT_DATA_REGULAR)</a>
+<a name="ln195">		logical = diff + extent_data-&gt;disk_offset;</a>
+<a name="ln196">	else</a>
+<a name="ln197">		panic(&quot;unknown extent type; %d\n&quot;, extent_data-&gt;Type());</a>
+<a name="ln198">	status = fVolume-&gt;FindBlock(logical, physical);</a>
+<a name="ln199">	if (_length != NULL)</a>
+<a name="ln200">		*_length = extent_data-&gt;Size() - diff;</a>
+<a name="ln201">	TRACE(&quot;Inode::FindBlock(%&quot; B_PRIdINO &quot;) %&quot; B_PRIdOFF &quot; physical %&quot;</a>
+<a name="ln202">		B_PRIdOFF &quot;\n&quot;, ID(), pos, physical);</a>
+<a name="ln203"> </a>
+<a name="ln204">	free(extent_data);</a>
+<a name="ln205">	return status;</a>
+<a name="ln206">}</a>
+<a name="ln207"> </a>
+<a name="ln208"> </a>
+<a name="ln209">status_t</a>
+<a name="ln210">Inode::ReadAt(off_t pos, uint8* buffer, size_t* _length)</a>
+<a name="ln211">{</a>
+<a name="ln212">	size_t length = *_length;</a>
+<a name="ln213"> </a>
+<a name="ln214">	// set/check boundaries for pos/length</a>
+<a name="ln215">	if (pos &lt; 0) {</a>
+<a name="ln216">		ERROR(&quot;inode %&quot; B_PRIdINO &quot;: ReadAt failed(pos %&quot; B_PRIdOFF</a>
+<a name="ln217">			&quot;, length %lu)\n&quot;, ID(), pos, length);</a>
+<a name="ln218">		return B_BAD_VALUE;</a>
+<a name="ln219">	}</a>
+<a name="ln220"> </a>
+<a name="ln221">	if (pos &gt;= Size() || length == 0) {</a>
+<a name="ln222">		TRACE(&quot;inode %&quot; B_PRIdINO &quot;: ReadAt 0 (pos %&quot; B_PRIdOFF</a>
+<a name="ln223">			&quot;, length %lu)\n&quot;, ID(), pos, length);</a>
+<a name="ln224">		*_length = 0;</a>
+<a name="ln225">		return B_NO_ERROR;</a>
+<a name="ln226">	}</a>
+<a name="ln227"> </a>
+<a name="ln228">	// the file cache doesn't seem to like non block aligned file offset</a>
+<a name="ln229">	// so we avoid the file cache for inline extents</a>
+<a name="ln230">	btrfs_key search_key;</a>
+<a name="ln231">	search_key.SetType(BTRFS_KEY_TYPE_EXTENT_DATA);</a>
+<a name="ln232">	search_key.SetObjectID(fID);</a>
+<a name="ln233">	search_key.SetOffset(pos + 1);</a>
+<a name="ln234">	BTree::Path path(fVolume-&gt;FSTree());</a>
+<a name="ln235"> </a>
+<a name="ln236">	uint32 item_size;</a>
+<a name="ln237">	btrfs_extent_data* extent_data;</a>
+<a name="ln238">	status_t status = fVolume-&gt;FSTree()-&gt;FindPrevious(&amp;path, search_key,</a>
+<a name="ln239">		(void**)&amp;extent_data, &amp;item_size);</a>
+<a name="ln240">	if (status != B_OK) {</a>
+<a name="ln241">		ERROR(&quot;Inode::FindBlock(): Couldn't find extent_data 0x%&quot; B_PRIx32</a>
+<a name="ln242">			&quot;\n&quot;, status);</a>
+<a name="ln243">		return status;</a>
+<a name="ln244">	}</a>
+<a name="ln245">	MemoryDeleter deleter(extent_data);</a>
+<a name="ln246"> </a>
+<a name="ln247"> </a>
+<a name="ln248">	uint8 compression = extent_data-&gt;Compression();</a>
+<a name="ln249">	if (FileCache() != NULL</a>
+<a name="ln250">		&amp;&amp; extent_data-&gt;Type() == BTRFS_EXTENT_DATA_REGULAR) {</a>
+<a name="ln251">		TRACE(&quot;inode %&quot; B_PRIdINO &quot;: ReadAt cache (pos %&quot; B_PRIdOFF &quot;, length %lu)\n&quot;,</a>
+<a name="ln252">			ID(), pos, length);</a>
+<a name="ln253">		if (compression == BTRFS_EXTENT_COMPRESS_NONE)</a>
+<a name="ln254">			return file_cache_read(FileCache(), NULL, pos, buffer, _length);</a>
+<a name="ln255">		else if (compression == BTRFS_EXTENT_COMPRESS_ZLIB)</a>
+<a name="ln256">			panic(&quot;zlib isn't unsupported for regular extent\n&quot;);</a>
+<a name="ln257">		else</a>
+<a name="ln258">			panic(&quot;unknown extent compression; %d\n&quot;, compression);</a>
+<a name="ln259">		return B_BAD_DATA;</a>
+<a name="ln260">	}</a>
+<a name="ln261"> </a>
+<a name="ln262">	TRACE(&quot;Inode::ReadAt(%&quot; B_PRIdINO &quot;) key.Offset() %&quot; B_PRId64 &quot;\n&quot;, ID(),</a>
+<a name="ln263">		search_key.Offset());</a>
+<a name="ln264"> </a>
+<a name="ln265">	off_t diff = pos - search_key.Offset();</a>
+<a name="ln266">	if (extent_data-&gt;Type() != BTRFS_EXTENT_DATA_INLINE) {</a>
+<a name="ln267">		panic(&quot;unknown extent type; %d\n&quot;, extent_data-&gt;Type());</a>
+<a name="ln268">		return B_BAD_DATA;</a>
+<a name="ln269">	}</a>
+<a name="ln270"> </a>
+<a name="ln271">	*_length = min_c(extent_data-&gt;Size() - diff, *_length);</a>
+<a name="ln272">	if (compression == BTRFS_EXTENT_COMPRESS_NONE)</a>
+<a name="ln273">		memcpy(buffer, extent_data-&gt;inline_data, *_length);</a>
+<a name="ln274">	else if (compression == BTRFS_EXTENT_COMPRESS_ZLIB) {</a>
+<a name="ln275">		char in[2048];</a>
+<a name="ln276">		z_stream zStream = {</a>
+<a name="ln277">			(Bytef*)in,		// next in</a>
+<a name="ln278">			sizeof(in),		// avail in</a>
+<a name="ln279">			0,				// total in</a>
+<a name="ln280">			NULL,			// next out</a>
+<a name="ln281">			0,				// avail out</a>
+<a name="ln282">			0,				// total out</a>
+<a name="ln283">			0,				// msg</a>
+<a name="ln284">			0,				// state</a>
+<a name="ln285">			Z_NULL,			// zalloc</a>
+<a name="ln286">			Z_NULL,			// zfree</a>
+<a name="ln287">			Z_NULL,			// opaque</a>
+<a name="ln288">			0,				// data type</a>
+<a name="ln289">			0,				// adler</a>
+<a name="ln290">			0,				// reserved</a>
+<a name="ln291">		};</a>
+<a name="ln292"> </a>
+<a name="ln293">		int status;</a>
+<a name="ln294">		ssize_t offset = 0;</a>
+<a name="ln295">		uint32 inline_size = item_size - 13;</a>
+<a name="ln296">		bool headerRead = false;</a>
+<a name="ln297"> </a>
+<a name="ln298">		TRACE(&quot;Inode::ReadAt(%&quot; B_PRIdINO &quot;) diff %&quot; B_PRIdOFF &quot; size %&quot;</a>
+<a name="ln299">			B_PRIuSIZE &quot;\n&quot;, ID(), diff, item_size);</a>
+<a name="ln300"> </a>
+<a name="ln301">		do {</a>
+<a name="ln302">			ssize_t bytesRead = min_c(sizeof(in), inline_size - offset);</a>
+<a name="ln303">			memcpy(in, extent_data-&gt;inline_data + offset, bytesRead);</a>
+<a name="ln304">			if (bytesRead != (ssize_t)sizeof(in)) {</a>
+<a name="ln305">				if (bytesRead &lt;= 0) {</a>
+<a name="ln306">					status = Z_STREAM_ERROR;</a>
+<a name="ln307">					break;</a>
+<a name="ln308">				}</a>
+<a name="ln309">			}</a>
+<a name="ln310"> </a>
+<a name="ln311">			zStream.avail_in = bytesRead;</a>
+<a name="ln312">			zStream.next_in = (Bytef*)in;</a>
+<a name="ln313"> </a>
+<a name="ln314">			if (!headerRead) {</a>
+<a name="ln315">				headerRead = true;</a>
+<a name="ln316"> </a>
+<a name="ln317">				zStream.avail_out = length;</a>
+<a name="ln318">				zStream.next_out = (Bytef*)buffer;</a>
+<a name="ln319"> </a>
+<a name="ln320">				status = inflateInit2(&amp;zStream, 15);</a>
+<a name="ln321">				if (status != Z_OK) {</a>
+<a name="ln322">					return B_ERROR;</a>
+<a name="ln323">				}</a>
+<a name="ln324">			}</a>
+<a name="ln325"> </a>
+<a name="ln326">			status = inflate(&amp;zStream, Z_SYNC_FLUSH);</a>
+<a name="ln327">			offset += bytesRead;</a>
+<a name="ln328">			if (diff &gt; 0) {</a>
+<a name="ln329">				zStream.next_out -= max_c(bytesRead, diff);</a>
+<a name="ln330">				diff -= max_c(bytesRead, diff);</a>
+<a name="ln331">			}</a>
+<a name="ln332"> </a>
+<a name="ln333">			if (zStream.avail_in != 0 &amp;&amp; status != Z_STREAM_END) {</a>
+<a name="ln334">				TRACE(&quot;Inode::ReadAt() didn't read whole block: %s\n&quot;,</a>
+<a name="ln335">					zStream.msg);</a>
+<a name="ln336">			}</a>
+<a name="ln337">		} while (status == Z_OK);</a>
+<a name="ln338"> </a>
+<a name="ln339">		inflateEnd(&amp;zStream);</a>
+<a name="ln340"> </a>
+<a name="ln341">		if (status != Z_STREAM_END) {</a>
+<a name="ln342">			TRACE(&quot;Inode::ReadAt() inflating failed: %d!\n&quot;, status);</a>
+<a name="ln343">			return B_BAD_DATA;</a>
+<a name="ln344">		}</a>
+<a name="ln345"> </a>
+<a name="ln346">		*_length = zStream.total_out;</a>
+<a name="ln347"> </a>
+<a name="ln348">	} else {</a>
+<a name="ln349">		panic(&quot;unknown extent compression; %d\n&quot;, compression);</a>
+<a name="ln350">		return B_BAD_DATA;</a>
+<a name="ln351">	}</a>
+<a name="ln352">	return B_OK;</a>
+<a name="ln353"> </a>
+<a name="ln354">}</a>
+<a name="ln355"> </a>
+<a name="ln356"> </a>
+<a name="ln357">status_t</a>
+<a name="ln358">Inode::FindParent(ino_t* id)</a>
+<a name="ln359">{</a>
+<a name="ln360">	btrfs_key search_key;</a>
+<a name="ln361">	search_key.SetType(BTRFS_KEY_TYPE_INODE_REF);</a>
+<a name="ln362">	search_key.SetObjectID(fID);</a>
+<a name="ln363">	search_key.SetOffset(-1);</a>
+<a name="ln364">	BTree::Path path(fVolume-&gt;FSTree());</a>
+<a name="ln365"> </a>
+<a name="ln366">	void* node_ref;</a>
+<a name="ln367">	if (fVolume-&gt;FSTree()-&gt;FindPrevious(&amp;path, search_key, &amp;node_ref) != B_OK) {</a>
+<a name="ln368">		ERROR(&quot;Inode::FindParent(): Couldn't find inode for %&quot; B_PRIdINO &quot;\n&quot;,</a>
+<a name="ln369">			fID);</a>
+<a name="ln370">		return B_ERROR;</a>
+<a name="ln371">	}</a>
+<a name="ln372"> </a>
+<a name="ln373">	free(node_ref);</a>
+<a name="ln374">	*id = search_key.Offset();</a>
+<a name="ln375">	TRACE(&quot;Inode::FindParent() for %&quot; B_PRIdINO &quot;: %&quot; B_PRIdINO &quot;\n&quot;, fID,</a>
+<a name="ln376">		*id);</a>
+<a name="ln377"> </a>
+<a name="ln378">	return B_OK;</a>
+<a name="ln379">}</a>
+<a name="ln380"> </a>
+<a name="ln381"> </a>
+<a name="ln382">uint64</a>
+<a name="ln383">Inode::FindNextIndex(BTree::Path* path) const</a>
+<a name="ln384">{</a>
+<a name="ln385">	btrfs_key key;</a>
+<a name="ln386">	key.SetObjectID(fID);</a>
+<a name="ln387">	key.SetType(BTRFS_KEY_TYPE_DIR_INDEX);</a>
+<a name="ln388">	key.SetOffset(-1);</a>
+<a name="ln389"> </a>
+<a name="ln390">	if (fVolume-&gt;FSTree()-&gt;FindPrevious(path, key, NULL))</a>
+<a name="ln391">		return 2;		// not found any dir index item</a>
+<a name="ln392"> </a>
+<a name="ln393">	return key.Offset() + 1;</a>
+<a name="ln394">}</a>
+<a name="ln395"> </a>
+<a name="ln396"> </a>
+<a name="ln397">/* Insert inode_item</a>
+<a name="ln398"> */</a>
+<a name="ln399">status_t</a>
+<a name="ln400">Inode::Insert(Transaction&amp; transaction, BTree::Path* path)</a>
+<a name="ln401">{</a>
+<a name="ln402">	BTree* tree = path-&gt;Tree();</a>
+<a name="ln403"> </a>
+<a name="ln404">	btrfs_entry item;</a>
+<a name="ln405">	item.key.SetObjectID(fID);</a>
+<a name="ln406">	item.key.SetType(BTRFS_KEY_TYPE_INODE_ITEM);</a>
+<a name="ln407">	item.key.SetOffset(0);</a>
+<a name="ln408">	item.SetSize(sizeof(btrfs_inode));</a>
+<a name="ln409"> </a>
+<a name="ln410">	void* data[1];</a>
+<a name="ln411">	data[0] = (void*)&amp;fNode;</a>
+<a name="ln412">	status_t status = tree-&gt;InsertEntries(transaction, path, &amp;item, data, 1);</a>
+<a name="ln413">	if (status != B_OK)</a>
+<a name="ln414">		return status;</a>
+<a name="ln415"> </a>
+<a name="ln416">	return B_OK;</a>
+<a name="ln417">}</a>
+<a name="ln418"> </a>
+<a name="ln419"> </a>
+<a name="ln420">/* Remove inode_item</a>
+<a name="ln421"> */</a>
+<a name="ln422">status_t</a>
+<a name="ln423">Inode::Remove(Transaction&amp; transaction, BTree::Path* path)</a>
+<a name="ln424">{</a>
+<a name="ln425">	BTree* tree = path-&gt;Tree();</a>
+<a name="ln426">	btrfs_key key;</a>
+<a name="ln427">	key.SetObjectID(fID);</a>
+<a name="ln428">	key.SetType(BTRFS_KEY_TYPE_INODE_ITEM);</a>
+<a name="ln429">	key.SetOffset(0);</a>
+<a name="ln430">	status_t status = tree-&gt;RemoveEntries(transaction, path, key, NULL, 1);</a>
+<a name="ln431">	if (status != B_OK)</a>
+<a name="ln432">		return status;</a>
+<a name="ln433"> </a>
+<a name="ln434">	return B_OK;</a>
+<a name="ln435">}</a>
+<a name="ln436"> </a>
+<a name="ln437"> </a>
+<a name="ln438">/* Insert 3 items: inode_ref, dir_item, dir_index</a>
+<a name="ln439"> * Basically, make a link between name and its node (location)</a>
+<a name="ln440"> */</a>
+<a name="ln441">status_t</a>
+<a name="ln442">Inode::MakeReference(Transaction&amp; transaction, BTree::Path* path,</a>
+<a name="ln443">	Inode* parent, const char* name, int32 mode)</a>
+<a name="ln444">{</a>
+<a name="ln445">	BTree* tree = fVolume-&gt;FSTree();</a>
+<a name="ln446">	uint16 nameLength = strlen(name);</a>
+<a name="ln447">	uint64 index = parent-&gt;FindNextIndex(path);</a>
+<a name="ln448"> </a>
+<a name="ln449">	// insert inode_ref</a>
+<a name="ln450">	btrfs_inode_ref* inodeRef = (btrfs_inode_ref*)malloc(sizeof(btrfs_inode_ref)</a>
+<a name="ln451">		+ nameLength);</a>
+<a name="ln452">	if (inodeRef == NULL)</a>
+<a name="ln453">		return B_NO_MEMORY;</a>
+<a name="ln454">	inodeRef-&gt;index = index;</a>
+<a name="ln455">	inodeRef-&gt;SetName(name, nameLength);</a>
+<a name="ln456"> </a>
+<a name="ln457">	btrfs_entry entry;</a>
+<a name="ln458">	entry.key.SetObjectID(fID);</a>
+<a name="ln459">	entry.key.SetType(BTRFS_KEY_TYPE_INODE_REF);</a>
+<a name="ln460">	entry.key.SetOffset(parent-&gt;ID());</a>
+<a name="ln461">	entry.SetSize(inodeRef-&gt;Length());</a>
+<a name="ln462"> </a>
+<a name="ln463">	status_t status = tree-&gt;InsertEntries(transaction, path, &amp;entry,</a>
+<a name="ln464">		(void**)&amp;inodeRef, 1);</a>
+<a name="ln465">	free(inodeRef);</a>
+<a name="ln466">	if (status != B_OK)</a>
+<a name="ln467">		return status;</a>
+<a name="ln468"> </a>
+<a name="ln469">	// insert dir_entry</a>
+<a name="ln470">	uint32 hash = calculate_crc((uint32)~1, (uint8*)name, nameLength);</a>
+<a name="ln471">	btrfs_dir_entry* directoryEntry =</a>
+<a name="ln472">		(btrfs_dir_entry*)malloc(sizeof(btrfs_dir_entry) + nameLength);</a>
+<a name="ln473">	if (directoryEntry == NULL)</a>
+<a name="ln474">		return B_NO_MEMORY;</a>
+<a name="ln475">	directoryEntry-&gt;location.SetObjectID(fID);</a>
+<a name="ln476">	directoryEntry-&gt;location.SetType(BTRFS_KEY_TYPE_INODE_ITEM);</a>
+<a name="ln477">	directoryEntry-&gt;location.SetOffset(0);</a>
+<a name="ln478">	directoryEntry-&gt;SetTransactionID(transaction.SystemID());</a>
+<a name="ln479">	// TODO: xattribute, 0 for standard directory</a>
+<a name="ln480">	directoryEntry-&gt;SetName(name, nameLength);</a>
+<a name="ln481">	directoryEntry-&gt;SetAttributeData(NULL, 0);</a>
+<a name="ln482">	directoryEntry-&gt;type = get_filetype(mode);</a>
+<a name="ln483"> </a>
+<a name="ln484">	entry.key.SetObjectID(parent-&gt;ID());</a>
+<a name="ln485">	entry.key.SetType(BTRFS_KEY_TYPE_DIR_ITEM);</a>
+<a name="ln486">	entry.key.SetOffset(hash);</a>
+<a name="ln487">	entry.SetSize(directoryEntry-&gt;Length());</a>
+<a name="ln488"> </a>
+<a name="ln489">	status = tree-&gt;InsertEntries(transaction, path, &amp;entry,</a>
+<a name="ln490">		(void**)&amp;directoryEntry, 1);</a>
+<a name="ln491">	if (status != B_OK) {</a>
+<a name="ln492">		free(directoryEntry);</a>
+<a name="ln493">		return status;</a>
+<a name="ln494">	}</a>
+<a name="ln495"> </a>
+<a name="ln496">	// insert dir_index (has same data with dir_entry)</a>
+<a name="ln497">	entry.key.SetType(BTRFS_KEY_TYPE_DIR_INDEX);</a>
+<a name="ln498">	entry.key.SetOffset(index);</a>
+<a name="ln499"> </a>
+<a name="ln500">	status = tree-&gt;InsertEntries(transaction, path, &amp;entry,</a>
+<a name="ln501">		(void**)&amp;directoryEntry, 1);</a>
+<a name="ln502">	if (status != B_OK) {</a>
+<a name="ln503">		free(directoryEntry);</a>
+<a name="ln504">		return status;</a>
+<a name="ln505">	}</a>
+<a name="ln506"> </a>
+<a name="ln507">	free(directoryEntry);</a>
+<a name="ln508">	return B_OK;</a>
+<a name="ln509">}</a>
+<a name="ln510"> </a>
+<a name="ln511"> </a>
+<a name="ln512">// Remove the &quot;name&quot; and unlink it with inode.</a>
+<a name="ln513">status_t</a>
+<a name="ln514">Inode::Dereference(Transaction&amp; transaction, BTree::Path* path, ino_t parentID,</a>
+<a name="ln515">	const char* name)</a>
+<a name="ln516">{</a>
+<a name="ln517">	BTree* tree = path-&gt;Tree();</a>
+<a name="ln518"> </a>
+<a name="ln519">	// remove inode_ref item</a>
+<a name="ln520">	btrfs_key key;</a>
+<a name="ln521">	key.SetObjectID(fID);</a>
+<a name="ln522">	key.SetType(BTRFS_KEY_TYPE_INODE_REF);</a>
+<a name="ln523">	key.SetOffset(parentID);</a>
+<a name="ln524">	btrfs_inode_ref* inodeRef;</a>
+<a name="ln525">	status_t status = tree-&gt;RemoveEntries(transaction, path, key,</a>
+<a name="ln526">		(void**)&amp;inodeRef, 1);</a>
+<a name="ln527">	if (status != B_OK)</a>
+<a name="ln528">		return status;</a>
+<a name="ln529"> </a>
+<a name="ln530">	// remove dir_item</a>
+<a name="ln531">	uint32 hash = calculate_crc((uint32)~1, (uint8*)name, strlen(name));</a>
+<a name="ln532">	key.SetObjectID(parentID);</a>
+<a name="ln533">	key.SetType(BTRFS_KEY_TYPE_DIR_ITEM);</a>
+<a name="ln534">	key.SetOffset(hash);</a>
+<a name="ln535">	status = tree-&gt;RemoveEntries(transaction, path, key, NULL, 1);</a>
+<a name="ln536">	if (status != B_OK)</a>
+<a name="ln537">		return status;</a>
+<a name="ln538"> </a>
+<a name="ln539">	// remove dir_index</a>
+<a name="ln540">	uint64 index = inodeRef-&gt;Index();</a>
+<a name="ln541">	free(inodeRef);</a>
+<a name="ln542">	key.SetType(BTRFS_KEY_TYPE_DIR_INDEX);</a>
+<a name="ln543">	key.SetOffset(index);</a>
+<a name="ln544">	status = tree-&gt;RemoveEntries(transaction, path, key, NULL, 1);</a>
+<a name="ln545">	if (status != B_OK)</a>
+<a name="ln546">		return status;</a>
+<a name="ln547"> </a>
+<a name="ln548">	return B_OK;</a>
+<a name="ln549">}</a>
+
+</code></pre>
+<div class="balloon" rel="303"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v781/" target="_blank">V781</a> The value of the 'bytesRead' variable is checked after it was used. Perhaps there is a mistake in program logic. Check lines: 303, 305.</p></div>
+<div class="balloon" rel="47"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fLock.</p></div>
+<div class="balloon" rel="63"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fNode.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

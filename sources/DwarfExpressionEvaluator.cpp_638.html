@@ -1,0 +1,864 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>DwarfExpressionEvaluator.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2009-2012, Ingo Weinhold, ingo_weinhold@gmx.de.</a>
+<a name="ln3"> * Copyright 2013, Rene Gollent, rene@gollent.com.</a>
+<a name="ln4"> * Distributed under the terms of the MIT License.</a>
+<a name="ln5"> */</a>
+<a name="ln6"> </a>
+<a name="ln7"> </a>
+<a name="ln8">#include &quot;DwarfExpressionEvaluator.h&quot;</a>
+<a name="ln9"> </a>
+<a name="ln10">#include &lt;stdio.h&gt;</a>
+<a name="ln11">#include &lt;stdlib.h&gt;</a>
+<a name="ln12"> </a>
+<a name="ln13">#include &lt;algorithm&gt;</a>
+<a name="ln14">#include &lt;new&gt;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &lt;Variant.h&gt;</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &quot;DataReader.h&quot;</a>
+<a name="ln19">#include &quot;Dwarf.h&quot;</a>
+<a name="ln20">#include &quot;DwarfTargetInterface.h&quot;</a>
+<a name="ln21">#include &quot;Tracing.h&quot;</a>
+<a name="ln22">#include &quot;ValueLocation.h&quot;</a>
+<a name="ln23"> </a>
+<a name="ln24"> </a>
+<a name="ln25">// number of elements to increase the stack capacity when the stack is full</a>
+<a name="ln26">static const size_t kStackCapacityIncrement = 64;</a>
+<a name="ln27"> </a>
+<a name="ln28">// maximum number of elements we allow to be pushed on the stack</a>
+<a name="ln29">static const size_t kMaxStackCapacity			= 1024;</a>
+<a name="ln30"> </a>
+<a name="ln31">// maximum number of operations we allow to be performed for a single expression</a>
+<a name="ln32">// (to avoid running infinite loops forever)</a>
+<a name="ln33">static const uint32 kMaxOperationCount			= 10000;</a>
+<a name="ln34"> </a>
+<a name="ln35"> </a>
+<a name="ln36">// #pragma mark - DwarfExpressionEvaluationContext</a>
+<a name="ln37"> </a>
+<a name="ln38"> </a>
+<a name="ln39">DwarfExpressionEvaluationContext::DwarfExpressionEvaluationContext(</a>
+<a name="ln40">	const DwarfTargetInterface* targetInterface, uint8 addressSize,</a>
+<a name="ln41">	target_addr_t relocationDelta)</a>
+<a name="ln42">	:</a>
+<a name="ln43">	fTargetInterface(targetInterface),</a>
+<a name="ln44">	fAddressSize(addressSize),</a>
+<a name="ln45">	fRelocationDelta(relocationDelta)</a>
+<a name="ln46">{</a>
+<a name="ln47">}</a>
+<a name="ln48"> </a>
+<a name="ln49"> </a>
+<a name="ln50">DwarfExpressionEvaluationContext::~DwarfExpressionEvaluationContext()</a>
+<a name="ln51">{</a>
+<a name="ln52">}</a>
+<a name="ln53"> </a>
+<a name="ln54"> </a>
+<a name="ln55">// #pragma mark - EvaluationException</a>
+<a name="ln56"> </a>
+<a name="ln57"> </a>
+<a name="ln58">struct DwarfExpressionEvaluator::EvaluationException {</a>
+<a name="ln59">	const char* message;</a>
+<a name="ln60"> </a>
+<a name="ln61">	EvaluationException(const char* message)</a>
+<a name="ln62">		:</a>
+<a name="ln63">		message(message)</a>
+<a name="ln64">	{</a>
+<a name="ln65">	}</a>
+<a name="ln66">};</a>
+<a name="ln67"> </a>
+<a name="ln68"> </a>
+<a name="ln69">// #pragma mark - DwarfExpressionEvaluator</a>
+<a name="ln70"> </a>
+<a name="ln71"> </a>
+<a name="ln72">void</a>
+<a name="ln73">DwarfExpressionEvaluator::_AssertMinStackSize(size_t size) const</a>
+<a name="ln74">{</a>
+<a name="ln75">	if (fStackSize &lt; size)</a>
+<a name="ln76">		throw EvaluationException(&quot;pop from empty stack&quot;);</a>
+<a name="ln77">}</a>
+<a name="ln78"> </a>
+<a name="ln79"> </a>
+<a name="ln80">void</a>
+<a name="ln81">DwarfExpressionEvaluator::_Push(target_addr_t value)</a>
+<a name="ln82">{</a>
+<a name="ln83">	// resize the stack, if we hit the capacity</a>
+<a name="ln84">	if (fStackSize == fStackCapacity) {</a>
+<a name="ln85">		if (fStackCapacity &gt;= kMaxStackCapacity)</a>
+<a name="ln86">			throw EvaluationException(&quot;stack overflow&quot;);</a>
+<a name="ln87"> </a>
+<a name="ln88">		size_t newCapacity = fStackCapacity + kStackCapacityIncrement;</a>
+<a name="ln89">		target_addr_t* newStack = (target_addr_t*)realloc(fStack,</a>
+<a name="ln90">			newCapacity * sizeof(target_addr_t));</a>
+<a name="ln91">		if (newStack == NULL)</a>
+<a name="ln92">			throw std::bad_alloc();</a>
+<a name="ln93"> </a>
+<a name="ln94">		fStack = newStack;</a>
+<a name="ln95">		fStackCapacity = newCapacity;</a>
+<a name="ln96">	}</a>
+<a name="ln97"> </a>
+<a name="ln98">	fStack[fStackSize++] = value;</a>
+<a name="ln99">}</a>
+<a name="ln100"> </a>
+<a name="ln101"> </a>
+<a name="ln102">target_addr_t</a>
+<a name="ln103">DwarfExpressionEvaluator::_Pop()</a>
+<a name="ln104">{</a>
+<a name="ln105">	_AssertMinStackSize(1);</a>
+<a name="ln106">	return fStack[--fStackSize];</a>
+<a name="ln107">}</a>
+<a name="ln108"> </a>
+<a name="ln109"> </a>
+<a name="ln110">DwarfExpressionEvaluator::DwarfExpressionEvaluator(</a>
+<a name="ln111">	DwarfExpressionEvaluationContext* context)</a>
+<a name="ln112">	:</a>
+<a name="ln113">	fContext(context),</a>
+<a name="ln114">	fStack(NULL),</a>
+<a name="ln115">	fStackSize(0),</a>
+<a name="ln116">	fStackCapacity(0)</a>
+<a name="ln117">{</a>
+<a name="ln118">}</a>
+<a name="ln119"> </a>
+<a name="ln120"> </a>
+<a name="ln121">DwarfExpressionEvaluator::~DwarfExpressionEvaluator()</a>
+<a name="ln122">{</a>
+<a name="ln123">	free(fStack);</a>
+<a name="ln124">}</a>
+<a name="ln125"> </a>
+<a name="ln126"> </a>
+<a name="ln127">status_t</a>
+<a name="ln128">DwarfExpressionEvaluator::Push(target_addr_t value)</a>
+<a name="ln129">{</a>
+<a name="ln130">	try {</a>
+<a name="ln131">		_Push(value);</a>
+<a name="ln132">		return B_OK;</a>
+<a name="ln133">	} catch (const EvaluationException&amp; exception) {</a>
+<a name="ln134">		return B_BAD_VALUE;</a>
+<a name="ln135">	} catch (const std::bad_alloc&amp; exception) {</a>
+<a name="ln136">		return B_NO_MEMORY;</a>
+<a name="ln137">	}</a>
+<a name="ln138">}</a>
+<a name="ln139"> </a>
+<a name="ln140"> </a>
+<a name="ln141">status_t</a>
+<a name="ln142">DwarfExpressionEvaluator::Evaluate(const void* expression, size_t size,</a>
+<a name="ln143">	target_addr_t&amp; _result)</a>
+<a name="ln144">{</a>
+<a name="ln145">	fDataReader.SetTo(expression, size, fContext-&gt;AddressSize());</a>
+<a name="ln146"> </a>
+<a name="ln147">	try {</a>
+<a name="ln148">		status_t error = _Evaluate(NULL);</a>
+<a name="ln149">		if (error != B_OK)</a>
+<a name="ln150">			return error;</a>
+<a name="ln151">		_result = _Pop();</a>
+<a name="ln152">		return B_OK;</a>
+<a name="ln153">	} catch (const EvaluationException&amp; exception) {</a>
+<a name="ln154">		WARNING(&quot;DwarfExpressionEvaluator::Evaluate(): %s\n&quot;,</a>
+<a name="ln155">			exception.message);</a>
+<a name="ln156">		return B_BAD_VALUE;</a>
+<a name="ln157">	} catch (const std::bad_alloc&amp; exception) {</a>
+<a name="ln158">		return B_NO_MEMORY;</a>
+<a name="ln159">	}</a>
+<a name="ln160">}</a>
+<a name="ln161"> </a>
+<a name="ln162"> </a>
+<a name="ln163">status_t</a>
+<a name="ln164">DwarfExpressionEvaluator::EvaluateLocation(const void* expression, size_t size,</a>
+<a name="ln165">	ValueLocation&amp; _location)</a>
+<a name="ln166">{</a>
+<a name="ln167">	_location.Clear();</a>
+<a name="ln168"> </a>
+<a name="ln169">	// the empty expression is a valid one</a>
+<a name="ln170">	if (size == 0) {</a>
+<a name="ln171">		ValuePieceLocation piece;</a>
+<a name="ln172">		piece.SetToUnknown();</a>
+<a name="ln173">		piece.SetSize(0);</a>
+<a name="ln174">		return _location.AddPiece(piece) ? B_OK : B_NO_MEMORY;</a>
+<a name="ln175">	}</a>
+<a name="ln176"> </a>
+<a name="ln177">	fDataReader.SetTo(expression, size, fContext-&gt;AddressSize());</a>
+<a name="ln178"> </a>
+<a name="ln179">	// parse the first (and maybe only) expression</a>
+<a name="ln180">	try {</a>
+<a name="ln181">		// push the object address, if any</a>
+<a name="ln182">		target_addr_t objectAddress;</a>
+<a name="ln183">		if (fContext-&gt;GetObjectAddress(objectAddress))</a>
+<a name="ln184">			_Push(objectAddress);</a>
+<a name="ln185"> </a>
+<a name="ln186">		ValuePieceLocation piece;</a>
+<a name="ln187">		status_t error = _Evaluate(&amp;piece);</a>
+<a name="ln188">		if (error != B_OK)</a>
+<a name="ln189">			return error;</a>
+<a name="ln190"> </a>
+<a name="ln191">		// if that's all, it's only a simple expression without composition</a>
+<a name="ln192">		if (fDataReader.BytesRemaining() == 0) {</a>
+<a name="ln193">			if (!piece.IsValid())</a>
+<a name="ln194">				piece.SetToMemory(_Pop());</a>
+<a name="ln195">			piece.SetSize(0);</a>
+<a name="ln196">			return _location.AddPiece(piece) ? B_OK : B_NO_MEMORY;</a>
+<a name="ln197">		}</a>
+<a name="ln198"> </a>
+<a name="ln199">		// there's more, so it must be a composition operator</a>
+<a name="ln200">		uint8 opcode = fDataReader.Read&lt;uint8&gt;(0);</a>
+<a name="ln201">		if (opcode == DW_OP_piece) {</a>
+<a name="ln202">			piece.SetSize(fDataReader.ReadUnsignedLEB128(0));</a>
+<a name="ln203">		} else if (opcode == DW_OP_bit_piece) {</a>
+<a name="ln204">			uint64 bitSize = fDataReader.ReadUnsignedLEB128(0);</a>
+<a name="ln205">			piece.SetSize(bitSize, fDataReader.ReadUnsignedLEB128(0));</a>
+<a name="ln206">		} else</a>
+<a name="ln207">			return B_BAD_DATA;</a>
+<a name="ln208"> </a>
+<a name="ln209">		// If there's a composition operator, there must be at least two</a>
+<a name="ln210">		// simple expressions, so this must not be the end.</a>
+<a name="ln211">		if (fDataReader.BytesRemaining() == 0)</a>
+<a name="ln212">			return B_BAD_DATA;</a>
+<a name="ln213">	} catch (const EvaluationException&amp; exception) {</a>
+<a name="ln214">		WARNING(&quot;DwarfExpressionEvaluator::EvaluateLocation(): %s\n&quot;,</a>
+<a name="ln215">			exception.message);</a>
+<a name="ln216">		return B_BAD_VALUE;</a>
+<a name="ln217">	} catch (const std::bad_alloc&amp; exception) {</a>
+<a name="ln218">		return B_NO_MEMORY;</a>
+<a name="ln219">	}</a>
+<a name="ln220"> </a>
+<a name="ln221">	// parse subsequent expressions (at least one)</a>
+<a name="ln222">	while (fDataReader.BytesRemaining() &gt; 0) {</a>
+<a name="ln223">		// Restrict the data reader to the remaining bytes to prevent jumping</a>
+<a name="ln224">		// back.</a>
+<a name="ln225">		fDataReader.SetTo(fDataReader.Data(), fDataReader.BytesRemaining(),</a>
+<a name="ln226">			fDataReader.AddressSize());</a>
+<a name="ln227"> </a>
+<a name="ln228">		try {</a>
+<a name="ln229">			// push the object address, if any</a>
+<a name="ln230">			target_addr_t objectAddress;</a>
+<a name="ln231">			if (fContext-&gt;GetObjectAddress(objectAddress))</a>
+<a name="ln232">				_Push(objectAddress);</a>
+<a name="ln233"> </a>
+<a name="ln234">			ValuePieceLocation piece;</a>
+<a name="ln235">			status_t error = _Evaluate(&amp;piece);</a>
+<a name="ln236">			if (error != B_OK)</a>
+<a name="ln237">				return error;</a>
+<a name="ln238"> </a>
+<a name="ln239">			if (!piece.IsValid())</a>
+<a name="ln240">				piece.SetToMemory(_Pop());</a>
+<a name="ln241"> </a>
+<a name="ln242">			// each expression must be followed by a composition operator</a>
+<a name="ln243">			if (fDataReader.BytesRemaining() == 0)</a>
+<a name="ln244">				return B_BAD_DATA;</a>
+<a name="ln245"> </a>
+<a name="ln246">			uint8 opcode = fDataReader.Read&lt;uint8&gt;(0);</a>
+<a name="ln247">			if (opcode == DW_OP_piece) {</a>
+<a name="ln248">				piece.SetSize(fDataReader.ReadUnsignedLEB128(0));</a>
+<a name="ln249">			} else if (opcode == DW_OP_bit_piece) {</a>
+<a name="ln250">				uint64 bitSize = fDataReader.ReadUnsignedLEB128(0);</a>
+<a name="ln251">				piece.SetSize(bitSize, fDataReader.ReadUnsignedLEB128(0));</a>
+<a name="ln252">			} else</a>
+<a name="ln253">				return B_BAD_DATA;</a>
+<a name="ln254">		} catch (const EvaluationException&amp; exception) {</a>
+<a name="ln255">			WARNING(&quot;DwarfExpressionEvaluator::EvaluateLocation(): %s\n&quot;,</a>
+<a name="ln256">				exception.message);</a>
+<a name="ln257">			return B_BAD_VALUE;</a>
+<a name="ln258">		} catch (const std::bad_alloc&amp; exception) {</a>
+<a name="ln259">			return B_NO_MEMORY;</a>
+<a name="ln260">		}</a>
+<a name="ln261">	}</a>
+<a name="ln262"> </a>
+<a name="ln263">	return B_OK;</a>
+<a name="ln264">}</a>
+<a name="ln265"> </a>
+<a name="ln266"> </a>
+<a name="ln267">status_t</a>
+<a name="ln268">DwarfExpressionEvaluator::_Evaluate(ValuePieceLocation* _piece)</a>
+<a name="ln269">{</a>
+<a name="ln270">	TRACE_EXPR_ONLY({</a>
+<a name="ln271">		TRACE_EXPR(&quot;DwarfExpressionEvaluator::_Evaluate(%p, %&quot; B_PRIdOFF &quot;)\n&quot;,</a>
+<a name="ln272">			fDataReader.Data(), fDataReader.BytesRemaining());</a>
+<a name="ln273">		const uint8* data = (const uint8*)fDataReader.Data();</a>
+<a name="ln274">		int32 count = fDataReader.BytesRemaining();</a>
+<a name="ln275">		for (int32 i = 0; i &lt; count; i++)</a>
+<a name="ln276">			TRACE_EXPR(&quot; %02x&quot;, data[i]);</a>
+<a name="ln277">		TRACE_EXPR(&quot;\n&quot;);</a>
+<a name="ln278">	})</a>
+<a name="ln279"> </a>
+<a name="ln280">	uint32 operationsExecuted = 0;</a>
+<a name="ln281"> </a>
+<a name="ln282">	while (fDataReader.BytesRemaining() &gt; 0) {</a>
+<a name="ln283">		uint8 opcode = fDataReader.Read&lt;uint8&gt;(0);</a>
+<a name="ln284"> </a>
+<a name="ln285">		switch (opcode) {</a>
+<a name="ln286">			case DW_OP_addr:</a>
+<a name="ln287">				TRACE_EXPR(&quot;  DW_OP_addr\n&quot;);</a>
+<a name="ln288">				_Push(fDataReader.ReadAddress(0) + fContext-&gt;RelocationDelta());</a>
+<a name="ln289">				break;</a>
+<a name="ln290">			case DW_OP_const1u:</a>
+<a name="ln291">				TRACE_EXPR(&quot;  DW_OP_const1u\n&quot;);</a>
+<a name="ln292">				_Push(fDataReader.Read&lt;uint8&gt;(0));</a>
+<a name="ln293">				break;</a>
+<a name="ln294">			case DW_OP_const1s:</a>
+<a name="ln295">				TRACE_EXPR(&quot;  DW_OP_const1s\n&quot;);</a>
+<a name="ln296">				_Push(fDataReader.Read&lt;int8&gt;(0));</a>
+<a name="ln297">				break;</a>
+<a name="ln298">			case DW_OP_const2u:</a>
+<a name="ln299">				TRACE_EXPR(&quot;  DW_OP_const2u\n&quot;);</a>
+<a name="ln300">				_Push(fDataReader.Read&lt;uint16&gt;(0));</a>
+<a name="ln301">				break;</a>
+<a name="ln302">			case DW_OP_const2s:</a>
+<a name="ln303">				TRACE_EXPR(&quot;  DW_OP_const2s\n&quot;);</a>
+<a name="ln304">				_Push(fDataReader.Read&lt;int16&gt;(0));</a>
+<a name="ln305">				break;</a>
+<a name="ln306">			case DW_OP_const4u:</a>
+<a name="ln307">				TRACE_EXPR(&quot;  DW_OP_const4u\n&quot;);</a>
+<a name="ln308">				_Push(fDataReader.Read&lt;uint32&gt;(0));</a>
+<a name="ln309">				break;</a>
+<a name="ln310">			case DW_OP_const4s:</a>
+<a name="ln311">				TRACE_EXPR(&quot;  DW_OP_const4s\n&quot;);</a>
+<a name="ln312">				_Push(fDataReader.Read&lt;int32&gt;(0));</a>
+<a name="ln313">				break;</a>
+<a name="ln314">			case DW_OP_const8u:</a>
+<a name="ln315">				TRACE_EXPR(&quot;  DW_OP_const8u\n&quot;);</a>
+<a name="ln316">				_Push(fDataReader.Read&lt;uint64&gt;(0));</a>
+<a name="ln317">				break;</a>
+<a name="ln318">			case DW_OP_const8s:</a>
+<a name="ln319">				TRACE_EXPR(&quot;  DW_OP_const8s\n&quot;);</a>
+<a name="ln320">				_Push(fDataReader.Read&lt;int64&gt;(0));</a>
+<a name="ln321">				break;</a>
+<a name="ln322">			case DW_OP_constu:</a>
+<a name="ln323">				TRACE_EXPR(&quot;  DW_OP_constu\n&quot;);</a>
+<a name="ln324">				_Push(fDataReader.ReadUnsignedLEB128(0));</a>
+<a name="ln325">				break;</a>
+<a name="ln326">			case DW_OP_consts:</a>
+<a name="ln327">				TRACE_EXPR(&quot;  DW_OP_consts\n&quot;);</a>
+<a name="ln328">				_Push(fDataReader.ReadSignedLEB128(0));</a>
+<a name="ln329">				break;</a>
+<a name="ln330">			case DW_OP_dup:</a>
+<a name="ln331">				TRACE_EXPR(&quot;  DW_OP_dup\n&quot;);</a>
+<a name="ln332">				_AssertMinStackSize(1);</a>
+<a name="ln333">				_Push(fStack[fStackSize - 1]);</a>
+<a name="ln334">				break;</a>
+<a name="ln335">			case DW_OP_drop:</a>
+<a name="ln336">				TRACE_EXPR(&quot;  DW_OP_drop\n&quot;);</a>
+<a name="ln337">				_Pop();</a>
+<a name="ln338">				break;</a>
+<a name="ln339">			case DW_OP_over:</a>
+<a name="ln340">				TRACE_EXPR(&quot;  DW_OP_over\n&quot;);</a>
+<a name="ln341">				_AssertMinStackSize(1);</a>
+<a name="ln342">				_Push(fStack[fStackSize - 2]);</a>
+<a name="ln343">				break;</a>
+<a name="ln344">			case DW_OP_pick:</a>
+<a name="ln345">			{</a>
+<a name="ln346">				TRACE_EXPR(&quot;  DW_OP_pick\n&quot;);</a>
+<a name="ln347">				uint8 index = fDataReader.Read&lt;uint8&gt;(0);</a>
+<a name="ln348">				_AssertMinStackSize(index + 1);</a>
+<a name="ln349">				_Push(fStack[fStackSize - index - 1]);</a>
+<a name="ln350">				break;</a>
+<a name="ln351">			}</a>
+<a name="ln352">			case DW_OP_swap:</a>
+<a name="ln353">			{</a>
+<a name="ln354">				TRACE_EXPR(&quot;  DW_OP_swap\n&quot;);</a>
+<a name="ln355">				_AssertMinStackSize(2);</a>
+<a name="ln356">				std::swap(fStack[fStackSize - 1], fStack[fStackSize - 2]);</a>
+<a name="ln357">				break;</a>
+<a name="ln358">			}</a>
+<a name="ln359">			case DW_OP_rot:</a>
+<a name="ln360">			{</a>
+<a name="ln361">				TRACE_EXPR(&quot;  DW_OP_rot\n&quot;);</a>
+<a name="ln362">				_AssertMinStackSize(3);</a>
+<a name="ln363">				target_addr_t tmp = fStack[fStackSize - 1];</a>
+<a name="ln364">				fStack[fStackSize - 1] = fStack[fStackSize - 2];</a>
+<a name="ln365">				fStack[fStackSize - 2] = fStack[fStackSize - 3];</a>
+<a name="ln366">				fStack[fStackSize - 3] = tmp;</a>
+<a name="ln367">				break;</a>
+<a name="ln368">			}</a>
+<a name="ln369"> </a>
+<a name="ln370">			case DW_OP_deref:</a>
+<a name="ln371">				TRACE_EXPR(&quot;  DW_OP_deref\n&quot;);</a>
+<a name="ln372">				_DereferenceAddress(fContext-&gt;AddressSize());</a>
+<a name="ln373">				break;</a>
+<a name="ln374">			case DW_OP_deref_size:</a>
+<a name="ln375">				TRACE_EXPR(&quot;  DW_OP_deref_size\n&quot;);</a>
+<a name="ln376">				_DereferenceAddress(fDataReader.Read&lt;uint8&gt;(0));</a>
+<a name="ln377">				break;</a>
+<a name="ln378">			case DW_OP_xderef:</a>
+<a name="ln379">				TRACE_EXPR(&quot;  DW_OP_xderef\n&quot;);</a>
+<a name="ln380">				_DereferenceAddressSpaceAddress(fContext-&gt;AddressSize());</a>
+<a name="ln381">				break;</a>
+<a name="ln382">			case DW_OP_xderef_size:</a>
+<a name="ln383">				TRACE_EXPR(&quot;  DW_OP_xderef_size\n&quot;);</a>
+<a name="ln384">				_DereferenceAddressSpaceAddress(fDataReader.Read&lt;uint8&gt;(0));</a>
+<a name="ln385">				break;</a>
+<a name="ln386"> </a>
+<a name="ln387">			case DW_OP_abs:</a>
+<a name="ln388">			{</a>
+<a name="ln389">				TRACE_EXPR(&quot;  DW_OP_abs\n&quot;);</a>
+<a name="ln390">				target_addr_t value = _Pop();</a>
+<a name="ln391">				if (fContext-&gt;AddressSize() == 4) {</a>
+<a name="ln392">					int32 signedValue = (int32)value;</a>
+<a name="ln393">					_Push(signedValue &gt;= 0 ? signedValue : -signedValue);</a>
+<a name="ln394">				} else {</a>
+<a name="ln395">					int64 signedValue = (int64)value;</a>
+<a name="ln396">					_Push(signedValue &gt;= 0 ? signedValue : -signedValue);</a>
+<a name="ln397">				}</a>
+<a name="ln398">				break;</a>
+<a name="ln399">			}</a>
+<a name="ln400">			case DW_OP_and:</a>
+<a name="ln401">				TRACE_EXPR(&quot;  DW_OP_and\n&quot;);</a>
+<a name="ln402">				_Push(_Pop() &amp; _Pop());</a>
+<a name="ln403">				break;</a>
+<a name="ln404">			case DW_OP_div:</a>
+<a name="ln405">			{</a>
+<a name="ln406">				TRACE_EXPR(&quot;  DW_OP_div\n&quot;);</a>
+<a name="ln407">				int64 top = (int64)_Pop();</a>
+<a name="ln408">				int64 second = (int64)_Pop();</a>
+<a name="ln409">				_Push(top != 0 ? second / top : 0);</a>
+<a name="ln410">				break;</a>
+<a name="ln411">			}</a>
+<a name="ln412">			case DW_OP_minus:</a>
+<a name="ln413">			{</a>
+<a name="ln414">				TRACE_EXPR(&quot;  DW_OP_minus\n&quot;);</a>
+<a name="ln415">				target_addr_t top = _Pop();</a>
+<a name="ln416">				_Push(_Pop() - top);</a>
+<a name="ln417">				break;</a>
+<a name="ln418">			}</a>
+<a name="ln419">			case DW_OP_mod:</a>
+<a name="ln420">			{</a>
+<a name="ln421">				TRACE_EXPR(&quot;  DW_OP_mod\n&quot;);</a>
+<a name="ln422">				// While the specs explicitly speak of signed integer division</a>
+<a name="ln423">				// for &quot;div&quot;, nothing is mentioned for &quot;mod&quot;.</a>
+<a name="ln424">				target_addr_t top = _Pop();</a>
+<a name="ln425">				target_addr_t second = _Pop();</a>
+<a name="ln426">				_Push(top != 0 ? second % top : 0);</a>
+<a name="ln427">				break;</a>
+<a name="ln428">			}</a>
+<a name="ln429">			case DW_OP_mul:</a>
+<a name="ln430">				TRACE_EXPR(&quot;  DW_OP_mul\n&quot;);</a>
+<a name="ln431">				_Push(_Pop() * _Pop());</a>
+<a name="ln432">				break;</a>
+<a name="ln433">			case DW_OP_neg:</a>
+<a name="ln434">			{</a>
+<a name="ln435">				TRACE_EXPR(&quot;  DW_OP_neg\n&quot;);</a>
+<a name="ln436">				if (fContext-&gt;AddressSize() == 4)</a>
+<a name="ln437">					_Push(-(int32)_Pop());</a>
+<a name="ln438">				else</a>
+<a name="ln439">					_Push(-(int64)_Pop());</a>
+<a name="ln440">				break;</a>
+<a name="ln441">			}</a>
+<a name="ln442">			case DW_OP_not:</a>
+<a name="ln443">				TRACE_EXPR(&quot;  DW_OP_not\n&quot;);</a>
+<a name="ln444">				_Push(~_Pop());</a>
+<a name="ln445">				break;</a>
+<a name="ln446">			case DW_OP_or:</a>
+<a name="ln447">				TRACE_EXPR(&quot;  DW_OP_or\n&quot;);</a>
+<a name="ln448">				_Push(_Pop() | _Pop());</a>
+<a name="ln449">				break;</a>
+<a name="ln450">			case DW_OP_plus:</a>
+<a name="ln451">				TRACE_EXPR(&quot;  DW_OP_plus\n&quot;);</a>
+<a name="ln452">				_Push(_Pop() + _Pop());</a>
+<a name="ln453">				break;</a>
+<a name="ln454">			case DW_OP_plus_uconst:</a>
+<a name="ln455">				TRACE_EXPR(&quot;  DW_OP_plus_uconst\n&quot;);</a>
+<a name="ln456">				_Push(_Pop() + fDataReader.ReadUnsignedLEB128(0));</a>
+<a name="ln457">				break;</a>
+<a name="ln458">			case DW_OP_shl:</a>
+<a name="ln459">			{</a>
+<a name="ln460">				TRACE_EXPR(&quot;  DW_OP_shl\n&quot;);</a>
+<a name="ln461">				target_addr_t top = _Pop();</a>
+<a name="ln462">				_Push(_Pop() &lt;&lt; top);</a>
+<a name="ln463">				break;</a>
+<a name="ln464">			}</a>
+<a name="ln465">			case DW_OP_shr:</a>
+<a name="ln466">			{</a>
+<a name="ln467">				TRACE_EXPR(&quot;  DW_OP_shr\n&quot;);</a>
+<a name="ln468">				target_addr_t top = _Pop();</a>
+<a name="ln469">				_Push(_Pop() &gt;&gt; top);</a>
+<a name="ln470">				break;</a>
+<a name="ln471">			}</a>
+<a name="ln472">			case DW_OP_shra:</a>
+<a name="ln473">			{</a>
+<a name="ln474">				TRACE_EXPR(&quot;  DW_OP_shra\n&quot;);</a>
+<a name="ln475">				target_addr_t top = _Pop();</a>
+<a name="ln476">				int64 second = (int64)_Pop();</a>
+<a name="ln477">				_Push(second &gt;= 0 ? second &gt;&gt; top : -(-second &gt;&gt; top));</a>
+<a name="ln478">					// right shift on negative values is implementation defined</a>
+<a name="ln479">				break;</a>
+<a name="ln480">			}</a>
+<a name="ln481">			case DW_OP_xor:</a>
+<a name="ln482">				TRACE_EXPR(&quot;  DW_OP_xor\n&quot;);</a>
+<a name="ln483">				_Push(_Pop() ^ _Pop());</a>
+<a name="ln484">				break;</a>
+<a name="ln485"> </a>
+<a name="ln486">			case DW_OP_bra:</a>
+<a name="ln487">				TRACE_EXPR(&quot;  DW_OP_bra\n&quot;);</a>
+<a name="ln488">				if (_Pop() == 0)</a>
+<a name="ln489">					break;</a>
+<a name="ln490">				// fall through</a>
+<a name="ln491">			case DW_OP_skip:</a>
+<a name="ln492">			{</a>
+<a name="ln493">				TRACE_EXPR(&quot;  DW_OP_skip\n&quot;);</a>
+<a name="ln494">				int16 offset = fDataReader.Read&lt;int16&gt;(0);</a>
+<a name="ln495">				if (offset &gt;= 0 ? offset &gt; fDataReader.BytesRemaining()</a>
+<a name="ln496">						: -offset &gt; fDataReader.Offset()) {</a>
+<a name="ln497">					throw EvaluationException(&quot;bra/skip: invalid offset&quot;);</a>
+<a name="ln498">				}</a>
+<a name="ln499">				fDataReader.SeekAbsolute(fDataReader.Offset() + offset);</a>
+<a name="ln500">				break;</a>
+<a name="ln501">			}</a>
+<a name="ln502"> </a>
+<a name="ln503">			case DW_OP_eq:</a>
+<a name="ln504">				TRACE_EXPR(&quot;  DW_OP_eq\n&quot;);</a>
+<a name="ln505">				_Push(_Pop() == _Pop() ? 1 : 0);</a>
+<a name="ln506">				break;</a>
+<a name="ln507">			case DW_OP_ge:</a>
+<a name="ln508">			{</a>
+<a name="ln509">				TRACE_EXPR(&quot;  DW_OP_ge\n&quot;);</a>
+<a name="ln510">				int64 top = (int64)_Pop();</a>
+<a name="ln511">				_Push((int64)_Pop() &gt;= top ? 1 : 0);</a>
+<a name="ln512">				break;</a>
+<a name="ln513">			}</a>
+<a name="ln514">			case DW_OP_gt:</a>
+<a name="ln515">			{</a>
+<a name="ln516">				TRACE_EXPR(&quot;  DW_OP_gt\n&quot;);</a>
+<a name="ln517">				int64 top = (int64)_Pop();</a>
+<a name="ln518">				_Push((int64)_Pop() &gt; top ? 1 : 0);</a>
+<a name="ln519">				break;</a>
+<a name="ln520">			}</a>
+<a name="ln521">			case DW_OP_le:</a>
+<a name="ln522">			{</a>
+<a name="ln523">				TRACE_EXPR(&quot;  DW_OP_le\n&quot;);</a>
+<a name="ln524">				int64 top = (int64)_Pop();</a>
+<a name="ln525">				_Push((int64)_Pop() &lt;= top ? 1 : 0);</a>
+<a name="ln526">				break;</a>
+<a name="ln527">			}</a>
+<a name="ln528">			case DW_OP_lt:</a>
+<a name="ln529">			{</a>
+<a name="ln530">				TRACE_EXPR(&quot;  DW_OP_lt\n&quot;);</a>
+<a name="ln531">				int64 top = (int64)_Pop();</a>
+<a name="ln532">				_Push((int64)_Pop() &lt; top ? 1 : 0);</a>
+<a name="ln533">				break;</a>
+<a name="ln534">			}</a>
+<a name="ln535">			case DW_OP_ne:</a>
+<a name="ln536">				TRACE_EXPR(&quot;  DW_OP_ne\n&quot;);</a>
+<a name="ln537">				_Push(_Pop() == _Pop() ? 1 : 0);</a>
+<a name="ln538">				break;</a>
+<a name="ln539"> </a>
+<a name="ln540">			case DW_OP_push_object_address:</a>
+<a name="ln541">			{</a>
+<a name="ln542">				TRACE_EXPR(&quot;  DW_OP_push_object_address\n&quot;);</a>
+<a name="ln543">				target_addr_t address;</a>
+<a name="ln544">				if (!fContext-&gt;GetObjectAddress(address))</a>
+<a name="ln545">					throw EvaluationException(&quot;failed to get object address&quot;);</a>
+<a name="ln546">				_Push(address);</a>
+<a name="ln547">				break;</a>
+<a name="ln548">			}</a>
+<a name="ln549">			case DW_OP_call_frame_cfa:</a>
+<a name="ln550">			{</a>
+<a name="ln551">				TRACE_EXPR(&quot;  DW_OP_call_frame_cfa\n&quot;);</a>
+<a name="ln552">				target_addr_t address;</a>
+<a name="ln553">				if (!fContext-&gt;GetFrameAddress(address))</a>
+<a name="ln554">					throw EvaluationException(&quot;failed to get frame address&quot;);</a>
+<a name="ln555">				_Push(address);</a>
+<a name="ln556">				break;</a>
+<a name="ln557">			}</a>
+<a name="ln558">			case DW_OP_fbreg:</a>
+<a name="ln559">			{</a>
+<a name="ln560">				int64 offset = fDataReader.ReadSignedLEB128(0);</a>
+<a name="ln561">				TRACE_EXPR(&quot;  DW_OP_fbreg(%&quot; B_PRId64 &quot;)\n&quot;, offset);</a>
+<a name="ln562">				target_addr_t address;</a>
+<a name="ln563">				if (!fContext-&gt;GetFrameBaseAddress(address)) {</a>
+<a name="ln564">					throw EvaluationException(</a>
+<a name="ln565">						&quot;failed to get frame base address&quot;);</a>
+<a name="ln566">				}</a>
+<a name="ln567">				_Push(address + offset);</a>
+<a name="ln568">				break;</a>
+<a name="ln569">			}</a>
+<a name="ln570">			case DW_OP_form_tls_address:</a>
+<a name="ln571">			{</a>
+<a name="ln572">				TRACE_EXPR(&quot;  DW_OP_form_tls_address\n&quot;);</a>
+<a name="ln573">				target_addr_t address;</a>
+<a name="ln574">				if (!fContext-&gt;GetTLSAddress(_Pop(), address))</a>
+<a name="ln575">					throw EvaluationException(&quot;failed to get tls address&quot;);</a>
+<a name="ln576">				_Push(address);</a>
+<a name="ln577">				break;</a>
+<a name="ln578">			}</a>
+<a name="ln579"> </a>
+<a name="ln580">			case DW_OP_regx:</a>
+<a name="ln581">			{</a>
+<a name="ln582">				TRACE_EXPR(&quot;  DW_OP_regx\n&quot;);</a>
+<a name="ln583">				if (_piece == NULL) {</a>
+<a name="ln584">					throw EvaluationException(</a>
+<a name="ln585">						&quot;DW_OP_regx in non-location expression&quot;);</a>
+<a name="ln586">				}</a>
+<a name="ln587">				uint32 reg = fDataReader.ReadUnsignedLEB128(0);</a>
+<a name="ln588">				if (fDataReader.HasOverflow())</a>
+<a name="ln589">					throw EvaluationException(&quot;unexpected end of expression&quot;);</a>
+<a name="ln590">				_piece-&gt;SetToRegister(reg);</a>
+<a name="ln591">				return B_OK;</a>
+<a name="ln592">			}</a>
+<a name="ln593"> </a>
+<a name="ln594">			case DW_OP_bregx:</a>
+<a name="ln595">			{</a>
+<a name="ln596">				TRACE_EXPR(&quot;  DW_OP_bregx\n&quot;);</a>
+<a name="ln597">				uint32 reg = fDataReader.ReadUnsignedLEB128(0);</a>
+<a name="ln598">				_PushRegister(reg, fDataReader.ReadSignedLEB128(0));</a>
+<a name="ln599">				break;</a>
+<a name="ln600">			}</a>
+<a name="ln601"> </a>
+<a name="ln602">			case DW_OP_call2:</a>
+<a name="ln603">				TRACE_EXPR(&quot;  DW_OP_call2\n&quot;);</a>
+<a name="ln604">				_Call(fDataReader.Read&lt;uint16&gt;(0), dwarf_reference_type_local);</a>
+<a name="ln605">				break;</a>
+<a name="ln606">			case DW_OP_call4:</a>
+<a name="ln607">				TRACE_EXPR(&quot;  DW_OP_call4\n&quot;);</a>
+<a name="ln608">				_Call(fDataReader.Read&lt;uint32&gt;(0), dwarf_reference_type_local);</a>
+<a name="ln609">				break;</a>
+<a name="ln610">			case DW_OP_call_ref:</a>
+<a name="ln611">				TRACE_EXPR(&quot;  DW_OP_call_ref\n&quot;);</a>
+<a name="ln612">				if (fContext-&gt;AddressSize() == 4) {</a>
+<a name="ln613">					_Call(fDataReader.Read&lt;uint32&gt;(0),</a>
+<a name="ln614">						dwarf_reference_type_global);</a>
+<a name="ln615">				} else {</a>
+<a name="ln616">					_Call(fDataReader.Read&lt;uint64&gt;(0),</a>
+<a name="ln617">						dwarf_reference_type_global);</a>
+<a name="ln618">				}</a>
+<a name="ln619">				break;</a>
+<a name="ln620"> </a>
+<a name="ln621">			case DW_OP_piece:</a>
+<a name="ln622">			case DW_OP_bit_piece:</a>
+<a name="ln623">				// are handled in EvaluateLocation()</a>
+<a name="ln624">				if (_piece == NULL)</a>
+<a name="ln625">					return B_BAD_DATA;</a>
+<a name="ln626"> </a>
+<a name="ln627">				fDataReader.SeekAbsolute(fDataReader.Offset() - 1);</a>
+<a name="ln628">					// put back the operation</a>
+<a name="ln629">				return B_OK;</a>
+<a name="ln630"> </a>
+<a name="ln631">			case DW_OP_nop:</a>
+<a name="ln632">				TRACE_EXPR(&quot;  DW_OP_nop\n&quot;);</a>
+<a name="ln633">				break;</a>
+<a name="ln634"> </a>
+<a name="ln635">			case DW_OP_implicit_value:</a>
+<a name="ln636">			{</a>
+<a name="ln637">				TRACE_EXPR(&quot;  DW_OP_implicit_value\n&quot;);</a>
+<a name="ln638">				if (_piece == NULL) {</a>
+<a name="ln639">					throw EvaluationException(</a>
+<a name="ln640">						&quot;DW_OP_implicit_value in non-location expression&quot;);</a>
+<a name="ln641">				}</a>
+<a name="ln642">				uint32 length = fDataReader.ReadUnsignedLEB128(0);</a>
+<a name="ln643">				if (length == 0)</a>
+<a name="ln644">					return B_BAD_DATA;</a>
+<a name="ln645"> </a>
+<a name="ln646">				if (fDataReader.BytesRemaining() &lt; length)</a>
+<a name="ln647">					return B_BAD_DATA;</a>
+<a name="ln648"> </a>
+<a name="ln649">				if (!_piece-&gt;SetToValue(fDataReader.Data(), length))</a>
+<a name="ln650">					return B_NO_MEMORY;</a>
+<a name="ln651"> </a>
+<a name="ln652">				return B_OK;</a>
+<a name="ln653">			}</a>
+<a name="ln654">			case DW_OP_stack_value:</a>
+<a name="ln655">			{</a>
+<a name="ln656">				TRACE_EXPR(&quot;  DW_OP_stack_value\n&quot;);</a>
+<a name="ln657">				if (_piece == NULL) {</a>
+<a name="ln658">					throw EvaluationException(</a>
+<a name="ln659">						&quot;DW_OP_stack_value in non-location expression&quot;);</a>
+<a name="ln660">				}</a>
+<a name="ln661">				if (fStackSize == 0)</a>
+<a name="ln662">					return B_BAD_DATA;</a>
+<a name="ln663">				target_addr_t value = _Pop();</a>
+<a name="ln664">				if (!_piece-&gt;SetToValue(&amp;value, sizeof(target_addr_t)))</a>
+<a name="ln665">					return B_NO_MEMORY;</a>
+<a name="ln666"> </a>
+<a name="ln667">				return B_OK;</a>
+<a name="ln668">			}</a>
+<a name="ln669">			default:</a>
+<a name="ln670">				if (opcode &gt;= DW_OP_lit0 &amp;&amp; opcode &lt;= DW_OP_lit31) {</a>
+<a name="ln671">					TRACE_EXPR(&quot;  DW_OP_lit%u\n&quot;, opcode - DW_OP_lit0);</a>
+<a name="ln672">					_Push(opcode - DW_OP_lit0);</a>
+<a name="ln673">				} else if (opcode &gt;= DW_OP_reg0 &amp;&amp; opcode &lt;= DW_OP_reg31) {</a>
+<a name="ln674">					TRACE_EXPR(&quot;  DW_OP_reg%u\n&quot;, opcode - DW_OP_reg0);</a>
+<a name="ln675">					if (_piece == NULL) {</a>
+<a name="ln676">						// NOTE: Using these opcodes is actually only allowed in</a>
+<a name="ln677">						// location expression, but gcc 2.95.3 does otherwise.</a>
+<a name="ln678">						_PushRegister(opcode - DW_OP_reg0, 0);</a>
+<a name="ln679">					} else {</a>
+<a name="ln680">						_piece-&gt;SetToRegister(opcode - DW_OP_reg0);</a>
+<a name="ln681">						return B_OK;</a>
+<a name="ln682">					}</a>
+<a name="ln683">				} else if (opcode &gt;= DW_OP_breg0 &amp;&amp; opcode &lt;= DW_OP_breg31) {</a>
+<a name="ln684">					int64 offset = fDataReader.ReadSignedLEB128(0);</a>
+<a name="ln685">					TRACE_EXPR(&quot;  DW_OP_breg%u(%&quot; B_PRId64 &quot;)\n&quot;,</a>
+<a name="ln686">						opcode - DW_OP_breg0, offset);</a>
+<a name="ln687">					_PushRegister(opcode - DW_OP_breg0, offset);</a>
+<a name="ln688">				} else {</a>
+<a name="ln689">					WARNING(&quot;DwarfExpressionEvaluator::_Evaluate(): &quot;</a>
+<a name="ln690">						&quot;unsupported opcode: %u\n&quot;, opcode);</a>
+<a name="ln691">					return B_BAD_DATA;</a>
+<a name="ln692">				}</a>
+<a name="ln693">				break;</a>
+<a name="ln694">		}</a>
+<a name="ln695"> </a>
+<a name="ln696">		if (++operationsExecuted &gt;= kMaxOperationCount)</a>
+<a name="ln697">			return B_BAD_DATA;</a>
+<a name="ln698">	}</a>
+<a name="ln699"> </a>
+<a name="ln700">	return fDataReader.HasOverflow() ? B_BAD_DATA : B_OK;</a>
+<a name="ln701">}</a>
+<a name="ln702"> </a>
+<a name="ln703"> </a>
+<a name="ln704">void</a>
+<a name="ln705">DwarfExpressionEvaluator::_DereferenceAddress(uint8 addressSize)</a>
+<a name="ln706">{</a>
+<a name="ln707">	uint32 valueType;</a>
+<a name="ln708">	switch (addressSize) {</a>
+<a name="ln709">		case 1:</a>
+<a name="ln710">			valueType = B_UINT8_TYPE;</a>
+<a name="ln711">			break;</a>
+<a name="ln712">		case 2:</a>
+<a name="ln713">			valueType = B_UINT16_TYPE;</a>
+<a name="ln714">			break;</a>
+<a name="ln715">		case 4:</a>
+<a name="ln716">			valueType = B_UINT32_TYPE;</a>
+<a name="ln717">			break;</a>
+<a name="ln718">		case 8:</a>
+<a name="ln719">			if (fContext-&gt;AddressSize() == 8) {</a>
+<a name="ln720">				valueType = B_UINT64_TYPE;</a>
+<a name="ln721">				break;</a>
+<a name="ln722">			}</a>
+<a name="ln723">			// fall through</a>
+<a name="ln724">		default:</a>
+<a name="ln725">			throw EvaluationException(&quot;invalid dereference size&quot;);</a>
+<a name="ln726">	}</a>
+<a name="ln727"> </a>
+<a name="ln728">	target_addr_t address = _Pop();</a>
+<a name="ln729">	BVariant value;</a>
+<a name="ln730">	if (!fContext-&gt;TargetInterface()-&gt;ReadValueFromMemory(address, valueType,</a>
+<a name="ln731">			value)) {</a>
+<a name="ln732">		throw EvaluationException(&quot;failed to read memory&quot;);</a>
+<a name="ln733">	}</a>
+<a name="ln734"> </a>
+<a name="ln735">	_Push(value.ToUInt64());</a>
+<a name="ln736">}</a>
+<a name="ln737"> </a>
+<a name="ln738"> </a>
+<a name="ln739">void</a>
+<a name="ln740">DwarfExpressionEvaluator::_DereferenceAddressSpaceAddress(uint8 addressSize)</a>
+<a name="ln741">{</a>
+<a name="ln742">	uint32 valueType;</a>
+<a name="ln743">	switch (addressSize) {</a>
+<a name="ln744">		case 1:</a>
+<a name="ln745">			valueType = B_UINT8_TYPE;</a>
+<a name="ln746">			break;</a>
+<a name="ln747">		case 2:</a>
+<a name="ln748">			valueType = B_UINT16_TYPE;</a>
+<a name="ln749">			break;</a>
+<a name="ln750">		case 4:</a>
+<a name="ln751">			valueType = B_UINT32_TYPE;</a>
+<a name="ln752">			break;</a>
+<a name="ln753">		case 8:</a>
+<a name="ln754">			if (fContext-&gt;AddressSize() == 8) {</a>
+<a name="ln755">				valueType = B_UINT64_TYPE;</a>
+<a name="ln756">				break;</a>
+<a name="ln757">			}</a>
+<a name="ln758">			// fall through</a>
+<a name="ln759">		default:</a>
+<a name="ln760">			throw EvaluationException(&quot;invalid dereference size&quot;);</a>
+<a name="ln761">	}</a>
+<a name="ln762"> </a>
+<a name="ln763">	target_addr_t address = _Pop();</a>
+<a name="ln764">	target_addr_t addressSpace = _Pop();</a>
+<a name="ln765">	BVariant value;</a>
+<a name="ln766">	if (!fContext-&gt;TargetInterface()-&gt;ReadValueFromMemory(addressSpace, address,</a>
+<a name="ln767">			valueType, value)) {</a>
+<a name="ln768">		throw EvaluationException(&quot;failed to read memory&quot;);</a>
+<a name="ln769">	}</a>
+<a name="ln770"> </a>
+<a name="ln771">	_Push(value.ToUInt64());</a>
+<a name="ln772">}</a>
+<a name="ln773"> </a>
+<a name="ln774"> </a>
+<a name="ln775">void</a>
+<a name="ln776">DwarfExpressionEvaluator::_PushRegister(uint32 reg, target_addr_t offset)</a>
+<a name="ln777">{</a>
+<a name="ln778">	BVariant value;</a>
+<a name="ln779">	if (!fContext-&gt;TargetInterface()-&gt;GetRegisterValue(reg, value))</a>
+<a name="ln780">		throw EvaluationException(&quot;failed to get register&quot;);</a>
+<a name="ln781"> </a>
+<a name="ln782">	_Push(value.ToUInt64() + offset);</a>
+<a name="ln783">}</a>
+<a name="ln784"> </a>
+<a name="ln785"> </a>
+<a name="ln786">void</a>
+<a name="ln787">DwarfExpressionEvaluator::_Call(uint64 offset, uint8 refType)</a>
+<a name="ln788">{</a>
+<a name="ln789">	if (fDataReader.HasOverflow())</a>
+<a name="ln790">		throw EvaluationException(&quot;unexpected end of expression&quot;);</a>
+<a name="ln791"> </a>
+<a name="ln792">	// get the expression to &quot;call&quot;</a>
+<a name="ln793">	const void* block;</a>
+<a name="ln794">	off_t size;</a>
+<a name="ln795">	if (fContext-&gt;GetCallTarget(offset, refType, block, size) != B_OK)</a>
+<a name="ln796">		throw EvaluationException(&quot;failed to get call target&quot;);</a>
+<a name="ln797"> </a>
+<a name="ln798">	// no expression is OK, then this is just a no-op</a>
+<a name="ln799">	if (block == NULL)</a>
+<a name="ln800">		return;</a>
+<a name="ln801"> </a>
+<a name="ln802">	// save the current data reader state</a>
+<a name="ln803">	DataReader savedReader = fDataReader;</a>
+<a name="ln804"> </a>
+<a name="ln805">	// set the reader to the target expression</a>
+<a name="ln806">	fDataReader.SetTo(block, size, savedReader.AddressSize());</a>
+<a name="ln807"> </a>
+<a name="ln808">	// and evaluate it</a>
+<a name="ln809">	try {</a>
+<a name="ln810">		if (_Evaluate(NULL) != B_OK)</a>
+<a name="ln811">			throw EvaluationException(&quot;call failed&quot;);</a>
+<a name="ln812">	} catch (...) {</a>
+<a name="ln813">		fDataReader = savedReader;</a>
+<a name="ln814">		throw;</a>
+<a name="ln815">	}</a>
+<a name="ln816"> </a>
+<a name="ln817">	fDataReader = savedReader;</a>
+<a name="ln818">}</a>
+
+</code></pre>
+<div class="balloon" rel="110"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fObjectAddress, fFrameAddress, fObjectAddressValid, fFrameAddressValid.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,918 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>UnixEndpoint.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2008, Ingo Weinhold, ingo_weinhold@gmx.de.</a>
+<a name="ln3"> * Distributed under the terms of the MIT License.</a>
+<a name="ln4"> */</a>
+<a name="ln5"> </a>
+<a name="ln6"> </a>
+<a name="ln7">#include &quot;UnixEndpoint.h&quot;</a>
+<a name="ln8"> </a>
+<a name="ln9">#include &lt;stdio.h&gt;</a>
+<a name="ln10">#include &lt;sys/stat.h&gt;</a>
+<a name="ln11"> </a>
+<a name="ln12">#include &lt;AutoDeleter.h&gt;</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &lt;vfs.h&gt;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &quot;UnixAddressManager.h&quot;</a>
+<a name="ln17">#include &quot;UnixFifo.h&quot;</a>
+<a name="ln18"> </a>
+<a name="ln19"> </a>
+<a name="ln20">#define UNIX_ENDPOINT_DEBUG_LEVEL	0</a>
+<a name="ln21">#define UNIX_DEBUG_LEVEL			UNIX_ENDPOINT_DEBUG_LEVEL</a>
+<a name="ln22">#include &quot;UnixDebug.h&quot;</a>
+<a name="ln23"> </a>
+<a name="ln24"> </a>
+<a name="ln25">// Note on locking order (outermost -&gt; innermost):</a>
+<a name="ln26">// UnixEndpoint: connecting -&gt; listening -&gt; child</a>
+<a name="ln27">// -&gt; UnixFifo (never lock more than one at a time)</a>
+<a name="ln28">// -&gt; UnixAddressManager</a>
+<a name="ln29"> </a>
+<a name="ln30"> </a>
+<a name="ln31">static inline bigtime_t</a>
+<a name="ln32">absolute_timeout(bigtime_t timeout)</a>
+<a name="ln33">{</a>
+<a name="ln34">	if (timeout == 0 || timeout == B_INFINITE_TIMEOUT)</a>
+<a name="ln35">		return timeout;</a>
+<a name="ln36"> </a>
+<a name="ln37">// TODO: Make overflow safe!</a>
+<a name="ln38">	return timeout + system_time();</a>
+<a name="ln39">}</a>
+<a name="ln40"> </a>
+<a name="ln41"> </a>
+<a name="ln42">UnixEndpoint::UnixEndpoint(net_socket* socket)</a>
+<a name="ln43">	:</a>
+<a name="ln44">	ProtocolSocket(socket),</a>
+<a name="ln45">	fAddress(),</a>
+<a name="ln46">	fAddressHashLink(),</a>
+<a name="ln47">	fPeerEndpoint(NULL),</a>
+<a name="ln48">	fReceiveFifo(NULL),</a>
+<a name="ln49">	fState(UNIX_ENDPOINT_CLOSED),</a>
+<a name="ln50">	fAcceptSemaphore(-1),</a>
+<a name="ln51">	fIsChild(false)</a>
+<a name="ln52">{</a>
+<a name="ln53">	TRACE(&quot;[%ld] %p-&gt;UnixEndpoint::UnixEndpoint()\n&quot;, find_thread(NULL), this);</a>
+<a name="ln54"> </a>
+<a name="ln55">	mutex_init(&amp;fLock, &quot;unix endpoint&quot;);</a>
+<a name="ln56">}</a>
+<a name="ln57"> </a>
+<a name="ln58"> </a>
+<a name="ln59">UnixEndpoint::~UnixEndpoint()</a>
+<a name="ln60">{</a>
+<a name="ln61">	TRACE(&quot;[%ld] %p-&gt;UnixEndpoint::~UnixEndpoint()\n&quot;, find_thread(NULL), this);</a>
+<a name="ln62"> </a>
+<a name="ln63">	mutex_destroy(&amp;fLock);</a>
+<a name="ln64">}</a>
+<a name="ln65"> </a>
+<a name="ln66"> </a>
+<a name="ln67">status_t</a>
+<a name="ln68">UnixEndpoint::Init()</a>
+<a name="ln69">{</a>
+<a name="ln70">	TRACE(&quot;[%ld] %p-&gt;UnixEndpoint::Init()\n&quot;, find_thread(NULL), this);</a>
+<a name="ln71"> </a>
+<a name="ln72">	RETURN_ERROR(B_OK);</a>
+<a name="ln73">}</a>
+<a name="ln74"> </a>
+<a name="ln75"> </a>
+<a name="ln76">void</a>
+<a name="ln77">UnixEndpoint::Uninit()</a>
+<a name="ln78">{</a>
+<a name="ln79">	TRACE(&quot;[%ld] %p-&gt;UnixEndpoint::Uninit()\n&quot;, find_thread(NULL), this);</a>
+<a name="ln80"> </a>
+<a name="ln81">	// check whether we're closed</a>
+<a name="ln82">	UnixEndpointLocker locker(this);</a>
+<a name="ln83">	bool closed = (fState == UNIX_ENDPOINT_CLOSED);</a>
+<a name="ln84">	locker.Unlock();</a>
+<a name="ln85"> </a>
+<a name="ln86">	if (!closed) {</a>
+<a name="ln87">		// That probably means, we're a child endpoint of a listener and</a>
+<a name="ln88">		// have been fully connected, but not yet accepted. Our Close()</a>
+<a name="ln89">		// hook isn't called in this case. Do it manually.</a>
+<a name="ln90">		Close();</a>
+<a name="ln91">	}</a>
+<a name="ln92"> </a>
+<a name="ln93">	ReleaseReference();</a>
+<a name="ln94">}</a>
+<a name="ln95"> </a>
+<a name="ln96"> </a>
+<a name="ln97">status_t</a>
+<a name="ln98">UnixEndpoint::Open()</a>
+<a name="ln99">{</a>
+<a name="ln100">	TRACE(&quot;[%ld] %p-&gt;UnixEndpoint::Open()\n&quot;, find_thread(NULL), this);</a>
+<a name="ln101"> </a>
+<a name="ln102">	status_t error = ProtocolSocket::Open();</a>
+<a name="ln103">	if (error != B_OK)</a>
+<a name="ln104">		RETURN_ERROR(error);</a>
+<a name="ln105"> </a>
+<a name="ln106">	fState = UNIX_ENDPOINT_NOT_CONNECTED;</a>
+<a name="ln107"> </a>
+<a name="ln108">	RETURN_ERROR(B_OK);</a>
+<a name="ln109">}</a>
+<a name="ln110"> </a>
+<a name="ln111"> </a>
+<a name="ln112">status_t</a>
+<a name="ln113">UnixEndpoint::Close()</a>
+<a name="ln114">{</a>
+<a name="ln115">	TRACE(&quot;[%ld] %p-&gt;UnixEndpoint::Close()\n&quot;, find_thread(NULL), this);</a>
+<a name="ln116"> </a>
+<a name="ln117">	UnixEndpointLocker locker(this);</a>
+<a name="ln118"> </a>
+<a name="ln119">	if (fState == UNIX_ENDPOINT_CONNECTED) {</a>
+<a name="ln120">		UnixEndpointLocker peerLocker;</a>
+<a name="ln121">		if (_LockConnectedEndpoints(locker, peerLocker) == B_OK) {</a>
+<a name="ln122">			// We're still connected. Disconnect both endpoints!</a>
+<a name="ln123">			fPeerEndpoint-&gt;_Disconnect();</a>
+<a name="ln124">			_Disconnect();</a>
+<a name="ln125">		}</a>
+<a name="ln126">	}</a>
+<a name="ln127"> </a>
+<a name="ln128">	if (fState == UNIX_ENDPOINT_LISTENING)</a>
+<a name="ln129">		_StopListening();</a>
+<a name="ln130"> </a>
+<a name="ln131">	_Unbind();</a>
+<a name="ln132"> </a>
+<a name="ln133">	fState = UNIX_ENDPOINT_CLOSED;</a>
+<a name="ln134">	RETURN_ERROR(B_OK);</a>
+<a name="ln135">}</a>
+<a name="ln136"> </a>
+<a name="ln137"> </a>
+<a name="ln138">status_t</a>
+<a name="ln139">UnixEndpoint::Free()</a>
+<a name="ln140">{</a>
+<a name="ln141">	TRACE(&quot;[%ld] %p-&gt;UnixEndpoint::Free()\n&quot;, find_thread(NULL), this);</a>
+<a name="ln142"> </a>
+<a name="ln143">	UnixEndpointLocker locker(this);</a>
+<a name="ln144"> </a>
+<a name="ln145">	_UnsetReceiveFifo();</a>
+<a name="ln146"> </a>
+<a name="ln147">	RETURN_ERROR(B_OK);</a>
+<a name="ln148">}</a>
+<a name="ln149"> </a>
+<a name="ln150"> </a>
+<a name="ln151">status_t</a>
+<a name="ln152">UnixEndpoint::Bind(const struct sockaddr *_address)</a>
+<a name="ln153">{</a>
+<a name="ln154">	if (_address-&gt;sa_family != AF_UNIX)</a>
+<a name="ln155">		RETURN_ERROR(EAFNOSUPPORT);</a>
+<a name="ln156"> </a>
+<a name="ln157">	TRACE(&quot;[%ld] %p-&gt;UnixEndpoint::Bind(\&quot;%s\&quot;)\n&quot;, find_thread(NULL), this,</a>
+<a name="ln158">		ConstSocketAddress(&amp;gAddressModule, _address).AsString().Data());</a>
+<a name="ln159"> </a>
+<a name="ln160">	const sockaddr_un* address = (const sockaddr_un*)_address;</a>
+<a name="ln161"> </a>
+<a name="ln162">	UnixEndpointLocker endpointLocker(this);</a>
+<a name="ln163"> </a>
+<a name="ln164">	if (fState != UNIX_ENDPOINT_NOT_CONNECTED || IsBound())</a>
+<a name="ln165">		RETURN_ERROR(B_BAD_VALUE);</a>
+<a name="ln166"> </a>
+<a name="ln167">	if (address-&gt;sun_path[0] == '\0') {</a>
+<a name="ln168">		UnixAddressManagerLocker addressLocker(gAddressManager);</a>
+<a name="ln169"> </a>
+<a name="ln170">		// internal address space (or empty address)</a>
+<a name="ln171">		int32 internalID;</a>
+<a name="ln172">		if (UnixAddress::IsEmptyAddress(*address))</a>
+<a name="ln173">			internalID = gAddressManager.NextUnusedInternalID();</a>
+<a name="ln174">		else</a>
+<a name="ln175">			internalID = UnixAddress::InternalID(*address);</a>
+<a name="ln176">		if (internalID &lt; 0)</a>
+<a name="ln177">			RETURN_ERROR(internalID);</a>
+<a name="ln178"> </a>
+<a name="ln179">		status_t error = _Bind(internalID);</a>
+<a name="ln180">		if (error != B_OK)</a>
+<a name="ln181">			RETURN_ERROR(error);</a>
+<a name="ln182"> </a>
+<a name="ln183">		sockaddr_un* outAddress = (sockaddr_un*)&amp;socket-&gt;address;</a>
+<a name="ln184">		outAddress-&gt;sun_path[0] = '\0';</a>
+<a name="ln185">		sprintf(outAddress-&gt;sun_path + 1, &quot;%05&quot; B_PRIx32, internalID);</a>
+<a name="ln186">		outAddress-&gt;sun_len = INTERNAL_UNIX_ADDRESS_LEN;</a>
+<a name="ln187">			// null-byte + 5 hex digits</a>
+<a name="ln188"> </a>
+<a name="ln189">		gAddressManager.Add(this);</a>
+<a name="ln190">	} else {</a>
+<a name="ln191">		// FS address space</a>
+<a name="ln192">		size_t pathLen = strnlen(address-&gt;sun_path, sizeof(address-&gt;sun_path));</a>
+<a name="ln193">		if (pathLen == 0 || pathLen == sizeof(address-&gt;sun_path))</a>
+<a name="ln194">			RETURN_ERROR(B_BAD_VALUE);</a>
+<a name="ln195"> </a>
+<a name="ln196">		struct vnode* vnode;</a>
+<a name="ln197">		status_t error = vfs_create_special_node(address-&gt;sun_path,</a>
+<a name="ln198">			NULL, S_IFSOCK | 0644, 0, !gStackModule-&gt;is_syscall(), NULL,</a>
+<a name="ln199">			&amp;vnode);</a>
+<a name="ln200">		if (error != B_OK)</a>
+<a name="ln201">			RETURN_ERROR(error == B_FILE_EXISTS ? EADDRINUSE : error);</a>
+<a name="ln202"> </a>
+<a name="ln203">		error = _Bind(vnode);</a>
+<a name="ln204">		if (error != B_OK) {</a>
+<a name="ln205">			vfs_put_vnode(vnode);</a>
+<a name="ln206">			RETURN_ERROR(error);</a>
+<a name="ln207">		}</a>
+<a name="ln208"> </a>
+<a name="ln209">		size_t addressLen = address-&gt;sun_path + pathLen + 1 - (char*)address;</a>
+<a name="ln210">		memcpy(&amp;socket-&gt;address, address, addressLen);</a>
+<a name="ln211">		socket-&gt;address.ss_len = addressLen;</a>
+<a name="ln212"> </a>
+<a name="ln213">		UnixAddressManagerLocker addressLocker(gAddressManager);</a>
+<a name="ln214">		gAddressManager.Add(this);</a>
+<a name="ln215">	}</a>
+<a name="ln216"> </a>
+<a name="ln217">	RETURN_ERROR(B_OK);</a>
+<a name="ln218">}</a>
+<a name="ln219"> </a>
+<a name="ln220"> </a>
+<a name="ln221">status_t</a>
+<a name="ln222">UnixEndpoint::Unbind()</a>
+<a name="ln223">{</a>
+<a name="ln224">	TRACE(&quot;[%ld] %p-&gt;UnixEndpoint::Unbind()\n&quot;, find_thread(NULL), this);</a>
+<a name="ln225"> </a>
+<a name="ln226">	UnixEndpointLocker endpointLocker(this);</a>
+<a name="ln227"> </a>
+<a name="ln228">	RETURN_ERROR(_Unbind());</a>
+<a name="ln229">}</a>
+<a name="ln230"> </a>
+<a name="ln231"> </a>
+<a name="ln232">status_t</a>
+<a name="ln233">UnixEndpoint::Listen(int backlog)</a>
+<a name="ln234">{</a>
+<a name="ln235">	TRACE(&quot;[%ld] %p-&gt;UnixEndpoint::Listen(%d)\n&quot;, find_thread(NULL), this,</a>
+<a name="ln236">		backlog);</a>
+<a name="ln237"> </a>
+<a name="ln238">	UnixEndpointLocker endpointLocker(this);</a>
+<a name="ln239"> </a>
+<a name="ln240">	if (!IsBound())</a>
+<a name="ln241">		RETURN_ERROR(EDESTADDRREQ);</a>
+<a name="ln242">	if (fState != UNIX_ENDPOINT_NOT_CONNECTED</a>
+<a name="ln243">		&amp;&amp; fState != UNIX_ENDPOINT_LISTENING)</a>
+<a name="ln244">		RETURN_ERROR(EINVAL);</a>
+<a name="ln245"> </a>
+<a name="ln246">	gSocketModule-&gt;set_max_backlog(socket, backlog);</a>
+<a name="ln247"> </a>
+<a name="ln248">	if (fState == UNIX_ENDPOINT_NOT_CONNECTED) {</a>
+<a name="ln249">		fAcceptSemaphore = create_sem(0, &quot;unix accept&quot;);</a>
+<a name="ln250">		if (fAcceptSemaphore &lt; 0)</a>
+<a name="ln251">			RETURN_ERROR(ENOBUFS);</a>
+<a name="ln252">	</a>
+<a name="ln253">		_UnsetReceiveFifo();</a>
+<a name="ln254">	</a>
+<a name="ln255">		fCredentials.pid = getpid();</a>
+<a name="ln256">		fCredentials.uid = geteuid();</a>
+<a name="ln257">		fCredentials.gid = getegid();</a>
+<a name="ln258">	</a>
+<a name="ln259">		fState = UNIX_ENDPOINT_LISTENING;</a>
+<a name="ln260">	}</a>
+<a name="ln261"> </a>
+<a name="ln262">	RETURN_ERROR(B_OK);</a>
+<a name="ln263">}</a>
+<a name="ln264"> </a>
+<a name="ln265"> </a>
+<a name="ln266">status_t</a>
+<a name="ln267">UnixEndpoint::Connect(const struct sockaddr *_address)</a>
+<a name="ln268">{</a>
+<a name="ln269">	if (_address-&gt;sa_family != AF_UNIX)</a>
+<a name="ln270">		RETURN_ERROR(EAFNOSUPPORT);</a>
+<a name="ln271"> </a>
+<a name="ln272">	TRACE(&quot;[%ld] %p-&gt;UnixEndpoint::Connect(\&quot;%s\&quot;)\n&quot;, find_thread(NULL), this,</a>
+<a name="ln273">		ConstSocketAddress(&amp;gAddressModule, _address).AsString().Data());</a>
+<a name="ln274"> </a>
+<a name="ln275">	const sockaddr_un* address = (const sockaddr_un*)_address;</a>
+<a name="ln276"> </a>
+<a name="ln277">	UnixEndpointLocker endpointLocker(this);</a>
+<a name="ln278"> </a>
+<a name="ln279">	if (fState == UNIX_ENDPOINT_CONNECTED)</a>
+<a name="ln280">		RETURN_ERROR(EISCONN);</a>
+<a name="ln281"> </a>
+<a name="ln282">	if (fState != UNIX_ENDPOINT_NOT_CONNECTED)</a>
+<a name="ln283">		RETURN_ERROR(B_BAD_VALUE);</a>
+<a name="ln284">// TODO: If listening, we could set the backlog to 0 and connect.</a>
+<a name="ln285"> </a>
+<a name="ln286">	// check the address first</a>
+<a name="ln287">	UnixAddress unixAddress;</a>
+<a name="ln288"> </a>
+<a name="ln289">	if (address-&gt;sun_path[0] == '\0') {</a>
+<a name="ln290">		// internal address space (or empty address)</a>
+<a name="ln291">		int32 internalID;</a>
+<a name="ln292">		if (UnixAddress::IsEmptyAddress(*address))</a>
+<a name="ln293">			RETURN_ERROR(B_BAD_VALUE);</a>
+<a name="ln294"> </a>
+<a name="ln295">		internalID = UnixAddress::InternalID(*address);</a>
+<a name="ln296">		if (internalID &lt; 0)</a>
+<a name="ln297">			RETURN_ERROR(internalID);</a>
+<a name="ln298"> </a>
+<a name="ln299">		unixAddress.SetTo(internalID);</a>
+<a name="ln300">	} else {</a>
+<a name="ln301">		// FS address space</a>
+<a name="ln302">		size_t pathLen = strnlen(address-&gt;sun_path, sizeof(address-&gt;sun_path));</a>
+<a name="ln303">		if (pathLen == 0 || pathLen == sizeof(address-&gt;sun_path))</a>
+<a name="ln304">			RETURN_ERROR(B_BAD_VALUE);</a>
+<a name="ln305"> </a>
+<a name="ln306">		struct stat st;</a>
+<a name="ln307">		status_t error = vfs_read_stat(-1, address-&gt;sun_path, true, &amp;st,</a>
+<a name="ln308">			!gStackModule-&gt;is_syscall());</a>
+<a name="ln309">		if (error != B_OK)</a>
+<a name="ln310">			RETURN_ERROR(error);</a>
+<a name="ln311"> </a>
+<a name="ln312">		if (!S_ISSOCK(st.st_mode))</a>
+<a name="ln313">			RETURN_ERROR(B_BAD_VALUE);</a>
+<a name="ln314"> </a>
+<a name="ln315">		unixAddress.SetTo(st.st_dev, st.st_ino, NULL);</a>
+<a name="ln316">	}</a>
+<a name="ln317"> </a>
+<a name="ln318">	// get the peer endpoint</a>
+<a name="ln319">	UnixAddressManagerLocker addressLocker(gAddressManager);</a>
+<a name="ln320">	UnixEndpoint* listeningEndpoint = gAddressManager.Lookup(unixAddress);</a>
+<a name="ln321">	if (listeningEndpoint == NULL)</a>
+<a name="ln322">		RETURN_ERROR(ECONNREFUSED);</a>
+<a name="ln323">	BReference&lt;UnixEndpoint&gt; peerReference(listeningEndpoint);</a>
+<a name="ln324">	addressLocker.Unlock();</a>
+<a name="ln325"> </a>
+<a name="ln326">	UnixEndpointLocker peerLocker(listeningEndpoint);</a>
+<a name="ln327"> </a>
+<a name="ln328">	if (!listeningEndpoint-&gt;IsBound()</a>
+<a name="ln329">		|| listeningEndpoint-&gt;fState != UNIX_ENDPOINT_LISTENING</a>
+<a name="ln330">		|| listeningEndpoint-&gt;fAddress != unixAddress) {</a>
+<a name="ln331">		RETURN_ERROR(ECONNREFUSED);</a>
+<a name="ln332">	}</a>
+<a name="ln333"> </a>
+<a name="ln334">	// Allocate FIFOs for us and the socket we're going to spawn. We do that</a>
+<a name="ln335">	// now, so that the mess we need to cleanup, if allocating them fails, is</a>
+<a name="ln336">	// harmless.</a>
+<a name="ln337">	UnixFifo* fifo = new(nothrow) UnixFifo(UNIX_MAX_TRANSFER_UNIT);</a>
+<a name="ln338">	UnixFifo* peerFifo = new(nothrow) UnixFifo(UNIX_MAX_TRANSFER_UNIT);</a>
+<a name="ln339">	ObjectDeleter&lt;UnixFifo&gt; fifoDeleter(fifo);</a>
+<a name="ln340">	ObjectDeleter&lt;UnixFifo&gt; peerFifoDeleter(peerFifo);</a>
+<a name="ln341"> </a>
+<a name="ln342">	status_t error;</a>
+<a name="ln343">	if ((error = fifo-&gt;Init()) != B_OK || (error = peerFifo-&gt;Init()) != B_OK)</a>
+<a name="ln344">		return error;</a>
+<a name="ln345"> </a>
+<a name="ln346">	// spawn new endpoint for accept()</a>
+<a name="ln347">	net_socket* newSocket;</a>
+<a name="ln348">	error = gSocketModule-&gt;spawn_pending_socket(listeningEndpoint-&gt;socket,</a>
+<a name="ln349">		&amp;newSocket);</a>
+<a name="ln350">	if (error != B_OK)</a>
+<a name="ln351">		RETURN_ERROR(error);</a>
+<a name="ln352"> </a>
+<a name="ln353">	// init connected peer endpoint</a>
+<a name="ln354">	UnixEndpoint* connectedEndpoint = (UnixEndpoint*)newSocket-&gt;first_protocol;</a>
+<a name="ln355"> </a>
+<a name="ln356">	UnixEndpointLocker connectedLocker(connectedEndpoint);</a>
+<a name="ln357"> </a>
+<a name="ln358">	connectedEndpoint-&gt;_Spawn(this, listeningEndpoint, peerFifo);</a>
+<a name="ln359"> </a>
+<a name="ln360">	// update our attributes</a>
+<a name="ln361">	_UnsetReceiveFifo();</a>
+<a name="ln362"> </a>
+<a name="ln363">	fPeerEndpoint = connectedEndpoint;</a>
+<a name="ln364">	PeerAddress().SetTo(&amp;connectedEndpoint-&gt;socket-&gt;address);</a>
+<a name="ln365">	fPeerEndpoint-&gt;AcquireReference();</a>
+<a name="ln366">	fReceiveFifo = fifo;</a>
+<a name="ln367"> </a>
+<a name="ln368">	fCredentials.pid = getpid();</a>
+<a name="ln369">	fCredentials.uid = geteuid();</a>
+<a name="ln370">	fCredentials.gid = getegid();</a>
+<a name="ln371"> </a>
+<a name="ln372">	fifoDeleter.Detach();</a>
+<a name="ln373">	peerFifoDeleter.Detach();</a>
+<a name="ln374"> </a>
+<a name="ln375">	fState = UNIX_ENDPOINT_CONNECTED;</a>
+<a name="ln376"> </a>
+<a name="ln377">	gSocketModule-&gt;set_connected(newSocket);</a>
+<a name="ln378"> </a>
+<a name="ln379">	release_sem(listeningEndpoint-&gt;fAcceptSemaphore);</a>
+<a name="ln380"> </a>
+<a name="ln381">	connectedLocker.Unlock();</a>
+<a name="ln382">	peerLocker.Unlock();</a>
+<a name="ln383">	endpointLocker.Unlock();</a>
+<a name="ln384"> </a>
+<a name="ln385">	RETURN_ERROR(B_OK);</a>
+<a name="ln386">}</a>
+<a name="ln387"> </a>
+<a name="ln388"> </a>
+<a name="ln389">status_t</a>
+<a name="ln390">UnixEndpoint::Accept(net_socket **_acceptedSocket)</a>
+<a name="ln391">{</a>
+<a name="ln392">	TRACE(&quot;[%ld] %p-&gt;UnixEndpoint::Accept()\n&quot;, find_thread(NULL), this);</a>
+<a name="ln393"> </a>
+<a name="ln394">	bigtime_t timeout = absolute_timeout(socket-&gt;receive.timeout);</a>
+<a name="ln395">	if (gStackModule-&gt;is_restarted_syscall())</a>
+<a name="ln396">		timeout = gStackModule-&gt;restore_syscall_restart_timeout();</a>
+<a name="ln397">	else</a>
+<a name="ln398">		gStackModule-&gt;store_syscall_restart_timeout(timeout);</a>
+<a name="ln399"> </a>
+<a name="ln400">	UnixEndpointLocker locker(this);</a>
+<a name="ln401"> </a>
+<a name="ln402">	status_t error;</a>
+<a name="ln403">	do {</a>
+<a name="ln404">		locker.Unlock();</a>
+<a name="ln405"> </a>
+<a name="ln406">		error = acquire_sem_etc(fAcceptSemaphore, 1,</a>
+<a name="ln407">			B_ABSOLUTE_TIMEOUT | B_CAN_INTERRUPT, timeout);</a>
+<a name="ln408">		if (error &lt; B_OK)</a>
+<a name="ln409">			RETURN_ERROR(error);</a>
+<a name="ln410"> </a>
+<a name="ln411">		locker.Lock();</a>
+<a name="ln412">		error = gSocketModule-&gt;dequeue_connected(socket, _acceptedSocket);</a>
+<a name="ln413">	} while (error != B_OK);</a>
+<a name="ln414"> </a>
+<a name="ln415">	if (error == B_TIMED_OUT &amp;&amp; timeout == 0) {</a>
+<a name="ln416">		// translate non-blocking timeouts to the correct error code</a>
+<a name="ln417">		error = B_WOULD_BLOCK;</a>
+<a name="ln418">	}</a>
+<a name="ln419"> </a>
+<a name="ln420">	RETURN_ERROR(error);</a>
+<a name="ln421">}</a>
+<a name="ln422"> </a>
+<a name="ln423"> </a>
+<a name="ln424">ssize_t</a>
+<a name="ln425">UnixEndpoint::Send(const iovec *vecs, size_t vecCount,</a>
+<a name="ln426">	ancillary_data_container *ancillaryData)</a>
+<a name="ln427">{</a>
+<a name="ln428">	TRACE(&quot;[%ld] %p-&gt;UnixEndpoint::Send(%p, %ld, %p)\n&quot;, find_thread(NULL),</a>
+<a name="ln429">		this, vecs, vecCount, ancillaryData);</a>
+<a name="ln430"> </a>
+<a name="ln431">	bigtime_t timeout = absolute_timeout(socket-&gt;send.timeout);</a>
+<a name="ln432">	if (gStackModule-&gt;is_restarted_syscall())</a>
+<a name="ln433">		timeout = gStackModule-&gt;restore_syscall_restart_timeout();</a>
+<a name="ln434">	else</a>
+<a name="ln435">		gStackModule-&gt;store_syscall_restart_timeout(timeout);</a>
+<a name="ln436"> </a>
+<a name="ln437">	UnixEndpointLocker locker(this);</a>
+<a name="ln438"> </a>
+<a name="ln439">	BReference&lt;UnixEndpoint&gt; peerReference;</a>
+<a name="ln440">	UnixEndpointLocker peerLocker;</a>
+<a name="ln441"> </a>
+<a name="ln442">	status_t error = _LockConnectedEndpoints(locker, peerLocker);</a>
+<a name="ln443">	if (error != B_OK)</a>
+<a name="ln444">		RETURN_ERROR(error);</a>
+<a name="ln445"> </a>
+<a name="ln446">	UnixEndpoint* peerEndpoint = fPeerEndpoint;</a>
+<a name="ln447">	peerReference.SetTo(peerEndpoint);</a>
+<a name="ln448"> </a>
+<a name="ln449">	// lock the peer's FIFO</a>
+<a name="ln450">	UnixFifo* peerFifo = peerEndpoint-&gt;fReceiveFifo;</a>
+<a name="ln451">	BReference&lt;UnixFifo&gt; _(peerFifo);</a>
+<a name="ln452">	UnixFifoLocker fifoLocker(peerFifo);</a>
+<a name="ln453"> </a>
+<a name="ln454">	// unlock endpoints</a>
+<a name="ln455">	locker.Unlock();</a>
+<a name="ln456">	peerLocker.Unlock();</a>
+<a name="ln457"> </a>
+<a name="ln458">	ssize_t result = peerFifo-&gt;Write(vecs, vecCount, ancillaryData, timeout);</a>
+<a name="ln459"> </a>
+<a name="ln460">	// Notify select()ing readers, if we successfully wrote anything.</a>
+<a name="ln461">	size_t readable = peerFifo-&gt;Readable();</a>
+<a name="ln462">	bool notifyRead = (error == B_OK &amp;&amp; readable &gt; 0</a>
+<a name="ln463">		&amp;&amp; !peerFifo-&gt;IsReadShutdown());</a>
+<a name="ln464"> </a>
+<a name="ln465">	// Notify select()ing writers, if we failed to write anything and there's</a>
+<a name="ln466">	// still room to write.</a>
+<a name="ln467">	size_t writable = peerFifo-&gt;Writable();</a>
+<a name="ln468">	bool notifyWrite = (error != B_OK &amp;&amp; writable &gt; 0</a>
+<a name="ln469">		&amp;&amp; !peerFifo-&gt;IsWriteShutdown());</a>
+<a name="ln470"> </a>
+<a name="ln471">	// re-lock our endpoint (unlock FIFO to respect locking order)</a>
+<a name="ln472">	fifoLocker.Unlock();</a>
+<a name="ln473">	locker.Lock();</a>
+<a name="ln474"> </a>
+<a name="ln475">	bool peerLocked = (fPeerEndpoint == peerEndpoint</a>
+<a name="ln476">		&amp;&amp; _LockConnectedEndpoints(locker, peerLocker) == B_OK);</a>
+<a name="ln477"> </a>
+<a name="ln478">	// send notifications</a>
+<a name="ln479">	if (peerLocked &amp;&amp; notifyRead)</a>
+<a name="ln480">		gSocketModule-&gt;notify(peerEndpoint-&gt;socket, B_SELECT_READ, readable);</a>
+<a name="ln481">	if (notifyWrite)</a>
+<a name="ln482">		gSocketModule-&gt;notify(socket, B_SELECT_WRITE, writable);</a>
+<a name="ln483"> </a>
+<a name="ln484">	switch (result) {</a>
+<a name="ln485">		case UNIX_FIFO_SHUTDOWN:</a>
+<a name="ln486">			if (fPeerEndpoint == peerEndpoint</a>
+<a name="ln487">					&amp;&amp; fState == UNIX_ENDPOINT_CONNECTED) {</a>
+<a name="ln488">				// Orderly write shutdown on our side.</a>
+<a name="ln489">				// Note: Linux and Solaris also send a SIGPIPE, but according</a>
+<a name="ln490">				// the send() specification that shouldn't be done.</a>
+<a name="ln491">				result = EPIPE;</a>
+<a name="ln492">			} else {</a>
+<a name="ln493">				// The FD has been closed.</a>
+<a name="ln494">				result = EBADF;</a>
+<a name="ln495">			}</a>
+<a name="ln496">			break;</a>
+<a name="ln497">		case EPIPE:</a>
+<a name="ln498">			// The peer closed connection or shutdown its read side. Reward</a>
+<a name="ln499">			// the caller with a SIGPIPE.</a>
+<a name="ln500">			if (gStackModule-&gt;is_syscall())</a>
+<a name="ln501">				send_signal(find_thread(NULL), SIGPIPE);</a>
+<a name="ln502">			break;</a>
+<a name="ln503">		case B_TIMED_OUT:</a>
+<a name="ln504">			// Translate non-blocking timeouts to the correct error code.</a>
+<a name="ln505">			if (timeout == 0)</a>
+<a name="ln506">				result = B_WOULD_BLOCK;</a>
+<a name="ln507">			break;</a>
+<a name="ln508">	}</a>
+<a name="ln509"> </a>
+<a name="ln510">	RETURN_ERROR(result);</a>
+<a name="ln511">}</a>
+<a name="ln512"> </a>
+<a name="ln513"> </a>
+<a name="ln514">ssize_t</a>
+<a name="ln515">UnixEndpoint::Receive(const iovec *vecs, size_t vecCount,</a>
+<a name="ln516">	ancillary_data_container **_ancillaryData, struct sockaddr *_address,</a>
+<a name="ln517">	socklen_t *_addressLength)</a>
+<a name="ln518">{</a>
+<a name="ln519">	TRACE(&quot;[%ld] %p-&gt;UnixEndpoint::Receive(%p, %ld)\n&quot;, find_thread(NULL),</a>
+<a name="ln520">		this, vecs, vecCount);</a>
+<a name="ln521"> </a>
+<a name="ln522">	bigtime_t timeout = absolute_timeout(socket-&gt;receive.timeout);</a>
+<a name="ln523">	if (gStackModule-&gt;is_restarted_syscall())</a>
+<a name="ln524">		timeout = gStackModule-&gt;restore_syscall_restart_timeout();</a>
+<a name="ln525">	else</a>
+<a name="ln526">		gStackModule-&gt;store_syscall_restart_timeout(timeout);</a>
+<a name="ln527"> </a>
+<a name="ln528">	UnixEndpointLocker locker(this);</a>
+<a name="ln529"> </a>
+<a name="ln530">	// We can read as long as we have a FIFO. I.e. we are still connected, or</a>
+<a name="ln531">	// disconnected and not yet reconnected/listening/closed.</a>
+<a name="ln532">	if (fReceiveFifo == NULL)</a>
+<a name="ln533">		RETURN_ERROR(ENOTCONN);</a>
+<a name="ln534"> </a>
+<a name="ln535">	UnixEndpoint* peerEndpoint = fPeerEndpoint;</a>
+<a name="ln536">	BReference&lt;UnixEndpoint&gt; peerReference(peerEndpoint);</a>
+<a name="ln537"> </a>
+<a name="ln538">	// Copy the peer address upfront. This way, if we read something, we don't</a>
+<a name="ln539">	// get into a potential race with Close().</a>
+<a name="ln540">	if (_address != NULL) {</a>
+<a name="ln541">		socklen_t addrLen = min_c(*_addressLength, socket-&gt;peer.ss_len);</a>
+<a name="ln542">		memcpy(_address, &amp;socket-&gt;peer, addrLen);</a>
+<a name="ln543">		*_addressLength = addrLen;</a>
+<a name="ln544">	}</a>
+<a name="ln545"> </a>
+<a name="ln546">	// lock our FIFO</a>
+<a name="ln547">	UnixFifo* fifo = fReceiveFifo;</a>
+<a name="ln548">	BReference&lt;UnixFifo&gt; _(fifo);</a>
+<a name="ln549">	UnixFifoLocker fifoLocker(fifo);</a>
+<a name="ln550"> </a>
+<a name="ln551">	// unlock endpoint</a>
+<a name="ln552">	locker.Unlock();</a>
+<a name="ln553"> </a>
+<a name="ln554">	ssize_t result = fifo-&gt;Read(vecs, vecCount, _ancillaryData, timeout);</a>
+<a name="ln555"> </a>
+<a name="ln556">	// Notify select()ing writers, if we successfully read anything.</a>
+<a name="ln557">	size_t writable = fifo-&gt;Writable();</a>
+<a name="ln558">	bool notifyWrite = (result &gt;= 0 &amp;&amp; writable &gt; 0</a>
+<a name="ln559">		&amp;&amp; !fifo-&gt;IsWriteShutdown());</a>
+<a name="ln560"> </a>
+<a name="ln561">	// Notify select()ing readers, if we failed to read anything and there's</a>
+<a name="ln562">	// still something left to read.</a>
+<a name="ln563">	size_t readable = fifo-&gt;Readable();</a>
+<a name="ln564">	bool notifyRead = (result &lt; 0 &amp;&amp; readable &gt; 0</a>
+<a name="ln565">		&amp;&amp; !fifo-&gt;IsReadShutdown());</a>
+<a name="ln566"> </a>
+<a name="ln567">	// re-lock our endpoint (unlock FIFO to respect locking order)</a>
+<a name="ln568">	fifoLocker.Unlock();</a>
+<a name="ln569">	locker.Lock();</a>
+<a name="ln570"> </a>
+<a name="ln571">	UnixEndpointLocker peerLocker;</a>
+<a name="ln572">	bool peerLocked = (peerEndpoint != NULL &amp;&amp; fPeerEndpoint == peerEndpoint</a>
+<a name="ln573">		&amp;&amp; _LockConnectedEndpoints(locker, peerLocker) == B_OK);</a>
+<a name="ln574"> </a>
+<a name="ln575">	// send notifications</a>
+<a name="ln576">	if (notifyRead)</a>
+<a name="ln577">		gSocketModule-&gt;notify(socket, B_SELECT_READ, readable);</a>
+<a name="ln578">	if (peerLocked &amp;&amp; notifyWrite)</a>
+<a name="ln579">		gSocketModule-&gt;notify(peerEndpoint-&gt;socket, B_SELECT_WRITE, writable);</a>
+<a name="ln580"> </a>
+<a name="ln581">	switch (result) {</a>
+<a name="ln582">		case UNIX_FIFO_SHUTDOWN:</a>
+<a name="ln583">			// Either our socket was closed or read shutdown.</a>
+<a name="ln584">			if (fState == UNIX_ENDPOINT_CLOSED) {</a>
+<a name="ln585">				// The FD has been closed.</a>
+<a name="ln586">				result = EBADF;</a>
+<a name="ln587">			} else {</a>
+<a name="ln588">				// if (fReceiveFifo == fifo) {</a>
+<a name="ln589">				// 		Orderly shutdown or the peer closed the connection.</a>
+<a name="ln590">				// } else {</a>
+<a name="ln591">				//		Weird case: Peer closed connection and we are already</a>
+<a name="ln592">				// 		reconnected (or listening).</a>
+<a name="ln593">				// }</a>
+<a name="ln594">				result = 0;</a>
+<a name="ln595">			}</a>
+<a name="ln596">			break;</a>
+<a name="ln597">		case B_TIMED_OUT:</a>
+<a name="ln598">			// translate non-blocking timeouts to the correct error code</a>
+<a name="ln599">			if (timeout == 0)</a>
+<a name="ln600">				result = B_WOULD_BLOCK;</a>
+<a name="ln601">			break;</a>
+<a name="ln602">	}</a>
+<a name="ln603"> </a>
+<a name="ln604">	RETURN_ERROR(result);</a>
+<a name="ln605">}</a>
+<a name="ln606"> </a>
+<a name="ln607"> </a>
+<a name="ln608">ssize_t</a>
+<a name="ln609">UnixEndpoint::Sendable()</a>
+<a name="ln610">{</a>
+<a name="ln611">	TRACE(&quot;[%ld] %p-&gt;UnixEndpoint::Sendable()\n&quot;, find_thread(NULL), this);</a>
+<a name="ln612"> </a>
+<a name="ln613">	UnixEndpointLocker locker(this);</a>
+<a name="ln614">	UnixEndpointLocker peerLocker;</a>
+<a name="ln615"> </a>
+<a name="ln616">	status_t error = _LockConnectedEndpoints(locker, peerLocker);</a>
+<a name="ln617">	if (error != B_OK)</a>
+<a name="ln618">		RETURN_ERROR(error);</a>
+<a name="ln619"> </a>
+<a name="ln620">	// lock the peer's FIFO</a>
+<a name="ln621">	UnixFifo* peerFifo = fPeerEndpoint-&gt;fReceiveFifo;</a>
+<a name="ln622">	UnixFifoLocker fifoLocker(peerFifo);</a>
+<a name="ln623"> </a>
+<a name="ln624">	RETURN_ERROR(peerFifo-&gt;Writable());</a>
+<a name="ln625">}</a>
+<a name="ln626"> </a>
+<a name="ln627"> </a>
+<a name="ln628">ssize_t</a>
+<a name="ln629">UnixEndpoint::Receivable()</a>
+<a name="ln630">{</a>
+<a name="ln631">	TRACE(&quot;[%ld] %p-&gt;UnixEndpoint::Receivable()\n&quot;, find_thread(NULL), this);</a>
+<a name="ln632"> </a>
+<a name="ln633">	UnixEndpointLocker locker(this);</a>
+<a name="ln634"> </a>
+<a name="ln635">	if (fState == UNIX_ENDPOINT_LISTENING)</a>
+<a name="ln636">		return gSocketModule-&gt;count_connected(socket);</a>
+<a name="ln637"> </a>
+<a name="ln638">	if (fState != UNIX_ENDPOINT_CONNECTED)</a>
+<a name="ln639">		RETURN_ERROR(ENOTCONN);</a>
+<a name="ln640"> </a>
+<a name="ln641">	UnixFifoLocker fifoLocker(fReceiveFifo);</a>
+<a name="ln642">	ssize_t readable = fReceiveFifo-&gt;Readable();</a>
+<a name="ln643">	if (readable == 0 &amp;&amp; fReceiveFifo-&gt;IsWriteShutdown())</a>
+<a name="ln644">		RETURN_ERROR(ENOTCONN);</a>
+<a name="ln645">	RETURN_ERROR(readable);</a>
+<a name="ln646">}</a>
+<a name="ln647"> </a>
+<a name="ln648"> </a>
+<a name="ln649">status_t</a>
+<a name="ln650">UnixEndpoint::SetReceiveBufferSize(size_t size)</a>
+<a name="ln651">{</a>
+<a name="ln652">	TRACE(&quot;[%ld] %p-&gt;UnixEndpoint::SetReceiveBufferSize(%lu)\n&quot;,</a>
+<a name="ln653">		find_thread(NULL), this, size);</a>
+<a name="ln654"> </a>
+<a name="ln655">	UnixEndpointLocker locker(this);</a>
+<a name="ln656"> </a>
+<a name="ln657">	if (fReceiveFifo == NULL)</a>
+<a name="ln658">		return B_BAD_VALUE;</a>
+<a name="ln659"> </a>
+<a name="ln660">	UnixFifoLocker fifoLocker(fReceiveFifo);</a>
+<a name="ln661">	return fReceiveFifo-&gt;SetBufferCapacity(size);</a>
+<a name="ln662">}</a>
+<a name="ln663"> </a>
+<a name="ln664"> </a>
+<a name="ln665">status_t</a>
+<a name="ln666">UnixEndpoint::GetPeerCredentials(ucred* credentials)</a>
+<a name="ln667">{</a>
+<a name="ln668">	UnixEndpointLocker locker(this);</a>
+<a name="ln669">	UnixEndpointLocker peerLocker;</a>
+<a name="ln670"> </a>
+<a name="ln671">	status_t error = _LockConnectedEndpoints(locker, peerLocker);</a>
+<a name="ln672">	if (error != B_OK)</a>
+<a name="ln673">		RETURN_ERROR(error);</a>
+<a name="ln674"> </a>
+<a name="ln675">	*credentials = fPeerEndpoint-&gt;fCredentials;</a>
+<a name="ln676"> </a>
+<a name="ln677">	return B_OK;</a>
+<a name="ln678">}</a>
+<a name="ln679"> </a>
+<a name="ln680"> </a>
+<a name="ln681">status_t</a>
+<a name="ln682">UnixEndpoint::Shutdown(int direction)</a>
+<a name="ln683">{</a>
+<a name="ln684">	TRACE(&quot;[%ld] %p-&gt;UnixEndpoint::Shutdown(%d)\n&quot;,</a>
+<a name="ln685">		find_thread(NULL), this, direction);</a>
+<a name="ln686"> </a>
+<a name="ln687">	uint32 shutdown;</a>
+<a name="ln688">	uint32 peerShutdown;</a>
+<a name="ln689"> </a>
+<a name="ln690">	// translate the direction into shutdown flags for our and the peer fifo</a>
+<a name="ln691">	switch (direction) {</a>
+<a name="ln692">		case SHUT_RD:</a>
+<a name="ln693">			shutdown = UNIX_FIFO_SHUTDOWN_READ;</a>
+<a name="ln694">			peerShutdown = 0;</a>
+<a name="ln695">			break;</a>
+<a name="ln696">		case SHUT_WR:</a>
+<a name="ln697">			shutdown = 0;</a>
+<a name="ln698">			peerShutdown = UNIX_FIFO_SHUTDOWN_WRITE;</a>
+<a name="ln699">			break;</a>
+<a name="ln700">		case SHUT_RDWR:</a>
+<a name="ln701">			shutdown = UNIX_FIFO_SHUTDOWN_READ;</a>
+<a name="ln702">			peerShutdown = UNIX_FIFO_SHUTDOWN_WRITE;</a>
+<a name="ln703">			break;</a>
+<a name="ln704">		default:</a>
+<a name="ln705">			RETURN_ERROR(B_BAD_VALUE);</a>
+<a name="ln706">	}</a>
+<a name="ln707"> </a>
+<a name="ln708">	// lock endpoints</a>
+<a name="ln709">	UnixEndpointLocker locker(this);</a>
+<a name="ln710">	UnixEndpointLocker peerLocker;</a>
+<a name="ln711"> </a>
+<a name="ln712">	status_t error = _LockConnectedEndpoints(locker, peerLocker);</a>
+<a name="ln713">	if (error != B_OK)</a>
+<a name="ln714">		RETURN_ERROR(error);</a>
+<a name="ln715"> </a>
+<a name="ln716">	// shutdown our FIFO</a>
+<a name="ln717">	fReceiveFifo-&gt;Lock();</a>
+<a name="ln718">	fReceiveFifo-&gt;Shutdown(shutdown);</a>
+<a name="ln719">	fReceiveFifo-&gt;Unlock();</a>
+<a name="ln720"> </a>
+<a name="ln721">	// shutdown peer FIFO</a>
+<a name="ln722">	fPeerEndpoint-&gt;fReceiveFifo-&gt;Lock();</a>
+<a name="ln723">	fPeerEndpoint-&gt;fReceiveFifo-&gt;Shutdown(peerShutdown);</a>
+<a name="ln724">	fPeerEndpoint-&gt;fReceiveFifo-&gt;Unlock();</a>
+<a name="ln725"> </a>
+<a name="ln726">	// send select notifications</a>
+<a name="ln727">	if (direction == SHUT_RD || direction == SHUT_RDWR) {</a>
+<a name="ln728">		gSocketModule-&gt;notify(socket, B_SELECT_READ, EPIPE);</a>
+<a name="ln729">		gSocketModule-&gt;notify(fPeerEndpoint-&gt;socket, B_SELECT_WRITE, EPIPE);</a>
+<a name="ln730">	}</a>
+<a name="ln731">	if (direction == SHUT_WR || direction == SHUT_RDWR) {</a>
+<a name="ln732">		gSocketModule-&gt;notify(socket, B_SELECT_WRITE, EPIPE);</a>
+<a name="ln733">		gSocketModule-&gt;notify(fPeerEndpoint-&gt;socket, B_SELECT_READ, EPIPE);</a>
+<a name="ln734">	}</a>
+<a name="ln735"> </a>
+<a name="ln736">	RETURN_ERROR(B_OK);</a>
+<a name="ln737">}</a>
+<a name="ln738"> </a>
+<a name="ln739"> </a>
+<a name="ln740">void</a>
+<a name="ln741">UnixEndpoint::_Spawn(UnixEndpoint* connectingEndpoint,</a>
+<a name="ln742">	UnixEndpoint* listeningEndpoint, UnixFifo* fifo)</a>
+<a name="ln743">{</a>
+<a name="ln744">	ProtocolSocket::Open();</a>
+<a name="ln745"> </a>
+<a name="ln746">	fIsChild = true;</a>
+<a name="ln747">	fPeerEndpoint = connectingEndpoint;</a>
+<a name="ln748">	fPeerEndpoint-&gt;AcquireReference();</a>
+<a name="ln749"> </a>
+<a name="ln750">	fReceiveFifo = fifo;</a>
+<a name="ln751"> </a>
+<a name="ln752">	PeerAddress().SetTo(&amp;connectingEndpoint-&gt;socket-&gt;address);</a>
+<a name="ln753"> </a>
+<a name="ln754">	fCredentials = listeningEndpoint-&gt;fCredentials;</a>
+<a name="ln755"> </a>
+<a name="ln756">	fState = UNIX_ENDPOINT_CONNECTED;</a>
+<a name="ln757">}</a>
+<a name="ln758"> </a>
+<a name="ln759"> </a>
+<a name="ln760">void</a>
+<a name="ln761">UnixEndpoint::_Disconnect()</a>
+<a name="ln762">{</a>
+<a name="ln763">	// Both endpoints must be locked.</a>
+<a name="ln764"> </a>
+<a name="ln765">	// Write shutdown the receive FIFO.</a>
+<a name="ln766">	fReceiveFifo-&gt;Lock();</a>
+<a name="ln767">	fReceiveFifo-&gt;Shutdown(UNIX_FIFO_SHUTDOWN_WRITE);</a>
+<a name="ln768">	fReceiveFifo-&gt;Unlock();</a>
+<a name="ln769"> </a>
+<a name="ln770">	// select() notification.</a>
+<a name="ln771">	gSocketModule-&gt;notify(socket, B_SELECT_READ, ECONNRESET);</a>
+<a name="ln772">	gSocketModule-&gt;notify(socket, B_SELECT_WRITE, ECONNRESET);</a>
+<a name="ln773"> </a>
+<a name="ln774">	// Unset the peer endpoint.</a>
+<a name="ln775">	fPeerEndpoint-&gt;ReleaseReference();</a>
+<a name="ln776">	fPeerEndpoint = NULL;</a>
+<a name="ln777"> </a>
+<a name="ln778">	// We're officially disconnected.</a>
+<a name="ln779">// TODO: Deal with non accept()ed connections correctly!</a>
+<a name="ln780">	fIsChild = false;</a>
+<a name="ln781">	fState = UNIX_ENDPOINT_NOT_CONNECTED;</a>
+<a name="ln782">}</a>
+<a name="ln783"> </a>
+<a name="ln784"> </a>
+<a name="ln785">status_t</a>
+<a name="ln786">UnixEndpoint::_LockConnectedEndpoints(UnixEndpointLocker&amp; locker,</a>
+<a name="ln787">	UnixEndpointLocker&amp; peerLocker)</a>
+<a name="ln788">{</a>
+<a name="ln789">	if (fState != UNIX_ENDPOINT_CONNECTED)</a>
+<a name="ln790">		RETURN_ERROR(ENOTCONN);</a>
+<a name="ln791"> </a>
+<a name="ln792">	// We need to lock the peer, too. Get a reference -- we might need to</a>
+<a name="ln793">	// unlock ourselves to get the locking order right.</a>
+<a name="ln794">	BReference&lt;UnixEndpoint&gt; peerReference(fPeerEndpoint);</a>
+<a name="ln795">	UnixEndpoint* peerEndpoint = fPeerEndpoint;</a>
+<a name="ln796"> </a>
+<a name="ln797">	if (fIsChild) {</a>
+<a name="ln798">		// We're the child, but locking order is the other way around.</a>
+<a name="ln799">		locker.Unlock();</a>
+<a name="ln800">		peerLocker.SetTo(peerEndpoint, false);</a>
+<a name="ln801"> </a>
+<a name="ln802">		locker.Lock();</a>
+<a name="ln803"> </a>
+<a name="ln804">		// recheck our state, also whether the peer is still the same</a>
+<a name="ln805">		if (fState != UNIX_ENDPOINT_CONNECTED || peerEndpoint != fPeerEndpoint)</a>
+<a name="ln806">			RETURN_ERROR(ENOTCONN);</a>
+<a name="ln807">	} else</a>
+<a name="ln808">		peerLocker.SetTo(peerEndpoint, false);</a>
+<a name="ln809"> </a>
+<a name="ln810">	RETURN_ERROR(B_OK);</a>
+<a name="ln811">}</a>
+<a name="ln812"> </a>
+<a name="ln813"> </a>
+<a name="ln814">status_t</a>
+<a name="ln815">UnixEndpoint::_Bind(struct vnode* vnode)</a>
+<a name="ln816">{</a>
+<a name="ln817">	struct stat st;</a>
+<a name="ln818">	status_t error = vfs_stat_vnode(vnode, &amp;st);</a>
+<a name="ln819">	if (error != B_OK)</a>
+<a name="ln820">		RETURN_ERROR(error);</a>
+<a name="ln821"> </a>
+<a name="ln822">	fAddress.SetTo(st.st_dev, st.st_ino, vnode);</a>
+<a name="ln823">	RETURN_ERROR(B_OK);</a>
+<a name="ln824">}</a>
+<a name="ln825"> </a>
+<a name="ln826"> </a>
+<a name="ln827">status_t</a>
+<a name="ln828">UnixEndpoint::_Bind(int32 internalID)</a>
+<a name="ln829">{</a>
+<a name="ln830">	fAddress.SetTo(internalID);</a>
+<a name="ln831">	RETURN_ERROR(B_OK);</a>
+<a name="ln832">}</a>
+<a name="ln833"> </a>
+<a name="ln834"> </a>
+<a name="ln835">status_t</a>
+<a name="ln836">UnixEndpoint::_Unbind()</a>
+<a name="ln837">{</a>
+<a name="ln838">	if (fState == UNIX_ENDPOINT_CONNECTED || fState == UNIX_ENDPOINT_LISTENING)</a>
+<a name="ln839">		RETURN_ERROR(B_BAD_VALUE);</a>
+<a name="ln840"> </a>
+<a name="ln841">	if (IsBound()) {</a>
+<a name="ln842">		UnixAddressManagerLocker addressLocker(gAddressManager);</a>
+<a name="ln843">		gAddressManager.Remove(this);</a>
+<a name="ln844">		if (struct vnode* vnode = fAddress.Vnode())</a>
+<a name="ln845">			vfs_put_vnode(vnode);</a>
+<a name="ln846"> </a>
+<a name="ln847">		fAddress.Unset();</a>
+<a name="ln848">	}</a>
+<a name="ln849"> </a>
+<a name="ln850">	RETURN_ERROR(B_OK);</a>
+<a name="ln851">}</a>
+<a name="ln852"> </a>
+<a name="ln853"> </a>
+<a name="ln854">void</a>
+<a name="ln855">UnixEndpoint::_UnsetReceiveFifo()</a>
+<a name="ln856">{</a>
+<a name="ln857">	if (fReceiveFifo) {</a>
+<a name="ln858">		fReceiveFifo-&gt;ReleaseReference();</a>
+<a name="ln859">		fReceiveFifo = NULL;</a>
+<a name="ln860">	}</a>
+<a name="ln861">}</a>
+<a name="ln862"> </a>
+<a name="ln863"> </a>
+<a name="ln864">void</a>
+<a name="ln865">UnixEndpoint::_StopListening()</a>
+<a name="ln866">{</a>
+<a name="ln867">	if (fState == UNIX_ENDPOINT_LISTENING) {</a>
+<a name="ln868">		delete_sem(fAcceptSemaphore);</a>
+<a name="ln869">		fAcceptSemaphore = -1;</a>
+<a name="ln870">		fState = UNIX_ENDPOINT_NOT_CONNECTED;</a>
+<a name="ln871">	}</a>
+<a name="ln872">}</a>
+
+</code></pre>
+<div class="balloon" rel="42"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fCredentials.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

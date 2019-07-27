@@ -1,0 +1,939 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>TCP.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2010 Andreas Färber &lt;andreas.faerber@web.de&gt;</a>
+<a name="ln3"> * All rights reserved. Distributed under the terms of the MIT License.</a>
+<a name="ln4"> */</a>
+<a name="ln5"> </a>
+<a name="ln6"> </a>
+<a name="ln7">/*</a>
+<a name="ln8"> * NOTE This is a cleanroom TCP implementation with some known issues.</a>
+<a name="ln9"> * Protection Against Wrapping Sequence (PAWS) needs to be added.</a>
+<a name="ln10"> * Congestion control needs to be implemented (slow start, recv. window size).</a>
+<a name="ln11"> * The use of *Packets needs to be re-evaluated in the context of TCP;</a>
+<a name="ln12"> * probably a singly-linked list of received data chunks is more efficient.</a>
+<a name="ln13"> * Debug output should be tuned for better aspect oriented tracing.</a>
+<a name="ln14"> * While Little Endian systems have been considered, this still needs testing.</a>
+<a name="ln15"> */</a>
+<a name="ln16"> </a>
+<a name="ln17"> </a>
+<a name="ln18">#include &lt;boot/net/TCP.h&gt;</a>
+<a name="ln19"> </a>
+<a name="ln20">#include &lt;stdio.h&gt;</a>
+<a name="ln21"> </a>
+<a name="ln22">#include &lt;KernelExport.h&gt;</a>
+<a name="ln23"> </a>
+<a name="ln24">#include &lt;boot/net/ChainBuffer.h&gt;</a>
+<a name="ln25">#include &lt;boot/net/NetStack.h&gt;</a>
+<a name="ln26"> </a>
+<a name="ln27">#include &quot;real_time_clock.h&quot;</a>
+<a name="ln28"> </a>
+<a name="ln29"> </a>
+<a name="ln30">//#define TRACE_TCP</a>
+<a name="ln31">//#define TRACE_TCP_RANDOMNESS</a>
+<a name="ln32">//#define TRACE_TCP_CHECKSUM</a>
+<a name="ln33">//#define TRACE_TCP_QUEUE</a>
+<a name="ln34"> </a>
+<a name="ln35"> </a>
+<a name="ln36">#ifdef TRACE_TCP</a>
+<a name="ln37">#	define TRACE(x, ...) dprintf(x, ## __VA_ARGS__)</a>
+<a name="ln38">#else</a>
+<a name="ln39">#	define TRACE(x, ...) ;</a>
+<a name="ln40">#endif</a>
+<a name="ln41">#ifdef TRACE_TCP_RANDOMNESS</a>
+<a name="ln42">#	define TRACE_PORT(x, ...) dprintf(x, ## __VA_ARGS__)</a>
+<a name="ln43">#else</a>
+<a name="ln44">#	define TRACE_PORT(x, ...) ;</a>
+<a name="ln45">#endif</a>
+<a name="ln46">#if defined(TRACE_TCP_CHECKSUM)</a>
+<a name="ln47">#	define TRACE_CHECKSUM(x, ...) dprintf(x, ## __VA_ARGS__)</a>
+<a name="ln48">#else</a>
+<a name="ln49">#	define TRACE_CHECKSUM(x, ...) ;</a>
+<a name="ln50">#endif</a>
+<a name="ln51">#if defined(TRACE_TCP_QUEUE)</a>
+<a name="ln52">#	define TRACE_QUEUE(x, ...) dprintf(x, ## __VA_ARGS__)</a>
+<a name="ln53">#else</a>
+<a name="ln54">#	define TRACE_QUEUE(x, ...) ;</a>
+<a name="ln55">#endif</a>
+<a name="ln56"> </a>
+<a name="ln57"> </a>
+<a name="ln58">static unsigned int</a>
+<a name="ln59">_rand32(void)</a>
+<a name="ln60">{</a>
+<a name="ln61">	static unsigned int next = 0;</a>
+<a name="ln62">	if (next == 0)</a>
+<a name="ln63">		next = real_time_clock_usecs() / 1000000;</a>
+<a name="ln64"> </a>
+<a name="ln65">	next = (next &gt;&gt; 1) ^ (unsigned int)((0 - (next &amp; 1U)) &amp; 0xd0000001U);</a>
+<a name="ln66">		// characteristic polynomial: x^32 + x^31 + x^29 + x + 1</a>
+<a name="ln67">	return next;</a>
+<a name="ln68">}</a>
+<a name="ln69"> </a>
+<a name="ln70"> </a>
+<a name="ln71">static unsigned short</a>
+<a name="ln72">_rand14(void)</a>
+<a name="ln73">{</a>
+<a name="ln74">	// TODO: Find suitable generator polynomial.</a>
+<a name="ln75">	return _rand32() &amp; 0x3fff;</a>
+<a name="ln76">}</a>
+<a name="ln77"> </a>
+<a name="ln78"> </a>
+<a name="ln79">TCPPacket::TCPPacket()</a>
+<a name="ln80">	:</a>
+<a name="ln81">	fData(NULL),</a>
+<a name="ln82">	fNext(NULL)</a>
+<a name="ln83">{</a>
+<a name="ln84">}</a>
+<a name="ln85"> </a>
+<a name="ln86"> </a>
+<a name="ln87">TCPPacket::~TCPPacket()</a>
+<a name="ln88">{</a>
+<a name="ln89">	free(fData);</a>
+<a name="ln90">}</a>
+<a name="ln91"> </a>
+<a name="ln92"> </a>
+<a name="ln93">status_t</a>
+<a name="ln94">TCPPacket::SetTo(const void* data, size_t size, ip_addr_t sourceAddress,</a>
+<a name="ln95">	uint16 sourcePort, ip_addr_t destinationAddress, uint16 destinationPort,</a>
+<a name="ln96">	uint32 sequenceNumber, uint32 acknowledgmentNumber, uint8 flags)</a>
+<a name="ln97">{</a>
+<a name="ln98">	if (data == NULL &amp;&amp; size &gt; 0)</a>
+<a name="ln99">		return B_BAD_VALUE;</a>
+<a name="ln100"> </a>
+<a name="ln101">	if (size &gt; 0) {</a>
+<a name="ln102">		fData = malloc(size);</a>
+<a name="ln103">		if (fData == NULL)</a>
+<a name="ln104">			return B_NO_MEMORY;</a>
+<a name="ln105">		memcpy(fData, data, size);</a>
+<a name="ln106">	} else</a>
+<a name="ln107">		fData = NULL;</a>
+<a name="ln108"> </a>
+<a name="ln109">	fSize = size;</a>
+<a name="ln110">	fSourceAddress = sourceAddress;</a>
+<a name="ln111">	fSourcePort = sourcePort;</a>
+<a name="ln112">	fDestinationAddress = destinationAddress;</a>
+<a name="ln113">	fDestinationPort = destinationPort;</a>
+<a name="ln114">	fSequenceNumber = sequenceNumber;</a>
+<a name="ln115">	fAcknowledgmentNumber = acknowledgmentNumber;</a>
+<a name="ln116">	fFlags = flags;</a>
+<a name="ln117"> </a>
+<a name="ln118">	return B_OK;</a>
+<a name="ln119">}</a>
+<a name="ln120"> </a>
+<a name="ln121"> </a>
+<a name="ln122">ip_addr_t</a>
+<a name="ln123">TCPPacket::SourceAddress() const</a>
+<a name="ln124">{</a>
+<a name="ln125">	return fSourceAddress;</a>
+<a name="ln126">}</a>
+<a name="ln127"> </a>
+<a name="ln128"> </a>
+<a name="ln129">ip_addr_t</a>
+<a name="ln130">TCPPacket::DestinationAddress() const</a>
+<a name="ln131">{</a>
+<a name="ln132">	return fDestinationAddress;</a>
+<a name="ln133">}</a>
+<a name="ln134"> </a>
+<a name="ln135"> </a>
+<a name="ln136">uint16</a>
+<a name="ln137">TCPPacket::SourcePort() const</a>
+<a name="ln138">{</a>
+<a name="ln139">	return fSourcePort;</a>
+<a name="ln140">}</a>
+<a name="ln141"> </a>
+<a name="ln142"> </a>
+<a name="ln143">uint16</a>
+<a name="ln144">TCPPacket::DestinationPort() const</a>
+<a name="ln145">{</a>
+<a name="ln146">	return fDestinationPort;</a>
+<a name="ln147">}</a>
+<a name="ln148"> </a>
+<a name="ln149"> </a>
+<a name="ln150">uint32</a>
+<a name="ln151">TCPPacket::SequenceNumber() const</a>
+<a name="ln152">{</a>
+<a name="ln153">	return fSequenceNumber;</a>
+<a name="ln154">}</a>
+<a name="ln155"> </a>
+<a name="ln156"> </a>
+<a name="ln157">uint32</a>
+<a name="ln158">TCPPacket::AcknowledgmentNumber() const</a>
+<a name="ln159">{</a>
+<a name="ln160">	return fAcknowledgmentNumber;</a>
+<a name="ln161">}</a>
+<a name="ln162"> </a>
+<a name="ln163"> </a>
+<a name="ln164">bool</a>
+<a name="ln165">TCPPacket::ProvidesSequenceNumber(uint32 sequenceNumber) const</a>
+<a name="ln166">{</a>
+<a name="ln167">	// TODO PAWS</a>
+<a name="ln168">	return fSequenceNumber &lt;= sequenceNumber</a>
+<a name="ln169">		&amp;&amp; fSequenceNumber + fSize &gt; sequenceNumber;</a>
+<a name="ln170">}</a>
+<a name="ln171"> </a>
+<a name="ln172"> </a>
+<a name="ln173">TCPPacket*</a>
+<a name="ln174">TCPPacket::Next() const</a>
+<a name="ln175">{</a>
+<a name="ln176">	return fNext;</a>
+<a name="ln177">}</a>
+<a name="ln178"> </a>
+<a name="ln179"> </a>
+<a name="ln180">void</a>
+<a name="ln181">TCPPacket::SetNext(TCPPacket* packet)</a>
+<a name="ln182">{</a>
+<a name="ln183">	fNext = packet;</a>
+<a name="ln184">}</a>
+<a name="ln185"> </a>
+<a name="ln186"> </a>
+<a name="ln187"> </a>
+<a name="ln188"> </a>
+<a name="ln189">TCPSocket::TCPSocket()</a>
+<a name="ln190">	:</a>
+<a name="ln191">	fTCPService(NetStack::Default()-&gt;GetTCPService()),</a>
+<a name="ln192">	fAddress(INADDR_ANY),</a>
+<a name="ln193">	fPort(0),</a>
+<a name="ln194">	fSequenceNumber(0),</a>
+<a name="ln195">	fFirstPacket(NULL),</a>
+<a name="ln196">	fLastPacket(NULL),</a>
+<a name="ln197">	fFirstSentPacket(NULL),</a>
+<a name="ln198">	fLastSentPacket(NULL),</a>
+<a name="ln199">	fState(TCP_SOCKET_STATE_INITIAL),</a>
+<a name="ln200">	fRemoteState(TCP_SOCKET_STATE_INITIAL)</a>
+<a name="ln201">{</a>
+<a name="ln202">}</a>
+<a name="ln203"> </a>
+<a name="ln204"> </a>
+<a name="ln205">TCPSocket::~TCPSocket()</a>
+<a name="ln206">{</a>
+<a name="ln207">	if (fTCPService != NULL &amp;&amp; fPort != 0)</a>
+<a name="ln208">		fTCPService-&gt;UnbindSocket(this);</a>
+<a name="ln209">}</a>
+<a name="ln210"> </a>
+<a name="ln211"> </a>
+<a name="ln212">uint16</a>
+<a name="ln213">TCPSocket::WindowSize() const</a>
+<a name="ln214">{</a>
+<a name="ln215">	// TODO A large window size leads to read timeouts</a>
+<a name="ln216">	// due to resends occuring too late.</a>
+<a name="ln217">#if 0</a>
+<a name="ln218">	size_t windowSize = 0xffff;</a>
+<a name="ln219">	for (TCPPacket* packet = fFirstPacket;</a>
+<a name="ln220">			packet != NULL &amp;&amp; windowSize &gt; packet-&gt;DataSize();</a>
+<a name="ln221">			packet = packet-&gt;Next())</a>
+<a name="ln222">		windowSize -= packet-&gt;DataSize();</a>
+<a name="ln223">	return windowSize;</a>
+<a name="ln224">#else</a>
+<a name="ln225">	return 4096;</a>
+<a name="ln226">#endif</a>
+<a name="ln227">}</a>
+<a name="ln228"> </a>
+<a name="ln229"> </a>
+<a name="ln230">status_t</a>
+<a name="ln231">TCPSocket::Connect(ip_addr_t address, uint16 port)</a>
+<a name="ln232">{</a>
+<a name="ln233">	fRemoteAddress = address;</a>
+<a name="ln234">	fRemotePort = port;</a>
+<a name="ln235">	fSequenceNumber = _rand32();</a>
+<a name="ln236">	fPort = 0xC000 + (_rand14() &amp; ~0xc000);</a>
+<a name="ln237">	TRACE_PORT(&quot;TCPSocket::Connect(): connecting from port %u\n&quot;, fPort);</a>
+<a name="ln238">	fAcknowledgeNumber = 0;</a>
+<a name="ln239">	fNextSequence = 0;</a>
+<a name="ln240"> </a>
+<a name="ln241">	status_t error = fTCPService-&gt;BindSocket(this);</a>
+<a name="ln242">	if (error != B_OK)</a>
+<a name="ln243">		return error;</a>
+<a name="ln244"> </a>
+<a name="ln245">	// send SYN</a>
+<a name="ln246">	TCPPacket* packet = new(nothrow) TCPPacket();</a>
+<a name="ln247">	if (packet == NULL)</a>
+<a name="ln248">		return B_NO_MEMORY;</a>
+<a name="ln249">	error = packet-&gt;SetTo(NULL, 0, fAddress, fPort, address, port,</a>
+<a name="ln250">		fSequenceNumber, fAcknowledgeNumber, TCP_SYN);</a>
+<a name="ln251">	if (error != B_OK) {</a>
+<a name="ln252">		delete packet;</a>
+<a name="ln253">		return error;</a>
+<a name="ln254">	}</a>
+<a name="ln255">	error = _Send(packet);</a>
+<a name="ln256">	if (error != B_OK)</a>
+<a name="ln257">		return error;</a>
+<a name="ln258">	fState = TCP_SOCKET_STATE_SYN_SENT;</a>
+<a name="ln259">	fSequenceNumber++;</a>
+<a name="ln260">	TRACE(&quot;SYN sent\n&quot;);</a>
+<a name="ln261"> </a>
+<a name="ln262">	// receive SYN-ACK</a>
+<a name="ln263">	error = _WaitForState(TCP_SOCKET_STATE_OPEN, 1000000LL);</a>
+<a name="ln264">	if (error != B_OK) {</a>
+<a name="ln265">		TRACE(&quot;no SYN-ACK received\n&quot;);</a>
+<a name="ln266">		return error;</a>
+<a name="ln267">	}</a>
+<a name="ln268">	TRACE(&quot;SYN-ACK received\n&quot;);</a>
+<a name="ln269"> </a>
+<a name="ln270">	return B_OK;</a>
+<a name="ln271">}</a>
+<a name="ln272"> </a>
+<a name="ln273"> </a>
+<a name="ln274">status_t</a>
+<a name="ln275">TCPSocket::Close()</a>
+<a name="ln276">{</a>
+<a name="ln277">	// send FIN</a>
+<a name="ln278">	TCPPacket* packet = new(nothrow) TCPPacket();</a>
+<a name="ln279">	if (packet == NULL)</a>
+<a name="ln280">		return B_NO_MEMORY;</a>
+<a name="ln281">	status_t error = packet-&gt;SetTo(NULL, 0, fAddress, fPort, fRemoteAddress,</a>
+<a name="ln282">		fRemotePort, fSequenceNumber, fAcknowledgeNumber, TCP_FIN | TCP_ACK);</a>
+<a name="ln283">	if (error != B_OK) {</a>
+<a name="ln284">		delete packet;</a>
+<a name="ln285">		return error;</a>
+<a name="ln286">	}</a>
+<a name="ln287">	error = _Send(packet);</a>
+<a name="ln288">	if (error != B_OK)</a>
+<a name="ln289">		return error;</a>
+<a name="ln290">	fState = TCP_SOCKET_STATE_FIN_SENT;</a>
+<a name="ln291">	TRACE(&quot;FIN sent\n&quot;);</a>
+<a name="ln292"> </a>
+<a name="ln293">	error = _WaitForState(TCP_SOCKET_STATE_CLOSED, 1000000LL);</a>
+<a name="ln294">	if (error != B_OK)</a>
+<a name="ln295">		return error;</a>
+<a name="ln296"> </a>
+<a name="ln297">	return B_OK;</a>
+<a name="ln298">}</a>
+<a name="ln299"> </a>
+<a name="ln300"> </a>
+<a name="ln301">status_t</a>
+<a name="ln302">TCPSocket::Read(void* buffer, size_t bufferSize, size_t* bytesRead,</a>
+<a name="ln303">	bigtime_t timeout)</a>
+<a name="ln304">{</a>
+<a name="ln305">	TRACE(&quot;TCPSocket::Read(): size = %lu\n&quot;, bufferSize);</a>
+<a name="ln306">	if (bytesRead == NULL)</a>
+<a name="ln307">		return B_BAD_VALUE;</a>
+<a name="ln308"> </a>
+<a name="ln309">	*bytesRead = 0;</a>
+<a name="ln310">	TCPPacket* packet = NULL;</a>
+<a name="ln311">	</a>
+<a name="ln312">	bigtime_t startTime = system_time();</a>
+<a name="ln313">	do {</a>
+<a name="ln314">		fTCPService-&gt;ProcessIncomingPackets();</a>
+<a name="ln315">		//_ResendQueue();</a>
+<a name="ln316">		packet = _PeekPacket();</a>
+<a name="ln317">		if (packet == NULL &amp;&amp; fRemoteState != TCP_SOCKET_STATE_OPEN)</a>
+<a name="ln318">			return B_ERROR;</a>
+<a name="ln319">		if (packet == NULL &amp;&amp; timeout &gt; 0LL)</a>
+<a name="ln320">			_Ack();</a>
+<a name="ln321">	} while (packet == NULL &amp;&amp; system_time() - startTime &lt; timeout);</a>
+<a name="ln322">	if (packet == NULL) {</a>
+<a name="ln323">#ifdef TRACE_TCP_QUEUE</a>
+<a name="ln324">		_DumpQueue();</a>
+<a name="ln325">#endif</a>
+<a name="ln326">		return (timeout == 0) ? B_WOULD_BLOCK : B_TIMED_OUT;</a>
+<a name="ln327">	}</a>
+<a name="ln328">	uint32 packetOffset = fNextSequence - packet-&gt;SequenceNumber();</a>
+<a name="ln329">	size_t readBytes = packet-&gt;DataSize() - packetOffset;</a>
+<a name="ln330">	if (readBytes &gt; bufferSize)</a>
+<a name="ln331">		readBytes = bufferSize;</a>
+<a name="ln332">	if (buffer != NULL)</a>
+<a name="ln333">		memcpy(buffer, (uint8*)packet-&gt;Data() + packetOffset, readBytes);</a>
+<a name="ln334">	*bytesRead = readBytes;</a>
+<a name="ln335">	if (!packet-&gt;ProvidesSequenceNumber(fNextSequence + readBytes)) {</a>
+<a name="ln336">		_DequeuePacket();</a>
+<a name="ln337">		delete packet;</a>
+<a name="ln338">		packet = NULL;</a>
+<a name="ln339">	}</a>
+<a name="ln340">	fNextSequence += readBytes;</a>
+<a name="ln341"> </a>
+<a name="ln342">	if (packet == NULL &amp;&amp; *bytesRead &lt; bufferSize) {</a>
+<a name="ln343">		do {</a>
+<a name="ln344">			if (buffer != NULL)</a>
+<a name="ln345">				buffer = (uint8*)buffer + readBytes;</a>
+<a name="ln346">			bufferSize -= readBytes;</a>
+<a name="ln347">			fTCPService-&gt;ProcessIncomingPackets();</a>
+<a name="ln348">			packet = _PeekPacket();</a>
+<a name="ln349">			if (packet == NULL &amp;&amp; fRemoteState != TCP_SOCKET_STATE_OPEN)</a>
+<a name="ln350">				break;</a>
+<a name="ln351">			readBytes = 0;</a>
+<a name="ln352">			if (packet == NULL) {</a>
+<a name="ln353">				_Ack();</a>
+<a name="ln354">				continue;</a>
+<a name="ln355">			}</a>
+<a name="ln356">			readBytes = packet-&gt;DataSize();</a>
+<a name="ln357">			if (readBytes &gt; bufferSize)</a>
+<a name="ln358">				readBytes = bufferSize;</a>
+<a name="ln359">			if (buffer != NULL)</a>
+<a name="ln360">				memcpy(buffer, packet-&gt;Data(), readBytes);</a>
+<a name="ln361">			*bytesRead += readBytes;</a>
+<a name="ln362">			if (readBytes == packet-&gt;DataSize()) {</a>
+<a name="ln363">				_DequeuePacket();</a>
+<a name="ln364">				delete packet;</a>
+<a name="ln365">			}</a>
+<a name="ln366">			fNextSequence += readBytes;</a>
+<a name="ln367">		} while (readBytes &lt; bufferSize &amp;&amp;</a>
+<a name="ln368">			system_time() - startTime &lt; timeout);</a>
+<a name="ln369">#ifdef TRACE_TCP_QUEUE</a>
+<a name="ln370">		if (readBytes &lt; bufferSize) {</a>
+<a name="ln371">			TRACE_QUEUE(&quot;TCP: Unable to deliver more data!\n&quot;);</a>
+<a name="ln372">			_DumpQueue();</a>
+<a name="ln373">		}</a>
+<a name="ln374">#endif</a>
+<a name="ln375">	}</a>
+<a name="ln376"> </a>
+<a name="ln377">	return B_OK;</a>
+<a name="ln378">}</a>
+<a name="ln379"> </a>
+<a name="ln380"> </a>
+<a name="ln381">status_t</a>
+<a name="ln382">TCPSocket::Write(const void* buffer, size_t bufferSize)</a>
+<a name="ln383">{</a>
+<a name="ln384">	if (buffer == NULL || bufferSize == 0)</a>
+<a name="ln385">		return B_BAD_VALUE;</a>
+<a name="ln386"> </a>
+<a name="ln387">	// TODO: Check for MTU and create multiple packets if necessary.</a>
+<a name="ln388"> </a>
+<a name="ln389">	TCPPacket* packet = new(nothrow) TCPPacket();</a>
+<a name="ln390">	if (packet == NULL)</a>
+<a name="ln391">		return B_NO_MEMORY;</a>
+<a name="ln392">	status_t error = packet-&gt;SetTo(buffer, bufferSize, fAddress, fPort,</a>
+<a name="ln393">		fRemoteAddress, fRemotePort, fSequenceNumber, fAcknowledgeNumber,</a>
+<a name="ln394">		TCP_ACK);</a>
+<a name="ln395">	if (error != B_OK) {</a>
+<a name="ln396">		delete packet;</a>
+<a name="ln397">		return error;</a>
+<a name="ln398">	}</a>
+<a name="ln399">	return _Send(packet);</a>
+<a name="ln400">}</a>
+<a name="ln401"> </a>
+<a name="ln402"> </a>
+<a name="ln403">void</a>
+<a name="ln404">TCPSocket::Acknowledge(uint32 number)</a>
+<a name="ln405">{</a>
+<a name="ln406">	TRACE(&quot;TCPSocket::Acknowledge(): %lu\n&quot;, number);</a>
+<a name="ln407">	// dequeue packets</a>
+<a name="ln408">	for (TCPPacket* packet = fFirstSentPacket; packet != NULL;</a>
+<a name="ln409">			packet = fFirstSentPacket) {</a>
+<a name="ln410">		if (packet-&gt;SequenceNumber() &gt;= number)</a>
+<a name="ln411">			return;</a>
+<a name="ln412">		fFirstSentPacket = packet-&gt;Next();</a>
+<a name="ln413">		delete packet;</a>
+<a name="ln414">	}</a>
+<a name="ln415">	fLastSentPacket = NULL;</a>
+<a name="ln416">}</a>
+<a name="ln417"> </a>
+<a name="ln418"> </a>
+<a name="ln419">void</a>
+<a name="ln420">TCPSocket::ProcessPacket(TCPPacket* packet)</a>
+<a name="ln421">{</a>
+<a name="ln422">	TRACE(&quot;TCPSocket::ProcessPacket()\n&quot;);</a>
+<a name="ln423"> </a>
+<a name="ln424">	if ((packet-&gt;Flags() &amp; TCP_FIN) != 0) {</a>
+<a name="ln425">		fRemoteState = TCP_SOCKET_STATE_FIN_SENT;</a>
+<a name="ln426">		TRACE(&quot;FIN received\n&quot;);</a>
+<a name="ln427">		_Ack();</a>
+<a name="ln428">	}</a>
+<a name="ln429"> </a>
+<a name="ln430">	if (fState == TCP_SOCKET_STATE_SYN_SENT) {</a>
+<a name="ln431">		if ((packet-&gt;Flags() &amp; TCP_SYN) != 0</a>
+<a name="ln432">				&amp;&amp; (packet-&gt;Flags() &amp; TCP_ACK) != 0) {</a>
+<a name="ln433">			fNextSequence = fAcknowledgeNumber = packet-&gt;SequenceNumber() + 1;</a>
+<a name="ln434">			fRemoteState = TCP_SOCKET_STATE_SYN_SENT;</a>
+<a name="ln435">			delete packet;</a>
+<a name="ln436">			_Ack();</a>
+<a name="ln437">			fState = fRemoteState = TCP_SOCKET_STATE_OPEN;</a>
+<a name="ln438">			return;</a>
+<a name="ln439">		}</a>
+<a name="ln440">	} else if (fState == TCP_SOCKET_STATE_OPEN) {</a>
+<a name="ln441">	} else if (fState == TCP_SOCKET_STATE_FIN_SENT) {</a>
+<a name="ln442">		if ((packet-&gt;Flags() &amp; TCP_ACK) != 0) {</a>
+<a name="ln443">			TRACE(&quot;FIN-ACK received\n&quot;);</a>
+<a name="ln444">			if (fRemoteState == TCP_SOCKET_STATE_FIN_SENT)</a>
+<a name="ln445">				fState = TCP_SOCKET_STATE_CLOSED;</a>
+<a name="ln446">		}</a>
+<a name="ln447">	}</a>
+<a name="ln448"> </a>
+<a name="ln449">	if (packet-&gt;DataSize() == 0) {</a>
+<a name="ln450">		TRACE(&quot;TCPSocket::ProcessPacket(): not queuing due to lack of data\n&quot;);</a>
+<a name="ln451">		delete packet;</a>
+<a name="ln452">		return;</a>
+<a name="ln453">	}</a>
+<a name="ln454"> </a>
+<a name="ln455">	// For now rather protect us against being flooded with packets already</a>
+<a name="ln456">	// acknowledged. &quot;If it's important, they'll send it again.&quot;</a>
+<a name="ln457">	// TODO PAWS</a>
+<a name="ln458">	if (packet-&gt;SequenceNumber() &lt; fAcknowledgeNumber) {</a>
+<a name="ln459">		TRACE_QUEUE(&quot;TCPSocket::ProcessPacket(): not queuing due to wraparound\n&quot;);</a>
+<a name="ln460">		delete packet;</a>
+<a name="ln461">		return;</a>
+<a name="ln462">	}</a>
+<a name="ln463"> </a>
+<a name="ln464">	if (fLastPacket == NULL) {</a>
+<a name="ln465">		// no packets enqueued</a>
+<a name="ln466">		TRACE(&quot;TCPSocket::ProcessPacket(): first in queue\n&quot;);</a>
+<a name="ln467">		packet-&gt;SetNext(NULL);</a>
+<a name="ln468">		fFirstPacket = fLastPacket = packet;</a>
+<a name="ln469">	} else if (fLastPacket-&gt;SequenceNumber() &lt; packet-&gt;SequenceNumber()) {</a>
+<a name="ln470">		// enqueue in back</a>
+<a name="ln471">		TRACE(&quot;TCPSocket::ProcessPacket(): enqueue in back\n&quot;);</a>
+<a name="ln472">		packet-&gt;SetNext(NULL);</a>
+<a name="ln473">		fLastPacket-&gt;SetNext(packet);</a>
+<a name="ln474">		fLastPacket = packet;</a>
+<a name="ln475">	} else if (fFirstPacket-&gt;SequenceNumber() &gt; packet-&gt;SequenceNumber()) {</a>
+<a name="ln476">		// enqueue in front</a>
+<a name="ln477">		TRACE(&quot;TCPSocket::ProcessPacket(): enqueue in front\n&quot;);</a>
+<a name="ln478">		TRACE_QUEUE(&quot;TCP: Enqueuing %lx - %lx in front! (next is %lx)\n&quot;,</a>
+<a name="ln479">			packet-&gt;SequenceNumber(),</a>
+<a name="ln480">			packet-&gt;SequenceNumber() + packet-&gt;DataSize() - 1,</a>
+<a name="ln481">			fNextSequence);</a>
+<a name="ln482">		packet-&gt;SetNext(fFirstPacket);</a>
+<a name="ln483">		fFirstPacket = packet;</a>
+<a name="ln484">	} else if (fFirstPacket-&gt;SequenceNumber() == packet-&gt;SequenceNumber()) {</a>
+<a name="ln485">		TRACE_QUEUE(&quot;%s(): dropping due to identical first packet\n&quot;, __func__);</a>
+<a name="ln486">		delete packet;</a>
+<a name="ln487">		return;</a>
+<a name="ln488">	} else {</a>
+<a name="ln489">		// enqueue in middle</a>
+<a name="ln490">		TRACE(&quot;TCPSocket::ProcessPacket(): enqueue in middle\n&quot;);</a>
+<a name="ln491">		for (TCPPacket* queuedPacket = fFirstPacket; queuedPacket != NULL;</a>
+<a name="ln492">				queuedPacket = queuedPacket-&gt;Next()) {</a>
+<a name="ln493">			if (queuedPacket-&gt;SequenceNumber() == packet-&gt;SequenceNumber()) {</a>
+<a name="ln494">				TRACE_QUEUE(&quot;TCPSocket::EnqueuePacket(): TCP packet dropped\n&quot;);</a>
+<a name="ln495">				// we may be waiting for a previous packet</a>
+<a name="ln496">				delete packet;</a>
+<a name="ln497">				return;</a>
+<a name="ln498">			}</a>
+<a name="ln499">			if (queuedPacket-&gt;Next()-&gt;SequenceNumber()</a>
+<a name="ln500">					&gt; packet-&gt;SequenceNumber()) {</a>
+<a name="ln501">				packet-&gt;SetNext(queuedPacket-&gt;Next());</a>
+<a name="ln502">				queuedPacket-&gt;SetNext(packet);</a>
+<a name="ln503">				break;</a>
+<a name="ln504">			}</a>
+<a name="ln505">		}</a>
+<a name="ln506">	}</a>
+<a name="ln507">	while (packet != NULL &amp;&amp; packet-&gt;SequenceNumber() == fAcknowledgeNumber) {</a>
+<a name="ln508">		fAcknowledgeNumber = packet-&gt;SequenceNumber() + packet-&gt;DataSize();</a>
+<a name="ln509">		packet = packet-&gt;Next();</a>
+<a name="ln510">	}</a>
+<a name="ln511">}</a>
+<a name="ln512"> </a>
+<a name="ln513"> </a>
+<a name="ln514">TCPPacket*</a>
+<a name="ln515">TCPSocket::_PeekPacket()</a>
+<a name="ln516">{</a>
+<a name="ln517">	TRACE(&quot;TCPSocket::_PeekPacket(): fNextSequence = %lu\n&quot;, fNextSequence);</a>
+<a name="ln518">	for (TCPPacket* packet = fFirstPacket; packet != NULL;</a>
+<a name="ln519">			packet = packet-&gt;Next()) {</a>
+<a name="ln520">		if (packet-&gt;ProvidesSequenceNumber(fNextSequence))</a>
+<a name="ln521">			return packet;</a>
+<a name="ln522">	}</a>
+<a name="ln523">	return NULL;</a>
+<a name="ln524">}</a>
+<a name="ln525"> </a>
+<a name="ln526"> </a>
+<a name="ln527">TCPPacket*</a>
+<a name="ln528">TCPSocket::_DequeuePacket()</a>
+<a name="ln529">{</a>
+<a name="ln530">	//TRACE(&quot;TCPSocket::DequeuePacket()\n&quot;);</a>
+<a name="ln531">	if (fFirstPacket == NULL)</a>
+<a name="ln532">		return NULL;</a>
+<a name="ln533"> </a>
+<a name="ln534">	if (fFirstPacket-&gt;ProvidesSequenceNumber(fNextSequence)) {</a>
+<a name="ln535">		TCPPacket* packet = fFirstPacket;</a>
+<a name="ln536">		fFirstPacket = packet-&gt;Next();</a>
+<a name="ln537">		if (fFirstPacket == NULL)</a>
+<a name="ln538">			fLastPacket = NULL;</a>
+<a name="ln539">		packet-&gt;SetNext(NULL);</a>
+<a name="ln540">		TRACE(&quot;TCP: Dequeuing %lx - %lx from front.\n&quot;,</a>
+<a name="ln541">			packet-&gt;SequenceNumber(),</a>
+<a name="ln542">			packet-&gt;SequenceNumber() + packet-&gt;DataSize() - 1);</a>
+<a name="ln543">		return packet;</a>
+<a name="ln544">	}</a>
+<a name="ln545"> </a>
+<a name="ln546">	for (TCPPacket* packet = fFirstPacket;</a>
+<a name="ln547">			packet != NULL &amp;&amp; packet-&gt;Next() != NULL;</a>
+<a name="ln548">			packet = packet-&gt;Next()) {</a>
+<a name="ln549">		if (packet-&gt;Next()-&gt;ProvidesSequenceNumber(fNextSequence)) {</a>
+<a name="ln550">			TCPPacket* nextPacket = packet-&gt;Next();</a>
+<a name="ln551">			packet-&gt;SetNext(nextPacket-&gt;Next());</a>
+<a name="ln552">			if (fLastPacket == nextPacket)</a>
+<a name="ln553">				fLastPacket = packet;</a>
+<a name="ln554">			TRACE(&quot;TCP: Dequeuing %lx - %lx.\n&quot;,</a>
+<a name="ln555">				nextPacket-&gt;SequenceNumber(),</a>
+<a name="ln556">				nextPacket-&gt;SequenceNumber() + nextPacket-&gt;DataSize() - 1);</a>
+<a name="ln557">			return nextPacket;</a>
+<a name="ln558">		}</a>
+<a name="ln559">	}</a>
+<a name="ln560">	TRACE_QUEUE(&quot;dequeue failed!\n&quot;);</a>
+<a name="ln561">	return NULL;</a>
+<a name="ln562">}</a>
+<a name="ln563"> </a>
+<a name="ln564"> </a>
+<a name="ln565">status_t</a>
+<a name="ln566">TCPSocket::_Send(TCPPacket* packet, bool enqueue)</a>
+<a name="ln567">{</a>
+<a name="ln568">	ChainBuffer buffer((void*)packet-&gt;Data(), packet-&gt;DataSize());</a>
+<a name="ln569">	status_t error = fTCPService-&gt;Send(fPort, fRemoteAddress, fRemotePort,</a>
+<a name="ln570">		packet-&gt;SequenceNumber(), fAcknowledgeNumber, packet-&gt;Flags(),</a>
+<a name="ln571">		WindowSize(), &amp;buffer);</a>
+<a name="ln572">	if (error != B_OK)</a>
+<a name="ln573">		return error;</a>
+<a name="ln574">	if (packet-&gt;SequenceNumber() == fSequenceNumber)</a>
+<a name="ln575">		fSequenceNumber += packet-&gt;DataSize();</a>
+<a name="ln576"> </a>
+<a name="ln577">	if (enqueue)</a>
+<a name="ln578">		_EnqueueOutgoingPacket(packet);</a>
+<a name="ln579"> </a>
+<a name="ln580">	return B_OK;</a>
+<a name="ln581">}</a>
+<a name="ln582"> </a>
+<a name="ln583"> </a>
+<a name="ln584">status_t</a>
+<a name="ln585">TCPSocket::_ResendQueue()</a>
+<a name="ln586">{</a>
+<a name="ln587">	TRACE(&quot;resending queue\n&quot;);</a>
+<a name="ln588">	for (TCPPacket* packet = fFirstSentPacket; packet != NULL;</a>
+<a name="ln589">			packet = packet-&gt;Next()) {</a>
+<a name="ln590">		ChainBuffer buffer((void*)packet-&gt;Data(), packet-&gt;DataSize());</a>
+<a name="ln591">		status_t error = fTCPService-&gt;Send(fPort, fRemoteAddress, fRemotePort,</a>
+<a name="ln592">			packet-&gt;SequenceNumber(), fAcknowledgeNumber, packet-&gt;Flags(),</a>
+<a name="ln593">			WindowSize(), &amp;buffer);</a>
+<a name="ln594">		if (error != B_OK)</a>
+<a name="ln595">			return error;</a>
+<a name="ln596">	}</a>
+<a name="ln597">	return B_OK;</a>
+<a name="ln598">}</a>
+<a name="ln599"> </a>
+<a name="ln600"> </a>
+<a name="ln601">void</a>
+<a name="ln602">TCPSocket::_EnqueueOutgoingPacket(TCPPacket* packet)</a>
+<a name="ln603">{</a>
+<a name="ln604">	if (fLastSentPacket != NULL) {</a>
+<a name="ln605">		fLastSentPacket-&gt;SetNext(packet);</a>
+<a name="ln606">		fLastSentPacket = packet;</a>
+<a name="ln607">	} else {</a>
+<a name="ln608">		fFirstSentPacket = fLastSentPacket = packet;</a>
+<a name="ln609">	}</a>
+<a name="ln610">}</a>
+<a name="ln611"> </a>
+<a name="ln612"> </a>
+<a name="ln613">#ifdef TRACE_TCP_QUEUE</a>
+<a name="ln614"> </a>
+<a name="ln615">inline void</a>
+<a name="ln616">TCPSocket::_DumpQueue()</a>
+<a name="ln617">{</a>
+<a name="ln618">	TRACE_QUEUE(&quot;TCP: waiting for %lx (ack'ed %lx)\n&quot;, fNextSequence, fAcknowledgeNumber);</a>
+<a name="ln619">	if (fFirstPacket == NULL)</a>
+<a name="ln620">		TRACE_QUEUE(&quot;TCP: Queue is empty.\n&quot;);</a>
+<a name="ln621">	else {</a>
+<a name="ln622">		for (TCPPacket* packet = fFirstPacket; packet != NULL;</a>
+<a name="ln623">				packet = packet-&gt;Next()) {</a>
+<a name="ln624">			TRACE_QUEUE(&quot;TCP: Queue: %lx\n&quot;, packet-&gt;SequenceNumber());</a>
+<a name="ln625">		}</a>
+<a name="ln626">	}</a>
+<a name="ln627">	if (fFirstSentPacket != NULL)</a>
+<a name="ln628">		TRACE_QUEUE(&quot;TCP: Send queue is non-empty.\n&quot;);</a>
+<a name="ln629">	else</a>
+<a name="ln630">		TRACE_QUEUE(&quot;TCP: Send queue is empty.\n&quot;);</a>
+<a name="ln631">}</a>
+<a name="ln632"> </a>
+<a name="ln633">#endif</a>
+<a name="ln634"> </a>
+<a name="ln635"> </a>
+<a name="ln636">status_t</a>
+<a name="ln637">TCPSocket::_Ack()</a>
+<a name="ln638">{</a>
+<a name="ln639">	TCPPacket* packet = new(nothrow) TCPPacket();</a>
+<a name="ln640">	if (packet == NULL)</a>
+<a name="ln641">		return B_NO_MEMORY;</a>
+<a name="ln642">	status_t error = packet-&gt;SetTo(NULL, 0, fAddress, fPort, fRemoteAddress,</a>
+<a name="ln643">		fRemotePort, fSequenceNumber, fAcknowledgeNumber, TCP_ACK);</a>
+<a name="ln644">	if (error != B_OK) {</a>
+<a name="ln645">		delete packet;</a>
+<a name="ln646">		return error;</a>
+<a name="ln647">	}</a>
+<a name="ln648">	error = _Send(packet, false);</a>
+<a name="ln649">	delete packet;</a>
+<a name="ln650">	if (error != B_OK)</a>
+<a name="ln651">		return error;</a>
+<a name="ln652">	return B_OK;</a>
+<a name="ln653">}</a>
+<a name="ln654"> </a>
+<a name="ln655"> </a>
+<a name="ln656">status_t</a>
+<a name="ln657">TCPSocket::_WaitForState(TCPSocketState state, bigtime_t timeout)</a>
+<a name="ln658">{</a>
+<a name="ln659">	if (fTCPService == NULL)</a>
+<a name="ln660">		return B_NO_INIT;</a>
+<a name="ln661"> </a>
+<a name="ln662">	bigtime_t startTime = system_time();</a>
+<a name="ln663">	do {</a>
+<a name="ln664">		fTCPService-&gt;ProcessIncomingPackets();</a>
+<a name="ln665">		if (fState == state)</a>
+<a name="ln666">			return B_OK;</a>
+<a name="ln667">	} while (system_time() - startTime &lt; timeout);</a>
+<a name="ln668">	return timeout == 0 ? B_WOULD_BLOCK : B_TIMED_OUT;</a>
+<a name="ln669">}</a>
+<a name="ln670"> </a>
+<a name="ln671"> </a>
+<a name="ln672"> </a>
+<a name="ln673"> </a>
+<a name="ln674">TCPService::TCPService(IPService* ipService)</a>
+<a name="ln675">	:</a>
+<a name="ln676">	IPSubService(kTCPServiceName),</a>
+<a name="ln677">	fIPService(ipService)</a>
+<a name="ln678">{</a>
+<a name="ln679">}</a>
+<a name="ln680"> </a>
+<a name="ln681"> </a>
+<a name="ln682">TCPService::~TCPService()</a>
+<a name="ln683">{</a>
+<a name="ln684">	if (fIPService != NULL)</a>
+<a name="ln685">		fIPService-&gt;UnregisterIPSubService(this);</a>
+<a name="ln686">}</a>
+<a name="ln687"> </a>
+<a name="ln688"> </a>
+<a name="ln689">status_t</a>
+<a name="ln690">TCPService::Init()</a>
+<a name="ln691">{</a>
+<a name="ln692">	if (fIPService == NULL)</a>
+<a name="ln693">		return B_BAD_VALUE;</a>
+<a name="ln694"> </a>
+<a name="ln695">	if (!fIPService-&gt;RegisterIPSubService(this))</a>
+<a name="ln696">		return B_NO_MEMORY;</a>
+<a name="ln697"> </a>
+<a name="ln698">	return B_OK;</a>
+<a name="ln699">}</a>
+<a name="ln700"> </a>
+<a name="ln701"> </a>
+<a name="ln702">uint8</a>
+<a name="ln703">TCPService::IPProtocol() const</a>
+<a name="ln704">{</a>
+<a name="ln705">	return IPPROTO_TCP;</a>
+<a name="ln706">}</a>
+<a name="ln707"> </a>
+<a name="ln708"> </a>
+<a name="ln709">void</a>
+<a name="ln710">TCPService::HandleIPPacket(IPService* ipService, ip_addr_t sourceIP,</a>
+<a name="ln711">	ip_addr_t destinationIP, const void* data, size_t size)</a>
+<a name="ln712">{</a>
+<a name="ln713">	TRACE(&quot;TCPService::HandleIPPacket(): source = %08lx, &quot;</a>
+<a name="ln714">		&quot;destination = %08lx, %lu - %lu bytes\n&quot;, sourceIP, destinationIP,</a>
+<a name="ln715">		size, sizeof(tcp_header));</a>
+<a name="ln716"> </a>
+<a name="ln717">	if (data == NULL || size &lt; sizeof(tcp_header))</a>
+<a name="ln718">		return;</a>
+<a name="ln719"> </a>
+<a name="ln720">	const tcp_header* header = (const tcp_header*)data;</a>
+<a name="ln721"> </a>
+<a name="ln722">	uint16 chksum = _ChecksumData(data, size, sourceIP, destinationIP);</a>
+<a name="ln723">	if (chksum != 0) {</a>
+<a name="ln724">		TRACE_CHECKSUM(&quot;TCPService::HandleIPPacket(): invalid checksum &quot;</a>
+<a name="ln725">			&quot;(%04x vs. %04x), padding %lu\n&quot;,</a>
+<a name="ln726">			header-&gt;checksum, chksum, size % 2);</a>
+<a name="ln727">		return;</a>
+<a name="ln728">	}</a>
+<a name="ln729"> </a>
+<a name="ln730">	uint16 source = ntohs(header-&gt;source);</a>
+<a name="ln731">	uint16 destination = ntohs(header-&gt;destination);</a>
+<a name="ln732">	uint32 sequenceNumber = ntohl(header-&gt;seqNumber);</a>
+<a name="ln733">	uint32 ackedNumber = ntohl(header-&gt;ackNumber);</a>
+<a name="ln734">	TRACE(&quot;\tsource = %u, dest = %u, seq = %lu, ack = %lu, dataOffset = %u, &quot;</a>
+<a name="ln735">		&quot;flags %s %s %s %s\n&quot;, source, destination, sequenceNumber,</a>
+<a name="ln736">		ackedNumber, header-&gt;dataOffset,</a>
+<a name="ln737">		(header-&gt;flags &amp; TCP_ACK) != 0 ? &quot;ACK&quot; : &quot;&quot;,</a>
+<a name="ln738">		(header-&gt;flags &amp; TCP_SYN) != 0 ? &quot;SYN&quot; : &quot;&quot;,</a>
+<a name="ln739">		(header-&gt;flags &amp; TCP_FIN) != 0 ? &quot;FIN&quot; : &quot;&quot;,</a>
+<a name="ln740">		(header-&gt;flags &amp; TCP_RST) != 0 ? &quot;RST&quot; : &quot;&quot;);</a>
+<a name="ln741">	if (header-&gt;dataOffset &gt; 5) {</a>
+<a name="ln742">		uint8* option = (uint8*)data + sizeof(tcp_header);</a>
+<a name="ln743">		while ((uint32*)option &lt; (uint32*)data + header-&gt;dataOffset) {</a>
+<a name="ln744">			uint8 optionKind = option[0];</a>
+<a name="ln745">			if (optionKind == 0)</a>
+<a name="ln746">				break;</a>
+<a name="ln747">			uint8 optionLength = 1;</a>
+<a name="ln748">			if (optionKind &gt; 1) {</a>
+<a name="ln749">				optionLength = option[1];</a>
+<a name="ln750">				TRACE(&quot;\tTCP option kind %u, length %u\n&quot;,</a>
+<a name="ln751">					optionKind, optionLength);</a>
+<a name="ln752">				if (optionKind == 2)</a>
+<a name="ln753">					TRACE(&quot;\tTCP MSS = %04hu\n&quot;, *(uint16_t*)&amp;option[2]);</a>
+<a name="ln754">			}</a>
+<a name="ln755">			option += optionLength;</a>
+<a name="ln756">		}</a>
+<a name="ln757">	}</a>
+<a name="ln758"> </a>
+<a name="ln759">	TCPSocket* socket = _FindSocket(destinationIP, destination);</a>
+<a name="ln760">	if (socket == NULL) {</a>
+<a name="ln761">		// TODO If SYN, answer with RST?</a>
+<a name="ln762">		TRACE(&quot;TCPService::HandleIPPacket(): no socket\n&quot;);</a>
+<a name="ln763">		return;</a>
+<a name="ln764">	}</a>
+<a name="ln765"> </a>
+<a name="ln766">	if ((header-&gt;flags &amp; TCP_ACK) != 0) {</a>
+<a name="ln767">		socket-&gt;Acknowledge(ackedNumber);</a>
+<a name="ln768">	}</a>
+<a name="ln769"> </a>
+<a name="ln770">	TCPPacket* packet = new(nothrow) TCPPacket();</a>
+<a name="ln771">	if (packet == NULL)</a>
+<a name="ln772">		return;</a>
+<a name="ln773">	status_t error = packet-&gt;SetTo((uint32*)data + header-&gt;dataOffset,</a>
+<a name="ln774">		size - header-&gt;dataOffset * 4, sourceIP, source, destinationIP,</a>
+<a name="ln775">		destination, sequenceNumber, ackedNumber, header-&gt;flags);</a>
+<a name="ln776">	if (error == B_OK)</a>
+<a name="ln777">		socket-&gt;ProcessPacket(packet);</a>
+<a name="ln778">	else</a>
+<a name="ln779">		delete packet;</a>
+<a name="ln780">}</a>
+<a name="ln781"> </a>
+<a name="ln782"> </a>
+<a name="ln783">status_t</a>
+<a name="ln784">TCPService::Send(uint16 sourcePort, ip_addr_t destinationAddress,</a>
+<a name="ln785">	uint16 destinationPort, uint32 sequenceNumber,</a>
+<a name="ln786">	uint32 acknowledgmentNumber, uint8 flags, uint16 windowSize,</a>
+<a name="ln787">	ChainBuffer* buffer)</a>
+<a name="ln788">{</a>
+<a name="ln789">	TRACE(&quot;TCPService::Send(): seq = %lu, ack = %lu\n&quot;,</a>
+<a name="ln790">		sequenceNumber, acknowledgmentNumber);</a>
+<a name="ln791">	if (fIPService == NULL)</a>
+<a name="ln792">		return B_NO_INIT;</a>
+<a name="ln793">	if (buffer == NULL)</a>
+<a name="ln794">		return B_BAD_VALUE;</a>
+<a name="ln795"> </a>
+<a name="ln796">	tcp_header header;</a>
+<a name="ln797">	ChainBuffer headerBuffer(&amp;header, sizeof(header), buffer);</a>
+<a name="ln798">	memset(&amp;header, 0, sizeof(header));</a>
+<a name="ln799">	header.source = htons(sourcePort);</a>
+<a name="ln800">	header.destination = htons(destinationPort);</a>
+<a name="ln801">	header.seqNumber = htonl(sequenceNumber);</a>
+<a name="ln802">	header.ackNumber = htonl(acknowledgmentNumber);</a>
+<a name="ln803">	header.dataOffset = 5;</a>
+<a name="ln804">	header.flags = flags;</a>
+<a name="ln805">	header.window = htons(windowSize);</a>
+<a name="ln806"> </a>
+<a name="ln807">	header.checksum = 0;</a>
+<a name="ln808">	header.checksum = htons(_ChecksumBuffer(&amp;headerBuffer,</a>
+<a name="ln809">		fIPService-&gt;IPAddress(), destinationAddress,</a>
+<a name="ln810">		headerBuffer.TotalSize()));</a>
+<a name="ln811"> </a>
+<a name="ln812">	return fIPService-&gt;Send(destinationAddress, IPPROTO_TCP, &amp;headerBuffer);</a>
+<a name="ln813">}</a>
+<a name="ln814"> </a>
+<a name="ln815"> </a>
+<a name="ln816">void</a>
+<a name="ln817">TCPService::ProcessIncomingPackets()</a>
+<a name="ln818">{</a>
+<a name="ln819">	if (fIPService != NULL)</a>
+<a name="ln820">		fIPService-&gt;ProcessIncomingPackets();</a>
+<a name="ln821">}</a>
+<a name="ln822"> </a>
+<a name="ln823"> </a>
+<a name="ln824">status_t</a>
+<a name="ln825">TCPService::BindSocket(TCPSocket* socket)</a>
+<a name="ln826">{</a>
+<a name="ln827">	if (socket == NULL)</a>
+<a name="ln828">		return B_BAD_VALUE;</a>
+<a name="ln829"> </a>
+<a name="ln830">	if (_FindSocket(socket-&gt;Address(), socket-&gt;Port()) != NULL)</a>
+<a name="ln831">		return EADDRINUSE;</a>
+<a name="ln832"> </a>
+<a name="ln833">	return fSockets.Add(socket);</a>
+<a name="ln834">}</a>
+<a name="ln835"> </a>
+<a name="ln836"> </a>
+<a name="ln837">void</a>
+<a name="ln838">TCPService::UnbindSocket(TCPSocket* socket)</a>
+<a name="ln839">{</a>
+<a name="ln840">	fSockets.Remove(socket);</a>
+<a name="ln841">}</a>
+<a name="ln842"> </a>
+<a name="ln843"> </a>
+<a name="ln844">uint16</a>
+<a name="ln845">TCPService::_ChecksumBuffer(ChainBuffer* buffer, ip_addr_t source,</a>
+<a name="ln846">	ip_addr_t destination, uint16 length)</a>
+<a name="ln847">{</a>
+<a name="ln848">	struct pseudo_header {</a>
+<a name="ln849">		ip_addr_t	source;</a>
+<a name="ln850">		ip_addr_t	destination;</a>
+<a name="ln851">		uint8		pad;</a>
+<a name="ln852">		uint8		protocol;</a>
+<a name="ln853">		uint16		length;</a>
+<a name="ln854">	} __attribute__ ((__packed__));</a>
+<a name="ln855">	pseudo_header header = {</a>
+<a name="ln856">		htonl(source),</a>
+<a name="ln857">		htonl(destination),</a>
+<a name="ln858">		0,</a>
+<a name="ln859">		IPPROTO_TCP,</a>
+<a name="ln860">		htons(length)</a>
+<a name="ln861">	};</a>
+<a name="ln862"> </a>
+<a name="ln863">	ChainBuffer headerBuffer(&amp;header, sizeof(header), buffer);</a>
+<a name="ln864">	uint16 checksum = ip_checksum(&amp;headerBuffer);</a>
+<a name="ln865">	headerBuffer.DetachNext();</a>
+<a name="ln866">	return checksum;</a>
+<a name="ln867">}</a>
+<a name="ln868"> </a>
+<a name="ln869"> </a>
+<a name="ln870">uint16</a>
+<a name="ln871">TCPService::_ChecksumData(const void* data, uint16 length, ip_addr_t source,</a>
+<a name="ln872">	ip_addr_t destination)</a>
+<a name="ln873">{</a>
+<a name="ln874">	ChainBuffer buffer((void*)data, length);</a>
+<a name="ln875">	return _ChecksumBuffer(&amp;buffer, source, destination, length);</a>
+<a name="ln876">}</a>
+<a name="ln877"> </a>
+<a name="ln878"> </a>
+<a name="ln879">TCPSocket*</a>
+<a name="ln880">TCPService::_FindSocket(ip_addr_t address, uint16 port)</a>
+<a name="ln881">{</a>
+<a name="ln882">	for (int i = 0; i &lt; fSockets.Count(); i++) {</a>
+<a name="ln883">		TCPSocket* socket = fSockets.ElementAt(i);</a>
+<a name="ln884">		// TODO Remove socket-&gt;Address() INADDR_ANY check once the socket is</a>
+<a name="ln885">		// aware of both its IP addresses (local one is INADDR_ANY for now).</a>
+<a name="ln886">		if ((address == INADDR_ANY || socket-&gt;Address() == INADDR_ANY</a>
+<a name="ln887">					|| socket-&gt;Address() == address)</a>
+<a name="ln888">				&amp;&amp; socket-&gt;Port() == port) {</a>
+<a name="ln889">			return socket;</a>
+<a name="ln890">		}</a>
+<a name="ln891">	}</a>
+<a name="ln892">	return NULL;</a>
+<a name="ln893">}</a>
+
+</code></pre>
+<div class="balloon" rel="189"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fRemoteAddress, fRemotePort, fAcknowledgeNumber, fNextSequence.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

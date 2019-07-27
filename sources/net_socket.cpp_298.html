@@ -1,0 +1,1836 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>net_socket.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2006-2010, Haiku, Inc. All Rights Reserved.</a>
+<a name="ln3"> * Distributed under the terms of the MIT License.</a>
+<a name="ln4"> *</a>
+<a name="ln5"> * Authors:</a>
+<a name="ln6"> *		Axel Dörfler, axeld@pinc-software.de</a>
+<a name="ln7"> */</a>
+<a name="ln8"> </a>
+<a name="ln9"> </a>
+<a name="ln10">#include &quot;stack_private.h&quot;</a>
+<a name="ln11"> </a>
+<a name="ln12">#include &lt;stdlib.h&gt;</a>
+<a name="ln13">#include &lt;string.h&gt;</a>
+<a name="ln14">#include &lt;sys/ioctl.h&gt;</a>
+<a name="ln15">#include &lt;sys/time.h&gt;</a>
+<a name="ln16"> </a>
+<a name="ln17">#include &lt;new&gt;</a>
+<a name="ln18"> </a>
+<a name="ln19">#include &lt;Drivers.h&gt;</a>
+<a name="ln20">#include &lt;KernelExport.h&gt;</a>
+<a name="ln21">#include &lt;Select.h&gt;</a>
+<a name="ln22"> </a>
+<a name="ln23">#include &lt;AutoDeleter.h&gt;</a>
+<a name="ln24">#include &lt;team.h&gt;</a>
+<a name="ln25">#include &lt;util/AutoLock.h&gt;</a>
+<a name="ln26">#include &lt;util/list.h&gt;</a>
+<a name="ln27">#include &lt;WeakReferenceable.h&gt;</a>
+<a name="ln28"> </a>
+<a name="ln29">#include &lt;fs/select_sync_pool.h&gt;</a>
+<a name="ln30">#include &lt;kernel.h&gt;</a>
+<a name="ln31"> </a>
+<a name="ln32">#include &lt;net_protocol.h&gt;</a>
+<a name="ln33">#include &lt;net_stack.h&gt;</a>
+<a name="ln34">#include &lt;net_stat.h&gt;</a>
+<a name="ln35"> </a>
+<a name="ln36">#include &quot;ancillary_data.h&quot;</a>
+<a name="ln37">#include &quot;utility.h&quot;</a>
+<a name="ln38"> </a>
+<a name="ln39"> </a>
+<a name="ln40">//#define TRACE_SOCKET</a>
+<a name="ln41">#ifdef TRACE_SOCKET</a>
+<a name="ln42">#	define TRACE(x...) dprintf(STACK_DEBUG_PREFIX x)</a>
+<a name="ln43">#else</a>
+<a name="ln44">#	define TRACE(x...) ;</a>
+<a name="ln45">#endif</a>
+<a name="ln46"> </a>
+<a name="ln47"> </a>
+<a name="ln48">struct net_socket_private;</a>
+<a name="ln49">typedef DoublyLinkedList&lt;net_socket_private&gt; SocketList;</a>
+<a name="ln50"> </a>
+<a name="ln51">struct net_socket_private : net_socket,</a>
+<a name="ln52">		DoublyLinkedListLinkImpl&lt;net_socket_private&gt;,</a>
+<a name="ln53">		BWeakReferenceable {</a>
+<a name="ln54">	net_socket_private();</a>
+<a name="ln55">	~net_socket_private();</a>
+<a name="ln56"> </a>
+<a name="ln57">	void RemoveFromParent();</a>
+<a name="ln58"> </a>
+<a name="ln59">	BWeakReference&lt;net_socket_private&gt; parent;</a>
+<a name="ln60">	team_id						owner;</a>
+<a name="ln61">	uint32						max_backlog;</a>
+<a name="ln62">	uint32						child_count;</a>
+<a name="ln63">	SocketList					pending_children;</a>
+<a name="ln64">	SocketList					connected_children;</a>
+<a name="ln65"> </a>
+<a name="ln66">	struct select_sync_pool*	select_pool;</a>
+<a name="ln67">	mutex						lock;</a>
+<a name="ln68"> </a>
+<a name="ln69">	bool						is_connected;</a>
+<a name="ln70">	bool						is_in_socket_list;</a>
+<a name="ln71">};</a>
+<a name="ln72"> </a>
+<a name="ln73"> </a>
+<a name="ln74">int socket_bind(net_socket* socket, const struct sockaddr* address,</a>
+<a name="ln75">	socklen_t addressLength);</a>
+<a name="ln76">int socket_setsockopt(net_socket* socket, int level, int option,</a>
+<a name="ln77">	const void* value, int length);</a>
+<a name="ln78">ssize_t socket_read_avail(net_socket* socket);</a>
+<a name="ln79"> </a>
+<a name="ln80">static SocketList sSocketList;</a>
+<a name="ln81">static mutex sSocketLock;</a>
+<a name="ln82"> </a>
+<a name="ln83"> </a>
+<a name="ln84">net_socket_private::net_socket_private()</a>
+<a name="ln85">	:</a>
+<a name="ln86">	owner(-1),</a>
+<a name="ln87">	max_backlog(0),</a>
+<a name="ln88">	child_count(0),</a>
+<a name="ln89">	select_pool(NULL),</a>
+<a name="ln90">	is_connected(false),</a>
+<a name="ln91">	is_in_socket_list(false)</a>
+<a name="ln92">{</a>
+<a name="ln93">	first_protocol = NULL;</a>
+<a name="ln94">	first_info = NULL;</a>
+<a name="ln95">	options = 0;</a>
+<a name="ln96">	linger = 0;</a>
+<a name="ln97">	bound_to_device = 0;</a>
+<a name="ln98">	error = 0;</a>
+<a name="ln99"> </a>
+<a name="ln100">	address.ss_len = 0;</a>
+<a name="ln101">	peer.ss_len = 0;</a>
+<a name="ln102"> </a>
+<a name="ln103">	mutex_init(&amp;lock, &quot;socket&quot;);</a>
+<a name="ln104"> </a>
+<a name="ln105">	// set defaults (may be overridden by the protocols)</a>
+<a name="ln106">	send.buffer_size = 65535;</a>
+<a name="ln107">	send.low_water_mark = 1;</a>
+<a name="ln108">	send.timeout = B_INFINITE_TIMEOUT;</a>
+<a name="ln109">	receive.buffer_size = 65535;</a>
+<a name="ln110">	receive.low_water_mark = 1;</a>
+<a name="ln111">	receive.timeout = B_INFINITE_TIMEOUT;</a>
+<a name="ln112">}</a>
+<a name="ln113"> </a>
+<a name="ln114"> </a>
+<a name="ln115">net_socket_private::~net_socket_private()</a>
+<a name="ln116">{</a>
+<a name="ln117">	TRACE(&quot;delete net_socket %p\n&quot;, this);</a>
+<a name="ln118"> </a>
+<a name="ln119">	if (parent != NULL)</a>
+<a name="ln120">		panic(&quot;socket still has a parent!&quot;);</a>
+<a name="ln121"> </a>
+<a name="ln122">	if (is_in_socket_list) {</a>
+<a name="ln123">		MutexLocker _(sSocketLock);</a>
+<a name="ln124">		sSocketList.Remove(this);</a>
+<a name="ln125">	}</a>
+<a name="ln126"> </a>
+<a name="ln127">	mutex_lock(&amp;lock);</a>
+<a name="ln128"> </a>
+<a name="ln129">	// also delete all children of this socket</a>
+<a name="ln130">	while (net_socket_private* child = pending_children.RemoveHead()) {</a>
+<a name="ln131">		child-&gt;RemoveFromParent();</a>
+<a name="ln132">	}</a>
+<a name="ln133">	while (net_socket_private* child = connected_children.RemoveHead()) {</a>
+<a name="ln134">		child-&gt;RemoveFromParent();</a>
+<a name="ln135">	}</a>
+<a name="ln136"> </a>
+<a name="ln137">	mutex_unlock(&amp;lock);</a>
+<a name="ln138"> </a>
+<a name="ln139">	put_domain_protocols(this);</a>
+<a name="ln140"> </a>
+<a name="ln141">	mutex_destroy(&amp;lock);</a>
+<a name="ln142">}</a>
+<a name="ln143"> </a>
+<a name="ln144"> </a>
+<a name="ln145">void</a>
+<a name="ln146">net_socket_private::RemoveFromParent()</a>
+<a name="ln147">{</a>
+<a name="ln148">	ASSERT(!is_in_socket_list &amp;&amp; parent != NULL);</a>
+<a name="ln149"> </a>
+<a name="ln150">	parent = NULL;</a>
+<a name="ln151"> </a>
+<a name="ln152">	mutex_lock(&amp;sSocketLock);</a>
+<a name="ln153">	sSocketList.Add(this);</a>
+<a name="ln154">	mutex_unlock(&amp;sSocketLock);</a>
+<a name="ln155"> </a>
+<a name="ln156">	is_in_socket_list = true;</a>
+<a name="ln157"> </a>
+<a name="ln158">	ReleaseReference();</a>
+<a name="ln159">}</a>
+<a name="ln160"> </a>
+<a name="ln161"> </a>
+<a name="ln162">//	#pragma mark -</a>
+<a name="ln163"> </a>
+<a name="ln164"> </a>
+<a name="ln165">static size_t</a>
+<a name="ln166">compute_user_iovec_length(iovec* userVec, uint32 count)</a>
+<a name="ln167">{</a>
+<a name="ln168">	size_t length = 0;</a>
+<a name="ln169"> </a>
+<a name="ln170">	for (uint32 i = 0; i &lt; count; i++) {</a>
+<a name="ln171">		iovec vec;</a>
+<a name="ln172">		if (user_memcpy(&amp;vec, userVec + i, sizeof(iovec)) &lt; B_OK)</a>
+<a name="ln173">			return 0;</a>
+<a name="ln174"> </a>
+<a name="ln175">		length += vec.iov_len;</a>
+<a name="ln176">	}</a>
+<a name="ln177"> </a>
+<a name="ln178">	return length;</a>
+<a name="ln179">}</a>
+<a name="ln180"> </a>
+<a name="ln181"> </a>
+<a name="ln182">static status_t</a>
+<a name="ln183">create_socket(int family, int type, int protocol, net_socket_private** _socket)</a>
+<a name="ln184">{</a>
+<a name="ln185">	struct net_socket_private* socket = new(std::nothrow) net_socket_private;</a>
+<a name="ln186">	if (socket == NULL)</a>
+<a name="ln187">		return B_NO_MEMORY;</a>
+<a name="ln188">	status_t status = socket-&gt;InitCheck();</a>
+<a name="ln189">	if (status != B_OK) {</a>
+<a name="ln190">		delete socket;</a>
+<a name="ln191">		return status;</a>
+<a name="ln192">	}</a>
+<a name="ln193"> </a>
+<a name="ln194">	socket-&gt;family = family;</a>
+<a name="ln195">	socket-&gt;type = type;</a>
+<a name="ln196">	socket-&gt;protocol = protocol;</a>
+<a name="ln197"> </a>
+<a name="ln198">	status = get_domain_protocols(socket);</a>
+<a name="ln199">	if (status != B_OK) {</a>
+<a name="ln200">		delete socket;</a>
+<a name="ln201">		return status;</a>
+<a name="ln202">	}</a>
+<a name="ln203"> </a>
+<a name="ln204">	TRACE(&quot;create net_socket %p (%u.%u.%u):\n&quot;, socket, socket-&gt;family,</a>
+<a name="ln205">		socket-&gt;type, socket-&gt;protocol);</a>
+<a name="ln206"> </a>
+<a name="ln207">#ifdef TRACE_SOCKET</a>
+<a name="ln208">	net_protocol* current = socket-&gt;first_protocol;</a>
+<a name="ln209">	for (int i = 0; current != NULL; current = current-&gt;next, i++)</a>
+<a name="ln210">		TRACE(&quot;  [%d] %p  %s\n&quot;, i, current, current-&gt;module-&gt;info.name);</a>
+<a name="ln211">#endif</a>
+<a name="ln212"> </a>
+<a name="ln213">	*_socket = socket;</a>
+<a name="ln214">	return B_OK;</a>
+<a name="ln215">}</a>
+<a name="ln216"> </a>
+<a name="ln217"> </a>
+<a name="ln218">static status_t</a>
+<a name="ln219">add_ancillary_data(net_socket* socket, ancillary_data_container* container,</a>
+<a name="ln220">	void* data, size_t dataLen)</a>
+<a name="ln221">{</a>
+<a name="ln222">	cmsghdr* header = (cmsghdr*)data;</a>
+<a name="ln223"> </a>
+<a name="ln224">	if (dataLen == 0)</a>
+<a name="ln225">		return B_OK;</a>
+<a name="ln226"> </a>
+<a name="ln227">	if (socket-&gt;first_info-&gt;add_ancillary_data == NULL)</a>
+<a name="ln228">		return B_NOT_SUPPORTED;</a>
+<a name="ln229"> </a>
+<a name="ln230">	while (true) {</a>
+<a name="ln231">		if (header-&gt;cmsg_len &lt; CMSG_LEN(0) || header-&gt;cmsg_len &gt; dataLen)</a>
+<a name="ln232">			return B_BAD_VALUE;</a>
+<a name="ln233"> </a>
+<a name="ln234">		status_t status = socket-&gt;first_info-&gt;add_ancillary_data(</a>
+<a name="ln235">			socket-&gt;first_protocol, container, header);</a>
+<a name="ln236">		if (status != B_OK)</a>
+<a name="ln237">			return status;</a>
+<a name="ln238"> </a>
+<a name="ln239">		if (dataLen &lt;= _ALIGN(header-&gt;cmsg_len))</a>
+<a name="ln240">			break;</a>
+<a name="ln241">		dataLen -= _ALIGN(header-&gt;cmsg_len);</a>
+<a name="ln242">		header = (cmsghdr*)((uint8*)header + _ALIGN(header-&gt;cmsg_len));</a>
+<a name="ln243">	}</a>
+<a name="ln244"> </a>
+<a name="ln245">	return B_OK;</a>
+<a name="ln246">}</a>
+<a name="ln247"> </a>
+<a name="ln248"> </a>
+<a name="ln249">static status_t</a>
+<a name="ln250">process_ancillary_data(net_socket* socket, ancillary_data_container* container,</a>
+<a name="ln251">	msghdr* messageHeader)</a>
+<a name="ln252">{</a>
+<a name="ln253">	uint8* dataBuffer = (uint8*)messageHeader-&gt;msg_control;</a>
+<a name="ln254">	int dataBufferLen = messageHeader-&gt;msg_controllen;</a>
+<a name="ln255"> </a>
+<a name="ln256">	if (container == NULL || dataBuffer == NULL) {</a>
+<a name="ln257">		messageHeader-&gt;msg_controllen = 0;</a>
+<a name="ln258">		return B_OK;</a>
+<a name="ln259">	}</a>
+<a name="ln260"> </a>
+<a name="ln261">	ancillary_data_header header;</a>
+<a name="ln262">	void* data = NULL;</a>
+<a name="ln263"> </a>
+<a name="ln264">	while ((data = next_ancillary_data(container, data, &amp;header)) != NULL) {</a>
+<a name="ln265">		if (socket-&gt;first_info-&gt;process_ancillary_data == NULL)</a>
+<a name="ln266">			return B_NOT_SUPPORTED;</a>
+<a name="ln267"> </a>
+<a name="ln268">		ssize_t bytesWritten = socket-&gt;first_info-&gt;process_ancillary_data(</a>
+<a name="ln269">			socket-&gt;first_protocol, &amp;header, data, dataBuffer, dataBufferLen);</a>
+<a name="ln270">		if (bytesWritten &lt; 0)</a>
+<a name="ln271">			return bytesWritten;</a>
+<a name="ln272"> </a>
+<a name="ln273">		dataBuffer += bytesWritten;</a>
+<a name="ln274">		dataBufferLen -= bytesWritten;</a>
+<a name="ln275">	}</a>
+<a name="ln276"> </a>
+<a name="ln277">	messageHeader-&gt;msg_controllen -= dataBufferLen;</a>
+<a name="ln278"> </a>
+<a name="ln279">	return B_OK;</a>
+<a name="ln280">}</a>
+<a name="ln281"> </a>
+<a name="ln282"> </a>
+<a name="ln283">static status_t</a>
+<a name="ln284">process_ancillary_data(net_socket* socket,</a>
+<a name="ln285">	net_buffer* buffer, msghdr* messageHeader)</a>
+<a name="ln286">{</a>
+<a name="ln287">	void *dataBuffer = messageHeader-&gt;msg_control;</a>
+<a name="ln288">	ssize_t bytesWritten;</a>
+<a name="ln289"> </a>
+<a name="ln290">	if (dataBuffer == NULL) {</a>
+<a name="ln291">		messageHeader-&gt;msg_controllen = 0;</a>
+<a name="ln292">		return B_OK;</a>
+<a name="ln293">	}</a>
+<a name="ln294"> </a>
+<a name="ln295">	if (socket-&gt;first_info-&gt;process_ancillary_data_no_container == NULL)</a>
+<a name="ln296">		return B_NOT_SUPPORTED;</a>
+<a name="ln297"> </a>
+<a name="ln298">	bytesWritten = socket-&gt;first_info-&gt;process_ancillary_data_no_container(</a>
+<a name="ln299">		socket-&gt;first_protocol, buffer, dataBuffer,</a>
+<a name="ln300">		messageHeader-&gt;msg_controllen);</a>
+<a name="ln301">	if (bytesWritten &lt; 0)</a>
+<a name="ln302">		return bytesWritten;</a>
+<a name="ln303">	messageHeader-&gt;msg_controllen = bytesWritten;</a>
+<a name="ln304"> </a>
+<a name="ln305">	return B_OK;</a>
+<a name="ln306">}</a>
+<a name="ln307"> </a>
+<a name="ln308"> </a>
+<a name="ln309">static ssize_t</a>
+<a name="ln310">socket_receive_no_buffer(net_socket* socket, msghdr* header, void* data,</a>
+<a name="ln311">	size_t length, int flags)</a>
+<a name="ln312">{</a>
+<a name="ln313">	iovec stackVec = { data, length };</a>
+<a name="ln314">	iovec* vecs = header ? header-&gt;msg_iov : &amp;stackVec;</a>
+<a name="ln315">	int vecCount = header ? header-&gt;msg_iovlen : 1;</a>
+<a name="ln316">	sockaddr* address = header ? (sockaddr*)header-&gt;msg_name : NULL;</a>
+<a name="ln317">	socklen_t* addressLen = header ? &amp;header-&gt;msg_namelen : NULL;</a>
+<a name="ln318"> </a>
+<a name="ln319">	ancillary_data_container* ancillaryData = NULL;</a>
+<a name="ln320">	ssize_t bytesRead = socket-&gt;first_info-&gt;read_data_no_buffer(</a>
+<a name="ln321">		socket-&gt;first_protocol, vecs, vecCount, &amp;ancillaryData, address,</a>
+<a name="ln322">		addressLen);</a>
+<a name="ln323">	if (bytesRead &lt; 0)</a>
+<a name="ln324">		return bytesRead;</a>
+<a name="ln325"> </a>
+<a name="ln326">	CObjectDeleter&lt;ancillary_data_container&gt; ancillaryDataDeleter(ancillaryData,</a>
+<a name="ln327">		&amp;delete_ancillary_data_container);</a>
+<a name="ln328"> </a>
+<a name="ln329">	// process ancillary data</a>
+<a name="ln330">	if (header != NULL) {</a>
+<a name="ln331">		status_t status = process_ancillary_data(socket, ancillaryData, header);</a>
+<a name="ln332">		if (status != B_OK)</a>
+<a name="ln333">			return status;</a>
+<a name="ln334"> </a>
+<a name="ln335">		header-&gt;msg_flags = 0;</a>
+<a name="ln336">	}</a>
+<a name="ln337"> </a>
+<a name="ln338">	return bytesRead;</a>
+<a name="ln339">}</a>
+<a name="ln340"> </a>
+<a name="ln341"> </a>
+<a name="ln342">#if ENABLE_DEBUGGER_COMMANDS</a>
+<a name="ln343"> </a>
+<a name="ln344"> </a>
+<a name="ln345">static void</a>
+<a name="ln346">print_socket_line(net_socket_private* socket, const char* prefix)</a>
+<a name="ln347">{</a>
+<a name="ln348">	BReference&lt;net_socket_private&gt; parent;</a>
+<a name="ln349">	if (socket-&gt;parent.PrivatePointer() != NULL)</a>
+<a name="ln350">		parent = socket-&gt;parent.GetReference();</a>
+<a name="ln351">	kprintf(&quot;%s%p %2d.%2d.%2d %6&quot; B_PRId32 &quot; %p %p  %p%s\n&quot;, prefix, socket,</a>
+<a name="ln352">		socket-&gt;family, socket-&gt;type, socket-&gt;protocol, socket-&gt;owner,</a>
+<a name="ln353">		socket-&gt;first_protocol, socket-&gt;first_info, parent.Get(),</a>
+<a name="ln354">		parent.Get() != NULL ? socket-&gt;is_connected ? &quot; (c)&quot; : &quot; (p)&quot; : &quot;&quot;);</a>
+<a name="ln355">}</a>
+<a name="ln356"> </a>
+<a name="ln357"> </a>
+<a name="ln358">static int</a>
+<a name="ln359">dump_socket(int argc, char** argv)</a>
+<a name="ln360">{</a>
+<a name="ln361">	if (argc &lt; 2) {</a>
+<a name="ln362">		kprintf(&quot;usage: %s [address]\n&quot;, argv[0]);</a>
+<a name="ln363">		return 0;</a>
+<a name="ln364">	}</a>
+<a name="ln365"> </a>
+<a name="ln366">	net_socket_private* socket = (net_socket_private*)parse_expression(argv[1]);</a>
+<a name="ln367"> </a>
+<a name="ln368">	kprintf(&quot;SOCKET %p\n&quot;, socket);</a>
+<a name="ln369">	kprintf(&quot;  family.type.protocol: %d.%d.%d\n&quot;,</a>
+<a name="ln370">		socket-&gt;family, socket-&gt;type, socket-&gt;protocol);</a>
+<a name="ln371">	BReference&lt;net_socket_private&gt; parent;</a>
+<a name="ln372">	if (socket-&gt;parent.PrivatePointer() != NULL)</a>
+<a name="ln373">		parent = socket-&gt;parent.GetReference();</a>
+<a name="ln374">	kprintf(&quot;  parent:               %p\n&quot;, parent.Get());</a>
+<a name="ln375">	kprintf(&quot;  first protocol:       %p\n&quot;, socket-&gt;first_protocol);</a>
+<a name="ln376">	kprintf(&quot;  first module_info:    %p\n&quot;, socket-&gt;first_info);</a>
+<a name="ln377">	kprintf(&quot;  options:              %x\n&quot;, socket-&gt;options);</a>
+<a name="ln378">	kprintf(&quot;  linger:               %d\n&quot;, socket-&gt;linger);</a>
+<a name="ln379">	kprintf(&quot;  bound to device:      %&quot; B_PRIu32 &quot;\n&quot;, socket-&gt;bound_to_device);</a>
+<a name="ln380">	kprintf(&quot;  owner:                %&quot; B_PRId32 &quot;\n&quot;, socket-&gt;owner);</a>
+<a name="ln381">	kprintf(&quot;  max backlog:          %&quot; B_PRId32 &quot;\n&quot;, socket-&gt;max_backlog);</a>
+<a name="ln382">	kprintf(&quot;  is connected:         %d\n&quot;, socket-&gt;is_connected);</a>
+<a name="ln383">	kprintf(&quot;  child_count:          %&quot; B_PRIu32 &quot;\n&quot;, socket-&gt;child_count);</a>
+<a name="ln384"> </a>
+<a name="ln385">	if (socket-&gt;child_count == 0)</a>
+<a name="ln386">		return 0;</a>
+<a name="ln387"> </a>
+<a name="ln388">	kprintf(&quot;    pending children:\n&quot;);</a>
+<a name="ln389">	SocketList::Iterator iterator = socket-&gt;pending_children.GetIterator();</a>
+<a name="ln390">	while (net_socket_private* child = iterator.Next()) {</a>
+<a name="ln391">		print_socket_line(child, &quot;      &quot;);</a>
+<a name="ln392">	}</a>
+<a name="ln393"> </a>
+<a name="ln394">	kprintf(&quot;    connected children:\n&quot;);</a>
+<a name="ln395">	iterator = socket-&gt;connected_children.GetIterator();</a>
+<a name="ln396">	while (net_socket_private* child = iterator.Next()) {</a>
+<a name="ln397">		print_socket_line(child, &quot;      &quot;);</a>
+<a name="ln398">	}</a>
+<a name="ln399"> </a>
+<a name="ln400">	return 0;</a>
+<a name="ln401">}</a>
+<a name="ln402"> </a>
+<a name="ln403"> </a>
+<a name="ln404">static int</a>
+<a name="ln405">dump_sockets(int argc, char** argv)</a>
+<a name="ln406">{</a>
+<a name="ln407">	kprintf(&quot;address        kind  owner protocol   module_info parent\n&quot;);</a>
+<a name="ln408"> </a>
+<a name="ln409">	SocketList::Iterator iterator = sSocketList.GetIterator();</a>
+<a name="ln410">	while (net_socket_private* socket = iterator.Next()) {</a>
+<a name="ln411">		print_socket_line(socket, &quot;&quot;);</a>
+<a name="ln412"> </a>
+<a name="ln413">		SocketList::Iterator childIterator</a>
+<a name="ln414">			= socket-&gt;pending_children.GetIterator();</a>
+<a name="ln415">		while (net_socket_private* child = childIterator.Next()) {</a>
+<a name="ln416">			print_socket_line(child, &quot; &quot;);</a>
+<a name="ln417">		}</a>
+<a name="ln418"> </a>
+<a name="ln419">		childIterator = socket-&gt;connected_children.GetIterator();</a>
+<a name="ln420">		while (net_socket_private* child = childIterator.Next()) {</a>
+<a name="ln421">			print_socket_line(child, &quot; &quot;);</a>
+<a name="ln422">		}</a>
+<a name="ln423">	}</a>
+<a name="ln424"> </a>
+<a name="ln425">	return 0;</a>
+<a name="ln426">}</a>
+<a name="ln427"> </a>
+<a name="ln428"> </a>
+<a name="ln429">#endif	// ENABLE_DEBUGGER_COMMANDS</a>
+<a name="ln430"> </a>
+<a name="ln431"> </a>
+<a name="ln432">//	#pragma mark -</a>
+<a name="ln433"> </a>
+<a name="ln434"> </a>
+<a name="ln435">status_t</a>
+<a name="ln436">socket_open(int family, int type, int protocol, net_socket** _socket)</a>
+<a name="ln437">{</a>
+<a name="ln438">	net_socket_private* socket;</a>
+<a name="ln439">	status_t status = create_socket(family, type, protocol, &amp;socket);</a>
+<a name="ln440">	if (status != B_OK)</a>
+<a name="ln441">		return status;</a>
+<a name="ln442"> </a>
+<a name="ln443">	status = socket-&gt;first_info-&gt;open(socket-&gt;first_protocol);</a>
+<a name="ln444">	if (status != B_OK) {</a>
+<a name="ln445">		delete socket;</a>
+<a name="ln446">		return status;</a>
+<a name="ln447">	}</a>
+<a name="ln448"> </a>
+<a name="ln449">	socket-&gt;owner = team_get_current_team_id();</a>
+<a name="ln450">	socket-&gt;is_in_socket_list = true;</a>
+<a name="ln451"> </a>
+<a name="ln452">	mutex_lock(&amp;sSocketLock);</a>
+<a name="ln453">	sSocketList.Add(socket);</a>
+<a name="ln454">	mutex_unlock(&amp;sSocketLock);</a>
+<a name="ln455"> </a>
+<a name="ln456">	*_socket = socket;</a>
+<a name="ln457">	return B_OK;</a>
+<a name="ln458">}</a>
+<a name="ln459"> </a>
+<a name="ln460"> </a>
+<a name="ln461">status_t</a>
+<a name="ln462">socket_close(net_socket* _socket)</a>
+<a name="ln463">{</a>
+<a name="ln464">	net_socket_private* socket = (net_socket_private*)_socket;</a>
+<a name="ln465">	return socket-&gt;first_info-&gt;close(socket-&gt;first_protocol);</a>
+<a name="ln466">}</a>
+<a name="ln467"> </a>
+<a name="ln468"> </a>
+<a name="ln469">void</a>
+<a name="ln470">socket_free(net_socket* _socket)</a>
+<a name="ln471">{</a>
+<a name="ln472">	net_socket_private* socket = (net_socket_private*)_socket;</a>
+<a name="ln473">	socket-&gt;first_info-&gt;free(socket-&gt;first_protocol);</a>
+<a name="ln474">	socket-&gt;ReleaseReference();</a>
+<a name="ln475">}</a>
+<a name="ln476"> </a>
+<a name="ln477"> </a>
+<a name="ln478">status_t</a>
+<a name="ln479">socket_readv(net_socket* socket, const iovec* vecs, size_t vecCount,</a>
+<a name="ln480">	size_t* _length)</a>
+<a name="ln481">{</a>
+<a name="ln482">	return -1;</a>
+<a name="ln483">}</a>
+<a name="ln484"> </a>
+<a name="ln485"> </a>
+<a name="ln486">status_t</a>
+<a name="ln487">socket_writev(net_socket* socket, const iovec* vecs, size_t vecCount,</a>
+<a name="ln488">	size_t* _length)</a>
+<a name="ln489">{</a>
+<a name="ln490">	if (socket-&gt;peer.ss_len == 0)</a>
+<a name="ln491">		return ECONNRESET;</a>
+<a name="ln492"> </a>
+<a name="ln493">	if (socket-&gt;address.ss_len == 0) {</a>
+<a name="ln494">		// try to bind first</a>
+<a name="ln495">		status_t status = socket_bind(socket, NULL, 0);</a>
+<a name="ln496">		if (status != B_OK)</a>
+<a name="ln497">			return status;</a>
+<a name="ln498">	}</a>
+<a name="ln499"> </a>
+<a name="ln500">	// TODO: useful, maybe even computed header space!</a>
+<a name="ln501">	net_buffer* buffer = gNetBufferModule.create(256);</a>
+<a name="ln502">	if (buffer == NULL)</a>
+<a name="ln503">		return ENOBUFS;</a>
+<a name="ln504"> </a>
+<a name="ln505">	// copy data into buffer</a>
+<a name="ln506"> </a>
+<a name="ln507">	for (uint32 i = 0; i &lt; vecCount; i++) {</a>
+<a name="ln508">		if (gNetBufferModule.append(buffer, vecs[i].iov_base,</a>
+<a name="ln509">				vecs[i].iov_len) &lt; B_OK) {</a>
+<a name="ln510">			gNetBufferModule.free(buffer);</a>
+<a name="ln511">			return ENOBUFS;</a>
+<a name="ln512">		}</a>
+<a name="ln513">	}</a>
+<a name="ln514"> </a>
+<a name="ln515">	memcpy(buffer-&gt;source, &amp;socket-&gt;address, socket-&gt;address.ss_len);</a>
+<a name="ln516">	memcpy(buffer-&gt;destination, &amp;socket-&gt;peer, socket-&gt;peer.ss_len);</a>
+<a name="ln517">	size_t size = buffer-&gt;size;</a>
+<a name="ln518"> </a>
+<a name="ln519">	ssize_t bytesWritten = socket-&gt;first_info-&gt;send_data(socket-&gt;first_protocol,</a>
+<a name="ln520">		buffer);</a>
+<a name="ln521">	if (bytesWritten &lt; B_OK) {</a>
+<a name="ln522">		if (buffer-&gt;size != size) {</a>
+<a name="ln523">			// this appears to be a partial write</a>
+<a name="ln524">			*_length = size - buffer-&gt;size;</a>
+<a name="ln525">		}</a>
+<a name="ln526">		gNetBufferModule.free(buffer);</a>
+<a name="ln527">		return bytesWritten;</a>
+<a name="ln528">	}</a>
+<a name="ln529"> </a>
+<a name="ln530">	*_length = bytesWritten;</a>
+<a name="ln531">	return B_OK;</a>
+<a name="ln532">}</a>
+<a name="ln533"> </a>
+<a name="ln534"> </a>
+<a name="ln535">status_t</a>
+<a name="ln536">socket_control(net_socket* socket, uint32 op, void* data, size_t length)</a>
+<a name="ln537">{</a>
+<a name="ln538">	switch (op) {</a>
+<a name="ln539">		case FIONBIO:</a>
+<a name="ln540">		{</a>
+<a name="ln541">			if (data == NULL)</a>
+<a name="ln542">				return B_BAD_VALUE;</a>
+<a name="ln543"> </a>
+<a name="ln544">			int value;</a>
+<a name="ln545">			if (is_syscall()) {</a>
+<a name="ln546">				if (!IS_USER_ADDRESS(data)</a>
+<a name="ln547">					|| user_memcpy(&amp;value, data, sizeof(int)) != B_OK) {</a>
+<a name="ln548">					return B_BAD_ADDRESS;</a>
+<a name="ln549">				}</a>
+<a name="ln550">			} else</a>
+<a name="ln551">				value = *(int*)data;</a>
+<a name="ln552"> </a>
+<a name="ln553">			return socket_setsockopt(socket, SOL_SOCKET, SO_NONBLOCK, &amp;value,</a>
+<a name="ln554">				sizeof(int));</a>
+<a name="ln555">		}</a>
+<a name="ln556"> </a>
+<a name="ln557">		case FIONREAD:</a>
+<a name="ln558">		{</a>
+<a name="ln559">			if (data == NULL)</a>
+<a name="ln560">				return B_BAD_VALUE;</a>
+<a name="ln561"> </a>
+<a name="ln562">			int available = (int)socket_read_avail(socket);</a>
+<a name="ln563">			if (available &lt; 0)</a>
+<a name="ln564">				return available;</a>
+<a name="ln565"> </a>
+<a name="ln566">			if (is_syscall()) {</a>
+<a name="ln567">				if (!IS_USER_ADDRESS(data)</a>
+<a name="ln568">					|| user_memcpy(data, &amp;available, sizeof(available))</a>
+<a name="ln569">						!= B_OK) {</a>
+<a name="ln570">					return B_BAD_ADDRESS;</a>
+<a name="ln571">				}</a>
+<a name="ln572">			} else</a>
+<a name="ln573">				*(int*)data = available;</a>
+<a name="ln574"> </a>
+<a name="ln575">			return B_OK;</a>
+<a name="ln576">		}</a>
+<a name="ln577"> </a>
+<a name="ln578">		case B_SET_BLOCKING_IO:</a>
+<a name="ln579">		case B_SET_NONBLOCKING_IO:</a>
+<a name="ln580">		{</a>
+<a name="ln581">			int value = op == B_SET_NONBLOCKING_IO;</a>
+<a name="ln582">			return socket_setsockopt(socket, SOL_SOCKET, SO_NONBLOCK, &amp;value,</a>
+<a name="ln583">				sizeof(int));</a>
+<a name="ln584">		}</a>
+<a name="ln585">	}</a>
+<a name="ln586"> </a>
+<a name="ln587">	return socket-&gt;first_info-&gt;control(socket-&gt;first_protocol,</a>
+<a name="ln588">		LEVEL_DRIVER_IOCTL, op, data, &amp;length);</a>
+<a name="ln589">}</a>
+<a name="ln590"> </a>
+<a name="ln591"> </a>
+<a name="ln592">ssize_t</a>
+<a name="ln593">socket_read_avail(net_socket* socket)</a>
+<a name="ln594">{</a>
+<a name="ln595">	return socket-&gt;first_info-&gt;read_avail(socket-&gt;first_protocol);</a>
+<a name="ln596">}</a>
+<a name="ln597"> </a>
+<a name="ln598"> </a>
+<a name="ln599">ssize_t</a>
+<a name="ln600">socket_send_avail(net_socket* socket)</a>
+<a name="ln601">{</a>
+<a name="ln602">	return socket-&gt;first_info-&gt;send_avail(socket-&gt;first_protocol);</a>
+<a name="ln603">}</a>
+<a name="ln604"> </a>
+<a name="ln605"> </a>
+<a name="ln606">status_t</a>
+<a name="ln607">socket_send_data(net_socket* socket, net_buffer* buffer)</a>
+<a name="ln608">{</a>
+<a name="ln609">	return socket-&gt;first_info-&gt;send_data(socket-&gt;first_protocol,</a>
+<a name="ln610">		buffer);</a>
+<a name="ln611">}</a>
+<a name="ln612"> </a>
+<a name="ln613"> </a>
+<a name="ln614">status_t</a>
+<a name="ln615">socket_receive_data(net_socket* socket, size_t length, uint32 flags,</a>
+<a name="ln616">	net_buffer** _buffer)</a>
+<a name="ln617">{</a>
+<a name="ln618">	status_t status = socket-&gt;first_info-&gt;read_data(socket-&gt;first_protocol,</a>
+<a name="ln619">		length, flags, _buffer);</a>
+<a name="ln620">	if (status != B_OK)</a>
+<a name="ln621">		return status;</a>
+<a name="ln622"> </a>
+<a name="ln623">	if (*_buffer &amp;&amp; length &lt; (*_buffer)-&gt;size) {</a>
+<a name="ln624">		// discard any data behind the amount requested</a>
+<a name="ln625">		gNetBufferModule.trim(*_buffer, length);</a>
+<a name="ln626">	}</a>
+<a name="ln627"> </a>
+<a name="ln628">	return status;</a>
+<a name="ln629">}</a>
+<a name="ln630"> </a>
+<a name="ln631"> </a>
+<a name="ln632">status_t</a>
+<a name="ln633">socket_get_next_stat(uint32* _cookie, int family, struct net_stat* stat)</a>
+<a name="ln634">{</a>
+<a name="ln635">	MutexLocker locker(sSocketLock);</a>
+<a name="ln636"> </a>
+<a name="ln637">	net_socket_private* socket = NULL;</a>
+<a name="ln638">	SocketList::Iterator iterator = sSocketList.GetIterator();</a>
+<a name="ln639">	uint32 cookie = *_cookie;</a>
+<a name="ln640">	uint32 count = 0;</a>
+<a name="ln641"> </a>
+<a name="ln642">	while (true) {</a>
+<a name="ln643">		socket = iterator.Next();</a>
+<a name="ln644">		if (socket == NULL)</a>
+<a name="ln645">			return B_ENTRY_NOT_FOUND;</a>
+<a name="ln646"> </a>
+<a name="ln647">		// TODO: also traverse the pending connections</a>
+<a name="ln648">		if (count == cookie)</a>
+<a name="ln649">			break;</a>
+<a name="ln650"> </a>
+<a name="ln651">		if (family == -1 || family == socket-&gt;family)</a>
+<a name="ln652">			count++;</a>
+<a name="ln653">	}</a>
+<a name="ln654"> </a>
+<a name="ln655">	*_cookie = count + 1;</a>
+<a name="ln656"> </a>
+<a name="ln657">	stat-&gt;family = socket-&gt;family;</a>
+<a name="ln658">	stat-&gt;type = socket-&gt;type;</a>
+<a name="ln659">	stat-&gt;protocol = socket-&gt;protocol;</a>
+<a name="ln660">	stat-&gt;owner = socket-&gt;owner;</a>
+<a name="ln661">	stat-&gt;state[0] = '\0';</a>
+<a name="ln662">	memcpy(&amp;stat-&gt;address, &amp;socket-&gt;address, sizeof(struct sockaddr_storage));</a>
+<a name="ln663">	memcpy(&amp;stat-&gt;peer, &amp;socket-&gt;peer, sizeof(struct sockaddr_storage));</a>
+<a name="ln664">	stat-&gt;receive_queue_size = 0;</a>
+<a name="ln665">	stat-&gt;send_queue_size = 0;</a>
+<a name="ln666"> </a>
+<a name="ln667">	// fill in protocol specific data (if supported by the protocol)</a>
+<a name="ln668">	size_t length = sizeof(net_stat);</a>
+<a name="ln669">	socket-&gt;first_info-&gt;control(socket-&gt;first_protocol, socket-&gt;protocol,</a>
+<a name="ln670">		NET_STAT_SOCKET, stat, &amp;length);</a>
+<a name="ln671"> </a>
+<a name="ln672">	return B_OK;</a>
+<a name="ln673">}</a>
+<a name="ln674"> </a>
+<a name="ln675"> </a>
+<a name="ln676">//	#pragma mark - connections</a>
+<a name="ln677"> </a>
+<a name="ln678"> </a>
+<a name="ln679">bool</a>
+<a name="ln680">socket_acquire(net_socket* _socket)</a>
+<a name="ln681">{</a>
+<a name="ln682">	net_socket_private* socket = (net_socket_private*)_socket;</a>
+<a name="ln683"> </a>
+<a name="ln684">	// During destruction, the socket might still be accessible over its</a>
+<a name="ln685">	// endpoint protocol. We need to make sure the endpoint cannot acquire the</a>
+<a name="ln686">	// socket anymore -- while not obvious, the endpoint protocol is responsible</a>
+<a name="ln687">	// for the proper locking here.</a>
+<a name="ln688">	if (socket-&gt;CountReferences() == 0)</a>
+<a name="ln689">		return false;</a>
+<a name="ln690"> </a>
+<a name="ln691">	socket-&gt;AcquireReference();</a>
+<a name="ln692">	return true;</a>
+<a name="ln693">}</a>
+<a name="ln694"> </a>
+<a name="ln695"> </a>
+<a name="ln696">bool</a>
+<a name="ln697">socket_release(net_socket* _socket)</a>
+<a name="ln698">{</a>
+<a name="ln699">	net_socket_private* socket = (net_socket_private*)_socket;</a>
+<a name="ln700">	return socket-&gt;ReleaseReference();</a>
+<a name="ln701">}</a>
+<a name="ln702"> </a>
+<a name="ln703"> </a>
+<a name="ln704">status_t</a>
+<a name="ln705">socket_spawn_pending(net_socket* _parent, net_socket** _socket)</a>
+<a name="ln706">{</a>
+<a name="ln707">	net_socket_private* parent = (net_socket_private*)_parent;</a>
+<a name="ln708"> </a>
+<a name="ln709">	TRACE(&quot;%s(%p)\n&quot;, __FUNCTION__, parent);</a>
+<a name="ln710"> </a>
+<a name="ln711">	MutexLocker locker(parent-&gt;lock);</a>
+<a name="ln712"> </a>
+<a name="ln713">	// We actually accept more pending connections to compensate for those</a>
+<a name="ln714">	// that never complete, and also make sure at least a single connection</a>
+<a name="ln715">	// can always be accepted</a>
+<a name="ln716">	if (parent-&gt;child_count &gt; 3 * parent-&gt;max_backlog / 2)</a>
+<a name="ln717">		return ENOBUFS;</a>
+<a name="ln718"> </a>
+<a name="ln719">	net_socket_private* socket;</a>
+<a name="ln720">	status_t status = create_socket(parent-&gt;family, parent-&gt;type,</a>
+<a name="ln721">		parent-&gt;protocol, &amp;socket);</a>
+<a name="ln722">	if (status != B_OK)</a>
+<a name="ln723">		return status;</a>
+<a name="ln724"> </a>
+<a name="ln725">	// inherit parent's properties</a>
+<a name="ln726">	socket-&gt;send = parent-&gt;send;</a>
+<a name="ln727">	socket-&gt;receive = parent-&gt;receive;</a>
+<a name="ln728">	socket-&gt;options = parent-&gt;options &amp; ~SO_ACCEPTCONN;</a>
+<a name="ln729">	socket-&gt;linger = parent-&gt;linger;</a>
+<a name="ln730">	socket-&gt;owner = parent-&gt;owner;</a>
+<a name="ln731">	memcpy(&amp;socket-&gt;address, &amp;parent-&gt;address, parent-&gt;address.ss_len);</a>
+<a name="ln732">	memcpy(&amp;socket-&gt;peer, &amp;parent-&gt;peer, parent-&gt;peer.ss_len);</a>
+<a name="ln733"> </a>
+<a name="ln734">	// add to the parent's list of pending connections</a>
+<a name="ln735">	parent-&gt;pending_children.Add(socket);</a>
+<a name="ln736">	socket-&gt;parent = parent;</a>
+<a name="ln737">	parent-&gt;child_count++;</a>
+<a name="ln738"> </a>
+<a name="ln739">	*_socket = socket;</a>
+<a name="ln740">	return B_OK;</a>
+<a name="ln741">}</a>
+<a name="ln742"> </a>
+<a name="ln743"> </a>
+<a name="ln744">/*!	Dequeues a connected child from a parent socket.</a>
+<a name="ln745">	It also returns a reference with the child socket.</a>
+<a name="ln746">*/</a>
+<a name="ln747">status_t</a>
+<a name="ln748">socket_dequeue_connected(net_socket* _parent, net_socket** _socket)</a>
+<a name="ln749">{</a>
+<a name="ln750">	net_socket_private* parent = (net_socket_private*)_parent;</a>
+<a name="ln751"> </a>
+<a name="ln752">	mutex_lock(&amp;parent-&gt;lock);</a>
+<a name="ln753"> </a>
+<a name="ln754">	net_socket_private* socket = parent-&gt;connected_children.RemoveHead();</a>
+<a name="ln755">	if (socket != NULL) {</a>
+<a name="ln756">		socket-&gt;AcquireReference();</a>
+<a name="ln757">		socket-&gt;RemoveFromParent();</a>
+<a name="ln758">		parent-&gt;child_count--;</a>
+<a name="ln759">		*_socket = socket;</a>
+<a name="ln760">	}</a>
+<a name="ln761"> </a>
+<a name="ln762">	mutex_unlock(&amp;parent-&gt;lock);</a>
+<a name="ln763"> </a>
+<a name="ln764">	if (socket == NULL)</a>
+<a name="ln765">		return B_ENTRY_NOT_FOUND;</a>
+<a name="ln766"> </a>
+<a name="ln767">	return B_OK;</a>
+<a name="ln768">}</a>
+<a name="ln769"> </a>
+<a name="ln770"> </a>
+<a name="ln771">ssize_t</a>
+<a name="ln772">socket_count_connected(net_socket* _parent)</a>
+<a name="ln773">{</a>
+<a name="ln774">	net_socket_private* parent = (net_socket_private*)_parent;</a>
+<a name="ln775"> </a>
+<a name="ln776">	MutexLocker _(parent-&gt;lock);</a>
+<a name="ln777">	return parent-&gt;connected_children.Count();</a>
+<a name="ln778">}</a>
+<a name="ln779"> </a>
+<a name="ln780"> </a>
+<a name="ln781">status_t</a>
+<a name="ln782">socket_set_max_backlog(net_socket* _socket, uint32 backlog)</a>
+<a name="ln783">{</a>
+<a name="ln784">	net_socket_private* socket = (net_socket_private*)_socket;</a>
+<a name="ln785"> </a>
+<a name="ln786">	// we enforce an upper limit of connections waiting to be accepted</a>
+<a name="ln787">	if (backlog &gt; 256)</a>
+<a name="ln788">		backlog = 256;</a>
+<a name="ln789"> </a>
+<a name="ln790">	MutexLocker _(socket-&gt;lock);</a>
+<a name="ln791"> </a>
+<a name="ln792">	// first remove the pending connections, then the already connected</a>
+<a name="ln793">	// ones as needed</a>
+<a name="ln794">	net_socket_private* child;</a>
+<a name="ln795">	while (socket-&gt;child_count &gt; backlog</a>
+<a name="ln796">		&amp;&amp; (child = socket-&gt;pending_children.RemoveTail()) != NULL) {</a>
+<a name="ln797">		child-&gt;RemoveFromParent();</a>
+<a name="ln798">		socket-&gt;child_count--;</a>
+<a name="ln799">	}</a>
+<a name="ln800">	while (socket-&gt;child_count &gt; backlog</a>
+<a name="ln801">		&amp;&amp; (child = socket-&gt;connected_children.RemoveTail()) != NULL) {</a>
+<a name="ln802">		child-&gt;RemoveFromParent();</a>
+<a name="ln803">		socket-&gt;child_count--;</a>
+<a name="ln804">	}</a>
+<a name="ln805"> </a>
+<a name="ln806">	socket-&gt;max_backlog = backlog;</a>
+<a name="ln807">	return B_OK;</a>
+<a name="ln808">}</a>
+<a name="ln809"> </a>
+<a name="ln810"> </a>
+<a name="ln811">/*!	Returns whether or not this socket has a parent. The parent might not be</a>
+<a name="ln812">	valid anymore, though.</a>
+<a name="ln813">*/</a>
+<a name="ln814">bool</a>
+<a name="ln815">socket_has_parent(net_socket* _socket)</a>
+<a name="ln816">{</a>
+<a name="ln817">	net_socket_private* socket = (net_socket_private*)_socket;</a>
+<a name="ln818">	return socket-&gt;parent != NULL;</a>
+<a name="ln819">}</a>
+<a name="ln820"> </a>
+<a name="ln821"> </a>
+<a name="ln822">/*!	The socket has been connected. It will be moved to the connected queue</a>
+<a name="ln823">	of its parent socket.</a>
+<a name="ln824">*/</a>
+<a name="ln825">status_t</a>
+<a name="ln826">socket_connected(net_socket* _socket)</a>
+<a name="ln827">{</a>
+<a name="ln828">	net_socket_private* socket = (net_socket_private*)_socket;</a>
+<a name="ln829"> </a>
+<a name="ln830">	TRACE(&quot;socket_connected(%p)\n&quot;, socket);</a>
+<a name="ln831"> </a>
+<a name="ln832">	BReference&lt;net_socket_private&gt; parent = socket-&gt;parent.GetReference();</a>
+<a name="ln833">	if (parent.Get() == NULL)</a>
+<a name="ln834">		return B_BAD_VALUE;</a>
+<a name="ln835"> </a>
+<a name="ln836">	MutexLocker _(parent-&gt;lock);</a>
+<a name="ln837"> </a>
+<a name="ln838">	parent-&gt;pending_children.Remove(socket);</a>
+<a name="ln839">	parent-&gt;connected_children.Add(socket);</a>
+<a name="ln840">	socket-&gt;is_connected = true;</a>
+<a name="ln841"> </a>
+<a name="ln842">	// notify parent</a>
+<a name="ln843">	if (parent-&gt;select_pool)</a>
+<a name="ln844">		notify_select_event_pool(parent-&gt;select_pool, B_SELECT_READ);</a>
+<a name="ln845"> </a>
+<a name="ln846">	return B_OK;</a>
+<a name="ln847">}</a>
+<a name="ln848"> </a>
+<a name="ln849"> </a>
+<a name="ln850">/*!	The socket has been aborted. Steals the parent's reference, and releases</a>
+<a name="ln851">	it.</a>
+<a name="ln852">*/</a>
+<a name="ln853">status_t</a>
+<a name="ln854">socket_aborted(net_socket* _socket)</a>
+<a name="ln855">{</a>
+<a name="ln856">	net_socket_private* socket = (net_socket_private*)_socket;</a>
+<a name="ln857"> </a>
+<a name="ln858">	TRACE(&quot;socket_aborted(%p)\n&quot;, socket);</a>
+<a name="ln859"> </a>
+<a name="ln860">	BReference&lt;net_socket_private&gt; parent = socket-&gt;parent.GetReference();</a>
+<a name="ln861">	if (parent.Get() == NULL)</a>
+<a name="ln862">		return B_BAD_VALUE;</a>
+<a name="ln863"> </a>
+<a name="ln864">	MutexLocker _(parent-&gt;lock);</a>
+<a name="ln865"> </a>
+<a name="ln866">	if (socket-&gt;is_connected)</a>
+<a name="ln867">		parent-&gt;connected_children.Remove(socket);</a>
+<a name="ln868">	else</a>
+<a name="ln869">		parent-&gt;pending_children.Remove(socket);</a>
+<a name="ln870"> </a>
+<a name="ln871">	parent-&gt;child_count--;</a>
+<a name="ln872">	socket-&gt;RemoveFromParent();</a>
+<a name="ln873"> </a>
+<a name="ln874">	return B_OK;</a>
+<a name="ln875">}</a>
+<a name="ln876"> </a>
+<a name="ln877"> </a>
+<a name="ln878">//	#pragma mark - notifications</a>
+<a name="ln879"> </a>
+<a name="ln880"> </a>
+<a name="ln881">status_t</a>
+<a name="ln882">socket_request_notification(net_socket* _socket, uint8 event, selectsync* sync)</a>
+<a name="ln883">{</a>
+<a name="ln884">	net_socket_private* socket = (net_socket_private*)_socket;</a>
+<a name="ln885"> </a>
+<a name="ln886">	mutex_lock(&amp;socket-&gt;lock);</a>
+<a name="ln887"> </a>
+<a name="ln888">	status_t status = add_select_sync_pool_entry(&amp;socket-&gt;select_pool, sync,</a>
+<a name="ln889">		event);</a>
+<a name="ln890"> </a>
+<a name="ln891">	mutex_unlock(&amp;socket-&gt;lock);</a>
+<a name="ln892"> </a>
+<a name="ln893">	if (status != B_OK)</a>
+<a name="ln894">		return status;</a>
+<a name="ln895"> </a>
+<a name="ln896">	// check if the event is already present</a>
+<a name="ln897">	// TODO: add support for poll() types</a>
+<a name="ln898"> </a>
+<a name="ln899">	switch (event) {</a>
+<a name="ln900">		case B_SELECT_READ:</a>
+<a name="ln901">		{</a>
+<a name="ln902">			ssize_t available = socket_read_avail(socket);</a>
+<a name="ln903">			if ((ssize_t)socket-&gt;receive.low_water_mark &lt;= available</a>
+<a name="ln904">				|| available &lt; B_OK)</a>
+<a name="ln905">				notify_select_event(sync, event);</a>
+<a name="ln906">			break;</a>
+<a name="ln907">		}</a>
+<a name="ln908">		case B_SELECT_WRITE:</a>
+<a name="ln909">		{</a>
+<a name="ln910">			ssize_t available = socket_send_avail(socket);</a>
+<a name="ln911">			if ((ssize_t)socket-&gt;send.low_water_mark &lt;= available</a>
+<a name="ln912">				|| available &lt; B_OK)</a>
+<a name="ln913">				notify_select_event(sync, event);</a>
+<a name="ln914">			break;</a>
+<a name="ln915">		}</a>
+<a name="ln916">		case B_SELECT_ERROR:</a>
+<a name="ln917">			if (socket-&gt;error != B_OK)</a>
+<a name="ln918">				notify_select_event(sync, event);</a>
+<a name="ln919">			break;</a>
+<a name="ln920">	}</a>
+<a name="ln921"> </a>
+<a name="ln922">	return B_OK;</a>
+<a name="ln923">}</a>
+<a name="ln924"> </a>
+<a name="ln925"> </a>
+<a name="ln926">status_t</a>
+<a name="ln927">socket_cancel_notification(net_socket* _socket, uint8 event, selectsync* sync)</a>
+<a name="ln928">{</a>
+<a name="ln929">	net_socket_private* socket = (net_socket_private*)_socket;</a>
+<a name="ln930"> </a>
+<a name="ln931">	MutexLocker _(socket-&gt;lock);</a>
+<a name="ln932">	return remove_select_sync_pool_entry(&amp;socket-&gt;select_pool, sync, event);</a>
+<a name="ln933">}</a>
+<a name="ln934"> </a>
+<a name="ln935"> </a>
+<a name="ln936">status_t</a>
+<a name="ln937">socket_notify(net_socket* _socket, uint8 event, int32 value)</a>
+<a name="ln938">{</a>
+<a name="ln939">	net_socket_private* socket = (net_socket_private*)_socket;</a>
+<a name="ln940">	bool notify = true;</a>
+<a name="ln941"> </a>
+<a name="ln942">	switch (event) {</a>
+<a name="ln943">		case B_SELECT_READ:</a>
+<a name="ln944">			if ((ssize_t)socket-&gt;receive.low_water_mark &gt; value</a>
+<a name="ln945">				&amp;&amp; value &gt;= B_OK)</a>
+<a name="ln946">				notify = false;</a>
+<a name="ln947">			break;</a>
+<a name="ln948"> </a>
+<a name="ln949">		case B_SELECT_WRITE:</a>
+<a name="ln950">			if ((ssize_t)socket-&gt;send.low_water_mark &gt; value &amp;&amp; value &gt;= B_OK)</a>
+<a name="ln951">				notify = false;</a>
+<a name="ln952">			break;</a>
+<a name="ln953"> </a>
+<a name="ln954">		case B_SELECT_ERROR:</a>
+<a name="ln955">			socket-&gt;error = value;</a>
+<a name="ln956">			break;</a>
+<a name="ln957">	}</a>
+<a name="ln958"> </a>
+<a name="ln959">	MutexLocker _(socket-&gt;lock);</a>
+<a name="ln960"> </a>
+<a name="ln961">	if (notify &amp;&amp; socket-&gt;select_pool != NULL) {</a>
+<a name="ln962">		notify_select_event_pool(socket-&gt;select_pool, event);</a>
+<a name="ln963"> </a>
+<a name="ln964">		if (event == B_SELECT_ERROR) {</a>
+<a name="ln965">			// always notify read/write on error</a>
+<a name="ln966">			notify_select_event_pool(socket-&gt;select_pool, B_SELECT_READ);</a>
+<a name="ln967">			notify_select_event_pool(socket-&gt;select_pool, B_SELECT_WRITE);</a>
+<a name="ln968">		}</a>
+<a name="ln969">	}</a>
+<a name="ln970"> </a>
+<a name="ln971">	return B_OK;</a>
+<a name="ln972">}</a>
+<a name="ln973"> </a>
+<a name="ln974"> </a>
+<a name="ln975">//	#pragma mark - standard socket API</a>
+<a name="ln976"> </a>
+<a name="ln977"> </a>
+<a name="ln978">int</a>
+<a name="ln979">socket_accept(net_socket* socket, struct sockaddr* address,</a>
+<a name="ln980">	socklen_t* _addressLength, net_socket** _acceptedSocket)</a>
+<a name="ln981">{</a>
+<a name="ln982">	if ((socket-&gt;options &amp; SO_ACCEPTCONN) == 0)</a>
+<a name="ln983">		return B_BAD_VALUE;</a>
+<a name="ln984"> </a>
+<a name="ln985">	net_socket* accepted;</a>
+<a name="ln986">	status_t status = socket-&gt;first_info-&gt;accept(socket-&gt;first_protocol,</a>
+<a name="ln987">		&amp;accepted);</a>
+<a name="ln988">	if (status != B_OK)</a>
+<a name="ln989">		return status;</a>
+<a name="ln990"> </a>
+<a name="ln991">	if (address &amp;&amp; *_addressLength &gt; 0) {</a>
+<a name="ln992">		memcpy(address, &amp;accepted-&gt;peer, min_c(*_addressLength,</a>
+<a name="ln993">			min_c(accepted-&gt;peer.ss_len, sizeof(sockaddr_storage))));</a>
+<a name="ln994">		*_addressLength = accepted-&gt;peer.ss_len;</a>
+<a name="ln995">	}</a>
+<a name="ln996"> </a>
+<a name="ln997">	*_acceptedSocket = accepted;</a>
+<a name="ln998">	return B_OK;</a>
+<a name="ln999">}</a>
+<a name="ln1000"> </a>
+<a name="ln1001"> </a>
+<a name="ln1002">int</a>
+<a name="ln1003">socket_bind(net_socket* socket, const struct sockaddr* address,</a>
+<a name="ln1004">	socklen_t addressLength)</a>
+<a name="ln1005">{</a>
+<a name="ln1006">	sockaddr empty;</a>
+<a name="ln1007">	if (address == NULL) {</a>
+<a name="ln1008">		// special - try to bind to an empty address, like INADDR_ANY</a>
+<a name="ln1009">		memset(&amp;empty, 0, sizeof(sockaddr));</a>
+<a name="ln1010">		empty.sa_len = sizeof(sockaddr);</a>
+<a name="ln1011">		empty.sa_family = socket-&gt;family;</a>
+<a name="ln1012"> </a>
+<a name="ln1013">		address = &amp;empty;</a>
+<a name="ln1014">		addressLength = sizeof(sockaddr);</a>
+<a name="ln1015">	}</a>
+<a name="ln1016"> </a>
+<a name="ln1017">	if (socket-&gt;address.ss_len != 0) {</a>
+<a name="ln1018">		status_t status = socket-&gt;first_info-&gt;unbind(socket-&gt;first_protocol,</a>
+<a name="ln1019">			(sockaddr*)&amp;socket-&gt;address);</a>
+<a name="ln1020">		if (status != B_OK)</a>
+<a name="ln1021">			return status;</a>
+<a name="ln1022">	}</a>
+<a name="ln1023"> </a>
+<a name="ln1024">	memcpy(&amp;socket-&gt;address, address, sizeof(sockaddr));</a>
+<a name="ln1025">	socket-&gt;address.ss_len = sizeof(sockaddr_storage);</a>
+<a name="ln1026"> </a>
+<a name="ln1027">	status_t status = socket-&gt;first_info-&gt;bind(socket-&gt;first_protocol,</a>
+<a name="ln1028">		(sockaddr*)address);</a>
+<a name="ln1029">	if (status != B_OK) {</a>
+<a name="ln1030">		// clear address again, as binding failed</a>
+<a name="ln1031">		socket-&gt;address.ss_len = 0;</a>
+<a name="ln1032">	}</a>
+<a name="ln1033"> </a>
+<a name="ln1034">	return status;</a>
+<a name="ln1035">}</a>
+<a name="ln1036"> </a>
+<a name="ln1037"> </a>
+<a name="ln1038">int</a>
+<a name="ln1039">socket_connect(net_socket* socket, const struct sockaddr* address,</a>
+<a name="ln1040">	socklen_t addressLength)</a>
+<a name="ln1041">{</a>
+<a name="ln1042">	if (address == NULL || addressLength == 0)</a>
+<a name="ln1043">		return ENETUNREACH;</a>
+<a name="ln1044"> </a>
+<a name="ln1045">	if (socket-&gt;address.ss_len == 0) {</a>
+<a name="ln1046">		// try to bind first</a>
+<a name="ln1047">		status_t status = socket_bind(socket, NULL, 0);</a>
+<a name="ln1048">		if (status != B_OK)</a>
+<a name="ln1049">			return status;</a>
+<a name="ln1050">	}</a>
+<a name="ln1051"> </a>
+<a name="ln1052">	return socket-&gt;first_info-&gt;connect(socket-&gt;first_protocol, address);</a>
+<a name="ln1053">}</a>
+<a name="ln1054"> </a>
+<a name="ln1055"> </a>
+<a name="ln1056">int</a>
+<a name="ln1057">socket_getpeername(net_socket* socket, struct sockaddr* address,</a>
+<a name="ln1058">	socklen_t* _addressLength)</a>
+<a name="ln1059">{</a>
+<a name="ln1060">	if (socket-&gt;peer.ss_len == 0)</a>
+<a name="ln1061">		return ENOTCONN;</a>
+<a name="ln1062"> </a>
+<a name="ln1063">	memcpy(address, &amp;socket-&gt;peer, min_c(*_addressLength, socket-&gt;peer.ss_len));</a>
+<a name="ln1064">	*_addressLength = socket-&gt;peer.ss_len;</a>
+<a name="ln1065">	return B_OK;</a>
+<a name="ln1066">}</a>
+<a name="ln1067"> </a>
+<a name="ln1068"> </a>
+<a name="ln1069">int</a>
+<a name="ln1070">socket_getsockname(net_socket* socket, struct sockaddr* address,</a>
+<a name="ln1071">	socklen_t* _addressLength)</a>
+<a name="ln1072">{</a>
+<a name="ln1073">	if (socket-&gt;address.ss_len == 0) {</a>
+<a name="ln1074">		struct sockaddr buffer;</a>
+<a name="ln1075">		memset(&amp;buffer, 0, sizeof(buffer));</a>
+<a name="ln1076">		buffer.sa_family = socket-&gt;family;</a>
+<a name="ln1077"> </a>
+<a name="ln1078">		memcpy(address, &amp;buffer, min_c(*_addressLength, sizeof(buffer)));</a>
+<a name="ln1079">		*_addressLength = sizeof(buffer);</a>
+<a name="ln1080">		return B_OK;</a>
+<a name="ln1081">	}</a>
+<a name="ln1082"> </a>
+<a name="ln1083">	memcpy(address, &amp;socket-&gt;address, min_c(*_addressLength,</a>
+<a name="ln1084">		socket-&gt;address.ss_len));</a>
+<a name="ln1085">	*_addressLength = socket-&gt;address.ss_len;</a>
+<a name="ln1086">	return B_OK;</a>
+<a name="ln1087">}</a>
+<a name="ln1088"> </a>
+<a name="ln1089"> </a>
+<a name="ln1090">status_t</a>
+<a name="ln1091">socket_get_option(net_socket* socket, int level, int option, void* value,</a>
+<a name="ln1092">	int* _length)</a>
+<a name="ln1093">{</a>
+<a name="ln1094">	if (level != SOL_SOCKET)</a>
+<a name="ln1095">		return ENOPROTOOPT;</a>
+<a name="ln1096"> </a>
+<a name="ln1097">	switch (option) {</a>
+<a name="ln1098">		case SO_SNDBUF:</a>
+<a name="ln1099">		{</a>
+<a name="ln1100">			uint32* size = (uint32*)value;</a>
+<a name="ln1101">			*size = socket-&gt;send.buffer_size;</a>
+<a name="ln1102">			*_length = sizeof(uint32);</a>
+<a name="ln1103">			return B_OK;</a>
+<a name="ln1104">		}</a>
+<a name="ln1105"> </a>
+<a name="ln1106">		case SO_RCVBUF:</a>
+<a name="ln1107">		{</a>
+<a name="ln1108">			uint32* size = (uint32*)value;</a>
+<a name="ln1109">			*size = socket-&gt;receive.buffer_size;</a>
+<a name="ln1110">			*_length = sizeof(uint32);</a>
+<a name="ln1111">			return B_OK;</a>
+<a name="ln1112">		}</a>
+<a name="ln1113"> </a>
+<a name="ln1114">		case SO_SNDLOWAT:</a>
+<a name="ln1115">		{</a>
+<a name="ln1116">			uint32* size = (uint32*)value;</a>
+<a name="ln1117">			*size = socket-&gt;send.low_water_mark;</a>
+<a name="ln1118">			*_length = sizeof(uint32);</a>
+<a name="ln1119">			return B_OK;</a>
+<a name="ln1120">		}</a>
+<a name="ln1121"> </a>
+<a name="ln1122">		case SO_RCVLOWAT:</a>
+<a name="ln1123">		{</a>
+<a name="ln1124">			uint32* size = (uint32*)value;</a>
+<a name="ln1125">			*size = socket-&gt;receive.low_water_mark;</a>
+<a name="ln1126">			*_length = sizeof(uint32);</a>
+<a name="ln1127">			return B_OK;</a>
+<a name="ln1128">		}</a>
+<a name="ln1129"> </a>
+<a name="ln1130">		case SO_RCVTIMEO:</a>
+<a name="ln1131">		case SO_SNDTIMEO:</a>
+<a name="ln1132">		{</a>
+<a name="ln1133">			if (*_length &lt; (int)sizeof(struct timeval))</a>
+<a name="ln1134">				return B_BAD_VALUE;</a>
+<a name="ln1135"> </a>
+<a name="ln1136">			bigtime_t timeout;</a>
+<a name="ln1137">			if (option == SO_SNDTIMEO)</a>
+<a name="ln1138">				timeout = socket-&gt;send.timeout;</a>
+<a name="ln1139">			else</a>
+<a name="ln1140">				timeout = socket-&gt;receive.timeout;</a>
+<a name="ln1141">			if (timeout == B_INFINITE_TIMEOUT)</a>
+<a name="ln1142">				timeout = 0;</a>
+<a name="ln1143"> </a>
+<a name="ln1144">			struct timeval* timeval = (struct timeval*)value;</a>
+<a name="ln1145">			timeval-&gt;tv_sec = timeout / 1000000LL;</a>
+<a name="ln1146">			timeval-&gt;tv_usec = timeout % 1000000LL;</a>
+<a name="ln1147"> </a>
+<a name="ln1148">			*_length = sizeof(struct timeval);</a>
+<a name="ln1149">			return B_OK;</a>
+<a name="ln1150">		}</a>
+<a name="ln1151"> </a>
+<a name="ln1152">		case SO_NONBLOCK:</a>
+<a name="ln1153">		{</a>
+<a name="ln1154">			int32* _set = (int32*)value;</a>
+<a name="ln1155">			*_set = socket-&gt;receive.timeout == 0 &amp;&amp; socket-&gt;send.timeout == 0;</a>
+<a name="ln1156">			*_length = sizeof(int32);</a>
+<a name="ln1157">			return B_OK;</a>
+<a name="ln1158">		}</a>
+<a name="ln1159"> </a>
+<a name="ln1160">		case SO_ACCEPTCONN:</a>
+<a name="ln1161">		case SO_BROADCAST:</a>
+<a name="ln1162">		case SO_DEBUG:</a>
+<a name="ln1163">		case SO_DONTROUTE:</a>
+<a name="ln1164">		case SO_KEEPALIVE:</a>
+<a name="ln1165">		case SO_OOBINLINE:</a>
+<a name="ln1166">		case SO_REUSEADDR:</a>
+<a name="ln1167">		case SO_REUSEPORT:</a>
+<a name="ln1168">		case SO_USELOOPBACK:</a>
+<a name="ln1169">		{</a>
+<a name="ln1170">			int32* _set = (int32*)value;</a>
+<a name="ln1171">			*_set = (socket-&gt;options &amp; option) != 0;</a>
+<a name="ln1172">			*_length = sizeof(int32);</a>
+<a name="ln1173">			return B_OK;</a>
+<a name="ln1174">		}</a>
+<a name="ln1175"> </a>
+<a name="ln1176">		case SO_TYPE:</a>
+<a name="ln1177">		{</a>
+<a name="ln1178">			int32* _set = (int32*)value;</a>
+<a name="ln1179">			*_set = socket-&gt;type;</a>
+<a name="ln1180">			*_length = sizeof(int32);</a>
+<a name="ln1181">			return B_OK;</a>
+<a name="ln1182">		}</a>
+<a name="ln1183"> </a>
+<a name="ln1184">		case SO_ERROR:</a>
+<a name="ln1185">		{</a>
+<a name="ln1186">			int32* _set = (int32*)value;</a>
+<a name="ln1187">			*_set = socket-&gt;error;</a>
+<a name="ln1188">			*_length = sizeof(int32);</a>
+<a name="ln1189"> </a>
+<a name="ln1190">			socket-&gt;error = B_OK;</a>
+<a name="ln1191">				// clear error upon retrieval</a>
+<a name="ln1192">			return B_OK;</a>
+<a name="ln1193">		}</a>
+<a name="ln1194"> </a>
+<a name="ln1195">		default:</a>
+<a name="ln1196">			break;</a>
+<a name="ln1197">	}</a>
+<a name="ln1198"> </a>
+<a name="ln1199">	dprintf(&quot;socket_getsockopt: unknown option %d\n&quot;, option);</a>
+<a name="ln1200">	return ENOPROTOOPT;</a>
+<a name="ln1201">}</a>
+<a name="ln1202"> </a>
+<a name="ln1203"> </a>
+<a name="ln1204">int</a>
+<a name="ln1205">socket_getsockopt(net_socket* socket, int level, int option, void* value,</a>
+<a name="ln1206">	int* _length)</a>
+<a name="ln1207">{</a>
+<a name="ln1208">	return socket-&gt;first_protocol-&gt;module-&gt;getsockopt(socket-&gt;first_protocol,</a>
+<a name="ln1209">		level, option, value, _length);</a>
+<a name="ln1210">}</a>
+<a name="ln1211"> </a>
+<a name="ln1212"> </a>
+<a name="ln1213">int</a>
+<a name="ln1214">socket_listen(net_socket* socket, int backlog)</a>
+<a name="ln1215">{</a>
+<a name="ln1216">	status_t status = socket-&gt;first_info-&gt;listen(socket-&gt;first_protocol,</a>
+<a name="ln1217">		backlog);</a>
+<a name="ln1218">	if (status == B_OK)</a>
+<a name="ln1219">		socket-&gt;options |= SO_ACCEPTCONN;</a>
+<a name="ln1220"> </a>
+<a name="ln1221">	return status;</a>
+<a name="ln1222">}</a>
+<a name="ln1223"> </a>
+<a name="ln1224"> </a>
+<a name="ln1225">ssize_t</a>
+<a name="ln1226">socket_receive(net_socket* socket, msghdr* header, void* data, size_t length,</a>
+<a name="ln1227">	int flags)</a>
+<a name="ln1228">{</a>
+<a name="ln1229">	// If the protocol sports read_data_no_buffer() we use it.</a>
+<a name="ln1230">	if (socket-&gt;first_info-&gt;read_data_no_buffer != NULL)</a>
+<a name="ln1231">		return socket_receive_no_buffer(socket, header, data, length, flags);</a>
+<a name="ln1232"> </a>
+<a name="ln1233">	size_t totalLength = length;</a>
+<a name="ln1234">	net_buffer* buffer;</a>
+<a name="ln1235">	int i;</a>
+<a name="ln1236"> </a>
+<a name="ln1237">	// the convention to this function is that have header been</a>
+<a name="ln1238">	// present, { data, length } would have been iovec[0] and is</a>
+<a name="ln1239">	// always considered like that</a>
+<a name="ln1240"> </a>
+<a name="ln1241">	if (header) {</a>
+<a name="ln1242">		// calculate the length considering all of the extra buffers</a>
+<a name="ln1243">		for (i = 1; i &lt; header-&gt;msg_iovlen; i++)</a>
+<a name="ln1244">			totalLength += header-&gt;msg_iov[i].iov_len;</a>
+<a name="ln1245">	}</a>
+<a name="ln1246"> </a>
+<a name="ln1247">	status_t status = socket-&gt;first_info-&gt;read_data(</a>
+<a name="ln1248">		socket-&gt;first_protocol, totalLength, flags, &amp;buffer);</a>
+<a name="ln1249">	if (status != B_OK)</a>
+<a name="ln1250">		return status;</a>
+<a name="ln1251"> </a>
+<a name="ln1252">	// process ancillary data</a>
+<a name="ln1253">	if (header != NULL) {</a>
+<a name="ln1254">		if (buffer != NULL &amp;&amp; header-&gt;msg_control != NULL) {</a>
+<a name="ln1255">			ancillary_data_container* container</a>
+<a name="ln1256">				= gNetBufferModule.get_ancillary_data(buffer);</a>
+<a name="ln1257">			if (container != NULL)</a>
+<a name="ln1258">				status = process_ancillary_data(socket, container, header);</a>
+<a name="ln1259">			else</a>
+<a name="ln1260">				status = process_ancillary_data(socket, buffer, header);</a>
+<a name="ln1261">			if (status != B_OK) {</a>
+<a name="ln1262">				gNetBufferModule.free(buffer);</a>
+<a name="ln1263">				return status;</a>
+<a name="ln1264">			}</a>
+<a name="ln1265">		} else</a>
+<a name="ln1266">			header-&gt;msg_controllen = 0;</a>
+<a name="ln1267">	}</a>
+<a name="ln1268"> </a>
+<a name="ln1269">	// TODO: - returning a NULL buffer when received 0 bytes</a>
+<a name="ln1270">	//         may not make much sense as we still need the address</a>
+<a name="ln1271">	//       - gNetBufferModule.read() uses memcpy() instead of user_memcpy</a>
+<a name="ln1272"> </a>
+<a name="ln1273">	size_t nameLen = 0;</a>
+<a name="ln1274"> </a>
+<a name="ln1275">	if (header) {</a>
+<a name="ln1276">		// TODO: - consider the control buffer options</a>
+<a name="ln1277">		nameLen = header-&gt;msg_namelen;</a>
+<a name="ln1278">		header-&gt;msg_namelen = 0;</a>
+<a name="ln1279">		header-&gt;msg_flags = 0;</a>
+<a name="ln1280">	}</a>
+<a name="ln1281"> </a>
+<a name="ln1282">	if (buffer == NULL)</a>
+<a name="ln1283">		return 0;</a>
+<a name="ln1284"> </a>
+<a name="ln1285">	size_t bytesReceived = buffer-&gt;size, bytesCopied = 0;</a>
+<a name="ln1286"> </a>
+<a name="ln1287">	length = min_c(bytesReceived, length);</a>
+<a name="ln1288">	if (gNetBufferModule.read(buffer, 0, data, length) &lt; B_OK) {</a>
+<a name="ln1289">		gNetBufferModule.free(buffer);</a>
+<a name="ln1290">		return ENOBUFS;</a>
+<a name="ln1291">	}</a>
+<a name="ln1292"> </a>
+<a name="ln1293">	// if first copy was a success, proceed to following</a>
+<a name="ln1294">	// copies as required</a>
+<a name="ln1295">	bytesCopied += length;</a>
+<a name="ln1296"> </a>
+<a name="ln1297">	if (header) {</a>
+<a name="ln1298">		// we only start considering at iovec[1]</a>
+<a name="ln1299">		// as { data, length } is iovec[0]</a>
+<a name="ln1300">		for (i = 1; i &lt; header-&gt;msg_iovlen &amp;&amp; bytesCopied &lt; bytesReceived; i++) {</a>
+<a name="ln1301">			iovec&amp; vec = header-&gt;msg_iov[i];</a>
+<a name="ln1302">			size_t toRead = min_c(bytesReceived - bytesCopied, vec.iov_len);</a>
+<a name="ln1303">			if (gNetBufferModule.read(buffer, bytesCopied, vec.iov_base,</a>
+<a name="ln1304">					toRead) &lt; B_OK) {</a>
+<a name="ln1305">				break;</a>
+<a name="ln1306">			}</a>
+<a name="ln1307"> </a>
+<a name="ln1308">			bytesCopied += toRead;</a>
+<a name="ln1309">		}</a>
+<a name="ln1310"> </a>
+<a name="ln1311">		if (header-&gt;msg_name != NULL) {</a>
+<a name="ln1312">			header-&gt;msg_namelen = min_c(nameLen, buffer-&gt;source-&gt;sa_len);</a>
+<a name="ln1313">			memcpy(header-&gt;msg_name, buffer-&gt;source, header-&gt;msg_namelen);</a>
+<a name="ln1314">		}</a>
+<a name="ln1315">	}</a>
+<a name="ln1316"> </a>
+<a name="ln1317">	gNetBufferModule.free(buffer);</a>
+<a name="ln1318"> </a>
+<a name="ln1319">	if (bytesCopied &lt; bytesReceived) {</a>
+<a name="ln1320">		if (header)</a>
+<a name="ln1321">			header-&gt;msg_flags = MSG_TRUNC;</a>
+<a name="ln1322"> </a>
+<a name="ln1323">		if (flags &amp; MSG_TRUNC)</a>
+<a name="ln1324">			return bytesReceived;</a>
+<a name="ln1325">	}</a>
+<a name="ln1326"> </a>
+<a name="ln1327">	return bytesCopied;</a>
+<a name="ln1328">}</a>
+<a name="ln1329"> </a>
+<a name="ln1330"> </a>
+<a name="ln1331">ssize_t</a>
+<a name="ln1332">socket_send(net_socket* socket, msghdr* header, const void* data, size_t length,</a>
+<a name="ln1333">	int flags)</a>
+<a name="ln1334">{</a>
+<a name="ln1335">	const sockaddr* address = NULL;</a>
+<a name="ln1336">	socklen_t addressLength = 0;</a>
+<a name="ln1337">	size_t bytesLeft = length;</a>
+<a name="ln1338"> </a>
+<a name="ln1339">	if (length &gt; SSIZE_MAX)</a>
+<a name="ln1340">		return B_BAD_VALUE;</a>
+<a name="ln1341"> </a>
+<a name="ln1342">	ancillary_data_container* ancillaryData = NULL;</a>
+<a name="ln1343">	CObjectDeleter&lt;ancillary_data_container&gt; ancillaryDataDeleter(NULL,</a>
+<a name="ln1344">		&amp;delete_ancillary_data_container);</a>
+<a name="ln1345"> </a>
+<a name="ln1346">	if (header != NULL) {</a>
+<a name="ln1347">		address = (const sockaddr*)header-&gt;msg_name;</a>
+<a name="ln1348">		addressLength = header-&gt;msg_namelen;</a>
+<a name="ln1349"> </a>
+<a name="ln1350">		// get the ancillary data</a>
+<a name="ln1351">		if (header-&gt;msg_control != NULL) {</a>
+<a name="ln1352">			ancillaryData = create_ancillary_data_container();</a>
+<a name="ln1353">			if (ancillaryData == NULL)</a>
+<a name="ln1354">				return B_NO_MEMORY;</a>
+<a name="ln1355">			ancillaryDataDeleter.SetTo(ancillaryData);</a>
+<a name="ln1356"> </a>
+<a name="ln1357">			status_t status = add_ancillary_data(socket, ancillaryData,</a>
+<a name="ln1358">				(cmsghdr*)header-&gt;msg_control, header-&gt;msg_controllen);</a>
+<a name="ln1359">			if (status != B_OK)</a>
+<a name="ln1360">				return status;</a>
+<a name="ln1361">		}</a>
+<a name="ln1362">	}</a>
+<a name="ln1363"> </a>
+<a name="ln1364">	if (addressLength == 0)</a>
+<a name="ln1365">		address = NULL;</a>
+<a name="ln1366">	else if (address == NULL)</a>
+<a name="ln1367">		return B_BAD_VALUE;</a>
+<a name="ln1368"> </a>
+<a name="ln1369">	if (socket-&gt;peer.ss_len != 0) {</a>
+<a name="ln1370">		if (address != NULL)</a>
+<a name="ln1371">			return EISCONN;</a>
+<a name="ln1372"> </a>
+<a name="ln1373">		// socket is connected, we use that address</a>
+<a name="ln1374">		address = (struct sockaddr*)&amp;socket-&gt;peer;</a>
+<a name="ln1375">		addressLength = socket-&gt;peer.ss_len;</a>
+<a name="ln1376">	}</a>
+<a name="ln1377"> </a>
+<a name="ln1378">	if (address == NULL || addressLength == 0) {</a>
+<a name="ln1379">		// don't know where to send to:</a>
+<a name="ln1380">		return EDESTADDRREQ;</a>
+<a name="ln1381">	}</a>
+<a name="ln1382"> </a>
+<a name="ln1383">	if ((socket-&gt;first_info-&gt;flags &amp; NET_PROTOCOL_ATOMIC_MESSAGES) != 0</a>
+<a name="ln1384">		&amp;&amp; bytesLeft &gt; socket-&gt;send.buffer_size)</a>
+<a name="ln1385">		return EMSGSIZE;</a>
+<a name="ln1386"> </a>
+<a name="ln1387">	if (socket-&gt;address.ss_len == 0) {</a>
+<a name="ln1388">		// try to bind first</a>
+<a name="ln1389">		status_t status = socket_bind(socket, NULL, 0);</a>
+<a name="ln1390">		if (status != B_OK)</a>
+<a name="ln1391">			return status;</a>
+<a name="ln1392">	}</a>
+<a name="ln1393"> </a>
+<a name="ln1394">	// If the protocol has a send_data_no_buffer() hook, we use that one.</a>
+<a name="ln1395">	if (socket-&gt;first_info-&gt;send_data_no_buffer != NULL) {</a>
+<a name="ln1396">		iovec stackVec = { (void*)data, length };</a>
+<a name="ln1397">		iovec* vecs = header ? header-&gt;msg_iov : &amp;stackVec;</a>
+<a name="ln1398">		int vecCount = header ? header-&gt;msg_iovlen : 1;</a>
+<a name="ln1399"> </a>
+<a name="ln1400">		ssize_t written = socket-&gt;first_info-&gt;send_data_no_buffer(</a>
+<a name="ln1401">			socket-&gt;first_protocol, vecs, vecCount, ancillaryData, address,</a>
+<a name="ln1402">			addressLength);</a>
+<a name="ln1403">		if (written &gt; 0)</a>
+<a name="ln1404">			ancillaryDataDeleter.Detach();</a>
+<a name="ln1405">		return written;</a>
+<a name="ln1406">	}</a>
+<a name="ln1407"> </a>
+<a name="ln1408">	// By convention, if a header is given, the (data, length) equals the first</a>
+<a name="ln1409">	// iovec. So drop the header, if it is the only iovec. Otherwise compute</a>
+<a name="ln1410">	// the size of the remaining ones.</a>
+<a name="ln1411">	if (header != NULL) {</a>
+<a name="ln1412">		if (header-&gt;msg_iovlen &lt;= 1)</a>
+<a name="ln1413">			header = NULL;</a>
+<a name="ln1414">		else {</a>
+<a name="ln1415">// TODO: The iovecs have already been copied to kernel space. Simplify!</a>
+<a name="ln1416">			bytesLeft += compute_user_iovec_length(header-&gt;msg_iov + 1,</a>
+<a name="ln1417">				header-&gt;msg_iovlen - 1);</a>
+<a name="ln1418">		}</a>
+<a name="ln1419">	}</a>
+<a name="ln1420"> </a>
+<a name="ln1421">	ssize_t bytesSent = 0;</a>
+<a name="ln1422">	size_t vecOffset = 0;</a>
+<a name="ln1423">	uint32 vecIndex = 0;</a>
+<a name="ln1424"> </a>
+<a name="ln1425">	while (bytesLeft &gt; 0) {</a>
+<a name="ln1426">		// TODO: useful, maybe even computed header space!</a>
+<a name="ln1427">		net_buffer* buffer = gNetBufferModule.create(256);</a>
+<a name="ln1428">		if (buffer == NULL)</a>
+<a name="ln1429">			return ENOBUFS;</a>
+<a name="ln1430"> </a>
+<a name="ln1431">		while (buffer-&gt;size &lt; socket-&gt;send.buffer_size</a>
+<a name="ln1432">			&amp;&amp; buffer-&gt;size &lt; bytesLeft) {</a>
+<a name="ln1433">			if (vecIndex &gt; 0 &amp;&amp; vecOffset == 0) {</a>
+<a name="ln1434">				// retrieve next iovec buffer from header</a>
+<a name="ln1435">				iovec vec;</a>
+<a name="ln1436">				if (user_memcpy(&amp;vec, header-&gt;msg_iov + vecIndex, sizeof(iovec))</a>
+<a name="ln1437">						&lt; B_OK) {</a>
+<a name="ln1438">					gNetBufferModule.free(buffer);</a>
+<a name="ln1439">					return B_BAD_ADDRESS;</a>
+<a name="ln1440">				}</a>
+<a name="ln1441"> </a>
+<a name="ln1442">				data = vec.iov_base;</a>
+<a name="ln1443">				length = vec.iov_len;</a>
+<a name="ln1444">			}</a>
+<a name="ln1445"> </a>
+<a name="ln1446">			size_t bytes = length;</a>
+<a name="ln1447">			if (buffer-&gt;size + bytes &gt; socket-&gt;send.buffer_size)</a>
+<a name="ln1448">				bytes = socket-&gt;send.buffer_size - buffer-&gt;size;</a>
+<a name="ln1449"> </a>
+<a name="ln1450">			if (gNetBufferModule.append(buffer, data, bytes) &lt; B_OK) {</a>
+<a name="ln1451">				gNetBufferModule.free(buffer);</a>
+<a name="ln1452">				return ENOBUFS;</a>
+<a name="ln1453">			}</a>
+<a name="ln1454"> </a>
+<a name="ln1455">			if (bytes != length) {</a>
+<a name="ln1456">				// partial send</a>
+<a name="ln1457">				vecOffset = bytes;</a>
+<a name="ln1458">				length -= vecOffset;</a>
+<a name="ln1459">				data = (uint8*)data + vecOffset;</a>
+<a name="ln1460">			} else if (header != NULL) {</a>
+<a name="ln1461">				// proceed with next buffer, if any</a>
+<a name="ln1462">				vecOffset = 0;</a>
+<a name="ln1463">				vecIndex++;</a>
+<a name="ln1464"> </a>
+<a name="ln1465">				if (vecIndex &gt;= (uint32)header-&gt;msg_iovlen)</a>
+<a name="ln1466">					break;</a>
+<a name="ln1467">			}</a>
+<a name="ln1468">		}</a>
+<a name="ln1469"> </a>
+<a name="ln1470">		// attach ancillary data to the first buffer</a>
+<a name="ln1471">		status_t status = B_OK;</a>
+<a name="ln1472">		if (ancillaryData != NULL) {</a>
+<a name="ln1473">			gNetBufferModule.set_ancillary_data(buffer, ancillaryData);</a>
+<a name="ln1474">			ancillaryDataDeleter.Detach();</a>
+<a name="ln1475">			ancillaryData = NULL;</a>
+<a name="ln1476">		}</a>
+<a name="ln1477"> </a>
+<a name="ln1478">		size_t bufferSize = buffer-&gt;size;</a>
+<a name="ln1479">		buffer-&gt;flags = flags;</a>
+<a name="ln1480">		memcpy(buffer-&gt;source, &amp;socket-&gt;address, socket-&gt;address.ss_len);</a>
+<a name="ln1481">		memcpy(buffer-&gt;destination, address, addressLength);</a>
+<a name="ln1482">		buffer-&gt;destination-&gt;sa_len = addressLength;</a>
+<a name="ln1483"> </a>
+<a name="ln1484">		if (status == B_OK) {</a>
+<a name="ln1485">			status = socket-&gt;first_info-&gt;send_data(socket-&gt;first_protocol,</a>
+<a name="ln1486">				buffer);</a>
+<a name="ln1487">		}</a>
+<a name="ln1488">		if (status != B_OK) {</a>
+<a name="ln1489">			size_t sizeAfterSend = buffer-&gt;size;</a>
+<a name="ln1490">			gNetBufferModule.free(buffer);</a>
+<a name="ln1491"> </a>
+<a name="ln1492">			if ((sizeAfterSend != bufferSize || bytesSent &gt; 0)</a>
+<a name="ln1493">				&amp;&amp; (status == B_INTERRUPTED || status == B_WOULD_BLOCK)) {</a>
+<a name="ln1494">				// this appears to be a partial write</a>
+<a name="ln1495">				return bytesSent + (bufferSize - sizeAfterSend);</a>
+<a name="ln1496">			}</a>
+<a name="ln1497">			return status;</a>
+<a name="ln1498">		}</a>
+<a name="ln1499"> </a>
+<a name="ln1500">		bytesLeft -= bufferSize;</a>
+<a name="ln1501">		bytesSent += bufferSize;</a>
+<a name="ln1502">	}</a>
+<a name="ln1503"> </a>
+<a name="ln1504">	return bytesSent;</a>
+<a name="ln1505">}</a>
+<a name="ln1506"> </a>
+<a name="ln1507"> </a>
+<a name="ln1508">status_t</a>
+<a name="ln1509">socket_set_option(net_socket* socket, int level, int option, const void* value,</a>
+<a name="ln1510">	int length)</a>
+<a name="ln1511">{</a>
+<a name="ln1512">	if (level != SOL_SOCKET)</a>
+<a name="ln1513">		return ENOPROTOOPT;</a>
+<a name="ln1514"> </a>
+<a name="ln1515">	TRACE(&quot;%s(socket %p, option %d\n&quot;, __FUNCTION__, socket, option);</a>
+<a name="ln1516"> </a>
+<a name="ln1517">	switch (option) {</a>
+<a name="ln1518">		// TODO: implement other options!</a>
+<a name="ln1519">		case SO_LINGER:</a>
+<a name="ln1520">		{</a>
+<a name="ln1521">			if (length &lt; (int)sizeof(struct linger))</a>
+<a name="ln1522">				return B_BAD_VALUE;</a>
+<a name="ln1523"> </a>
+<a name="ln1524">			struct linger* linger = (struct linger*)value;</a>
+<a name="ln1525">			if (linger-&gt;l_onoff) {</a>
+<a name="ln1526">				socket-&gt;options |= SO_LINGER;</a>
+<a name="ln1527">				socket-&gt;linger = linger-&gt;l_linger;</a>
+<a name="ln1528">			} else {</a>
+<a name="ln1529">				socket-&gt;options &amp;= ~SO_LINGER;</a>
+<a name="ln1530">				socket-&gt;linger = 0;</a>
+<a name="ln1531">			}</a>
+<a name="ln1532">			return B_OK;</a>
+<a name="ln1533">		}</a>
+<a name="ln1534"> </a>
+<a name="ln1535">		case SO_SNDBUF:</a>
+<a name="ln1536">			if (length != sizeof(uint32))</a>
+<a name="ln1537">				return B_BAD_VALUE;</a>
+<a name="ln1538"> </a>
+<a name="ln1539">			socket-&gt;send.buffer_size = *(const uint32*)value;</a>
+<a name="ln1540">			return B_OK;</a>
+<a name="ln1541"> </a>
+<a name="ln1542">		case SO_RCVBUF:</a>
+<a name="ln1543">			if (length != sizeof(uint32))</a>
+<a name="ln1544">				return B_BAD_VALUE;</a>
+<a name="ln1545"> </a>
+<a name="ln1546">			socket-&gt;receive.buffer_size = *(const uint32*)value;</a>
+<a name="ln1547">			return B_OK;</a>
+<a name="ln1548"> </a>
+<a name="ln1549">		case SO_SNDLOWAT:</a>
+<a name="ln1550">			if (length != sizeof(uint32))</a>
+<a name="ln1551">				return B_BAD_VALUE;</a>
+<a name="ln1552"> </a>
+<a name="ln1553">			socket-&gt;send.low_water_mark = *(const uint32*)value;</a>
+<a name="ln1554">			return B_OK;</a>
+<a name="ln1555"> </a>
+<a name="ln1556">		case SO_RCVLOWAT:</a>
+<a name="ln1557">			if (length != sizeof(uint32))</a>
+<a name="ln1558">				return B_BAD_VALUE;</a>
+<a name="ln1559"> </a>
+<a name="ln1560">			socket-&gt;receive.low_water_mark = *(const uint32*)value;</a>
+<a name="ln1561">			return B_OK;</a>
+<a name="ln1562"> </a>
+<a name="ln1563">		case SO_RCVTIMEO:</a>
+<a name="ln1564">		case SO_SNDTIMEO:</a>
+<a name="ln1565">		{</a>
+<a name="ln1566">			if (length != sizeof(struct timeval))</a>
+<a name="ln1567">				return B_BAD_VALUE;</a>
+<a name="ln1568"> </a>
+<a name="ln1569">			const struct timeval* timeval = (const struct timeval*)value;</a>
+<a name="ln1570">			bigtime_t timeout = timeval-&gt;tv_sec * 1000000LL + timeval-&gt;tv_usec;</a>
+<a name="ln1571">			if (timeout == 0)</a>
+<a name="ln1572">				timeout = B_INFINITE_TIMEOUT;</a>
+<a name="ln1573"> </a>
+<a name="ln1574">			if (option == SO_SNDTIMEO)</a>
+<a name="ln1575">				socket-&gt;send.timeout = timeout;</a>
+<a name="ln1576">			else</a>
+<a name="ln1577">				socket-&gt;receive.timeout = timeout;</a>
+<a name="ln1578">			return B_OK;</a>
+<a name="ln1579">		}</a>
+<a name="ln1580"> </a>
+<a name="ln1581">		case SO_NONBLOCK:</a>
+<a name="ln1582">			if (length != sizeof(int32))</a>
+<a name="ln1583">				return B_BAD_VALUE;</a>
+<a name="ln1584"> </a>
+<a name="ln1585">			if (*(const int32*)value) {</a>
+<a name="ln1586">				socket-&gt;send.timeout = 0;</a>
+<a name="ln1587">				socket-&gt;receive.timeout = 0;</a>
+<a name="ln1588">			} else {</a>
+<a name="ln1589">				socket-&gt;send.timeout = B_INFINITE_TIMEOUT;</a>
+<a name="ln1590">				socket-&gt;receive.timeout = B_INFINITE_TIMEOUT;</a>
+<a name="ln1591">			}</a>
+<a name="ln1592">			return B_OK;</a>
+<a name="ln1593"> </a>
+<a name="ln1594">		case SO_BROADCAST:</a>
+<a name="ln1595">		case SO_DEBUG:</a>
+<a name="ln1596">		case SO_DONTROUTE:</a>
+<a name="ln1597">		case SO_KEEPALIVE:</a>
+<a name="ln1598">		case SO_OOBINLINE:</a>
+<a name="ln1599">		case SO_REUSEADDR:</a>
+<a name="ln1600">		case SO_REUSEPORT:</a>
+<a name="ln1601">		case SO_USELOOPBACK:</a>
+<a name="ln1602">			if (length != sizeof(int32))</a>
+<a name="ln1603">				return B_BAD_VALUE;</a>
+<a name="ln1604"> </a>
+<a name="ln1605">			if (*(const int32*)value)</a>
+<a name="ln1606">				socket-&gt;options |= option;</a>
+<a name="ln1607">			else</a>
+<a name="ln1608">				socket-&gt;options &amp;= ~option;</a>
+<a name="ln1609">			return B_OK;</a>
+<a name="ln1610"> </a>
+<a name="ln1611">		case SO_BINDTODEVICE:</a>
+<a name="ln1612">		{</a>
+<a name="ln1613">			if (length != sizeof(uint32))</a>
+<a name="ln1614">				return B_BAD_VALUE;</a>
+<a name="ln1615"> </a>
+<a name="ln1616">			// TODO: we might want to check if the device exists at all</a>
+<a name="ln1617">			// (although it doesn't really harm when we don't)</a>
+<a name="ln1618">			socket-&gt;bound_to_device = *(const uint32*)value;</a>
+<a name="ln1619">			return B_OK;</a>
+<a name="ln1620">		}</a>
+<a name="ln1621"> </a>
+<a name="ln1622">		default:</a>
+<a name="ln1623">			break;</a>
+<a name="ln1624">	}</a>
+<a name="ln1625"> </a>
+<a name="ln1626">	dprintf(&quot;socket_setsockopt: unknown option %d\n&quot;, option);</a>
+<a name="ln1627">	return ENOPROTOOPT;</a>
+<a name="ln1628">}</a>
+<a name="ln1629"> </a>
+<a name="ln1630"> </a>
+<a name="ln1631">int</a>
+<a name="ln1632">socket_setsockopt(net_socket* socket, int level, int option, const void* value,</a>
+<a name="ln1633">	int length)</a>
+<a name="ln1634">{</a>
+<a name="ln1635">	return socket-&gt;first_protocol-&gt;module-&gt;setsockopt(socket-&gt;first_protocol,</a>
+<a name="ln1636">		level, option, value, length);</a>
+<a name="ln1637">}</a>
+<a name="ln1638"> </a>
+<a name="ln1639"> </a>
+<a name="ln1640">int</a>
+<a name="ln1641">socket_shutdown(net_socket* socket, int direction)</a>
+<a name="ln1642">{</a>
+<a name="ln1643">	return socket-&gt;first_info-&gt;shutdown(socket-&gt;first_protocol, direction);</a>
+<a name="ln1644">}</a>
+<a name="ln1645"> </a>
+<a name="ln1646"> </a>
+<a name="ln1647">status_t</a>
+<a name="ln1648">socket_socketpair(int family, int type, int protocol, net_socket* sockets[2])</a>
+<a name="ln1649">{</a>
+<a name="ln1650">	sockets[0] = NULL;</a>
+<a name="ln1651">	sockets[1] = NULL;</a>
+<a name="ln1652"> </a>
+<a name="ln1653">	// create sockets</a>
+<a name="ln1654">	status_t error = socket_open(family, type, protocol, &amp;sockets[0]);</a>
+<a name="ln1655">	if (error != B_OK)</a>
+<a name="ln1656">		return error;</a>
+<a name="ln1657"> </a>
+<a name="ln1658">	if (error == B_OK)</a>
+<a name="ln1659">		error = socket_open(family, type, protocol, &amp;sockets[1]);</a>
+<a name="ln1660"> </a>
+<a name="ln1661">	// bind one</a>
+<a name="ln1662">	if (error == B_OK)</a>
+<a name="ln1663">		error = socket_bind(sockets[0], NULL, 0);</a>
+<a name="ln1664"> </a>
+<a name="ln1665">	// start listening</a>
+<a name="ln1666">	if (error == B_OK)</a>
+<a name="ln1667">		error = socket_listen(sockets[0], 1);</a>
+<a name="ln1668"> </a>
+<a name="ln1669">	// connect them</a>
+<a name="ln1670">	if (error == B_OK) {</a>
+<a name="ln1671">		error = socket_connect(sockets[1], (sockaddr*)&amp;sockets[0]-&gt;address,</a>
+<a name="ln1672">			sockets[0]-&gt;address.ss_len);</a>
+<a name="ln1673">	}</a>
+<a name="ln1674"> </a>
+<a name="ln1675">	// accept a socket</a>
+<a name="ln1676">	net_socket* acceptedSocket = NULL;</a>
+<a name="ln1677">	if (error == B_OK)</a>
+<a name="ln1678">		error = socket_accept(sockets[0], NULL, NULL, &amp;acceptedSocket);</a>
+<a name="ln1679"> </a>
+<a name="ln1680">	if (error == B_OK) {</a>
+<a name="ln1681">		// everything worked: close the listener socket</a>
+<a name="ln1682">		socket_close(sockets[0]);</a>
+<a name="ln1683">		socket_free(sockets[0]);</a>
+<a name="ln1684">		sockets[0] = acceptedSocket;</a>
+<a name="ln1685">	} else {</a>
+<a name="ln1686">		// close sockets on error</a>
+<a name="ln1687">		for (int i = 0; i &lt; 2; i++) {</a>
+<a name="ln1688">			if (sockets[i] != NULL) {</a>
+<a name="ln1689">				socket_close(sockets[i]);</a>
+<a name="ln1690">				socket_free(sockets[i]);</a>
+<a name="ln1691">				sockets[i] = NULL;</a>
+<a name="ln1692">			}</a>
+<a name="ln1693">		}</a>
+<a name="ln1694">	}</a>
+<a name="ln1695"> </a>
+<a name="ln1696">	return error;</a>
+<a name="ln1697">}</a>
+<a name="ln1698"> </a>
+<a name="ln1699"> </a>
+<a name="ln1700">//	#pragma mark -</a>
+<a name="ln1701"> </a>
+<a name="ln1702"> </a>
+<a name="ln1703">static status_t</a>
+<a name="ln1704">socket_std_ops(int32 op, ...)</a>
+<a name="ln1705">{</a>
+<a name="ln1706">	switch (op) {</a>
+<a name="ln1707">		case B_MODULE_INIT:</a>
+<a name="ln1708">		{</a>
+<a name="ln1709">			new (&amp;sSocketList) SocketList;</a>
+<a name="ln1710">			mutex_init(&amp;sSocketLock, &quot;socket list&quot;);</a>
+<a name="ln1711"> </a>
+<a name="ln1712">#if ENABLE_DEBUGGER_COMMANDS</a>
+<a name="ln1713">			add_debugger_command(&quot;sockets&quot;, dump_sockets, &quot;lists all sockets&quot;);</a>
+<a name="ln1714">			add_debugger_command(&quot;socket&quot;, dump_socket, &quot;dumps a socket&quot;);</a>
+<a name="ln1715">#endif</a>
+<a name="ln1716">			return B_OK;</a>
+<a name="ln1717">		}</a>
+<a name="ln1718">		case B_MODULE_UNINIT:</a>
+<a name="ln1719">			ASSERT(sSocketList.IsEmpty());</a>
+<a name="ln1720">			mutex_destroy(&amp;sSocketLock);</a>
+<a name="ln1721"> </a>
+<a name="ln1722">#if ENABLE_DEBUGGER_COMMANDS</a>
+<a name="ln1723">			remove_debugger_command(&quot;socket&quot;, dump_socket);</a>
+<a name="ln1724">			remove_debugger_command(&quot;sockets&quot;, dump_sockets);</a>
+<a name="ln1725">#endif</a>
+<a name="ln1726">			return B_OK;</a>
+<a name="ln1727"> </a>
+<a name="ln1728">		default:</a>
+<a name="ln1729">			return B_ERROR;</a>
+<a name="ln1730">	}</a>
+<a name="ln1731">}</a>
+<a name="ln1732"> </a>
+<a name="ln1733"> </a>
+<a name="ln1734">net_socket_module_info gNetSocketModule = {</a>
+<a name="ln1735">	{</a>
+<a name="ln1736">		NET_SOCKET_MODULE_NAME,</a>
+<a name="ln1737">		0,</a>
+<a name="ln1738">		socket_std_ops</a>
+<a name="ln1739">	},</a>
+<a name="ln1740">	socket_open,</a>
+<a name="ln1741">	socket_close,</a>
+<a name="ln1742">	socket_free,</a>
+<a name="ln1743"> </a>
+<a name="ln1744">	socket_readv,</a>
+<a name="ln1745">	socket_writev,</a>
+<a name="ln1746">	socket_control,</a>
+<a name="ln1747"> </a>
+<a name="ln1748">	socket_read_avail,</a>
+<a name="ln1749">	socket_send_avail,</a>
+<a name="ln1750"> </a>
+<a name="ln1751">	socket_send_data,</a>
+<a name="ln1752">	socket_receive_data,</a>
+<a name="ln1753"> </a>
+<a name="ln1754">	socket_get_option,</a>
+<a name="ln1755">	socket_set_option,</a>
+<a name="ln1756"> </a>
+<a name="ln1757">	socket_get_next_stat,</a>
+<a name="ln1758"> </a>
+<a name="ln1759">	// connections</a>
+<a name="ln1760">	socket_acquire,</a>
+<a name="ln1761">	socket_release,</a>
+<a name="ln1762">	socket_spawn_pending,</a>
+<a name="ln1763">	socket_dequeue_connected,</a>
+<a name="ln1764">	socket_count_connected,</a>
+<a name="ln1765">	socket_set_max_backlog,</a>
+<a name="ln1766">	socket_has_parent,</a>
+<a name="ln1767">	socket_connected,</a>
+<a name="ln1768">	socket_aborted,</a>
+<a name="ln1769"> </a>
+<a name="ln1770">	// notifications</a>
+<a name="ln1771">	socket_request_notification,</a>
+<a name="ln1772">	socket_cancel_notification,</a>
+<a name="ln1773">	socket_notify,</a>
+<a name="ln1774"> </a>
+<a name="ln1775">	// standard socket API</a>
+<a name="ln1776">	socket_accept,</a>
+<a name="ln1777">	socket_bind,</a>
+<a name="ln1778">	socket_connect,</a>
+<a name="ln1779">	socket_getpeername,</a>
+<a name="ln1780">	socket_getsockname,</a>
+<a name="ln1781">	socket_getsockopt,</a>
+<a name="ln1782">	socket_listen,</a>
+<a name="ln1783">	socket_receive,</a>
+<a name="ln1784">	socket_send,</a>
+<a name="ln1785">	socket_setsockopt,</a>
+<a name="ln1786">	socket_shutdown,</a>
+<a name="ln1787">	socket_socketpair</a>
+<a name="ln1788">};</a>
+<a name="ln1789"> </a>
+
+</code></pre>
+<div class="balloon" rel="1658"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v547/" target="_blank">V547</a> Expression 'error == ((int) 0)' is always true.</p></div>
+<div class="balloon" rel="1484"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v547/" target="_blank">V547</a> Expression 'status == ((int) 0)' is always true.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

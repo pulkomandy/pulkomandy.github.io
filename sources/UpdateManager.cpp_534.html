@@ -1,0 +1,623 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>UpdateManager.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2013-2019, Haiku, Inc. All Rights Reserved.</a>
+<a name="ln3"> * Distributed under the terms of the MIT License.</a>
+<a name="ln4"> *</a>
+<a name="ln5"> * Authors:</a>
+<a name="ln6"> *		Axel Dörfler &lt;axeld@pinc-software.de&gt;</a>
+<a name="ln7"> *		Rene Gollent &lt;rene@gollent.com&gt;</a>
+<a name="ln8"> *		Ingo Weinhold &lt;ingo_weinhold@gmx.de&gt;</a>
+<a name="ln9"> *		Brian Hill &lt;supernova@tycho.email&gt;</a>
+<a name="ln10"> *		Jacob Secunda</a>
+<a name="ln11"> */</a>
+<a name="ln12"> </a>
+<a name="ln13"> </a>
+<a name="ln14">#include &quot;UpdateManager.h&quot;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &lt;sys/ioctl.h&gt;</a>
+<a name="ln17">#include &lt;unistd.h&gt;</a>
+<a name="ln18"> </a>
+<a name="ln19">#include &lt;Alert.h&gt;</a>
+<a name="ln20">#include &lt;Application.h&gt;</a>
+<a name="ln21">#include &lt;Catalog.h&gt;</a>
+<a name="ln22">#include &lt;Message.h&gt;</a>
+<a name="ln23">#include &lt;Messenger.h&gt;</a>
+<a name="ln24">#include &lt;NetworkInterface.h&gt;</a>
+<a name="ln25">#include &lt;NetworkRoster.h&gt;</a>
+<a name="ln26">#include &lt;Notification.h&gt;</a>
+<a name="ln27">#include &lt;Roster.h&gt;</a>
+<a name="ln28"> </a>
+<a name="ln29">#include &lt;package/manager/Exceptions.h&gt;</a>
+<a name="ln30">#include &lt;package/solver/SolverPackage.h&gt;</a>
+<a name="ln31"> </a>
+<a name="ln32">#include &quot;constants.h&quot;</a>
+<a name="ln33">#include &quot;ProblemWindow.h&quot;</a>
+<a name="ln34"> </a>
+<a name="ln35">using namespace BPackageKit;</a>
+<a name="ln36">using namespace BPackageKit::BManager::BPrivate;</a>
+<a name="ln37"> </a>
+<a name="ln38">#undef B_TRANSLATION_CONTEXT</a>
+<a name="ln39">#define B_TRANSLATION_CONTEXT &quot;UpdateManager&quot;</a>
+<a name="ln40"> </a>
+<a name="ln41"> </a>
+<a name="ln42">UpdateManager::UpdateManager(BPackageInstallationLocation location,</a>
+<a name="ln43">	bool verbose)</a>
+<a name="ln44">	:</a>
+<a name="ln45">	BPackageManager(location, &amp;fClientInstallationInterface, this),</a>
+<a name="ln46">	BPackageManager::UserInteractionHandler(),</a>
+<a name="ln47">	fClientInstallationInterface(),</a>
+<a name="ln48">	fStatusWindow(NULL),</a>
+<a name="ln49">	fCurrentStep(ACTION_STEP_INIT),</a>
+<a name="ln50">	fChangesConfirmed(false),</a>
+<a name="ln51">	fVerbose(verbose)</a>
+<a name="ln52">{</a>
+<a name="ln53">	fStatusWindow = new SoftwareUpdaterWindow();</a>
+<a name="ln54">	_SetCurrentStep(ACTION_STEP_START);</a>
+<a name="ln55">}</a>
+<a name="ln56"> </a>
+<a name="ln57"> </a>
+<a name="ln58">UpdateManager::~UpdateManager()</a>
+<a name="ln59">{</a>
+<a name="ln60">	if (fStatusWindow != NULL) {</a>
+<a name="ln61">		fStatusWindow-&gt;Lock();</a>
+<a name="ln62">		fStatusWindow-&gt;Quit();</a>
+<a name="ln63">	}</a>
+<a name="ln64">	if (fProblemWindow != NULL) {</a>
+<a name="ln65">		fProblemWindow-&gt;Lock();</a>
+<a name="ln66">		fProblemWindow-&gt;Quit();</a>
+<a name="ln67">	}</a>
+<a name="ln68">}</a>
+<a name="ln69"> </a>
+<a name="ln70"> </a>
+<a name="ln71">void</a>
+<a name="ln72">UpdateManager::CheckNetworkConnection()</a>
+<a name="ln73">{</a>
+<a name="ln74">	BNetworkRoster&amp; roster = BNetworkRoster::Default();</a>
+<a name="ln75">	BNetworkInterface interface;</a>
+<a name="ln76">	uint32 cookie = 0;</a>
+<a name="ln77">	while (roster.GetNextInterface(&amp;cookie, interface) == B_OK) {</a>
+<a name="ln78">		uint32 flags = interface.Flags();</a>
+<a name="ln79">		if ((flags &amp; IFF_LOOPBACK) == 0</a>
+<a name="ln80">			&amp;&amp; (flags &amp; (IFF_UP | IFF_LINK)) == (IFF_UP | IFF_LINK)) {</a>
+<a name="ln81">			return;</a>
+<a name="ln82">		}</a>
+<a name="ln83">	}</a>
+<a name="ln84"> </a>
+<a name="ln85">	// No network connection detected, cannot continue</a>
+<a name="ln86">	throw BException(B_TRANSLATE_COMMENT(</a>
+<a name="ln87">		&quot;No active network connection was found&quot;, &quot;Error message&quot;));</a>
+<a name="ln88">}</a>
+<a name="ln89"> </a>
+<a name="ln90"> </a>
+<a name="ln91">update_type</a>
+<a name="ln92">UpdateManager::GetUpdateType()</a>
+<a name="ln93">{</a>
+<a name="ln94">	int32 action = USER_SELECTION_NEEDED;</a>
+<a name="ln95">	BMessenger messenger(fStatusWindow);</a>
+<a name="ln96">	if (messenger.IsValid()) {</a>
+<a name="ln97">		BMessage message(kMsgGetUpdateType);</a>
+<a name="ln98">		BMessage reply;</a>
+<a name="ln99">		messenger.SendMessage(&amp;message, &amp;reply);</a>
+<a name="ln100">		reply.FindInt32(kKeyAlertResult, &amp;action);</a>
+<a name="ln101">	}</a>
+<a name="ln102">	return (update_type)action;</a>
+<a name="ln103">}</a>
+<a name="ln104"> </a>
+<a name="ln105"> </a>
+<a name="ln106">void</a>
+<a name="ln107">UpdateManager::CheckRepositories()</a>
+<a name="ln108">{</a>
+<a name="ln109">	int32 count = fOtherRepositories.CountItems();</a>
+<a name="ln110">	if (fVerbose)</a>
+<a name="ln111">		printf(&quot;Remote repositories available: %&quot; B_PRId32 &quot;\n&quot;, count);</a>
+<a name="ln112">	if (count == 0) {</a>
+<a name="ln113">		BMessenger messenger(fStatusWindow);</a>
+<a name="ln114">		if (messenger.IsValid()) {</a>
+<a name="ln115">			BMessage message(kMsgNoRepositories);</a>
+<a name="ln116">			BMessage reply;</a>
+<a name="ln117">			messenger.SendMessage(&amp;message, &amp;reply);</a>
+<a name="ln118">			int32 result;</a>
+<a name="ln119">			reply.FindInt32(kKeyAlertResult, &amp;result);</a>
+<a name="ln120">			if (result == 1)</a>
+<a name="ln121">				be_roster-&gt;Launch(&quot;application/x-vnd.Haiku-Repositories&quot;);</a>
+<a name="ln122">		}</a>
+<a name="ln123">		be_app-&gt;PostMessage(kMsgFinalQuit);</a>
+<a name="ln124">		throw BException(B_TRANSLATE_COMMENT(</a>
+<a name="ln125">			&quot;No remote repositories are available&quot;, &quot;Error message&quot;));</a>
+<a name="ln126">	}</a>
+<a name="ln127">}</a>
+<a name="ln128"> </a>
+<a name="ln129"> </a>
+<a name="ln130">void</a>
+<a name="ln131">UpdateManager::JobFailed(BSupportKit::BJob* job)</a>
+<a name="ln132">{</a>
+<a name="ln133">	if (!fVerbose)</a>
+<a name="ln134">		return;</a>
+<a name="ln135"> </a>
+<a name="ln136">	BString error = job-&gt;ErrorString();</a>
+<a name="ln137">	if (error.Length() &gt; 0) {</a>
+<a name="ln138">		error.ReplaceAll(&quot;\n&quot;, &quot;\n*** &quot;);</a>
+<a name="ln139">		fprintf(stderr, &quot;%s&quot;, error.String());</a>
+<a name="ln140">	}</a>
+<a name="ln141">}</a>
+<a name="ln142"> </a>
+<a name="ln143"> </a>
+<a name="ln144">void</a>
+<a name="ln145">UpdateManager::JobAborted(BSupportKit::BJob* job)</a>
+<a name="ln146">{</a>
+<a name="ln147">	if (fVerbose)</a>
+<a name="ln148">		puts(&quot;Job aborted&quot;);</a>
+<a name="ln149">}</a>
+<a name="ln150"> </a>
+<a name="ln151"> </a>
+<a name="ln152">void</a>
+<a name="ln153">UpdateManager::FinalUpdate(const char* header, const char* text)</a>
+<a name="ln154">{</a>
+<a name="ln155">	_FinalUpdate(header, text);</a>
+<a name="ln156">}</a>
+<a name="ln157"> </a>
+<a name="ln158"> </a>
+<a name="ln159">void</a>
+<a name="ln160">UpdateManager::HandleProblems()</a>
+<a name="ln161">{</a>
+<a name="ln162">	if (fProblemWindow == NULL)</a>
+<a name="ln163">		fProblemWindow = new ProblemWindow;</a>
+<a name="ln164"> </a>
+<a name="ln165">	ProblemWindow::SolverPackageSet installPackages;</a>
+<a name="ln166">	ProblemWindow::SolverPackageSet uninstallPackages;</a>
+<a name="ln167">	if (!fProblemWindow-&gt;Go(fSolver,installPackages, uninstallPackages))</a>
+<a name="ln168">		throw BAbortedByUserException();</a>
+<a name="ln169">	fProblemWindow-&gt;Hide();</a>
+<a name="ln170">}</a>
+<a name="ln171"> </a>
+<a name="ln172"> </a>
+<a name="ln173">void</a>
+<a name="ln174">UpdateManager::ConfirmChanges(bool fromMostSpecific)</a>
+<a name="ln175">{</a>
+<a name="ln176">	if (fVerbose)</a>
+<a name="ln177">		puts(&quot;The following changes will be made:&quot;);</a>
+<a name="ln178"> </a>
+<a name="ln179">	int32 count = fInstalledRepositories.CountItems();</a>
+<a name="ln180">	int32 upgradeCount = 0;</a>
+<a name="ln181">	int32 installCount = 0;</a>
+<a name="ln182">	int32 uninstallCount = 0;</a>
+<a name="ln183"> </a>
+<a name="ln184">	if (fromMostSpecific) {</a>
+<a name="ln185">		for (int32 i = count - 1; i &gt;= 0; i--)</a>
+<a name="ln186">			_PrintResult(*fInstalledRepositories.ItemAt(i), upgradeCount,</a>
+<a name="ln187">				installCount, uninstallCount);</a>
+<a name="ln188">	} else {</a>
+<a name="ln189">		for (int32 i = 0; i &lt; count; i++)</a>
+<a name="ln190">			_PrintResult(*fInstalledRepositories.ItemAt(i), upgradeCount,</a>
+<a name="ln191">				installCount, uninstallCount);</a>
+<a name="ln192">	}</a>
+<a name="ln193"> </a>
+<a name="ln194">	if (fVerbose)</a>
+<a name="ln195">		printf(&quot;Upgrade count=%&quot; B_PRId32 &quot;, Install count=%&quot; B_PRId32</a>
+<a name="ln196">			&quot;, Uninstall count=%&quot; B_PRId32 &quot;\n&quot;,</a>
+<a name="ln197">			upgradeCount, installCount, uninstallCount);</a>
+<a name="ln198"> </a>
+<a name="ln199">	fChangesConfirmed = fStatusWindow-&gt;ConfirmUpdates();</a>
+<a name="ln200">	if (!fChangesConfirmed)</a>
+<a name="ln201">		throw BAbortedByUserException();</a>
+<a name="ln202"> </a>
+<a name="ln203">	_SetCurrentStep(ACTION_STEP_DOWNLOAD);</a>
+<a name="ln204">	fPackageDownloadsTotal = upgradeCount + installCount;</a>
+<a name="ln205">	fPackageDownloadsCount = 1;</a>
+<a name="ln206">}</a>
+<a name="ln207"> </a>
+<a name="ln208"> </a>
+<a name="ln209">void</a>
+<a name="ln210">UpdateManager::Warn(status_t error, const char* format, ...)</a>
+<a name="ln211">{</a>
+<a name="ln212">	char buffer[256];</a>
+<a name="ln213">	va_list args;</a>
+<a name="ln214">	va_start(args, format);</a>
+<a name="ln215">	vsnprintf(buffer, sizeof(buffer), format, args);</a>
+<a name="ln216">	va_end(args);</a>
+<a name="ln217"> </a>
+<a name="ln218">	if (fVerbose) {</a>
+<a name="ln219">		fputs(buffer, stderr);</a>
+<a name="ln220">		if (error == B_OK)</a>
+<a name="ln221">			puts(&quot;&quot;);</a>
+<a name="ln222">		else</a>
+<a name="ln223">			printf(&quot;: %s\n&quot;, strerror(error));</a>
+<a name="ln224">	}</a>
+<a name="ln225"> </a>
+<a name="ln226">	if (fStatusWindow != NULL) {</a>
+<a name="ln227">		if (fStatusWindow-&gt;UserCancelRequested())</a>
+<a name="ln228">			throw BAbortedByUserException();</a>
+<a name="ln229">		fStatusWindow-&gt;ShowWarningAlert(buffer);</a>
+<a name="ln230">	} else {</a>
+<a name="ln231">		BString text(&quot;SoftwareUpdater:\n&quot;);</a>
+<a name="ln232">		text.Append(buffer);</a>
+<a name="ln233">		BAlert* alert = new BAlert(&quot;warning&quot;, text, B_TRANSLATE(&quot;OK&quot;), NULL,</a>
+<a name="ln234">			NULL, B_WIDTH_AS_USUAL, B_WARNING_ALERT);</a>
+<a name="ln235">		alert-&gt;Go(NULL);</a>
+<a name="ln236">	}</a>
+<a name="ln237">}</a>
+<a name="ln238"> </a>
+<a name="ln239"> </a>
+<a name="ln240">void</a>
+<a name="ln241">UpdateManager::ProgressPackageDownloadStarted(const char* packageName)</a>
+<a name="ln242">{</a>
+<a name="ln243">	if (fCurrentStep == ACTION_STEP_DOWNLOAD) {</a>
+<a name="ln244">		BString header(B_TRANSLATE(&quot;Downloading packages&quot;));</a>
+<a name="ln245">		_UpdateDownloadProgress(header.String(), packageName, 0.0);</a>
+<a name="ln246">		fNewDownloadStarted = false;</a>
+<a name="ln247">	}</a>
+<a name="ln248"> </a>
+<a name="ln249">	if (fVerbose)</a>
+<a name="ln250">		printf(&quot;Downloading %s...\n&quot;, packageName);</a>
+<a name="ln251">}</a>
+<a name="ln252"> </a>
+<a name="ln253"> </a>
+<a name="ln254">void</a>
+<a name="ln255">UpdateManager::ProgressPackageDownloadActive(const char* packageName,</a>
+<a name="ln256">	float completionValue, off_t bytes, off_t totalBytes)</a>
+<a name="ln257">{</a>
+<a name="ln258">	if (fCurrentStep == ACTION_STEP_DOWNLOAD) {</a>
+<a name="ln259">		// Fix a bug where a 100% completion percentage gets sent at the start</a>
+<a name="ln260">		// of a package download</a>
+<a name="ln261">		if (!fNewDownloadStarted) {</a>
+<a name="ln262">			if (completionValue &gt; 0 &amp;&amp; completionValue &lt; 1)</a>
+<a name="ln263">				fNewDownloadStarted = true;</a>
+<a name="ln264">			else</a>
+<a name="ln265">				completionValue = 0.0;</a>
+<a name="ln266">		}</a>
+<a name="ln267">		_UpdateDownloadProgress(NULL, packageName, completionValue * 100.0);</a>
+<a name="ln268">	}</a>
+<a name="ln269"> </a>
+<a name="ln270">	if (fVerbose) {</a>
+<a name="ln271">		static const char* progressChars[] = {</a>
+<a name="ln272">			&quot;\xE2\x96\x8F&quot;,</a>
+<a name="ln273">			&quot;\xE2\x96\x8E&quot;,</a>
+<a name="ln274">			&quot;\xE2\x96\x8D&quot;,</a>
+<a name="ln275">			&quot;\xE2\x96\x8C&quot;,</a>
+<a name="ln276">			&quot;\xE2\x96\x8B&quot;,</a>
+<a name="ln277">			&quot;\xE2\x96\x8A&quot;,</a>
+<a name="ln278">			&quot;\xE2\x96\x89&quot;,</a>
+<a name="ln279">			&quot;\xE2\x96\x88&quot;,</a>
+<a name="ln280">		};</a>
+<a name="ln281"> </a>
+<a name="ln282">		int width = 70;</a>
+<a name="ln283"> </a>
+<a name="ln284">		struct winsize winSize;</a>
+<a name="ln285">		if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &amp;winSize) == 0</a>
+<a name="ln286">			&amp;&amp; winSize.ws_col &lt; 77) {</a>
+<a name="ln287">			// We need 7 characters for the percent display</a>
+<a name="ln288">			width = winSize.ws_col - 7;</a>
+<a name="ln289">		}</a>
+<a name="ln290"> </a>
+<a name="ln291">		int position;</a>
+<a name="ln292">		int ipart = (int)(completionValue * width);</a>
+<a name="ln293">		int fpart = (int)(((completionValue * width) - ipart) * 8);</a>
+<a name="ln294"> </a>
+<a name="ln295">		fputs(&quot;\r&quot;, stdout); // return to the beginning of the line</a>
+<a name="ln296"> </a>
+<a name="ln297">		for (position = 0; position &lt; width; position++) {</a>
+<a name="ln298">			if (position &lt; ipart) {</a>
+<a name="ln299">				// This part is fully downloaded, show a full block</a>
+<a name="ln300">				fputs(progressChars[7], stdout);</a>
+<a name="ln301">			} else if (position &gt; ipart) {</a>
+<a name="ln302">				// This part is not downloaded, show a space</a>
+<a name="ln303">				fputs(&quot; &quot;, stdout);</a>
+<a name="ln304">			} else {</a>
+<a name="ln305">				// This part is partially downloaded</a>
+<a name="ln306">				fputs(progressChars[fpart], stdout);</a>
+<a name="ln307">			}</a>
+<a name="ln308">		}</a>
+<a name="ln309"> </a>
+<a name="ln310">		// Also print the progress percentage</a>
+<a name="ln311">		printf(&quot; %3d%%&quot;, (int)(completionValue * 100));</a>
+<a name="ln312"> </a>
+<a name="ln313">		fflush(stdout);</a>
+<a name="ln314">	}</a>
+<a name="ln315"> </a>
+<a name="ln316">}</a>
+<a name="ln317"> </a>
+<a name="ln318"> </a>
+<a name="ln319">void</a>
+<a name="ln320">UpdateManager::ProgressPackageDownloadComplete(const char* packageName)</a>
+<a name="ln321">{</a>
+<a name="ln322">	if (fCurrentStep == ACTION_STEP_DOWNLOAD) {</a>
+<a name="ln323">		_UpdateDownloadProgress(NULL, packageName, 100.0);</a>
+<a name="ln324">		fPackageDownloadsCount++;</a>
+<a name="ln325">	}</a>
+<a name="ln326"> </a>
+<a name="ln327">	if (fVerbose) {</a>
+<a name="ln328">		// Overwrite the progress bar with whitespace</a>
+<a name="ln329">		fputs(&quot;\r&quot;, stdout);</a>
+<a name="ln330">		struct winsize w;</a>
+<a name="ln331">		ioctl(STDOUT_FILENO, TIOCGWINSZ, &amp;w);</a>
+<a name="ln332">		for (int i = 0; i &lt; (w.ws_col); i++)</a>
+<a name="ln333">			fputs(&quot; &quot;, stdout);</a>
+<a name="ln334">		fputs(&quot;\r\x1b[1A&quot;, stdout); // Go to previous line.</a>
+<a name="ln335"> </a>
+<a name="ln336">		printf(&quot;Downloading %s...done.\n&quot;, packageName);</a>
+<a name="ln337">	}</a>
+<a name="ln338">}</a>
+<a name="ln339"> </a>
+<a name="ln340"> </a>
+<a name="ln341">void</a>
+<a name="ln342">UpdateManager::ProgressPackageChecksumStarted(const char* title)</a>
+<a name="ln343">{</a>
+<a name="ln344">	// Repository checksums</a>
+<a name="ln345">	if (fCurrentStep == ACTION_STEP_START)</a>
+<a name="ln346">		_UpdateStatusWindow(NULL, title);</a>
+<a name="ln347"> </a>
+<a name="ln348">	if (fVerbose)</a>
+<a name="ln349">		printf(&quot;%s...&quot;, title);</a>
+<a name="ln350">}</a>
+<a name="ln351"> </a>
+<a name="ln352"> </a>
+<a name="ln353">void</a>
+<a name="ln354">UpdateManager::ProgressPackageChecksumComplete(const char* title)</a>
+<a name="ln355">{</a>
+<a name="ln356">	if (fVerbose)</a>
+<a name="ln357">		puts(&quot;done.&quot;);</a>
+<a name="ln358">}</a>
+<a name="ln359"> </a>
+<a name="ln360"> </a>
+<a name="ln361">void</a>
+<a name="ln362">UpdateManager::ProgressStartApplyingChanges(InstalledRepository&amp; repository)</a>
+<a name="ln363">{</a>
+<a name="ln364">	_SetCurrentStep(ACTION_STEP_APPLY);</a>
+<a name="ln365">	BString header(B_TRANSLATE(&quot;Applying changes&quot;));</a>
+<a name="ln366">	BString detail(B_TRANSLATE(&quot;Packages are being updated&quot;));</a>
+<a name="ln367">	fStatusWindow-&gt;UpdatesApplying(header.String(), detail.String());</a>
+<a name="ln368"> </a>
+<a name="ln369">	if (fVerbose)</a>
+<a name="ln370">		printf(&quot;[%s] Applying changes ...\n&quot;, repository.Name().String());</a>
+<a name="ln371">}</a>
+<a name="ln372"> </a>
+<a name="ln373"> </a>
+<a name="ln374">void</a>
+<a name="ln375">UpdateManager::ProgressTransactionCommitted(InstalledRepository&amp; repository,</a>
+<a name="ln376">	const BCommitTransactionResult&amp; result)</a>
+<a name="ln377">{</a>
+<a name="ln378">	_SetCurrentStep(ACTION_STEP_COMPLETE);</a>
+<a name="ln379">	BString header(B_TRANSLATE(&quot;Updates completed&quot;));</a>
+<a name="ln380"> </a>
+<a name="ln381">	BString detail;</a>
+<a name="ln382">	if (BPackageRoster().IsRebootNeeded()) {</a>
+<a name="ln383">		detail = B_TRANSLATE(&quot;A reboot is necessary to complete the &quot;</a>
+<a name="ln384">			&quot;update process.&quot;);</a>
+<a name="ln385">		fStatusWindow-&gt;PostMessage(kMsgShowReboot);</a>
+<a name="ln386">	} else {</a>
+<a name="ln387">		detail = B_TRANSLATE(&quot;Updates have been successfully installed.&quot;);</a>
+<a name="ln388">	}</a>
+<a name="ln389"> </a>
+<a name="ln390">	_FinalUpdate(header.String(), detail.String());</a>
+<a name="ln391"> </a>
+<a name="ln392">	if (fVerbose) {</a>
+<a name="ln393">		const char* repositoryName = repository.Name().String();</a>
+<a name="ln394"> </a>
+<a name="ln395">		int32 issueCount = result.CountIssues();</a>
+<a name="ln396">		for (int32 i = 0; i &lt; issueCount; i++) {</a>
+<a name="ln397">			const BTransactionIssue* issue = result.IssueAt(i);</a>
+<a name="ln398">			if (issue-&gt;PackageName().IsEmpty()) {</a>
+<a name="ln399">				printf(&quot;[%s] warning: %s\n&quot;, repositoryName,</a>
+<a name="ln400">					issue-&gt;ToString().String());</a>
+<a name="ln401">			} else {</a>
+<a name="ln402">				printf(&quot;[%s] warning: package %s: %s\n&quot;, repositoryName,</a>
+<a name="ln403">					issue-&gt;PackageName().String(), issue-&gt;ToString().String());</a>
+<a name="ln404">			}</a>
+<a name="ln405">		}</a>
+<a name="ln406"> </a>
+<a name="ln407">		printf(&quot;[%s] Changes applied. Old activation state backed up in \&quot;%s\&quot;\n&quot;,</a>
+<a name="ln408">			repositoryName, result.OldStateDirectory().String());</a>
+<a name="ln409">		printf(&quot;[%s] Cleaning up ...\n&quot;, repositoryName);</a>
+<a name="ln410">	}</a>
+<a name="ln411">}</a>
+<a name="ln412"> </a>
+<a name="ln413"> </a>
+<a name="ln414">void</a>
+<a name="ln415">UpdateManager::ProgressApplyingChangesDone(InstalledRepository&amp; repository)</a>
+<a name="ln416">{</a>
+<a name="ln417">	if (fVerbose)</a>
+<a name="ln418">		printf(&quot;[%s] Done.\n&quot;, repository.Name().String());</a>
+<a name="ln419">}</a>
+<a name="ln420"> </a>
+<a name="ln421"> </a>
+<a name="ln422">void</a>
+<a name="ln423">UpdateManager::_PrintResult(InstalledRepository&amp; installationRepository,</a>
+<a name="ln424">	int32&amp; upgradeCount, int32&amp; installCount, int32&amp; uninstallCount)</a>
+<a name="ln425">{</a>
+<a name="ln426">	if (!installationRepository.HasChanges())</a>
+<a name="ln427">		return;</a>
+<a name="ln428"> </a>
+<a name="ln429">	if (fVerbose)</a>
+<a name="ln430">		printf(&quot;  in %s:\n&quot;, installationRepository.Name().String());</a>
+<a name="ln431"> </a>
+<a name="ln432">	PackageList&amp; packagesToActivate</a>
+<a name="ln433">		= installationRepository.PackagesToActivate();</a>
+<a name="ln434">	PackageList&amp; packagesToDeactivate</a>
+<a name="ln435">		= installationRepository.PackagesToDeactivate();</a>
+<a name="ln436"> </a>
+<a name="ln437">	BStringList upgradedPackages;</a>
+<a name="ln438">	BStringList upgradedPackageVersions;</a>
+<a name="ln439">	for (int32 i = 0;</a>
+<a name="ln440">		BSolverPackage* installPackage = packagesToActivate.ItemAt(i);</a>
+<a name="ln441">		i++) {</a>
+<a name="ln442">		for (int32 j = 0;</a>
+<a name="ln443">			BSolverPackage* uninstallPackage = packagesToDeactivate.ItemAt(j);</a>
+<a name="ln444">			j++) {</a>
+<a name="ln445">			if (installPackage-&gt;Info().Name() == uninstallPackage-&gt;Info().Name()) {</a>
+<a name="ln446">				upgradedPackages.Add(installPackage-&gt;Info().Name());</a>
+<a name="ln447">				upgradedPackageVersions.Add(uninstallPackage-&gt;Info().Version().ToString());</a>
+<a name="ln448">				break;</a>
+<a name="ln449">			}</a>
+<a name="ln450">		}</a>
+<a name="ln451">	}</a>
+<a name="ln452"> </a>
+<a name="ln453">	for (int32 i = 0; BSolverPackage* package = packagesToActivate.ItemAt(i);</a>
+<a name="ln454">		i++) {</a>
+<a name="ln455">		BString repository;</a>
+<a name="ln456">		if (dynamic_cast&lt;MiscLocalRepository*&gt;(package-&gt;Repository()) != NULL)</a>
+<a name="ln457">			repository = &quot;local file&quot;;</a>
+<a name="ln458">		else</a>
+<a name="ln459">			repository.SetToFormat(&quot;repository %s&quot;,</a>
+<a name="ln460">				package-&gt;Repository()-&gt;Name().String());</a>
+<a name="ln461"> </a>
+<a name="ln462">		int position = upgradedPackages.IndexOf(package-&gt;Info().Name());</a>
+<a name="ln463">		if (position &gt;= 0) {</a>
+<a name="ln464">			if (fVerbose)</a>
+<a name="ln465">				printf(&quot;    upgrade package %s-%s to %s from %s\n&quot;,</a>
+<a name="ln466">					package-&gt;Info().Name().String(),</a>
+<a name="ln467">					upgradedPackageVersions.StringAt(position).String(),</a>
+<a name="ln468">					package-&gt;Info().Version().ToString().String(),</a>
+<a name="ln469">					repository.String());</a>
+<a name="ln470">			fStatusWindow-&gt;AddPackageInfo(PACKAGE_UPDATE,</a>
+<a name="ln471">				package-&gt;Info().Name().String(),</a>
+<a name="ln472">				upgradedPackageVersions.StringAt(position).String(),</a>
+<a name="ln473">				package-&gt;Info().Version().ToString().String(),</a>
+<a name="ln474">				package-&gt;Info().Summary().String(),</a>
+<a name="ln475">				package-&gt;Repository()-&gt;Name().String(),</a>
+<a name="ln476">				package-&gt;Info().FileName().String());</a>
+<a name="ln477">			upgradeCount++;</a>
+<a name="ln478">		} else {</a>
+<a name="ln479">			if (fVerbose)</a>
+<a name="ln480">				printf(&quot;    install package %s-%s from %s\n&quot;,</a>
+<a name="ln481">					package-&gt;Info().Name().String(),</a>
+<a name="ln482">					package-&gt;Info().Version().ToString().String(),</a>
+<a name="ln483">					repository.String());</a>
+<a name="ln484">			fStatusWindow-&gt;AddPackageInfo(PACKAGE_INSTALL,</a>
+<a name="ln485">				package-&gt;Info().Name().String(),</a>
+<a name="ln486">				NULL,</a>
+<a name="ln487">				package-&gt;Info().Version().ToString().String(),</a>
+<a name="ln488">				package-&gt;Info().Summary().String(),</a>
+<a name="ln489">				package-&gt;Repository()-&gt;Name().String(),</a>
+<a name="ln490">				package-&gt;Info().FileName().String());</a>
+<a name="ln491">			installCount++;</a>
+<a name="ln492">		}</a>
+<a name="ln493">	}</a>
+<a name="ln494"> </a>
+<a name="ln495">	BStringList uninstallList;</a>
+<a name="ln496">	for (int32 i = 0; BSolverPackage* package = packagesToDeactivate.ItemAt(i);</a>
+<a name="ln497">		i++) {</a>
+<a name="ln498">		if (upgradedPackages.HasString(package-&gt;Info().Name()))</a>
+<a name="ln499">			continue;</a>
+<a name="ln500">		if (fVerbose)</a>
+<a name="ln501">			printf(&quot;    uninstall package %s\n&quot;,</a>
+<a name="ln502">				package-&gt;VersionedName().String());</a>
+<a name="ln503">		fStatusWindow-&gt;AddPackageInfo(PACKAGE_UNINSTALL,</a>
+<a name="ln504">			package-&gt;Info().Name().String(),</a>
+<a name="ln505">			package-&gt;Info().Version().ToString(),</a>
+<a name="ln506">			NULL,</a>
+<a name="ln507">			package-&gt;Info().Summary().String(),</a>
+<a name="ln508">			package-&gt;Repository()-&gt;Name().String(),</a>
+<a name="ln509">			package-&gt;Info().FileName().String());</a>
+<a name="ln510">		uninstallCount++;</a>
+<a name="ln511">	}</a>
+<a name="ln512">}</a>
+<a name="ln513"> </a>
+<a name="ln514"> </a>
+<a name="ln515">void</a>
+<a name="ln516">UpdateManager::_UpdateStatusWindow(const char* header, const char* detail)</a>
+<a name="ln517">{</a>
+<a name="ln518">	if (header == NULL &amp;&amp; detail == NULL)</a>
+<a name="ln519">		return;</a>
+<a name="ln520"> </a>
+<a name="ln521">	if (fStatusWindow-&gt;UserCancelRequested())</a>
+<a name="ln522">		throw BAbortedByUserException();</a>
+<a name="ln523"> </a>
+<a name="ln524">	BMessage message(kMsgTextUpdate);</a>
+<a name="ln525">	if (header != NULL)</a>
+<a name="ln526">		message.AddString(kKeyHeader, header);</a>
+<a name="ln527">	if (detail != NULL)</a>
+<a name="ln528">		message.AddString(kKeyDetail, detail);</a>
+<a name="ln529">	fStatusWindow-&gt;PostMessage(&amp;message);</a>
+<a name="ln530">}</a>
+<a name="ln531"> </a>
+<a name="ln532"> </a>
+<a name="ln533">void</a>
+<a name="ln534">UpdateManager::_UpdateDownloadProgress(const char* header,</a>
+<a name="ln535">	const char* packageName, float percentageComplete)</a>
+<a name="ln536">{</a>
+<a name="ln537">	if (packageName == NULL)</a>
+<a name="ln538">		return;</a>
+<a name="ln539"> </a>
+<a name="ln540">	if (fStatusWindow-&gt;UserCancelRequested())</a>
+<a name="ln541">		throw BAbortedByUserException();</a>
+<a name="ln542"> </a>
+<a name="ln543">	BString packageCount;</a>
+<a name="ln544">	packageCount.SetToFormat(</a>
+<a name="ln545">		B_TRANSLATE_COMMENT(&quot;%i of %i&quot;, &quot;Do not translate %i&quot;),</a>
+<a name="ln546">		fPackageDownloadsCount,</a>
+<a name="ln547">		fPackageDownloadsTotal);</a>
+<a name="ln548">	BMessage message(kMsgProgressUpdate);</a>
+<a name="ln549">	if (header != NULL)</a>
+<a name="ln550">		message.AddString(kKeyHeader, header);</a>
+<a name="ln551">	message.AddString(kKeyPackageName, packageName);</a>
+<a name="ln552">	message.AddString(kKeyPackageCount, packageCount.String());</a>
+<a name="ln553">	message.AddFloat(kKeyPercentage, percentageComplete);</a>
+<a name="ln554">	fStatusWindow-&gt;PostMessage(&amp;message);</a>
+<a name="ln555">}</a>
+<a name="ln556"> </a>
+<a name="ln557"> </a>
+<a name="ln558">void</a>
+<a name="ln559">UpdateManager::_FinalUpdate(const char* header, const char* text)</a>
+<a name="ln560">{</a>
+<a name="ln561">	if (!fStatusWindow-&gt;IsFront()) {</a>
+<a name="ln562">		BNotification notification(B_INFORMATION_NOTIFICATION);</a>
+<a name="ln563">		notification.SetGroup(&quot;SoftwareUpdater&quot;);</a>
+<a name="ln564">		notification.SetTitle(header);</a>
+<a name="ln565">		notification.SetContent(text);</a>
+<a name="ln566">		notification.Send();</a>
+<a name="ln567">	}</a>
+<a name="ln568"> </a>
+<a name="ln569">	fStatusWindow-&gt;FinalUpdate(header, text);</a>
+<a name="ln570">}</a>
+<a name="ln571"> </a>
+<a name="ln572"> </a>
+<a name="ln573">void</a>
+<a name="ln574">UpdateManager::_SetCurrentStep(int32 step)</a>
+<a name="ln575">{</a>
+<a name="ln576">	fCurrentStep = step;</a>
+<a name="ln577">}</a>
+
+</code></pre>
+<div class="balloon" rel="236"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v773/" target="_blank">V773</a> Visibility scope of the 'alert' pointer was exited without releasing the memory. A memory leak is possible.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

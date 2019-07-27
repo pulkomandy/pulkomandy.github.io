@@ -1,0 +1,1398 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>file_cache.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2004-2009, Axel Dörfler, axeld@pinc-software.de.</a>
+<a name="ln3"> * Distributed under the terms of the MIT License.</a>
+<a name="ln4"> */</a>
+<a name="ln5"> </a>
+<a name="ln6"> </a>
+<a name="ln7">#include &quot;vnode_store.h&quot;</a>
+<a name="ln8"> </a>
+<a name="ln9">#include &lt;unistd.h&gt;</a>
+<a name="ln10">#include &lt;stdlib.h&gt;</a>
+<a name="ln11">#include &lt;string.h&gt;</a>
+<a name="ln12"> </a>
+<a name="ln13">#include &lt;KernelExport.h&gt;</a>
+<a name="ln14">#include &lt;fs_cache.h&gt;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &lt;condition_variable.h&gt;</a>
+<a name="ln17">#include &lt;file_cache.h&gt;</a>
+<a name="ln18">#include &lt;generic_syscall.h&gt;</a>
+<a name="ln19">#include &lt;low_resource_manager.h&gt;</a>
+<a name="ln20">#include &lt;thread.h&gt;</a>
+<a name="ln21">#include &lt;util/AutoLock.h&gt;</a>
+<a name="ln22">#include &lt;util/kernel_cpp.h&gt;</a>
+<a name="ln23">#include &lt;vfs.h&gt;</a>
+<a name="ln24">#include &lt;vm/vm.h&gt;</a>
+<a name="ln25">#include &lt;vm/vm_page.h&gt;</a>
+<a name="ln26">#include &lt;vm/VMCache.h&gt;</a>
+<a name="ln27"> </a>
+<a name="ln28">#include &quot;IORequest.h&quot;</a>
+<a name="ln29"> </a>
+<a name="ln30"> </a>
+<a name="ln31">//#define TRACE_FILE_CACHE</a>
+<a name="ln32">#ifdef TRACE_FILE_CACHE</a>
+<a name="ln33">#	define TRACE(x) dprintf x</a>
+<a name="ln34">#else</a>
+<a name="ln35">#	define TRACE(x) ;</a>
+<a name="ln36">#endif</a>
+<a name="ln37"> </a>
+<a name="ln38">// maximum number of iovecs per request</a>
+<a name="ln39">#define MAX_IO_VECS			32	// 128 kB</a>
+<a name="ln40"> </a>
+<a name="ln41">#define BYPASS_IO_SIZE		65536</a>
+<a name="ln42">#define LAST_ACCESSES		3</a>
+<a name="ln43"> </a>
+<a name="ln44">struct file_cache_ref {</a>
+<a name="ln45">	VMCache			*cache;</a>
+<a name="ln46">	struct vnode	*vnode;</a>
+<a name="ln47">	off_t			last_access[LAST_ACCESSES];</a>
+<a name="ln48">		// TODO: it would probably be enough to only store the least</a>
+<a name="ln49">		//	significant 31 bits, and make this uint32 (one bit for</a>
+<a name="ln50">		//	write vs. read)</a>
+<a name="ln51">	int32			last_access_index;</a>
+<a name="ln52">	uint16			disabled_count;</a>
+<a name="ln53"> </a>
+<a name="ln54">	inline void SetLastAccess(int32 index, off_t access, bool isWrite)</a>
+<a name="ln55">	{</a>
+<a name="ln56">		// we remember writes as negative offsets</a>
+<a name="ln57">		last_access[index] = isWrite ? -access : access;</a>
+<a name="ln58">	}</a>
+<a name="ln59"> </a>
+<a name="ln60">	inline off_t LastAccess(int32 index, bool isWrite) const</a>
+<a name="ln61">	{</a>
+<a name="ln62">		return isWrite ? -last_access[index] : last_access[index];</a>
+<a name="ln63">	}</a>
+<a name="ln64"> </a>
+<a name="ln65">	inline uint32 LastAccessPageOffset(int32 index, bool isWrite)</a>
+<a name="ln66">	{</a>
+<a name="ln67">		return LastAccess(index, isWrite) &gt;&gt; PAGE_SHIFT;</a>
+<a name="ln68">	}</a>
+<a name="ln69">};</a>
+<a name="ln70"> </a>
+<a name="ln71">class PrecacheIO : public AsyncIOCallback {</a>
+<a name="ln72">public:</a>
+<a name="ln73">								PrecacheIO(file_cache_ref* ref, off_t offset,</a>
+<a name="ln74">									generic_size_t size);</a>
+<a name="ln75">								~PrecacheIO();</a>
+<a name="ln76"> </a>
+<a name="ln77">			status_t			Prepare(vm_page_reservation* reservation);</a>
+<a name="ln78">			void				ReadAsync();</a>
+<a name="ln79"> </a>
+<a name="ln80">	virtual	void				IOFinished(status_t status,</a>
+<a name="ln81">									bool partialTransfer,</a>
+<a name="ln82">									generic_size_t bytesTransferred);</a>
+<a name="ln83"> </a>
+<a name="ln84">private:</a>
+<a name="ln85">			file_cache_ref*		fRef;</a>
+<a name="ln86">			VMCache*			fCache;</a>
+<a name="ln87">			vm_page**			fPages;</a>
+<a name="ln88">			size_t				fPageCount;</a>
+<a name="ln89">			ConditionVariable*	fBusyConditions;</a>
+<a name="ln90">			generic_io_vec*		fVecs;</a>
+<a name="ln91">			off_t				fOffset;</a>
+<a name="ln92">			uint32				fVecCount;</a>
+<a name="ln93">			generic_size_t		fSize;</a>
+<a name="ln94">#if DEBUG_PAGE_ACCESS</a>
+<a name="ln95">			thread_id			fAllocatingThread;</a>
+<a name="ln96">#endif</a>
+<a name="ln97">};</a>
+<a name="ln98"> </a>
+<a name="ln99">typedef status_t (*cache_func)(file_cache_ref* ref, void* cookie, off_t offset,</a>
+<a name="ln100">	int32 pageOffset, addr_t buffer, size_t bufferSize, bool useBuffer,</a>
+<a name="ln101">	vm_page_reservation* reservation, size_t reservePages);</a>
+<a name="ln102"> </a>
+<a name="ln103">static void add_to_iovec(generic_io_vec* vecs, uint32 &amp;index, uint32 max,</a>
+<a name="ln104">	generic_addr_t address, generic_size_t size);</a>
+<a name="ln105"> </a>
+<a name="ln106"> </a>
+<a name="ln107">static struct cache_module_info* sCacheModule;</a>
+<a name="ln108"> </a>
+<a name="ln109"> </a>
+<a name="ln110">static const uint32 kZeroVecCount = 32;</a>
+<a name="ln111">static const size_t kZeroVecSize = kZeroVecCount * B_PAGE_SIZE;</a>
+<a name="ln112">static phys_addr_t sZeroPage;	// physical address</a>
+<a name="ln113">static generic_io_vec sZeroVecs[kZeroVecCount];</a>
+<a name="ln114"> </a>
+<a name="ln115"> </a>
+<a name="ln116">//	#pragma mark -</a>
+<a name="ln117"> </a>
+<a name="ln118"> </a>
+<a name="ln119">PrecacheIO::PrecacheIO(file_cache_ref* ref, off_t offset, generic_size_t size)</a>
+<a name="ln120">	:</a>
+<a name="ln121">	fRef(ref),</a>
+<a name="ln122">	fCache(ref-&gt;cache),</a>
+<a name="ln123">	fPages(NULL),</a>
+<a name="ln124">	fVecs(NULL),</a>
+<a name="ln125">	fOffset(offset),</a>
+<a name="ln126">	fVecCount(0),</a>
+<a name="ln127">	fSize(size)</a>
+<a name="ln128">{</a>
+<a name="ln129">	fPageCount = (size + B_PAGE_SIZE - 1) / B_PAGE_SIZE;</a>
+<a name="ln130">	fCache-&gt;AcquireRefLocked();</a>
+<a name="ln131">}</a>
+<a name="ln132"> </a>
+<a name="ln133"> </a>
+<a name="ln134">PrecacheIO::~PrecacheIO()</a>
+<a name="ln135">{</a>
+<a name="ln136">	delete[] fPages;</a>
+<a name="ln137">	delete[] fVecs;</a>
+<a name="ln138">	fCache-&gt;ReleaseRefLocked();</a>
+<a name="ln139">}</a>
+<a name="ln140"> </a>
+<a name="ln141"> </a>
+<a name="ln142">status_t</a>
+<a name="ln143">PrecacheIO::Prepare(vm_page_reservation* reservation)</a>
+<a name="ln144">{</a>
+<a name="ln145">	if (fPageCount == 0)</a>
+<a name="ln146">		return B_BAD_VALUE;</a>
+<a name="ln147"> </a>
+<a name="ln148">	fPages = new(std::nothrow) vm_page*[fPageCount];</a>
+<a name="ln149">	if (fPages == NULL)</a>
+<a name="ln150">		return B_NO_MEMORY;</a>
+<a name="ln151"> </a>
+<a name="ln152">	fVecs = new(std::nothrow) generic_io_vec[fPageCount];</a>
+<a name="ln153">	if (fVecs == NULL)</a>
+<a name="ln154">		return B_NO_MEMORY;</a>
+<a name="ln155"> </a>
+<a name="ln156">	// allocate pages for the cache and mark them busy</a>
+<a name="ln157">	uint32 i = 0;</a>
+<a name="ln158">	for (generic_size_t pos = 0; pos &lt; fSize; pos += B_PAGE_SIZE) {</a>
+<a name="ln159">		vm_page* page = vm_page_allocate_page(reservation,</a>
+<a name="ln160">			PAGE_STATE_CACHED | VM_PAGE_ALLOC_BUSY);</a>
+<a name="ln161"> </a>
+<a name="ln162">		fCache-&gt;InsertPage(page, fOffset + pos);</a>
+<a name="ln163"> </a>
+<a name="ln164">		add_to_iovec(fVecs, fVecCount, fPageCount,</a>
+<a name="ln165">			page-&gt;physical_page_number * B_PAGE_SIZE, B_PAGE_SIZE);</a>
+<a name="ln166">		fPages[i++] = page;</a>
+<a name="ln167">	}</a>
+<a name="ln168"> </a>
+<a name="ln169">#if DEBUG_PAGE_ACCESS</a>
+<a name="ln170">	fAllocatingThread = find_thread(NULL);</a>
+<a name="ln171">#endif</a>
+<a name="ln172"> </a>
+<a name="ln173">	return B_OK;</a>
+<a name="ln174">}</a>
+<a name="ln175"> </a>
+<a name="ln176"> </a>
+<a name="ln177">void</a>
+<a name="ln178">PrecacheIO::ReadAsync()</a>
+<a name="ln179">{</a>
+<a name="ln180">	// This object is going to be deleted after the I/O request has been</a>
+<a name="ln181">	// fulfilled</a>
+<a name="ln182">	vfs_asynchronous_read_pages(fRef-&gt;vnode, NULL, fOffset, fVecs, fVecCount,</a>
+<a name="ln183">		fSize, B_PHYSICAL_IO_REQUEST, this);</a>
+<a name="ln184">}</a>
+<a name="ln185"> </a>
+<a name="ln186"> </a>
+<a name="ln187">void</a>
+<a name="ln188">PrecacheIO::IOFinished(status_t status, bool partialTransfer,</a>
+<a name="ln189">	generic_size_t bytesTransferred)</a>
+<a name="ln190">{</a>
+<a name="ln191">	AutoLocker&lt;VMCache&gt; locker(fCache);</a>
+<a name="ln192"> </a>
+<a name="ln193">	// Make successfully loaded pages accessible again (partially</a>
+<a name="ln194">	// transferred pages are considered failed)</a>
+<a name="ln195">	phys_size_t pagesTransferred</a>
+<a name="ln196">		= (bytesTransferred + B_PAGE_SIZE - 1) / B_PAGE_SIZE;</a>
+<a name="ln197"> </a>
+<a name="ln198">	if (fOffset + (off_t)bytesTransferred &gt; fCache-&gt;virtual_end)</a>
+<a name="ln199">		bytesTransferred = fCache-&gt;virtual_end - fOffset;</a>
+<a name="ln200"> </a>
+<a name="ln201">	for (uint32 i = 0; i &lt; pagesTransferred; i++) {</a>
+<a name="ln202">		if (i == pagesTransferred - 1</a>
+<a name="ln203">			&amp;&amp; (bytesTransferred % B_PAGE_SIZE) != 0) {</a>
+<a name="ln204">			// clear partial page</a>
+<a name="ln205">			size_t bytesTouched = bytesTransferred % B_PAGE_SIZE;</a>
+<a name="ln206">			vm_memset_physical(</a>
+<a name="ln207">				((phys_addr_t)fPages[i]-&gt;physical_page_number &lt;&lt; PAGE_SHIFT)</a>
+<a name="ln208">					+ bytesTouched,</a>
+<a name="ln209">				0, B_PAGE_SIZE - bytesTouched);</a>
+<a name="ln210">		}</a>
+<a name="ln211"> </a>
+<a name="ln212">		DEBUG_PAGE_ACCESS_TRANSFER(fPages[i], fAllocatingThread);</a>
+<a name="ln213"> </a>
+<a name="ln214">		fCache-&gt;MarkPageUnbusy(fPages[i]);</a>
+<a name="ln215"> </a>
+<a name="ln216">		DEBUG_PAGE_ACCESS_END(fPages[i]);</a>
+<a name="ln217">	}</a>
+<a name="ln218"> </a>
+<a name="ln219">	// Free pages after failed I/O</a>
+<a name="ln220">	for (uint32 i = pagesTransferred; i &lt; fPageCount; i++) {</a>
+<a name="ln221">		DEBUG_PAGE_ACCESS_TRANSFER(fPages[i], fAllocatingThread);</a>
+<a name="ln222">		fCache-&gt;NotifyPageEvents(fPages[i], PAGE_EVENT_NOT_BUSY);</a>
+<a name="ln223">		fCache-&gt;RemovePage(fPages[i]);</a>
+<a name="ln224">		vm_page_set_state(fPages[i], PAGE_STATE_FREE);</a>
+<a name="ln225">	}</a>
+<a name="ln226"> </a>
+<a name="ln227">	delete this;</a>
+<a name="ln228">}</a>
+<a name="ln229"> </a>
+<a name="ln230"> </a>
+<a name="ln231">//	#pragma mark -</a>
+<a name="ln232"> </a>
+<a name="ln233"> </a>
+<a name="ln234">static void</a>
+<a name="ln235">add_to_iovec(generic_io_vec* vecs, uint32 &amp;index, uint32 max,</a>
+<a name="ln236">	generic_addr_t address, generic_size_t size)</a>
+<a name="ln237">{</a>
+<a name="ln238">	if (index &gt; 0 &amp;&amp; vecs[index - 1].base + vecs[index - 1].length == address) {</a>
+<a name="ln239">		// the iovec can be combined with the previous one</a>
+<a name="ln240">		vecs[index - 1].length += size;</a>
+<a name="ln241">		return;</a>
+<a name="ln242">	}</a>
+<a name="ln243"> </a>
+<a name="ln244">	if (index == max)</a>
+<a name="ln245">		panic(&quot;no more space for iovecs!&quot;);</a>
+<a name="ln246"> </a>
+<a name="ln247">	// we need to start a new iovec</a>
+<a name="ln248">	vecs[index].base = address;</a>
+<a name="ln249">	vecs[index].length = size;</a>
+<a name="ln250">	index++;</a>
+<a name="ln251">}</a>
+<a name="ln252"> </a>
+<a name="ln253"> </a>
+<a name="ln254">static inline bool</a>
+<a name="ln255">access_is_sequential(file_cache_ref* ref)</a>
+<a name="ln256">{</a>
+<a name="ln257">	return ref-&gt;last_access[ref-&gt;last_access_index] != 0;</a>
+<a name="ln258">}</a>
+<a name="ln259"> </a>
+<a name="ln260"> </a>
+<a name="ln261">static inline void</a>
+<a name="ln262">push_access(file_cache_ref* ref, off_t offset, generic_size_t bytes,</a>
+<a name="ln263">	bool isWrite)</a>
+<a name="ln264">{</a>
+<a name="ln265">	TRACE((&quot;%p: push %Ld, %ld, %s\n&quot;, ref, offset, bytes,</a>
+<a name="ln266">		isWrite ? &quot;write&quot; : &quot;read&quot;));</a>
+<a name="ln267"> </a>
+<a name="ln268">	int32 index = ref-&gt;last_access_index;</a>
+<a name="ln269">	int32 previous = index - 1;</a>
+<a name="ln270">	if (previous &lt; 0)</a>
+<a name="ln271">		previous = LAST_ACCESSES - 1;</a>
+<a name="ln272"> </a>
+<a name="ln273">	if (offset != ref-&gt;LastAccess(previous, isWrite))</a>
+<a name="ln274">		ref-&gt;last_access[previous] = 0;</a>
+<a name="ln275"> </a>
+<a name="ln276">	ref-&gt;SetLastAccess(index, offset + bytes, isWrite);</a>
+<a name="ln277"> </a>
+<a name="ln278">	if (++index &gt;= LAST_ACCESSES)</a>
+<a name="ln279">		index = 0;</a>
+<a name="ln280">	ref-&gt;last_access_index = index;</a>
+<a name="ln281">}</a>
+<a name="ln282"> </a>
+<a name="ln283"> </a>
+<a name="ln284">static void</a>
+<a name="ln285">reserve_pages(file_cache_ref* ref, vm_page_reservation* reservation,</a>
+<a name="ln286">	size_t reservePages, bool isWrite)</a>
+<a name="ln287">{</a>
+<a name="ln288">	if (low_resource_state(B_KERNEL_RESOURCE_PAGES) != B_NO_LOW_RESOURCE) {</a>
+<a name="ln289">		VMCache* cache = ref-&gt;cache;</a>
+<a name="ln290">		cache-&gt;Lock();</a>
+<a name="ln291"> </a>
+<a name="ln292">		if (cache-&gt;consumers.IsEmpty() &amp;&amp; cache-&gt;areas == NULL</a>
+<a name="ln293">			&amp;&amp; access_is_sequential(ref)) {</a>
+<a name="ln294">			// we are not mapped, and we're accessed sequentially</a>
+<a name="ln295"> </a>
+<a name="ln296">			if (isWrite) {</a>
+<a name="ln297">				// Just write some pages back, and actually wait until they</a>
+<a name="ln298">				// have been written back in order to relieve the page pressure</a>
+<a name="ln299">				// a bit.</a>
+<a name="ln300">				int32 index = ref-&gt;last_access_index;</a>
+<a name="ln301">				int32 previous = index - 1;</a>
+<a name="ln302">				if (previous &lt; 0)</a>
+<a name="ln303">					previous = LAST_ACCESSES - 1;</a>
+<a name="ln304"> </a>
+<a name="ln305">				vm_page_write_modified_page_range(cache,</a>
+<a name="ln306">					ref-&gt;LastAccessPageOffset(previous, true),</a>
+<a name="ln307">					ref-&gt;LastAccessPageOffset(index, true));</a>
+<a name="ln308">			} else {</a>
+<a name="ln309">				// free some pages from our cache</a>
+<a name="ln310">				// TODO: start with oldest</a>
+<a name="ln311">				uint32 left = reservePages;</a>
+<a name="ln312">				vm_page* page;</a>
+<a name="ln313">				for (VMCachePagesTree::Iterator it = cache-&gt;pages.GetIterator();</a>
+<a name="ln314">						(page = it.Next()) != NULL &amp;&amp; left &gt; 0;) {</a>
+<a name="ln315">					if (page-&gt;State() == PAGE_STATE_CACHED &amp;&amp; !page-&gt;busy) {</a>
+<a name="ln316">						DEBUG_PAGE_ACCESS_START(page);</a>
+<a name="ln317">						ASSERT(!page-&gt;IsMapped());</a>
+<a name="ln318">						ASSERT(!page-&gt;modified);</a>
+<a name="ln319">						cache-&gt;RemovePage(page);</a>
+<a name="ln320">						vm_page_set_state(page, PAGE_STATE_FREE);</a>
+<a name="ln321">						left--;</a>
+<a name="ln322">					}</a>
+<a name="ln323">				}</a>
+<a name="ln324">			}</a>
+<a name="ln325">		}</a>
+<a name="ln326">		cache-&gt;Unlock();</a>
+<a name="ln327">	}</a>
+<a name="ln328"> </a>
+<a name="ln329">	vm_page_reserve_pages(reservation, reservePages, VM_PRIORITY_USER);</a>
+<a name="ln330">}</a>
+<a name="ln331"> </a>
+<a name="ln332"> </a>
+<a name="ln333">static inline status_t</a>
+<a name="ln334">read_pages_and_clear_partial(file_cache_ref* ref, void* cookie, off_t offset,</a>
+<a name="ln335">	const generic_io_vec* vecs, size_t count, uint32 flags,</a>
+<a name="ln336">	generic_size_t* _numBytes)</a>
+<a name="ln337">{</a>
+<a name="ln338">	generic_size_t bytesUntouched = *_numBytes;</a>
+<a name="ln339"> </a>
+<a name="ln340">	status_t status = vfs_read_pages(ref-&gt;vnode, cookie, offset, vecs, count,</a>
+<a name="ln341">		flags, _numBytes);</a>
+<a name="ln342"> </a>
+<a name="ln343">	generic_size_t bytesEnd = *_numBytes;</a>
+<a name="ln344"> </a>
+<a name="ln345">	if (offset + (off_t)bytesEnd &gt; ref-&gt;cache-&gt;virtual_end)</a>
+<a name="ln346">		bytesEnd = ref-&gt;cache-&gt;virtual_end - offset;</a>
+<a name="ln347"> </a>
+<a name="ln348">	if (status == B_OK &amp;&amp; bytesEnd &lt; bytesUntouched) {</a>
+<a name="ln349">		// Clear out any leftovers that were not touched by the above read.</a>
+<a name="ln350">		// We're doing this here so that not every file system/device has to</a>
+<a name="ln351">		// implement this.</a>
+<a name="ln352">		bytesUntouched -= bytesEnd;</a>
+<a name="ln353"> </a>
+<a name="ln354">		for (int32 i = count; i-- &gt; 0 &amp;&amp; bytesUntouched != 0; ) {</a>
+<a name="ln355">			generic_size_t length = min_c(bytesUntouched, vecs[i].length);</a>
+<a name="ln356">			vm_memset_physical(vecs[i].base + vecs[i].length - length, 0,</a>
+<a name="ln357">				length);</a>
+<a name="ln358"> </a>
+<a name="ln359">			bytesUntouched -= length;</a>
+<a name="ln360">		}</a>
+<a name="ln361">	}</a>
+<a name="ln362"> </a>
+<a name="ln363">	return status;</a>
+<a name="ln364">}</a>
+<a name="ln365"> </a>
+<a name="ln366"> </a>
+<a name="ln367">/*!	Reads the requested amount of data into the cache, and allocates</a>
+<a name="ln368">	pages needed to fulfill that request. This function is called by cache_io().</a>
+<a name="ln369">	It can only handle a certain amount of bytes, and the caller must make</a>
+<a name="ln370">	sure that it matches that criterion.</a>
+<a name="ln371">	The cache_ref lock must be held when calling this function; during</a>
+<a name="ln372">	operation it will unlock the cache, though.</a>
+<a name="ln373">*/</a>
+<a name="ln374">static status_t</a>
+<a name="ln375">read_into_cache(file_cache_ref* ref, void* cookie, off_t offset,</a>
+<a name="ln376">	int32 pageOffset, addr_t buffer, size_t bufferSize, bool useBuffer,</a>
+<a name="ln377">	vm_page_reservation* reservation, size_t reservePages)</a>
+<a name="ln378">{</a>
+<a name="ln379">	TRACE((&quot;read_into_cache(offset = %Ld, pageOffset = %ld, buffer = %#lx, &quot;</a>
+<a name="ln380">		&quot;bufferSize = %lu\n&quot;, offset, pageOffset, buffer, bufferSize));</a>
+<a name="ln381"> </a>
+<a name="ln382">	VMCache* cache = ref-&gt;cache;</a>
+<a name="ln383"> </a>
+<a name="ln384">	// TODO: We're using way too much stack! Rather allocate a sufficiently</a>
+<a name="ln385">	// large chunk on the heap.</a>
+<a name="ln386">	generic_io_vec vecs[MAX_IO_VECS];</a>
+<a name="ln387">	uint32 vecCount = 0;</a>
+<a name="ln388"> </a>
+<a name="ln389">	generic_size_t numBytes = PAGE_ALIGN(pageOffset + bufferSize);</a>
+<a name="ln390">	vm_page* pages[MAX_IO_VECS];</a>
+<a name="ln391">	int32 pageIndex = 0;</a>
+<a name="ln392"> </a>
+<a name="ln393">	// allocate pages for the cache and mark them busy</a>
+<a name="ln394">	for (generic_size_t pos = 0; pos &lt; numBytes; pos += B_PAGE_SIZE) {</a>
+<a name="ln395">		vm_page* page = pages[pageIndex++] = vm_page_allocate_page(</a>
+<a name="ln396">			reservation, PAGE_STATE_CACHED | VM_PAGE_ALLOC_BUSY);</a>
+<a name="ln397"> </a>
+<a name="ln398">		cache-&gt;InsertPage(page, offset + pos);</a>
+<a name="ln399"> </a>
+<a name="ln400">		add_to_iovec(vecs, vecCount, MAX_IO_VECS,</a>
+<a name="ln401">			page-&gt;physical_page_number * B_PAGE_SIZE, B_PAGE_SIZE);</a>
+<a name="ln402">			// TODO: check if the array is large enough (currently panics)!</a>
+<a name="ln403">	}</a>
+<a name="ln404"> </a>
+<a name="ln405">	push_access(ref, offset, bufferSize, false);</a>
+<a name="ln406">	cache-&gt;Unlock();</a>
+<a name="ln407">	vm_page_unreserve_pages(reservation);</a>
+<a name="ln408"> </a>
+<a name="ln409">	// read file into reserved pages</a>
+<a name="ln410">	status_t status = read_pages_and_clear_partial(ref, cookie, offset, vecs,</a>
+<a name="ln411">		vecCount, B_PHYSICAL_IO_REQUEST, &amp;numBytes);</a>
+<a name="ln412">	if (status != B_OK) {</a>
+<a name="ln413">		// reading failed, free allocated pages</a>
+<a name="ln414"> </a>
+<a name="ln415">		dprintf(&quot;file_cache: read pages failed: %s\n&quot;, strerror(status));</a>
+<a name="ln416"> </a>
+<a name="ln417">		cache-&gt;Lock();</a>
+<a name="ln418"> </a>
+<a name="ln419">		for (int32 i = 0; i &lt; pageIndex; i++) {</a>
+<a name="ln420">			cache-&gt;NotifyPageEvents(pages[i], PAGE_EVENT_NOT_BUSY);</a>
+<a name="ln421">			cache-&gt;RemovePage(pages[i]);</a>
+<a name="ln422">			vm_page_set_state(pages[i], PAGE_STATE_FREE);</a>
+<a name="ln423">		}</a>
+<a name="ln424"> </a>
+<a name="ln425">		return status;</a>
+<a name="ln426">	}</a>
+<a name="ln427"> </a>
+<a name="ln428">	// copy the pages if needed and unmap them again</a>
+<a name="ln429"> </a>
+<a name="ln430">	for (int32 i = 0; i &lt; pageIndex; i++) {</a>
+<a name="ln431">		if (useBuffer &amp;&amp; bufferSize != 0) {</a>
+<a name="ln432">			size_t bytes = min_c(bufferSize, (size_t)B_PAGE_SIZE - pageOffset);</a>
+<a name="ln433"> </a>
+<a name="ln434">			vm_memcpy_from_physical((void*)buffer,</a>
+<a name="ln435">				pages[i]-&gt;physical_page_number * B_PAGE_SIZE + pageOffset,</a>
+<a name="ln436">				bytes, IS_USER_ADDRESS(buffer));</a>
+<a name="ln437"> </a>
+<a name="ln438">			buffer += bytes;</a>
+<a name="ln439">			bufferSize -= bytes;</a>
+<a name="ln440">			pageOffset = 0;</a>
+<a name="ln441">		}</a>
+<a name="ln442">	}</a>
+<a name="ln443"> </a>
+<a name="ln444">	reserve_pages(ref, reservation, reservePages, false);</a>
+<a name="ln445">	cache-&gt;Lock();</a>
+<a name="ln446"> </a>
+<a name="ln447">	// make the pages accessible in the cache</a>
+<a name="ln448">	for (int32 i = pageIndex; i-- &gt; 0;) {</a>
+<a name="ln449">		DEBUG_PAGE_ACCESS_END(pages[i]);</a>
+<a name="ln450"> </a>
+<a name="ln451">		cache-&gt;MarkPageUnbusy(pages[i]);</a>
+<a name="ln452">	}</a>
+<a name="ln453"> </a>
+<a name="ln454">	return B_OK;</a>
+<a name="ln455">}</a>
+<a name="ln456"> </a>
+<a name="ln457"> </a>
+<a name="ln458">static status_t</a>
+<a name="ln459">read_from_file(file_cache_ref* ref, void* cookie, off_t offset,</a>
+<a name="ln460">	int32 pageOffset, addr_t buffer, size_t bufferSize, bool useBuffer,</a>
+<a name="ln461">	vm_page_reservation* reservation, size_t reservePages)</a>
+<a name="ln462">{</a>
+<a name="ln463">	TRACE((&quot;read_from_file(offset = %Ld, pageOffset = %ld, buffer = %#lx, &quot;</a>
+<a name="ln464">		&quot;bufferSize = %lu\n&quot;, offset, pageOffset, buffer, bufferSize));</a>
+<a name="ln465"> </a>
+<a name="ln466">	if (!useBuffer)</a>
+<a name="ln467">		return B_OK;</a>
+<a name="ln468"> </a>
+<a name="ln469">	generic_io_vec vec;</a>
+<a name="ln470">	vec.base = buffer;</a>
+<a name="ln471">	vec.length = bufferSize;</a>
+<a name="ln472"> </a>
+<a name="ln473">	push_access(ref, offset, bufferSize, false);</a>
+<a name="ln474">	ref-&gt;cache-&gt;Unlock();</a>
+<a name="ln475">	vm_page_unreserve_pages(reservation);</a>
+<a name="ln476"> </a>
+<a name="ln477">	generic_size_t toRead = bufferSize;</a>
+<a name="ln478">	status_t status = vfs_read_pages(ref-&gt;vnode, cookie, offset + pageOffset,</a>
+<a name="ln479">		&amp;vec, 1, 0, &amp;toRead);</a>
+<a name="ln480"> </a>
+<a name="ln481">	if (status == B_OK)</a>
+<a name="ln482">		reserve_pages(ref, reservation, reservePages, false);</a>
+<a name="ln483"> </a>
+<a name="ln484">	ref-&gt;cache-&gt;Lock();</a>
+<a name="ln485"> </a>
+<a name="ln486">	return status;</a>
+<a name="ln487">}</a>
+<a name="ln488"> </a>
+<a name="ln489"> </a>
+<a name="ln490">/*!	Like read_into_cache() but writes data into the cache.</a>
+<a name="ln491">	To preserve data consistency, it might also read pages into the cache,</a>
+<a name="ln492">	though, if only a partial page gets written.</a>
+<a name="ln493">	The same restrictions apply.</a>
+<a name="ln494">*/</a>
+<a name="ln495">static status_t</a>
+<a name="ln496">write_to_cache(file_cache_ref* ref, void* cookie, off_t offset,</a>
+<a name="ln497">	int32 pageOffset, addr_t buffer, size_t bufferSize, bool useBuffer,</a>
+<a name="ln498">	vm_page_reservation* reservation, size_t reservePages)</a>
+<a name="ln499">{</a>
+<a name="ln500">	// TODO: We're using way too much stack! Rather allocate a sufficiently</a>
+<a name="ln501">	// large chunk on the heap.</a>
+<a name="ln502">	generic_io_vec vecs[MAX_IO_VECS];</a>
+<a name="ln503">	uint32 vecCount = 0;</a>
+<a name="ln504">	generic_size_t numBytes = PAGE_ALIGN(pageOffset + bufferSize);</a>
+<a name="ln505">	vm_page* pages[MAX_IO_VECS];</a>
+<a name="ln506">	int32 pageIndex = 0;</a>
+<a name="ln507">	status_t status = B_OK;</a>
+<a name="ln508"> </a>
+<a name="ln509">	// ToDo: this should be settable somewhere</a>
+<a name="ln510">	bool writeThrough = false;</a>
+<a name="ln511"> </a>
+<a name="ln512">	// allocate pages for the cache and mark them busy</a>
+<a name="ln513">	for (generic_size_t pos = 0; pos &lt; numBytes; pos += B_PAGE_SIZE) {</a>
+<a name="ln514">		// TODO: if space is becoming tight, and this cache is already grown</a>
+<a name="ln515">		//	big - shouldn't we better steal the pages directly in that case?</a>
+<a name="ln516">		//	(a working set like approach for the file cache)</a>
+<a name="ln517">		// TODO: the pages we allocate here should have been reserved upfront</a>
+<a name="ln518">		//	in cache_io()</a>
+<a name="ln519">		vm_page* page = pages[pageIndex++] = vm_page_allocate_page(</a>
+<a name="ln520">			reservation,</a>
+<a name="ln521">			(writeThrough ? PAGE_STATE_CACHED : PAGE_STATE_MODIFIED)</a>
+<a name="ln522">				| VM_PAGE_ALLOC_BUSY);</a>
+<a name="ln523"> </a>
+<a name="ln524">		page-&gt;modified = !writeThrough;</a>
+<a name="ln525"> </a>
+<a name="ln526">		ref-&gt;cache-&gt;InsertPage(page, offset + pos);</a>
+<a name="ln527"> </a>
+<a name="ln528">		add_to_iovec(vecs, vecCount, MAX_IO_VECS,</a>
+<a name="ln529">			page-&gt;physical_page_number * B_PAGE_SIZE, B_PAGE_SIZE);</a>
+<a name="ln530">	}</a>
+<a name="ln531"> </a>
+<a name="ln532">	push_access(ref, offset, bufferSize, true);</a>
+<a name="ln533">	ref-&gt;cache-&gt;Unlock();</a>
+<a name="ln534">	vm_page_unreserve_pages(reservation);</a>
+<a name="ln535"> </a>
+<a name="ln536">	// copy contents (and read in partially written pages first)</a>
+<a name="ln537"> </a>
+<a name="ln538">	if (pageOffset != 0) {</a>
+<a name="ln539">		// This is only a partial write, so we have to read the rest of the page</a>
+<a name="ln540">		// from the file to have consistent data in the cache</a>
+<a name="ln541">		generic_io_vec readVec = { vecs[0].base, B_PAGE_SIZE };</a>
+<a name="ln542">		generic_size_t bytesRead = B_PAGE_SIZE;</a>
+<a name="ln543"> </a>
+<a name="ln544">		status = vfs_read_pages(ref-&gt;vnode, cookie, offset, &amp;readVec, 1,</a>
+<a name="ln545">			B_PHYSICAL_IO_REQUEST, &amp;bytesRead);</a>
+<a name="ln546">		// ToDo: handle errors for real!</a>
+<a name="ln547">		if (status &lt; B_OK)</a>
+<a name="ln548">			panic(&quot;1. vfs_read_pages() failed: %s!\n&quot;, strerror(status));</a>
+<a name="ln549">	}</a>
+<a name="ln550"> </a>
+<a name="ln551">	size_t lastPageOffset = (pageOffset + bufferSize) % B_PAGE_SIZE;</a>
+<a name="ln552">	if (lastPageOffset != 0) {</a>
+<a name="ln553">		// get the last page in the I/O vectors</a>
+<a name="ln554">		generic_addr_t last = vecs[vecCount - 1].base</a>
+<a name="ln555">			+ vecs[vecCount - 1].length - B_PAGE_SIZE;</a>
+<a name="ln556"> </a>
+<a name="ln557">		if ((off_t)(offset + pageOffset + bufferSize) == ref-&gt;cache-&gt;virtual_end) {</a>
+<a name="ln558">			// the space in the page after this write action needs to be cleaned</a>
+<a name="ln559">			vm_memset_physical(last + lastPageOffset, 0,</a>
+<a name="ln560">				B_PAGE_SIZE - lastPageOffset);</a>
+<a name="ln561">		} else {</a>
+<a name="ln562">			// the end of this write does not happen on a page boundary, so we</a>
+<a name="ln563">			// need to fetch the last page before we can update it</a>
+<a name="ln564">			generic_io_vec readVec = { last, B_PAGE_SIZE };</a>
+<a name="ln565">			generic_size_t bytesRead = B_PAGE_SIZE;</a>
+<a name="ln566"> </a>
+<a name="ln567">			status = vfs_read_pages(ref-&gt;vnode, cookie,</a>
+<a name="ln568">				PAGE_ALIGN(offset + pageOffset + bufferSize) - B_PAGE_SIZE,</a>
+<a name="ln569">				&amp;readVec, 1, B_PHYSICAL_IO_REQUEST, &amp;bytesRead);</a>
+<a name="ln570">			// ToDo: handle errors for real!</a>
+<a name="ln571">			if (status &lt; B_OK)</a>
+<a name="ln572">				panic(&quot;vfs_read_pages() failed: %s!\n&quot;, strerror(status));</a>
+<a name="ln573"> </a>
+<a name="ln574">			if (bytesRead &lt; B_PAGE_SIZE) {</a>
+<a name="ln575">				// the space beyond the file size needs to be cleaned</a>
+<a name="ln576">				vm_memset_physical(last + bytesRead, 0,</a>
+<a name="ln577">					B_PAGE_SIZE - bytesRead);</a>
+<a name="ln578">			}</a>
+<a name="ln579">		}</a>
+<a name="ln580">	}</a>
+<a name="ln581"> </a>
+<a name="ln582">	for (uint32 i = 0; i &lt; vecCount; i++) {</a>
+<a name="ln583">		generic_addr_t base = vecs[i].base;</a>
+<a name="ln584">		generic_size_t bytes = min_c((generic_size_t)bufferSize,</a>
+<a name="ln585">			generic_size_t(vecs[i].length - pageOffset));</a>
+<a name="ln586"> </a>
+<a name="ln587">		if (useBuffer) {</a>
+<a name="ln588">			// copy data from user buffer</a>
+<a name="ln589">			vm_memcpy_to_physical(base + pageOffset, (void*)buffer, bytes,</a>
+<a name="ln590">				IS_USER_ADDRESS(buffer));</a>
+<a name="ln591">		} else {</a>
+<a name="ln592">			// clear buffer instead</a>
+<a name="ln593">			vm_memset_physical(base + pageOffset, 0, bytes);</a>
+<a name="ln594">		}</a>
+<a name="ln595"> </a>
+<a name="ln596">		bufferSize -= bytes;</a>
+<a name="ln597">		if (bufferSize == 0)</a>
+<a name="ln598">			break;</a>
+<a name="ln599"> </a>
+<a name="ln600">		buffer += bytes;</a>
+<a name="ln601">		pageOffset = 0;</a>
+<a name="ln602">	}</a>
+<a name="ln603"> </a>
+<a name="ln604">	if (writeThrough) {</a>
+<a name="ln605">		// write cached pages back to the file if we were asked to do that</a>
+<a name="ln606">		status_t status = vfs_write_pages(ref-&gt;vnode, cookie, offset, vecs,</a>
+<a name="ln607">			vecCount, B_PHYSICAL_IO_REQUEST, &amp;numBytes);</a>
+<a name="ln608">		if (status &lt; B_OK) {</a>
+<a name="ln609">			// ToDo: remove allocated pages, ...?</a>
+<a name="ln610">			panic(&quot;file_cache: remove allocated pages! write pages failed: %s\n&quot;,</a>
+<a name="ln611">				strerror(status));</a>
+<a name="ln612">		}</a>
+<a name="ln613">	}</a>
+<a name="ln614"> </a>
+<a name="ln615">	if (status == B_OK)</a>
+<a name="ln616">		reserve_pages(ref, reservation, reservePages, true);</a>
+<a name="ln617"> </a>
+<a name="ln618">	ref-&gt;cache-&gt;Lock();</a>
+<a name="ln619"> </a>
+<a name="ln620">	// make the pages accessible in the cache</a>
+<a name="ln621">	for (int32 i = pageIndex; i-- &gt; 0;) {</a>
+<a name="ln622">		ref-&gt;cache-&gt;MarkPageUnbusy(pages[i]);</a>
+<a name="ln623"> </a>
+<a name="ln624">		DEBUG_PAGE_ACCESS_END(pages[i]);</a>
+<a name="ln625">	}</a>
+<a name="ln626"> </a>
+<a name="ln627">	return status;</a>
+<a name="ln628">}</a>
+<a name="ln629"> </a>
+<a name="ln630"> </a>
+<a name="ln631">static status_t</a>
+<a name="ln632">write_to_file(file_cache_ref* ref, void* cookie, off_t offset, int32 pageOffset,</a>
+<a name="ln633">	addr_t buffer, size_t bufferSize, bool useBuffer,</a>
+<a name="ln634">	vm_page_reservation* reservation, size_t reservePages)</a>
+<a name="ln635">{</a>
+<a name="ln636">	push_access(ref, offset, bufferSize, true);</a>
+<a name="ln637">	ref-&gt;cache-&gt;Unlock();</a>
+<a name="ln638">	vm_page_unreserve_pages(reservation);</a>
+<a name="ln639"> </a>
+<a name="ln640">	status_t status = B_OK;</a>
+<a name="ln641"> </a>
+<a name="ln642">	if (!useBuffer) {</a>
+<a name="ln643">		while (bufferSize &gt; 0) {</a>
+<a name="ln644">			generic_size_t written = min_c(bufferSize, kZeroVecSize);</a>
+<a name="ln645">			status = vfs_write_pages(ref-&gt;vnode, cookie, offset + pageOffset,</a>
+<a name="ln646">				sZeroVecs, kZeroVecCount, B_PHYSICAL_IO_REQUEST, &amp;written);</a>
+<a name="ln647">			if (status != B_OK)</a>
+<a name="ln648">				return status;</a>
+<a name="ln649">			if (written == 0)</a>
+<a name="ln650">				return B_ERROR;</a>
+<a name="ln651"> </a>
+<a name="ln652">			bufferSize -= written;</a>
+<a name="ln653">			pageOffset += written;</a>
+<a name="ln654">		}</a>
+<a name="ln655">	} else {</a>
+<a name="ln656">		generic_io_vec vec;</a>
+<a name="ln657">		vec.base = buffer;</a>
+<a name="ln658">		vec.length = bufferSize;</a>
+<a name="ln659">		generic_size_t toWrite = bufferSize;</a>
+<a name="ln660">		status = vfs_write_pages(ref-&gt;vnode, cookie, offset + pageOffset,</a>
+<a name="ln661">			&amp;vec, 1, 0, &amp;toWrite);</a>
+<a name="ln662">	}</a>
+<a name="ln663"> </a>
+<a name="ln664">	if (status == B_OK)</a>
+<a name="ln665">		reserve_pages(ref, reservation, reservePages, true);</a>
+<a name="ln666"> </a>
+<a name="ln667">	ref-&gt;cache-&gt;Lock();</a>
+<a name="ln668"> </a>
+<a name="ln669">	return status;</a>
+<a name="ln670">}</a>
+<a name="ln671"> </a>
+<a name="ln672"> </a>
+<a name="ln673">static inline status_t</a>
+<a name="ln674">satisfy_cache_io(file_cache_ref* ref, void* cookie, cache_func function,</a>
+<a name="ln675">	off_t offset, addr_t buffer, bool useBuffer, int32 &amp;pageOffset,</a>
+<a name="ln676">	size_t bytesLeft, size_t &amp;reservePages, off_t &amp;lastOffset,</a>
+<a name="ln677">	addr_t &amp;lastBuffer, int32 &amp;lastPageOffset, size_t &amp;lastLeft,</a>
+<a name="ln678">	size_t &amp;lastReservedPages, vm_page_reservation* reservation)</a>
+<a name="ln679">{</a>
+<a name="ln680">	if (lastBuffer == buffer)</a>
+<a name="ln681">		return B_OK;</a>
+<a name="ln682"> </a>
+<a name="ln683">	size_t requestSize = buffer - lastBuffer;</a>
+<a name="ln684">	reservePages = min_c(MAX_IO_VECS, (lastLeft - requestSize</a>
+<a name="ln685">		+ lastPageOffset + B_PAGE_SIZE - 1) &gt;&gt; PAGE_SHIFT);</a>
+<a name="ln686"> </a>
+<a name="ln687">	status_t status = function(ref, cookie, lastOffset, lastPageOffset,</a>
+<a name="ln688">		lastBuffer, requestSize, useBuffer, reservation, reservePages);</a>
+<a name="ln689">	if (status == B_OK) {</a>
+<a name="ln690">		lastReservedPages = reservePages;</a>
+<a name="ln691">		lastBuffer = buffer;</a>
+<a name="ln692">		lastLeft = bytesLeft;</a>
+<a name="ln693">		lastOffset = offset;</a>
+<a name="ln694">		lastPageOffset = 0;</a>
+<a name="ln695">		pageOffset = 0;</a>
+<a name="ln696">	}</a>
+<a name="ln697">	return status;</a>
+<a name="ln698">}</a>
+<a name="ln699"> </a>
+<a name="ln700"> </a>
+<a name="ln701">static status_t</a>
+<a name="ln702">cache_io(void* _cacheRef, void* cookie, off_t offset, addr_t buffer,</a>
+<a name="ln703">	size_t* _size, bool doWrite)</a>
+<a name="ln704">{</a>
+<a name="ln705">	if (_cacheRef == NULL)</a>
+<a name="ln706">		panic(&quot;cache_io() called with NULL ref!\n&quot;);</a>
+<a name="ln707"> </a>
+<a name="ln708">	file_cache_ref* ref = (file_cache_ref*)_cacheRef;</a>
+<a name="ln709">	VMCache* cache = ref-&gt;cache;</a>
+<a name="ln710">	bool useBuffer = buffer != 0;</a>
+<a name="ln711"> </a>
+<a name="ln712">	TRACE((&quot;cache_io(ref = %p, offset = %Ld, buffer = %p, size = %lu, %s)\n&quot;,</a>
+<a name="ln713">		ref, offset, (void*)buffer, *_size, doWrite ? &quot;write&quot; : &quot;read&quot;));</a>
+<a name="ln714"> </a>
+<a name="ln715">	int32 pageOffset = offset &amp; (B_PAGE_SIZE - 1);</a>
+<a name="ln716">	size_t size = *_size;</a>
+<a name="ln717">	offset -= pageOffset;</a>
+<a name="ln718"> </a>
+<a name="ln719">	// &quot;offset&quot; and &quot;lastOffset&quot; are always aligned to B_PAGE_SIZE,</a>
+<a name="ln720">	// the &quot;last*&quot; variables always point to the end of the last</a>
+<a name="ln721">	// satisfied request part</a>
+<a name="ln722"> </a>
+<a name="ln723">	const uint32 kMaxChunkSize = MAX_IO_VECS * B_PAGE_SIZE;</a>
+<a name="ln724">	size_t bytesLeft = size, lastLeft = size;</a>
+<a name="ln725">	int32 lastPageOffset = pageOffset;</a>
+<a name="ln726">	addr_t lastBuffer = buffer;</a>
+<a name="ln727">	off_t lastOffset = offset;</a>
+<a name="ln728">	size_t lastReservedPages = min_c(MAX_IO_VECS, (pageOffset + bytesLeft</a>
+<a name="ln729">		+ B_PAGE_SIZE - 1) &gt;&gt; PAGE_SHIFT);</a>
+<a name="ln730">	size_t reservePages = 0;</a>
+<a name="ln731">	size_t pagesProcessed = 0;</a>
+<a name="ln732">	cache_func function = NULL;</a>
+<a name="ln733"> </a>
+<a name="ln734">	vm_page_reservation reservation;</a>
+<a name="ln735">	reserve_pages(ref, &amp;reservation, lastReservedPages, doWrite);</a>
+<a name="ln736"> </a>
+<a name="ln737">	AutoLocker&lt;VMCache&gt; locker(cache);</a>
+<a name="ln738"> </a>
+<a name="ln739">	while (bytesLeft &gt; 0) {</a>
+<a name="ln740">		// Periodically reevaluate the low memory situation and select the</a>
+<a name="ln741">		// read/write hook accordingly</a>
+<a name="ln742">		if (pagesProcessed % 32 == 0) {</a>
+<a name="ln743">			if (size &gt;= BYPASS_IO_SIZE</a>
+<a name="ln744">				&amp;&amp; low_resource_state(B_KERNEL_RESOURCE_PAGES)</a>
+<a name="ln745">					!= B_NO_LOW_RESOURCE) {</a>
+<a name="ln746">				// In low memory situations we bypass the cache beyond a</a>
+<a name="ln747">				// certain I/O size.</a>
+<a name="ln748">				function = doWrite ? write_to_file : read_from_file;</a>
+<a name="ln749">			} else</a>
+<a name="ln750">				function = doWrite ? write_to_cache : read_into_cache;</a>
+<a name="ln751">		}</a>
+<a name="ln752"> </a>
+<a name="ln753">		// check if this page is already in memory</a>
+<a name="ln754">		vm_page* page = cache-&gt;LookupPage(offset);</a>
+<a name="ln755">		if (page != NULL) {</a>
+<a name="ln756">			// The page may be busy - since we need to unlock the cache sometime</a>
+<a name="ln757">			// in the near future, we need to satisfy the request of the pages</a>
+<a name="ln758">			// we didn't get yet (to make sure no one else interferes in the</a>
+<a name="ln759">			// meantime).</a>
+<a name="ln760">			status_t status = satisfy_cache_io(ref, cookie, function, offset,</a>
+<a name="ln761">				buffer, useBuffer, pageOffset, bytesLeft, reservePages,</a>
+<a name="ln762">				lastOffset, lastBuffer, lastPageOffset, lastLeft,</a>
+<a name="ln763">				lastReservedPages, &amp;reservation);</a>
+<a name="ln764">			if (status != B_OK)</a>
+<a name="ln765">				return status;</a>
+<a name="ln766"> </a>
+<a name="ln767">			// Since satisfy_cache_io() unlocks the cache, we need to look up</a>
+<a name="ln768">			// the page again.</a>
+<a name="ln769">			page = cache-&gt;LookupPage(offset);</a>
+<a name="ln770">			if (page != NULL &amp;&amp; page-&gt;busy) {</a>
+<a name="ln771">				cache-&gt;WaitForPageEvents(page, PAGE_EVENT_NOT_BUSY, true);</a>
+<a name="ln772">				continue;</a>
+<a name="ln773">			}</a>
+<a name="ln774">		}</a>
+<a name="ln775"> </a>
+<a name="ln776">		size_t bytesInPage = min_c(size_t(B_PAGE_SIZE - pageOffset), bytesLeft);</a>
+<a name="ln777"> </a>
+<a name="ln778">		TRACE((&quot;lookup page from offset %Ld: %p, size = %lu, pageOffset &quot;</a>
+<a name="ln779">			&quot;= %lu\n&quot;, offset, page, bytesLeft, pageOffset));</a>
+<a name="ln780"> </a>
+<a name="ln781">		if (page != NULL) {</a>
+<a name="ln782">			if (doWrite || useBuffer) {</a>
+<a name="ln783">				// Since the following user_mem{cpy,set}() might cause a page</a>
+<a name="ln784">				// fault, which in turn might cause pages to be reserved, we</a>
+<a name="ln785">				// need to unlock the cache temporarily to avoid a potential</a>
+<a name="ln786">				// deadlock. To make sure that our page doesn't go away, we mark</a>
+<a name="ln787">				// it busy for the time.</a>
+<a name="ln788">				page-&gt;busy = true;</a>
+<a name="ln789">				locker.Unlock();</a>
+<a name="ln790"> </a>
+<a name="ln791">				// copy the contents of the page already in memory</a>
+<a name="ln792">				phys_addr_t pageAddress</a>
+<a name="ln793">					= (phys_addr_t)page-&gt;physical_page_number * B_PAGE_SIZE</a>
+<a name="ln794">						+ pageOffset;</a>
+<a name="ln795">				bool userBuffer = IS_USER_ADDRESS(buffer);</a>
+<a name="ln796">				if (doWrite) {</a>
+<a name="ln797">					if (useBuffer) {</a>
+<a name="ln798">						vm_memcpy_to_physical(pageAddress, (void*)buffer,</a>
+<a name="ln799">							bytesInPage, userBuffer);</a>
+<a name="ln800">					} else {</a>
+<a name="ln801">						vm_memset_physical(pageAddress, 0, bytesInPage);</a>
+<a name="ln802">					}</a>
+<a name="ln803">				} else if (useBuffer) {</a>
+<a name="ln804">					vm_memcpy_from_physical((void*)buffer, pageAddress,</a>
+<a name="ln805">						bytesInPage, userBuffer);</a>
+<a name="ln806">				}</a>
+<a name="ln807"> </a>
+<a name="ln808">				locker.Lock();</a>
+<a name="ln809"> </a>
+<a name="ln810">				if (doWrite) {</a>
+<a name="ln811">					DEBUG_PAGE_ACCESS_START(page);</a>
+<a name="ln812"> </a>
+<a name="ln813">					page-&gt;modified = true;</a>
+<a name="ln814"> </a>
+<a name="ln815">					if (page-&gt;State() != PAGE_STATE_MODIFIED)</a>
+<a name="ln816">						vm_page_set_state(page, PAGE_STATE_MODIFIED);</a>
+<a name="ln817"> </a>
+<a name="ln818">					DEBUG_PAGE_ACCESS_END(page);</a>
+<a name="ln819">				}</a>
+<a name="ln820"> </a>
+<a name="ln821">				cache-&gt;MarkPageUnbusy(page);</a>
+<a name="ln822">			}</a>
+<a name="ln823"> </a>
+<a name="ln824">			// If it is cached only, requeue the page, so the respective queue</a>
+<a name="ln825">			// roughly remains LRU first sorted.</a>
+<a name="ln826">			if (page-&gt;State() == PAGE_STATE_CACHED</a>
+<a name="ln827">					|| page-&gt;State() == PAGE_STATE_MODIFIED) {</a>
+<a name="ln828">				DEBUG_PAGE_ACCESS_START(page);</a>
+<a name="ln829">				vm_page_requeue(page, true);</a>
+<a name="ln830">				DEBUG_PAGE_ACCESS_END(page);</a>
+<a name="ln831">			}</a>
+<a name="ln832"> </a>
+<a name="ln833">			if (bytesLeft &lt;= bytesInPage) {</a>
+<a name="ln834">				// we've read the last page, so we're done!</a>
+<a name="ln835">				locker.Unlock();</a>
+<a name="ln836">				vm_page_unreserve_pages(&amp;reservation);</a>
+<a name="ln837">				return B_OK;</a>
+<a name="ln838">			}</a>
+<a name="ln839"> </a>
+<a name="ln840">			// prepare a potential gap request</a>
+<a name="ln841">			lastBuffer = buffer + bytesInPage;</a>
+<a name="ln842">			lastLeft = bytesLeft - bytesInPage;</a>
+<a name="ln843">			lastOffset = offset + B_PAGE_SIZE;</a>
+<a name="ln844">			lastPageOffset = 0;</a>
+<a name="ln845">		}</a>
+<a name="ln846"> </a>
+<a name="ln847">		if (bytesLeft &lt;= bytesInPage)</a>
+<a name="ln848">			break;</a>
+<a name="ln849"> </a>
+<a name="ln850">		buffer += bytesInPage;</a>
+<a name="ln851">		bytesLeft -= bytesInPage;</a>
+<a name="ln852">		pageOffset = 0;</a>
+<a name="ln853">		offset += B_PAGE_SIZE;</a>
+<a name="ln854">		pagesProcessed++;</a>
+<a name="ln855"> </a>
+<a name="ln856">		if (buffer - lastBuffer + lastPageOffset &gt;= kMaxChunkSize) {</a>
+<a name="ln857">			status_t status = satisfy_cache_io(ref, cookie, function, offset,</a>
+<a name="ln858">				buffer, useBuffer, pageOffset, bytesLeft, reservePages,</a>
+<a name="ln859">				lastOffset, lastBuffer, lastPageOffset, lastLeft,</a>
+<a name="ln860">				lastReservedPages, &amp;reservation);</a>
+<a name="ln861">			if (status != B_OK)</a>
+<a name="ln862">				return status;</a>
+<a name="ln863">		}</a>
+<a name="ln864">	}</a>
+<a name="ln865"> </a>
+<a name="ln866">	// fill the last remaining bytes of the request (either write or read)</a>
+<a name="ln867"> </a>
+<a name="ln868">	return function(ref, cookie, lastOffset, lastPageOffset, lastBuffer,</a>
+<a name="ln869">		lastLeft, useBuffer, &amp;reservation, 0);</a>
+<a name="ln870">}</a>
+<a name="ln871"> </a>
+<a name="ln872"> </a>
+<a name="ln873">static status_t</a>
+<a name="ln874">file_cache_control(const char* subsystem, uint32 function, void* buffer,</a>
+<a name="ln875">	size_t bufferSize)</a>
+<a name="ln876">{</a>
+<a name="ln877">	switch (function) {</a>
+<a name="ln878">		case CACHE_CLEAR:</a>
+<a name="ln879">			// ToDo: clear the cache</a>
+<a name="ln880">			dprintf(&quot;cache_control: clear cache!\n&quot;);</a>
+<a name="ln881">			return B_OK;</a>
+<a name="ln882"> </a>
+<a name="ln883">		case CACHE_SET_MODULE:</a>
+<a name="ln884">		{</a>
+<a name="ln885">			cache_module_info* module = sCacheModule;</a>
+<a name="ln886"> </a>
+<a name="ln887">			// unset previous module</a>
+<a name="ln888"> </a>
+<a name="ln889">			if (sCacheModule != NULL) {</a>
+<a name="ln890">				sCacheModule = NULL;</a>
+<a name="ln891">				snooze(100000);	// 0.1 secs</a>
+<a name="ln892">				put_module(module-&gt;info.name);</a>
+<a name="ln893">			}</a>
+<a name="ln894"> </a>
+<a name="ln895">			// get new module, if any</a>
+<a name="ln896"> </a>
+<a name="ln897">			if (buffer == NULL)</a>
+<a name="ln898">				return B_OK;</a>
+<a name="ln899"> </a>
+<a name="ln900">			char name[B_FILE_NAME_LENGTH];</a>
+<a name="ln901">			if (!IS_USER_ADDRESS(buffer)</a>
+<a name="ln902">				|| user_strlcpy(name, (char*)buffer,</a>
+<a name="ln903">						B_FILE_NAME_LENGTH) &lt; B_OK)</a>
+<a name="ln904">				return B_BAD_ADDRESS;</a>
+<a name="ln905"> </a>
+<a name="ln906">			if (strncmp(name, CACHE_MODULES_NAME, strlen(CACHE_MODULES_NAME)))</a>
+<a name="ln907">				return B_BAD_VALUE;</a>
+<a name="ln908"> </a>
+<a name="ln909">			dprintf(&quot;cache_control: set module %s!\n&quot;, name);</a>
+<a name="ln910"> </a>
+<a name="ln911">			status_t status = get_module(name, (module_info**)&amp;module);</a>
+<a name="ln912">			if (status == B_OK)</a>
+<a name="ln913">				sCacheModule = module;</a>
+<a name="ln914"> </a>
+<a name="ln915">			return status;</a>
+<a name="ln916">		}</a>
+<a name="ln917">	}</a>
+<a name="ln918"> </a>
+<a name="ln919">	return B_BAD_HANDLER;</a>
+<a name="ln920">}</a>
+<a name="ln921"> </a>
+<a name="ln922"> </a>
+<a name="ln923">//	#pragma mark - private kernel API</a>
+<a name="ln924"> </a>
+<a name="ln925"> </a>
+<a name="ln926">extern &quot;C&quot; void</a>
+<a name="ln927">cache_prefetch_vnode(struct vnode* vnode, off_t offset, size_t size)</a>
+<a name="ln928">{</a>
+<a name="ln929">	if (size == 0)</a>
+<a name="ln930">		return;</a>
+<a name="ln931"> </a>
+<a name="ln932">	VMCache* cache;</a>
+<a name="ln933">	if (vfs_get_vnode_cache(vnode, &amp;cache, false) != B_OK)</a>
+<a name="ln934">		return;</a>
+<a name="ln935"> </a>
+<a name="ln936">	file_cache_ref* ref = ((VMVnodeCache*)cache)-&gt;FileCacheRef();</a>
+<a name="ln937">	off_t fileSize = cache-&gt;virtual_end;</a>
+<a name="ln938"> </a>
+<a name="ln939">	if ((off_t)(offset + size) &gt; fileSize)</a>
+<a name="ln940">		size = fileSize - offset;</a>
+<a name="ln941"> </a>
+<a name="ln942">	// &quot;offset&quot; and &quot;size&quot; are always aligned to B_PAGE_SIZE,</a>
+<a name="ln943">	offset = ROUNDDOWN(offset, B_PAGE_SIZE);</a>
+<a name="ln944">	size = ROUNDUP(size, B_PAGE_SIZE);</a>
+<a name="ln945"> </a>
+<a name="ln946">	size_t reservePages = size / B_PAGE_SIZE;</a>
+<a name="ln947"> </a>
+<a name="ln948">	// Don't do anything if we don't have the resources left, or the cache</a>
+<a name="ln949">	// already contains more than 2/3 of its pages</a>
+<a name="ln950">	if (offset &gt;= fileSize || vm_page_num_unused_pages() &lt; 2 * reservePages</a>
+<a name="ln951">		|| 3 * cache-&gt;page_count &gt; 2 * fileSize / B_PAGE_SIZE) {</a>
+<a name="ln952">		cache-&gt;ReleaseRef();</a>
+<a name="ln953">		return;</a>
+<a name="ln954">	}</a>
+<a name="ln955"> </a>
+<a name="ln956">	size_t bytesToRead = 0;</a>
+<a name="ln957">	off_t lastOffset = offset;</a>
+<a name="ln958"> </a>
+<a name="ln959">	vm_page_reservation reservation;</a>
+<a name="ln960">	vm_page_reserve_pages(&amp;reservation, reservePages, VM_PRIORITY_USER);</a>
+<a name="ln961"> </a>
+<a name="ln962">	cache-&gt;Lock();</a>
+<a name="ln963"> </a>
+<a name="ln964">	while (true) {</a>
+<a name="ln965">		// check if this page is already in memory</a>
+<a name="ln966">		if (size &gt; 0) {</a>
+<a name="ln967">			vm_page* page = cache-&gt;LookupPage(offset);</a>
+<a name="ln968"> </a>
+<a name="ln969">			offset += B_PAGE_SIZE;</a>
+<a name="ln970">			size -= B_PAGE_SIZE;</a>
+<a name="ln971"> </a>
+<a name="ln972">			if (page == NULL) {</a>
+<a name="ln973">				bytesToRead += B_PAGE_SIZE;</a>
+<a name="ln974">				continue;</a>
+<a name="ln975">			}</a>
+<a name="ln976">		}</a>
+<a name="ln977">		if (bytesToRead != 0) {</a>
+<a name="ln978">			// read the part before the current page (or the end of the request)</a>
+<a name="ln979">			PrecacheIO* io = new(std::nothrow) PrecacheIO(ref, lastOffset,</a>
+<a name="ln980">				bytesToRead);</a>
+<a name="ln981">			if (io == NULL || io-&gt;Prepare(&amp;reservation) != B_OK) {</a>
+<a name="ln982">				delete io;</a>
+<a name="ln983">				break;</a>
+<a name="ln984">			}</a>
+<a name="ln985"> </a>
+<a name="ln986">			// we must not have the cache locked during I/O</a>
+<a name="ln987">			cache-&gt;Unlock();</a>
+<a name="ln988">			io-&gt;ReadAsync();</a>
+<a name="ln989">			cache-&gt;Lock();</a>
+<a name="ln990"> </a>
+<a name="ln991">			bytesToRead = 0;</a>
+<a name="ln992">		}</a>
+<a name="ln993"> </a>
+<a name="ln994">		if (size == 0) {</a>
+<a name="ln995">			// we have reached the end of the request</a>
+<a name="ln996">			break;</a>
+<a name="ln997">		}</a>
+<a name="ln998"> </a>
+<a name="ln999">		lastOffset = offset;</a>
+<a name="ln1000">	}</a>
+<a name="ln1001"> </a>
+<a name="ln1002">	cache-&gt;ReleaseRefAndUnlock();</a>
+<a name="ln1003">	vm_page_unreserve_pages(&amp;reservation);</a>
+<a name="ln1004">}</a>
+<a name="ln1005"> </a>
+<a name="ln1006"> </a>
+<a name="ln1007">extern &quot;C&quot; void</a>
+<a name="ln1008">cache_prefetch(dev_t mountID, ino_t vnodeID, off_t offset, size_t size)</a>
+<a name="ln1009">{</a>
+<a name="ln1010">	// ToDo: schedule prefetch</a>
+<a name="ln1011"> </a>
+<a name="ln1012">	TRACE((&quot;cache_prefetch(vnode %ld:%Ld)\n&quot;, mountID, vnodeID));</a>
+<a name="ln1013"> </a>
+<a name="ln1014">	// get the vnode for the object, this also grabs a ref to it</a>
+<a name="ln1015">	struct vnode* vnode;</a>
+<a name="ln1016">	if (vfs_get_vnode(mountID, vnodeID, true, &amp;vnode) != B_OK)</a>
+<a name="ln1017">		return;</a>
+<a name="ln1018"> </a>
+<a name="ln1019">	cache_prefetch_vnode(vnode, offset, size);</a>
+<a name="ln1020">	vfs_put_vnode(vnode);</a>
+<a name="ln1021">}</a>
+<a name="ln1022"> </a>
+<a name="ln1023"> </a>
+<a name="ln1024">extern &quot;C&quot; void</a>
+<a name="ln1025">cache_node_opened(struct vnode* vnode, int32 fdType, VMCache* cache,</a>
+<a name="ln1026">	dev_t mountID, ino_t parentID, ino_t vnodeID, const char* name)</a>
+<a name="ln1027">{</a>
+<a name="ln1028">	if (sCacheModule == NULL || sCacheModule-&gt;node_opened == NULL)</a>
+<a name="ln1029">		return;</a>
+<a name="ln1030"> </a>
+<a name="ln1031">	off_t size = -1;</a>
+<a name="ln1032">	if (cache != NULL) {</a>
+<a name="ln1033">		file_cache_ref* ref = ((VMVnodeCache*)cache)-&gt;FileCacheRef();</a>
+<a name="ln1034">		if (ref != NULL)</a>
+<a name="ln1035">			size = cache-&gt;virtual_end;</a>
+<a name="ln1036">	}</a>
+<a name="ln1037"> </a>
+<a name="ln1038">	sCacheModule-&gt;node_opened(vnode, fdType, mountID, parentID, vnodeID, name,</a>
+<a name="ln1039">		size);</a>
+<a name="ln1040">}</a>
+<a name="ln1041"> </a>
+<a name="ln1042"> </a>
+<a name="ln1043">extern &quot;C&quot; void</a>
+<a name="ln1044">cache_node_closed(struct vnode* vnode, int32 fdType, VMCache* cache,</a>
+<a name="ln1045">	dev_t mountID, ino_t vnodeID)</a>
+<a name="ln1046">{</a>
+<a name="ln1047">	if (sCacheModule == NULL || sCacheModule-&gt;node_closed == NULL)</a>
+<a name="ln1048">		return;</a>
+<a name="ln1049"> </a>
+<a name="ln1050">	int32 accessType = 0;</a>
+<a name="ln1051">	if (cache != NULL) {</a>
+<a name="ln1052">		// ToDo: set accessType</a>
+<a name="ln1053">	}</a>
+<a name="ln1054"> </a>
+<a name="ln1055">	sCacheModule-&gt;node_closed(vnode, fdType, mountID, vnodeID, accessType);</a>
+<a name="ln1056">}</a>
+<a name="ln1057"> </a>
+<a name="ln1058"> </a>
+<a name="ln1059">extern &quot;C&quot; void</a>
+<a name="ln1060">cache_node_launched(size_t argCount, char*  const* args)</a>
+<a name="ln1061">{</a>
+<a name="ln1062">	if (sCacheModule == NULL || sCacheModule-&gt;node_launched == NULL)</a>
+<a name="ln1063">		return;</a>
+<a name="ln1064"> </a>
+<a name="ln1065">	sCacheModule-&gt;node_launched(argCount, args);</a>
+<a name="ln1066">}</a>
+<a name="ln1067"> </a>
+<a name="ln1068"> </a>
+<a name="ln1069">extern &quot;C&quot; status_t</a>
+<a name="ln1070">file_cache_init_post_boot_device(void)</a>
+<a name="ln1071">{</a>
+<a name="ln1072">	// ToDo: get cache module out of driver settings</a>
+<a name="ln1073"> </a>
+<a name="ln1074">	if (get_module(&quot;file_cache/launch_speedup/v1&quot;,</a>
+<a name="ln1075">			(module_info**)&amp;sCacheModule) == B_OK) {</a>
+<a name="ln1076">		dprintf(&quot;** opened launch speedup: %&quot; B_PRId64 &quot;\n&quot;, system_time());</a>
+<a name="ln1077">	}</a>
+<a name="ln1078">	return B_OK;</a>
+<a name="ln1079">}</a>
+<a name="ln1080"> </a>
+<a name="ln1081"> </a>
+<a name="ln1082">extern &quot;C&quot; status_t</a>
+<a name="ln1083">file_cache_init(void)</a>
+<a name="ln1084">{</a>
+<a name="ln1085">	// allocate a clean page we can use for writing zeroes</a>
+<a name="ln1086">	vm_page_reservation reservation;</a>
+<a name="ln1087">	vm_page_reserve_pages(&amp;reservation, 1, VM_PRIORITY_SYSTEM);</a>
+<a name="ln1088">	vm_page* page = vm_page_allocate_page(&amp;reservation,</a>
+<a name="ln1089">		PAGE_STATE_WIRED | VM_PAGE_ALLOC_CLEAR);</a>
+<a name="ln1090">	vm_page_unreserve_pages(&amp;reservation);</a>
+<a name="ln1091"> </a>
+<a name="ln1092">	sZeroPage = (phys_addr_t)page-&gt;physical_page_number * B_PAGE_SIZE;</a>
+<a name="ln1093"> </a>
+<a name="ln1094">	for (uint32 i = 0; i &lt; kZeroVecCount; i++) {</a>
+<a name="ln1095">		sZeroVecs[i].base = sZeroPage;</a>
+<a name="ln1096">		sZeroVecs[i].length = B_PAGE_SIZE;</a>
+<a name="ln1097">	}</a>
+<a name="ln1098"> </a>
+<a name="ln1099">	register_generic_syscall(CACHE_SYSCALLS, file_cache_control, 1, 0);</a>
+<a name="ln1100">	return B_OK;</a>
+<a name="ln1101">}</a>
+<a name="ln1102"> </a>
+<a name="ln1103"> </a>
+<a name="ln1104">//	#pragma mark - public FS API</a>
+<a name="ln1105"> </a>
+<a name="ln1106"> </a>
+<a name="ln1107">extern &quot;C&quot; void*</a>
+<a name="ln1108">file_cache_create(dev_t mountID, ino_t vnodeID, off_t size)</a>
+<a name="ln1109">{</a>
+<a name="ln1110">	TRACE((&quot;file_cache_create(mountID = %ld, vnodeID = %Ld, size = %Ld)\n&quot;,</a>
+<a name="ln1111">		mountID, vnodeID, size));</a>
+<a name="ln1112"> </a>
+<a name="ln1113">	file_cache_ref* ref = new file_cache_ref;</a>
+<a name="ln1114">	if (ref == NULL)</a>
+<a name="ln1115">		return NULL;</a>
+<a name="ln1116"> </a>
+<a name="ln1117">	memset(ref-&gt;last_access, 0, sizeof(ref-&gt;last_access));</a>
+<a name="ln1118">	ref-&gt;last_access_index = 0;</a>
+<a name="ln1119">	ref-&gt;disabled_count = 0;</a>
+<a name="ln1120"> </a>
+<a name="ln1121">	// TODO: delay VMCache creation until data is</a>
+<a name="ln1122">	//	requested/written for the first time? Listing lots of</a>
+<a name="ln1123">	//	files in Tracker (and elsewhere) could be slowed down.</a>
+<a name="ln1124">	//	Since the file_cache_ref itself doesn't have a lock,</a>
+<a name="ln1125">	//	we would need to &quot;rent&quot; one during construction, possibly</a>
+<a name="ln1126">	//	the vnode lock, maybe a dedicated one.</a>
+<a name="ln1127">	//	As there shouldn't be too much contention, we could also</a>
+<a name="ln1128">	//	use atomic_test_and_set(), and free the resources again</a>
+<a name="ln1129">	//	when that fails...</a>
+<a name="ln1130"> </a>
+<a name="ln1131">	// Get the vnode for the object</a>
+<a name="ln1132">	// (note, this does not grab a reference to the node)</a>
+<a name="ln1133">	if (vfs_lookup_vnode(mountID, vnodeID, &amp;ref-&gt;vnode) != B_OK)</a>
+<a name="ln1134">		goto err1;</a>
+<a name="ln1135"> </a>
+<a name="ln1136">	// Gets (usually creates) the cache for the node</a>
+<a name="ln1137">	if (vfs_get_vnode_cache(ref-&gt;vnode, &amp;ref-&gt;cache, true) != B_OK)</a>
+<a name="ln1138">		goto err1;</a>
+<a name="ln1139"> </a>
+<a name="ln1140">	ref-&gt;cache-&gt;virtual_end = size;</a>
+<a name="ln1141">	((VMVnodeCache*)ref-&gt;cache)-&gt;SetFileCacheRef(ref);</a>
+<a name="ln1142">	return ref;</a>
+<a name="ln1143"> </a>
+<a name="ln1144">err1:</a>
+<a name="ln1145">	delete ref;</a>
+<a name="ln1146">	return NULL;</a>
+<a name="ln1147">}</a>
+<a name="ln1148"> </a>
+<a name="ln1149"> </a>
+<a name="ln1150">extern &quot;C&quot; void</a>
+<a name="ln1151">file_cache_delete(void* _cacheRef)</a>
+<a name="ln1152">{</a>
+<a name="ln1153">	file_cache_ref* ref = (file_cache_ref*)_cacheRef;</a>
+<a name="ln1154"> </a>
+<a name="ln1155">	if (ref == NULL)</a>
+<a name="ln1156">		return;</a>
+<a name="ln1157"> </a>
+<a name="ln1158">	TRACE((&quot;file_cache_delete(ref = %p)\n&quot;, ref));</a>
+<a name="ln1159"> </a>
+<a name="ln1160">	ref-&gt;cache-&gt;ReleaseRef();</a>
+<a name="ln1161">	delete ref;</a>
+<a name="ln1162">}</a>
+<a name="ln1163"> </a>
+<a name="ln1164"> </a>
+<a name="ln1165">extern &quot;C&quot; void</a>
+<a name="ln1166">file_cache_enable(void* _cacheRef)</a>
+<a name="ln1167">{</a>
+<a name="ln1168">	file_cache_ref* ref = (file_cache_ref*)_cacheRef;</a>
+<a name="ln1169"> </a>
+<a name="ln1170">	AutoLocker&lt;VMCache&gt; _(ref-&gt;cache);</a>
+<a name="ln1171"> </a>
+<a name="ln1172">	if (ref-&gt;disabled_count == 0) {</a>
+<a name="ln1173">		panic(&quot;Unbalanced file_cache_enable()!&quot;);</a>
+<a name="ln1174">		return;</a>
+<a name="ln1175">	}</a>
+<a name="ln1176"> </a>
+<a name="ln1177">	ref-&gt;disabled_count--;</a>
+<a name="ln1178">}</a>
+<a name="ln1179"> </a>
+<a name="ln1180"> </a>
+<a name="ln1181">extern &quot;C&quot; status_t</a>
+<a name="ln1182">file_cache_disable(void* _cacheRef)</a>
+<a name="ln1183">{</a>
+<a name="ln1184">	// TODO: This function only removes all pages from the cache and prevents</a>
+<a name="ln1185">	// that the file cache functions add any new ones until re-enabled. The</a>
+<a name="ln1186">	// VM (on page fault) can still add pages, if the file is mmap()ed. We</a>
+<a name="ln1187">	// should mark the cache to prevent shared mappings of the file and fix</a>
+<a name="ln1188">	// the page fault code to deal correctly with private mappings (i.e. only</a>
+<a name="ln1189">	// insert pages in consumer caches).</a>
+<a name="ln1190"> </a>
+<a name="ln1191">	file_cache_ref* ref = (file_cache_ref*)_cacheRef;</a>
+<a name="ln1192"> </a>
+<a name="ln1193">	AutoLocker&lt;VMCache&gt; _(ref-&gt;cache);</a>
+<a name="ln1194"> </a>
+<a name="ln1195">	// If already disabled, there's nothing to do for us.</a>
+<a name="ln1196">	if (ref-&gt;disabled_count &gt; 0) {</a>
+<a name="ln1197">		ref-&gt;disabled_count++;</a>
+<a name="ln1198">		return B_OK;</a>
+<a name="ln1199">	}</a>
+<a name="ln1200"> </a>
+<a name="ln1201">	// The file cache is not yet disabled. We need to evict all cached pages.</a>
+<a name="ln1202">	status_t error = ref-&gt;cache-&gt;FlushAndRemoveAllPages();</a>
+<a name="ln1203">	if (error != B_OK)</a>
+<a name="ln1204">		return error;</a>
+<a name="ln1205"> </a>
+<a name="ln1206">	ref-&gt;disabled_count++;</a>
+<a name="ln1207">	return B_OK;</a>
+<a name="ln1208">}</a>
+<a name="ln1209"> </a>
+<a name="ln1210"> </a>
+<a name="ln1211">extern &quot;C&quot; bool</a>
+<a name="ln1212">file_cache_is_enabled(void* _cacheRef)</a>
+<a name="ln1213">{</a>
+<a name="ln1214">	file_cache_ref* ref = (file_cache_ref*)_cacheRef;</a>
+<a name="ln1215">	AutoLocker&lt;VMCache&gt; _(ref-&gt;cache);</a>
+<a name="ln1216"> </a>
+<a name="ln1217">	return ref-&gt;disabled_count == 0;</a>
+<a name="ln1218">}</a>
+<a name="ln1219"> </a>
+<a name="ln1220"> </a>
+<a name="ln1221">extern &quot;C&quot; status_t</a>
+<a name="ln1222">file_cache_set_size(void* _cacheRef, off_t newSize)</a>
+<a name="ln1223">{</a>
+<a name="ln1224">	file_cache_ref* ref = (file_cache_ref*)_cacheRef;</a>
+<a name="ln1225"> </a>
+<a name="ln1226">	TRACE((&quot;file_cache_set_size(ref = %p, size = %Ld)\n&quot;, ref, newSize));</a>
+<a name="ln1227"> </a>
+<a name="ln1228">	if (ref == NULL)</a>
+<a name="ln1229">		return B_OK;</a>
+<a name="ln1230"> </a>
+<a name="ln1231">	VMCache* cache = ref-&gt;cache;</a>
+<a name="ln1232">	AutoLocker&lt;VMCache&gt; _(cache);</a>
+<a name="ln1233"> </a>
+<a name="ln1234">	off_t oldSize = cache-&gt;virtual_end;</a>
+<a name="ln1235">	status_t status = cache-&gt;Resize(newSize, VM_PRIORITY_USER);</a>
+<a name="ln1236">		// Note, the priority doesn't really matter, since this cache doesn't</a>
+<a name="ln1237">		// reserve any memory.</a>
+<a name="ln1238">	if (status == B_OK &amp;&amp; newSize &lt; oldSize) {</a>
+<a name="ln1239">		// We may have a new partial page at the end of the cache that must be</a>
+<a name="ln1240">		// cleared.</a>
+<a name="ln1241">		uint32 partialBytes = newSize % B_PAGE_SIZE;</a>
+<a name="ln1242">		if (partialBytes != 0) {</a>
+<a name="ln1243">			vm_page* page = cache-&gt;LookupPage(newSize - partialBytes);</a>
+<a name="ln1244">			if (page != NULL) {</a>
+<a name="ln1245">				vm_memset_physical(page-&gt;physical_page_number * B_PAGE_SIZE</a>
+<a name="ln1246">					+ partialBytes, 0, B_PAGE_SIZE - partialBytes);</a>
+<a name="ln1247">			}</a>
+<a name="ln1248">		}</a>
+<a name="ln1249">	}</a>
+<a name="ln1250"> </a>
+<a name="ln1251">	return status;</a>
+<a name="ln1252">}</a>
+<a name="ln1253"> </a>
+<a name="ln1254"> </a>
+<a name="ln1255">extern &quot;C&quot; status_t</a>
+<a name="ln1256">file_cache_sync(void* _cacheRef)</a>
+<a name="ln1257">{</a>
+<a name="ln1258">	file_cache_ref* ref = (file_cache_ref*)_cacheRef;</a>
+<a name="ln1259">	if (ref == NULL)</a>
+<a name="ln1260">		return B_BAD_VALUE;</a>
+<a name="ln1261"> </a>
+<a name="ln1262">	return ref-&gt;cache-&gt;WriteModified();</a>
+<a name="ln1263">}</a>
+<a name="ln1264"> </a>
+<a name="ln1265"> </a>
+<a name="ln1266">extern &quot;C&quot; status_t</a>
+<a name="ln1267">file_cache_read(void* _cacheRef, void* cookie, off_t offset, void* buffer,</a>
+<a name="ln1268">	size_t* _size)</a>
+<a name="ln1269">{</a>
+<a name="ln1270">	file_cache_ref* ref = (file_cache_ref*)_cacheRef;</a>
+<a name="ln1271"> </a>
+<a name="ln1272">	TRACE((&quot;file_cache_read(ref = %p, offset = %Ld, buffer = %p, size = %lu)\n&quot;,</a>
+<a name="ln1273">		ref, offset, buffer, *_size));</a>
+<a name="ln1274"> </a>
+<a name="ln1275">	// Bounds checking. We do this here so it applies to uncached I/O.</a>
+<a name="ln1276">	if (offset &lt; 0)</a>
+<a name="ln1277">		return B_BAD_VALUE;</a>
+<a name="ln1278">	const off_t fileSize = ref-&gt;cache-&gt;virtual_end;</a>
+<a name="ln1279">	if (offset &gt;= fileSize || *_size == 0) {</a>
+<a name="ln1280">		*_size = 0;</a>
+<a name="ln1281">		return B_OK;</a>
+<a name="ln1282">	}</a>
+<a name="ln1283">	if ((off_t)(offset + *_size) &gt; fileSize)</a>
+<a name="ln1284">		*_size = fileSize - offset;</a>
+<a name="ln1285"> </a>
+<a name="ln1286">	if (ref-&gt;disabled_count &gt; 0) {</a>
+<a name="ln1287">		// Caching is disabled -- read directly from the file.</a>
+<a name="ln1288">		generic_io_vec vec;</a>
+<a name="ln1289">		vec.base = (addr_t)buffer;</a>
+<a name="ln1290">		generic_size_t size = vec.length = *_size;</a>
+<a name="ln1291">		status_t error = vfs_read_pages(ref-&gt;vnode, cookie, offset, &amp;vec, 1, 0,</a>
+<a name="ln1292">			&amp;size);</a>
+<a name="ln1293">		*_size = size;</a>
+<a name="ln1294">		return error;</a>
+<a name="ln1295">	}</a>
+<a name="ln1296"> </a>
+<a name="ln1297">	return cache_io(ref, cookie, offset, (addr_t)buffer, _size, false);</a>
+<a name="ln1298">}</a>
+<a name="ln1299"> </a>
+<a name="ln1300"> </a>
+<a name="ln1301">extern &quot;C&quot; status_t</a>
+<a name="ln1302">file_cache_write(void* _cacheRef, void* cookie, off_t offset,</a>
+<a name="ln1303">	const void* buffer, size_t* _size)</a>
+<a name="ln1304">{</a>
+<a name="ln1305">	file_cache_ref* ref = (file_cache_ref*)_cacheRef;</a>
+<a name="ln1306"> </a>
+<a name="ln1307">	// We don't do bounds checking here, as we are relying on the</a>
+<a name="ln1308">	// file system which called us to already have done that and made</a>
+<a name="ln1309">	// adjustments as necessary, unlike in read().</a>
+<a name="ln1310"> </a>
+<a name="ln1311">	if (ref-&gt;disabled_count &gt; 0) {</a>
+<a name="ln1312">		// Caching is disabled -- write directly to the file.</a>
+<a name="ln1313"> </a>
+<a name="ln1314">		if (buffer != NULL) {</a>
+<a name="ln1315">			generic_io_vec vec;</a>
+<a name="ln1316">			vec.base = (addr_t)buffer;</a>
+<a name="ln1317">			generic_size_t size = vec.length = *_size;</a>
+<a name="ln1318"> </a>
+<a name="ln1319">			status_t error = vfs_write_pages(ref-&gt;vnode, cookie, offset, &amp;vec,</a>
+<a name="ln1320">				1, 0, &amp;size);</a>
+<a name="ln1321">			*_size = size;</a>
+<a name="ln1322">			return error;</a>
+<a name="ln1323">		}</a>
+<a name="ln1324"> </a>
+<a name="ln1325">		// NULL buffer -- use a dummy buffer to write zeroes</a>
+<a name="ln1326">		size_t size = *_size;</a>
+<a name="ln1327">		while (size &gt; 0) {</a>
+<a name="ln1328">			size_t toWrite = min_c(size, kZeroVecSize);</a>
+<a name="ln1329">			generic_size_t written = toWrite;</a>
+<a name="ln1330">			status_t error = vfs_write_pages(ref-&gt;vnode, cookie, offset,</a>
+<a name="ln1331">				sZeroVecs, kZeroVecCount, B_PHYSICAL_IO_REQUEST, &amp;written);</a>
+<a name="ln1332">			if (error != B_OK)</a>
+<a name="ln1333">				return error;</a>
+<a name="ln1334">			if (written == 0)</a>
+<a name="ln1335">				break;</a>
+<a name="ln1336"> </a>
+<a name="ln1337">			offset += written;</a>
+<a name="ln1338">			size -= written;</a>
+<a name="ln1339">		}</a>
+<a name="ln1340"> </a>
+<a name="ln1341">		*_size -= size;</a>
+<a name="ln1342">		return B_OK;</a>
+<a name="ln1343">	}</a>
+<a name="ln1344"> </a>
+<a name="ln1345">	status_t status = cache_io(ref, cookie, offset,</a>
+<a name="ln1346">		(addr_t)const_cast&lt;void*&gt;(buffer), _size, true);</a>
+<a name="ln1347"> </a>
+<a name="ln1348">	TRACE((&quot;file_cache_write(ref = %p, offset = %Ld, buffer = %p, size = %lu)&quot;</a>
+<a name="ln1349">		&quot; = %ld\n&quot;, ref, offset, buffer, *_size, status));</a>
+<a name="ln1350"> </a>
+<a name="ln1351">	return status;</a>
+<a name="ln1352">}</a>
+
+</code></pre>
+<div class="balloon" rel="119"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fBusyConditions, fAllocatingThread.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

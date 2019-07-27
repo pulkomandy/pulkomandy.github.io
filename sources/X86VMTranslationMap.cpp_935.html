@@ -1,0 +1,195 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>X86VMTranslationMap.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2008-2011, Ingo Weinhold, ingo_weinhold@gmx.de.</a>
+<a name="ln3"> * Copyright 2002-2007, Axel Dörfler, axeld@pinc-software.de. All rights reserved.</a>
+<a name="ln4"> * Distributed under the terms of the MIT License.</a>
+<a name="ln5"> *</a>
+<a name="ln6"> * Copyright 2001-2002, Travis Geiselbrecht. All rights reserved.</a>
+<a name="ln7"> * Distributed under the terms of the NewOS License.</a>
+<a name="ln8"> */</a>
+<a name="ln9"> </a>
+<a name="ln10"> </a>
+<a name="ln11">#include &quot;paging/X86VMTranslationMap.h&quot;</a>
+<a name="ln12"> </a>
+<a name="ln13">#include &lt;thread.h&gt;</a>
+<a name="ln14">#include &lt;smp.h&gt;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &quot;paging/X86PagingStructures.h&quot;</a>
+<a name="ln17"> </a>
+<a name="ln18"> </a>
+<a name="ln19">//#define TRACE_X86_VM_TRANSLATION_MAP</a>
+<a name="ln20">#ifdef TRACE_X86_VM_TRANSLATION_MAP</a>
+<a name="ln21">#	define TRACE(x...) dprintf(x)</a>
+<a name="ln22">#else</a>
+<a name="ln23">#	define TRACE(x...) ;</a>
+<a name="ln24">#endif</a>
+<a name="ln25"> </a>
+<a name="ln26"> </a>
+<a name="ln27">X86VMTranslationMap::X86VMTranslationMap()</a>
+<a name="ln28">	:</a>
+<a name="ln29">	fPageMapper(NULL),</a>
+<a name="ln30">	fInvalidPagesCount(0)</a>
+<a name="ln31">{</a>
+<a name="ln32">}</a>
+<a name="ln33"> </a>
+<a name="ln34"> </a>
+<a name="ln35">X86VMTranslationMap::~X86VMTranslationMap()</a>
+<a name="ln36">{</a>
+<a name="ln37">}</a>
+<a name="ln38"> </a>
+<a name="ln39"> </a>
+<a name="ln40">status_t</a>
+<a name="ln41">X86VMTranslationMap::Init(bool kernel)</a>
+<a name="ln42">{</a>
+<a name="ln43">	fIsKernelMap = kernel;</a>
+<a name="ln44">	return B_OK;</a>
+<a name="ln45">}</a>
+<a name="ln46"> </a>
+<a name="ln47"> </a>
+<a name="ln48">/*!	Acquires the map's recursive lock, and resets the invalidate pages counter</a>
+<a name="ln49">	in case it's the first locking recursion.</a>
+<a name="ln50">*/</a>
+<a name="ln51">bool</a>
+<a name="ln52">X86VMTranslationMap::Lock()</a>
+<a name="ln53">{</a>
+<a name="ln54">	TRACE(&quot;%p-&gt;X86VMTranslationMap::Lock()\n&quot;, this);</a>
+<a name="ln55"> </a>
+<a name="ln56">	recursive_lock_lock(&amp;fLock);</a>
+<a name="ln57">	if (recursive_lock_get_recursion(&amp;fLock) == 1) {</a>
+<a name="ln58">		// we were the first one to grab the lock</a>
+<a name="ln59">		TRACE(&quot;clearing invalidated page count\n&quot;);</a>
+<a name="ln60">		fInvalidPagesCount = 0;</a>
+<a name="ln61">	}</a>
+<a name="ln62"> </a>
+<a name="ln63">	return true;</a>
+<a name="ln64">}</a>
+<a name="ln65"> </a>
+<a name="ln66"> </a>
+<a name="ln67">/*!	Unlocks the map, and, if we are actually losing the recursive lock,</a>
+<a name="ln68">	flush all pending changes of this map (ie. flush TLB caches as</a>
+<a name="ln69">	needed).</a>
+<a name="ln70">*/</a>
+<a name="ln71">void</a>
+<a name="ln72">X86VMTranslationMap::Unlock()</a>
+<a name="ln73">{</a>
+<a name="ln74">	TRACE(&quot;%p-&gt;X86VMTranslationMap::Unlock()\n&quot;, this);</a>
+<a name="ln75"> </a>
+<a name="ln76">	if (recursive_lock_get_recursion(&amp;fLock) == 1) {</a>
+<a name="ln77">		// we're about to release it for the last time</a>
+<a name="ln78">		Flush();</a>
+<a name="ln79">	}</a>
+<a name="ln80"> </a>
+<a name="ln81">	recursive_lock_unlock(&amp;fLock);</a>
+<a name="ln82">}</a>
+<a name="ln83"> </a>
+<a name="ln84"> </a>
+<a name="ln85">addr_t</a>
+<a name="ln86">X86VMTranslationMap::MappedSize() const</a>
+<a name="ln87">{</a>
+<a name="ln88">	return fMapCount;</a>
+<a name="ln89">}</a>
+<a name="ln90"> </a>
+<a name="ln91"> </a>
+<a name="ln92">void</a>
+<a name="ln93">X86VMTranslationMap::Flush()</a>
+<a name="ln94">{</a>
+<a name="ln95">	if (fInvalidPagesCount &lt;= 0)</a>
+<a name="ln96">		return;</a>
+<a name="ln97"> </a>
+<a name="ln98">	Thread* thread = thread_get_current_thread();</a>
+<a name="ln99">	thread_pin_to_current_cpu(thread);</a>
+<a name="ln100"> </a>
+<a name="ln101">	if (fInvalidPagesCount &gt; PAGE_INVALIDATE_CACHE_SIZE) {</a>
+<a name="ln102">		// invalidate all pages</a>
+<a name="ln103">		TRACE(&quot;flush_tmap: %d pages to invalidate, invalidate all\n&quot;,</a>
+<a name="ln104">			fInvalidPagesCount);</a>
+<a name="ln105"> </a>
+<a name="ln106">		if (fIsKernelMap) {</a>
+<a name="ln107">			arch_cpu_global_TLB_invalidate();</a>
+<a name="ln108">			smp_send_broadcast_ici(SMP_MSG_GLOBAL_INVALIDATE_PAGES, 0, 0, 0,</a>
+<a name="ln109">				NULL, SMP_MSG_FLAG_SYNC);</a>
+<a name="ln110">		} else {</a>
+<a name="ln111">			cpu_status state = disable_interrupts();</a>
+<a name="ln112">			arch_cpu_user_TLB_invalidate();</a>
+<a name="ln113">			restore_interrupts(state);</a>
+<a name="ln114"> </a>
+<a name="ln115">			int cpu = smp_get_current_cpu();</a>
+<a name="ln116">			CPUSet cpuMask = PagingStructures()-&gt;active_on_cpus;</a>
+<a name="ln117">			cpuMask.ClearBit(cpu);</a>
+<a name="ln118"> </a>
+<a name="ln119">			if (!cpuMask.IsEmpty()) {</a>
+<a name="ln120">				smp_send_multicast_ici(cpuMask, SMP_MSG_USER_INVALIDATE_PAGES,</a>
+<a name="ln121">					0, 0, 0, NULL, SMP_MSG_FLAG_SYNC);</a>
+<a name="ln122">			}</a>
+<a name="ln123">		}</a>
+<a name="ln124">	} else {</a>
+<a name="ln125">		TRACE(&quot;flush_tmap: %d pages to invalidate, invalidate list\n&quot;,</a>
+<a name="ln126">			fInvalidPagesCount);</a>
+<a name="ln127"> </a>
+<a name="ln128">		arch_cpu_invalidate_TLB_list(fInvalidPages, fInvalidPagesCount);</a>
+<a name="ln129"> </a>
+<a name="ln130">		if (fIsKernelMap) {</a>
+<a name="ln131">			smp_send_broadcast_ici(SMP_MSG_INVALIDATE_PAGE_LIST,</a>
+<a name="ln132">				(addr_t)fInvalidPages, fInvalidPagesCount, 0, NULL,</a>
+<a name="ln133">				SMP_MSG_FLAG_SYNC);</a>
+<a name="ln134">		} else {</a>
+<a name="ln135">			int cpu = smp_get_current_cpu();</a>
+<a name="ln136">			CPUSet cpuMask = PagingStructures()-&gt;active_on_cpus;</a>
+<a name="ln137">			cpuMask.ClearBit(cpu);</a>
+<a name="ln138"> </a>
+<a name="ln139">			if (!cpuMask.IsEmpty()) {</a>
+<a name="ln140">				smp_send_multicast_ici(cpuMask, SMP_MSG_INVALIDATE_PAGE_LIST,</a>
+<a name="ln141">					(addr_t)fInvalidPages, fInvalidPagesCount, 0, NULL,</a>
+<a name="ln142">					SMP_MSG_FLAG_SYNC);</a>
+<a name="ln143">			}</a>
+<a name="ln144">		}</a>
+<a name="ln145">	}</a>
+<a name="ln146">	fInvalidPagesCount = 0;</a>
+<a name="ln147"> </a>
+<a name="ln148">	thread_unpin_from_current_cpu(thread);</a>
+<a name="ln149">}</a>
+
+</code></pre>
+<div class="balloon" rel="27"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fInvalidPages, fIsKernelMap.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

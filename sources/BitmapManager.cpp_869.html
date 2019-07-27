@@ -1,0 +1,342 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>BitmapManager.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2001-2009, Haiku.</a>
+<a name="ln3"> * Distributed under the terms of the MIT License.</a>
+<a name="ln4"> *</a>
+<a name="ln5"> * Authors:</a>
+<a name="ln6"> *		DarkWyrm &lt;bpmagic@columbus.rr.com&gt;</a>
+<a name="ln7"> *		Axel Dörfler, axeld@pinc-software.de</a>
+<a name="ln8"> */</a>
+<a name="ln9"> </a>
+<a name="ln10"> </a>
+<a name="ln11">/*!	Whenever a ServerBitmap associated with a client-side BBitmap needs to be</a>
+<a name="ln12">	created or destroyed, the BitmapManager needs to handle it. It takes care of</a>
+<a name="ln13">	all memory management related to them.</a>
+<a name="ln14">*/</a>
+<a name="ln15"> </a>
+<a name="ln16"> </a>
+<a name="ln17">#include &quot;BitmapManager.h&quot;</a>
+<a name="ln18"> </a>
+<a name="ln19">#include &quot;ClientMemoryAllocator.h&quot;</a>
+<a name="ln20">#include &quot;HWInterface.h&quot;</a>
+<a name="ln21">#include &quot;Overlay.h&quot;</a>
+<a name="ln22">#include &quot;ServerApp.h&quot;</a>
+<a name="ln23">#include &quot;ServerBitmap.h&quot;</a>
+<a name="ln24">#include &quot;ServerProtocol.h&quot;</a>
+<a name="ln25">#include &quot;ServerTokenSpace.h&quot;</a>
+<a name="ln26"> </a>
+<a name="ln27">#include &lt;BitmapPrivate.h&gt;</a>
+<a name="ln28">#include &lt;ObjectList.h&gt;</a>
+<a name="ln29">#include &lt;video_overlay.h&gt;</a>
+<a name="ln30"> </a>
+<a name="ln31">#include &lt;AppDefs.h&gt;</a>
+<a name="ln32">#include &lt;Autolock.h&gt;</a>
+<a name="ln33">#include &lt;Bitmap.h&gt;</a>
+<a name="ln34">#include &lt;Message.h&gt;</a>
+<a name="ln35"> </a>
+<a name="ln36">#include &lt;new&gt;</a>
+<a name="ln37">#include &lt;stdio.h&gt;</a>
+<a name="ln38">#include &lt;stdlib.h&gt;</a>
+<a name="ln39">#include &lt;string.h&gt;</a>
+<a name="ln40"> </a>
+<a name="ln41">using std::nothrow;</a>
+<a name="ln42"> </a>
+<a name="ln43"> </a>
+<a name="ln44">//! The one and only bitmap manager for the server, created by the AppServer</a>
+<a name="ln45">BitmapManager *gBitmapManager = NULL;</a>
+<a name="ln46"> </a>
+<a name="ln47"> </a>
+<a name="ln48">int</a>
+<a name="ln49">compare_app_pointer(const ServerApp* a, const ServerApp* b)</a>
+<a name="ln50">{</a>
+<a name="ln51">	return (addr_t)b - (addr_t)b;</a>
+<a name="ln52">}</a>
+<a name="ln53"> </a>
+<a name="ln54"> </a>
+<a name="ln55">//	#pragma mark -</a>
+<a name="ln56"> </a>
+<a name="ln57"> </a>
+<a name="ln58">//! Sets up stuff to be ready to allocate space for bitmaps</a>
+<a name="ln59">BitmapManager::BitmapManager()</a>
+<a name="ln60">	:</a>
+<a name="ln61">	fBitmapList(1024),</a>
+<a name="ln62">	fLock(&quot;BitmapManager Lock&quot;)</a>
+<a name="ln63">{</a>
+<a name="ln64">}</a>
+<a name="ln65"> </a>
+<a name="ln66"> </a>
+<a name="ln67">//! Deallocates everything associated with the manager</a>
+<a name="ln68">BitmapManager::~BitmapManager()</a>
+<a name="ln69">{</a>
+<a name="ln70">	int32 count = fBitmapList.CountItems();</a>
+<a name="ln71">	for (int32 i = 0; i &lt; count; i++)</a>
+<a name="ln72">		delete (ServerBitmap*)fBitmapList.ItemAt(i);</a>
+<a name="ln73">}</a>
+<a name="ln74"> </a>
+<a name="ln75"> </a>
+<a name="ln76">/*!	\brief Allocates a new ServerBitmap.</a>
+<a name="ln77"> </a>
+<a name="ln78">	\param bounds Size of the bitmap</a>
+<a name="ln79">	\param space Color space of the bitmap</a>
+<a name="ln80">	\param flags Bitmap flags as defined in Bitmap.h</a>
+<a name="ln81">	\param bytesPerRow Number of bytes per row.</a>
+<a name="ln82">	\param screen Screen id of the screen associated with it. Unused.</a>
+<a name="ln83">	\return A new ServerBitmap or NULL if unable to allocate one.</a>
+<a name="ln84">*/</a>
+<a name="ln85">ServerBitmap*</a>
+<a name="ln86">BitmapManager::CreateBitmap(ClientMemoryAllocator* allocator,</a>
+<a name="ln87">	HWInterface&amp; hwInterface, BRect bounds, color_space space, uint32 flags,</a>
+<a name="ln88">	int32 bytesPerRow, int32 screen, uint8* _allocationFlags)</a>
+<a name="ln89">{</a>
+<a name="ln90">	BAutolock locker(fLock);</a>
+<a name="ln91">	if (!locker.IsLocked())</a>
+<a name="ln92">		return NULL;</a>
+<a name="ln93"> </a>
+<a name="ln94">	overlay_token overlayToken = NULL;</a>
+<a name="ln95"> </a>
+<a name="ln96">	if (flags &amp; B_BITMAP_WILL_OVERLAY) {</a>
+<a name="ln97">		if (!hwInterface.CheckOverlayRestrictions(bounds.IntegerWidth() + 1,</a>
+<a name="ln98">				bounds.IntegerHeight() + 1, space))</a>
+<a name="ln99">			return NULL;</a>
+<a name="ln100"> </a>
+<a name="ln101">		if (flags &amp; B_BITMAP_RESERVE_OVERLAY_CHANNEL) {</a>
+<a name="ln102">			overlayToken = hwInterface.AcquireOverlayChannel();</a>
+<a name="ln103">			if (overlayToken == NULL)</a>
+<a name="ln104">				return NULL;</a>
+<a name="ln105">		}</a>
+<a name="ln106">	}</a>
+<a name="ln107"> </a>
+<a name="ln108">	ServerBitmap* bitmap = new(std::nothrow) ServerBitmap(bounds, space, flags,</a>
+<a name="ln109">		bytesPerRow);</a>
+<a name="ln110">	if (bitmap == NULL) {</a>
+<a name="ln111">		if (overlayToken != NULL)</a>
+<a name="ln112">			hwInterface.ReleaseOverlayChannel(overlayToken);</a>
+<a name="ln113"> </a>
+<a name="ln114">		return NULL;</a>
+<a name="ln115">	}</a>
+<a name="ln116"> </a>
+<a name="ln117">	uint8* buffer = NULL;</a>
+<a name="ln118"> </a>
+<a name="ln119">	if (flags &amp; B_BITMAP_WILL_OVERLAY) {</a>
+<a name="ln120">		Overlay* overlay = new(std::nothrow) Overlay(hwInterface, bitmap,</a>
+<a name="ln121">			overlayToken);</a>
+<a name="ln122"> </a>
+<a name="ln123">		overlay_client_data* clientData = NULL;</a>
+<a name="ln124">		bool newArea = false;</a>
+<a name="ln125"> </a>
+<a name="ln126">		if (overlay != NULL &amp;&amp; overlay-&gt;InitCheck() == B_OK) {</a>
+<a name="ln127">			// allocate client memory to communicate the overlay semaphore</a>
+<a name="ln128">			// and buffer location to the BBitmap</a>
+<a name="ln129">			clientData = (overlay_client_data*)bitmap-&gt;fClientMemory.Allocate(</a>
+<a name="ln130">				allocator, sizeof(overlay_client_data), newArea);</a>
+<a name="ln131">		}</a>
+<a name="ln132"> </a>
+<a name="ln133">		if (clientData != NULL) {</a>
+<a name="ln134">			overlay-&gt;SetClientData(clientData);</a>
+<a name="ln135"> </a>
+<a name="ln136">			bitmap-&gt;fMemory = &amp;bitmap-&gt;fClientMemory;</a>
+<a name="ln137">			bitmap-&gt;SetOverlay(overlay);</a>
+<a name="ln138">			bitmap-&gt;fBytesPerRow = overlay-&gt;OverlayBuffer()-&gt;bytes_per_row;</a>
+<a name="ln139"> </a>
+<a name="ln140">			buffer = (uint8*)overlay-&gt;OverlayBuffer()-&gt;buffer;</a>
+<a name="ln141">			if (_allocationFlags)</a>
+<a name="ln142">				*_allocationFlags = kFramebuffer | (newArea ? kNewAllocatorArea : 0);</a>
+<a name="ln143">		} else</a>
+<a name="ln144">			delete overlay;</a>
+<a name="ln145">	} else if (allocator != NULL) {</a>
+<a name="ln146">		// standard bitmaps</a>
+<a name="ln147">		bool newArea;</a>
+<a name="ln148">		buffer = (uint8*)bitmap-&gt;fClientMemory.Allocate(allocator,</a>
+<a name="ln149">			bitmap-&gt;BitsLength(), newArea);</a>
+<a name="ln150">		if (buffer != NULL) {</a>
+<a name="ln151">			bitmap-&gt;fMemory = &amp;bitmap-&gt;fClientMemory;</a>
+<a name="ln152"> </a>
+<a name="ln153">			if (_allocationFlags)</a>
+<a name="ln154">				*_allocationFlags = kAllocator | (newArea ? kNewAllocatorArea : 0);</a>
+<a name="ln155">		}</a>
+<a name="ln156">	} else {</a>
+<a name="ln157">		// server side only bitmaps</a>
+<a name="ln158">		buffer = (uint8*)malloc(bitmap-&gt;BitsLength());</a>
+<a name="ln159">		if (buffer != NULL) {</a>
+<a name="ln160">			bitmap-&gt;fMemory = NULL;</a>
+<a name="ln161"> </a>
+<a name="ln162">			if (_allocationFlags)</a>
+<a name="ln163">				*_allocationFlags = kHeap;</a>
+<a name="ln164">		}</a>
+<a name="ln165">	}</a>
+<a name="ln166"> </a>
+<a name="ln167">	bool success = false;</a>
+<a name="ln168">	if (buffer != NULL) {</a>
+<a name="ln169">		success = fBitmapList.AddItem(bitmap);</a>
+<a name="ln170">		if (success &amp;&amp; bitmap-&gt;Overlay() != NULL) {</a>
+<a name="ln171">			success = fOverlays.AddItem(bitmap);</a>
+<a name="ln172">			if (!success)</a>
+<a name="ln173">				fBitmapList.RemoveItem(bitmap);</a>
+<a name="ln174">		}</a>
+<a name="ln175">	}</a>
+<a name="ln176"> </a>
+<a name="ln177">	if (success) {</a>
+<a name="ln178">		bitmap-&gt;fBuffer = buffer;</a>
+<a name="ln179">		bitmap-&gt;fToken = gTokenSpace.NewToken(kBitmapToken, bitmap);</a>
+<a name="ln180">		// NOTE: the client handles clearing to white in case the flags</a>
+<a name="ln181">		// indicate this is needed</a>
+<a name="ln182">	} else {</a>
+<a name="ln183">		// Allocation failed for buffer or bitmap list</a>
+<a name="ln184">		free(buffer);</a>
+<a name="ln185">		delete bitmap;</a>
+<a name="ln186">		bitmap = NULL;</a>
+<a name="ln187">	}</a>
+<a name="ln188"> </a>
+<a name="ln189">	return bitmap;</a>
+<a name="ln190">}</a>
+<a name="ln191"> </a>
+<a name="ln192"> </a>
+<a name="ln193">ServerBitmap*</a>
+<a name="ln194">BitmapManager::CloneFromClient(area_id clientArea, int32 areaOffset,</a>
+<a name="ln195">	BRect bounds, color_space space, uint32 flags, int32 bytesPerRow)</a>
+<a name="ln196">{</a>
+<a name="ln197">	BAutolock locker(fLock);</a>
+<a name="ln198">	if (!locker.IsLocked())</a>
+<a name="ln199">		return NULL;</a>
+<a name="ln200">	ServerBitmap* bitmap = new(std::nothrow) ServerBitmap(bounds, space, flags,</a>
+<a name="ln201">		bytesPerRow);</a>
+<a name="ln202">	if (bitmap == NULL)</a>
+<a name="ln203">		return NULL;</a>
+<a name="ln204"> </a>
+<a name="ln205">	ClonedAreaMemory* memory = new(std::nothrow) ClonedAreaMemory;</a>
+<a name="ln206">	if (memory == NULL) {</a>
+<a name="ln207">		delete bitmap;</a>
+<a name="ln208">		return NULL;</a>
+<a name="ln209">	}</a>
+<a name="ln210">	int8* buffer = (int8*)memory-&gt;Clone(clientArea, areaOffset);</a>
+<a name="ln211">	if (buffer == NULL) {</a>
+<a name="ln212">		delete bitmap;</a>
+<a name="ln213">		delete memory;</a>
+<a name="ln214">		return NULL;</a>
+<a name="ln215">	}</a>
+<a name="ln216"> </a>
+<a name="ln217">	bitmap-&gt;fMemory = memory;</a>
+<a name="ln218">	bitmap-&gt;fBuffer = memory-&gt;Address();</a>
+<a name="ln219">	bitmap-&gt;fToken = gTokenSpace.NewToken(kBitmapToken, bitmap);</a>
+<a name="ln220">	return bitmap;</a>
+<a name="ln221">}</a>
+<a name="ln222"> </a>
+<a name="ln223"> </a>
+<a name="ln224">/*!	\brief Called when a ServerBitmap is deleted.</a>
+<a name="ln225">*/</a>
+<a name="ln226">void</a>
+<a name="ln227">BitmapManager::BitmapRemoved(ServerBitmap* bitmap)</a>
+<a name="ln228">{</a>
+<a name="ln229">	BAutolock locker(fLock);</a>
+<a name="ln230">	if (!locker.IsLocked())</a>
+<a name="ln231">		return;</a>
+<a name="ln232"> </a>
+<a name="ln233">	if (bitmap-&gt;Overlay() != NULL)</a>
+<a name="ln234">		fOverlays.RemoveItem(bitmap);</a>
+<a name="ln235"> </a>
+<a name="ln236">	fBitmapList.RemoveItem(bitmap);</a>
+<a name="ln237">}</a>
+<a name="ln238"> </a>
+<a name="ln239"> </a>
+<a name="ln240">void</a>
+<a name="ln241">BitmapManager::SuspendOverlays()</a>
+<a name="ln242">{</a>
+<a name="ln243">	BAutolock locker(fLock);</a>
+<a name="ln244">	if (!locker.IsLocked())</a>
+<a name="ln245">		return;</a>
+<a name="ln246"> </a>
+<a name="ln247">	// first, tell all applications owning an overlay to release their locks</a>
+<a name="ln248"> </a>
+<a name="ln249">	BObjectList&lt;ServerApp&gt; apps;</a>
+<a name="ln250">	for (int32 i = 0; i &lt; fOverlays.CountItems(); i++) {</a>
+<a name="ln251">		ServerBitmap* bitmap = (ServerBitmap*)fOverlays.ItemAt(i);</a>
+<a name="ln252">		apps.BinaryInsert(bitmap-&gt;Owner(), &amp;compare_app_pointer);</a>
+<a name="ln253">	}</a>
+<a name="ln254">	for (int32 i = 0; i &lt; apps.CountItems(); i++) {</a>
+<a name="ln255">		BMessage notify(B_RELEASE_OVERLAY_LOCK);</a>
+<a name="ln256">		apps.ItemAt(i)-&gt;SendMessageToClient(&amp;notify);</a>
+<a name="ln257">	}</a>
+<a name="ln258"> </a>
+<a name="ln259">	// suspend overlays</a>
+<a name="ln260"> </a>
+<a name="ln261">	for (int32 i = 0; i &lt; fOverlays.CountItems(); i++) {</a>
+<a name="ln262">		ServerBitmap* bitmap = (ServerBitmap*)fOverlays.ItemAt(i);</a>
+<a name="ln263">		bitmap-&gt;Overlay()-&gt;Suspend(bitmap, false);</a>
+<a name="ln264">	}</a>
+<a name="ln265">}</a>
+<a name="ln266"> </a>
+<a name="ln267"> </a>
+<a name="ln268">void</a>
+<a name="ln269">BitmapManager::ResumeOverlays()</a>
+<a name="ln270">{</a>
+<a name="ln271">	BAutolock locker(fLock);</a>
+<a name="ln272">	if (!locker.IsLocked())</a>
+<a name="ln273">		return;</a>
+<a name="ln274"> </a>
+<a name="ln275">	// first, tell all applications owning an overlay that</a>
+<a name="ln276">	// they can reacquire their locks</a>
+<a name="ln277"> </a>
+<a name="ln278">	BObjectList&lt;ServerApp&gt; apps;</a>
+<a name="ln279">	for (int32 i = 0; i &lt; fOverlays.CountItems(); i++) {</a>
+<a name="ln280">		ServerBitmap* bitmap = (ServerBitmap*)fOverlays.ItemAt(i);</a>
+<a name="ln281">		apps.BinaryInsert(bitmap-&gt;Owner(), &amp;compare_app_pointer);</a>
+<a name="ln282">	}</a>
+<a name="ln283">	for (int32 i = 0; i &lt; apps.CountItems(); i++) {</a>
+<a name="ln284">		BMessage notify(B_RELEASE_OVERLAY_LOCK);</a>
+<a name="ln285">		apps.ItemAt(i)-&gt;SendMessageToClient(&amp;notify);</a>
+<a name="ln286">	}</a>
+<a name="ln287"> </a>
+<a name="ln288">	// resume overlays</a>
+<a name="ln289"> </a>
+<a name="ln290">	for (int32 i = 0; i &lt; fOverlays.CountItems(); i++) {</a>
+<a name="ln291">		ServerBitmap* bitmap = (ServerBitmap*)fOverlays.ItemAt(i);</a>
+<a name="ln292"> </a>
+<a name="ln293">		bitmap-&gt;Overlay()-&gt;Resume(bitmap);</a>
+<a name="ln294">	}</a>
+<a name="ln295">}</a>
+<a name="ln296"> </a>
+
+</code></pre>
+<div class="balloon" rel="51"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v501/" target="_blank">V501</a> There are identical sub-expressions to the left and to the right of the '-' operator: (addr_t) b - (addr_t) b</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

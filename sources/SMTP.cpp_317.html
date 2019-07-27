@@ -1,0 +1,971 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>SMTP.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2007-2015, Haiku, Inc. All rights reserved.</a>
+<a name="ln3"> * Copyright 2001-2002 Dr. Zoidberg Enterprises. All rights reserved.</a>
+<a name="ln4"> * Copyright 2011, Clemens Zeidler &lt;haiku@clemens-zeidler.de&gt;</a>
+<a name="ln5"> *</a>
+<a name="ln6"> * Distributed under the terms of the MIT License.</a>
+<a name="ln7"> */</a>
+<a name="ln8"> </a>
+<a name="ln9"> </a>
+<a name="ln10">//!	Implementation of the SMTP protocol</a>
+<a name="ln11"> </a>
+<a name="ln12"> </a>
+<a name="ln13">#include &quot;SMTP.h&quot;</a>
+<a name="ln14"> </a>
+<a name="ln15">#include &lt;map&gt;</a>
+<a name="ln16"> </a>
+<a name="ln17">#include &lt;ctype.h&gt;</a>
+<a name="ln18">#include &lt;errno.h&gt;</a>
+<a name="ln19">#include &lt;stdio.h&gt;</a>
+<a name="ln20">#include &lt;stdlib.h&gt;</a>
+<a name="ln21">#include &lt;sys/time.h&gt;</a>
+<a name="ln22">#include &lt;unistd.h&gt;</a>
+<a name="ln23"> </a>
+<a name="ln24">#include &lt;Alert.h&gt;</a>
+<a name="ln25">#include &lt;Catalog.h&gt;</a>
+<a name="ln26">#include &lt;DataIO.h&gt;</a>
+<a name="ln27">#include &lt;Entry.h&gt;</a>
+<a name="ln28">#include &lt;File.h&gt;</a>
+<a name="ln29">#include &lt;MenuField.h&gt;</a>
+<a name="ln30">#include &lt;Message.h&gt;</a>
+<a name="ln31">#include &lt;Path.h&gt;</a>
+<a name="ln32">#include &lt;Socket.h&gt;</a>
+<a name="ln33">#include &lt;SecureSocket.h&gt;</a>
+<a name="ln34">#include &lt;TextControl.h&gt;</a>
+<a name="ln35"> </a>
+<a name="ln36">#include &lt;crypt.h&gt;</a>
+<a name="ln37">#include &lt;mail_encoding.h&gt;</a>
+<a name="ln38">#include &lt;MailSettings.h&gt;</a>
+<a name="ln39">#include &lt;NodeMessage.h&gt;</a>
+<a name="ln40">#include &lt;ProtocolConfigView.h&gt;</a>
+<a name="ln41"> </a>
+<a name="ln42">#include &quot;md5.h&quot;</a>
+<a name="ln43"> </a>
+<a name="ln44"> </a>
+<a name="ln45">#undef B_TRANSLATION_CONTEXT</a>
+<a name="ln46">#define B_TRANSLATION_CONTEXT &quot;smtp&quot;</a>
+<a name="ln47"> </a>
+<a name="ln48"> </a>
+<a name="ln49">#define CRLF &quot;\r\n&quot;</a>
+<a name="ln50">#define SMTP_RESPONSE_SIZE 8192</a>
+<a name="ln51"> </a>
+<a name="ln52">//#define DEBUG</a>
+<a name="ln53">#ifdef DEBUG</a>
+<a name="ln54">#	define D(x) x</a>
+<a name="ln55">#	define bug printf</a>
+<a name="ln56">#else</a>
+<a name="ln57">#	define D(x) ;</a>
+<a name="ln58">#endif</a>
+<a name="ln59"> </a>
+<a name="ln60"> </a>
+<a name="ln61">// Authentication types recognized. Not all methods are implemented.</a>
+<a name="ln62">enum AuthType {</a>
+<a name="ln63">	LOGIN		= 1,</a>
+<a name="ln64">	PLAIN		= 1 &lt;&lt; 2,</a>
+<a name="ln65">	CRAM_MD5	= 1 &lt;&lt; 3,</a>
+<a name="ln66">	DIGEST_MD5	= 1 &lt;&lt; 4</a>
+<a name="ln67">};</a>
+<a name="ln68"> </a>
+<a name="ln69"> </a>
+<a name="ln70">using namespace std;</a>
+<a name="ln71"> </a>
+<a name="ln72">/*</a>
+<a name="ln73">** Function: md5_hmac</a>
+<a name="ln74">** taken from the file rfc2104.txt</a>
+<a name="ln75">** written by Martin Schaaf &lt;mascha@ma-scha.de&gt;</a>
+<a name="ln76">*/</a>
+<a name="ln77">void</a>
+<a name="ln78">MD5Hmac(unsigned char *digest, const unsigned char* text, int text_len,</a>
+<a name="ln79">	const unsigned char* key, int key_len)</a>
+<a name="ln80">{</a>
+<a name="ln81">	MD5_CTX context;</a>
+<a name="ln82">	unsigned char k_ipad[64];</a>
+<a name="ln83">		// inner padding - key XORd with ipad</a>
+<a name="ln84">	unsigned char k_opad[64];</a>
+<a name="ln85">		// outer padding - key XORd with opad</a>
+<a name="ln86">	int i;</a>
+<a name="ln87"> </a>
+<a name="ln88">	/* start out by storing key in pads */</a>
+<a name="ln89">	memset(k_ipad, 0, sizeof k_ipad);</a>
+<a name="ln90">	memset(k_opad, 0, sizeof k_opad);</a>
+<a name="ln91">	if (key_len &gt; 64) {</a>
+<a name="ln92">		/* if key is longer than 64 bytes reset it to key=MD5(key) */</a>
+<a name="ln93">		MD5_CTX tctx;</a>
+<a name="ln94"> </a>
+<a name="ln95">		MD5_Init(&amp;tctx);</a>
+<a name="ln96">		MD5_Update(&amp;tctx, (unsigned char*)key, key_len);</a>
+<a name="ln97">		MD5_Final(k_ipad, &amp;tctx);</a>
+<a name="ln98">		MD5_Final(k_opad, &amp;tctx);</a>
+<a name="ln99">	} else {</a>
+<a name="ln100">		memcpy(k_ipad, key, key_len);</a>
+<a name="ln101">		memcpy(k_opad, key, key_len);</a>
+<a name="ln102">	}</a>
+<a name="ln103"> </a>
+<a name="ln104">	/*</a>
+<a name="ln105">	 * the HMAC_MD5 transform looks like:</a>
+<a name="ln106">	 *</a>
+<a name="ln107">	 * MD5(K XOR opad, MD5(K XOR ipad, text))</a>
+<a name="ln108">	 *</a>
+<a name="ln109">	 * where K is an n byte key</a>
+<a name="ln110">	 * ipad is the byte 0x36 repeated 64 times</a>
+<a name="ln111">	 * opad is the byte 0x5c repeated 64 times</a>
+<a name="ln112">	 * and text is the data being protected</a>
+<a name="ln113">	 */</a>
+<a name="ln114"> </a>
+<a name="ln115">	/* XOR key with ipad and opad values */</a>
+<a name="ln116">	for (i = 0; i &lt; 64; i++) {</a>
+<a name="ln117">		k_ipad[i] ^= 0x36;</a>
+<a name="ln118">		k_opad[i] ^= 0x5c;</a>
+<a name="ln119">	}</a>
+<a name="ln120"> </a>
+<a name="ln121">	/*</a>
+<a name="ln122">	 * perform inner MD5</a>
+<a name="ln123">	 */</a>
+<a name="ln124">	MD5_Init(&amp;context);		      /* init context for 1st</a>
+<a name="ln125">					       * pass */</a>
+<a name="ln126">	MD5_Update(&amp;context, k_ipad, 64);     /* start with inner pad */</a>
+<a name="ln127">	MD5_Update(&amp;context, (unsigned char*)text, text_len); /* then text of datagram */</a>
+<a name="ln128">	MD5_Final(digest, &amp;context);	      /* finish up 1st pass */</a>
+<a name="ln129">	/*</a>
+<a name="ln130">	 * perform outer MD5</a>
+<a name="ln131">	 */</a>
+<a name="ln132">	MD5_Init(&amp;context);		      /* init context for 2nd</a>
+<a name="ln133">					       * pass */</a>
+<a name="ln134">	MD5_Update(&amp;context, k_opad, 64);     /* start with outer pad */</a>
+<a name="ln135">	MD5_Update(&amp;context, digest, 16);     /* then results of 1st</a>
+<a name="ln136">					       * hash */</a>
+<a name="ln137">	MD5_Final(digest, &amp;context);	      /* finish up 2nd pass */</a>
+<a name="ln138">}</a>
+<a name="ln139"> </a>
+<a name="ln140"> </a>
+<a name="ln141">void</a>
+<a name="ln142">MD5HexHmac(char *hexdigest, const unsigned char* text, int text_len,</a>
+<a name="ln143">	const unsigned char* key, int key_len)</a>
+<a name="ln144">{</a>
+<a name="ln145">	unsigned char digest[16];</a>
+<a name="ln146">	int i;</a>
+<a name="ln147">	unsigned char c;</a>
+<a name="ln148"> </a>
+<a name="ln149">	MD5Hmac(digest, text, text_len, key, key_len);</a>
+<a name="ln150">  	for (i = 0;  i &lt; 16;  i++) {</a>
+<a name="ln151">  		c = digest[i];</a>
+<a name="ln152">		*hexdigest++ = (c &gt; 0x9F ? 'a'-10 : '0')+(c&gt;&gt;4);</a>
+<a name="ln153">		*hexdigest++ = ((c&amp;0x0F) &gt; 9 ? 'a'-10 : '0')+(c&amp;0x0F);</a>
+<a name="ln154">  	}</a>
+<a name="ln155">  	*hexdigest = '\0';</a>
+<a name="ln156">}</a>
+<a name="ln157"> </a>
+<a name="ln158"> </a>
+<a name="ln159">/*</a>
+<a name="ln160">** Function: MD5Sum</a>
+<a name="ln161">** generates an MD5-sum from the given string</a>
+<a name="ln162">*/</a>
+<a name="ln163">void</a>
+<a name="ln164">MD5Sum (char* sum, unsigned char *text, int text_len) {</a>
+<a name="ln165">	MD5_CTX context;</a>
+<a name="ln166">	MD5_Init(&amp;context);</a>
+<a name="ln167">	MD5_Update(&amp;context, text, text_len);</a>
+<a name="ln168">	MD5_Final((unsigned char*)sum, &amp;context);</a>
+<a name="ln169">	sum[16] = '\0';</a>
+<a name="ln170">}</a>
+<a name="ln171"> </a>
+<a name="ln172">/*</a>
+<a name="ln173">** Function: MD5Digest</a>
+<a name="ln174">** generates an MD5-digest from the given string</a>
+<a name="ln175">*/</a>
+<a name="ln176">void MD5Digest (char* hexdigest, unsigned char *text, int text_len) {</a>
+<a name="ln177">	int i;</a>
+<a name="ln178">	unsigned char digest[17];</a>
+<a name="ln179">	unsigned char c;</a>
+<a name="ln180"> </a>
+<a name="ln181">	MD5Sum((char*)digest, text, text_len);</a>
+<a name="ln182"> </a>
+<a name="ln183">  	for (i = 0;  i &lt; 16;  i++) {</a>
+<a name="ln184">  		c = digest[i];</a>
+<a name="ln185">		*hexdigest++ = (c &gt; 0x9F ? 'a'-10 : '0')+(c&gt;&gt;4);</a>
+<a name="ln186">		*hexdigest++ = ((c&amp;0x0F) &gt; 9 ? 'a'-10 : '0')+(c&amp;0x0F);</a>
+<a name="ln187">  	}</a>
+<a name="ln188">  	*hexdigest = '\0';</a>
+<a name="ln189">}</a>
+<a name="ln190"> </a>
+<a name="ln191">/*</a>
+<a name="ln192">** Function: SplitChallengeIntoMap</a>
+<a name="ln193">** splits a challenge-string into the given map (see RFC-2831)</a>
+<a name="ln194">*/</a>
+<a name="ln195">// :</a>
+<a name="ln196">static bool</a>
+<a name="ln197">SplitChallengeIntoMap(BString str, map&lt;BString,BString&gt;&amp; m)</a>
+<a name="ln198">{</a>
+<a name="ln199">	m.clear();</a>
+<a name="ln200">	const char* key;</a>
+<a name="ln201">	const char* val;</a>
+<a name="ln202">	char* s = (char*)str.String();</a>
+<a name="ln203">	while(*s != 0) {</a>
+<a name="ln204">		while(isspace(*s))</a>
+<a name="ln205">			s++;</a>
+<a name="ln206">		key = s;</a>
+<a name="ln207">		while(isalpha(*s))</a>
+<a name="ln208">			s++;</a>
+<a name="ln209">		if (*s != '=')</a>
+<a name="ln210">			return false;</a>
+<a name="ln211">		*s++ = '\0';</a>
+<a name="ln212">		while(isspace(*s))</a>
+<a name="ln213">			s++;</a>
+<a name="ln214">		if (*s=='&quot;') {</a>
+<a name="ln215">			val = ++s;</a>
+<a name="ln216">			while(*s!='&quot;') {</a>
+<a name="ln217">				if (*s == 0)</a>
+<a name="ln218">					return false;</a>
+<a name="ln219">				s++;</a>
+<a name="ln220">			}</a>
+<a name="ln221">			*s++ = '\0';</a>
+<a name="ln222">		} else {</a>
+<a name="ln223">			val = s;</a>
+<a name="ln224">			while(*s!=0 &amp;&amp; *s!=',' &amp;&amp; !isspace(*s))</a>
+<a name="ln225">				s++;</a>
+<a name="ln226">			if (*s != 0)</a>
+<a name="ln227">				*s++ = '\0';</a>
+<a name="ln228">		}</a>
+<a name="ln229">		m[key] = val;</a>
+<a name="ln230">		while(isspace(*s))</a>
+<a name="ln231">			s++;</a>
+<a name="ln232">		if (*s != ',')</a>
+<a name="ln233">			return false;</a>
+<a name="ln234">		s++;</a>
+<a name="ln235">	}</a>
+<a name="ln236">	return true;</a>
+<a name="ln237">}</a>
+<a name="ln238"> </a>
+<a name="ln239"> </a>
+<a name="ln240">// #pragma mark -</a>
+<a name="ln241"> </a>
+<a name="ln242"> </a>
+<a name="ln243">SMTPProtocol::SMTPProtocol(const BMailAccountSettings&amp; settings)</a>
+<a name="ln244">	:</a>
+<a name="ln245">	BOutboundMailProtocol(&quot;SMTP&quot;, settings),</a>
+<a name="ln246">	fAuthType(0)</a>
+<a name="ln247">{</a>
+<a name="ln248">	fSettingsMessage = settings.OutboundSettings();</a>
+<a name="ln249">}</a>
+<a name="ln250"> </a>
+<a name="ln251"> </a>
+<a name="ln252">SMTPProtocol::~SMTPProtocol()</a>
+<a name="ln253">{</a>
+<a name="ln254">}</a>
+<a name="ln255"> </a>
+<a name="ln256"> </a>
+<a name="ln257">status_t</a>
+<a name="ln258">SMTPProtocol::Connect()</a>
+<a name="ln259">{</a>
+<a name="ln260">	BString errorMessage;</a>
+<a name="ln261">	int32 authMethod = fSettingsMessage.FindInt32(&quot;auth_method&quot;);</a>
+<a name="ln262"> </a>
+<a name="ln263">	status_t status = B_ERROR;</a>
+<a name="ln264"> </a>
+<a name="ln265">	if (authMethod == 2) {</a>
+<a name="ln266">		// POP3 authentication is handled here instead of SMTPProtocol::Login()</a>
+<a name="ln267">		// because some servers obviously don't like establishing the connection</a>
+<a name="ln268">		// to the SMTP server first...</a>
+<a name="ln269">		status_t status = _POP3Authentication();</a>
+<a name="ln270">		if (status &lt; B_OK) {</a>
+<a name="ln271">			errorMessage &lt;&lt; B_TRANSLATE(&quot;POP3 authentication failed. The &quot;</a>
+<a name="ln272">				&quot;server said:\n&quot;) &lt;&lt; fLog;</a>
+<a name="ln273">			ShowError(errorMessage.String());</a>
+<a name="ln274">			return status;</a>
+<a name="ln275">		}</a>
+<a name="ln276">	}</a>
+<a name="ln277"> </a>
+<a name="ln278">	status = Open(fSettingsMessage.FindString(&quot;server&quot;),</a>
+<a name="ln279">		fSettingsMessage.FindInt32(&quot;port&quot;), authMethod == 1);</a>
+<a name="ln280">	if (status &lt; B_OK) {</a>
+<a name="ln281">		errorMessage &lt;&lt; B_TRANSLATE(&quot;Error while opening connection to %serv&quot;);</a>
+<a name="ln282">		errorMessage.ReplaceFirst(&quot;%serv&quot;,</a>
+<a name="ln283">			fSettingsMessage.FindString(&quot;server&quot;));</a>
+<a name="ln284"> </a>
+<a name="ln285">		if (fSettingsMessage.FindInt32(&quot;port&quot;) &gt; 0)</a>
+<a name="ln286">			errorMessage &lt;&lt; &quot;:&quot; &lt;&lt; fSettingsMessage.FindInt32(&quot;port&quot;);</a>
+<a name="ln287"> </a>
+<a name="ln288">		if (fLog.Length() &gt; 0)</a>
+<a name="ln289">			errorMessage &lt;&lt; B_TRANSLATE(&quot;. The server says:\n&quot;) &lt;&lt; fLog;</a>
+<a name="ln290">		else {</a>
+<a name="ln291">			errorMessage &lt;&lt; &quot;. &quot; &lt;&lt; strerror(status);</a>
+<a name="ln292">		}</a>
+<a name="ln293"> </a>
+<a name="ln294">		ShowError(errorMessage.String());</a>
+<a name="ln295"> </a>
+<a name="ln296">		return status;</a>
+<a name="ln297">	}</a>
+<a name="ln298"> </a>
+<a name="ln299">	const char* password = get_passwd(&amp;fSettingsMessage, &quot;cpasswd&quot;);</a>
+<a name="ln300">	status = Login(fSettingsMessage.FindString(&quot;username&quot;), password);</a>
+<a name="ln301">	delete[] password;</a>
+<a name="ln302"> </a>
+<a name="ln303">	if (status != B_OK) {</a>
+<a name="ln304">		errorMessage &lt;&lt; B_TRANSLATE(&quot;Error while logging in to %serv&quot;)</a>
+<a name="ln305">			&lt;&lt; B_TRANSLATE(&quot;. The server said:\n&quot;) &lt;&lt; fLog;</a>
+<a name="ln306">		errorMessage.ReplaceFirst(&quot;%serv&quot;,</a>
+<a name="ln307">			fSettingsMessage.FindString(&quot;server&quot;));</a>
+<a name="ln308"> </a>
+<a name="ln309">		ShowError(errorMessage.String());</a>
+<a name="ln310">	}</a>
+<a name="ln311">	return B_OK;</a>
+<a name="ln312">}</a>
+<a name="ln313"> </a>
+<a name="ln314"> </a>
+<a name="ln315">void</a>
+<a name="ln316">SMTPProtocol::Disconnect()</a>
+<a name="ln317">{</a>
+<a name="ln318">	Close();</a>
+<a name="ln319">}</a>
+<a name="ln320"> </a>
+<a name="ln321"> </a>
+<a name="ln322">//! Process EMail to be sent</a>
+<a name="ln323">status_t</a>
+<a name="ln324">SMTPProtocol::HandleSendMessages(const BMessage&amp; message, off_t totalBytes)</a>
+<a name="ln325">{</a>
+<a name="ln326">	type_code type;</a>
+<a name="ln327">	int32 count;</a>
+<a name="ln328">	status_t status = message.GetInfo(&quot;ref&quot;, &amp;type, &amp;count);</a>
+<a name="ln329">	if (status != B_OK)</a>
+<a name="ln330">		return status;</a>
+<a name="ln331"> </a>
+<a name="ln332">	// TODO: sort out already sent messages -- the request could</a>
+<a name="ln333">	// be issued while we're busy sending them already</a>
+<a name="ln334"> </a>
+<a name="ln335">	SetTotalItems(count);</a>
+<a name="ln336">	SetTotalItemsSize(totalBytes);</a>
+<a name="ln337"> </a>
+<a name="ln338">	status = Connect();</a>
+<a name="ln339">	if (status != B_OK)</a>
+<a name="ln340">		return status;</a>
+<a name="ln341"> </a>
+<a name="ln342">	entry_ref ref;</a>
+<a name="ln343">	for (int32 i = 0; message.FindRef(&quot;ref&quot;, i++, &amp;ref) == B_OK;) {</a>
+<a name="ln344">		status = _SendMessage(ref);</a>
+<a name="ln345">		if (status != B_OK) {</a>
+<a name="ln346">			BString error;</a>
+<a name="ln347">			error &lt;&lt; &quot;An error occurred while sending the message &quot;</a>
+<a name="ln348">				&lt;&lt; ref.name &lt;&lt; &quot; (&quot; &lt;&lt; strerror(status) &lt;&lt; &quot;):\n&quot; &lt;&lt; fLog;</a>
+<a name="ln349">			ShowError(error.String());</a>
+<a name="ln350"> </a>
+<a name="ln351">			ResetProgress();</a>
+<a name="ln352">			break;</a>
+<a name="ln353">		}</a>
+<a name="ln354">	}</a>
+<a name="ln355"> </a>
+<a name="ln356">	Disconnect();</a>
+<a name="ln357">	return B_ERROR;</a>
+<a name="ln358">}</a>
+<a name="ln359"> </a>
+<a name="ln360"> </a>
+<a name="ln361">//! Opens connection to server</a>
+<a name="ln362">status_t</a>
+<a name="ln363">SMTPProtocol::Open(const char *address, int port, bool esmtp)</a>
+<a name="ln364">{</a>
+<a name="ln365">	ReportProgress(0, 0, B_TRANSLATE(&quot;Connecting to server&quot; B_UTF8_ELLIPSIS));</a>
+<a name="ln366"> </a>
+<a name="ln367">	use_ssl = (fSettingsMessage.FindInt32(&quot;flavor&quot;) == 1);</a>
+<a name="ln368"> </a>
+<a name="ln369">	if (port &lt;= 0)</a>
+<a name="ln370">		port = use_ssl ? 465 : 25;</a>
+<a name="ln371"> </a>
+<a name="ln372">	BNetworkAddress addr(address);</a>
+<a name="ln373">	if (addr.InitCheck() != B_OK) {</a>
+<a name="ln374">		BString str;</a>
+<a name="ln375">		str.SetToFormat(&quot;Invalid network address for SMTP server: %s&quot;,</a>
+<a name="ln376">			strerror(addr.InitCheck()));</a>
+<a name="ln377">		ShowError(str.String());</a>
+<a name="ln378">		return addr.InitCheck();</a>
+<a name="ln379">	}</a>
+<a name="ln380">		</a>
+<a name="ln381">	if (addr.Port() == 0)</a>
+<a name="ln382">		addr.SetPort(port);</a>
+<a name="ln383"> </a>
+<a name="ln384">	if (use_ssl)</a>
+<a name="ln385">		fSocket = new(std::nothrow) BSecureSocket;</a>
+<a name="ln386">	else</a>
+<a name="ln387">		fSocket = new(std::nothrow) BSocket;</a>
+<a name="ln388">	</a>
+<a name="ln389">	if (!fSocket)</a>
+<a name="ln390">		return B_NO_MEMORY;</a>
+<a name="ln391">	</a>
+<a name="ln392">	if (fSocket-&gt;Connect(addr) != B_OK) {</a>
+<a name="ln393">		BString error;</a>
+<a name="ln394">		error &lt;&lt; &quot;Could not connect to SMTP server &quot;</a>
+<a name="ln395">			&lt;&lt; fSettingsMessage.FindString(&quot;server&quot;);</a>
+<a name="ln396">		error &lt;&lt; &quot;:&quot; &lt;&lt; addr.Port();</a>
+<a name="ln397">		ShowError(error.String());</a>
+<a name="ln398">		delete fSocket;</a>
+<a name="ln399">		return B_ERROR;</a>
+<a name="ln400">	}</a>
+<a name="ln401"> </a>
+<a name="ln402">	BString line;</a>
+<a name="ln403">	ReceiveResponse(line);</a>
+<a name="ln404"> </a>
+<a name="ln405">	char localhost[255];</a>
+<a name="ln406">	gethostname(localhost, 255);</a>
+<a name="ln407"> </a>
+<a name="ln408">	if (localhost[0] == 0)</a>
+<a name="ln409">		strcpy(localhost, &quot;namethisbebox&quot;);</a>
+<a name="ln410"> </a>
+<a name="ln411">	char *cmd = new char[::strlen(localhost)+8];</a>
+<a name="ln412">	if (!esmtp)</a>
+<a name="ln413">		::sprintf(cmd,&quot;HELO %s&quot; CRLF, localhost);</a>
+<a name="ln414">	else</a>
+<a name="ln415">		::sprintf(cmd,&quot;EHLO %s&quot; CRLF, localhost);</a>
+<a name="ln416"> </a>
+<a name="ln417">	if (SendCommand(cmd) != B_OK) {</a>
+<a name="ln418">		delete[] cmd;</a>
+<a name="ln419">		return B_ERROR;</a>
+<a name="ln420">	}</a>
+<a name="ln421"> </a>
+<a name="ln422">	delete[] cmd;</a>
+<a name="ln423"> </a>
+<a name="ln424">	// Check auth type</a>
+<a name="ln425">	if (esmtp) {</a>
+<a name="ln426">		const char *res = fLog.String();</a>
+<a name="ln427">		char *p;</a>
+<a name="ln428">		if ((p = ::strstr(res, &quot;250-AUTH&quot;)) != NULL</a>
+<a name="ln429">				|| (p = ::strstr(res, &quot;250 AUTH&quot;)) != NULL) {</a>
+<a name="ln430">			if(::strstr(p, &quot;LOGIN&quot;))</a>
+<a name="ln431">				fAuthType |= LOGIN;</a>
+<a name="ln432">			if(::strstr(p, &quot;PLAIN&quot;))</a>
+<a name="ln433">				fAuthType |= PLAIN;</a>
+<a name="ln434">			if(::strstr(p, &quot;CRAM-MD5&quot;))</a>
+<a name="ln435">				fAuthType |= CRAM_MD5;</a>
+<a name="ln436">			if(::strstr(p, &quot;DIGEST-MD5&quot;)) {</a>
+<a name="ln437">				fAuthType |= DIGEST_MD5;</a>
+<a name="ln438">				fServerName = address;</a>
+<a name="ln439">			}</a>
+<a name="ln440">		}</a>
+<a name="ln441">	}</a>
+<a name="ln442">	return B_OK;</a>
+<a name="ln443">}</a>
+<a name="ln444"> </a>
+<a name="ln445"> </a>
+<a name="ln446">status_t</a>
+<a name="ln447">SMTPProtocol::_SendMessage(const entry_ref&amp; ref)</a>
+<a name="ln448">{</a>
+<a name="ln449">	// open read write to be able to manipulate in MessageReadyToSend hook</a>
+<a name="ln450">	BFile file(&amp;ref, B_READ_WRITE);</a>
+<a name="ln451">	status_t status = file.InitCheck();</a>
+<a name="ln452">	if (status != B_OK)</a>
+<a name="ln453">		return status;</a>
+<a name="ln454"> </a>
+<a name="ln455">	BMessage header;</a>
+<a name="ln456">	file &gt;&gt; header;</a>
+<a name="ln457"> </a>
+<a name="ln458">	const char *from = header.FindString(&quot;MAIL:from&quot;);</a>
+<a name="ln459">	const char *to = header.FindString(&quot;MAIL:recipients&quot;);</a>
+<a name="ln460">	if (to == NULL)</a>
+<a name="ln461">		to = header.FindString(&quot;MAIL:to&quot;);</a>
+<a name="ln462"> </a>
+<a name="ln463">	if (to == NULL || from == NULL) {</a>
+<a name="ln464">		fLog = &quot;Invalid message headers&quot;;</a>
+<a name="ln465">		return B_ERROR;</a>
+<a name="ln466">	}</a>
+<a name="ln467"> </a>
+<a name="ln468">	NotifyMessageReadyToSend(ref, file);</a>
+<a name="ln469">	status = Send(to, from, &amp;file);</a>
+<a name="ln470">	if (status != B_OK)</a>
+<a name="ln471">		return status;</a>
+<a name="ln472">	NotifyMessageSent(ref, file);</a>
+<a name="ln473"> </a>
+<a name="ln474">	off_t size = 0;</a>
+<a name="ln475">	file.GetSize(&amp;size);</a>
+<a name="ln476">	ReportProgress(size, 1);</a>
+<a name="ln477"> </a>
+<a name="ln478">	return B_OK;</a>
+<a name="ln479">}</a>
+<a name="ln480"> </a>
+<a name="ln481"> </a>
+<a name="ln482">status_t</a>
+<a name="ln483">SMTPProtocol::_POP3Authentication()</a>
+<a name="ln484">{</a>
+<a name="ln485">	const entry_ref&amp; entry = fAccountSettings.InboundAddOnRef();</a>
+<a name="ln486">	if (strcmp(entry.name, &quot;POP3&quot;) != 0)</a>
+<a name="ln487">		return B_ERROR;</a>
+<a name="ln488"> </a>
+<a name="ln489">	status_t (*pop3_smtp_auth)(const BMailAccountSettings&amp;);</a>
+<a name="ln490"> </a>
+<a name="ln491">	BPath path(&amp;entry);</a>
+<a name="ln492">	image_id image = load_add_on(path.Path());</a>
+<a name="ln493">	if (image &lt; 0)</a>
+<a name="ln494">		return B_ERROR;</a>
+<a name="ln495">	if (get_image_symbol(image, &quot;pop3_smtp_auth&quot;,</a>
+<a name="ln496">			B_SYMBOL_TYPE_TEXT, (void **)&amp;pop3_smtp_auth) != B_OK) {</a>
+<a name="ln497">		unload_add_on(image);</a>
+<a name="ln498">		image = -1;</a>
+<a name="ln499">		return B_ERROR;</a>
+<a name="ln500">	}</a>
+<a name="ln501">	status_t status = (*pop3_smtp_auth)(fAccountSettings);</a>
+<a name="ln502">	unload_add_on(image);</a>
+<a name="ln503">	return status;</a>
+<a name="ln504">}</a>
+<a name="ln505"> </a>
+<a name="ln506"> </a>
+<a name="ln507">status_t</a>
+<a name="ln508">SMTPProtocol::Login(const char *_login, const char *password)</a>
+<a name="ln509">{</a>
+<a name="ln510">	if (fAuthType == 0)</a>
+<a name="ln511">		return B_OK;</a>
+<a name="ln512"> </a>
+<a name="ln513">	const char *login = _login;</a>
+<a name="ln514">	char hex_digest[33];</a>
+<a name="ln515">	BString out;</a>
+<a name="ln516"> </a>
+<a name="ln517">	int32 loginlen = ::strlen(login);</a>
+<a name="ln518">	int32 passlen = ::strlen(password);</a>
+<a name="ln519"> </a>
+<a name="ln520">	if (fAuthType &amp; DIGEST_MD5) {</a>
+<a name="ln521">		//******* DIGEST-MD5 Authentication ( tested. works fine [with Cyrus SASL] )</a>
+<a name="ln522">		// this implements only the subpart of DIGEST-MD5 which is</a>
+<a name="ln523">		// required for authentication to SMTP-servers. Integrity-</a>
+<a name="ln524">		// and confidentiality-protection are not implemented, as</a>
+<a name="ln525">		// they are provided by the use of OpenSSL.</a>
+<a name="ln526">		SendCommand(&quot;AUTH DIGEST-MD5&quot; CRLF);</a>
+<a name="ln527">		const char *res = fLog.String();</a>
+<a name="ln528"> </a>
+<a name="ln529">		if (strncmp(res, &quot;334&quot;, 3) != 0)</a>
+<a name="ln530">			return B_ERROR;</a>
+<a name="ln531">		int32 baselen = ::strlen(&amp;res[4]);</a>
+<a name="ln532">		char *base = new char[baselen+1];</a>
+<a name="ln533">		baselen = ::decode_base64(base, &amp;res[4], baselen);</a>
+<a name="ln534">		base[baselen] = '\0';</a>
+<a name="ln535"> </a>
+<a name="ln536">		D(bug(&quot;base: %s\n&quot;, base));</a>
+<a name="ln537"> </a>
+<a name="ln538">		map&lt;BString,BString&gt; challengeMap;</a>
+<a name="ln539">		SplitChallengeIntoMap(base, challengeMap);</a>
+<a name="ln540"> </a>
+<a name="ln541">		delete[] base;</a>
+<a name="ln542"> </a>
+<a name="ln543">		BString rawResponse = BString(&quot;username=&quot;) &lt;&lt; '&quot;' &lt;&lt; login &lt;&lt; '&quot;';</a>
+<a name="ln544">		rawResponse &lt;&lt; &quot;,realm=&quot; &lt;&lt; '&quot;' &lt;&lt; challengeMap[&quot;realm&quot;] &lt;&lt; '&quot;';</a>
+<a name="ln545">		rawResponse &lt;&lt; &quot;,nonce=&quot; &lt;&lt; '&quot;' &lt;&lt; challengeMap[&quot;nonce&quot;] &lt;&lt; '&quot;';</a>
+<a name="ln546">		rawResponse &lt;&lt; &quot;,nc=00000001&quot;;</a>
+<a name="ln547">		char temp[33];</a>
+<a name="ln548">		for( int i=0; i&lt;32; ++i)</a>
+<a name="ln549">			temp[i] = 1+(rand()%254);</a>
+<a name="ln550">		temp[32] = '\0';</a>
+<a name="ln551">		BString rawCnonce(temp);</a>
+<a name="ln552">		BString cnonce;</a>
+<a name="ln553">		char* cnoncePtr = cnonce.LockBuffer(rawCnonce.Length()*2);</a>
+<a name="ln554">		baselen = ::encode_base64(cnoncePtr, rawCnonce.String(), rawCnonce.Length(), true /* headerMode */);</a>
+<a name="ln555">		cnoncePtr[baselen] = '\0';</a>
+<a name="ln556">		cnonce.UnlockBuffer(baselen);</a>
+<a name="ln557">		rawResponse &lt;&lt; &quot;,cnonce=&quot; &lt;&lt; '&quot;' &lt;&lt; cnonce &lt;&lt; '&quot;';</a>
+<a name="ln558">		rawResponse &lt;&lt; &quot;,qop=auth&quot;;</a>
+<a name="ln559">		BString digestUriValue	= BString(&quot;smtp/&quot;) &lt;&lt; fServerName;</a>
+<a name="ln560">		rawResponse &lt;&lt; &quot;,digest-uri=&quot; &lt;&lt; '&quot;' &lt;&lt; digestUriValue &lt;&lt; '&quot;';</a>
+<a name="ln561">		char sum[17], hex_digest2[33];</a>
+<a name="ln562">		BString a1,a2,kd;</a>
+<a name="ln563">		BString t1 = BString(login) &lt;&lt; &quot;:&quot;</a>
+<a name="ln564">				&lt;&lt; challengeMap[&quot;realm&quot;] &lt;&lt; &quot;:&quot;</a>
+<a name="ln565">				&lt;&lt; password;</a>
+<a name="ln566">		MD5Sum(sum, (unsigned char*)t1.String(), t1.Length());</a>
+<a name="ln567">		a1 &lt;&lt; sum &lt;&lt; &quot;:&quot; &lt;&lt; challengeMap[&quot;nonce&quot;] &lt;&lt; &quot;:&quot; &lt;&lt; cnonce;</a>
+<a name="ln568">		MD5Digest(hex_digest, (unsigned char*)a1.String(), a1.Length());</a>
+<a name="ln569">		a2 &lt;&lt; &quot;AUTHENTICATE:&quot; &lt;&lt; digestUriValue;</a>
+<a name="ln570">		MD5Digest(hex_digest2, (unsigned char*)a2.String(), a2.Length());</a>
+<a name="ln571">		kd &lt;&lt; hex_digest &lt;&lt; ':' &lt;&lt; challengeMap[&quot;nonce&quot;]</a>
+<a name="ln572">		   &lt;&lt; &quot;:&quot; &lt;&lt; &quot;00000001&quot; &lt;&lt; ':' &lt;&lt; cnonce &lt;&lt; ':' &lt;&lt; &quot;auth&quot;</a>
+<a name="ln573">		   &lt;&lt; ':' &lt;&lt; hex_digest2;</a>
+<a name="ln574">		MD5Digest(hex_digest, (unsigned char*)kd.String(), kd.Length());</a>
+<a name="ln575"> </a>
+<a name="ln576">		rawResponse &lt;&lt; &quot;,response=&quot; &lt;&lt; hex_digest;</a>
+<a name="ln577">		BString postResponse;</a>
+<a name="ln578">		char *resp = postResponse.LockBuffer(rawResponse.Length() * 2 + 10);</a>
+<a name="ln579">		baselen = ::encode_base64(resp, rawResponse.String(), rawResponse.Length(), true /* headerMode */);</a>
+<a name="ln580">		resp[baselen] = 0;</a>
+<a name="ln581">		postResponse.UnlockBuffer();</a>
+<a name="ln582">		postResponse.Append(CRLF);</a>
+<a name="ln583"> </a>
+<a name="ln584">		SendCommand(postResponse.String());</a>
+<a name="ln585"> </a>
+<a name="ln586">		res = fLog.String();</a>
+<a name="ln587">		if (atol(res) &gt;= 500)</a>
+<a name="ln588">			return B_ERROR;</a>
+<a name="ln589">		// actually, we are supposed to check the rspauth sent back</a>
+<a name="ln590">		// by the SMTP-server, but that isn't strictly required,</a>
+<a name="ln591">		// so we skip that for now.</a>
+<a name="ln592">		SendCommand(CRLF);	// finish off authentication</a>
+<a name="ln593">		res = fLog.String();</a>
+<a name="ln594">		if (atol(res) &lt; 500)</a>
+<a name="ln595">			return B_OK;</a>
+<a name="ln596">	}</a>
+<a name="ln597">	if (fAuthType &amp; CRAM_MD5) {</a>
+<a name="ln598">		//******* CRAM-MD5 Authentication ( tested. works fine [with Cyrus SASL] )</a>
+<a name="ln599">		SendCommand(&quot;AUTH CRAM-MD5&quot; CRLF);</a>
+<a name="ln600">		const char *res = fLog.String();</a>
+<a name="ln601"> </a>
+<a name="ln602">		if (strncmp(res, &quot;334&quot;, 3) != 0)</a>
+<a name="ln603">			return B_ERROR;</a>
+<a name="ln604">		int32 baselen = ::strlen(&amp;res[4]);</a>
+<a name="ln605">		char *base = new char[baselen+1];</a>
+<a name="ln606">		baselen = ::decode_base64(base, &amp;res[4], baselen);</a>
+<a name="ln607">		base[baselen] = '\0';</a>
+<a name="ln608"> </a>
+<a name="ln609">		D(bug(&quot;base: %s\n&quot;, base));</a>
+<a name="ln610"> </a>
+<a name="ln611">		::MD5HexHmac(hex_digest, (const unsigned char *)base, (int)baselen,</a>
+<a name="ln612">			(const unsigned char *)password, (int)passlen);</a>
+<a name="ln613"> </a>
+<a name="ln614">		D(bug(&quot;%s\n%s\n&quot;, base, hex_digest));</a>
+<a name="ln615"> </a>
+<a name="ln616">		delete[] base;</a>
+<a name="ln617"> </a>
+<a name="ln618">		BString preResponse, postResponse;</a>
+<a name="ln619">		preResponse = login;</a>
+<a name="ln620">		preResponse &lt;&lt; &quot; &quot; &lt;&lt; hex_digest &lt;&lt; CRLF;</a>
+<a name="ln621">		char *resp = postResponse.LockBuffer(preResponse.Length() * 2 + 10);</a>
+<a name="ln622">		baselen = ::encode_base64(resp, preResponse.String(), preResponse.Length(), true /* headerMode */);</a>
+<a name="ln623">		resp[baselen] = 0;</a>
+<a name="ln624">		postResponse.UnlockBuffer();</a>
+<a name="ln625">		postResponse.Append(CRLF);</a>
+<a name="ln626"> </a>
+<a name="ln627">		SendCommand(postResponse.String());</a>
+<a name="ln628"> </a>
+<a name="ln629">		res = fLog.String();</a>
+<a name="ln630">		if (atol(res) &lt; 500)</a>
+<a name="ln631">			return B_OK;</a>
+<a name="ln632">	}</a>
+<a name="ln633">	if (fAuthType &amp; LOGIN) {</a>
+<a name="ln634">		//******* LOGIN Authentication ( tested. works fine)</a>
+<a name="ln635">		ssize_t encodedsize; // required by our base64 implementation</a>
+<a name="ln636"> </a>
+<a name="ln637">		SendCommand(&quot;AUTH LOGIN&quot; CRLF);</a>
+<a name="ln638">		const char *res = fLog.String();</a>
+<a name="ln639"> </a>
+<a name="ln640">		if (strncmp(res, &quot;334&quot;, 3) != 0)</a>
+<a name="ln641">			return B_ERROR;</a>
+<a name="ln642"> </a>
+<a name="ln643">		// Send login name as base64</a>
+<a name="ln644">		char *login64 = new char[loginlen*3 + 6];</a>
+<a name="ln645">		encodedsize = ::encode_base64(login64, (char *)login, loginlen, true /* headerMode */);</a>
+<a name="ln646">		login64[encodedsize] = 0;</a>
+<a name="ln647">		strcat (login64, CRLF);</a>
+<a name="ln648">		SendCommand(login64);</a>
+<a name="ln649">		delete[] login64;</a>
+<a name="ln650"> </a>
+<a name="ln651">		res = fLog.String();</a>
+<a name="ln652">		if (strncmp(res,&quot;334&quot;,3) != 0)</a>
+<a name="ln653">			return B_ERROR;</a>
+<a name="ln654"> </a>
+<a name="ln655">		// Send password as base64</a>
+<a name="ln656">		login64 = new char[passlen*3 + 6];</a>
+<a name="ln657">		encodedsize = ::encode_base64(login64, (char *)password, passlen, true /* headerMode */);</a>
+<a name="ln658">		login64[encodedsize] = 0;</a>
+<a name="ln659">		strcat (login64, CRLF);</a>
+<a name="ln660">		SendCommand(login64);</a>
+<a name="ln661">		delete[] login64;</a>
+<a name="ln662"> </a>
+<a name="ln663">		res = fLog.String();</a>
+<a name="ln664">		if (atol(res) &lt; 500)</a>
+<a name="ln665">			return B_OK;</a>
+<a name="ln666">	}</a>
+<a name="ln667">	if (fAuthType &amp; PLAIN) {</a>
+<a name="ln668">		//******* PLAIN Authentication ( tested. works fine [with Cyrus SASL] )</a>
+<a name="ln669">		// format is:</a>
+<a name="ln670">		// 	authenticateID + \0 + username + \0 + password</a>
+<a name="ln671">		// 	(where authenticateID is always empty !?!)</a>
+<a name="ln672">		BString preResponse, postResponse;</a>
+<a name="ln673">		char *stringPntr;</a>
+<a name="ln674">		ssize_t encodedLength;</a>
+<a name="ln675">		stringPntr = preResponse.LockBuffer(loginlen + passlen + 3);</a>
+<a name="ln676">			// +3 to make room for the two \0-chars between the tokens and</a>
+<a name="ln677">			// the final delimiter added by sprintf().</a>
+<a name="ln678">		sprintf (stringPntr, &quot;%c%s%c%s&quot;, 0, login, 0, password);</a>
+<a name="ln679">		preResponse.UnlockBuffer(loginlen + passlen + 2);</a>
+<a name="ln680">			// +2 in order to leave out the final delimiter (which is not part</a>
+<a name="ln681">			// of the string).</a>
+<a name="ln682">		stringPntr = postResponse.LockBuffer(preResponse.Length() * 3);</a>
+<a name="ln683">		encodedLength = ::encode_base64(stringPntr, preResponse.String(),</a>
+<a name="ln684">			preResponse.Length(), true /* headerMode */);</a>
+<a name="ln685">		stringPntr[encodedLength] = 0;</a>
+<a name="ln686">		postResponse.UnlockBuffer();</a>
+<a name="ln687">		postResponse.Prepend(&quot;AUTH PLAIN &quot;);</a>
+<a name="ln688">		postResponse &lt;&lt; CRLF;</a>
+<a name="ln689"> </a>
+<a name="ln690">		SendCommand(postResponse.String());</a>
+<a name="ln691"> </a>
+<a name="ln692">		const char *res = fLog.String();</a>
+<a name="ln693">		if (atol(res) &lt; 500)</a>
+<a name="ln694">			return B_OK;</a>
+<a name="ln695">	}</a>
+<a name="ln696">	return B_ERROR;</a>
+<a name="ln697">}</a>
+<a name="ln698"> </a>
+<a name="ln699"> </a>
+<a name="ln700">void</a>
+<a name="ln701">SMTPProtocol::Close()</a>
+<a name="ln702">{</a>
+<a name="ln703"> </a>
+<a name="ln704">	BString cmd = &quot;QUIT&quot;;</a>
+<a name="ln705">	cmd += CRLF;</a>
+<a name="ln706"> </a>
+<a name="ln707">	if (SendCommand(cmd.String()) != B_OK) {</a>
+<a name="ln708">		// Error</a>
+<a name="ln709">	}</a>
+<a name="ln710"> </a>
+<a name="ln711">	delete fSocket;</a>
+<a name="ln712">}</a>
+<a name="ln713"> </a>
+<a name="ln714"> </a>
+<a name="ln715">status_t</a>
+<a name="ln716">SMTPProtocol::Send(const char* to, const char* from, BPositionIO *message)</a>
+<a name="ln717">{</a>
+<a name="ln718">	BString cmd = from;</a>
+<a name="ln719">	cmd.Remove(0, cmd.FindFirst(&quot;\&quot; &lt;&quot;) + 2);</a>
+<a name="ln720">	cmd.Prepend(&quot;MAIL FROM: &quot;);</a>
+<a name="ln721">	cmd += CRLF;</a>
+<a name="ln722">	if (SendCommand(cmd.String()) != B_OK)</a>
+<a name="ln723">		return B_ERROR;</a>
+<a name="ln724"> </a>
+<a name="ln725">	int32 len = strlen(to);</a>
+<a name="ln726">	BString addr(&quot;&quot;);</a>
+<a name="ln727">	for (int32 i = 0;i &lt; len;i++) {</a>
+<a name="ln728">		char c = to[i];</a>
+<a name="ln729">		if (c != ',')</a>
+<a name="ln730">			addr += (char)c;</a>
+<a name="ln731">		if (c == ','||i == len-1) {</a>
+<a name="ln732">			if(addr.Length() == 0)</a>
+<a name="ln733">				continue;</a>
+<a name="ln734">			cmd = &quot;RCPT TO: &quot;;</a>
+<a name="ln735">			cmd &lt;&lt; addr.String() &lt;&lt; CRLF;</a>
+<a name="ln736">			if (SendCommand(cmd.String()) != B_OK)</a>
+<a name="ln737">				return B_ERROR;</a>
+<a name="ln738"> </a>
+<a name="ln739">			addr =&quot;&quot;;</a>
+<a name="ln740">		}</a>
+<a name="ln741">	}</a>
+<a name="ln742"> </a>
+<a name="ln743">	cmd = &quot;DATA&quot;;</a>
+<a name="ln744">	cmd += CRLF;</a>
+<a name="ln745">	if (SendCommand(cmd.String()) != B_OK)</a>
+<a name="ln746">		return B_ERROR;</a>
+<a name="ln747"> </a>
+<a name="ln748">	// Send the message data.  Convert lines starting with a period to start</a>
+<a name="ln749">	// with two periods and so on.  The actual sequence is CR LF Period.  The</a>
+<a name="ln750">	// SMTP server will remove the periods.  Of course, the POP server may then</a>
+<a name="ln751">	// add some of its own, but the POP client should take care of them.</a>
+<a name="ln752"> </a>
+<a name="ln753">	ssize_t amountRead;</a>
+<a name="ln754">	ssize_t amountToRead;</a>
+<a name="ln755">	ssize_t amountUnread;</a>
+<a name="ln756">	ssize_t bufferLen = 0;</a>
+<a name="ln757">	const int bufferMax = 2000;</a>
+<a name="ln758">	bool foundCRLFPeriod;</a>
+<a name="ln759">	int i;</a>
+<a name="ln760">	bool messageEndedWithCRLF = false;</a>
+<a name="ln761"> </a>
+<a name="ln762">	message-&gt;Seek(0, SEEK_END);</a>
+<a name="ln763">	amountUnread = message-&gt;Position();</a>
+<a name="ln764">	message-&gt;Seek(0, SEEK_SET);</a>
+<a name="ln765">	char *data = new char[bufferMax];</a>
+<a name="ln766"> </a>
+<a name="ln767">	while (true) {</a>
+<a name="ln768">		// Fill the buffer if it is getting low, but not every time, to avoid</a>
+<a name="ln769">		// small reads.</a>
+<a name="ln770">		if (bufferLen &lt; bufferMax / 2) {</a>
+<a name="ln771">			amountToRead = bufferMax - bufferLen;</a>
+<a name="ln772">			if (amountToRead &gt; amountUnread)</a>
+<a name="ln773">				amountToRead = amountUnread;</a>
+<a name="ln774">			if (amountToRead &gt; 0) {</a>
+<a name="ln775">				amountRead = message-&gt;Read (data + bufferLen, amountToRead);</a>
+<a name="ln776">				if (amountRead &lt;= 0 || amountRead &gt; amountToRead)</a>
+<a name="ln777">					amountUnread = 0; // Just stop reading when an error happens.</a>
+<a name="ln778">				else {</a>
+<a name="ln779">					amountUnread -= amountRead;</a>
+<a name="ln780">					bufferLen += amountRead;</a>
+<a name="ln781">				}</a>
+<a name="ln782">			}</a>
+<a name="ln783">		}</a>
+<a name="ln784"> </a>
+<a name="ln785">		// Look for the next CRLFPeriod triple.</a>
+<a name="ln786">		foundCRLFPeriod = false;</a>
+<a name="ln787">		for (i = 0; i &lt;= bufferLen - 3; i++) {</a>
+<a name="ln788">			if (data[i] == '\r' &amp;&amp; data[i+1] == '\n' &amp;&amp; data[i+2] == '.') {</a>
+<a name="ln789">				foundCRLFPeriod = true;</a>
+<a name="ln790">				// Send data up to the CRLF, and include the period too.</a>
+<a name="ln791">				if (fSocket-&gt;Write(data, i + 3) &lt; 0) {</a>
+<a name="ln792">					amountUnread = 0; // Stop when an error happens.</a>
+<a name="ln793">					bufferLen = 0;</a>
+<a name="ln794">					break;</a>
+<a name="ln795">				}</a>
+<a name="ln796">				ReportProgress (i + 2 /* Don't include the double period here */,0);</a>
+<a name="ln797">				// Move the data over in the buffer, but leave the period there</a>
+<a name="ln798">				// so it gets sent a second time.</a>
+<a name="ln799">				memmove(data, data + (i + 2), bufferLen - (i + 2));</a>
+<a name="ln800">				bufferLen -= i + 2;</a>
+<a name="ln801">				break;</a>
+<a name="ln802">			}</a>
+<a name="ln803">		}</a>
+<a name="ln804"> </a>
+<a name="ln805">		if (!foundCRLFPeriod) {</a>
+<a name="ln806">			if (amountUnread &lt;= 0) { // No more data, all we have is in the buffer.</a>
+<a name="ln807">				if (bufferLen &gt; 0) {</a>
+<a name="ln808">					fSocket-&gt;Write(data, bufferLen);</a>
+<a name="ln809">					ReportProgress(bufferLen, 0);</a>
+<a name="ln810">					if (bufferLen &gt;= 2)</a>
+<a name="ln811">						messageEndedWithCRLF = (data[bufferLen-2] == '\r' &amp;&amp;</a>
+<a name="ln812">							data[bufferLen-1] == '\n');</a>
+<a name="ln813">				}</a>
+<a name="ln814">				break; // Finished!</a>
+<a name="ln815">			}</a>
+<a name="ln816"> </a>
+<a name="ln817">			// Send most of the buffer, except a few characters to overlap with</a>
+<a name="ln818">			// the next read, in case the CRLFPeriod is split between reads.</a>
+<a name="ln819">			if (bufferLen &gt; 3) {</a>
+<a name="ln820">				if (fSocket-&gt;Write(data, bufferLen - 3) &lt; 0)</a>
+<a name="ln821">					break; // Stop when an error happens.</a>
+<a name="ln822"> </a>
+<a name="ln823">				ReportProgress(bufferLen - 3, 0);</a>
+<a name="ln824">				memmove (data, data + bufferLen - 3, 3);</a>
+<a name="ln825">				bufferLen = 3;</a>
+<a name="ln826">			}</a>
+<a name="ln827">		}</a>
+<a name="ln828">	}</a>
+<a name="ln829">	delete [] data;</a>
+<a name="ln830"> </a>
+<a name="ln831">	if (messageEndedWithCRLF)</a>
+<a name="ln832">		cmd = &quot;.&quot; CRLF; // The standard says don't add extra CRLF.</a>
+<a name="ln833">	else</a>
+<a name="ln834">		cmd = CRLF &quot;.&quot; CRLF;</a>
+<a name="ln835"> </a>
+<a name="ln836">	if (SendCommand(cmd.String()) != B_OK)</a>
+<a name="ln837">		return B_ERROR;</a>
+<a name="ln838"> </a>
+<a name="ln839">	return B_OK;</a>
+<a name="ln840">}</a>
+<a name="ln841"> </a>
+<a name="ln842"> </a>
+<a name="ln843">//! Receives response from server.</a>
+<a name="ln844">int32</a>
+<a name="ln845">SMTPProtocol::ReceiveResponse(BString &amp;out)</a>
+<a name="ln846">{</a>
+<a name="ln847">	out = &quot;&quot;;</a>
+<a name="ln848">	int32 len = 0,r;</a>
+<a name="ln849">	char buf[SMTP_RESPONSE_SIZE];</a>
+<a name="ln850">	bigtime_t timeout = 1000000*180; // timeout 180 secs</a>
+<a name="ln851">	bool gotCode = false;</a>
+<a name="ln852">	int32 errCode;</a>
+<a name="ln853">	BString searchStr = &quot;&quot;;</a>
+<a name="ln854"> </a>
+<a name="ln855">	if (fSocket-&gt;WaitForReadable(timeout) == B_OK) {</a>
+<a name="ln856">		while (1) {</a>
+<a name="ln857">			r = fSocket-&gt;Read(buf, SMTP_RESPONSE_SIZE - 1);</a>
+<a name="ln858">			if (r &lt;= 0)</a>
+<a name="ln859">				break;</a>
+<a name="ln860"> </a>
+<a name="ln861">			if (!gotCode) {</a>
+<a name="ln862">				if (buf[3] == ' ' || buf[3] == '-') {</a>
+<a name="ln863">					errCode = atol(buf);</a>
+<a name="ln864">					gotCode = true;</a>
+<a name="ln865">					searchStr &lt;&lt; errCode &lt;&lt; ' ';</a>
+<a name="ln866">				}</a>
+<a name="ln867">			}</a>
+<a name="ln868"> </a>
+<a name="ln869">			len += r;</a>
+<a name="ln870">			out.Append(buf, r);</a>
+<a name="ln871"> </a>
+<a name="ln872">			if (strstr(buf, CRLF) &amp;&amp; (out.FindFirst(searchStr) != B_ERROR))</a>
+<a name="ln873">				break;</a>
+<a name="ln874">		}</a>
+<a name="ln875">	} else</a>
+<a name="ln876">		fLog = &quot;SMTP socket timeout.&quot;;</a>
+<a name="ln877"> </a>
+<a name="ln878">	D(bug(&quot;S:%s\n&quot;, out.String()));</a>
+<a name="ln879">	return len;</a>
+<a name="ln880">}</a>
+<a name="ln881"> </a>
+<a name="ln882"> </a>
+<a name="ln883">// Sends SMTP command. Result kept in fLog</a>
+<a name="ln884"> </a>
+<a name="ln885">status_t</a>
+<a name="ln886">SMTPProtocol::SendCommand(const char *cmd)</a>
+<a name="ln887">{</a>
+<a name="ln888">	D(bug(&quot;C:%s\n&quot;, cmd));</a>
+<a name="ln889"> </a>
+<a name="ln890">	if (fSocket-&gt;Write(cmd, ::strlen(cmd)) &lt; 0)</a>
+<a name="ln891">		return B_ERROR;</a>
+<a name="ln892">	fLog = &quot;&quot;;</a>
+<a name="ln893"> </a>
+<a name="ln894">	// Receive</a>
+<a name="ln895">	while (1) {</a>
+<a name="ln896">		int32 len = ReceiveResponse(fLog);</a>
+<a name="ln897"> </a>
+<a name="ln898">		if (len &lt;= 0) {</a>
+<a name="ln899">			D(bug(&quot;SMTP: len == %&quot; B_PRId32 &quot;\n&quot;, len));</a>
+<a name="ln900">			return B_ERROR;</a>
+<a name="ln901">		}</a>
+<a name="ln902"> </a>
+<a name="ln903">		if (fLog.Length() &gt; 4 &amp;&amp; (fLog[3] == ' ' || fLog[3] == '-'))</a>
+<a name="ln904">		{</a>
+<a name="ln905">			int32 num = atol(fLog.String());</a>
+<a name="ln906">			D(bug(&quot;ReplyNumber: %&quot; B_PRId32 &quot;\n&quot;, num));</a>
+<a name="ln907">			if (num &gt;= 500)</a>
+<a name="ln908">				return B_ERROR;</a>
+<a name="ln909"> </a>
+<a name="ln910">			break;</a>
+<a name="ln911">		}</a>
+<a name="ln912">	}</a>
+<a name="ln913"> </a>
+<a name="ln914">	return B_OK;</a>
+<a name="ln915">}</a>
+<a name="ln916"> </a>
+<a name="ln917"> </a>
+<a name="ln918">// #pragma mark -</a>
+<a name="ln919"> </a>
+<a name="ln920"> </a>
+<a name="ln921">extern &quot;C&quot; BOutboundMailProtocol*</a>
+<a name="ln922">instantiate_outbound_protocol(const BMailAccountSettings&amp; settings)</a>
+<a name="ln923">{</a>
+<a name="ln924">	return new SMTPProtocol(settings);</a>
+<a name="ln925">}</a>
+
+</code></pre>
+<div class="balloon" rel="243"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fSocket, use_ssl, fStatus.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

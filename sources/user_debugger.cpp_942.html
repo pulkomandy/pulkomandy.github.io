@@ -1,0 +1,3071 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>user_debugger.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2005-2016, Ingo Weinhold, ingo_weinhold@gmx.de.</a>
+<a name="ln3"> * Copyright 2015, Rene Gollent, rene@gollent.com.</a>
+<a name="ln4"> * Distributed under the terms of the MIT License.</a>
+<a name="ln5"> */</a>
+<a name="ln6"> </a>
+<a name="ln7"> </a>
+<a name="ln8">#include &lt;errno.h&gt;</a>
+<a name="ln9">#include &lt;signal.h&gt;</a>
+<a name="ln10">#include &lt;stdlib.h&gt;</a>
+<a name="ln11">#include &lt;stdio.h&gt;</a>
+<a name="ln12">#include &lt;string.h&gt;</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &lt;algorithm&gt;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &lt;arch/debug.h&gt;</a>
+<a name="ln17">#include &lt;arch/user_debugger.h&gt;</a>
+<a name="ln18">#include &lt;core_dump.h&gt;</a>
+<a name="ln19">#include &lt;cpu.h&gt;</a>
+<a name="ln20">#include &lt;debugger.h&gt;</a>
+<a name="ln21">#include &lt;kernel.h&gt;</a>
+<a name="ln22">#include &lt;KernelExport.h&gt;</a>
+<a name="ln23">#include &lt;kscheduler.h&gt;</a>
+<a name="ln24">#include &lt;ksignal.h&gt;</a>
+<a name="ln25">#include &lt;ksyscalls.h&gt;</a>
+<a name="ln26">#include &lt;port.h&gt;</a>
+<a name="ln27">#include &lt;sem.h&gt;</a>
+<a name="ln28">#include &lt;team.h&gt;</a>
+<a name="ln29">#include &lt;thread.h&gt;</a>
+<a name="ln30">#include &lt;thread_types.h&gt;</a>
+<a name="ln31">#include &lt;user_debugger.h&gt;</a>
+<a name="ln32">#include &lt;vm/vm.h&gt;</a>
+<a name="ln33">#include &lt;vm/vm_types.h&gt;</a>
+<a name="ln34"> </a>
+<a name="ln35">#include &lt;AutoDeleter.h&gt;</a>
+<a name="ln36">#include &lt;util/AutoLock.h&gt;</a>
+<a name="ln37"> </a>
+<a name="ln38">#include &quot;BreakpointManager.h&quot;</a>
+<a name="ln39"> </a>
+<a name="ln40"> </a>
+<a name="ln41">//#define TRACE_USER_DEBUGGER</a>
+<a name="ln42">#ifdef TRACE_USER_DEBUGGER</a>
+<a name="ln43">#	define TRACE(x) dprintf x</a>
+<a name="ln44">#else</a>
+<a name="ln45">#	define TRACE(x) ;</a>
+<a name="ln46">#endif</a>
+<a name="ln47"> </a>
+<a name="ln48"> </a>
+<a name="ln49">// TODO: Since the introduction of team_debug_info::debugger_changed_condition</a>
+<a name="ln50">// there's some potential for simplifications. E.g. clear_team_debug_info() and</a>
+<a name="ln51">// destroy_team_debug_info() are now only used in nub_thread_cleanup() (plus</a>
+<a name="ln52">// arch_clear_team_debug_info() in install_team_debugger_init_debug_infos()).</a>
+<a name="ln53"> </a>
+<a name="ln54"> </a>
+<a name="ln55">static port_id sDefaultDebuggerPort = -1;</a>
+<a name="ln56">	// accessed atomically</a>
+<a name="ln57"> </a>
+<a name="ln58">static timer sProfilingTimers[SMP_MAX_CPUS];</a>
+<a name="ln59">	// a profiling timer for each CPU -- used when a profiled thread is running</a>
+<a name="ln60">	// on that CPU</a>
+<a name="ln61"> </a>
+<a name="ln62"> </a>
+<a name="ln63">static void schedule_profiling_timer(Thread* thread, bigtime_t interval);</a>
+<a name="ln64">static int32 profiling_event(timer* unused);</a>
+<a name="ln65">static status_t ensure_debugger_installed();</a>
+<a name="ln66">static void get_team_debug_info(team_debug_info &amp;teamDebugInfo);</a>
+<a name="ln67"> </a>
+<a name="ln68"> </a>
+<a name="ln69">static inline status_t</a>
+<a name="ln70">kill_interruptable_write_port(port_id port, int32 code, const void *buffer,</a>
+<a name="ln71">	size_t bufferSize)</a>
+<a name="ln72">{</a>
+<a name="ln73">	return write_port_etc(port, code, buffer, bufferSize, B_KILL_CAN_INTERRUPT,</a>
+<a name="ln74">		0);</a>
+<a name="ln75">}</a>
+<a name="ln76"> </a>
+<a name="ln77"> </a>
+<a name="ln78">static status_t</a>
+<a name="ln79">debugger_write(port_id port, int32 code, const void *buffer, size_t bufferSize,</a>
+<a name="ln80">	bool dontWait)</a>
+<a name="ln81">{</a>
+<a name="ln82">	TRACE((&quot;debugger_write(): thread: %&quot; B_PRId32 &quot;, team %&quot; B_PRId32 &quot;, &quot;</a>
+<a name="ln83">		&quot;port: %&quot; B_PRId32 &quot;, code: %&quot; B_PRIx32 &quot;, message: %p, size: %lu, &quot;</a>
+<a name="ln84">		&quot;dontWait: %d\n&quot;, thread_get_current_thread()-&gt;id,</a>
+<a name="ln85">		thread_get_current_thread()-&gt;team-&gt;id, port, code, buffer, bufferSize,</a>
+<a name="ln86">		dontWait));</a>
+<a name="ln87"> </a>
+<a name="ln88">	status_t error = B_OK;</a>
+<a name="ln89"> </a>
+<a name="ln90">	// get the team debug info</a>
+<a name="ln91">	team_debug_info teamDebugInfo;</a>
+<a name="ln92">	get_team_debug_info(teamDebugInfo);</a>
+<a name="ln93">	sem_id writeLock = teamDebugInfo.debugger_write_lock;</a>
+<a name="ln94"> </a>
+<a name="ln95">	// get the write lock</a>
+<a name="ln96">	TRACE((&quot;debugger_write(): acquiring write lock...\n&quot;));</a>
+<a name="ln97">	error = acquire_sem_etc(writeLock, 1,</a>
+<a name="ln98">		dontWait ? (uint32)B_RELATIVE_TIMEOUT : (uint32)B_KILL_CAN_INTERRUPT, 0);</a>
+<a name="ln99">	if (error != B_OK) {</a>
+<a name="ln100">		TRACE((&quot;debugger_write() done1: %&quot; B_PRIx32 &quot;\n&quot;, error));</a>
+<a name="ln101">		return error;</a>
+<a name="ln102">	}</a>
+<a name="ln103"> </a>
+<a name="ln104">	// re-get the team debug info</a>
+<a name="ln105">	get_team_debug_info(teamDebugInfo);</a>
+<a name="ln106"> </a>
+<a name="ln107">	if (teamDebugInfo.debugger_port != port</a>
+<a name="ln108">		|| (teamDebugInfo.flags &amp; B_TEAM_DEBUG_DEBUGGER_HANDOVER)) {</a>
+<a name="ln109">		// The debugger has changed in the meantime or we are about to be</a>
+<a name="ln110">		// handed over to a new debugger. In either case we don't send the</a>
+<a name="ln111">		// message.</a>
+<a name="ln112">		TRACE((&quot;debugger_write(): %s\n&quot;,</a>
+<a name="ln113">			(teamDebugInfo.debugger_port != port ? &quot;debugger port changed&quot;</a>
+<a name="ln114">				: &quot;handover flag set&quot;)));</a>
+<a name="ln115">	} else {</a>
+<a name="ln116">		TRACE((&quot;debugger_write(): writing to port...\n&quot;));</a>
+<a name="ln117"> </a>
+<a name="ln118">		error = write_port_etc(port, code, buffer, bufferSize,</a>
+<a name="ln119">			dontWait ? (uint32)B_RELATIVE_TIMEOUT : (uint32)B_KILL_CAN_INTERRUPT, 0);</a>
+<a name="ln120">	}</a>
+<a name="ln121"> </a>
+<a name="ln122">	// release the write lock</a>
+<a name="ln123">	release_sem(writeLock);</a>
+<a name="ln124"> </a>
+<a name="ln125">	TRACE((&quot;debugger_write() done: %&quot; B_PRIx32 &quot;\n&quot;, error));</a>
+<a name="ln126"> </a>
+<a name="ln127">	return error;</a>
+<a name="ln128">}</a>
+<a name="ln129"> </a>
+<a name="ln130"> </a>
+<a name="ln131">/*!	Updates the thread::flags field according to what user debugger flags are</a>
+<a name="ln132">	set for the thread.</a>
+<a name="ln133">	Interrupts must be disabled and the thread's debug info lock must be held.</a>
+<a name="ln134">*/</a>
+<a name="ln135">static void</a>
+<a name="ln136">update_thread_user_debug_flag(Thread* thread)</a>
+<a name="ln137">{</a>
+<a name="ln138">	if ((atomic_get(&amp;thread-&gt;debug_info.flags) &amp; B_THREAD_DEBUG_STOP) != 0)</a>
+<a name="ln139">		atomic_or(&amp;thread-&gt;flags, THREAD_FLAGS_DEBUG_THREAD);</a>
+<a name="ln140">	else</a>
+<a name="ln141">		atomic_and(&amp;thread-&gt;flags, ~THREAD_FLAGS_DEBUG_THREAD);</a>
+<a name="ln142">}</a>
+<a name="ln143"> </a>
+<a name="ln144"> </a>
+<a name="ln145">/*!	Updates the thread::flags THREAD_FLAGS_BREAKPOINTS_DEFINED bit of the</a>
+<a name="ln146">	given thread.</a>
+<a name="ln147">	Interrupts must be disabled and the thread debug info lock must be held.</a>
+<a name="ln148">*/</a>
+<a name="ln149">static void</a>
+<a name="ln150">update_thread_breakpoints_flag(Thread* thread)</a>
+<a name="ln151">{</a>
+<a name="ln152">	Team* team = thread-&gt;team;</a>
+<a name="ln153"> </a>
+<a name="ln154">	if (arch_has_breakpoints(&amp;team-&gt;debug_info.arch_info))</a>
+<a name="ln155">		atomic_or(&amp;thread-&gt;flags, THREAD_FLAGS_BREAKPOINTS_DEFINED);</a>
+<a name="ln156">	else</a>
+<a name="ln157">		atomic_and(&amp;thread-&gt;flags, ~THREAD_FLAGS_BREAKPOINTS_DEFINED);</a>
+<a name="ln158">}</a>
+<a name="ln159"> </a>
+<a name="ln160"> </a>
+<a name="ln161">/*!	Updates the Thread::flags THREAD_FLAGS_BREAKPOINTS_DEFINED bit of all</a>
+<a name="ln162">	threads of the current team.</a>
+<a name="ln163">*/</a>
+<a name="ln164">static void</a>
+<a name="ln165">update_threads_breakpoints_flag()</a>
+<a name="ln166">{</a>
+<a name="ln167">	Team* team = thread_get_current_thread()-&gt;team;</a>
+<a name="ln168"> </a>
+<a name="ln169">	TeamLocker teamLocker(team);</a>
+<a name="ln170"> </a>
+<a name="ln171">	Thread* thread = team-&gt;thread_list;</a>
+<a name="ln172"> </a>
+<a name="ln173">	if (arch_has_breakpoints(&amp;team-&gt;debug_info.arch_info)) {</a>
+<a name="ln174">		for (; thread != NULL; thread = thread-&gt;team_next)</a>
+<a name="ln175">			atomic_or(&amp;thread-&gt;flags, THREAD_FLAGS_BREAKPOINTS_DEFINED);</a>
+<a name="ln176">	} else {</a>
+<a name="ln177">		for (; thread != NULL; thread = thread-&gt;team_next)</a>
+<a name="ln178">			atomic_and(&amp;thread-&gt;flags, ~THREAD_FLAGS_BREAKPOINTS_DEFINED);</a>
+<a name="ln179">	}</a>
+<a name="ln180">}</a>
+<a name="ln181"> </a>
+<a name="ln182"> </a>
+<a name="ln183">/*!	Updates the thread::flags B_TEAM_DEBUG_DEBUGGER_INSTALLED bit of the</a>
+<a name="ln184">	given thread, which must be the current thread.</a>
+<a name="ln185">*/</a>
+<a name="ln186">static void</a>
+<a name="ln187">update_thread_debugger_installed_flag(Thread* thread)</a>
+<a name="ln188">{</a>
+<a name="ln189">	Team* team = thread-&gt;team;</a>
+<a name="ln190"> </a>
+<a name="ln191">	if (atomic_get(&amp;team-&gt;debug_info.flags) &amp; B_TEAM_DEBUG_DEBUGGER_INSTALLED)</a>
+<a name="ln192">		atomic_or(&amp;thread-&gt;flags, THREAD_FLAGS_DEBUGGER_INSTALLED);</a>
+<a name="ln193">	else</a>
+<a name="ln194">		atomic_and(&amp;thread-&gt;flags, ~THREAD_FLAGS_DEBUGGER_INSTALLED);</a>
+<a name="ln195">}</a>
+<a name="ln196"> </a>
+<a name="ln197"> </a>
+<a name="ln198">/*!	Updates the thread::flags THREAD_FLAGS_DEBUGGER_INSTALLED bit of all</a>
+<a name="ln199">	threads of the given team.</a>
+<a name="ln200">	The team's lock must be held.</a>
+<a name="ln201">*/</a>
+<a name="ln202">static void</a>
+<a name="ln203">update_threads_debugger_installed_flag(Team* team)</a>
+<a name="ln204">{</a>
+<a name="ln205">	Thread* thread = team-&gt;thread_list;</a>
+<a name="ln206"> </a>
+<a name="ln207">	if (atomic_get(&amp;team-&gt;debug_info.flags) &amp; B_TEAM_DEBUG_DEBUGGER_INSTALLED) {</a>
+<a name="ln208">		for (; thread != NULL; thread = thread-&gt;team_next)</a>
+<a name="ln209">			atomic_or(&amp;thread-&gt;flags, THREAD_FLAGS_DEBUGGER_INSTALLED);</a>
+<a name="ln210">	} else {</a>
+<a name="ln211">		for (; thread != NULL; thread = thread-&gt;team_next)</a>
+<a name="ln212">			atomic_and(&amp;thread-&gt;flags, ~THREAD_FLAGS_DEBUGGER_INSTALLED);</a>
+<a name="ln213">	}</a>
+<a name="ln214">}</a>
+<a name="ln215"> </a>
+<a name="ln216"> </a>
+<a name="ln217">/**</a>
+<a name="ln218"> *	For the first initialization the function must be called with \a initLock</a>
+<a name="ln219"> *	set to \c true. If it would be possible that another thread accesses the</a>
+<a name="ln220"> *	structure at the same time, `lock' must be held when calling the function.</a>
+<a name="ln221"> */</a>
+<a name="ln222">void</a>
+<a name="ln223">clear_team_debug_info(struct team_debug_info *info, bool initLock)</a>
+<a name="ln224">{</a>
+<a name="ln225">	if (info) {</a>
+<a name="ln226">		arch_clear_team_debug_info(&amp;info-&gt;arch_info);</a>
+<a name="ln227">		atomic_set(&amp;info-&gt;flags, B_TEAM_DEBUG_DEFAULT_FLAGS);</a>
+<a name="ln228">		info-&gt;debugger_team = -1;</a>
+<a name="ln229">		info-&gt;debugger_port = -1;</a>
+<a name="ln230">		info-&gt;nub_thread = -1;</a>
+<a name="ln231">		info-&gt;nub_port = -1;</a>
+<a name="ln232">		info-&gt;debugger_write_lock = -1;</a>
+<a name="ln233">		info-&gt;causing_thread = -1;</a>
+<a name="ln234">		info-&gt;image_event = 0;</a>
+<a name="ln235">		info-&gt;breakpoint_manager = NULL;</a>
+<a name="ln236"> </a>
+<a name="ln237">		if (initLock) {</a>
+<a name="ln238">			B_INITIALIZE_SPINLOCK(&amp;info-&gt;lock);</a>
+<a name="ln239">			info-&gt;debugger_changed_condition = NULL;</a>
+<a name="ln240">		}</a>
+<a name="ln241">	}</a>
+<a name="ln242">}</a>
+<a name="ln243"> </a>
+<a name="ln244">/**</a>
+<a name="ln245"> *  `lock' must not be held nor may interrupts be disabled.</a>
+<a name="ln246"> *  \a info must not be a member of a team struct (or the team struct must no</a>
+<a name="ln247"> *  longer be accessible, i.e. the team should already be removed).</a>
+<a name="ln248"> *</a>
+<a name="ln249"> *	In case the team is still accessible, the procedure is:</a>
+<a name="ln250"> *	1. get `lock'</a>
+<a name="ln251"> *	2. copy the team debug info on stack</a>
+<a name="ln252"> *	3. call clear_team_debug_info() on the team debug info</a>
+<a name="ln253"> *	4. release `lock'</a>
+<a name="ln254"> *	5. call destroy_team_debug_info() on the copied team debug info</a>
+<a name="ln255"> */</a>
+<a name="ln256">static void</a>
+<a name="ln257">destroy_team_debug_info(struct team_debug_info *info)</a>
+<a name="ln258">{</a>
+<a name="ln259">	if (info) {</a>
+<a name="ln260">		arch_destroy_team_debug_info(&amp;info-&gt;arch_info);</a>
+<a name="ln261"> </a>
+<a name="ln262">		// delete the breakpoint manager</a>
+<a name="ln263">		delete info-&gt;breakpoint_manager ;</a>
+<a name="ln264">		info-&gt;breakpoint_manager = NULL;</a>
+<a name="ln265"> </a>
+<a name="ln266">		// delete the debugger port write lock</a>
+<a name="ln267">		if (info-&gt;debugger_write_lock &gt;= 0) {</a>
+<a name="ln268">			delete_sem(info-&gt;debugger_write_lock);</a>
+<a name="ln269">			info-&gt;debugger_write_lock = -1;</a>
+<a name="ln270">		}</a>
+<a name="ln271"> </a>
+<a name="ln272">		// delete the nub port</a>
+<a name="ln273">		if (info-&gt;nub_port &gt;= 0) {</a>
+<a name="ln274">			set_port_owner(info-&gt;nub_port, B_CURRENT_TEAM);</a>
+<a name="ln275">			delete_port(info-&gt;nub_port);</a>
+<a name="ln276">			info-&gt;nub_port = -1;</a>
+<a name="ln277">		}</a>
+<a name="ln278"> </a>
+<a name="ln279">		// wait for the nub thread</a>
+<a name="ln280">		if (info-&gt;nub_thread &gt;= 0) {</a>
+<a name="ln281">			if (info-&gt;nub_thread != thread_get_current_thread()-&gt;id) {</a>
+<a name="ln282">				int32 result;</a>
+<a name="ln283">				wait_for_thread(info-&gt;nub_thread, &amp;result);</a>
+<a name="ln284">			}</a>
+<a name="ln285"> </a>
+<a name="ln286">			info-&gt;nub_thread = -1;</a>
+<a name="ln287">		}</a>
+<a name="ln288"> </a>
+<a name="ln289">		atomic_set(&amp;info-&gt;flags, 0);</a>
+<a name="ln290">		info-&gt;debugger_team = -1;</a>
+<a name="ln291">		info-&gt;debugger_port = -1;</a>
+<a name="ln292">		info-&gt;causing_thread = -1;</a>
+<a name="ln293">		info-&gt;image_event = -1;</a>
+<a name="ln294">	}</a>
+<a name="ln295">}</a>
+<a name="ln296"> </a>
+<a name="ln297"> </a>
+<a name="ln298">void</a>
+<a name="ln299">init_thread_debug_info(struct thread_debug_info *info)</a>
+<a name="ln300">{</a>
+<a name="ln301">	if (info) {</a>
+<a name="ln302">		B_INITIALIZE_SPINLOCK(&amp;info-&gt;lock);</a>
+<a name="ln303">		arch_clear_thread_debug_info(&amp;info-&gt;arch_info);</a>
+<a name="ln304">		info-&gt;flags = B_THREAD_DEBUG_DEFAULT_FLAGS;</a>
+<a name="ln305">		info-&gt;debug_port = -1;</a>
+<a name="ln306">		info-&gt;ignore_signals = 0;</a>
+<a name="ln307">		info-&gt;ignore_signals_once = 0;</a>
+<a name="ln308">		info-&gt;profile.sample_area = -1;</a>
+<a name="ln309">		info-&gt;profile.samples = NULL;</a>
+<a name="ln310">		info-&gt;profile.buffer_full = false;</a>
+<a name="ln311">		info-&gt;profile.installed_timer = NULL;</a>
+<a name="ln312">	}</a>
+<a name="ln313">}</a>
+<a name="ln314"> </a>
+<a name="ln315"> </a>
+<a name="ln316">/*!	Clears the debug info for the current thread.</a>
+<a name="ln317">	Invoked with thread debug info lock being held.</a>
+<a name="ln318">*/</a>
+<a name="ln319">void</a>
+<a name="ln320">clear_thread_debug_info(struct thread_debug_info *info, bool dying)</a>
+<a name="ln321">{</a>
+<a name="ln322">	if (info) {</a>
+<a name="ln323">		// cancel profiling timer</a>
+<a name="ln324">		if (info-&gt;profile.installed_timer != NULL) {</a>
+<a name="ln325">			cancel_timer(info-&gt;profile.installed_timer);</a>
+<a name="ln326">			info-&gt;profile.installed_timer = NULL;</a>
+<a name="ln327">		}</a>
+<a name="ln328"> </a>
+<a name="ln329">		arch_clear_thread_debug_info(&amp;info-&gt;arch_info);</a>
+<a name="ln330">		atomic_set(&amp;info-&gt;flags,</a>
+<a name="ln331">			B_THREAD_DEBUG_DEFAULT_FLAGS | (dying ? B_THREAD_DEBUG_DYING : 0));</a>
+<a name="ln332">		info-&gt;debug_port = -1;</a>
+<a name="ln333">		info-&gt;ignore_signals = 0;</a>
+<a name="ln334">		info-&gt;ignore_signals_once = 0;</a>
+<a name="ln335">		info-&gt;profile.sample_area = -1;</a>
+<a name="ln336">		info-&gt;profile.samples = NULL;</a>
+<a name="ln337">		info-&gt;profile.buffer_full = false;</a>
+<a name="ln338">	}</a>
+<a name="ln339">}</a>
+<a name="ln340"> </a>
+<a name="ln341"> </a>
+<a name="ln342">void</a>
+<a name="ln343">destroy_thread_debug_info(struct thread_debug_info *info)</a>
+<a name="ln344">{</a>
+<a name="ln345">	if (info) {</a>
+<a name="ln346">		area_id sampleArea = info-&gt;profile.sample_area;</a>
+<a name="ln347">		if (sampleArea &gt;= 0) {</a>
+<a name="ln348">			area_info areaInfo;</a>
+<a name="ln349">			if (get_area_info(sampleArea, &amp;areaInfo) == B_OK) {</a>
+<a name="ln350">				unlock_memory(areaInfo.address, areaInfo.size, B_READ_DEVICE);</a>
+<a name="ln351">				delete_area(sampleArea);</a>
+<a name="ln352">			}</a>
+<a name="ln353">		}</a>
+<a name="ln354"> </a>
+<a name="ln355">		arch_destroy_thread_debug_info(&amp;info-&gt;arch_info);</a>
+<a name="ln356"> </a>
+<a name="ln357">		if (info-&gt;debug_port &gt;= 0) {</a>
+<a name="ln358">			delete_port(info-&gt;debug_port);</a>
+<a name="ln359">			info-&gt;debug_port = -1;</a>
+<a name="ln360">		}</a>
+<a name="ln361"> </a>
+<a name="ln362">		info-&gt;ignore_signals = 0;</a>
+<a name="ln363">		info-&gt;ignore_signals_once = 0;</a>
+<a name="ln364"> </a>
+<a name="ln365">		atomic_set(&amp;info-&gt;flags, 0);</a>
+<a name="ln366">	}</a>
+<a name="ln367">}</a>
+<a name="ln368"> </a>
+<a name="ln369"> </a>
+<a name="ln370">static status_t</a>
+<a name="ln371">prepare_debugger_change(team_id teamID, ConditionVariable&amp; condition,</a>
+<a name="ln372">	Team*&amp; team)</a>
+<a name="ln373">{</a>
+<a name="ln374">	// We look up the team by ID, even in case of the current team, so we can be</a>
+<a name="ln375">	// sure, that the team is not already dying.</a>
+<a name="ln376">	if (teamID == B_CURRENT_TEAM)</a>
+<a name="ln377">		teamID = thread_get_current_thread()-&gt;team-&gt;id;</a>
+<a name="ln378"> </a>
+<a name="ln379">	while (true) {</a>
+<a name="ln380">		// get the team</a>
+<a name="ln381">		team = Team::GetAndLock(teamID);</a>
+<a name="ln382">		if (team == NULL)</a>
+<a name="ln383">			return B_BAD_TEAM_ID;</a>
+<a name="ln384">		BReference&lt;Team&gt; teamReference(team, true);</a>
+<a name="ln385">		TeamLocker teamLocker(team, true);</a>
+<a name="ln386"> </a>
+<a name="ln387">		// don't allow messing with the kernel team</a>
+<a name="ln388">		if (team == team_get_kernel_team())</a>
+<a name="ln389">			return B_NOT_ALLOWED;</a>
+<a name="ln390"> </a>
+<a name="ln391">		// check whether the condition is already set</a>
+<a name="ln392">		InterruptsSpinLocker debugInfoLocker(team-&gt;debug_info.lock);</a>
+<a name="ln393"> </a>
+<a name="ln394">		if (team-&gt;debug_info.debugger_changed_condition == NULL) {</a>
+<a name="ln395">			// nobody there yet -- set our condition variable and be done</a>
+<a name="ln396">			team-&gt;debug_info.debugger_changed_condition = &amp;condition;</a>
+<a name="ln397">			return B_OK;</a>
+<a name="ln398">		}</a>
+<a name="ln399"> </a>
+<a name="ln400">		// we'll have to wait</a>
+<a name="ln401">		ConditionVariableEntry entry;</a>
+<a name="ln402">		team-&gt;debug_info.debugger_changed_condition-&gt;Add(&amp;entry);</a>
+<a name="ln403"> </a>
+<a name="ln404">		debugInfoLocker.Unlock();</a>
+<a name="ln405">		teamLocker.Unlock();</a>
+<a name="ln406"> </a>
+<a name="ln407">		entry.Wait();</a>
+<a name="ln408">	}</a>
+<a name="ln409">}</a>
+<a name="ln410"> </a>
+<a name="ln411"> </a>
+<a name="ln412">static void</a>
+<a name="ln413">prepare_debugger_change(Team* team, ConditionVariable&amp; condition)</a>
+<a name="ln414">{</a>
+<a name="ln415">	while (true) {</a>
+<a name="ln416">		// check whether the condition is already set</a>
+<a name="ln417">		InterruptsSpinLocker debugInfoLocker(team-&gt;debug_info.lock);</a>
+<a name="ln418"> </a>
+<a name="ln419">		if (team-&gt;debug_info.debugger_changed_condition == NULL) {</a>
+<a name="ln420">			// nobody there yet -- set our condition variable and be done</a>
+<a name="ln421">			team-&gt;debug_info.debugger_changed_condition = &amp;condition;</a>
+<a name="ln422">			return;</a>
+<a name="ln423">		}</a>
+<a name="ln424"> </a>
+<a name="ln425">		// we'll have to wait</a>
+<a name="ln426">		ConditionVariableEntry entry;</a>
+<a name="ln427">		team-&gt;debug_info.debugger_changed_condition-&gt;Add(&amp;entry);</a>
+<a name="ln428"> </a>
+<a name="ln429">		debugInfoLocker.Unlock();</a>
+<a name="ln430"> </a>
+<a name="ln431">		entry.Wait();</a>
+<a name="ln432">	}</a>
+<a name="ln433">}</a>
+<a name="ln434"> </a>
+<a name="ln435"> </a>
+<a name="ln436">static void</a>
+<a name="ln437">finish_debugger_change(Team* team)</a>
+<a name="ln438">{</a>
+<a name="ln439">	// unset our condition variable and notify all threads waiting on it</a>
+<a name="ln440">	InterruptsSpinLocker debugInfoLocker(team-&gt;debug_info.lock);</a>
+<a name="ln441"> </a>
+<a name="ln442">	ConditionVariable* condition = team-&gt;debug_info.debugger_changed_condition;</a>
+<a name="ln443">	team-&gt;debug_info.debugger_changed_condition = NULL;</a>
+<a name="ln444"> </a>
+<a name="ln445">	condition-&gt;NotifyAll();</a>
+<a name="ln446">}</a>
+<a name="ln447"> </a>
+<a name="ln448"> </a>
+<a name="ln449">void</a>
+<a name="ln450">user_debug_prepare_for_exec()</a>
+<a name="ln451">{</a>
+<a name="ln452">	Thread *thread = thread_get_current_thread();</a>
+<a name="ln453">	Team *team = thread-&gt;team;</a>
+<a name="ln454"> </a>
+<a name="ln455">	// If a debugger is installed for the team and the thread debug stuff</a>
+<a name="ln456">	// initialized, change the ownership of the debug port for the thread</a>
+<a name="ln457">	// to the kernel team, since exec_team() deletes all ports owned by this</a>
+<a name="ln458">	// team. We change the ownership back later.</a>
+<a name="ln459">	if (atomic_get(&amp;team-&gt;debug_info.flags) &amp; B_TEAM_DEBUG_DEBUGGER_INSTALLED) {</a>
+<a name="ln460">		// get the port</a>
+<a name="ln461">		port_id debugPort = -1;</a>
+<a name="ln462"> </a>
+<a name="ln463">		InterruptsSpinLocker threadDebugInfoLocker(thread-&gt;debug_info.lock);</a>
+<a name="ln464"> </a>
+<a name="ln465">		if ((thread-&gt;debug_info.flags &amp; B_THREAD_DEBUG_INITIALIZED) != 0)</a>
+<a name="ln466">			debugPort = thread-&gt;debug_info.debug_port;</a>
+<a name="ln467"> </a>
+<a name="ln468">		threadDebugInfoLocker.Unlock();</a>
+<a name="ln469"> </a>
+<a name="ln470">		// set the new port ownership</a>
+<a name="ln471">		if (debugPort &gt;= 0)</a>
+<a name="ln472">			set_port_owner(debugPort, team_get_kernel_team_id());</a>
+<a name="ln473">	}</a>
+<a name="ln474">}</a>
+<a name="ln475"> </a>
+<a name="ln476"> </a>
+<a name="ln477">void</a>
+<a name="ln478">user_debug_finish_after_exec()</a>
+<a name="ln479">{</a>
+<a name="ln480">	Thread *thread = thread_get_current_thread();</a>
+<a name="ln481">	Team *team = thread-&gt;team;</a>
+<a name="ln482"> </a>
+<a name="ln483">	// If a debugger is installed for the team and the thread debug stuff</a>
+<a name="ln484">	// initialized for this thread, change the ownership of its debug port</a>
+<a name="ln485">	// back to this team.</a>
+<a name="ln486">	if (atomic_get(&amp;team-&gt;debug_info.flags) &amp; B_TEAM_DEBUG_DEBUGGER_INSTALLED) {</a>
+<a name="ln487">		// get the port</a>
+<a name="ln488">		port_id debugPort = -1;</a>
+<a name="ln489"> </a>
+<a name="ln490">		InterruptsSpinLocker threadDebugInfoLocker(thread-&gt;debug_info.lock);</a>
+<a name="ln491"> </a>
+<a name="ln492">		if (thread-&gt;debug_info.flags &amp; B_THREAD_DEBUG_INITIALIZED)</a>
+<a name="ln493">			debugPort = thread-&gt;debug_info.debug_port;</a>
+<a name="ln494"> </a>
+<a name="ln495">		threadDebugInfoLocker.Unlock();</a>
+<a name="ln496"> </a>
+<a name="ln497">		// set the new port ownership</a>
+<a name="ln498">		if (debugPort &gt;= 0)</a>
+<a name="ln499">			set_port_owner(debugPort, team-&gt;id);</a>
+<a name="ln500">	}</a>
+<a name="ln501">}</a>
+<a name="ln502"> </a>
+<a name="ln503"> </a>
+<a name="ln504">void</a>
+<a name="ln505">init_user_debug()</a>
+<a name="ln506">{</a>
+<a name="ln507">	#ifdef ARCH_INIT_USER_DEBUG</a>
+<a name="ln508">		ARCH_INIT_USER_DEBUG();</a>
+<a name="ln509">	#endif</a>
+<a name="ln510">}</a>
+<a name="ln511"> </a>
+<a name="ln512"> </a>
+<a name="ln513">static void</a>
+<a name="ln514">get_team_debug_info(team_debug_info &amp;teamDebugInfo)</a>
+<a name="ln515">{</a>
+<a name="ln516">	Thread *thread = thread_get_current_thread();</a>
+<a name="ln517"> </a>
+<a name="ln518">	cpu_status state = disable_interrupts();</a>
+<a name="ln519">	GRAB_TEAM_DEBUG_INFO_LOCK(thread-&gt;team-&gt;debug_info);</a>
+<a name="ln520"> </a>
+<a name="ln521">	memcpy(&amp;teamDebugInfo, &amp;thread-&gt;team-&gt;debug_info, sizeof(team_debug_info));</a>
+<a name="ln522"> </a>
+<a name="ln523">	RELEASE_TEAM_DEBUG_INFO_LOCK(thread-&gt;team-&gt;debug_info);</a>
+<a name="ln524">	restore_interrupts(state);</a>
+<a name="ln525">}</a>
+<a name="ln526"> </a>
+<a name="ln527"> </a>
+<a name="ln528">static status_t</a>
+<a name="ln529">thread_hit_debug_event_internal(debug_debugger_message event,</a>
+<a name="ln530">	const void *message, int32 size, bool requireDebugger, bool &amp;restart)</a>
+<a name="ln531">{</a>
+<a name="ln532">	restart = false;</a>
+<a name="ln533">	Thread *thread = thread_get_current_thread();</a>
+<a name="ln534"> </a>
+<a name="ln535">	TRACE((&quot;thread_hit_debug_event(): thread: %&quot; B_PRId32 &quot;, event: %&quot; B_PRIu32</a>
+<a name="ln536">		&quot;, message: %p, size: %&quot; B_PRId32 &quot;\n&quot;, thread-&gt;id, (uint32)event,</a>
+<a name="ln537">		message, size));</a>
+<a name="ln538"> </a>
+<a name="ln539">	// check, if there's a debug port already</a>
+<a name="ln540">	bool setPort = !(atomic_get(&amp;thread-&gt;debug_info.flags)</a>
+<a name="ln541">		&amp; B_THREAD_DEBUG_INITIALIZED);</a>
+<a name="ln542"> </a>
+<a name="ln543">	// create a port, if there is none yet</a>
+<a name="ln544">	port_id port = -1;</a>
+<a name="ln545">	if (setPort) {</a>
+<a name="ln546">		char nameBuffer[128];</a>
+<a name="ln547">		snprintf(nameBuffer, sizeof(nameBuffer), &quot;nub to thread %&quot; B_PRId32,</a>
+<a name="ln548">			thread-&gt;id);</a>
+<a name="ln549"> </a>
+<a name="ln550">		port = create_port(1, nameBuffer);</a>
+<a name="ln551">		if (port &lt; 0) {</a>
+<a name="ln552">			dprintf(&quot;thread_hit_debug_event(): Failed to create debug port: &quot;</a>
+<a name="ln553">				&quot;%s\n&quot;, strerror(port));</a>
+<a name="ln554">			return port;</a>
+<a name="ln555">		}</a>
+<a name="ln556">	}</a>
+<a name="ln557"> </a>
+<a name="ln558">	// check the debug info structures once more: get the debugger port, set</a>
+<a name="ln559">	// the thread's debug port, and update the thread's debug flags</a>
+<a name="ln560">	port_id deletePort = port;</a>
+<a name="ln561">	port_id debuggerPort = -1;</a>
+<a name="ln562">	port_id nubPort = -1;</a>
+<a name="ln563">	status_t error = B_OK;</a>
+<a name="ln564">	cpu_status state = disable_interrupts();</a>
+<a name="ln565">	GRAB_TEAM_DEBUG_INFO_LOCK(thread-&gt;team-&gt;debug_info);</a>
+<a name="ln566">	SpinLocker threadDebugInfoLocker(thread-&gt;debug_info.lock);</a>
+<a name="ln567"> </a>
+<a name="ln568">	uint32 threadFlags = thread-&gt;debug_info.flags;</a>
+<a name="ln569">	threadFlags &amp;= ~B_THREAD_DEBUG_STOP;</a>
+<a name="ln570">	bool debuggerInstalled</a>
+<a name="ln571">		= (thread-&gt;team-&gt;debug_info.flags &amp; B_TEAM_DEBUG_DEBUGGER_INSTALLED);</a>
+<a name="ln572">	if (thread-&gt;id == thread-&gt;team-&gt;debug_info.nub_thread) {</a>
+<a name="ln573">		// Ugh, we're the nub thread. We shouldn't be here.</a>
+<a name="ln574">		TRACE((&quot;thread_hit_debug_event(): Misdirected nub thread: %&quot; B_PRId32</a>
+<a name="ln575">			&quot;\n&quot;, thread-&gt;id));</a>
+<a name="ln576"> </a>
+<a name="ln577">		error = B_ERROR;</a>
+<a name="ln578">	} else if (debuggerInstalled || !requireDebugger) {</a>
+<a name="ln579">		if (debuggerInstalled) {</a>
+<a name="ln580">			debuggerPort = thread-&gt;team-&gt;debug_info.debugger_port;</a>
+<a name="ln581">			nubPort = thread-&gt;team-&gt;debug_info.nub_port;</a>
+<a name="ln582">		}</a>
+<a name="ln583"> </a>
+<a name="ln584">		if (setPort) {</a>
+<a name="ln585">			if (threadFlags &amp; B_THREAD_DEBUG_INITIALIZED) {</a>
+<a name="ln586">				// someone created a port for us (the port we've created will</a>
+<a name="ln587">				// be deleted below)</a>
+<a name="ln588">				port = thread-&gt;debug_info.debug_port;</a>
+<a name="ln589">			} else {</a>
+<a name="ln590">				thread-&gt;debug_info.debug_port = port;</a>
+<a name="ln591">				deletePort = -1;	// keep the port</a>
+<a name="ln592">				threadFlags |= B_THREAD_DEBUG_INITIALIZED;</a>
+<a name="ln593">			}</a>
+<a name="ln594">		} else {</a>
+<a name="ln595">			if (threadFlags &amp; B_THREAD_DEBUG_INITIALIZED) {</a>
+<a name="ln596">				port = thread-&gt;debug_info.debug_port;</a>
+<a name="ln597">			} else {</a>
+<a name="ln598">				// someone deleted our port</a>
+<a name="ln599">				error = B_ERROR;</a>
+<a name="ln600">			}</a>
+<a name="ln601">		}</a>
+<a name="ln602">	} else</a>
+<a name="ln603">		error = B_ERROR;</a>
+<a name="ln604"> </a>
+<a name="ln605">	// update the flags</a>
+<a name="ln606">	if (error == B_OK)</a>
+<a name="ln607">		threadFlags |= B_THREAD_DEBUG_STOPPED;</a>
+<a name="ln608">	atomic_set(&amp;thread-&gt;debug_info.flags, threadFlags);</a>
+<a name="ln609"> </a>
+<a name="ln610">	update_thread_user_debug_flag(thread);</a>
+<a name="ln611"> </a>
+<a name="ln612">	threadDebugInfoLocker.Unlock();</a>
+<a name="ln613">	RELEASE_TEAM_DEBUG_INFO_LOCK(thread-&gt;team-&gt;debug_info);</a>
+<a name="ln614">	restore_interrupts(state);</a>
+<a name="ln615"> </a>
+<a name="ln616">	// delete the superfluous port</a>
+<a name="ln617">	if (deletePort &gt;= 0)</a>
+<a name="ln618">		delete_port(deletePort);</a>
+<a name="ln619"> </a>
+<a name="ln620">	if (error != B_OK) {</a>
+<a name="ln621">		TRACE((&quot;thread_hit_debug_event() error: thread: %&quot; B_PRId32 &quot;, error: &quot;</a>
+<a name="ln622">			&quot;%&quot; B_PRIx32 &quot;\n&quot;, thread-&gt;id, error));</a>
+<a name="ln623">		return error;</a>
+<a name="ln624">	}</a>
+<a name="ln625"> </a>
+<a name="ln626">	// send a message to the debugger port</a>
+<a name="ln627">	if (debuggerInstalled) {</a>
+<a name="ln628">		// update the message's origin info first</a>
+<a name="ln629">		debug_origin *origin = (debug_origin *)message;</a>
+<a name="ln630">		origin-&gt;thread = thread-&gt;id;</a>
+<a name="ln631">		origin-&gt;team = thread-&gt;team-&gt;id;</a>
+<a name="ln632">		origin-&gt;nub_port = nubPort;</a>
+<a name="ln633"> </a>
+<a name="ln634">		TRACE((&quot;thread_hit_debug_event(): thread: %&quot; B_PRId32 &quot;, sending &quot;</a>
+<a name="ln635">			&quot;message to debugger port %&quot; B_PRId32 &quot;\n&quot;, thread-&gt;id,</a>
+<a name="ln636">			debuggerPort));</a>
+<a name="ln637"> </a>
+<a name="ln638">		error = debugger_write(debuggerPort, event, message, size, false);</a>
+<a name="ln639">	}</a>
+<a name="ln640"> </a>
+<a name="ln641">	status_t result = B_THREAD_DEBUG_HANDLE_EVENT;</a>
+<a name="ln642">	bool singleStep = false;</a>
+<a name="ln643"> </a>
+<a name="ln644">	if (error == B_OK) {</a>
+<a name="ln645">		bool done = false;</a>
+<a name="ln646">		while (!done) {</a>
+<a name="ln647">			// read a command from the debug port</a>
+<a name="ln648">			int32 command;</a>
+<a name="ln649">			debugged_thread_message_data commandMessage;</a>
+<a name="ln650">			ssize_t commandMessageSize = read_port_etc(port, &amp;command,</a>
+<a name="ln651">				&amp;commandMessage, sizeof(commandMessage), B_KILL_CAN_INTERRUPT,</a>
+<a name="ln652">				0);</a>
+<a name="ln653"> </a>
+<a name="ln654">			if (commandMessageSize &lt; 0) {</a>
+<a name="ln655">				error = commandMessageSize;</a>
+<a name="ln656">				TRACE((&quot;thread_hit_debug_event(): thread: %&quot; B_PRId32 &quot;, failed &quot;</a>
+<a name="ln657">					&quot;to receive message from port %&quot; B_PRId32 &quot;: %&quot; B_PRIx32 &quot;\n&quot;,</a>
+<a name="ln658">					thread-&gt;id, port, error));</a>
+<a name="ln659">				break;</a>
+<a name="ln660">			}</a>
+<a name="ln661"> </a>
+<a name="ln662">			switch (command) {</a>
+<a name="ln663">				case B_DEBUGGED_THREAD_MESSAGE_CONTINUE:</a>
+<a name="ln664">					TRACE((&quot;thread_hit_debug_event(): thread: %&quot; B_PRId32 &quot;: &quot;</a>
+<a name="ln665">						&quot;B_DEBUGGED_THREAD_MESSAGE_CONTINUE\n&quot;,</a>
+<a name="ln666">						thread-&gt;id));</a>
+<a name="ln667">					result = commandMessage.continue_thread.handle_event;</a>
+<a name="ln668"> </a>
+<a name="ln669">					singleStep = commandMessage.continue_thread.single_step;</a>
+<a name="ln670">					done = true;</a>
+<a name="ln671">					break;</a>
+<a name="ln672"> </a>
+<a name="ln673">				case B_DEBUGGED_THREAD_SET_CPU_STATE:</a>
+<a name="ln674">				{</a>
+<a name="ln675">					TRACE((&quot;thread_hit_debug_event(): thread: %&quot; B_PRId32 &quot;: &quot;</a>
+<a name="ln676">						&quot;B_DEBUGGED_THREAD_SET_CPU_STATE\n&quot;,</a>
+<a name="ln677">						thread-&gt;id));</a>
+<a name="ln678">					arch_set_debug_cpu_state(</a>
+<a name="ln679">						&amp;commandMessage.set_cpu_state.cpu_state);</a>
+<a name="ln680"> </a>
+<a name="ln681">					break;</a>
+<a name="ln682">				}</a>
+<a name="ln683"> </a>
+<a name="ln684">				case B_DEBUGGED_THREAD_GET_CPU_STATE:</a>
+<a name="ln685">				{</a>
+<a name="ln686">					port_id replyPort = commandMessage.get_cpu_state.reply_port;</a>
+<a name="ln687"> </a>
+<a name="ln688">					// prepare the message</a>
+<a name="ln689">					debug_nub_get_cpu_state_reply replyMessage;</a>
+<a name="ln690">					replyMessage.error = B_OK;</a>
+<a name="ln691">					replyMessage.message = event;</a>
+<a name="ln692">					arch_get_debug_cpu_state(&amp;replyMessage.cpu_state);</a>
+<a name="ln693"> </a>
+<a name="ln694">					// send it</a>
+<a name="ln695">					error = kill_interruptable_write_port(replyPort, event,</a>
+<a name="ln696">						&amp;replyMessage, sizeof(replyMessage));</a>
+<a name="ln697"> </a>
+<a name="ln698">					break;</a>
+<a name="ln699">				}</a>
+<a name="ln700"> </a>
+<a name="ln701">				case B_DEBUGGED_THREAD_DEBUGGER_CHANGED:</a>
+<a name="ln702">				{</a>
+<a name="ln703">					// Check, if the debugger really changed, i.e. is different</a>
+<a name="ln704">					// than the one we know.</a>
+<a name="ln705">					team_debug_info teamDebugInfo;</a>
+<a name="ln706">					get_team_debug_info(teamDebugInfo);</a>
+<a name="ln707"> </a>
+<a name="ln708">					if (teamDebugInfo.flags &amp; B_TEAM_DEBUG_DEBUGGER_INSTALLED) {</a>
+<a name="ln709">						if (!debuggerInstalled</a>
+<a name="ln710">							|| teamDebugInfo.debugger_port != debuggerPort) {</a>
+<a name="ln711">							// debugger was installed or has changed: restart</a>
+<a name="ln712">							// this function</a>
+<a name="ln713">							restart = true;</a>
+<a name="ln714">							done = true;</a>
+<a name="ln715">						}</a>
+<a name="ln716">					} else {</a>
+<a name="ln717">						if (debuggerInstalled) {</a>
+<a name="ln718">							// debugger is gone: continue the thread normally</a>
+<a name="ln719">							done = true;</a>
+<a name="ln720">						}</a>
+<a name="ln721">					}</a>
+<a name="ln722"> </a>
+<a name="ln723">					break;</a>
+<a name="ln724">				}</a>
+<a name="ln725">			}</a>
+<a name="ln726">		}</a>
+<a name="ln727">	} else {</a>
+<a name="ln728">		TRACE((&quot;thread_hit_debug_event(): thread: %&quot; B_PRId32 &quot;, failed to send &quot;</a>
+<a name="ln729">			&quot;message to debugger port %&quot; B_PRId32 &quot;: %&quot; B_PRIx32 &quot;\n&quot;,</a>
+<a name="ln730">			thread-&gt;id, debuggerPort, error));</a>
+<a name="ln731">	}</a>
+<a name="ln732"> </a>
+<a name="ln733">	// update the thread debug info</a>
+<a name="ln734">	bool destroyThreadInfo = false;</a>
+<a name="ln735">	thread_debug_info threadDebugInfo;</a>
+<a name="ln736"> </a>
+<a name="ln737">	state = disable_interrupts();</a>
+<a name="ln738">	threadDebugInfoLocker.Lock();</a>
+<a name="ln739"> </a>
+<a name="ln740">	// check, if the team is still being debugged</a>
+<a name="ln741">	int32 teamDebugFlags = atomic_get(&amp;thread-&gt;team-&gt;debug_info.flags);</a>
+<a name="ln742">	if (teamDebugFlags &amp; B_TEAM_DEBUG_DEBUGGER_INSTALLED) {</a>
+<a name="ln743">		// update the single-step flag</a>
+<a name="ln744">		if (singleStep) {</a>
+<a name="ln745">			atomic_or(&amp;thread-&gt;debug_info.flags,</a>
+<a name="ln746">				B_THREAD_DEBUG_SINGLE_STEP);</a>
+<a name="ln747">			atomic_or(&amp;thread-&gt;flags, THREAD_FLAGS_SINGLE_STEP);</a>
+<a name="ln748">		} else {</a>
+<a name="ln749">			atomic_and(&amp;thread-&gt;debug_info.flags,</a>
+<a name="ln750">				~(int32)B_THREAD_DEBUG_SINGLE_STEP);</a>
+<a name="ln751">		}</a>
+<a name="ln752"> </a>
+<a name="ln753">		// unset the &quot;stopped&quot; state</a>
+<a name="ln754">		atomic_and(&amp;thread-&gt;debug_info.flags, ~B_THREAD_DEBUG_STOPPED);</a>
+<a name="ln755"> </a>
+<a name="ln756">		update_thread_user_debug_flag(thread);</a>
+<a name="ln757"> </a>
+<a name="ln758">	} else {</a>
+<a name="ln759">		// the debugger is gone: cleanup our info completely</a>
+<a name="ln760">		threadDebugInfo = thread-&gt;debug_info;</a>
+<a name="ln761">		clear_thread_debug_info(&amp;thread-&gt;debug_info, false);</a>
+<a name="ln762">		destroyThreadInfo = true;</a>
+<a name="ln763">	}</a>
+<a name="ln764"> </a>
+<a name="ln765">	threadDebugInfoLocker.Unlock();</a>
+<a name="ln766">	restore_interrupts(state);</a>
+<a name="ln767"> </a>
+<a name="ln768">	// enable/disable single stepping</a>
+<a name="ln769">	arch_update_thread_single_step();</a>
+<a name="ln770"> </a>
+<a name="ln771">	if (destroyThreadInfo)</a>
+<a name="ln772">		destroy_thread_debug_info(&amp;threadDebugInfo);</a>
+<a name="ln773"> </a>
+<a name="ln774">	return (error == B_OK ? result : error);</a>
+<a name="ln775">}</a>
+<a name="ln776"> </a>
+<a name="ln777"> </a>
+<a name="ln778">static status_t</a>
+<a name="ln779">thread_hit_debug_event(debug_debugger_message event, const void *message,</a>
+<a name="ln780">	int32 size, bool requireDebugger)</a>
+<a name="ln781">{</a>
+<a name="ln782">	status_t result;</a>
+<a name="ln783">	bool restart;</a>
+<a name="ln784">	do {</a>
+<a name="ln785">		restart = false;</a>
+<a name="ln786">		result = thread_hit_debug_event_internal(event, message, size,</a>
+<a name="ln787">			requireDebugger, restart);</a>
+<a name="ln788">	} while (result &gt;= 0 &amp;&amp; restart);</a>
+<a name="ln789"> </a>
+<a name="ln790">	// Prepare to continue -- we install a debugger change condition, so no one</a>
+<a name="ln791">	// will change the debugger while we're playing with the breakpoint manager.</a>
+<a name="ln792">	// TODO: Maybe better use ref-counting and a flag in the breakpoint manager.</a>
+<a name="ln793">	Team* team = thread_get_current_thread()-&gt;team;</a>
+<a name="ln794">	ConditionVariable debugChangeCondition;</a>
+<a name="ln795">	prepare_debugger_change(team, debugChangeCondition);</a>
+<a name="ln796"> </a>
+<a name="ln797">	if (team-&gt;debug_info.breakpoint_manager != NULL) {</a>
+<a name="ln798">		bool isSyscall;</a>
+<a name="ln799">		void* pc = arch_debug_get_interrupt_pc(&amp;isSyscall);</a>
+<a name="ln800">		if (pc != NULL &amp;&amp; !isSyscall)</a>
+<a name="ln801">			team-&gt;debug_info.breakpoint_manager-&gt;PrepareToContinue(pc);</a>
+<a name="ln802">	}</a>
+<a name="ln803"> </a>
+<a name="ln804">	finish_debugger_change(team);</a>
+<a name="ln805"> </a>
+<a name="ln806">	return result;</a>
+<a name="ln807">}</a>
+<a name="ln808"> </a>
+<a name="ln809"> </a>
+<a name="ln810">static status_t</a>
+<a name="ln811">thread_hit_serious_debug_event(debug_debugger_message event,</a>
+<a name="ln812">	const void *message, int32 messageSize)</a>
+<a name="ln813">{</a>
+<a name="ln814">	// ensure that a debugger is installed for this team</a>
+<a name="ln815">	status_t error = ensure_debugger_installed();</a>
+<a name="ln816">	if (error != B_OK) {</a>
+<a name="ln817">		Thread *thread = thread_get_current_thread();</a>
+<a name="ln818">		dprintf(&quot;thread_hit_serious_debug_event(): Failed to install debugger: &quot;</a>
+<a name="ln819">			&quot;thread: %&quot; B_PRId32 &quot;: %s\n&quot;, thread-&gt;id, strerror(error));</a>
+<a name="ln820">		return error;</a>
+<a name="ln821">	}</a>
+<a name="ln822"> </a>
+<a name="ln823">	// enter the debug loop</a>
+<a name="ln824">	return thread_hit_debug_event(event, message, messageSize, true);</a>
+<a name="ln825">}</a>
+<a name="ln826"> </a>
+<a name="ln827"> </a>
+<a name="ln828">void</a>
+<a name="ln829">user_debug_pre_syscall(uint32 syscall, void *args)</a>
+<a name="ln830">{</a>
+<a name="ln831">	// check whether a debugger is installed</a>
+<a name="ln832">	Thread *thread = thread_get_current_thread();</a>
+<a name="ln833">	int32 teamDebugFlags = atomic_get(&amp;thread-&gt;team-&gt;debug_info.flags);</a>
+<a name="ln834">	if (!(teamDebugFlags &amp; B_TEAM_DEBUG_DEBUGGER_INSTALLED))</a>
+<a name="ln835">		return;</a>
+<a name="ln836"> </a>
+<a name="ln837">	// check whether pre-syscall tracing is enabled for team or thread</a>
+<a name="ln838">	int32 threadDebugFlags = atomic_get(&amp;thread-&gt;debug_info.flags);</a>
+<a name="ln839">	if (!(teamDebugFlags &amp; B_TEAM_DEBUG_PRE_SYSCALL)</a>
+<a name="ln840">			&amp;&amp; !(threadDebugFlags &amp; B_THREAD_DEBUG_PRE_SYSCALL)) {</a>
+<a name="ln841">		return;</a>
+<a name="ln842">	}</a>
+<a name="ln843"> </a>
+<a name="ln844">	// prepare the message</a>
+<a name="ln845">	debug_pre_syscall message;</a>
+<a name="ln846">	message.syscall = syscall;</a>
+<a name="ln847"> </a>
+<a name="ln848">	// copy the syscall args</a>
+<a name="ln849">	if (syscall &lt; (uint32)kSyscallCount) {</a>
+<a name="ln850">		if (kSyscallInfos[syscall].parameter_size &gt; 0)</a>
+<a name="ln851">			memcpy(message.args, args, kSyscallInfos[syscall].parameter_size);</a>
+<a name="ln852">	}</a>
+<a name="ln853"> </a>
+<a name="ln854">	thread_hit_debug_event(B_DEBUGGER_MESSAGE_PRE_SYSCALL, &amp;message,</a>
+<a name="ln855">		sizeof(message), true);</a>
+<a name="ln856">}</a>
+<a name="ln857"> </a>
+<a name="ln858"> </a>
+<a name="ln859">void</a>
+<a name="ln860">user_debug_post_syscall(uint32 syscall, void *args, uint64 returnValue,</a>
+<a name="ln861">	bigtime_t startTime)</a>
+<a name="ln862">{</a>
+<a name="ln863">	// check whether a debugger is installed</a>
+<a name="ln864">	Thread *thread = thread_get_current_thread();</a>
+<a name="ln865">	int32 teamDebugFlags = atomic_get(&amp;thread-&gt;team-&gt;debug_info.flags);</a>
+<a name="ln866">	if (!(teamDebugFlags &amp; B_TEAM_DEBUG_DEBUGGER_INSTALLED))</a>
+<a name="ln867">		return;</a>
+<a name="ln868"> </a>
+<a name="ln869">	// check whether post-syscall tracing is enabled for team or thread</a>
+<a name="ln870">	int32 threadDebugFlags = atomic_get(&amp;thread-&gt;debug_info.flags);</a>
+<a name="ln871">	if (!(teamDebugFlags &amp; B_TEAM_DEBUG_POST_SYSCALL)</a>
+<a name="ln872">			&amp;&amp; !(threadDebugFlags &amp; B_THREAD_DEBUG_POST_SYSCALL)) {</a>
+<a name="ln873">		return;</a>
+<a name="ln874">	}</a>
+<a name="ln875"> </a>
+<a name="ln876">	// prepare the message</a>
+<a name="ln877">	debug_post_syscall message;</a>
+<a name="ln878">	message.start_time = startTime;</a>
+<a name="ln879">	message.end_time = system_time();</a>
+<a name="ln880">	message.return_value = returnValue;</a>
+<a name="ln881">	message.syscall = syscall;</a>
+<a name="ln882"> </a>
+<a name="ln883">	// copy the syscall args</a>
+<a name="ln884">	if (syscall &lt; (uint32)kSyscallCount) {</a>
+<a name="ln885">		if (kSyscallInfos[syscall].parameter_size &gt; 0)</a>
+<a name="ln886">			memcpy(message.args, args, kSyscallInfos[syscall].parameter_size);</a>
+<a name="ln887">	}</a>
+<a name="ln888"> </a>
+<a name="ln889">	thread_hit_debug_event(B_DEBUGGER_MESSAGE_POST_SYSCALL, &amp;message,</a>
+<a name="ln890">		sizeof(message), true);</a>
+<a name="ln891">}</a>
+<a name="ln892"> </a>
+<a name="ln893"> </a>
+<a name="ln894">/**	\brief To be called when an unhandled processor exception (error/fault)</a>
+<a name="ln895"> *		   occurred.</a>
+<a name="ln896"> *	\param exception The debug_why_stopped value identifying the kind of fault.</a>
+<a name="ln897"> *	\param signal The signal corresponding to the exception.</a>
+<a name="ln898"> *	\return \c true, if the caller shall continue normally, i.e. usually send</a>
+<a name="ln899"> *			a deadly signal. \c false, if the debugger insists to continue the</a>
+<a name="ln900"> *			program (e.g. because it has solved the removed the cause of the</a>
+<a name="ln901"> *			problem).</a>
+<a name="ln902"> */</a>
+<a name="ln903">bool</a>
+<a name="ln904">user_debug_exception_occurred(debug_exception_type exception, int signal)</a>
+<a name="ln905">{</a>
+<a name="ln906">	// First check whether there's a signal handler installed for the signal.</a>
+<a name="ln907">	// If so, we don't want to install a debugger for the team. We always send</a>
+<a name="ln908">	// the signal instead. An already installed debugger will be notified, if</a>
+<a name="ln909">	// it has requested notifications of signal.</a>
+<a name="ln910">	struct sigaction signalAction;</a>
+<a name="ln911">	if (sigaction(signal, NULL, &amp;signalAction) == 0</a>
+<a name="ln912">		&amp;&amp; signalAction.sa_handler != SIG_DFL) {</a>
+<a name="ln913">		return true;</a>
+<a name="ln914">	}</a>
+<a name="ln915"> </a>
+<a name="ln916">	// prepare the message</a>
+<a name="ln917">	debug_exception_occurred message;</a>
+<a name="ln918">	message.exception = exception;</a>
+<a name="ln919">	message.signal = signal;</a>
+<a name="ln920"> </a>
+<a name="ln921">	status_t result = thread_hit_serious_debug_event(</a>
+<a name="ln922">		B_DEBUGGER_MESSAGE_EXCEPTION_OCCURRED, &amp;message, sizeof(message));</a>
+<a name="ln923">	return (result != B_THREAD_DEBUG_IGNORE_EVENT);</a>
+<a name="ln924">}</a>
+<a name="ln925"> </a>
+<a name="ln926"> </a>
+<a name="ln927">bool</a>
+<a name="ln928">user_debug_handle_signal(int signal, struct sigaction *handler, bool deadly)</a>
+<a name="ln929">{</a>
+<a name="ln930">	// check, if a debugger is installed and is interested in signals</a>
+<a name="ln931">	Thread *thread = thread_get_current_thread();</a>
+<a name="ln932">	int32 teamDebugFlags = atomic_get(&amp;thread-&gt;team-&gt;debug_info.flags);</a>
+<a name="ln933">	if (~teamDebugFlags</a>
+<a name="ln934">		&amp; (B_TEAM_DEBUG_DEBUGGER_INSTALLED | B_TEAM_DEBUG_SIGNALS)) {</a>
+<a name="ln935">		return true;</a>
+<a name="ln936">	}</a>
+<a name="ln937"> </a>
+<a name="ln938">	// prepare the message</a>
+<a name="ln939">	debug_signal_received message;</a>
+<a name="ln940">	message.signal = signal;</a>
+<a name="ln941">	message.handler = *handler;</a>
+<a name="ln942">	message.deadly = deadly;</a>
+<a name="ln943"> </a>
+<a name="ln944">	status_t result = thread_hit_debug_event(B_DEBUGGER_MESSAGE_SIGNAL_RECEIVED,</a>
+<a name="ln945">		&amp;message, sizeof(message), true);</a>
+<a name="ln946">	return (result != B_THREAD_DEBUG_IGNORE_EVENT);</a>
+<a name="ln947">}</a>
+<a name="ln948"> </a>
+<a name="ln949"> </a>
+<a name="ln950">void</a>
+<a name="ln951">user_debug_stop_thread()</a>
+<a name="ln952">{</a>
+<a name="ln953">	// check whether this is actually an emulated single-step notification</a>
+<a name="ln954">	Thread* thread = thread_get_current_thread();</a>
+<a name="ln955">	InterruptsSpinLocker threadDebugInfoLocker(thread-&gt;debug_info.lock);</a>
+<a name="ln956"> </a>
+<a name="ln957">	bool singleStepped = false;</a>
+<a name="ln958">	if ((atomic_and(&amp;thread-&gt;debug_info.flags,</a>
+<a name="ln959">				~B_THREAD_DEBUG_NOTIFY_SINGLE_STEP)</a>
+<a name="ln960">			&amp; B_THREAD_DEBUG_NOTIFY_SINGLE_STEP) != 0) {</a>
+<a name="ln961">		singleStepped = true;</a>
+<a name="ln962">	}</a>
+<a name="ln963"> </a>
+<a name="ln964">	threadDebugInfoLocker.Unlock();</a>
+<a name="ln965"> </a>
+<a name="ln966">	if (singleStepped) {</a>
+<a name="ln967">		user_debug_single_stepped();</a>
+<a name="ln968">	} else {</a>
+<a name="ln969">		debug_thread_debugged message;</a>
+<a name="ln970">		thread_hit_serious_debug_event(B_DEBUGGER_MESSAGE_THREAD_DEBUGGED,</a>
+<a name="ln971">			&amp;message, sizeof(message));</a>
+<a name="ln972">	}</a>
+<a name="ln973">}</a>
+<a name="ln974"> </a>
+<a name="ln975"> </a>
+<a name="ln976">void</a>
+<a name="ln977">user_debug_team_created(team_id teamID)</a>
+<a name="ln978">{</a>
+<a name="ln979">	// check, if a debugger is installed and is interested in team creation</a>
+<a name="ln980">	// events</a>
+<a name="ln981">	Thread *thread = thread_get_current_thread();</a>
+<a name="ln982">	int32 teamDebugFlags = atomic_get(&amp;thread-&gt;team-&gt;debug_info.flags);</a>
+<a name="ln983">	if (~teamDebugFlags</a>
+<a name="ln984">		&amp; (B_TEAM_DEBUG_DEBUGGER_INSTALLED | B_TEAM_DEBUG_TEAM_CREATION)) {</a>
+<a name="ln985">		return;</a>
+<a name="ln986">	}</a>
+<a name="ln987"> </a>
+<a name="ln988">	// prepare the message</a>
+<a name="ln989">	debug_team_created message;</a>
+<a name="ln990">	message.new_team = teamID;</a>
+<a name="ln991"> </a>
+<a name="ln992">	thread_hit_debug_event(B_DEBUGGER_MESSAGE_TEAM_CREATED, &amp;message,</a>
+<a name="ln993">		sizeof(message), true);</a>
+<a name="ln994">}</a>
+<a name="ln995"> </a>
+<a name="ln996"> </a>
+<a name="ln997">void</a>
+<a name="ln998">user_debug_team_deleted(team_id teamID, port_id debuggerPort)</a>
+<a name="ln999">{</a>
+<a name="ln1000">	if (debuggerPort &gt;= 0) {</a>
+<a name="ln1001">		TRACE((&quot;user_debug_team_deleted(team: %&quot; B_PRId32 &quot;, debugger port: &quot;</a>
+<a name="ln1002">			&quot;%&quot; B_PRId32 &quot;)\n&quot;, teamID, debuggerPort));</a>
+<a name="ln1003"> </a>
+<a name="ln1004">		debug_team_deleted message;</a>
+<a name="ln1005">		message.origin.thread = -1;</a>
+<a name="ln1006">		message.origin.team = teamID;</a>
+<a name="ln1007">		message.origin.nub_port = -1;</a>
+<a name="ln1008">		write_port_etc(debuggerPort, B_DEBUGGER_MESSAGE_TEAM_DELETED, &amp;message,</a>
+<a name="ln1009">			sizeof(message), B_RELATIVE_TIMEOUT, 0);</a>
+<a name="ln1010">	}</a>
+<a name="ln1011">}</a>
+<a name="ln1012"> </a>
+<a name="ln1013"> </a>
+<a name="ln1014">void</a>
+<a name="ln1015">user_debug_team_exec()</a>
+<a name="ln1016">{</a>
+<a name="ln1017">	// check, if a debugger is installed and is interested in team creation</a>
+<a name="ln1018">	// events</a>
+<a name="ln1019">	Thread *thread = thread_get_current_thread();</a>
+<a name="ln1020">	int32 teamDebugFlags = atomic_get(&amp;thread-&gt;team-&gt;debug_info.flags);</a>
+<a name="ln1021">	if (~teamDebugFlags</a>
+<a name="ln1022">		&amp; (B_TEAM_DEBUG_DEBUGGER_INSTALLED | B_TEAM_DEBUG_TEAM_CREATION)) {</a>
+<a name="ln1023">		return;</a>
+<a name="ln1024">	}</a>
+<a name="ln1025"> </a>
+<a name="ln1026">	// prepare the message</a>
+<a name="ln1027">	debug_team_exec message;</a>
+<a name="ln1028">	message.image_event = atomic_add(&amp;thread-&gt;team-&gt;debug_info.image_event, 1)</a>
+<a name="ln1029">		+ 1;</a>
+<a name="ln1030"> </a>
+<a name="ln1031">	thread_hit_debug_event(B_DEBUGGER_MESSAGE_TEAM_EXEC, &amp;message,</a>
+<a name="ln1032">		sizeof(message), true);</a>
+<a name="ln1033">}</a>
+<a name="ln1034"> </a>
+<a name="ln1035"> </a>
+<a name="ln1036">/*!	Called by a new userland thread to update the debugging related flags of</a>
+<a name="ln1037">	\c Thread::flags before the thread first enters userland.</a>
+<a name="ln1038">	\param thread The calling thread.</a>
+<a name="ln1039">*/</a>
+<a name="ln1040">void</a>
+<a name="ln1041">user_debug_update_new_thread_flags(Thread* thread)</a>
+<a name="ln1042">{</a>
+<a name="ln1043">	// lock it and update it's flags</a>
+<a name="ln1044">	InterruptsSpinLocker threadDebugInfoLocker(thread-&gt;debug_info.lock);</a>
+<a name="ln1045"> </a>
+<a name="ln1046">	update_thread_user_debug_flag(thread);</a>
+<a name="ln1047">	update_thread_breakpoints_flag(thread);</a>
+<a name="ln1048">	update_thread_debugger_installed_flag(thread);</a>
+<a name="ln1049">}</a>
+<a name="ln1050"> </a>
+<a name="ln1051"> </a>
+<a name="ln1052">void</a>
+<a name="ln1053">user_debug_thread_created(thread_id threadID)</a>
+<a name="ln1054">{</a>
+<a name="ln1055">	// check, if a debugger is installed and is interested in thread events</a>
+<a name="ln1056">	Thread *thread = thread_get_current_thread();</a>
+<a name="ln1057">	int32 teamDebugFlags = atomic_get(&amp;thread-&gt;team-&gt;debug_info.flags);</a>
+<a name="ln1058">	if (~teamDebugFlags</a>
+<a name="ln1059">		&amp; (B_TEAM_DEBUG_DEBUGGER_INSTALLED | B_TEAM_DEBUG_THREADS)) {</a>
+<a name="ln1060">		return;</a>
+<a name="ln1061">	}</a>
+<a name="ln1062"> </a>
+<a name="ln1063">	// prepare the message</a>
+<a name="ln1064">	debug_thread_created message;</a>
+<a name="ln1065">	message.new_thread = threadID;</a>
+<a name="ln1066"> </a>
+<a name="ln1067">	thread_hit_debug_event(B_DEBUGGER_MESSAGE_THREAD_CREATED, &amp;message,</a>
+<a name="ln1068">		sizeof(message), true);</a>
+<a name="ln1069">}</a>
+<a name="ln1070"> </a>
+<a name="ln1071"> </a>
+<a name="ln1072">void</a>
+<a name="ln1073">user_debug_thread_deleted(team_id teamID, thread_id threadID)</a>
+<a name="ln1074">{</a>
+<a name="ln1075">	// Things are a bit complicated here, since this thread no longer belongs to</a>
+<a name="ln1076">	// the debugged team (but to the kernel). So we can't use debugger_write().</a>
+<a name="ln1077"> </a>
+<a name="ln1078">	// get the team debug flags and debugger port</a>
+<a name="ln1079">	Team* team = Team::Get(teamID);</a>
+<a name="ln1080">	if (team == NULL)</a>
+<a name="ln1081">		return;</a>
+<a name="ln1082">	BReference&lt;Team&gt; teamReference(team, true);</a>
+<a name="ln1083"> </a>
+<a name="ln1084">	InterruptsSpinLocker debugInfoLocker(team-&gt;debug_info.lock);</a>
+<a name="ln1085"> </a>
+<a name="ln1086">	int32 teamDebugFlags = atomic_get(&amp;team-&gt;debug_info.flags);</a>
+<a name="ln1087">	port_id debuggerPort = team-&gt;debug_info.debugger_port;</a>
+<a name="ln1088">	sem_id writeLock = team-&gt;debug_info.debugger_write_lock;</a>
+<a name="ln1089"> </a>
+<a name="ln1090">	debugInfoLocker.Unlock();</a>
+<a name="ln1091"> </a>
+<a name="ln1092">	// check, if a debugger is installed and is interested in thread events</a>
+<a name="ln1093">	if (~teamDebugFlags</a>
+<a name="ln1094">		&amp; (B_TEAM_DEBUG_DEBUGGER_INSTALLED | B_TEAM_DEBUG_THREADS)) {</a>
+<a name="ln1095">		return;</a>
+<a name="ln1096">	}</a>
+<a name="ln1097"> </a>
+<a name="ln1098">	// acquire the debugger write lock</a>
+<a name="ln1099">	status_t error = acquire_sem_etc(writeLock, 1, B_KILL_CAN_INTERRUPT, 0);</a>
+<a name="ln1100">	if (error != B_OK)</a>
+<a name="ln1101">		return;</a>
+<a name="ln1102"> </a>
+<a name="ln1103">	// re-get the team debug info -- we need to check whether anything changed</a>
+<a name="ln1104">	debugInfoLocker.Lock();</a>
+<a name="ln1105"> </a>
+<a name="ln1106">	teamDebugFlags = atomic_get(&amp;team-&gt;debug_info.flags);</a>
+<a name="ln1107">	port_id newDebuggerPort = team-&gt;debug_info.debugger_port;</a>
+<a name="ln1108"> </a>
+<a name="ln1109">	debugInfoLocker.Unlock();</a>
+<a name="ln1110"> </a>
+<a name="ln1111">	// Send the message only if the debugger hasn't changed in the meantime or</a>
+<a name="ln1112">	// the team is about to be handed over.</a>
+<a name="ln1113">	if (newDebuggerPort == debuggerPort</a>
+<a name="ln1114">		|| (teamDebugFlags &amp; B_TEAM_DEBUG_DEBUGGER_HANDOVER) == 0) {</a>
+<a name="ln1115">		debug_thread_deleted message;</a>
+<a name="ln1116">		message.origin.thread = threadID;</a>
+<a name="ln1117">		message.origin.team = teamID;</a>
+<a name="ln1118">		message.origin.nub_port = -1;</a>
+<a name="ln1119"> </a>
+<a name="ln1120">		write_port_etc(debuggerPort, B_DEBUGGER_MESSAGE_THREAD_DELETED,</a>
+<a name="ln1121">			&amp;message, sizeof(message), B_KILL_CAN_INTERRUPT, 0);</a>
+<a name="ln1122">	}</a>
+<a name="ln1123"> </a>
+<a name="ln1124">	// release the debugger write lock</a>
+<a name="ln1125">	release_sem(writeLock);</a>
+<a name="ln1126">}</a>
+<a name="ln1127"> </a>
+<a name="ln1128"> </a>
+<a name="ln1129">/*!	Called for a thread that is about to die, cleaning up all user debug</a>
+<a name="ln1130">	facilities installed for the thread.</a>
+<a name="ln1131">	\param thread The current thread, the one that is going to die.</a>
+<a name="ln1132">*/</a>
+<a name="ln1133">void</a>
+<a name="ln1134">user_debug_thread_exiting(Thread* thread)</a>
+<a name="ln1135">{</a>
+<a name="ln1136">	// thread is the current thread, so using team is safe</a>
+<a name="ln1137">	Team* team = thread-&gt;team;</a>
+<a name="ln1138"> </a>
+<a name="ln1139">	InterruptsLocker interruptsLocker;</a>
+<a name="ln1140"> </a>
+<a name="ln1141">	GRAB_TEAM_DEBUG_INFO_LOCK(team-&gt;debug_info);</a>
+<a name="ln1142"> </a>
+<a name="ln1143">	int32 teamDebugFlags = atomic_get(&amp;team-&gt;debug_info.flags);</a>
+<a name="ln1144">	port_id debuggerPort = team-&gt;debug_info.debugger_port;</a>
+<a name="ln1145"> </a>
+<a name="ln1146">	RELEASE_TEAM_DEBUG_INFO_LOCK(team-&gt;debug_info);</a>
+<a name="ln1147"> </a>
+<a name="ln1148">	// check, if a debugger is installed</a>
+<a name="ln1149">	if ((teamDebugFlags &amp; B_TEAM_DEBUG_DEBUGGER_INSTALLED) == 0</a>
+<a name="ln1150">		|| debuggerPort &lt; 0) {</a>
+<a name="ln1151">		return;</a>
+<a name="ln1152">	}</a>
+<a name="ln1153"> </a>
+<a name="ln1154">	// detach the profile info and mark the thread dying</a>
+<a name="ln1155">	SpinLocker threadDebugInfoLocker(thread-&gt;debug_info.lock);</a>
+<a name="ln1156"> </a>
+<a name="ln1157">	thread_debug_info&amp; threadDebugInfo = thread-&gt;debug_info;</a>
+<a name="ln1158">	if (threadDebugInfo.profile.samples == NULL)</a>
+<a name="ln1159">		return;</a>
+<a name="ln1160"> </a>
+<a name="ln1161">	area_id sampleArea = threadDebugInfo.profile.sample_area;</a>
+<a name="ln1162">	int32 sampleCount = threadDebugInfo.profile.sample_count;</a>
+<a name="ln1163">	int32 droppedTicks = threadDebugInfo.profile.dropped_ticks;</a>
+<a name="ln1164">	int32 stackDepth = threadDebugInfo.profile.stack_depth;</a>
+<a name="ln1165">	bool variableStackDepth = threadDebugInfo.profile.variable_stack_depth;</a>
+<a name="ln1166">	int32 imageEvent = threadDebugInfo.profile.image_event;</a>
+<a name="ln1167">	threadDebugInfo.profile.sample_area = -1;</a>
+<a name="ln1168">	threadDebugInfo.profile.samples = NULL;</a>
+<a name="ln1169">	threadDebugInfo.profile.buffer_full = false;</a>
+<a name="ln1170"> </a>
+<a name="ln1171">	atomic_or(&amp;threadDebugInfo.flags, B_THREAD_DEBUG_DYING);</a>
+<a name="ln1172"> </a>
+<a name="ln1173">	threadDebugInfoLocker.Unlock();</a>
+<a name="ln1174">	interruptsLocker.Unlock();</a>
+<a name="ln1175"> </a>
+<a name="ln1176">	// notify the debugger</a>
+<a name="ln1177">	debug_profiler_update message;</a>
+<a name="ln1178">	message.origin.thread = thread-&gt;id;</a>
+<a name="ln1179">	message.origin.team = thread-&gt;team-&gt;id;</a>
+<a name="ln1180">	message.origin.nub_port = -1;	// asynchronous message</a>
+<a name="ln1181">	message.sample_count = sampleCount;</a>
+<a name="ln1182">	message.dropped_ticks = droppedTicks;</a>
+<a name="ln1183">	message.stack_depth = stackDepth;</a>
+<a name="ln1184">	message.variable_stack_depth = variableStackDepth;</a>
+<a name="ln1185">	message.image_event = imageEvent;</a>
+<a name="ln1186">	message.stopped = true;</a>
+<a name="ln1187">	debugger_write(debuggerPort, B_DEBUGGER_MESSAGE_PROFILER_UPDATE,</a>
+<a name="ln1188">		&amp;message, sizeof(message), false);</a>
+<a name="ln1189"> </a>
+<a name="ln1190">	if (sampleArea &gt;= 0) {</a>
+<a name="ln1191">		area_info areaInfo;</a>
+<a name="ln1192">		if (get_area_info(sampleArea, &amp;areaInfo) == B_OK) {</a>
+<a name="ln1193">			unlock_memory(areaInfo.address, areaInfo.size, B_READ_DEVICE);</a>
+<a name="ln1194">			delete_area(sampleArea);</a>
+<a name="ln1195">		}</a>
+<a name="ln1196">	}</a>
+<a name="ln1197">}</a>
+<a name="ln1198"> </a>
+<a name="ln1199"> </a>
+<a name="ln1200">void</a>
+<a name="ln1201">user_debug_image_created(const image_info *imageInfo)</a>
+<a name="ln1202">{</a>
+<a name="ln1203">	// check, if a debugger is installed and is interested in image events</a>
+<a name="ln1204">	Thread *thread = thread_get_current_thread();</a>
+<a name="ln1205">	int32 teamDebugFlags = atomic_get(&amp;thread-&gt;team-&gt;debug_info.flags);</a>
+<a name="ln1206">	if (~teamDebugFlags</a>
+<a name="ln1207">		&amp; (B_TEAM_DEBUG_DEBUGGER_INSTALLED | B_TEAM_DEBUG_IMAGES)) {</a>
+<a name="ln1208">		return;</a>
+<a name="ln1209">	}</a>
+<a name="ln1210"> </a>
+<a name="ln1211">	// prepare the message</a>
+<a name="ln1212">	debug_image_created message;</a>
+<a name="ln1213">	memcpy(&amp;message.info, imageInfo, sizeof(image_info));</a>
+<a name="ln1214">	message.image_event = atomic_add(&amp;thread-&gt;team-&gt;debug_info.image_event, 1)</a>
+<a name="ln1215">		+ 1;</a>
+<a name="ln1216"> </a>
+<a name="ln1217">	thread_hit_debug_event(B_DEBUGGER_MESSAGE_IMAGE_CREATED, &amp;message,</a>
+<a name="ln1218">		sizeof(message), true);</a>
+<a name="ln1219">}</a>
+<a name="ln1220"> </a>
+<a name="ln1221"> </a>
+<a name="ln1222">void</a>
+<a name="ln1223">user_debug_image_deleted(const image_info *imageInfo)</a>
+<a name="ln1224">{</a>
+<a name="ln1225">	// check, if a debugger is installed and is interested in image events</a>
+<a name="ln1226">	Thread *thread = thread_get_current_thread();</a>
+<a name="ln1227">	int32 teamDebugFlags = atomic_get(&amp;thread-&gt;team-&gt;debug_info.flags);</a>
+<a name="ln1228">	if (~teamDebugFlags</a>
+<a name="ln1229">		&amp; (B_TEAM_DEBUG_DEBUGGER_INSTALLED | B_TEAM_DEBUG_IMAGES)) {</a>
+<a name="ln1230">		return;</a>
+<a name="ln1231">	}</a>
+<a name="ln1232"> </a>
+<a name="ln1233">	// prepare the message</a>
+<a name="ln1234">	debug_image_deleted message;</a>
+<a name="ln1235">	memcpy(&amp;message.info, imageInfo, sizeof(image_info));</a>
+<a name="ln1236">	message.image_event = atomic_add(&amp;thread-&gt;team-&gt;debug_info.image_event, 1)</a>
+<a name="ln1237">		+ 1;</a>
+<a name="ln1238"> </a>
+<a name="ln1239">	thread_hit_debug_event(B_DEBUGGER_MESSAGE_IMAGE_DELETED, &amp;message,</a>
+<a name="ln1240">		sizeof(message), true);</a>
+<a name="ln1241">}</a>
+<a name="ln1242"> </a>
+<a name="ln1243"> </a>
+<a name="ln1244">void</a>
+<a name="ln1245">user_debug_breakpoint_hit(bool software)</a>
+<a name="ln1246">{</a>
+<a name="ln1247">	// prepare the message</a>
+<a name="ln1248">	debug_breakpoint_hit message;</a>
+<a name="ln1249">	arch_get_debug_cpu_state(&amp;message.cpu_state);</a>
+<a name="ln1250"> </a>
+<a name="ln1251">	thread_hit_serious_debug_event(B_DEBUGGER_MESSAGE_BREAKPOINT_HIT, &amp;message,</a>
+<a name="ln1252">		sizeof(message));</a>
+<a name="ln1253">}</a>
+<a name="ln1254"> </a>
+<a name="ln1255"> </a>
+<a name="ln1256">void</a>
+<a name="ln1257">user_debug_watchpoint_hit()</a>
+<a name="ln1258">{</a>
+<a name="ln1259">	// prepare the message</a>
+<a name="ln1260">	debug_watchpoint_hit message;</a>
+<a name="ln1261">	arch_get_debug_cpu_state(&amp;message.cpu_state);</a>
+<a name="ln1262"> </a>
+<a name="ln1263">	thread_hit_serious_debug_event(B_DEBUGGER_MESSAGE_WATCHPOINT_HIT, &amp;message,</a>
+<a name="ln1264">		sizeof(message));</a>
+<a name="ln1265">}</a>
+<a name="ln1266"> </a>
+<a name="ln1267"> </a>
+<a name="ln1268">void</a>
+<a name="ln1269">user_debug_single_stepped()</a>
+<a name="ln1270">{</a>
+<a name="ln1271">	// clear the single-step thread flag</a>
+<a name="ln1272">	Thread* thread = thread_get_current_thread();</a>
+<a name="ln1273">	atomic_and(&amp;thread-&gt;flags, ~(int32)THREAD_FLAGS_SINGLE_STEP);</a>
+<a name="ln1274"> </a>
+<a name="ln1275">	// prepare the message</a>
+<a name="ln1276">	debug_single_step message;</a>
+<a name="ln1277">	arch_get_debug_cpu_state(&amp;message.cpu_state);</a>
+<a name="ln1278"> </a>
+<a name="ln1279">	thread_hit_serious_debug_event(B_DEBUGGER_MESSAGE_SINGLE_STEP, &amp;message,</a>
+<a name="ln1280">		sizeof(message));</a>
+<a name="ln1281">}</a>
+<a name="ln1282"> </a>
+<a name="ln1283"> </a>
+<a name="ln1284">/*!	Schedules the profiling timer for the current thread.</a>
+<a name="ln1285">	The caller must hold the thread's debug info lock.</a>
+<a name="ln1286">	\param thread The current thread.</a>
+<a name="ln1287">	\param interval The time after which the timer should fire.</a>
+<a name="ln1288">*/</a>
+<a name="ln1289">static void</a>
+<a name="ln1290">schedule_profiling_timer(Thread* thread, bigtime_t interval)</a>
+<a name="ln1291">{</a>
+<a name="ln1292">	struct timer* timer = &amp;sProfilingTimers[thread-&gt;cpu-&gt;cpu_num];</a>
+<a name="ln1293">	thread-&gt;debug_info.profile.installed_timer = timer;</a>
+<a name="ln1294">	thread-&gt;debug_info.profile.timer_end = system_time() + interval;</a>
+<a name="ln1295">	add_timer(timer, &amp;profiling_event, interval, B_ONE_SHOT_RELATIVE_TIMER);</a>
+<a name="ln1296">}</a>
+<a name="ln1297"> </a>
+<a name="ln1298"> </a>
+<a name="ln1299">/*!	Samples the current thread's instruction pointer/stack trace.</a>
+<a name="ln1300">	The caller must hold the current thread's debug info lock.</a>
+<a name="ln1301">	\param flushBuffer Return parameter: Set to \c true when the sampling</a>
+<a name="ln1302">		buffer must be flushed.</a>
+<a name="ln1303">*/</a>
+<a name="ln1304">static bool</a>
+<a name="ln1305">profiling_do_sample(bool&amp; flushBuffer)</a>
+<a name="ln1306">{</a>
+<a name="ln1307">	Thread* thread = thread_get_current_thread();</a>
+<a name="ln1308">	thread_debug_info&amp; debugInfo = thread-&gt;debug_info;</a>
+<a name="ln1309"> </a>
+<a name="ln1310">	if (debugInfo.profile.samples == NULL)</a>
+<a name="ln1311">		return false;</a>
+<a name="ln1312"> </a>
+<a name="ln1313">	// Check, whether the buffer is full or an image event occurred since the</a>
+<a name="ln1314">	// last sample was taken.</a>
+<a name="ln1315">	int32 maxSamples = debugInfo.profile.max_samples;</a>
+<a name="ln1316">	int32 sampleCount = debugInfo.profile.sample_count;</a>
+<a name="ln1317">	int32 stackDepth = debugInfo.profile.stack_depth;</a>
+<a name="ln1318">	int32 imageEvent = thread-&gt;team-&gt;debug_info.image_event;</a>
+<a name="ln1319">	if (debugInfo.profile.sample_count &gt; 0) {</a>
+<a name="ln1320">		if (debugInfo.profile.last_image_event &lt; imageEvent</a>
+<a name="ln1321">			&amp;&amp; debugInfo.profile.variable_stack_depth</a>
+<a name="ln1322">			&amp;&amp; sampleCount + 2 &lt;= maxSamples) {</a>
+<a name="ln1323">			// an image event occurred, but we use variable stack depth and</a>
+<a name="ln1324">			// have enough room in the buffer to indicate an image event</a>
+<a name="ln1325">			addr_t* event = debugInfo.profile.samples + sampleCount;</a>
+<a name="ln1326">			event[0] = B_DEBUG_PROFILE_IMAGE_EVENT;</a>
+<a name="ln1327">			event[1] = imageEvent;</a>
+<a name="ln1328">			sampleCount += 2;</a>
+<a name="ln1329">			debugInfo.profile.sample_count = sampleCount;</a>
+<a name="ln1330">			debugInfo.profile.last_image_event = imageEvent;</a>
+<a name="ln1331">		}</a>
+<a name="ln1332"> </a>
+<a name="ln1333">		if (debugInfo.profile.last_image_event &lt; imageEvent</a>
+<a name="ln1334">			|| debugInfo.profile.flush_threshold - sampleCount &lt; stackDepth) {</a>
+<a name="ln1335">			if (!IS_KERNEL_ADDRESS(arch_debug_get_interrupt_pc(NULL))) {</a>
+<a name="ln1336">				flushBuffer = true;</a>
+<a name="ln1337">				return true;</a>
+<a name="ln1338">			}</a>
+<a name="ln1339"> </a>
+<a name="ln1340">			// We can't flush the buffer now, since we interrupted a kernel</a>
+<a name="ln1341">			// function. If the buffer is not full yet, we add the samples,</a>
+<a name="ln1342">			// otherwise we have to drop them.</a>
+<a name="ln1343">			if (maxSamples - sampleCount &lt; stackDepth) {</a>
+<a name="ln1344">				debugInfo.profile.dropped_ticks++;</a>
+<a name="ln1345">				return true;</a>
+<a name="ln1346">			}</a>
+<a name="ln1347">		}</a>
+<a name="ln1348">	} else {</a>
+<a name="ln1349">		// first sample -- set the image event</a>
+<a name="ln1350">		debugInfo.profile.image_event = imageEvent;</a>
+<a name="ln1351">		debugInfo.profile.last_image_event = imageEvent;</a>
+<a name="ln1352">	}</a>
+<a name="ln1353"> </a>
+<a name="ln1354">	// get the samples</a>
+<a name="ln1355">	addr_t* returnAddresses = debugInfo.profile.samples</a>
+<a name="ln1356">		+ debugInfo.profile.sample_count;</a>
+<a name="ln1357">	if (debugInfo.profile.variable_stack_depth) {</a>
+<a name="ln1358">		// variable sample count per hit</a>
+<a name="ln1359">		*returnAddresses = arch_debug_get_stack_trace(returnAddresses + 1,</a>
+<a name="ln1360">			stackDepth - 1, 1, 0, STACK_TRACE_KERNEL | STACK_TRACE_USER);</a>
+<a name="ln1361"> </a>
+<a name="ln1362">		debugInfo.profile.sample_count += *returnAddresses + 1;</a>
+<a name="ln1363">	} else {</a>
+<a name="ln1364">		// fixed sample count per hit</a>
+<a name="ln1365">		if (stackDepth &gt; 1) {</a>
+<a name="ln1366">			int32 count = arch_debug_get_stack_trace(returnAddresses,</a>
+<a name="ln1367">				stackDepth, 1, 0, STACK_TRACE_KERNEL | STACK_TRACE_USER);</a>
+<a name="ln1368"> </a>
+<a name="ln1369">			for (int32 i = count; i &lt; stackDepth; i++)</a>
+<a name="ln1370">				returnAddresses[i] = 0;</a>
+<a name="ln1371">		} else</a>
+<a name="ln1372">			*returnAddresses = (addr_t)arch_debug_get_interrupt_pc(NULL);</a>
+<a name="ln1373"> </a>
+<a name="ln1374">		debugInfo.profile.sample_count += stackDepth;</a>
+<a name="ln1375">	}</a>
+<a name="ln1376"> </a>
+<a name="ln1377">	return true;</a>
+<a name="ln1378">}</a>
+<a name="ln1379"> </a>
+<a name="ln1380"> </a>
+<a name="ln1381">static void</a>
+<a name="ln1382">profiling_buffer_full(void*)</a>
+<a name="ln1383">{</a>
+<a name="ln1384">	// It is undefined whether the function is called with interrupts enabled</a>
+<a name="ln1385">	// or disabled. We are allowed to enable interrupts, though. First make</a>
+<a name="ln1386">	// sure interrupts are disabled.</a>
+<a name="ln1387">	disable_interrupts();</a>
+<a name="ln1388"> </a>
+<a name="ln1389">	Thread* thread = thread_get_current_thread();</a>
+<a name="ln1390">	thread_debug_info&amp; debugInfo = thread-&gt;debug_info;</a>
+<a name="ln1391"> </a>
+<a name="ln1392">	SpinLocker threadDebugInfoLocker(debugInfo.lock);</a>
+<a name="ln1393"> </a>
+<a name="ln1394">	if (debugInfo.profile.samples != NULL &amp;&amp; debugInfo.profile.buffer_full) {</a>
+<a name="ln1395">		int32 sampleCount = debugInfo.profile.sample_count;</a>
+<a name="ln1396">		int32 droppedTicks = debugInfo.profile.dropped_ticks;</a>
+<a name="ln1397">		int32 stackDepth = debugInfo.profile.stack_depth;</a>
+<a name="ln1398">		bool variableStackDepth = debugInfo.profile.variable_stack_depth;</a>
+<a name="ln1399">		int32 imageEvent = debugInfo.profile.image_event;</a>
+<a name="ln1400"> </a>
+<a name="ln1401">		// notify the debugger</a>
+<a name="ln1402">		debugInfo.profile.sample_count = 0;</a>
+<a name="ln1403">		debugInfo.profile.dropped_ticks = 0;</a>
+<a name="ln1404"> </a>
+<a name="ln1405">		threadDebugInfoLocker.Unlock();</a>
+<a name="ln1406">		enable_interrupts();</a>
+<a name="ln1407"> </a>
+<a name="ln1408">		// prepare the message</a>
+<a name="ln1409">		debug_profiler_update message;</a>
+<a name="ln1410">		message.sample_count = sampleCount;</a>
+<a name="ln1411">		message.dropped_ticks = droppedTicks;</a>
+<a name="ln1412">		message.stack_depth = stackDepth;</a>
+<a name="ln1413">		message.variable_stack_depth = variableStackDepth;</a>
+<a name="ln1414">		message.image_event = imageEvent;</a>
+<a name="ln1415">		message.stopped = false;</a>
+<a name="ln1416"> </a>
+<a name="ln1417">		thread_hit_debug_event(B_DEBUGGER_MESSAGE_PROFILER_UPDATE, &amp;message,</a>
+<a name="ln1418">			sizeof(message), false);</a>
+<a name="ln1419"> </a>
+<a name="ln1420">		disable_interrupts();</a>
+<a name="ln1421">		threadDebugInfoLocker.Lock();</a>
+<a name="ln1422"> </a>
+<a name="ln1423">		// do the sampling and reschedule timer, if still profiling this thread</a>
+<a name="ln1424">		bool flushBuffer;</a>
+<a name="ln1425">		if (profiling_do_sample(flushBuffer)) {</a>
+<a name="ln1426">			debugInfo.profile.buffer_full = false;</a>
+<a name="ln1427">			schedule_profiling_timer(thread, debugInfo.profile.interval);</a>
+<a name="ln1428">		}</a>
+<a name="ln1429">	}</a>
+<a name="ln1430"> </a>
+<a name="ln1431">	threadDebugInfoLocker.Unlock();</a>
+<a name="ln1432">	enable_interrupts();</a>
+<a name="ln1433">}</a>
+<a name="ln1434"> </a>
+<a name="ln1435"> </a>
+<a name="ln1436">/*!	Profiling timer event callback.</a>
+<a name="ln1437">	Called with interrupts disabled.</a>
+<a name="ln1438">*/</a>
+<a name="ln1439">static int32</a>
+<a name="ln1440">profiling_event(timer* /*unused*/)</a>
+<a name="ln1441">{</a>
+<a name="ln1442">	Thread* thread = thread_get_current_thread();</a>
+<a name="ln1443">	thread_debug_info&amp; debugInfo = thread-&gt;debug_info;</a>
+<a name="ln1444"> </a>
+<a name="ln1445">	SpinLocker threadDebugInfoLocker(debugInfo.lock);</a>
+<a name="ln1446"> </a>
+<a name="ln1447">	bool flushBuffer = false;</a>
+<a name="ln1448">	if (profiling_do_sample(flushBuffer)) {</a>
+<a name="ln1449">		if (flushBuffer) {</a>
+<a name="ln1450">			// The sample buffer needs to be flushed; we'll have to notify the</a>
+<a name="ln1451">			// debugger. We can't do that right here. Instead we set a post</a>
+<a name="ln1452">			// interrupt callback doing that for us, and don't reschedule the</a>
+<a name="ln1453">			// timer yet.</a>
+<a name="ln1454">			thread-&gt;post_interrupt_callback = profiling_buffer_full;</a>
+<a name="ln1455">			debugInfo.profile.installed_timer = NULL;</a>
+<a name="ln1456">			debugInfo.profile.buffer_full = true;</a>
+<a name="ln1457">		} else</a>
+<a name="ln1458">			schedule_profiling_timer(thread, debugInfo.profile.interval);</a>
+<a name="ln1459">	} else</a>
+<a name="ln1460">		debugInfo.profile.installed_timer = NULL;</a>
+<a name="ln1461"> </a>
+<a name="ln1462">	return B_HANDLED_INTERRUPT;</a>
+<a name="ln1463">}</a>
+<a name="ln1464"> </a>
+<a name="ln1465"> </a>
+<a name="ln1466">/*!	Called by the scheduler when a debugged thread has been unscheduled.</a>
+<a name="ln1467">	The scheduler lock is being held.</a>
+<a name="ln1468">*/</a>
+<a name="ln1469">void</a>
+<a name="ln1470">user_debug_thread_unscheduled(Thread* thread)</a>
+<a name="ln1471">{</a>
+<a name="ln1472">	SpinLocker threadDebugInfoLocker(thread-&gt;debug_info.lock);</a>
+<a name="ln1473"> </a>
+<a name="ln1474">	// if running, cancel the profiling timer</a>
+<a name="ln1475">	struct timer* timer = thread-&gt;debug_info.profile.installed_timer;</a>
+<a name="ln1476">	if (timer != NULL) {</a>
+<a name="ln1477">		// track remaining time</a>
+<a name="ln1478">		bigtime_t left = thread-&gt;debug_info.profile.timer_end - system_time();</a>
+<a name="ln1479">		thread-&gt;debug_info.profile.interval_left = max_c(left, 0);</a>
+<a name="ln1480">		thread-&gt;debug_info.profile.installed_timer = NULL;</a>
+<a name="ln1481"> </a>
+<a name="ln1482">		// cancel timer</a>
+<a name="ln1483">		threadDebugInfoLocker.Unlock();</a>
+<a name="ln1484">			// not necessary, but doesn't harm and reduces contention</a>
+<a name="ln1485">		cancel_timer(timer);</a>
+<a name="ln1486">			// since invoked on the same CPU, this will not possibly wait for</a>
+<a name="ln1487">			// an already called timer hook</a>
+<a name="ln1488">	}</a>
+<a name="ln1489">}</a>
+<a name="ln1490"> </a>
+<a name="ln1491"> </a>
+<a name="ln1492">/*!	Called by the scheduler when a debugged thread has been scheduled.</a>
+<a name="ln1493">	The scheduler lock is being held.</a>
+<a name="ln1494">*/</a>
+<a name="ln1495">void</a>
+<a name="ln1496">user_debug_thread_scheduled(Thread* thread)</a>
+<a name="ln1497">{</a>
+<a name="ln1498">	SpinLocker threadDebugInfoLocker(thread-&gt;debug_info.lock);</a>
+<a name="ln1499"> </a>
+<a name="ln1500">	if (thread-&gt;debug_info.profile.samples != NULL</a>
+<a name="ln1501">		&amp;&amp; !thread-&gt;debug_info.profile.buffer_full) {</a>
+<a name="ln1502">		// install profiling timer</a>
+<a name="ln1503">		schedule_profiling_timer(thread,</a>
+<a name="ln1504">			thread-&gt;debug_info.profile.interval_left);</a>
+<a name="ln1505">	}</a>
+<a name="ln1506">}</a>
+<a name="ln1507"> </a>
+<a name="ln1508"> </a>
+<a name="ln1509">/*!	\brief Called by the debug nub thread of a team to broadcast a message to</a>
+<a name="ln1510">		all threads of the team that are initialized for debugging (and</a>
+<a name="ln1511">		thus have a debug port).</a>
+<a name="ln1512">*/</a>
+<a name="ln1513">static void</a>
+<a name="ln1514">broadcast_debugged_thread_message(Thread *nubThread, int32 code,</a>
+<a name="ln1515">	const void *message, int32 size)</a>
+<a name="ln1516">{</a>
+<a name="ln1517">	// iterate through the threads</a>
+<a name="ln1518">	thread_info threadInfo;</a>
+<a name="ln1519">	int32 cookie = 0;</a>
+<a name="ln1520">	while (get_next_thread_info(nubThread-&gt;team-&gt;id, &amp;cookie, &amp;threadInfo)</a>
+<a name="ln1521">			== B_OK) {</a>
+<a name="ln1522">		// get the thread and lock it</a>
+<a name="ln1523">		Thread* thread = Thread::GetAndLock(threadInfo.thread);</a>
+<a name="ln1524">		if (thread == NULL)</a>
+<a name="ln1525">			continue;</a>
+<a name="ln1526"> </a>
+<a name="ln1527">		BReference&lt;Thread&gt; threadReference(thread, true);</a>
+<a name="ln1528">		ThreadLocker threadLocker(thread, true);</a>
+<a name="ln1529"> </a>
+<a name="ln1530">		// get the thread's debug port</a>
+<a name="ln1531">		InterruptsSpinLocker threadDebugInfoLocker(thread-&gt;debug_info.lock);</a>
+<a name="ln1532"> </a>
+<a name="ln1533">		port_id threadDebugPort = -1;</a>
+<a name="ln1534">		if (thread &amp;&amp; thread != nubThread &amp;&amp; thread-&gt;team == nubThread-&gt;team</a>
+<a name="ln1535">			&amp;&amp; (thread-&gt;debug_info.flags &amp; B_THREAD_DEBUG_INITIALIZED) != 0</a>
+<a name="ln1536">			&amp;&amp; (thread-&gt;debug_info.flags &amp; B_THREAD_DEBUG_STOPPED) != 0) {</a>
+<a name="ln1537">			threadDebugPort = thread-&gt;debug_info.debug_port;</a>
+<a name="ln1538">		}</a>
+<a name="ln1539"> </a>
+<a name="ln1540">		threadDebugInfoLocker.Unlock();</a>
+<a name="ln1541">		threadLocker.Unlock();</a>
+<a name="ln1542"> </a>
+<a name="ln1543">		// send the message to the thread</a>
+<a name="ln1544">		if (threadDebugPort &gt;= 0) {</a>
+<a name="ln1545">			status_t error = kill_interruptable_write_port(threadDebugPort,</a>
+<a name="ln1546">				code, message, size);</a>
+<a name="ln1547">			if (error != B_OK) {</a>
+<a name="ln1548">				TRACE((&quot;broadcast_debugged_thread_message(): Failed to send &quot;</a>
+<a name="ln1549">					&quot;message to thread %&quot; B_PRId32 &quot;: %&quot; B_PRIx32 &quot;\n&quot;,</a>
+<a name="ln1550">					thread-&gt;id, error));</a>
+<a name="ln1551">			}</a>
+<a name="ln1552">		}</a>
+<a name="ln1553">	}</a>
+<a name="ln1554">}</a>
+<a name="ln1555"> </a>
+<a name="ln1556"> </a>
+<a name="ln1557">static void</a>
+<a name="ln1558">nub_thread_cleanup(Thread *nubThread)</a>
+<a name="ln1559">{</a>
+<a name="ln1560">	TRACE((&quot;nub_thread_cleanup(%&quot; B_PRId32 &quot;): debugger port: %&quot; B_PRId32 &quot;\n&quot;,</a>
+<a name="ln1561">		nubThread-&gt;id, nubThread-&gt;team-&gt;debug_info.debugger_port));</a>
+<a name="ln1562"> </a>
+<a name="ln1563">	ConditionVariable debugChangeCondition;</a>
+<a name="ln1564">	prepare_debugger_change(nubThread-&gt;team, debugChangeCondition);</a>
+<a name="ln1565"> </a>
+<a name="ln1566">	team_debug_info teamDebugInfo;</a>
+<a name="ln1567">	bool destroyDebugInfo = false;</a>
+<a name="ln1568"> </a>
+<a name="ln1569">	TeamLocker teamLocker(nubThread-&gt;team);</a>
+<a name="ln1570">		// required by update_threads_debugger_installed_flag()</a>
+<a name="ln1571"> </a>
+<a name="ln1572">	cpu_status state = disable_interrupts();</a>
+<a name="ln1573">	GRAB_TEAM_DEBUG_INFO_LOCK(nubThread-&gt;team-&gt;debug_info);</a>
+<a name="ln1574"> </a>
+<a name="ln1575">	team_debug_info &amp;info = nubThread-&gt;team-&gt;debug_info;</a>
+<a name="ln1576">	if (info.flags &amp; B_TEAM_DEBUG_DEBUGGER_INSTALLED</a>
+<a name="ln1577">		&amp;&amp; info.nub_thread == nubThread-&gt;id) {</a>
+<a name="ln1578">		teamDebugInfo = info;</a>
+<a name="ln1579">		clear_team_debug_info(&amp;info, false);</a>
+<a name="ln1580">		destroyDebugInfo = true;</a>
+<a name="ln1581">	}</a>
+<a name="ln1582"> </a>
+<a name="ln1583">	// update the thread::flags fields</a>
+<a name="ln1584">	update_threads_debugger_installed_flag(nubThread-&gt;team);</a>
+<a name="ln1585"> </a>
+<a name="ln1586">	RELEASE_TEAM_DEBUG_INFO_LOCK(nubThread-&gt;team-&gt;debug_info);</a>
+<a name="ln1587">	restore_interrupts(state);</a>
+<a name="ln1588"> </a>
+<a name="ln1589">	teamLocker.Unlock();</a>
+<a name="ln1590"> </a>
+<a name="ln1591">	if (destroyDebugInfo)</a>
+<a name="ln1592">		teamDebugInfo.breakpoint_manager-&gt;RemoveAllBreakpoints();</a>
+<a name="ln1593"> </a>
+<a name="ln1594">	finish_debugger_change(nubThread-&gt;team);</a>
+<a name="ln1595"> </a>
+<a name="ln1596">	if (destroyDebugInfo)</a>
+<a name="ln1597">		destroy_team_debug_info(&amp;teamDebugInfo);</a>
+<a name="ln1598"> </a>
+<a name="ln1599">	// notify all threads that the debugger is gone</a>
+<a name="ln1600">	broadcast_debugged_thread_message(nubThread,</a>
+<a name="ln1601">		B_DEBUGGED_THREAD_DEBUGGER_CHANGED, NULL, 0);</a>
+<a name="ln1602">}</a>
+<a name="ln1603"> </a>
+<a name="ln1604"> </a>
+<a name="ln1605">/**	\brief Debug nub thread helper function that returns the debug port of</a>
+<a name="ln1606"> *		   a thread of the same team.</a>
+<a name="ln1607"> */</a>
+<a name="ln1608">static status_t</a>
+<a name="ln1609">debug_nub_thread_get_thread_debug_port(Thread *nubThread,</a>
+<a name="ln1610">	thread_id threadID, port_id &amp;threadDebugPort)</a>
+<a name="ln1611">{</a>
+<a name="ln1612">	threadDebugPort = -1;</a>
+<a name="ln1613"> </a>
+<a name="ln1614">	// get the thread</a>
+<a name="ln1615">	Thread* thread = Thread::GetAndLock(threadID);</a>
+<a name="ln1616">	if (thread == NULL)</a>
+<a name="ln1617">		return B_BAD_THREAD_ID;</a>
+<a name="ln1618">	BReference&lt;Thread&gt; threadReference(thread, true);</a>
+<a name="ln1619">	ThreadLocker threadLocker(thread, true);</a>
+<a name="ln1620"> </a>
+<a name="ln1621">	// get the debug port</a>
+<a name="ln1622">	InterruptsSpinLocker threadDebugInfoLocker(thread-&gt;debug_info.lock);</a>
+<a name="ln1623"> </a>
+<a name="ln1624">	if (thread-&gt;team != nubThread-&gt;team)</a>
+<a name="ln1625">		return B_BAD_VALUE;</a>
+<a name="ln1626">	if ((thread-&gt;debug_info.flags &amp; B_THREAD_DEBUG_STOPPED) == 0)</a>
+<a name="ln1627">		return B_BAD_THREAD_STATE;</a>
+<a name="ln1628"> </a>
+<a name="ln1629">	threadDebugPort = thread-&gt;debug_info.debug_port;</a>
+<a name="ln1630"> </a>
+<a name="ln1631">	threadDebugInfoLocker.Unlock();</a>
+<a name="ln1632"> </a>
+<a name="ln1633">	if (threadDebugPort &lt; 0)</a>
+<a name="ln1634">		return B_ERROR;</a>
+<a name="ln1635"> </a>
+<a name="ln1636">	return B_OK;</a>
+<a name="ln1637">}</a>
+<a name="ln1638"> </a>
+<a name="ln1639"> </a>
+<a name="ln1640">static status_t</a>
+<a name="ln1641">debug_nub_thread(void *)</a>
+<a name="ln1642">{</a>
+<a name="ln1643">	Thread *nubThread = thread_get_current_thread();</a>
+<a name="ln1644"> </a>
+<a name="ln1645">	// check, if we're still the current nub thread and get our port</a>
+<a name="ln1646">	cpu_status state = disable_interrupts();</a>
+<a name="ln1647">	GRAB_TEAM_DEBUG_INFO_LOCK(nubThread-&gt;team-&gt;debug_info);</a>
+<a name="ln1648"> </a>
+<a name="ln1649">	if (nubThread-&gt;team-&gt;debug_info.nub_thread != nubThread-&gt;id) {</a>
+<a name="ln1650">		RELEASE_TEAM_DEBUG_INFO_LOCK(nubThread-&gt;team-&gt;debug_info);</a>
+<a name="ln1651">		restore_interrupts(state);</a>
+<a name="ln1652">		return 0;</a>
+<a name="ln1653">	}</a>
+<a name="ln1654"> </a>
+<a name="ln1655">	port_id port = nubThread-&gt;team-&gt;debug_info.nub_port;</a>
+<a name="ln1656">	sem_id writeLock = nubThread-&gt;team-&gt;debug_info.debugger_write_lock;</a>
+<a name="ln1657">	BreakpointManager* breakpointManager</a>
+<a name="ln1658">		= nubThread-&gt;team-&gt;debug_info.breakpoint_manager;</a>
+<a name="ln1659"> </a>
+<a name="ln1660">	RELEASE_TEAM_DEBUG_INFO_LOCK(nubThread-&gt;team-&gt;debug_info);</a>
+<a name="ln1661">	restore_interrupts(state);</a>
+<a name="ln1662"> </a>
+<a name="ln1663">	TRACE((&quot;debug_nub_thread() thread: %&quot; B_PRId32 &quot;, team %&quot; B_PRId32 &quot;, nub &quot;</a>
+<a name="ln1664">		&quot;port: %&quot; B_PRId32 &quot;\n&quot;, nubThread-&gt;id, nubThread-&gt;team-&gt;id, port));</a>
+<a name="ln1665"> </a>
+<a name="ln1666">	// notify all threads that a debugger has been installed</a>
+<a name="ln1667">	broadcast_debugged_thread_message(nubThread,</a>
+<a name="ln1668">		B_DEBUGGED_THREAD_DEBUGGER_CHANGED, NULL, 0);</a>
+<a name="ln1669"> </a>
+<a name="ln1670">	// command processing loop</a>
+<a name="ln1671">	while (true) {</a>
+<a name="ln1672">		int32 command;</a>
+<a name="ln1673">		debug_nub_message_data message;</a>
+<a name="ln1674">		ssize_t messageSize = read_port_etc(port, &amp;command, &amp;message,</a>
+<a name="ln1675">			sizeof(message), B_KILL_CAN_INTERRUPT, 0);</a>
+<a name="ln1676"> </a>
+<a name="ln1677">		if (messageSize &lt; 0) {</a>
+<a name="ln1678">			// The port is no longer valid or we were interrupted by a kill</a>
+<a name="ln1679">			// signal: If we are still listed in the team's debug info as nub</a>
+<a name="ln1680">			// thread, we need to update that.</a>
+<a name="ln1681">			nub_thread_cleanup(nubThread);</a>
+<a name="ln1682"> </a>
+<a name="ln1683">			TRACE((&quot;nub thread %&quot; B_PRId32 &quot;: terminating: %lx\n&quot;,</a>
+<a name="ln1684">				nubThread-&gt;id, messageSize));</a>
+<a name="ln1685"> </a>
+<a name="ln1686">			return messageSize;</a>
+<a name="ln1687">		}</a>
+<a name="ln1688"> </a>
+<a name="ln1689">		bool sendReply = false;</a>
+<a name="ln1690">		union {</a>
+<a name="ln1691">			debug_nub_read_memory_reply			read_memory;</a>
+<a name="ln1692">			debug_nub_write_memory_reply		write_memory;</a>
+<a name="ln1693">			debug_nub_get_cpu_state_reply		get_cpu_state;</a>
+<a name="ln1694">			debug_nub_set_breakpoint_reply		set_breakpoint;</a>
+<a name="ln1695">			debug_nub_set_watchpoint_reply		set_watchpoint;</a>
+<a name="ln1696">			debug_nub_get_signal_masks_reply	get_signal_masks;</a>
+<a name="ln1697">			debug_nub_get_signal_handler_reply	get_signal_handler;</a>
+<a name="ln1698">			debug_nub_start_profiler_reply		start_profiler;</a>
+<a name="ln1699">			debug_profiler_update				profiler_update;</a>
+<a name="ln1700">			debug_nub_write_core_file_reply		write_core_file;</a>
+<a name="ln1701">		} reply;</a>
+<a name="ln1702">		int32 replySize = 0;</a>
+<a name="ln1703">		port_id replyPort = -1;</a>
+<a name="ln1704"> </a>
+<a name="ln1705">		// process the command</a>
+<a name="ln1706">		switch (command) {</a>
+<a name="ln1707">			case B_DEBUG_MESSAGE_READ_MEMORY:</a>
+<a name="ln1708">			{</a>
+<a name="ln1709">				// get the parameters</a>
+<a name="ln1710">				replyPort = message.read_memory.reply_port;</a>
+<a name="ln1711">				void *address = message.read_memory.address;</a>
+<a name="ln1712">				int32 size = message.read_memory.size;</a>
+<a name="ln1713">				status_t result = B_OK;</a>
+<a name="ln1714"> </a>
+<a name="ln1715">				// check the parameters</a>
+<a name="ln1716">				if (!BreakpointManager::CanAccessAddress(address, false))</a>
+<a name="ln1717">					result = B_BAD_ADDRESS;</a>
+<a name="ln1718">				else if (size &lt;= 0 || size &gt; B_MAX_READ_WRITE_MEMORY_SIZE)</a>
+<a name="ln1719">					result = B_BAD_VALUE;</a>
+<a name="ln1720"> </a>
+<a name="ln1721">				// read the memory</a>
+<a name="ln1722">				size_t bytesRead = 0;</a>
+<a name="ln1723">				if (result == B_OK) {</a>
+<a name="ln1724">					result = breakpointManager-&gt;ReadMemory(address,</a>
+<a name="ln1725">						reply.read_memory.data, size, bytesRead);</a>
+<a name="ln1726">				}</a>
+<a name="ln1727">				reply.read_memory.error = result;</a>
+<a name="ln1728"> </a>
+<a name="ln1729">				TRACE((&quot;nub thread %&quot; B_PRId32 &quot;: B_DEBUG_MESSAGE_READ_MEMORY: &quot;</a>
+<a name="ln1730">					&quot;reply port: %&quot; B_PRId32 &quot;, address: %p, size: %&quot; B_PRId32</a>
+<a name="ln1731">					&quot;, result: %&quot; B_PRIx32 &quot;, read: %ld\n&quot;, nubThread-&gt;id,</a>
+<a name="ln1732">					replyPort, address, size, result, bytesRead));</a>
+<a name="ln1733"> </a>
+<a name="ln1734">				// send only as much data as necessary</a>
+<a name="ln1735">				reply.read_memory.size = bytesRead;</a>
+<a name="ln1736">				replySize = reply.read_memory.data + bytesRead - (char*)&amp;reply;</a>
+<a name="ln1737">				sendReply = true;</a>
+<a name="ln1738">				break;</a>
+<a name="ln1739">			}</a>
+<a name="ln1740"> </a>
+<a name="ln1741">			case B_DEBUG_MESSAGE_WRITE_MEMORY:</a>
+<a name="ln1742">			{</a>
+<a name="ln1743">				// get the parameters</a>
+<a name="ln1744">				replyPort = message.write_memory.reply_port;</a>
+<a name="ln1745">				void *address = message.write_memory.address;</a>
+<a name="ln1746">				int32 size = message.write_memory.size;</a>
+<a name="ln1747">				const char *data = message.write_memory.data;</a>
+<a name="ln1748">				int32 realSize = (char*)&amp;message + messageSize - data;</a>
+<a name="ln1749">				status_t result = B_OK;</a>
+<a name="ln1750"> </a>
+<a name="ln1751">				// check the parameters</a>
+<a name="ln1752">				if (!BreakpointManager::CanAccessAddress(address, true))</a>
+<a name="ln1753">					result = B_BAD_ADDRESS;</a>
+<a name="ln1754">				else if (size &lt;= 0 || size &gt; realSize)</a>
+<a name="ln1755">					result = B_BAD_VALUE;</a>
+<a name="ln1756"> </a>
+<a name="ln1757">				// write the memory</a>
+<a name="ln1758">				size_t bytesWritten = 0;</a>
+<a name="ln1759">				if (result == B_OK) {</a>
+<a name="ln1760">					result = breakpointManager-&gt;WriteMemory(address, data, size,</a>
+<a name="ln1761">						bytesWritten);</a>
+<a name="ln1762">				}</a>
+<a name="ln1763">				reply.write_memory.error = result;</a>
+<a name="ln1764"> </a>
+<a name="ln1765">				TRACE((&quot;nub thread %&quot; B_PRId32 &quot;: B_DEBUG_MESSAGE_WRITE_MEMORY: &quot;</a>
+<a name="ln1766">					&quot;reply port: %&quot; B_PRId32 &quot;, address: %p, size: %&quot; B_PRId32</a>
+<a name="ln1767">					&quot;, result: %&quot; B_PRIx32 &quot;, written: %ld\n&quot;, nubThread-&gt;id,</a>
+<a name="ln1768">					replyPort, address, size, result, bytesWritten));</a>
+<a name="ln1769"> </a>
+<a name="ln1770">				reply.write_memory.size = bytesWritten;</a>
+<a name="ln1771">				sendReply = true;</a>
+<a name="ln1772">				replySize = sizeof(debug_nub_write_memory_reply);</a>
+<a name="ln1773">				break;</a>
+<a name="ln1774">			}</a>
+<a name="ln1775"> </a>
+<a name="ln1776">			case B_DEBUG_MESSAGE_SET_TEAM_FLAGS:</a>
+<a name="ln1777">			{</a>
+<a name="ln1778">				// get the parameters</a>
+<a name="ln1779">				int32 flags = message.set_team_flags.flags</a>
+<a name="ln1780">					&amp; B_TEAM_DEBUG_USER_FLAG_MASK;</a>
+<a name="ln1781"> </a>
+<a name="ln1782">				TRACE((&quot;nub thread %&quot; B_PRId32 &quot;: B_DEBUG_MESSAGE_SET_TEAM_FLAGS&quot;</a>
+<a name="ln1783">					&quot;: flags: %&quot; B_PRIx32 &quot;\n&quot;, nubThread-&gt;id, flags));</a>
+<a name="ln1784"> </a>
+<a name="ln1785">				Team *team = thread_get_current_thread()-&gt;team;</a>
+<a name="ln1786"> </a>
+<a name="ln1787">				// set the flags</a>
+<a name="ln1788">				cpu_status state = disable_interrupts();</a>
+<a name="ln1789">				GRAB_TEAM_DEBUG_INFO_LOCK(team-&gt;debug_info);</a>
+<a name="ln1790"> </a>
+<a name="ln1791">				flags |= team-&gt;debug_info.flags &amp; B_TEAM_DEBUG_KERNEL_FLAG_MASK;</a>
+<a name="ln1792">				atomic_set(&amp;team-&gt;debug_info.flags, flags);</a>
+<a name="ln1793"> </a>
+<a name="ln1794">				RELEASE_TEAM_DEBUG_INFO_LOCK(team-&gt;debug_info);</a>
+<a name="ln1795">				restore_interrupts(state);</a>
+<a name="ln1796"> </a>
+<a name="ln1797">				break;</a>
+<a name="ln1798">			}</a>
+<a name="ln1799"> </a>
+<a name="ln1800">			case B_DEBUG_MESSAGE_SET_THREAD_FLAGS:</a>
+<a name="ln1801">			{</a>
+<a name="ln1802">				// get the parameters</a>
+<a name="ln1803">				thread_id threadID = message.set_thread_flags.thread;</a>
+<a name="ln1804">				int32 flags = message.set_thread_flags.flags</a>
+<a name="ln1805">					&amp; B_THREAD_DEBUG_USER_FLAG_MASK;</a>
+<a name="ln1806"> </a>
+<a name="ln1807">				TRACE((&quot;nub thread %&quot; B_PRId32 &quot;: B_DEBUG_MESSAGE_SET_THREAD_FLAGS&quot;</a>
+<a name="ln1808">					&quot;: thread: %&quot; B_PRId32 &quot;, flags: %&quot; B_PRIx32 &quot;\n&quot;,</a>
+<a name="ln1809">					nubThread-&gt;id, threadID, flags));</a>
+<a name="ln1810"> </a>
+<a name="ln1811">				// set the flags</a>
+<a name="ln1812">				Thread* thread = Thread::GetAndLock(threadID);</a>
+<a name="ln1813">				if (thread == NULL)</a>
+<a name="ln1814">					break;</a>
+<a name="ln1815">				BReference&lt;Thread&gt; threadReference(thread, true);</a>
+<a name="ln1816">				ThreadLocker threadLocker(thread, true);</a>
+<a name="ln1817"> </a>
+<a name="ln1818">				InterruptsSpinLocker threadDebugInfoLocker(</a>
+<a name="ln1819">					thread-&gt;debug_info.lock);</a>
+<a name="ln1820"> </a>
+<a name="ln1821">				if (thread-&gt;team == thread_get_current_thread()-&gt;team) {</a>
+<a name="ln1822">					flags |= thread-&gt;debug_info.flags</a>
+<a name="ln1823">						&amp; B_THREAD_DEBUG_KERNEL_FLAG_MASK;</a>
+<a name="ln1824">					atomic_set(&amp;thread-&gt;debug_info.flags, flags);</a>
+<a name="ln1825">				}</a>
+<a name="ln1826"> </a>
+<a name="ln1827">				break;</a>
+<a name="ln1828">			}</a>
+<a name="ln1829"> </a>
+<a name="ln1830">			case B_DEBUG_MESSAGE_CONTINUE_THREAD:</a>
+<a name="ln1831">			{</a>
+<a name="ln1832">				// get the parameters</a>
+<a name="ln1833">				thread_id threadID;</a>
+<a name="ln1834">				uint32 handleEvent;</a>
+<a name="ln1835">				bool singleStep;</a>
+<a name="ln1836"> </a>
+<a name="ln1837">				threadID = message.continue_thread.thread;</a>
+<a name="ln1838">				handleEvent = message.continue_thread.handle_event;</a>
+<a name="ln1839">				singleStep = message.continue_thread.single_step;</a>
+<a name="ln1840"> </a>
+<a name="ln1841">				TRACE((&quot;nub thread %&quot; B_PRId32 &quot;: B_DEBUG_MESSAGE_CONTINUE_THREAD&quot;</a>
+<a name="ln1842">					&quot;: thread: %&quot; B_PRId32 &quot;, handle event: %&quot; B_PRIu32 &quot;, &quot;</a>
+<a name="ln1843">					&quot;single step: %d\n&quot;, nubThread-&gt;id, threadID, handleEvent,</a>
+<a name="ln1844">					singleStep));</a>
+<a name="ln1845"> </a>
+<a name="ln1846">				// find the thread and get its debug port</a>
+<a name="ln1847">				port_id threadDebugPort = -1;</a>
+<a name="ln1848">				status_t result = debug_nub_thread_get_thread_debug_port(</a>
+<a name="ln1849">					nubThread, threadID, threadDebugPort);</a>
+<a name="ln1850"> </a>
+<a name="ln1851">				// send a message to the debugged thread</a>
+<a name="ln1852">				if (result == B_OK) {</a>
+<a name="ln1853">					debugged_thread_continue commandMessage;</a>
+<a name="ln1854">					commandMessage.handle_event = handleEvent;</a>
+<a name="ln1855">					commandMessage.single_step = singleStep;</a>
+<a name="ln1856"> </a>
+<a name="ln1857">					result = write_port(threadDebugPort,</a>
+<a name="ln1858">						B_DEBUGGED_THREAD_MESSAGE_CONTINUE,</a>
+<a name="ln1859">						&amp;commandMessage, sizeof(commandMessage));</a>
+<a name="ln1860">				} else if (result == B_BAD_THREAD_STATE) {</a>
+<a name="ln1861">					Thread* thread = Thread::GetAndLock(threadID);</a>
+<a name="ln1862">					if (thread == NULL)</a>
+<a name="ln1863">						break;</a>
+<a name="ln1864"> </a>
+<a name="ln1865">					BReference&lt;Thread&gt; threadReference(thread, true);</a>
+<a name="ln1866">					ThreadLocker threadLocker(thread, true);</a>
+<a name="ln1867">					if (thread-&gt;state == B_THREAD_SUSPENDED) {</a>
+<a name="ln1868">						threadLocker.Unlock();</a>
+<a name="ln1869">						resume_thread(threadID);</a>
+<a name="ln1870">						break;</a>
+<a name="ln1871">					}</a>
+<a name="ln1872">				}</a>
+<a name="ln1873"> </a>
+<a name="ln1874">				break;</a>
+<a name="ln1875">			}</a>
+<a name="ln1876"> </a>
+<a name="ln1877">			case B_DEBUG_MESSAGE_SET_CPU_STATE:</a>
+<a name="ln1878">			{</a>
+<a name="ln1879">				// get the parameters</a>
+<a name="ln1880">				thread_id threadID = message.set_cpu_state.thread;</a>
+<a name="ln1881">				const debug_cpu_state &amp;cpuState</a>
+<a name="ln1882">					= message.set_cpu_state.cpu_state;</a>
+<a name="ln1883"> </a>
+<a name="ln1884">				TRACE((&quot;nub thread %&quot; B_PRId32 &quot;: B_DEBUG_MESSAGE_SET_CPU_STATE&quot;</a>
+<a name="ln1885">					&quot;: thread: %&quot; B_PRId32 &quot;\n&quot;, nubThread-&gt;id, threadID));</a>
+<a name="ln1886"> </a>
+<a name="ln1887">				// find the thread and get its debug port</a>
+<a name="ln1888">				port_id threadDebugPort = -1;</a>
+<a name="ln1889">				status_t result = debug_nub_thread_get_thread_debug_port(</a>
+<a name="ln1890">					nubThread, threadID, threadDebugPort);</a>
+<a name="ln1891"> </a>
+<a name="ln1892">				// send a message to the debugged thread</a>
+<a name="ln1893">				if (result == B_OK) {</a>
+<a name="ln1894">					debugged_thread_set_cpu_state commandMessage;</a>
+<a name="ln1895">					memcpy(&amp;commandMessage.cpu_state, &amp;cpuState,</a>
+<a name="ln1896">						sizeof(debug_cpu_state));</a>
+<a name="ln1897">					write_port(threadDebugPort,</a>
+<a name="ln1898">						B_DEBUGGED_THREAD_SET_CPU_STATE,</a>
+<a name="ln1899">						&amp;commandMessage, sizeof(commandMessage));</a>
+<a name="ln1900">				}</a>
+<a name="ln1901"> </a>
+<a name="ln1902">				break;</a>
+<a name="ln1903">			}</a>
+<a name="ln1904"> </a>
+<a name="ln1905">			case B_DEBUG_MESSAGE_GET_CPU_STATE:</a>
+<a name="ln1906">			{</a>
+<a name="ln1907">				// get the parameters</a>
+<a name="ln1908">				thread_id threadID = message.get_cpu_state.thread;</a>
+<a name="ln1909">				replyPort = message.get_cpu_state.reply_port;</a>
+<a name="ln1910"> </a>
+<a name="ln1911">				TRACE((&quot;nub thread %&quot; B_PRId32 &quot;: B_DEBUG_MESSAGE_GET_CPU_STATE&quot;</a>
+<a name="ln1912">					&quot;: thread: %&quot; B_PRId32 &quot;\n&quot;, nubThread-&gt;id, threadID));</a>
+<a name="ln1913"> </a>
+<a name="ln1914">				// find the thread and get its debug port</a>
+<a name="ln1915">				port_id threadDebugPort = -1;</a>
+<a name="ln1916">				status_t result = debug_nub_thread_get_thread_debug_port(</a>
+<a name="ln1917">					nubThread, threadID, threadDebugPort);</a>
+<a name="ln1918"> </a>
+<a name="ln1919">				// send a message to the debugged thread</a>
+<a name="ln1920">				if (threadDebugPort &gt;= 0) {</a>
+<a name="ln1921">					debugged_thread_get_cpu_state commandMessage;</a>
+<a name="ln1922">					commandMessage.reply_port = replyPort;</a>
+<a name="ln1923">					result = write_port(threadDebugPort,</a>
+<a name="ln1924">						B_DEBUGGED_THREAD_GET_CPU_STATE, &amp;commandMessage,</a>
+<a name="ln1925">						sizeof(commandMessage));</a>
+<a name="ln1926">				}</a>
+<a name="ln1927"> </a>
+<a name="ln1928">				// send a reply to the debugger in case of error</a>
+<a name="ln1929">				if (result != B_OK) {</a>
+<a name="ln1930">					reply.get_cpu_state.error = result;</a>
+<a name="ln1931">					sendReply = true;</a>
+<a name="ln1932">					replySize = sizeof(reply.get_cpu_state);</a>
+<a name="ln1933">				}</a>
+<a name="ln1934"> </a>
+<a name="ln1935">				break;</a>
+<a name="ln1936">			}</a>
+<a name="ln1937"> </a>
+<a name="ln1938">			case B_DEBUG_MESSAGE_SET_BREAKPOINT:</a>
+<a name="ln1939">			{</a>
+<a name="ln1940">				// get the parameters</a>
+<a name="ln1941">				replyPort = message.set_breakpoint.reply_port;</a>
+<a name="ln1942">				void *address = message.set_breakpoint.address;</a>
+<a name="ln1943"> </a>
+<a name="ln1944">				TRACE((&quot;nub thread %&quot; B_PRId32 &quot;: B_DEBUG_MESSAGE_SET_BREAKPOINT&quot;</a>
+<a name="ln1945">					&quot;: address: %p\n&quot;, nubThread-&gt;id, address));</a>
+<a name="ln1946"> </a>
+<a name="ln1947">				// check the address</a>
+<a name="ln1948">				status_t result = B_OK;</a>
+<a name="ln1949">				if (address == NULL</a>
+<a name="ln1950">					|| !BreakpointManager::CanAccessAddress(address, false)) {</a>
+<a name="ln1951">					result = B_BAD_ADDRESS;</a>
+<a name="ln1952">				}</a>
+<a name="ln1953"> </a>
+<a name="ln1954">				// set the breakpoint</a>
+<a name="ln1955">				if (result == B_OK)</a>
+<a name="ln1956">					result = breakpointManager-&gt;InstallBreakpoint(address);</a>
+<a name="ln1957"> </a>
+<a name="ln1958">				if (result == B_OK)</a>
+<a name="ln1959">					update_threads_breakpoints_flag();</a>
+<a name="ln1960"> </a>
+<a name="ln1961">				// prepare the reply</a>
+<a name="ln1962">				reply.set_breakpoint.error = result;</a>
+<a name="ln1963">				replySize = sizeof(reply.set_breakpoint);</a>
+<a name="ln1964">				sendReply = true;</a>
+<a name="ln1965"> </a>
+<a name="ln1966">				break;</a>
+<a name="ln1967">			}</a>
+<a name="ln1968"> </a>
+<a name="ln1969">			case B_DEBUG_MESSAGE_CLEAR_BREAKPOINT:</a>
+<a name="ln1970">			{</a>
+<a name="ln1971">				// get the parameters</a>
+<a name="ln1972">				void *address = message.clear_breakpoint.address;</a>
+<a name="ln1973"> </a>
+<a name="ln1974">				TRACE((&quot;nub thread %&quot; B_PRId32 &quot;: B_DEBUG_MESSAGE_CLEAR_BREAKPOINT&quot;</a>
+<a name="ln1975">					&quot;: address: %p\n&quot;, nubThread-&gt;id, address));</a>
+<a name="ln1976"> </a>
+<a name="ln1977">				// check the address</a>
+<a name="ln1978">				status_t result = B_OK;</a>
+<a name="ln1979">				if (address == NULL</a>
+<a name="ln1980">					|| !BreakpointManager::CanAccessAddress(address, false)) {</a>
+<a name="ln1981">					result = B_BAD_ADDRESS;</a>
+<a name="ln1982">				}</a>
+<a name="ln1983"> </a>
+<a name="ln1984">				// clear the breakpoint</a>
+<a name="ln1985">				if (result == B_OK)</a>
+<a name="ln1986">					result = breakpointManager-&gt;UninstallBreakpoint(address);</a>
+<a name="ln1987"> </a>
+<a name="ln1988">				if (result == B_OK)</a>
+<a name="ln1989">					update_threads_breakpoints_flag();</a>
+<a name="ln1990"> </a>
+<a name="ln1991">				break;</a>
+<a name="ln1992">			}</a>
+<a name="ln1993"> </a>
+<a name="ln1994">			case B_DEBUG_MESSAGE_SET_WATCHPOINT:</a>
+<a name="ln1995">			{</a>
+<a name="ln1996">				// get the parameters</a>
+<a name="ln1997">				replyPort = message.set_watchpoint.reply_port;</a>
+<a name="ln1998">				void *address = message.set_watchpoint.address;</a>
+<a name="ln1999">				uint32 type = message.set_watchpoint.type;</a>
+<a name="ln2000">				int32 length = message.set_watchpoint.length;</a>
+<a name="ln2001"> </a>
+<a name="ln2002">				TRACE((&quot;nub thread %&quot; B_PRId32 &quot;: B_DEBUG_MESSAGE_SET_WATCHPOINT&quot;</a>
+<a name="ln2003">					&quot;: address: %p, type: %&quot; B_PRIu32 &quot;, length: %&quot; B_PRId32 &quot;\n&quot;,</a>
+<a name="ln2004">					nubThread-&gt;id, address, type, length));</a>
+<a name="ln2005"> </a>
+<a name="ln2006">				// check the address and size</a>
+<a name="ln2007">				status_t result = B_OK;</a>
+<a name="ln2008">				if (address == NULL</a>
+<a name="ln2009">					|| !BreakpointManager::CanAccessAddress(address, false)) {</a>
+<a name="ln2010">					result = B_BAD_ADDRESS;</a>
+<a name="ln2011">				}</a>
+<a name="ln2012">				if (length &lt; 0)</a>
+<a name="ln2013">					result = B_BAD_VALUE;</a>
+<a name="ln2014"> </a>
+<a name="ln2015">				// set the watchpoint</a>
+<a name="ln2016">				if (result == B_OK) {</a>
+<a name="ln2017">					result = breakpointManager-&gt;InstallWatchpoint(address, type,</a>
+<a name="ln2018">						length);</a>
+<a name="ln2019">				}</a>
+<a name="ln2020"> </a>
+<a name="ln2021">				if (result == B_OK)</a>
+<a name="ln2022">					update_threads_breakpoints_flag();</a>
+<a name="ln2023"> </a>
+<a name="ln2024">				// prepare the reply</a>
+<a name="ln2025">				reply.set_watchpoint.error = result;</a>
+<a name="ln2026">				replySize = sizeof(reply.set_watchpoint);</a>
+<a name="ln2027">				sendReply = true;</a>
+<a name="ln2028"> </a>
+<a name="ln2029">				break;</a>
+<a name="ln2030">			}</a>
+<a name="ln2031"> </a>
+<a name="ln2032">			case B_DEBUG_MESSAGE_CLEAR_WATCHPOINT:</a>
+<a name="ln2033">			{</a>
+<a name="ln2034">				// get the parameters</a>
+<a name="ln2035">				void *address = message.clear_watchpoint.address;</a>
+<a name="ln2036"> </a>
+<a name="ln2037">				TRACE((&quot;nub thread %&quot; B_PRId32 &quot;: B_DEBUG_MESSAGE_CLEAR_WATCHPOINT&quot;</a>
+<a name="ln2038">					&quot;: address: %p\n&quot;, nubThread-&gt;id, address));</a>
+<a name="ln2039"> </a>
+<a name="ln2040">				// check the address</a>
+<a name="ln2041">				status_t result = B_OK;</a>
+<a name="ln2042">				if (address == NULL</a>
+<a name="ln2043">					|| !BreakpointManager::CanAccessAddress(address, false)) {</a>
+<a name="ln2044">					result = B_BAD_ADDRESS;</a>
+<a name="ln2045">				}</a>
+<a name="ln2046"> </a>
+<a name="ln2047">				// clear the watchpoint</a>
+<a name="ln2048">				if (result == B_OK)</a>
+<a name="ln2049">					result = breakpointManager-&gt;UninstallWatchpoint(address);</a>
+<a name="ln2050"> </a>
+<a name="ln2051">				if (result == B_OK)</a>
+<a name="ln2052">					update_threads_breakpoints_flag();</a>
+<a name="ln2053"> </a>
+<a name="ln2054">				break;</a>
+<a name="ln2055">			}</a>
+<a name="ln2056"> </a>
+<a name="ln2057">			case B_DEBUG_MESSAGE_SET_SIGNAL_MASKS:</a>
+<a name="ln2058">			{</a>
+<a name="ln2059">				// get the parameters</a>
+<a name="ln2060">				thread_id threadID = message.set_signal_masks.thread;</a>
+<a name="ln2061">				uint64 ignore = message.set_signal_masks.ignore_mask;</a>
+<a name="ln2062">				uint64 ignoreOnce = message.set_signal_masks.ignore_once_mask;</a>
+<a name="ln2063">				uint32 ignoreOp = message.set_signal_masks.ignore_op;</a>
+<a name="ln2064">				uint32 ignoreOnceOp = message.set_signal_masks.ignore_once_op;</a>
+<a name="ln2065"> </a>
+<a name="ln2066">				TRACE((&quot;nub thread %&quot; B_PRId32 &quot;: B_DEBUG_MESSAGE_SET_SIGNAL_MASKS&quot;</a>
+<a name="ln2067">					&quot;: thread: %&quot; B_PRId32 &quot;, ignore: %&quot; B_PRIx64 &quot; (op: %&quot;</a>
+<a name="ln2068">					B_PRIu32 &quot;), ignore once: %&quot; B_PRIx64 &quot; (op: %&quot; B_PRIu32</a>
+<a name="ln2069">					&quot;)\n&quot;, nubThread-&gt;id, threadID, ignore, ignoreOp,</a>
+<a name="ln2070">					ignoreOnce, ignoreOnceOp));</a>
+<a name="ln2071"> </a>
+<a name="ln2072">				// set the masks</a>
+<a name="ln2073">				Thread* thread = Thread::GetAndLock(threadID);</a>
+<a name="ln2074">				if (thread == NULL)</a>
+<a name="ln2075">					break;</a>
+<a name="ln2076">				BReference&lt;Thread&gt; threadReference(thread, true);</a>
+<a name="ln2077">				ThreadLocker threadLocker(thread, true);</a>
+<a name="ln2078"> </a>
+<a name="ln2079">				InterruptsSpinLocker threadDebugInfoLocker(</a>
+<a name="ln2080">					thread-&gt;debug_info.lock);</a>
+<a name="ln2081"> </a>
+<a name="ln2082">				if (thread-&gt;team == thread_get_current_thread()-&gt;team) {</a>
+<a name="ln2083">					thread_debug_info &amp;threadDebugInfo = thread-&gt;debug_info;</a>
+<a name="ln2084">					// set ignore mask</a>
+<a name="ln2085">					switch (ignoreOp) {</a>
+<a name="ln2086">						case B_DEBUG_SIGNAL_MASK_AND:</a>
+<a name="ln2087">							threadDebugInfo.ignore_signals &amp;= ignore;</a>
+<a name="ln2088">							break;</a>
+<a name="ln2089">						case B_DEBUG_SIGNAL_MASK_OR:</a>
+<a name="ln2090">							threadDebugInfo.ignore_signals |= ignore;</a>
+<a name="ln2091">							break;</a>
+<a name="ln2092">						case B_DEBUG_SIGNAL_MASK_SET:</a>
+<a name="ln2093">							threadDebugInfo.ignore_signals = ignore;</a>
+<a name="ln2094">							break;</a>
+<a name="ln2095">					}</a>
+<a name="ln2096"> </a>
+<a name="ln2097">					// set ignore once mask</a>
+<a name="ln2098">					switch (ignoreOnceOp) {</a>
+<a name="ln2099">						case B_DEBUG_SIGNAL_MASK_AND:</a>
+<a name="ln2100">							threadDebugInfo.ignore_signals_once &amp;= ignoreOnce;</a>
+<a name="ln2101">							break;</a>
+<a name="ln2102">						case B_DEBUG_SIGNAL_MASK_OR:</a>
+<a name="ln2103">							threadDebugInfo.ignore_signals_once |= ignoreOnce;</a>
+<a name="ln2104">							break;</a>
+<a name="ln2105">						case B_DEBUG_SIGNAL_MASK_SET:</a>
+<a name="ln2106">							threadDebugInfo.ignore_signals_once = ignoreOnce;</a>
+<a name="ln2107">							break;</a>
+<a name="ln2108">					}</a>
+<a name="ln2109">				}</a>
+<a name="ln2110"> </a>
+<a name="ln2111">				break;</a>
+<a name="ln2112">			}</a>
+<a name="ln2113"> </a>
+<a name="ln2114">			case B_DEBUG_MESSAGE_GET_SIGNAL_MASKS:</a>
+<a name="ln2115">			{</a>
+<a name="ln2116">				// get the parameters</a>
+<a name="ln2117">				replyPort = message.get_signal_masks.reply_port;</a>
+<a name="ln2118">				thread_id threadID = message.get_signal_masks.thread;</a>
+<a name="ln2119">				status_t result = B_OK;</a>
+<a name="ln2120"> </a>
+<a name="ln2121">				// get the masks</a>
+<a name="ln2122">				uint64 ignore = 0;</a>
+<a name="ln2123">				uint64 ignoreOnce = 0;</a>
+<a name="ln2124"> </a>
+<a name="ln2125">				Thread* thread = Thread::GetAndLock(threadID);</a>
+<a name="ln2126">				if (thread != NULL) {</a>
+<a name="ln2127">					BReference&lt;Thread&gt; threadReference(thread, true);</a>
+<a name="ln2128">					ThreadLocker threadLocker(thread, true);</a>
+<a name="ln2129"> </a>
+<a name="ln2130">					InterruptsSpinLocker threadDebugInfoLocker(</a>
+<a name="ln2131">						thread-&gt;debug_info.lock);</a>
+<a name="ln2132"> </a>
+<a name="ln2133">					ignore = thread-&gt;debug_info.ignore_signals;</a>
+<a name="ln2134">					ignoreOnce = thread-&gt;debug_info.ignore_signals_once;</a>
+<a name="ln2135">				} else</a>
+<a name="ln2136">					result = B_BAD_THREAD_ID;</a>
+<a name="ln2137"> </a>
+<a name="ln2138">				TRACE((&quot;nub thread %&quot; B_PRId32 &quot;: B_DEBUG_MESSAGE_GET_SIGNAL_MASKS&quot;</a>
+<a name="ln2139">					&quot;: reply port: %&quot; B_PRId32 &quot;, thread: %&quot; B_PRId32 &quot;, &quot;</a>
+<a name="ln2140">					&quot;ignore: %&quot; B_PRIx64 &quot;, ignore once: %&quot; B_PRIx64 &quot;, result: &quot;</a>
+<a name="ln2141">					&quot;%&quot; B_PRIx32 &quot;\n&quot;, nubThread-&gt;id, replyPort, threadID,</a>
+<a name="ln2142">					ignore, ignoreOnce, result));</a>
+<a name="ln2143"> </a>
+<a name="ln2144">				// prepare the message</a>
+<a name="ln2145">				reply.get_signal_masks.error = result;</a>
+<a name="ln2146">				reply.get_signal_masks.ignore_mask = ignore;</a>
+<a name="ln2147">				reply.get_signal_masks.ignore_once_mask = ignoreOnce;</a>
+<a name="ln2148">				replySize = sizeof(reply.get_signal_masks);</a>
+<a name="ln2149">				sendReply = true;</a>
+<a name="ln2150">				break;</a>
+<a name="ln2151">			}</a>
+<a name="ln2152"> </a>
+<a name="ln2153">			case B_DEBUG_MESSAGE_SET_SIGNAL_HANDLER:</a>
+<a name="ln2154">			{</a>
+<a name="ln2155">				// get the parameters</a>
+<a name="ln2156">				int signal = message.set_signal_handler.signal;</a>
+<a name="ln2157">				struct sigaction &amp;handler = message.set_signal_handler.handler;</a>
+<a name="ln2158"> </a>
+<a name="ln2159">				TRACE((&quot;nub thread %&quot; B_PRId32 &quot;: B_DEBUG_MESSAGE_SET_SIGNAL_HANDLER&quot;</a>
+<a name="ln2160">					&quot;: signal: %d, handler: %p\n&quot;, nubThread-&gt;id, signal,</a>
+<a name="ln2161">					handler.sa_handler));</a>
+<a name="ln2162"> </a>
+<a name="ln2163">				// set the handler</a>
+<a name="ln2164">				sigaction(signal, &amp;handler, NULL);</a>
+<a name="ln2165"> </a>
+<a name="ln2166">				break;</a>
+<a name="ln2167">			}</a>
+<a name="ln2168"> </a>
+<a name="ln2169">			case B_DEBUG_MESSAGE_GET_SIGNAL_HANDLER:</a>
+<a name="ln2170">			{</a>
+<a name="ln2171">				// get the parameters</a>
+<a name="ln2172">				replyPort = message.get_signal_handler.reply_port;</a>
+<a name="ln2173">				int signal = message.get_signal_handler.signal;</a>
+<a name="ln2174">				status_t result = B_OK;</a>
+<a name="ln2175"> </a>
+<a name="ln2176">				// get the handler</a>
+<a name="ln2177">				if (sigaction(signal, NULL, &amp;reply.get_signal_handler.handler)</a>
+<a name="ln2178">						!= 0) {</a>
+<a name="ln2179">					result = errno;</a>
+<a name="ln2180">				}</a>
+<a name="ln2181"> </a>
+<a name="ln2182">				TRACE((&quot;nub thread %&quot; B_PRId32 &quot;: B_DEBUG_MESSAGE_GET_SIGNAL_HANDLER&quot;</a>
+<a name="ln2183">					&quot;: reply port: %&quot; B_PRId32 &quot;, signal: %d, handler: %p\n&quot;,</a>
+<a name="ln2184">					nubThread-&gt;id, replyPort, signal,</a>
+<a name="ln2185">					reply.get_signal_handler.handler.sa_handler));</a>
+<a name="ln2186"> </a>
+<a name="ln2187">				// prepare the message</a>
+<a name="ln2188">				reply.get_signal_handler.error = result;</a>
+<a name="ln2189">				replySize = sizeof(reply.get_signal_handler);</a>
+<a name="ln2190">				sendReply = true;</a>
+<a name="ln2191">				break;</a>
+<a name="ln2192">			}</a>
+<a name="ln2193"> </a>
+<a name="ln2194">			case B_DEBUG_MESSAGE_PREPARE_HANDOVER:</a>
+<a name="ln2195">			{</a>
+<a name="ln2196">				TRACE((&quot;nub thread %&quot; B_PRId32 &quot;: B_DEBUG_MESSAGE_PREPARE_HANDOVER&quot;</a>
+<a name="ln2197">					&quot;\n&quot;, nubThread-&gt;id));</a>
+<a name="ln2198"> </a>
+<a name="ln2199">				Team *team = nubThread-&gt;team;</a>
+<a name="ln2200"> </a>
+<a name="ln2201">				// Acquire the debugger write lock. As soon as we have it and</a>
+<a name="ln2202">				// have set the B_TEAM_DEBUG_DEBUGGER_HANDOVER flag, no thread</a>
+<a name="ln2203">				// will write anything to the debugger port anymore.</a>
+<a name="ln2204">				status_t result = acquire_sem_etc(writeLock, 1,</a>
+<a name="ln2205">					B_KILL_CAN_INTERRUPT, 0);</a>
+<a name="ln2206">				if (result == B_OK) {</a>
+<a name="ln2207">					// set the respective team debug flag</a>
+<a name="ln2208">					cpu_status state = disable_interrupts();</a>
+<a name="ln2209">					GRAB_TEAM_DEBUG_INFO_LOCK(team-&gt;debug_info);</a>
+<a name="ln2210"> </a>
+<a name="ln2211">					atomic_or(&amp;team-&gt;debug_info.flags,</a>
+<a name="ln2212">						B_TEAM_DEBUG_DEBUGGER_HANDOVER);</a>
+<a name="ln2213">					BreakpointManager* breakpointManager</a>
+<a name="ln2214">						= team-&gt;debug_info.breakpoint_manager;</a>
+<a name="ln2215"> </a>
+<a name="ln2216">					RELEASE_TEAM_DEBUG_INFO_LOCK(team-&gt;debug_info);</a>
+<a name="ln2217">					restore_interrupts(state);</a>
+<a name="ln2218"> </a>
+<a name="ln2219">					// remove all installed breakpoints</a>
+<a name="ln2220">					breakpointManager-&gt;RemoveAllBreakpoints();</a>
+<a name="ln2221"> </a>
+<a name="ln2222">					release_sem(writeLock);</a>
+<a name="ln2223">				} else {</a>
+<a name="ln2224">					// We probably got a SIGKILL. If so, we will terminate when</a>
+<a name="ln2225">					// reading the next message fails.</a>
+<a name="ln2226">				}</a>
+<a name="ln2227"> </a>
+<a name="ln2228">				break;</a>
+<a name="ln2229">			}</a>
+<a name="ln2230"> </a>
+<a name="ln2231">			case B_DEBUG_MESSAGE_HANDED_OVER:</a>
+<a name="ln2232">			{</a>
+<a name="ln2233">				// notify all threads that the debugger has changed</a>
+<a name="ln2234">				broadcast_debugged_thread_message(nubThread,</a>
+<a name="ln2235">					B_DEBUGGED_THREAD_DEBUGGER_CHANGED, NULL, 0);</a>
+<a name="ln2236"> </a>
+<a name="ln2237">				break;</a>
+<a name="ln2238">			}</a>
+<a name="ln2239"> </a>
+<a name="ln2240">			case B_DEBUG_START_PROFILER:</a>
+<a name="ln2241">			{</a>
+<a name="ln2242">				// get the parameters</a>
+<a name="ln2243">				thread_id threadID = message.start_profiler.thread;</a>
+<a name="ln2244">				replyPort = message.start_profiler.reply_port;</a>
+<a name="ln2245">				area_id sampleArea = message.start_profiler.sample_area;</a>
+<a name="ln2246">				int32 stackDepth = message.start_profiler.stack_depth;</a>
+<a name="ln2247">				bool variableStackDepth</a>
+<a name="ln2248">					= message.start_profiler.variable_stack_depth;</a>
+<a name="ln2249">				bigtime_t interval = max_c(message.start_profiler.interval,</a>
+<a name="ln2250">					B_DEBUG_MIN_PROFILE_INTERVAL);</a>
+<a name="ln2251">				status_t result = B_OK;</a>
+<a name="ln2252"> </a>
+<a name="ln2253">				TRACE((&quot;nub thread %&quot; B_PRId32 &quot;: B_DEBUG_START_PROFILER: &quot;</a>
+<a name="ln2254">					&quot;thread: %&quot; B_PRId32 &quot;, sample area: %&quot; B_PRId32 &quot;\n&quot;,</a>
+<a name="ln2255">					nubThread-&gt;id, threadID, sampleArea));</a>
+<a name="ln2256"> </a>
+<a name="ln2257">				if (stackDepth &lt; 1)</a>
+<a name="ln2258">					stackDepth = 1;</a>
+<a name="ln2259">				else if (stackDepth &gt; B_DEBUG_STACK_TRACE_DEPTH)</a>
+<a name="ln2260">					stackDepth = B_DEBUG_STACK_TRACE_DEPTH;</a>
+<a name="ln2261"> </a>
+<a name="ln2262">				// provision for an extra entry per hit (for the number of</a>
+<a name="ln2263">				// samples), if variable stack depth</a>
+<a name="ln2264">				if (variableStackDepth)</a>
+<a name="ln2265">					stackDepth++;</a>
+<a name="ln2266"> </a>
+<a name="ln2267">				// clone the sample area</a>
+<a name="ln2268">				area_info areaInfo;</a>
+<a name="ln2269">				if (result == B_OK)</a>
+<a name="ln2270">					result = get_area_info(sampleArea, &amp;areaInfo);</a>
+<a name="ln2271"> </a>
+<a name="ln2272">				area_id clonedSampleArea = -1;</a>
+<a name="ln2273">				void* samples = NULL;</a>
+<a name="ln2274">				if (result == B_OK) {</a>
+<a name="ln2275">					clonedSampleArea = clone_area(&quot;profiling samples&quot;, &amp;samples,</a>
+<a name="ln2276">						B_ANY_KERNEL_ADDRESS, B_READ_AREA | B_WRITE_AREA,</a>
+<a name="ln2277">						sampleArea);</a>
+<a name="ln2278">					if (clonedSampleArea &gt;= 0) {</a>
+<a name="ln2279">						// we need the memory locked</a>
+<a name="ln2280">						result = lock_memory(samples, areaInfo.size,</a>
+<a name="ln2281">							B_READ_DEVICE);</a>
+<a name="ln2282">						if (result != B_OK) {</a>
+<a name="ln2283">							delete_area(clonedSampleArea);</a>
+<a name="ln2284">							clonedSampleArea = -1;</a>
+<a name="ln2285">						}</a>
+<a name="ln2286">					} else</a>
+<a name="ln2287">						result = clonedSampleArea;</a>
+<a name="ln2288">				}</a>
+<a name="ln2289"> </a>
+<a name="ln2290">				// get the thread and set the profile info</a>
+<a name="ln2291">				int32 imageEvent = nubThread-&gt;team-&gt;debug_info.image_event;</a>
+<a name="ln2292">				if (result == B_OK) {</a>
+<a name="ln2293">					Thread* thread = Thread::GetAndLock(threadID);</a>
+<a name="ln2294">					BReference&lt;Thread&gt; threadReference(thread, true);</a>
+<a name="ln2295">					ThreadLocker threadLocker(thread, true);</a>
+<a name="ln2296"> </a>
+<a name="ln2297">					if (thread != NULL &amp;&amp; thread-&gt;team == nubThread-&gt;team) {</a>
+<a name="ln2298">						thread_debug_info &amp;threadDebugInfo = thread-&gt;debug_info;</a>
+<a name="ln2299"> </a>
+<a name="ln2300">						InterruptsSpinLocker threadDebugInfoLocker(</a>
+<a name="ln2301">							threadDebugInfo.lock);</a>
+<a name="ln2302"> </a>
+<a name="ln2303">						if (threadDebugInfo.profile.samples == NULL) {</a>
+<a name="ln2304">							threadDebugInfo.profile.interval = interval;</a>
+<a name="ln2305">							threadDebugInfo.profile.sample_area</a>
+<a name="ln2306">								= clonedSampleArea;</a>
+<a name="ln2307">							threadDebugInfo.profile.samples = (addr_t*)samples;</a>
+<a name="ln2308">							threadDebugInfo.profile.max_samples</a>
+<a name="ln2309">								= areaInfo.size / sizeof(addr_t);</a>
+<a name="ln2310">							threadDebugInfo.profile.flush_threshold</a>
+<a name="ln2311">								= threadDebugInfo.profile.max_samples</a>
+<a name="ln2312">									* B_DEBUG_PROFILE_BUFFER_FLUSH_THRESHOLD</a>
+<a name="ln2313">									/ 100;</a>
+<a name="ln2314">							threadDebugInfo.profile.sample_count = 0;</a>
+<a name="ln2315">							threadDebugInfo.profile.dropped_ticks = 0;</a>
+<a name="ln2316">							threadDebugInfo.profile.stack_depth = stackDepth;</a>
+<a name="ln2317">							threadDebugInfo.profile.variable_stack_depth</a>
+<a name="ln2318">								= variableStackDepth;</a>
+<a name="ln2319">							threadDebugInfo.profile.buffer_full = false;</a>
+<a name="ln2320">							threadDebugInfo.profile.interval_left = interval;</a>
+<a name="ln2321">							threadDebugInfo.profile.installed_timer = NULL;</a>
+<a name="ln2322">							threadDebugInfo.profile.image_event = imageEvent;</a>
+<a name="ln2323">							threadDebugInfo.profile.last_image_event</a>
+<a name="ln2324">								= imageEvent;</a>
+<a name="ln2325">						} else</a>
+<a name="ln2326">							result = B_BAD_VALUE;</a>
+<a name="ln2327">					} else</a>
+<a name="ln2328">						result = B_BAD_THREAD_ID;</a>
+<a name="ln2329">				}</a>
+<a name="ln2330"> </a>
+<a name="ln2331">				// on error unlock and delete the sample area</a>
+<a name="ln2332">				if (result != B_OK) {</a>
+<a name="ln2333">					if (clonedSampleArea &gt;= 0) {</a>
+<a name="ln2334">						unlock_memory(samples, areaInfo.size, B_READ_DEVICE);</a>
+<a name="ln2335">						delete_area(clonedSampleArea);</a>
+<a name="ln2336">					}</a>
+<a name="ln2337">				}</a>
+<a name="ln2338"> </a>
+<a name="ln2339">				// send a reply to the debugger</a>
+<a name="ln2340">				reply.start_profiler.error = result;</a>
+<a name="ln2341">				reply.start_profiler.interval = interval;</a>
+<a name="ln2342">				reply.start_profiler.image_event = imageEvent;</a>
+<a name="ln2343">				sendReply = true;</a>
+<a name="ln2344">				replySize = sizeof(reply.start_profiler);</a>
+<a name="ln2345"> </a>
+<a name="ln2346">				break;</a>
+<a name="ln2347">			}</a>
+<a name="ln2348"> </a>
+<a name="ln2349">			case B_DEBUG_STOP_PROFILER:</a>
+<a name="ln2350">			{</a>
+<a name="ln2351">				// get the parameters</a>
+<a name="ln2352">				thread_id threadID = message.stop_profiler.thread;</a>
+<a name="ln2353">				replyPort = message.stop_profiler.reply_port;</a>
+<a name="ln2354">				status_t result = B_OK;</a>
+<a name="ln2355"> </a>
+<a name="ln2356">				TRACE((&quot;nub thread %&quot; B_PRId32 &quot;: B_DEBUG_STOP_PROFILER: &quot;</a>
+<a name="ln2357">					&quot;thread: %&quot; B_PRId32 &quot;\n&quot;, nubThread-&gt;id, threadID));</a>
+<a name="ln2358"> </a>
+<a name="ln2359">				area_id sampleArea = -1;</a>
+<a name="ln2360">				addr_t* samples = NULL;</a>
+<a name="ln2361">				int32 sampleCount = 0;</a>
+<a name="ln2362">				int32 stackDepth = 0;</a>
+<a name="ln2363">				bool variableStackDepth = false;</a>
+<a name="ln2364">				int32 imageEvent = 0;</a>
+<a name="ln2365">				int32 droppedTicks = 0;</a>
+<a name="ln2366"> </a>
+<a name="ln2367">				// get the thread and detach the profile info</a>
+<a name="ln2368">				Thread* thread = Thread::GetAndLock(threadID);</a>
+<a name="ln2369">				BReference&lt;Thread&gt; threadReference(thread, true);</a>
+<a name="ln2370">				ThreadLocker threadLocker(thread, true);</a>
+<a name="ln2371"> </a>
+<a name="ln2372">				if (thread &amp;&amp; thread-&gt;team == nubThread-&gt;team) {</a>
+<a name="ln2373">					thread_debug_info &amp;threadDebugInfo = thread-&gt;debug_info;</a>
+<a name="ln2374"> </a>
+<a name="ln2375">					InterruptsSpinLocker threadDebugInfoLocker(</a>
+<a name="ln2376">						threadDebugInfo.lock);</a>
+<a name="ln2377"> </a>
+<a name="ln2378">					if (threadDebugInfo.profile.samples != NULL) {</a>
+<a name="ln2379">						sampleArea = threadDebugInfo.profile.sample_area;</a>
+<a name="ln2380">						samples = threadDebugInfo.profile.samples;</a>
+<a name="ln2381">						sampleCount = threadDebugInfo.profile.sample_count;</a>
+<a name="ln2382">						droppedTicks = threadDebugInfo.profile.dropped_ticks;</a>
+<a name="ln2383">						stackDepth = threadDebugInfo.profile.stack_depth;</a>
+<a name="ln2384">						variableStackDepth</a>
+<a name="ln2385">							= threadDebugInfo.profile.variable_stack_depth;</a>
+<a name="ln2386">						imageEvent = threadDebugInfo.profile.image_event;</a>
+<a name="ln2387">						threadDebugInfo.profile.sample_area = -1;</a>
+<a name="ln2388">						threadDebugInfo.profile.samples = NULL;</a>
+<a name="ln2389">						threadDebugInfo.profile.buffer_full = false;</a>
+<a name="ln2390">						threadDebugInfo.profile.dropped_ticks = 0;</a>
+<a name="ln2391">					} else</a>
+<a name="ln2392">						result = B_BAD_VALUE;</a>
+<a name="ln2393">				} else</a>
+<a name="ln2394">					result = B_BAD_THREAD_ID;</a>
+<a name="ln2395"> </a>
+<a name="ln2396">				threadLocker.Unlock();</a>
+<a name="ln2397"> </a>
+<a name="ln2398">				// prepare the reply</a>
+<a name="ln2399">				if (result == B_OK) {</a>
+<a name="ln2400">					reply.profiler_update.origin.thread = threadID;</a>
+<a name="ln2401">					reply.profiler_update.image_event = imageEvent;</a>
+<a name="ln2402">					reply.profiler_update.stack_depth = stackDepth;</a>
+<a name="ln2403">					reply.profiler_update.variable_stack_depth</a>
+<a name="ln2404">						= variableStackDepth;</a>
+<a name="ln2405">					reply.profiler_update.sample_count = sampleCount;</a>
+<a name="ln2406">					reply.profiler_update.dropped_ticks = droppedTicks;</a>
+<a name="ln2407">					reply.profiler_update.stopped = true;</a>
+<a name="ln2408">				} else</a>
+<a name="ln2409">					reply.profiler_update.origin.thread = result;</a>
+<a name="ln2410"> </a>
+<a name="ln2411">				replySize = sizeof(debug_profiler_update);</a>
+<a name="ln2412">				sendReply = true;</a>
+<a name="ln2413"> </a>
+<a name="ln2414">				if (sampleArea &gt;= 0) {</a>
+<a name="ln2415">					area_info areaInfo;</a>
+<a name="ln2416">					if (get_area_info(sampleArea, &amp;areaInfo) == B_OK) {</a>
+<a name="ln2417">						unlock_memory(samples, areaInfo.size, B_READ_DEVICE);</a>
+<a name="ln2418">						delete_area(sampleArea);</a>
+<a name="ln2419">					}</a>
+<a name="ln2420">				}</a>
+<a name="ln2421"> </a>
+<a name="ln2422">				break;</a>
+<a name="ln2423">			}</a>
+<a name="ln2424"> </a>
+<a name="ln2425">			case B_DEBUG_WRITE_CORE_FILE:</a>
+<a name="ln2426">			{</a>
+<a name="ln2427">				// get the parameters</a>
+<a name="ln2428">				replyPort = message.write_core_file.reply_port;</a>
+<a name="ln2429">				char* path = message.write_core_file.path;</a>
+<a name="ln2430">				path[sizeof(message.write_core_file.path) - 1] = '\0';</a>
+<a name="ln2431"> </a>
+<a name="ln2432">				TRACE((&quot;nub thread %&quot; B_PRId32 &quot;: B_DEBUG_WRITE_CORE_FILE&quot;</a>
+<a name="ln2433">					&quot;: path: %s\n&quot;, nubThread-&gt;id, path));</a>
+<a name="ln2434"> </a>
+<a name="ln2435">				// write the core file</a>
+<a name="ln2436">				status_t result = core_dump_write_core_file(path, false);</a>
+<a name="ln2437"> </a>
+<a name="ln2438">				// prepare the reply</a>
+<a name="ln2439">				reply.write_core_file.error = result;</a>
+<a name="ln2440">				replySize = sizeof(reply.write_core_file);</a>
+<a name="ln2441">				sendReply = true;</a>
+<a name="ln2442"> </a>
+<a name="ln2443">				break;</a>
+<a name="ln2444">			}</a>
+<a name="ln2445">		}</a>
+<a name="ln2446"> </a>
+<a name="ln2447">		// send the reply, if necessary</a>
+<a name="ln2448">		if (sendReply) {</a>
+<a name="ln2449">			status_t error = kill_interruptable_write_port(replyPort, command,</a>
+<a name="ln2450">				&amp;reply, replySize);</a>
+<a name="ln2451"> </a>
+<a name="ln2452">			if (error != B_OK) {</a>
+<a name="ln2453">				// The debugger port is either not longer existing or we got</a>
+<a name="ln2454">				// interrupted by a kill signal. In either case we terminate.</a>
+<a name="ln2455">				TRACE((&quot;nub thread %&quot; B_PRId32 &quot;: failed to send reply to port &quot;</a>
+<a name="ln2456">					&quot;%&quot; B_PRId32 &quot;: %s\n&quot;, nubThread-&gt;id, replyPort,</a>
+<a name="ln2457">					strerror(error)));</a>
+<a name="ln2458"> </a>
+<a name="ln2459">				nub_thread_cleanup(nubThread);</a>
+<a name="ln2460">				return error;</a>
+<a name="ln2461">			}</a>
+<a name="ln2462">		}</a>
+<a name="ln2463">	}</a>
+<a name="ln2464">}</a>
+<a name="ln2465"> </a>
+<a name="ln2466"> </a>
+<a name="ln2467">/**	\brief Helper function for install_team_debugger(), that sets up the team</a>
+<a name="ln2468">		   and thread debug infos.</a>
+<a name="ln2469"> </a>
+<a name="ln2470">	The caller must hold the team's lock as well as the team debug info lock.</a>
+<a name="ln2471"> </a>
+<a name="ln2472">	The function also clears the arch specific team and thread debug infos</a>
+<a name="ln2473">	(including among other things formerly set break/watchpoints).</a>
+<a name="ln2474"> */</a>
+<a name="ln2475">static void</a>
+<a name="ln2476">install_team_debugger_init_debug_infos(Team *team, team_id debuggerTeam,</a>
+<a name="ln2477">	port_id debuggerPort, port_id nubPort, thread_id nubThread,</a>
+<a name="ln2478">	sem_id debuggerPortWriteLock, thread_id causingThread)</a>
+<a name="ln2479">{</a>
+<a name="ln2480">	atomic_set(&amp;team-&gt;debug_info.flags,</a>
+<a name="ln2481">		B_TEAM_DEBUG_DEFAULT_FLAGS | B_TEAM_DEBUG_DEBUGGER_INSTALLED);</a>
+<a name="ln2482">	team-&gt;debug_info.nub_port = nubPort;</a>
+<a name="ln2483">	team-&gt;debug_info.nub_thread = nubThread;</a>
+<a name="ln2484">	team-&gt;debug_info.debugger_team = debuggerTeam;</a>
+<a name="ln2485">	team-&gt;debug_info.debugger_port = debuggerPort;</a>
+<a name="ln2486">	team-&gt;debug_info.debugger_write_lock = debuggerPortWriteLock;</a>
+<a name="ln2487">	team-&gt;debug_info.causing_thread = causingThread;</a>
+<a name="ln2488"> </a>
+<a name="ln2489">	arch_clear_team_debug_info(&amp;team-&gt;debug_info.arch_info);</a>
+<a name="ln2490"> </a>
+<a name="ln2491">	// set the user debug flags and signal masks of all threads to the default</a>
+<a name="ln2492">	for (Thread *thread = team-&gt;thread_list; thread;</a>
+<a name="ln2493">			thread = thread-&gt;team_next) {</a>
+<a name="ln2494">		SpinLocker threadDebugInfoLocker(thread-&gt;debug_info.lock);</a>
+<a name="ln2495"> </a>
+<a name="ln2496">		if (thread-&gt;id == nubThread) {</a>
+<a name="ln2497">			atomic_set(&amp;thread-&gt;debug_info.flags, B_THREAD_DEBUG_NUB_THREAD);</a>
+<a name="ln2498">		} else {</a>
+<a name="ln2499">			int32 flags = thread-&gt;debug_info.flags</a>
+<a name="ln2500">				&amp; ~B_THREAD_DEBUG_USER_FLAG_MASK;</a>
+<a name="ln2501">			atomic_set(&amp;thread-&gt;debug_info.flags,</a>
+<a name="ln2502">				flags | B_THREAD_DEBUG_DEFAULT_FLAGS);</a>
+<a name="ln2503">			thread-&gt;debug_info.ignore_signals = 0;</a>
+<a name="ln2504">			thread-&gt;debug_info.ignore_signals_once = 0;</a>
+<a name="ln2505"> </a>
+<a name="ln2506">			arch_clear_thread_debug_info(&amp;thread-&gt;debug_info.arch_info);</a>
+<a name="ln2507">		}</a>
+<a name="ln2508">	}</a>
+<a name="ln2509"> </a>
+<a name="ln2510">	// update the thread::flags fields</a>
+<a name="ln2511">	update_threads_debugger_installed_flag(team);</a>
+<a name="ln2512">}</a>
+<a name="ln2513"> </a>
+<a name="ln2514"> </a>
+<a name="ln2515">static port_id</a>
+<a name="ln2516">install_team_debugger(team_id teamID, port_id debuggerPort,</a>
+<a name="ln2517">	thread_id causingThread, bool useDefault, bool dontReplace)</a>
+<a name="ln2518">{</a>
+<a name="ln2519">	TRACE((&quot;install_team_debugger(team: %&quot; B_PRId32 &quot;, port: %&quot; B_PRId32 &quot;, &quot;</a>
+<a name="ln2520">		&quot;default: %d, dontReplace: %d)\n&quot;, teamID, debuggerPort, useDefault,</a>
+<a name="ln2521">		dontReplace));</a>
+<a name="ln2522"> </a>
+<a name="ln2523">	if (useDefault)</a>
+<a name="ln2524">		debuggerPort = atomic_get(&amp;sDefaultDebuggerPort);</a>
+<a name="ln2525"> </a>
+<a name="ln2526">	// get the debugger team</a>
+<a name="ln2527">	port_info debuggerPortInfo;</a>
+<a name="ln2528">	status_t error = get_port_info(debuggerPort, &amp;debuggerPortInfo);</a>
+<a name="ln2529">	if (error != B_OK) {</a>
+<a name="ln2530">		TRACE((&quot;install_team_debugger(): Failed to get debugger port info: &quot;</a>
+<a name="ln2531">			&quot;%&quot; B_PRIx32 &quot;\n&quot;, error));</a>
+<a name="ln2532">		return error;</a>
+<a name="ln2533">	}</a>
+<a name="ln2534">	team_id debuggerTeam = debuggerPortInfo.team;</a>
+<a name="ln2535"> </a>
+<a name="ln2536">	// Check the debugger team: It must neither be the kernel team nor the</a>
+<a name="ln2537">	// debugged team.</a>
+<a name="ln2538">	if (debuggerTeam == team_get_kernel_team_id() || debuggerTeam == teamID) {</a>
+<a name="ln2539">		TRACE((&quot;install_team_debugger(): Can't debug kernel or debugger team. &quot;</a>
+<a name="ln2540">			&quot;debugger: %&quot; B_PRId32 &quot;, debugged: %&quot; B_PRId32 &quot;\n&quot;, debuggerTeam,</a>
+<a name="ln2541">			teamID));</a>
+<a name="ln2542">		return B_NOT_ALLOWED;</a>
+<a name="ln2543">	}</a>
+<a name="ln2544"> </a>
+<a name="ln2545">	// get the team</a>
+<a name="ln2546">	Team* team;</a>
+<a name="ln2547">	ConditionVariable debugChangeCondition;</a>
+<a name="ln2548">	error = prepare_debugger_change(teamID, debugChangeCondition, team);</a>
+<a name="ln2549">	if (error != B_OK)</a>
+<a name="ln2550">		return error;</a>
+<a name="ln2551"> </a>
+<a name="ln2552">	// get the real team ID</a>
+<a name="ln2553">	teamID = team-&gt;id;</a>
+<a name="ln2554"> </a>
+<a name="ln2555">	// check, if a debugger is already installed</a>
+<a name="ln2556"> </a>
+<a name="ln2557">	bool done = false;</a>
+<a name="ln2558">	port_id result = B_ERROR;</a>
+<a name="ln2559">	bool handOver = false;</a>
+<a name="ln2560">	port_id oldDebuggerPort = -1;</a>
+<a name="ln2561">	port_id nubPort = -1;</a>
+<a name="ln2562"> </a>
+<a name="ln2563">	TeamLocker teamLocker(team);</a>
+<a name="ln2564">	cpu_status state = disable_interrupts();</a>
+<a name="ln2565">	GRAB_TEAM_DEBUG_INFO_LOCK(team-&gt;debug_info);</a>
+<a name="ln2566"> </a>
+<a name="ln2567">	int32 teamDebugFlags = team-&gt;debug_info.flags;</a>
+<a name="ln2568"> </a>
+<a name="ln2569">	if (teamDebugFlags &amp; B_TEAM_DEBUG_DEBUGGER_INSTALLED) {</a>
+<a name="ln2570">		// There's already a debugger installed.</a>
+<a name="ln2571">		if (teamDebugFlags &amp; B_TEAM_DEBUG_DEBUGGER_HANDOVER) {</a>
+<a name="ln2572">			if (dontReplace) {</a>
+<a name="ln2573">				// We're fine with already having a debugger.</a>
+<a name="ln2574">				error = B_OK;</a>
+<a name="ln2575">				done = true;</a>
+<a name="ln2576">				result = team-&gt;debug_info.nub_port;</a>
+<a name="ln2577">			} else {</a>
+<a name="ln2578">				// a handover to another debugger is requested</a>
+<a name="ln2579">				// Set the handing-over flag -- we'll clear both flags after</a>
+<a name="ln2580">				// having sent the handed-over message to the new debugger.</a>
+<a name="ln2581">				atomic_or(&amp;team-&gt;debug_info.flags,</a>
+<a name="ln2582">					B_TEAM_DEBUG_DEBUGGER_HANDING_OVER);</a>
+<a name="ln2583"> </a>
+<a name="ln2584">				oldDebuggerPort = team-&gt;debug_info.debugger_port;</a>
+<a name="ln2585">				result = nubPort = team-&gt;debug_info.nub_port;</a>
+<a name="ln2586">				if (causingThread &lt; 0)</a>
+<a name="ln2587">					causingThread = team-&gt;debug_info.causing_thread;</a>
+<a name="ln2588"> </a>
+<a name="ln2589">				// set the new debugger</a>
+<a name="ln2590">				install_team_debugger_init_debug_infos(team, debuggerTeam,</a>
+<a name="ln2591">					debuggerPort, nubPort, team-&gt;debug_info.nub_thread,</a>
+<a name="ln2592">					team-&gt;debug_info.debugger_write_lock, causingThread);</a>
+<a name="ln2593"> </a>
+<a name="ln2594">				handOver = true;</a>
+<a name="ln2595">				done = true;</a>
+<a name="ln2596">			}</a>
+<a name="ln2597">		} else {</a>
+<a name="ln2598">			// there's already a debugger installed</a>
+<a name="ln2599">			error = (dontReplace ? B_OK : B_BAD_VALUE);</a>
+<a name="ln2600">			done = true;</a>
+<a name="ln2601">			result = team-&gt;debug_info.nub_port;</a>
+<a name="ln2602">		}</a>
+<a name="ln2603">	} else if ((teamDebugFlags &amp; B_TEAM_DEBUG_DEBUGGER_DISABLED) != 0</a>
+<a name="ln2604">		&amp;&amp; useDefault) {</a>
+<a name="ln2605">		// No debugger yet, disable_debugger() had been invoked, and we</a>
+<a name="ln2606">		// would install the default debugger. Just fail.</a>
+<a name="ln2607">		error = B_BAD_VALUE;</a>
+<a name="ln2608">	}</a>
+<a name="ln2609"> </a>
+<a name="ln2610">	RELEASE_TEAM_DEBUG_INFO_LOCK(team-&gt;debug_info);</a>
+<a name="ln2611">	restore_interrupts(state);</a>
+<a name="ln2612">	teamLocker.Unlock();</a>
+<a name="ln2613"> </a>
+<a name="ln2614">	if (handOver &amp;&amp; set_port_owner(nubPort, debuggerTeam) != B_OK) {</a>
+<a name="ln2615">		// The old debugger must just have died. Just proceed as</a>
+<a name="ln2616">		// if there was no debugger installed. We may still be too</a>
+<a name="ln2617">		// early, in which case we'll fail, but this race condition</a>
+<a name="ln2618">		// should be unbelievably rare and relatively harmless.</a>
+<a name="ln2619">		handOver = false;</a>
+<a name="ln2620">		done = false;</a>
+<a name="ln2621">	}</a>
+<a name="ln2622"> </a>
+<a name="ln2623">	if (handOver) {</a>
+<a name="ln2624">		// prepare the handed-over message</a>
+<a name="ln2625">		debug_handed_over notification;</a>
+<a name="ln2626">		notification.origin.thread = -1;</a>
+<a name="ln2627">		notification.origin.team = teamID;</a>
+<a name="ln2628">		notification.origin.nub_port = nubPort;</a>
+<a name="ln2629">		notification.debugger = debuggerTeam;</a>
+<a name="ln2630">		notification.debugger_port = debuggerPort;</a>
+<a name="ln2631">		notification.causing_thread = causingThread;</a>
+<a name="ln2632"> </a>
+<a name="ln2633">		// notify the new debugger</a>
+<a name="ln2634">		error = write_port_etc(debuggerPort,</a>
+<a name="ln2635">			B_DEBUGGER_MESSAGE_HANDED_OVER, &amp;notification,</a>
+<a name="ln2636">			sizeof(notification), B_RELATIVE_TIMEOUT, 0);</a>
+<a name="ln2637">		if (error != B_OK) {</a>
+<a name="ln2638">			dprintf(&quot;install_team_debugger(): Failed to send message to new &quot;</a>
+<a name="ln2639">				&quot;debugger: %s\n&quot;, strerror(error));</a>
+<a name="ln2640">		}</a>
+<a name="ln2641"> </a>
+<a name="ln2642">		// clear the handed-over and handing-over flags</a>
+<a name="ln2643">		state = disable_interrupts();</a>
+<a name="ln2644">		GRAB_TEAM_DEBUG_INFO_LOCK(team-&gt;debug_info);</a>
+<a name="ln2645"> </a>
+<a name="ln2646">		atomic_and(&amp;team-&gt;debug_info.flags,</a>
+<a name="ln2647">			~(B_TEAM_DEBUG_DEBUGGER_HANDOVER</a>
+<a name="ln2648">				| B_TEAM_DEBUG_DEBUGGER_HANDING_OVER));</a>
+<a name="ln2649"> </a>
+<a name="ln2650">		RELEASE_TEAM_DEBUG_INFO_LOCK(team-&gt;debug_info);</a>
+<a name="ln2651">		restore_interrupts(state);</a>
+<a name="ln2652"> </a>
+<a name="ln2653">		finish_debugger_change(team);</a>
+<a name="ln2654"> </a>
+<a name="ln2655">		// notify the nub thread</a>
+<a name="ln2656">		kill_interruptable_write_port(nubPort, B_DEBUG_MESSAGE_HANDED_OVER,</a>
+<a name="ln2657">			NULL, 0);</a>
+<a name="ln2658"> </a>
+<a name="ln2659">		// notify the old debugger</a>
+<a name="ln2660">		error = write_port_etc(oldDebuggerPort,</a>
+<a name="ln2661">			B_DEBUGGER_MESSAGE_HANDED_OVER, &amp;notification,</a>
+<a name="ln2662">			sizeof(notification), B_RELATIVE_TIMEOUT, 0);</a>
+<a name="ln2663">		if (error != B_OK) {</a>
+<a name="ln2664">			TRACE((&quot;install_team_debugger(): Failed to send message to old &quot;</a>
+<a name="ln2665">				&quot;debugger: %s\n&quot;, strerror(error)));</a>
+<a name="ln2666">		}</a>
+<a name="ln2667"> </a>
+<a name="ln2668">		TRACE((&quot;install_team_debugger() done: handed over to debugger: team: &quot;</a>
+<a name="ln2669">			&quot;%&quot; B_PRId32 &quot;, port: %&quot; B_PRId32 &quot;\n&quot;, debuggerTeam,</a>
+<a name="ln2670">			debuggerPort));</a>
+<a name="ln2671"> </a>
+<a name="ln2672">		return result;</a>
+<a name="ln2673">	}</a>
+<a name="ln2674"> </a>
+<a name="ln2675">	if (done || error != B_OK) {</a>
+<a name="ln2676">		TRACE((&quot;install_team_debugger() done1: %&quot; B_PRId32 &quot;\n&quot;,</a>
+<a name="ln2677">			(error == B_OK ? result : error)));</a>
+<a name="ln2678">		finish_debugger_change(team);</a>
+<a name="ln2679">		return (error == B_OK ? result : error);</a>
+<a name="ln2680">	}</a>
+<a name="ln2681"> </a>
+<a name="ln2682">	// create the debugger write lock semaphore</a>
+<a name="ln2683">	char nameBuffer[B_OS_NAME_LENGTH];</a>
+<a name="ln2684">	snprintf(nameBuffer, sizeof(nameBuffer), &quot;team %&quot; B_PRId32 &quot; debugger port &quot;</a>
+<a name="ln2685">		&quot;write&quot;, teamID);</a>
+<a name="ln2686">	sem_id debuggerWriteLock = create_sem(1, nameBuffer);</a>
+<a name="ln2687">	if (debuggerWriteLock &lt; 0)</a>
+<a name="ln2688">		error = debuggerWriteLock;</a>
+<a name="ln2689"> </a>
+<a name="ln2690">	// create the nub port</a>
+<a name="ln2691">	snprintf(nameBuffer, sizeof(nameBuffer), &quot;team %&quot; B_PRId32 &quot; debug&quot;, teamID);</a>
+<a name="ln2692">	if (error == B_OK) {</a>
+<a name="ln2693">		nubPort = create_port(1, nameBuffer);</a>
+<a name="ln2694">		if (nubPort &lt; 0)</a>
+<a name="ln2695">			error = nubPort;</a>
+<a name="ln2696">		else</a>
+<a name="ln2697">			result = nubPort;</a>
+<a name="ln2698">	}</a>
+<a name="ln2699"> </a>
+<a name="ln2700">	// make the debugger team the port owner; thus we know, if the debugger is</a>
+<a name="ln2701">	// gone and can cleanup</a>
+<a name="ln2702">	if (error == B_OK)</a>
+<a name="ln2703">		error = set_port_owner(nubPort, debuggerTeam);</a>
+<a name="ln2704"> </a>
+<a name="ln2705">	// create the breakpoint manager</a>
+<a name="ln2706">	BreakpointManager* breakpointManager = NULL;</a>
+<a name="ln2707">	if (error == B_OK) {</a>
+<a name="ln2708">		breakpointManager = new(std::nothrow) BreakpointManager;</a>
+<a name="ln2709">		if (breakpointManager != NULL)</a>
+<a name="ln2710">			error = breakpointManager-&gt;Init();</a>
+<a name="ln2711">		else</a>
+<a name="ln2712">			error = B_NO_MEMORY;</a>
+<a name="ln2713">	}</a>
+<a name="ln2714"> </a>
+<a name="ln2715">	// spawn the nub thread</a>
+<a name="ln2716">	thread_id nubThread = -1;</a>
+<a name="ln2717">	if (error == B_OK) {</a>
+<a name="ln2718">		snprintf(nameBuffer, sizeof(nameBuffer), &quot;team %&quot; B_PRId32 &quot; debug task&quot;,</a>
+<a name="ln2719">			teamID);</a>
+<a name="ln2720">		nubThread = spawn_kernel_thread_etc(debug_nub_thread, nameBuffer,</a>
+<a name="ln2721">			B_NORMAL_PRIORITY, NULL, teamID);</a>
+<a name="ln2722">		if (nubThread &lt; 0)</a>
+<a name="ln2723">			error = nubThread;</a>
+<a name="ln2724">	}</a>
+<a name="ln2725"> </a>
+<a name="ln2726">	// now adjust the debug info accordingly</a>
+<a name="ln2727">	if (error == B_OK) {</a>
+<a name="ln2728">		TeamLocker teamLocker(team);</a>
+<a name="ln2729">		state = disable_interrupts();</a>
+<a name="ln2730">		GRAB_TEAM_DEBUG_INFO_LOCK(team-&gt;debug_info);</a>
+<a name="ln2731"> </a>
+<a name="ln2732">		team-&gt;debug_info.breakpoint_manager = breakpointManager;</a>
+<a name="ln2733">		install_team_debugger_init_debug_infos(team, debuggerTeam,</a>
+<a name="ln2734">			debuggerPort, nubPort, nubThread, debuggerWriteLock,</a>
+<a name="ln2735">			causingThread);</a>
+<a name="ln2736"> </a>
+<a name="ln2737">		RELEASE_TEAM_DEBUG_INFO_LOCK(team-&gt;debug_info);</a>
+<a name="ln2738">		restore_interrupts(state);</a>
+<a name="ln2739">	}</a>
+<a name="ln2740"> </a>
+<a name="ln2741">	finish_debugger_change(team);</a>
+<a name="ln2742"> </a>
+<a name="ln2743">	// if everything went fine, resume the nub thread, otherwise clean up</a>
+<a name="ln2744">	if (error == B_OK) {</a>
+<a name="ln2745">		resume_thread(nubThread);</a>
+<a name="ln2746">	} else {</a>
+<a name="ln2747">		// delete port and terminate thread</a>
+<a name="ln2748">		if (nubPort &gt;= 0) {</a>
+<a name="ln2749">			set_port_owner(nubPort, B_CURRENT_TEAM);</a>
+<a name="ln2750">			delete_port(nubPort);</a>
+<a name="ln2751">		}</a>
+<a name="ln2752">		if (nubThread &gt;= 0) {</a>
+<a name="ln2753">			int32 result;</a>
+<a name="ln2754">			wait_for_thread(nubThread, &amp;result);</a>
+<a name="ln2755">		}</a>
+<a name="ln2756"> </a>
+<a name="ln2757">		delete breakpointManager;</a>
+<a name="ln2758">	}</a>
+<a name="ln2759"> </a>
+<a name="ln2760">	TRACE((&quot;install_team_debugger() done2: %&quot; B_PRId32 &quot;\n&quot;,</a>
+<a name="ln2761">		(error == B_OK ? result : error)));</a>
+<a name="ln2762">	return (error == B_OK ? result : error);</a>
+<a name="ln2763">}</a>
+<a name="ln2764"> </a>
+<a name="ln2765"> </a>
+<a name="ln2766">static status_t</a>
+<a name="ln2767">ensure_debugger_installed()</a>
+<a name="ln2768">{</a>
+<a name="ln2769">	port_id port = install_team_debugger(B_CURRENT_TEAM, -1,</a>
+<a name="ln2770">		thread_get_current_thread_id(), true, true);</a>
+<a name="ln2771">	return port &gt;= 0 ? B_OK : port;</a>
+<a name="ln2772">}</a>
+<a name="ln2773"> </a>
+<a name="ln2774"> </a>
+<a name="ln2775">// #pragma mark -</a>
+<a name="ln2776"> </a>
+<a name="ln2777"> </a>
+<a name="ln2778">void</a>
+<a name="ln2779">_user_debugger(const char *userMessage)</a>
+<a name="ln2780">{</a>
+<a name="ln2781">	// install the default debugger, if there is none yet</a>
+<a name="ln2782">	status_t error = ensure_debugger_installed();</a>
+<a name="ln2783">	if (error != B_OK) {</a>
+<a name="ln2784">		// time to commit suicide</a>
+<a name="ln2785">		char buffer[128];</a>
+<a name="ln2786">		ssize_t length = user_strlcpy(buffer, userMessage, sizeof(buffer));</a>
+<a name="ln2787">		if (length &gt;= 0) {</a>
+<a name="ln2788">			dprintf(&quot;_user_debugger(): Failed to install debugger. Message is: &quot;</a>
+<a name="ln2789">				&quot;`%s'\n&quot;, buffer);</a>
+<a name="ln2790">		} else {</a>
+<a name="ln2791">			dprintf(&quot;_user_debugger(): Failed to install debugger. Message is: &quot;</a>
+<a name="ln2792">				&quot;%p (%s)\n&quot;, userMessage, strerror(length));</a>
+<a name="ln2793">		}</a>
+<a name="ln2794">		_user_exit_team(1);</a>
+<a name="ln2795">	}</a>
+<a name="ln2796"> </a>
+<a name="ln2797">	// prepare the message</a>
+<a name="ln2798">	debug_debugger_call message;</a>
+<a name="ln2799">	message.message = (void*)userMessage;</a>
+<a name="ln2800"> </a>
+<a name="ln2801">	thread_hit_debug_event(B_DEBUGGER_MESSAGE_DEBUGGER_CALL, &amp;message,</a>
+<a name="ln2802">		sizeof(message), true);</a>
+<a name="ln2803">}</a>
+<a name="ln2804"> </a>
+<a name="ln2805"> </a>
+<a name="ln2806">int</a>
+<a name="ln2807">_user_disable_debugger(int state)</a>
+<a name="ln2808">{</a>
+<a name="ln2809">	Team *team = thread_get_current_thread()-&gt;team;</a>
+<a name="ln2810"> </a>
+<a name="ln2811">	TRACE((&quot;_user_disable_debugger(%d): team: %&quot; B_PRId32 &quot;\n&quot;, state,</a>
+<a name="ln2812">		team-&gt;id));</a>
+<a name="ln2813"> </a>
+<a name="ln2814">	cpu_status cpuState = disable_interrupts();</a>
+<a name="ln2815">	GRAB_TEAM_DEBUG_INFO_LOCK(team-&gt;debug_info);</a>
+<a name="ln2816"> </a>
+<a name="ln2817">	int32 oldFlags;</a>
+<a name="ln2818">	if (state) {</a>
+<a name="ln2819">		oldFlags = atomic_or(&amp;team-&gt;debug_info.flags,</a>
+<a name="ln2820">			B_TEAM_DEBUG_DEBUGGER_DISABLED);</a>
+<a name="ln2821">	} else {</a>
+<a name="ln2822">		oldFlags = atomic_and(&amp;team-&gt;debug_info.flags,</a>
+<a name="ln2823">			~B_TEAM_DEBUG_DEBUGGER_DISABLED);</a>
+<a name="ln2824">	}</a>
+<a name="ln2825"> </a>
+<a name="ln2826">	RELEASE_TEAM_DEBUG_INFO_LOCK(team-&gt;debug_info);</a>
+<a name="ln2827">	restore_interrupts(cpuState);</a>
+<a name="ln2828"> </a>
+<a name="ln2829">	// TODO: Check, if the return value is really the old state.</a>
+<a name="ln2830">	return !(oldFlags &amp; B_TEAM_DEBUG_DEBUGGER_DISABLED);</a>
+<a name="ln2831">}</a>
+<a name="ln2832"> </a>
+<a name="ln2833"> </a>
+<a name="ln2834">status_t</a>
+<a name="ln2835">_user_install_default_debugger(port_id debuggerPort)</a>
+<a name="ln2836">{</a>
+<a name="ln2837">	// if supplied, check whether the port is a valid port</a>
+<a name="ln2838">	if (debuggerPort &gt;= 0) {</a>
+<a name="ln2839">		port_info portInfo;</a>
+<a name="ln2840">		status_t error = get_port_info(debuggerPort, &amp;portInfo);</a>
+<a name="ln2841">		if (error != B_OK)</a>
+<a name="ln2842">			return error;</a>
+<a name="ln2843"> </a>
+<a name="ln2844">		// the debugger team must not be the kernel team</a>
+<a name="ln2845">		if (portInfo.team == team_get_kernel_team_id())</a>
+<a name="ln2846">			return B_NOT_ALLOWED;</a>
+<a name="ln2847">	}</a>
+<a name="ln2848"> </a>
+<a name="ln2849">	atomic_set(&amp;sDefaultDebuggerPort, debuggerPort);</a>
+<a name="ln2850"> </a>
+<a name="ln2851">	return B_OK;</a>
+<a name="ln2852">}</a>
+<a name="ln2853"> </a>
+<a name="ln2854"> </a>
+<a name="ln2855">port_id</a>
+<a name="ln2856">_user_install_team_debugger(team_id teamID, port_id debuggerPort)</a>
+<a name="ln2857">{</a>
+<a name="ln2858">	return install_team_debugger(teamID, debuggerPort, -1, false, false);</a>
+<a name="ln2859">}</a>
+<a name="ln2860"> </a>
+<a name="ln2861"> </a>
+<a name="ln2862">status_t</a>
+<a name="ln2863">_user_remove_team_debugger(team_id teamID)</a>
+<a name="ln2864">{</a>
+<a name="ln2865">	Team* team;</a>
+<a name="ln2866">	ConditionVariable debugChangeCondition;</a>
+<a name="ln2867">	status_t error = prepare_debugger_change(teamID, debugChangeCondition,</a>
+<a name="ln2868">		team);</a>
+<a name="ln2869">	if (error != B_OK)</a>
+<a name="ln2870">		return error;</a>
+<a name="ln2871"> </a>
+<a name="ln2872">	InterruptsSpinLocker debugInfoLocker(team-&gt;debug_info.lock);</a>
+<a name="ln2873"> </a>
+<a name="ln2874">	thread_id nubThread = -1;</a>
+<a name="ln2875">	port_id nubPort = -1;</a>
+<a name="ln2876"> </a>
+<a name="ln2877">	if (team-&gt;debug_info.flags &amp; B_TEAM_DEBUG_DEBUGGER_INSTALLED) {</a>
+<a name="ln2878">		// there's a debugger installed</a>
+<a name="ln2879">		nubThread = team-&gt;debug_info.nub_thread;</a>
+<a name="ln2880">		nubPort = team-&gt;debug_info.nub_port;</a>
+<a name="ln2881">	} else {</a>
+<a name="ln2882">		// no debugger installed</a>
+<a name="ln2883">		error = B_BAD_VALUE;</a>
+<a name="ln2884">	}</a>
+<a name="ln2885"> </a>
+<a name="ln2886">	debugInfoLocker.Unlock();</a>
+<a name="ln2887"> </a>
+<a name="ln2888">	// Delete the nub port -- this will cause the nub thread to terminate and</a>
+<a name="ln2889">	// remove the debugger.</a>
+<a name="ln2890">	if (nubPort &gt;= 0)</a>
+<a name="ln2891">		delete_port(nubPort);</a>
+<a name="ln2892"> </a>
+<a name="ln2893">	finish_debugger_change(team);</a>
+<a name="ln2894"> </a>
+<a name="ln2895">	// wait for the nub thread</a>
+<a name="ln2896">	if (nubThread &gt;= 0)</a>
+<a name="ln2897">		wait_for_thread(nubThread, NULL);</a>
+<a name="ln2898"> </a>
+<a name="ln2899">	return error;</a>
+<a name="ln2900">}</a>
+<a name="ln2901"> </a>
+<a name="ln2902"> </a>
+<a name="ln2903">status_t</a>
+<a name="ln2904">_user_debug_thread(thread_id threadID)</a>
+<a name="ln2905">{</a>
+<a name="ln2906">	TRACE((&quot;[%&quot; B_PRId32 &quot;] _user_debug_thread(%&quot; B_PRId32 &quot;)\n&quot;,</a>
+<a name="ln2907">		find_thread(NULL), threadID));</a>
+<a name="ln2908"> </a>
+<a name="ln2909">	// get the thread</a>
+<a name="ln2910">	Thread* thread = Thread::GetAndLock(threadID);</a>
+<a name="ln2911">	if (thread == NULL)</a>
+<a name="ln2912">		return B_BAD_THREAD_ID;</a>
+<a name="ln2913">	BReference&lt;Thread&gt; threadReference(thread, true);</a>
+<a name="ln2914">	ThreadLocker threadLocker(thread, true);</a>
+<a name="ln2915"> </a>
+<a name="ln2916">	// we can't debug the kernel team</a>
+<a name="ln2917">	if (thread-&gt;team == team_get_kernel_team())</a>
+<a name="ln2918">		return B_NOT_ALLOWED;</a>
+<a name="ln2919"> </a>
+<a name="ln2920">	InterruptsLocker interruptsLocker;</a>
+<a name="ln2921">	SpinLocker threadDebugInfoLocker(thread-&gt;debug_info.lock);</a>
+<a name="ln2922"> </a>
+<a name="ln2923">	// If the thread is already dying, it's too late to debug it.</a>
+<a name="ln2924">	if ((thread-&gt;debug_info.flags &amp; B_THREAD_DEBUG_DYING) != 0)</a>
+<a name="ln2925">		return B_BAD_THREAD_ID;</a>
+<a name="ln2926"> </a>
+<a name="ln2927">	// don't debug the nub thread</a>
+<a name="ln2928">	if ((thread-&gt;debug_info.flags &amp; B_THREAD_DEBUG_NUB_THREAD) != 0)</a>
+<a name="ln2929">		return B_NOT_ALLOWED;</a>
+<a name="ln2930"> </a>
+<a name="ln2931">	// already marked stopped or being told to stop?</a>
+<a name="ln2932">	if ((thread-&gt;debug_info.flags</a>
+<a name="ln2933">			&amp; (B_THREAD_DEBUG_STOPPED | B_THREAD_DEBUG_STOP)) != 0) {</a>
+<a name="ln2934">		return B_OK;</a>
+<a name="ln2935">	}</a>
+<a name="ln2936"> </a>
+<a name="ln2937">	// set the flag that tells the thread to stop as soon as possible</a>
+<a name="ln2938">	atomic_or(&amp;thread-&gt;debug_info.flags, B_THREAD_DEBUG_STOP);</a>
+<a name="ln2939"> </a>
+<a name="ln2940">	update_thread_user_debug_flag(thread);</a>
+<a name="ln2941"> </a>
+<a name="ln2942">	// send the thread a SIGNAL_DEBUG_THREAD, so it is interrupted (or</a>
+<a name="ln2943">	// continued)</a>
+<a name="ln2944">	threadDebugInfoLocker.Unlock();</a>
+<a name="ln2945">	ReadSpinLocker teamLocker(thread-&gt;team_lock);</a>
+<a name="ln2946">	SpinLocker locker(thread-&gt;team-&gt;signal_lock);</a>
+<a name="ln2947"> </a>
+<a name="ln2948">	send_signal_to_thread_locked(thread, SIGNAL_DEBUG_THREAD, NULL, 0);</a>
+<a name="ln2949"> </a>
+<a name="ln2950">	return B_OK;</a>
+<a name="ln2951">}</a>
+<a name="ln2952"> </a>
+<a name="ln2953"> </a>
+<a name="ln2954">void</a>
+<a name="ln2955">_user_wait_for_debugger(void)</a>
+<a name="ln2956">{</a>
+<a name="ln2957">	debug_thread_debugged message;</a>
+<a name="ln2958">	thread_hit_debug_event(B_DEBUGGER_MESSAGE_THREAD_DEBUGGED, &amp;message,</a>
+<a name="ln2959">		sizeof(message), false);</a>
+<a name="ln2960">}</a>
+<a name="ln2961"> </a>
+<a name="ln2962"> </a>
+<a name="ln2963">status_t</a>
+<a name="ln2964">_user_set_debugger_breakpoint(void *address, uint32 type, int32 length,</a>
+<a name="ln2965">	bool watchpoint)</a>
+<a name="ln2966">{</a>
+<a name="ln2967">	// check the address and size</a>
+<a name="ln2968">	if (address == NULL || !BreakpointManager::CanAccessAddress(address, false))</a>
+<a name="ln2969">		return B_BAD_ADDRESS;</a>
+<a name="ln2970">	if (watchpoint &amp;&amp; length &lt; 0)</a>
+<a name="ln2971">		return B_BAD_VALUE;</a>
+<a name="ln2972"> </a>
+<a name="ln2973">	// check whether a debugger is installed already</a>
+<a name="ln2974">	team_debug_info teamDebugInfo;</a>
+<a name="ln2975">	get_team_debug_info(teamDebugInfo);</a>
+<a name="ln2976">	if (teamDebugInfo.flags &amp; B_TEAM_DEBUG_DEBUGGER_INSTALLED)</a>
+<a name="ln2977">		return B_BAD_VALUE;</a>
+<a name="ln2978"> </a>
+<a name="ln2979">	// We can't help it, here's a small but relatively harmless race condition,</a>
+<a name="ln2980">	// since a debugger could be installed in the meantime. The worst case is</a>
+<a name="ln2981">	// that we install a break/watchpoint the debugger doesn't know about.</a>
+<a name="ln2982"> </a>
+<a name="ln2983">	// set the break/watchpoint</a>
+<a name="ln2984">	status_t result;</a>
+<a name="ln2985">	if (watchpoint)</a>
+<a name="ln2986">		result = arch_set_watchpoint(address, type, length);</a>
+<a name="ln2987">	else</a>
+<a name="ln2988">		result = arch_set_breakpoint(address);</a>
+<a name="ln2989"> </a>
+<a name="ln2990">	if (result == B_OK)</a>
+<a name="ln2991">		update_threads_breakpoints_flag();</a>
+<a name="ln2992"> </a>
+<a name="ln2993">	return result;</a>
+<a name="ln2994">}</a>
+<a name="ln2995"> </a>
+<a name="ln2996"> </a>
+<a name="ln2997">status_t</a>
+<a name="ln2998">_user_clear_debugger_breakpoint(void *address, bool watchpoint)</a>
+<a name="ln2999">{</a>
+<a name="ln3000">	// check the address</a>
+<a name="ln3001">	if (address == NULL || !BreakpointManager::CanAccessAddress(address, false))</a>
+<a name="ln3002">		return B_BAD_ADDRESS;</a>
+<a name="ln3003"> </a>
+<a name="ln3004">	// check whether a debugger is installed already</a>
+<a name="ln3005">	team_debug_info teamDebugInfo;</a>
+<a name="ln3006">	get_team_debug_info(teamDebugInfo);</a>
+<a name="ln3007">	if (teamDebugInfo.flags &amp; B_TEAM_DEBUG_DEBUGGER_INSTALLED)</a>
+<a name="ln3008">		return B_BAD_VALUE;</a>
+<a name="ln3009"> </a>
+<a name="ln3010">	// We can't help it, here's a small but relatively harmless race condition,</a>
+<a name="ln3011">	// since a debugger could be installed in the meantime. The worst case is</a>
+<a name="ln3012">	// that we clear a break/watchpoint the debugger has just installed.</a>
+<a name="ln3013"> </a>
+<a name="ln3014">	// clear the break/watchpoint</a>
+<a name="ln3015">	status_t result;</a>
+<a name="ln3016">	if (watchpoint)</a>
+<a name="ln3017">		result = arch_clear_watchpoint(address);</a>
+<a name="ln3018">	else</a>
+<a name="ln3019">		result = arch_clear_breakpoint(address);</a>
+<a name="ln3020"> </a>
+<a name="ln3021">	if (result == B_OK)</a>
+<a name="ln3022">		update_threads_breakpoints_flag();</a>
+<a name="ln3023"> </a>
+<a name="ln3024">	return result;</a>
+<a name="ln3025">}</a>
+
+</code></pre>
+<div class="balloon" rel="2269"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v547/" target="_blank">V547</a> Expression 'result == ((int) 0)' is always true.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

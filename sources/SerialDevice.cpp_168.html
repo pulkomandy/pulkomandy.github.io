@@ -1,0 +1,1156 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>SerialDevice.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2009-2010, François Revol, &lt;revol@free.fr&gt;.</a>
+<a name="ln3"> * Sponsored by TuneTracker Systems.</a>
+<a name="ln4"> * Based on the Haiku usb_serial driver which is:</a>
+<a name="ln5"> *</a>
+<a name="ln6"> * Copyright (c) 2007-2008 by Michael Lotz</a>
+<a name="ln7"> * Heavily based on the original usb_serial driver which is:</a>
+<a name="ln8"> *</a>
+<a name="ln9"> * Copyright (c) 2003 by Siarzhuk Zharski &lt;imker@gmx.li&gt;</a>
+<a name="ln10"> * Distributed under the terms of the MIT License.</a>
+<a name="ln11"> */</a>
+<a name="ln12">#include &quot;SerialDevice.h&quot;</a>
+<a name="ln13">#include &quot;UART.h&quot;</a>
+<a name="ln14"> </a>
+<a name="ln15">#include &lt;sys/ioctl.h&gt;</a>
+<a name="ln16"> </a>
+<a name="ln17">SerialDevice::SerialDevice(const struct serial_support_descriptor *device,</a>
+<a name="ln18">	uint32 ioBase, uint32 irq, const SerialDevice *master)</a>
+<a name="ln19">	:	/*fSupportDescriptor(device-&gt;descriptor),</a>
+<a name="ln20">		fDevice(device),</a>
+<a name="ln21">		fDescription(device-&gt;descriptor-&gt;name),*/</a>
+<a name="ln22">		fSupportDescriptor(device),</a>
+<a name="ln23">		fDevice(NULL),</a>
+<a name="ln24">		fDescription(device-&gt;name),</a>
+<a name="ln25">		//</a>
+<a name="ln26">		fDeviceOpen(false),</a>
+<a name="ln27">		fDeviceRemoved(false),</a>
+<a name="ln28">		fBus(device-&gt;bus),</a>
+<a name="ln29">		fIOBase(ioBase),</a>
+<a name="ln30">		fIRQ(irq),</a>
+<a name="ln31">		fMaster(master),</a>
+<a name="ln32">		fCachedIER(0x0),</a>
+<a name="ln33">		fCachedIIR(0x1),</a>
+<a name="ln34">		fPendingDPC(0),</a>
+<a name="ln35">		fReadBufferAvail(0),</a>
+<a name="ln36">		fReadBufferIn(0),</a>
+<a name="ln37">		fReadBufferOut(0),</a>
+<a name="ln38">		fReadBufferSem(-1),</a>
+<a name="ln39">		fWriteBufferAvail(0),</a>
+<a name="ln40">		fWriteBufferIn(0),</a>
+<a name="ln41">		fWriteBufferOut(0),</a>
+<a name="ln42">		fWriteBufferSem(-1),</a>
+<a name="ln43">		fDoneRead(-1),</a>
+<a name="ln44">		fDoneWrite(-1),</a>
+<a name="ln45">		fControlOut(0),</a>
+<a name="ln46">		fInputStopped(false),</a>
+<a name="ln47">		fMasterTTY(NULL),</a>
+<a name="ln48">		fSlaveTTY(NULL),</a>
+<a name="ln49">		fSystemTTYCookie(NULL),</a>
+<a name="ln50">		fDeviceTTYCookie(NULL),</a>
+<a name="ln51">		fDeviceThread(-1),</a>
+<a name="ln52">		fStopDeviceThread(false)</a>
+<a name="ln53">{</a>
+<a name="ln54">	memset(&amp;fTTYConfig, 0, sizeof(termios));</a>
+<a name="ln55">	fTTYConfig.c_cflag = B9600 | CS8 | CREAD;</a>
+<a name="ln56">	memset(fReadBuffer, 'z', DEF_BUFFER_SIZE);</a>
+<a name="ln57">	memset(fWriteBuffer, 'z', DEF_BUFFER_SIZE);</a>
+<a name="ln58">}</a>
+<a name="ln59"> </a>
+<a name="ln60"> </a>
+<a name="ln61">SerialDevice::~SerialDevice()</a>
+<a name="ln62">{</a>
+<a name="ln63">	Removed();</a>
+<a name="ln64"> </a>
+<a name="ln65">	if (fDoneWrite &gt;= B_OK)</a>
+<a name="ln66">		delete_sem(fDoneWrite);</a>
+<a name="ln67">	if (fReadBufferSem &gt;= B_OK)</a>
+<a name="ln68">		delete_sem(fReadBufferSem);</a>
+<a name="ln69">	if (fWriteBufferSem &gt;= B_OK)</a>
+<a name="ln70">		delete_sem(fWriteBufferSem);</a>
+<a name="ln71">}</a>
+<a name="ln72"> </a>
+<a name="ln73"> </a>
+<a name="ln74">bool</a>
+<a name="ln75">SerialDevice::Probe()</a>
+<a name="ln76">{</a>
+<a name="ln77">	uint8 msr;</a>
+<a name="ln78">	msr = ReadReg8(MSR);</a>
+<a name="ln79">	// just in case read twice to make sure the &quot;delta&quot; bits are 0</a>
+<a name="ln80">	msr = ReadReg8(MSR);</a>
+<a name="ln81">	// this should be enough to probe for the device for now</a>
+<a name="ln82">	// we might want to check the scratch reg, and try identifying</a>
+<a name="ln83">	// the model as in:</a>
+<a name="ln84">	// http://en.wikibooks.org/wiki/Serial_Programming/8250_UART_Programming#Software_Identification_of_the_UART</a>
+<a name="ln85">	return (msr != 0xff);</a>
+<a name="ln86">}</a>
+<a name="ln87"> </a>
+<a name="ln88"> </a>
+<a name="ln89">status_t</a>
+<a name="ln90">SerialDevice::Init()</a>
+<a name="ln91">{</a>
+<a name="ln92">	fDoneWrite = create_sem(0, &quot;pc_serial:done_write&quot;);</a>
+<a name="ln93">	fReadBufferSem = create_sem(0, &quot;pc_serial:done_read&quot;);</a>
+<a name="ln94">	fWriteBufferSem = create_sem(0, &quot;pc_serial:done_write&quot;);</a>
+<a name="ln95"> </a>
+<a name="ln96">	// disable IRQ</a>
+<a name="ln97">	fCachedIER = 0;</a>
+<a name="ln98">	WriteReg8(IER, fCachedIER);</a>
+<a name="ln99"> </a>
+<a name="ln100">	// disable DLAB</a>
+<a name="ln101">	WriteReg8(LCR, 0);</a>
+<a name="ln102"> </a>
+<a name="ln103">	return B_OK;</a>
+<a name="ln104">}</a>
+<a name="ln105"> </a>
+<a name="ln106"> </a>
+<a name="ln107">void</a>
+<a name="ln108">SerialDevice::SetModes(struct termios *tios)</a>
+<a name="ln109">{</a>
+<a name="ln110">	//TRACE_FUNCRES(trace_termios, tios);</a>
+<a name="ln111">	spin(10000);</a>
+<a name="ln112">	uint32 baudIndex = tios-&gt;c_cflag &amp; CBAUD;</a>
+<a name="ln113">	if (baudIndex &gt; BLAST)</a>
+<a name="ln114">		baudIndex = BLAST;</a>
+<a name="ln115"> </a>
+<a name="ln116">	// update our master config in full</a>
+<a name="ln117">	memcpy(&amp;fTTYConfig, tios, sizeof(termios));</a>
+<a name="ln118">	fTTYConfig.c_cflag &amp;= ~CBAUD;</a>
+<a name="ln119">	fTTYConfig.c_cflag |= baudIndex;</a>
+<a name="ln120"> </a>
+<a name="ln121">	// only apply the relevant parts to the device side</a>
+<a name="ln122">	termios config;</a>
+<a name="ln123">	memset(&amp;config, 0, sizeof(termios));</a>
+<a name="ln124">	config.c_cflag = tios-&gt;c_cflag;</a>
+<a name="ln125">	config.c_cflag &amp;= ~CBAUD;</a>
+<a name="ln126">	config.c_cflag |= baudIndex;</a>
+<a name="ln127"> </a>
+<a name="ln128">	// update the termios of the device side</a>
+<a name="ln129">	gTTYModule-&gt;tty_control(fDeviceTTYCookie, TCSETA, &amp;config, sizeof(termios));</a>
+<a name="ln130"> </a>
+<a name="ln131">	uint8 lcr = 0;</a>
+<a name="ln132">	uint16 divisor = SupportDescriptor()-&gt;bauds[baudIndex];</a>
+<a name="ln133"> </a>
+<a name="ln134">	switch (tios-&gt;c_cflag &amp; CSIZE) {</a>
+<a name="ln135">#if	CS5 != CS7</a>
+<a name="ln136">	// in case someday...</a>
+<a name="ln137">	case CS5:</a>
+<a name="ln138">		lcr |= LCR_5BIT;</a>
+<a name="ln139">		break;</a>
+<a name="ln140">	case CS6:</a>
+<a name="ln141">		lcr |= LCR_6BIT;</a>
+<a name="ln142">		break;</a>
+<a name="ln143">#endif</a>
+<a name="ln144">	case CS7:</a>
+<a name="ln145">		lcr |= LCR_7BIT;</a>
+<a name="ln146">		break;</a>
+<a name="ln147">	case CS8:</a>
+<a name="ln148">	default:</a>
+<a name="ln149">		lcr |= LCR_8BIT;</a>
+<a name="ln150">		break;</a>
+<a name="ln151">	}</a>
+<a name="ln152"> </a>
+<a name="ln153">	if (tios-&gt;c_cflag &amp; CSTOPB)</a>
+<a name="ln154">		lcr |= LCR_2STOP;</a>
+<a name="ln155">	if (tios-&gt;c_cflag &amp; PARENB)</a>
+<a name="ln156">		lcr |= LCR_P_EN;</a>
+<a name="ln157">	if ((tios-&gt;c_cflag &amp; PARODD) == 0)</a>
+<a name="ln158">		lcr |= LCR_P_EVEN;</a>
+<a name="ln159"> </a>
+<a name="ln160">	if (baudIndex == B0) {</a>
+<a name="ln161">		// disable</a>
+<a name="ln162">		MaskReg8(MCR, MCR_DTR);</a>
+<a name="ln163">	} else {</a>
+<a name="ln164">		// set FCR now, </a>
+<a name="ln165">		// 16650 and later chips have another reg at 2 when DLAB=1</a>
+<a name="ln166">		uint8 fcr = FCR_ENABLE | FCR_RX_RST | FCR_TX_RST | FCR_F_8 | FCR_F64EN;</a>
+<a name="ln167">		// enable fifo</a>
+<a name="ln168">		//fcr = 0;</a>
+<a name="ln169">		WriteReg8(FCR, fcr);</a>
+<a name="ln170"> </a>
+<a name="ln171">		// unmask the divisor latch regs</a>
+<a name="ln172">		WriteReg8(LCR, lcr | LCR_DLAB);</a>
+<a name="ln173">		// set divisor</a>
+<a name="ln174">		WriteReg8(DLLB, divisor &amp; 0x00ff);</a>
+<a name="ln175">		WriteReg8(DLHB, divisor &gt;&gt; 8);</a>
+<a name="ln176">		//WriteReg8(2,0);</a>
+<a name="ln177"> </a>
+<a name="ln178">	}</a>
+<a name="ln179">	// set control lines, and disable divisor latch reg</a>
+<a name="ln180">	WriteReg8(LCR, lcr);</a>
+<a name="ln181"> </a>
+<a name="ln182"> </a>
+<a name="ln183">#if 0</a>
+<a name="ln184">	uint16 newControl = fControlOut;</a>
+<a name="ln185"> </a>
+<a name="ln186">	static uint32 baudRates[] = {</a>
+<a name="ln187">		0x00000000, //B0</a>
+<a name="ln188">		0x00000032, //B50</a>
+<a name="ln189">		0x0000004B, //B75</a>
+<a name="ln190">		0x0000006E, //B110</a>
+<a name="ln191">		0x00000086, //B134</a>
+<a name="ln192">		0x00000096, //B150</a>
+<a name="ln193">		0x000000C8, //B200</a>
+<a name="ln194">		0x0000012C, //B300</a>
+<a name="ln195">		0x00000258, //B600</a>
+<a name="ln196">		0x000004B0, //B1200</a>
+<a name="ln197">		0x00000708, //B1800</a>
+<a name="ln198">		0x00000960, //B2400</a>
+<a name="ln199">		0x000012C0, //B4800</a>
+<a name="ln200">		0x00002580, //B9600</a>
+<a name="ln201">		0x00004B00, //B19200</a>
+<a name="ln202">		0x00009600, //B38400</a>
+<a name="ln203">		0x0000E100, //B57600</a>
+<a name="ln204">		0x0001C200, //B115200</a>
+<a name="ln205">		0x00038400, //B230400</a>
+<a name="ln206">		0x00070800, //460800</a>
+<a name="ln207">		0x000E1000, //921600</a>
+<a name="ln208">	};</a>
+<a name="ln209"> </a>
+<a name="ln210">	usb_serial_line_coding lineCoding;</a>
+<a name="ln211">	lineCoding.speed = baudRates[baudIndex];</a>
+<a name="ln212">	lineCoding.stopbits = (tios-&gt;c_cflag &amp; CSTOPB) ? LC_STOP_BIT_2 : LC_STOP_BIT_1;</a>
+<a name="ln213"> </a>
+<a name="ln214">	if (tios-&gt;c_cflag &amp; PARENB) {</a>
+<a name="ln215">		lineCoding.parity = LC_PARITY_EVEN;</a>
+<a name="ln216">		if (tios-&gt;c_cflag &amp; PARODD)</a>
+<a name="ln217">			lineCoding.parity = LC_PARITY_ODD;</a>
+<a name="ln218">	} else</a>
+<a name="ln219">		lineCoding.parity = LC_PARITY_NONE;</a>
+<a name="ln220"> </a>
+<a name="ln221">	lineCoding.databits = (tios-&gt;c_cflag &amp; CS8) ? 8 : 7;</a>
+<a name="ln222"> </a>
+<a name="ln223">	if (lineCoding.speed == 0) {</a>
+<a name="ln224">		newControl &amp;= 0xfffffffe;</a>
+<a name="ln225">		lineCoding.speed = fLineCoding.speed;</a>
+<a name="ln226">	} else</a>
+<a name="ln227">		newControl = CLS_LINE_DTR;</a>
+<a name="ln228"> </a>
+<a name="ln229">	if (fControlOut != newControl) {</a>
+<a name="ln230">		fControlOut = newControl;</a>
+<a name="ln231">		TRACE(&quot;newctrl send to modem: 0x%08x\n&quot;, newControl);</a>
+<a name="ln232">		SetControlLineState(newControl);</a>
+<a name="ln233">	}</a>
+<a name="ln234"> </a>
+<a name="ln235">	if (memcmp(&amp;lineCoding, &amp;fLineCoding, sizeof(usb_serial_line_coding)) != 0) {</a>
+<a name="ln236">		fLineCoding.speed = lineCoding.speed;</a>
+<a name="ln237">		fLineCoding.stopbits = lineCoding.stopbits;</a>
+<a name="ln238">		fLineCoding.databits = lineCoding.databits;</a>
+<a name="ln239">		fLineCoding.parity = lineCoding.parity;</a>
+<a name="ln240">		TRACE(&quot;send to modem: speed %d sb: 0x%08x db: 0x%08x parity: 0x%08x\n&quot;,</a>
+<a name="ln241">			fLineCoding.speed, fLineCoding.stopbits, fLineCoding.databits,</a>
+<a name="ln242">			fLineCoding.parity);</a>
+<a name="ln243">		SetLineCoding(&amp;fLineCoding);</a>
+<a name="ln244">	}</a>
+<a name="ln245">#endif</a>
+<a name="ln246">}</a>
+<a name="ln247"> </a>
+<a name="ln248"> </a>
+<a name="ln249">bool</a>
+<a name="ln250">SerialDevice::Service(struct tty *tty, uint32 op, void *buffer, size_t length)</a>
+<a name="ln251">{</a>
+<a name="ln252">	uint8 msr;</a>
+<a name="ln253">	status_t err;</a>
+<a name="ln254"> </a>
+<a name="ln255">	TRACE(&quot;%s(,0x%08lx,,%d)\n&quot;, __FUNCTION__, op, length);</a>
+<a name="ln256">	if (tty != fMasterTTY)</a>
+<a name="ln257">		return false;</a>
+<a name="ln258"> </a>
+<a name="ln259">	TRACE(&quot;%s(,0x%08lx,,%d)\n&quot;, __FUNCTION__, op, length);</a>
+<a name="ln260"> </a>
+<a name="ln261">	switch (op) {</a>
+<a name="ln262">		case TTYENABLE:</a>
+<a name="ln263">		{</a>
+<a name="ln264">			bool enable = *(bool *)buffer;</a>
+<a name="ln265">			TRACE(&quot;TTYENABLE: %sable\n&quot;, enable ? &quot;en&quot; : &quot;dis&quot;);</a>
+<a name="ln266"> </a>
+<a name="ln267">			if (enable) {</a>
+<a name="ln268">				//XXX:must call SetModes();</a>
+<a name="ln269">				err = install_io_interrupt_handler(IRQ(), pc_serial_interrupt, this, 0);</a>
+<a name="ln270">				TRACE(&quot;installing irq handler for %d: %s\n&quot;, IRQ(), strerror(err));</a>
+<a name="ln271">			} else {</a>
+<a name="ln272">				// remove the handler</a>
+<a name="ln273">				remove_io_interrupt_handler(IRQ(), pc_serial_interrupt, this);</a>
+<a name="ln274">				// disable IRQ</a>
+<a name="ln275">				fCachedIER = 0;</a>
+<a name="ln276">				WriteReg8(IER, fCachedIER);</a>
+<a name="ln277">				WriteReg8(MCR, 0);</a>
+<a name="ln278">			}</a>
+<a name="ln279"> </a>
+<a name="ln280">			msr = ReadReg8(MSR);</a>
+<a name="ln281"> </a>
+<a name="ln282">			SignalControlLineState(TTYHWDCD, msr &amp; MSR_DCD);</a>
+<a name="ln283">			SignalControlLineState(TTYHWCTS, msr &amp; MSR_CTS);</a>
+<a name="ln284"> </a>
+<a name="ln285">			if (enable) {</a>
+<a name="ln286">				// </a>
+<a name="ln287">				WriteReg8(MCR, MCR_DTR | MCR_RTS | MCR_IRQ_EN /*| MCR_LOOP*//*XXXXXXX*/);</a>
+<a name="ln288">				// enable irqs</a>
+<a name="ln289">				fCachedIER = IER_RLS | IER_MS | IER_RDA;</a>
+<a name="ln290">				WriteReg8(IER, fCachedIER);</a>
+<a name="ln291">				//WriteReg8(IER, IER_RDA);</a>
+<a name="ln292">			}</a>
+<a name="ln293"> </a>
+<a name="ln294">			return true;</a>
+<a name="ln295">		}</a>
+<a name="ln296"> </a>
+<a name="ln297">		case TTYISTOP:</a>
+<a name="ln298">			fInputStopped = *(bool *)buffer;</a>
+<a name="ln299">			TRACE(&quot;TTYISTOP: %sstopped\n&quot;, fInputStopped ? &quot;&quot; : &quot;not &quot;);</a>
+<a name="ln300"> </a>
+<a name="ln301">			if (fInputStopped)</a>
+<a name="ln302">				MaskReg8(MCR, MCR_RTS);</a>
+<a name="ln303">			else</a>
+<a name="ln304">				OrReg8(MCR, MCR_RTS);</a>
+<a name="ln305"> </a>
+<a name="ln306">			//gTTYModule-&gt;ttyhwsignal(ptty, ddr, TTYHWCTS, false);</a>
+<a name="ln307">			//SignalControlLineState(TTYHWCTS, !fInputStopped);</a>
+<a name="ln308">			//msr = ReadReg8(MSR);</a>
+<a name="ln309">			//SignalControlLineState(TTYHWCTS, msr &amp; MSR_CTS);</a>
+<a name="ln310">			return true;</a>
+<a name="ln311"> </a>
+<a name="ln312">		case TTYGETSIGNALS:</a>
+<a name="ln313">			TRACE(&quot;TTYGETSIGNALS\n&quot;);</a>
+<a name="ln314">			msr = ReadReg8(MSR);</a>
+<a name="ln315">			SignalControlLineState(TTYHWDCD, msr &amp; MSR_DCD);</a>
+<a name="ln316">			SignalControlLineState(TTYHWCTS, msr &amp; MSR_CTS);</a>
+<a name="ln317">			SignalControlLineState(TTYHWDSR, msr &amp; MSR_DSR);</a>
+<a name="ln318">			SignalControlLineState(TTYHWRI, msr &amp; MSR_RI);</a>
+<a name="ln319">			return true;</a>
+<a name="ln320"> </a>
+<a name="ln321">		case TTYSETMODES:</a>
+<a name="ln322">			TRACE(&quot;TTYSETMODES\n&quot;);</a>
+<a name="ln323">			SetModes((struct termios *)buffer);</a>
+<a name="ln324">//WriteReg8(IER, IER_RLS | IER_MS | IER_RDA);</a>
+<a name="ln325">			return true;</a>
+<a name="ln326"> </a>
+<a name="ln327">		case TTYSETDTR:</a>
+<a name="ln328">		case TTYSETRTS:</a>
+<a name="ln329">		{</a>
+<a name="ln330">			bool set = *(bool *)buffer;</a>
+<a name="ln331">			uint8 bit = op == TTYSETDTR ? MCR_DTR : MCR_RTS;</a>
+<a name="ln332">			if (set)</a>
+<a name="ln333">				OrReg8(MCR, bit);</a>
+<a name="ln334">			else</a>
+<a name="ln335">				MaskReg8(MCR, bit);</a>
+<a name="ln336"> </a>
+<a name="ln337">			return true;</a>
+<a name="ln338">		}</a>
+<a name="ln339"> </a>
+<a name="ln340">		case TTYOSTART:</a>
+<a name="ln341">			TRACE(&quot;TTYOSTART\n&quot;);</a>
+<a name="ln342">			// enable irqs</a>
+<a name="ln343">			fCachedIER |= IER_THRE;</a>
+<a name="ln344">			// XXX: toggle the bit to make VirtualBox happy !?</a>
+<a name="ln345">			WriteReg8(IER, fCachedIER &amp; ~IER_THRE);</a>
+<a name="ln346">			WriteReg8(IER, fCachedIER);</a>
+<a name="ln347">			return true;</a>
+<a name="ln348">		case TTYOSYNC:</a>
+<a name="ln349">			TRACE(&quot;TTYOSYNC\n&quot;);</a>
+<a name="ln350">			return (ReadReg8(LSR) &amp; (LSR_THRE | LSR_TSRE)) == (LSR_THRE | LSR_TSRE);</a>
+<a name="ln351">			return true;</a>
+<a name="ln352">		case TTYSETBREAK:</a>
+<a name="ln353">		{</a>
+<a name="ln354">			bool set = *(bool *)buffer;</a>
+<a name="ln355">			if (set)</a>
+<a name="ln356">				OrReg8(MCR, LCR_BREAK);</a>
+<a name="ln357">			else</a>
+<a name="ln358">				MaskReg8(MCR, LCR_BREAK);</a>
+<a name="ln359"> </a>
+<a name="ln360">			return true;</a>
+<a name="ln361">		}</a>
+<a name="ln362">		default:</a>
+<a name="ln363">			return false;</a>
+<a name="ln364">	}</a>
+<a name="ln365"> </a>
+<a name="ln366">	return false;</a>
+<a name="ln367">}</a>
+<a name="ln368"> </a>
+<a name="ln369"> </a>
+<a name="ln370">bool</a>
+<a name="ln371">SerialDevice::IsInterruptPending()</a>
+<a name="ln372">{</a>
+<a name="ln373">	TRACE((&quot;IsInterruptPending()\n&quot;));</a>
+<a name="ln374"> </a>
+<a name="ln375">	// because reading the IIR acknowledges some IRQ conditions,</a>
+<a name="ln376">	// the next time we'll read we'll miss the IRQ condition</a>
+<a name="ln377">	// so we just cache the value for the real handler</a>
+<a name="ln378">	fCachedIIR = ReadReg8(IIR);</a>
+<a name="ln379"> </a>
+<a name="ln380">	bool pending = (fCachedIIR &amp; IIR_PENDING) == 0;</a>
+<a name="ln381"> </a>
+<a name="ln382">	if (pending) {</a>
+<a name="ln383">		// temporarily mask the IRQ</a>
+<a name="ln384">		// else VirtualBox triggers one per every written byte it seems</a>
+<a name="ln385">		// not sure it's required on real hardware</a>
+<a name="ln386">		WriteReg8(IER, fCachedIER &amp; ~(IER_RLS | IER_MS | IER_RDA | IER_THRE));</a>
+<a name="ln387"> </a>
+<a name="ln388">		atomic_add(&amp;fPendingDPC, 1);</a>
+<a name="ln389">	}</a>
+<a name="ln390"> </a>
+<a name="ln391">	return pending; // 0 means yes</a>
+<a name="ln392">}</a>
+<a name="ln393"> </a>
+<a name="ln394"> </a>
+<a name="ln395">int32</a>
+<a name="ln396">SerialDevice::InterruptHandler()</a>
+<a name="ln397">{</a>
+<a name="ln398">	int32 ret = B_UNHANDLED_INTERRUPT;</a>
+<a name="ln399">	//XXX: what should we do here ? (certainly not use a mutex !)</a>
+<a name="ln400"> </a>
+<a name="ln401">	uint8 iir, lsr, msr;</a>
+<a name="ln402">	uint8 buffer[64];</a>
+<a name="ln403">	int tries = 8; // avoid busy looping</a>
+<a name="ln404">	TRACE((&quot;InterruptHandler()\n&quot;));</a>
+<a name="ln405"> </a>
+<a name="ln406">	// start with the first (cached) irq condition</a>
+<a name="ln407">	iir = fCachedIIR;</a>
+<a name="ln408">	while ((iir &amp; IIR_PENDING) == 0) { // 0 means yes</a>
+<a name="ln409">		status_t status;</a>
+<a name="ln410">		size_t bytesLeft;</a>
+<a name="ln411">		size_t readable = 0;</a>
+<a name="ln412">		size_t fifoavail = 1;</a>
+<a name="ln413">		size_t i;</a>
+<a name="ln414">		</a>
+<a name="ln415">		//DEBUG</a>
+<a name="ln416">//		for (int count = 0; ReadReg8(LSR) &amp; LSR_DR; count++)</a>
+<a name="ln417">//			gTTYModule-&gt;ttyin(&amp;fTTY, &amp;fRover, ReadReg8(RBR));</a>
+<a name="ln418"> </a>
+<a name="ln419">		switch (iir &amp; (IIR_IMASK | IIR_TO)) {</a>
+<a name="ln420">		case IIR_THRE:</a>
+<a name="ln421">			TRACE((&quot;IIR_THRE\n&quot;));</a>
+<a name="ln422">			// check how much fifo we can use</a>
+<a name="ln423">			//XXX: move to Init() ?</a>
+<a name="ln424">			if ((iir &amp; IIR_FMASK) == IIR_FMASK)</a>
+<a name="ln425">				fifoavail = 16;</a>
+<a name="ln426">			if (iir &amp; IIR_F64EN)</a>
+<a name="ln427">				fifoavail = 64;</a>
+<a name="ln428">			// we're not open... just discard the data</a>
+<a name="ln429">			if (!IsOpen())</a>
+<a name="ln430">				break;</a>
+<a name="ln431">			gTTYModule-&gt;tty_control(fDeviceTTYCookie, FIONREAD, &amp;readable,</a>
+<a name="ln432">				sizeof(readable));</a>
+<a name="ln433">			TRACE(&quot;%s: FIONREAD: %d\n&quot;, __FUNCTION__, readable);</a>
+<a name="ln434"> </a>
+<a name="ln435">			if (readable == 0) {</a>
+<a name="ln436">				release_sem_etc(fDoneWrite, 1, B_DO_NOT_RESCHEDULE);</a>
+<a name="ln437">				// mask it until there's data again</a>
+<a name="ln438">				fCachedIER &amp;= ~IER_THRE;</a>
+<a name="ln439">				break;</a>
+<a name="ln440">			}</a>
+<a name="ln441"> </a>
+<a name="ln442">			bytesLeft = MIN(fifoavail, sizeof(buffer));</a>
+<a name="ln443">			bytesLeft = MIN(bytesLeft, readable);</a>
+<a name="ln444">			TRACE(&quot;%s: left %d\n&quot;, __FUNCTION__, bytesLeft);</a>
+<a name="ln445">			status = gTTYModule-&gt;tty_read(fDeviceTTYCookie, buffer, &amp;bytesLeft);</a>
+<a name="ln446">			TRACE(&quot;%s: tty_read: %d\n&quot;, __FUNCTION__, bytesLeft);</a>
+<a name="ln447">			if (status != B_OK) {</a>
+<a name="ln448">				dprintf(DRIVER_NAME &quot;: irq: tty_read: %s\n&quot;, strerror(status));</a>
+<a name="ln449">				break;</a>
+<a name="ln450">			}</a>
+<a name="ln451"> </a>
+<a name="ln452">			for (i = 0; i &lt; bytesLeft; i++) {</a>
+<a name="ln453">				WriteReg8(THB, buffer[i]);</a>
+<a name="ln454">			}</a>
+<a name="ln455"> </a>
+<a name="ln456">			break;</a>
+<a name="ln457">		case IIR_TO:</a>
+<a name="ln458">		case IIR_TO | IIR_RDA:</a>
+<a name="ln459">			// timeout: FALLTHROUGH</a>
+<a name="ln460">		case IIR_RDA:</a>
+<a name="ln461">			TRACE((&quot;IIR_TO/RDA\n&quot;));</a>
+<a name="ln462">			// while data is ready... and we have room for it, get it</a>
+<a name="ln463">			bytesLeft = sizeof(buffer);</a>
+<a name="ln464">			for (i = 0; i &lt; bytesLeft &amp;&amp; (ReadReg8(LSR) &amp; LSR_DR); i++) {</a>
+<a name="ln465">				buffer[i] = ReadReg8(RBR);</a>
+<a name="ln466">			}</a>
+<a name="ln467">			// we're not open... just discard the data</a>
+<a name="ln468">			if (!IsOpen())</a>
+<a name="ln469">				break;</a>
+<a name="ln470">			// we shouldn't block here but it's &lt; 256 bytes anyway</a>
+<a name="ln471">			status = gTTYModule-&gt;tty_write(fDeviceTTYCookie, buffer, &amp;i);</a>
+<a name="ln472">			if (status != B_OK) {</a>
+<a name="ln473">				dprintf(DRIVER_NAME &quot;: irq: tty_write: %s\n&quot;, strerror(status));</a>
+<a name="ln474">				break;</a>
+<a name="ln475">			}</a>
+<a name="ln476">			break;</a>
+<a name="ln477">		case IIR_RLS:</a>
+<a name="ln478">			TRACE((&quot;IIR_RLS\n&quot;));</a>
+<a name="ln479">			// ack</a>
+<a name="ln480">			lsr = ReadReg8(LSR);</a>
+<a name="ln481">			//XXX: handle this somehow</a>
+<a name="ln482">			break;</a>
+<a name="ln483">		case IIR_MS:</a>
+<a name="ln484">			TRACE((&quot;IIR_MS\n&quot;));</a>
+<a name="ln485">			// modem signals changed</a>
+<a name="ln486">			msr = ReadReg8(MSR);</a>
+<a name="ln487">			if (!IsOpen())</a>
+<a name="ln488">				break;</a>
+<a name="ln489">			if (msr &amp; MSR_DDCD)</a>
+<a name="ln490">				SignalControlLineState(TTYHWDCD, msr &amp; MSR_DCD);</a>
+<a name="ln491">			if (msr &amp; MSR_DCTS)</a>
+<a name="ln492">				SignalControlLineState(TTYHWCTS, msr &amp; MSR_CTS);</a>
+<a name="ln493">			if (msr &amp; MSR_DDSR)</a>
+<a name="ln494">				SignalControlLineState(TTYHWDSR, msr &amp; MSR_DSR);</a>
+<a name="ln495">			if (msr &amp; MSR_TERI)</a>
+<a name="ln496">				SignalControlLineState(TTYHWRI, msr &amp; MSR_RI);</a>
+<a name="ln497">			break;</a>
+<a name="ln498">		default:</a>
+<a name="ln499">			TRACE((&quot;IIR_?\n&quot;));</a>
+<a name="ln500">			// something happened</a>
+<a name="ln501">			break;</a>
+<a name="ln502">		}</a>
+<a name="ln503">		ret = B_HANDLED_INTERRUPT;</a>
+<a name="ln504">		TRACE((&quot;IRQ:h\n&quot;));</a>
+<a name="ln505"> </a>
+<a name="ln506">		// enough for now</a>
+<a name="ln507">		if (tries-- == 0)</a>
+<a name="ln508">			break;</a>
+<a name="ln509"> </a>
+<a name="ln510">		// check the next IRQ condition</a>
+<a name="ln511">		iir = ReadReg8(IIR);</a>
+<a name="ln512">	}</a>
+<a name="ln513"> </a>
+<a name="ln514">	atomic_add(&amp;fPendingDPC, -1);</a>
+<a name="ln515"> </a>
+<a name="ln516">	// unmask IRQ</a>
+<a name="ln517">	WriteReg8(IER, fCachedIER);</a>
+<a name="ln518"> </a>
+<a name="ln519">	TRACE_FUNCRET(&quot;&lt; IRQ:%d\n&quot;, ret);</a>
+<a name="ln520">	return ret;</a>
+<a name="ln521">}</a>
+<a name="ln522"> </a>
+<a name="ln523"> </a>
+<a name="ln524">status_t</a>
+<a name="ln525">SerialDevice::Open(uint32 flags)</a>
+<a name="ln526">{</a>
+<a name="ln527">	status_t status = B_OK;</a>
+<a name="ln528"> </a>
+<a name="ln529">	if (fDeviceOpen)</a>
+<a name="ln530">		return B_BUSY;</a>
+<a name="ln531"> </a>
+<a name="ln532">	if (fDeviceRemoved)</a>
+<a name="ln533">		return B_DEV_NOT_READY;</a>
+<a name="ln534"> </a>
+<a name="ln535">	fMasterTTY = gTTYModule-&gt;tty_create(pc_serial_service, true);</a>
+<a name="ln536">	if (fMasterTTY == NULL) {</a>
+<a name="ln537">		TRACE_ALWAYS(&quot;open: failed to init master tty\n&quot;);</a>
+<a name="ln538">		return B_NO_MEMORY;</a>
+<a name="ln539">	}</a>
+<a name="ln540"> </a>
+<a name="ln541">	fSlaveTTY = gTTYModule-&gt;tty_create(pc_serial_service, false);</a>
+<a name="ln542">	if (fSlaveTTY == NULL) {</a>
+<a name="ln543">		TRACE_ALWAYS(&quot;open: failed to init slave tty\n&quot;);</a>
+<a name="ln544">		gTTYModule-&gt;tty_destroy(fMasterTTY);</a>
+<a name="ln545">		return B_NO_MEMORY;</a>
+<a name="ln546">	}</a>
+<a name="ln547"> </a>
+<a name="ln548">	fSystemTTYCookie = gTTYModule-&gt;tty_create_cookie(fMasterTTY, fSlaveTTY,</a>
+<a name="ln549">		O_RDWR);</a>
+<a name="ln550">	if (fSystemTTYCookie == NULL) {</a>
+<a name="ln551">		TRACE_ALWAYS(&quot;open: failed to init system tty cookie\n&quot;);</a>
+<a name="ln552">		gTTYModule-&gt;tty_destroy(fMasterTTY);</a>
+<a name="ln553">		gTTYModule-&gt;tty_destroy(fSlaveTTY);</a>
+<a name="ln554">		return B_NO_MEMORY;</a>
+<a name="ln555">	}</a>
+<a name="ln556"> </a>
+<a name="ln557">	fDeviceTTYCookie = gTTYModule-&gt;tty_create_cookie(fSlaveTTY, fMasterTTY,</a>
+<a name="ln558">		O_RDWR);</a>
+<a name="ln559">	if (fDeviceTTYCookie == NULL) {</a>
+<a name="ln560">		TRACE_ALWAYS(&quot;open: failed to init device tty cookie\n&quot;);</a>
+<a name="ln561">		gTTYModule-&gt;tty_destroy_cookie(fSystemTTYCookie);</a>
+<a name="ln562">		gTTYModule-&gt;tty_destroy(fMasterTTY);</a>
+<a name="ln563">		gTTYModule-&gt;tty_destroy(fSlaveTTY);</a>
+<a name="ln564">		return B_NO_MEMORY;</a>
+<a name="ln565">	}</a>
+<a name="ln566"> </a>
+<a name="ln567">	ResetDevice();</a>
+<a name="ln568"> </a>
+<a name="ln569">	//XXX: we shouldn't have to do this!</a>
+<a name="ln570">	bool en = true;</a>
+<a name="ln571">	Service(fMasterTTY, TTYENABLE, &amp;en, sizeof(en));</a>
+<a name="ln572"> </a>
+<a name="ln573">	if (status &lt; B_OK) {</a>
+<a name="ln574">		TRACE_ALWAYS(&quot;open: failed to open tty\n&quot;);</a>
+<a name="ln575">		return status;</a>
+<a name="ln576">	}</a>
+<a name="ln577"> </a>
+<a name="ln578">	// set our config (will propagate to the slave config as well in SetModes()</a>
+<a name="ln579">	gTTYModule-&gt;tty_control(fSystemTTYCookie, TCSETA, &amp;fTTYConfig,</a>
+<a name="ln580">		sizeof(termios));</a>
+<a name="ln581"> </a>
+<a name="ln582">#if 0</a>
+<a name="ln583">	fDeviceThread = spawn_kernel_thread(_DeviceThread, &quot;usb_serial device thread&quot;,</a>
+<a name="ln584">		B_NORMAL_PRIORITY, this);</a>
+<a name="ln585"> </a>
+<a name="ln586">	if (fDeviceThread &lt; B_OK) {</a>
+<a name="ln587">		TRACE_ALWAYS(&quot;open: failed to spawn kernel thread\n&quot;);</a>
+<a name="ln588">		return fDeviceThread;</a>
+<a name="ln589">	}</a>
+<a name="ln590"> </a>
+<a name="ln591">	resume_thread(fDeviceThread);</a>
+<a name="ln592"> </a>
+<a name="ln593">	fControlOut = CLS_LINE_DTR | CLS_LINE_RTS;</a>
+<a name="ln594">	SetControlLineState(fControlOut);</a>
+<a name="ln595"> </a>
+<a name="ln596">	status = gUSBModule-&gt;queue_interrupt(fControlPipe, fInterruptBuffer,</a>
+<a name="ln597">		fInterruptBufferSize, InterruptCallbackFunction, this);</a>
+<a name="ln598">	if (status &lt; B_OK)</a>
+<a name="ln599">		TRACE_ALWAYS(&quot;failed to queue initial interrupt\n&quot;);</a>
+<a name="ln600"> </a>
+<a name="ln601">#endif</a>
+<a name="ln602">	fDeviceOpen = true;</a>
+<a name="ln603">	return B_OK;</a>
+<a name="ln604">}</a>
+<a name="ln605"> </a>
+<a name="ln606"> </a>
+<a name="ln607">status_t</a>
+<a name="ln608">SerialDevice::Read(char *buffer, size_t *numBytes)</a>
+<a name="ln609">{</a>
+<a name="ln610">	if (fDeviceRemoved) {</a>
+<a name="ln611">		*numBytes = 0;</a>
+<a name="ln612">		return B_DEV_NOT_READY;</a>
+<a name="ln613">	}</a>
+<a name="ln614"> </a>
+<a name="ln615">	status_t status;</a>
+<a name="ln616"> </a>
+<a name="ln617">	status = gTTYModule-&gt;tty_read(fSystemTTYCookie, buffer, numBytes);</a>
+<a name="ln618"> </a>
+<a name="ln619">	return status;</a>
+<a name="ln620">}</a>
+<a name="ln621"> </a>
+<a name="ln622"> </a>
+<a name="ln623">status_t</a>
+<a name="ln624">SerialDevice::Write(const char *buffer, size_t *numBytes)</a>
+<a name="ln625">{</a>
+<a name="ln626">	TRACE(&quot;%s(,&amp;%d)\n&quot;, __FUNCTION__, *numBytes);</a>
+<a name="ln627">	if (fDeviceRemoved) {</a>
+<a name="ln628">		*numBytes = 0;</a>
+<a name="ln629">		return B_DEV_NOT_READY;</a>
+<a name="ln630">	}</a>
+<a name="ln631"> </a>
+<a name="ln632">	status_t status;</a>
+<a name="ln633">	size_t bytesLeft = *numBytes;</a>
+<a name="ln634">	*numBytes = 0;</a>
+<a name="ln635"> </a>
+<a name="ln636">	while (bytesLeft &gt; 0) {</a>
+<a name="ln637">		size_t length = MIN(bytesLeft, 256);</a>
+<a name="ln638">			// TODO: This is an ugly hack; We use a small buffer size so that</a>
+<a name="ln639">			// we don't overrun the tty line buffer and cause it to block. While</a>
+<a name="ln640">			// that isn't a problem, we shouldn't just hardcode the value here.</a>
+<a name="ln641"> </a>
+<a name="ln642">		TRACE(&quot;%s: tty_write(,&amp;%d)\n&quot;, __FUNCTION__, length);</a>
+<a name="ln643">		status = gTTYModule-&gt;tty_write(fSystemTTYCookie, buffer,</a>
+<a name="ln644">			&amp;length);</a>
+<a name="ln645">		if (status != B_OK) {</a>
+<a name="ln646">			TRACE_ALWAYS(&quot;failed to write to tty: %s\n&quot;, strerror(status));</a>
+<a name="ln647">			return status;</a>
+<a name="ln648">		}</a>
+<a name="ln649"> </a>
+<a name="ln650">		buffer += length;</a>
+<a name="ln651">		*numBytes += length;</a>
+<a name="ln652">		bytesLeft -= length;</a>
+<a name="ln653"> </a>
+<a name="ln654">		// XXX: WTF: this ought to be done by the tty module calling service_func!</a>
+<a name="ln655">		// enable irqs</a>
+<a name="ln656">		Service(fMasterTTY, TTYOSTART, NULL, 0);</a>
+<a name="ln657">	}</a>
+<a name="ln658"> </a>
+<a name="ln659">	status = acquire_sem_etc(fDoneWrite, 1, B_CAN_INTERRUPT, 0);</a>
+<a name="ln660">	if (status != B_OK) {</a>
+<a name="ln661">		TRACE_ALWAYS(&quot;write: failed to get write done sem &quot;</a>
+<a name="ln662">				&quot;0x%08x\n&quot;, status);</a>
+<a name="ln663">		return status;</a>
+<a name="ln664">	}</a>
+<a name="ln665"> </a>
+<a name="ln666"> </a>
+<a name="ln667">	if (*numBytes &gt; 0)</a>
+<a name="ln668">		return B_OK;</a>
+<a name="ln669"> </a>
+<a name="ln670">	return B_ERROR;</a>
+<a name="ln671">}</a>
+<a name="ln672"> </a>
+<a name="ln673"> </a>
+<a name="ln674">status_t</a>
+<a name="ln675">SerialDevice::Control(uint32 op, void *arg, size_t length)</a>
+<a name="ln676">{</a>
+<a name="ln677">	status_t status = B_OK;</a>
+<a name="ln678"> </a>
+<a name="ln679">	if (fDeviceRemoved)</a>
+<a name="ln680">		return B_DEV_NOT_READY;</a>
+<a name="ln681"> </a>
+<a name="ln682">	status = gTTYModule-&gt;tty_control(fSystemTTYCookie, op, arg, length);</a>
+<a name="ln683"> </a>
+<a name="ln684">	return status;</a>
+<a name="ln685">}</a>
+<a name="ln686"> </a>
+<a name="ln687"> </a>
+<a name="ln688">status_t</a>
+<a name="ln689">SerialDevice::Select(uint8 event, uint32 ref, selectsync *sync)</a>
+<a name="ln690">{</a>
+<a name="ln691">	if (fDeviceRemoved)</a>
+<a name="ln692">		return B_DEV_NOT_READY;</a>
+<a name="ln693"> </a>
+<a name="ln694">	return gTTYModule-&gt;tty_select(fSystemTTYCookie, event, ref, sync);</a>
+<a name="ln695">}</a>
+<a name="ln696"> </a>
+<a name="ln697"> </a>
+<a name="ln698">status_t</a>
+<a name="ln699">SerialDevice::DeSelect(uint8 event, selectsync *sync)</a>
+<a name="ln700">{</a>
+<a name="ln701">	if (fDeviceRemoved)</a>
+<a name="ln702">		return B_DEV_NOT_READY;</a>
+<a name="ln703"> </a>
+<a name="ln704">	return gTTYModule-&gt;tty_deselect(fSystemTTYCookie, event, sync);</a>
+<a name="ln705">}</a>
+<a name="ln706"> </a>
+<a name="ln707"> </a>
+<a name="ln708">status_t</a>
+<a name="ln709">SerialDevice::Close()</a>
+<a name="ln710">{</a>
+<a name="ln711">	status_t status = B_OK;</a>
+<a name="ln712"> </a>
+<a name="ln713">	OnClose();</a>
+<a name="ln714"> </a>
+<a name="ln715">	if (!fDeviceRemoved) {</a>
+<a name="ln716">#if 0</a>
+<a name="ln717">		gUSBModule-&gt;cancel_queued_transfers(fReadPipe);</a>
+<a name="ln718">		gUSBModule-&gt;cancel_queued_transfers(fWritePipe);</a>
+<a name="ln719">		gUSBModule-&gt;cancel_queued_transfers(fControlPipe);</a>
+<a name="ln720">#endif</a>
+<a name="ln721">	}</a>
+<a name="ln722"> </a>
+<a name="ln723">	fDeviceOpen = false;</a>
+<a name="ln724"> </a>
+<a name="ln725">	gTTYModule-&gt;tty_close_cookie(fSystemTTYCookie);</a>
+<a name="ln726">	gTTYModule-&gt;tty_close_cookie(fDeviceTTYCookie);</a>
+<a name="ln727"> </a>
+<a name="ln728">	//XXX: we shouldn't have to do this!</a>
+<a name="ln729">	bool en = false;</a>
+<a name="ln730">	Service(fMasterTTY, TTYENABLE, &amp;en, sizeof(en));</a>
+<a name="ln731"> </a>
+<a name="ln732">	return status;</a>
+<a name="ln733">}</a>
+<a name="ln734"> </a>
+<a name="ln735"> </a>
+<a name="ln736">status_t</a>
+<a name="ln737">SerialDevice::Free()</a>
+<a name="ln738">{</a>
+<a name="ln739">	status_t status = B_OK;</a>
+<a name="ln740"> </a>
+<a name="ln741">	// wait until currently executing DPC is done. In case another one</a>
+<a name="ln742">	// is run beyond this point it will just bail out on !IsOpen().</a>
+<a name="ln743">	//while (atomic_get(&amp;fPendingDPC))</a>
+<a name="ln744">	//	snooze(1000);</a>
+<a name="ln745"> </a>
+<a name="ln746">	gTTYModule-&gt;tty_destroy_cookie(fSystemTTYCookie);</a>
+<a name="ln747">	gTTYModule-&gt;tty_destroy_cookie(fDeviceTTYCookie);</a>
+<a name="ln748">	fSystemTTYCookie = fDeviceTTYCookie = NULL;</a>
+<a name="ln749"> </a>
+<a name="ln750">	gTTYModule-&gt;tty_destroy(fMasterTTY);</a>
+<a name="ln751">	gTTYModule-&gt;tty_destroy(fSlaveTTY);</a>
+<a name="ln752">	fMasterTTY = fSlaveTTY = NULL;</a>
+<a name="ln753"> </a>
+<a name="ln754">	return status;</a>
+<a name="ln755">}</a>
+<a name="ln756"> </a>
+<a name="ln757"> </a>
+<a name="ln758">void</a>
+<a name="ln759">SerialDevice::Removed()</a>
+<a name="ln760">{</a>
+<a name="ln761">	if (fDeviceRemoved)</a>
+<a name="ln762">		return;</a>
+<a name="ln763"> </a>
+<a name="ln764">	// notifies us that the device was removed</a>
+<a name="ln765">	fDeviceRemoved = true;</a>
+<a name="ln766"> </a>
+<a name="ln767">	// we need to ensure that we do not use the device anymore</a>
+<a name="ln768">	fStopDeviceThread = true;</a>
+<a name="ln769">	fInputStopped = false;</a>
+<a name="ln770">#if 0</a>
+<a name="ln771">	gUSBModule-&gt;cancel_queued_transfers(fReadPipe);</a>
+<a name="ln772">	gUSBModule-&gt;cancel_queued_transfers(fWritePipe);</a>
+<a name="ln773">	gUSBModule-&gt;cancel_queued_transfers(fControlPipe);</a>
+<a name="ln774">#endif</a>
+<a name="ln775"> </a>
+<a name="ln776">	int32 result = B_OK;</a>
+<a name="ln777">	wait_for_thread(fDeviceThread, &amp;result);</a>
+<a name="ln778">	fDeviceThread = -1;</a>
+<a name="ln779">}</a>
+<a name="ln780"> </a>
+<a name="ln781"> </a>
+<a name="ln782">status_t</a>
+<a name="ln783">SerialDevice::AddDevice(const serial_config_descriptor *config)</a>
+<a name="ln784">{</a>
+<a name="ln785">	// default implementation - does nothing</a>
+<a name="ln786">	return B_ERROR;</a>
+<a name="ln787">}</a>
+<a name="ln788"> </a>
+<a name="ln789"> </a>
+<a name="ln790">status_t</a>
+<a name="ln791">SerialDevice::ResetDevice()</a>
+<a name="ln792">{</a>
+<a name="ln793">	// default implementation - does nothing</a>
+<a name="ln794">	return B_OK;</a>
+<a name="ln795">}</a>
+<a name="ln796"> </a>
+<a name="ln797"> </a>
+<a name="ln798">#if 0</a>
+<a name="ln799">status_t</a>
+<a name="ln800">SerialDevice::SetLineCoding(usb_serial_line_coding *coding)</a>
+<a name="ln801">{</a>
+<a name="ln802">	// default implementation - does nothing</a>
+<a name="ln803">	return B_OK;</a>
+<a name="ln804">}</a>
+<a name="ln805">#endif</a>
+<a name="ln806"> </a>
+<a name="ln807">status_t</a>
+<a name="ln808">SerialDevice::SignalControlLineState(int line, bool enable)</a>
+<a name="ln809">{</a>
+<a name="ln810">	gTTYModule-&gt;tty_hardware_signal(fSystemTTYCookie, line, enable);</a>
+<a name="ln811"> </a>
+<a name="ln812">	return B_OK;</a>
+<a name="ln813">}</a>
+<a name="ln814"> </a>
+<a name="ln815"> </a>
+<a name="ln816">void</a>
+<a name="ln817">SerialDevice::OnRead(char **buffer, size_t *numBytes)</a>
+<a name="ln818">{</a>
+<a name="ln819">	// default implementation - does nothing</a>
+<a name="ln820">}</a>
+<a name="ln821"> </a>
+<a name="ln822"> </a>
+<a name="ln823">void</a>
+<a name="ln824">SerialDevice::OnWrite(const char *buffer, size_t *numBytes, size_t *packetBytes)</a>
+<a name="ln825">{</a>
+<a name="ln826">	// default implementation - does nothing</a>
+<a name="ln827">}</a>
+<a name="ln828"> </a>
+<a name="ln829"> </a>
+<a name="ln830">void</a>
+<a name="ln831">SerialDevice::OnClose()</a>
+<a name="ln832">{</a>
+<a name="ln833">	// default implementation - does nothing</a>
+<a name="ln834">}</a>
+<a name="ln835"> </a>
+<a name="ln836"> </a>
+<a name="ln837">int32</a>
+<a name="ln838">SerialDevice::_DeviceThread(void *data)</a>
+<a name="ln839">{</a>
+<a name="ln840">#if 0</a>
+<a name="ln841">	SerialDevice *device = (SerialDevice *)data;</a>
+<a name="ln842"> </a>
+<a name="ln843">	while (!device-&gt;fStopDeviceThread) {</a>
+<a name="ln844">		status_t status = gUSBModule-&gt;queue_bulk(device-&gt;fReadPipe,</a>
+<a name="ln845">			device-&gt;fReadBuffer, device-&gt;fReadBufferSize,</a>
+<a name="ln846">			device-&gt;ReadCallbackFunction, data);</a>
+<a name="ln847">		if (status &lt; B_OK) {</a>
+<a name="ln848">			TRACE_ALWAYS(&quot;device thread: queueing failed with error: 0x%08x\n&quot;, status);</a>
+<a name="ln849">			break;</a>
+<a name="ln850">		}</a>
+<a name="ln851"> </a>
+<a name="ln852">		status = acquire_sem_etc(device-&gt;fDoneRead, 1, B_CAN_INTERRUPT, 0);</a>
+<a name="ln853">		if (status &lt; B_OK) {</a>
+<a name="ln854">			TRACE_ALWAYS(&quot;device thread: failed to get read done sem 0x%08x\n&quot;, status);</a>
+<a name="ln855">			break;</a>
+<a name="ln856">		}</a>
+<a name="ln857"> </a>
+<a name="ln858">		if (device-&gt;fStatusRead != B_OK) {</a>
+<a name="ln859">			TRACE(&quot;device thread: device status error 0x%08x\n&quot;,</a>
+<a name="ln860">				device-&gt;fStatusRead);</a>
+<a name="ln861">			if (gUSBModule-&gt;clear_feature(device-&gt;fReadPipe,</a>
+<a name="ln862">				USB_FEATURE_ENDPOINT_HALT) != B_OK) {</a>
+<a name="ln863">				TRACE_ALWAYS(&quot;device thread: failed to clear halt feature\n&quot;);</a>
+<a name="ln864">				break;</a>
+<a name="ln865">			}</a>
+<a name="ln866">		}</a>
+<a name="ln867"> </a>
+<a name="ln868">		char *buffer = device-&gt;fReadBuffer;</a>
+<a name="ln869">		size_t readLength = device-&gt;fActualLengthRead;</a>
+<a name="ln870">		device-&gt;OnRead(&amp;buffer, &amp;readLength);</a>
+<a name="ln871">		if (readLength == 0)</a>
+<a name="ln872">			continue;</a>
+<a name="ln873"> </a>
+<a name="ln874">		ddrover *ddr = gTTYModule-&gt;ddrstart(NULL);</a>
+<a name="ln875">		if (!ddr) {</a>
+<a name="ln876">			TRACE_ALWAYS(&quot;device thread: ddrstart problem\n&quot;);</a>
+<a name="ln877">			return B_NO_MEMORY;</a>
+<a name="ln878">		}</a>
+<a name="ln879"> </a>
+<a name="ln880">		while (device-&gt;fInputStopped)</a>
+<a name="ln881">			snooze(100);</a>
+<a name="ln882"> </a>
+<a name="ln883">		gTTYModule-&gt;ttyilock(&amp;device-&gt;fTTY, ddr, true);</a>
+<a name="ln884">		for (size_t i = 0; i &lt; readLength; i++)</a>
+<a name="ln885">			gTTYModule-&gt;ttyin(&amp;device-&gt;fTTY, ddr, buffer[i]);</a>
+<a name="ln886"> </a>
+<a name="ln887">		gTTYModule-&gt;ttyilock(&amp;device-&gt;fTTY, ddr, false);</a>
+<a name="ln888">		gTTYModule-&gt;ddrdone(ddr);</a>
+<a name="ln889">	}</a>
+<a name="ln890"> </a>
+<a name="ln891">#endif</a>
+<a name="ln892">	return B_OK;</a>
+<a name="ln893">}</a>
+<a name="ln894"> </a>
+<a name="ln895"> </a>
+<a name="ln896">status_t</a>
+<a name="ln897">SerialDevice::_WriteToDevice()</a>
+<a name="ln898">{</a>
+<a name="ln899">	char *buffer = &amp;fWriteBuffer[fWriteBufferIn];</a>
+<a name="ln900">	size_t bytesLeft = DEF_BUFFER_SIZE - atomic_get(&amp;fWriteBufferAvail);</a>
+<a name="ln901">	bytesLeft = MIN(bytesLeft, DEF_BUFFER_SIZE - fWriteBufferIn);</a>
+<a name="ln902">	TRACE(&quot;%s: in %d left %d\n&quot;, __FUNCTION__, fWriteBufferIn, bytesLeft);</a>
+<a name="ln903">	status_t status = gTTYModule-&gt;tty_read(fDeviceTTYCookie, buffer,</a>
+<a name="ln904">		&amp;bytesLeft);</a>
+<a name="ln905">	TRACE(&quot;%s: tty_read: %d\n&quot;, __FUNCTION__, bytesLeft);</a>
+<a name="ln906">	if (status != B_OK) {</a>
+<a name="ln907">		TRACE_ALWAYS(&quot;write to device: failed to read from TTY: %s\n&quot;,</a>
+<a name="ln908">			strerror(status));</a>
+<a name="ln909">		return status;</a>
+<a name="ln910">	}</a>
+<a name="ln911">	fWriteBufferIn += bytesLeft;</a>
+<a name="ln912">	fWriteBufferIn %= DEF_BUFFER_SIZE;</a>
+<a name="ln913">	atomic_add(&amp;fWriteBufferAvail, bytesLeft);</a>
+<a name="ln914"> </a>
+<a name="ln915">	// XXX: WTF: this ought to be done by the tty module calling service_func!</a>
+<a name="ln916">	// enable irqs</a>
+<a name="ln917">	Service(fMasterTTY, TTYOSTART, NULL, 0);</a>
+<a name="ln918"> </a>
+<a name="ln919">	status = acquire_sem_etc(fWriteBufferSem, 1, B_CAN_INTERRUPT, 0);</a>
+<a name="ln920">	if (status != B_OK) {</a>
+<a name="ln921">		TRACE_ALWAYS(&quot;write to device: failed to acquire sem: %s\n&quot;,</a>
+<a name="ln922">			strerror(status));</a>
+<a name="ln923">		return status;</a>
+<a name="ln924">	}</a>
+<a name="ln925">	return B_OK;</a>
+<a name="ln926">}</a>
+<a name="ln927"> </a>
+<a name="ln928"> </a>
+<a name="ln929">void</a>
+<a name="ln930">SerialDevice::ReadCallbackFunction(void *cookie, int32 status, void *data,</a>
+<a name="ln931">	uint32 actualLength)</a>
+<a name="ln932">{</a>
+<a name="ln933">	TRACE_FUNCALLS(&quot;read callback: cookie: 0x%08x status: 0x%08x data: 0x%08x len: %lu\n&quot;,</a>
+<a name="ln934">		cookie, status, data, actualLength);</a>
+<a name="ln935"> </a>
+<a name="ln936">	SerialDevice *device = (SerialDevice *)cookie;</a>
+<a name="ln937">	device-&gt;fActualLengthRead = actualLength;</a>
+<a name="ln938">	device-&gt;fStatusRead = status;</a>
+<a name="ln939">	release_sem_etc(device-&gt;fDoneRead, 1, B_DO_NOT_RESCHEDULE);</a>
+<a name="ln940">}</a>
+<a name="ln941"> </a>
+<a name="ln942"> </a>
+<a name="ln943">void</a>
+<a name="ln944">SerialDevice::WriteCallbackFunction(void *cookie, int32 status, void *data,</a>
+<a name="ln945">	uint32 actualLength)</a>
+<a name="ln946">{</a>
+<a name="ln947">	TRACE_FUNCALLS(&quot;write callback: cookie: 0x%08x status: 0x%08x data: 0x%08x len: %lu\n&quot;,</a>
+<a name="ln948">		cookie, status, data, actualLength);</a>
+<a name="ln949"> </a>
+<a name="ln950">	SerialDevice *device = (SerialDevice *)cookie;</a>
+<a name="ln951">	device-&gt;fActualLengthWrite = actualLength;</a>
+<a name="ln952">	device-&gt;fStatusWrite = status;</a>
+<a name="ln953">	release_sem_etc(device-&gt;fDoneWrite, 1, B_DO_NOT_RESCHEDULE);</a>
+<a name="ln954">}</a>
+<a name="ln955"> </a>
+<a name="ln956"> </a>
+<a name="ln957">void</a>
+<a name="ln958">SerialDevice::InterruptCallbackFunction(void *cookie, int32 status,</a>
+<a name="ln959">	void *data, uint32 actualLength)</a>
+<a name="ln960">{</a>
+<a name="ln961">	TRACE_FUNCALLS(&quot;interrupt callback: cookie: 0x%08x status: 0x%08x data: 0x%08x len: %lu\n&quot;,</a>
+<a name="ln962">		cookie, status, data, actualLength);</a>
+<a name="ln963"> </a>
+<a name="ln964">	SerialDevice *device = (SerialDevice *)cookie;</a>
+<a name="ln965">	device-&gt;fActualLengthInterrupt = actualLength;</a>
+<a name="ln966">	device-&gt;fStatusInterrupt = status;</a>
+<a name="ln967"> </a>
+<a name="ln968">	// ToDo: maybe handle those somehow?</a>
+<a name="ln969"> </a>
+<a name="ln970">	if (status == B_OK &amp;&amp; !device-&gt;fDeviceRemoved) {</a>
+<a name="ln971">#if 0</a>
+<a name="ln972">		status = gUSBModule-&gt;queue_interrupt(device-&gt;fControlPipe,</a>
+<a name="ln973">			device-&gt;fInterruptBuffer, device-&gt;fInterruptBufferSize,</a>
+<a name="ln974">			device-&gt;InterruptCallbackFunction, device);</a>
+<a name="ln975">#endif</a>
+<a name="ln976">	}</a>
+<a name="ln977">}</a>
+<a name="ln978"> </a>
+<a name="ln979"> </a>
+<a name="ln980"> </a>
+<a name="ln981">#if 0</a>
+<a name="ln982">SerialDevice *</a>
+<a name="ln983">SerialDevice::MakeDevice(usb_device device, uint16 vendorID,</a>
+<a name="ln984">	uint16 productID)</a>
+<a name="ln985">{</a>
+<a name="ln986">	const char *description = NULL;</a>
+<a name="ln987"> </a>
+<a name="ln988">	switch (vendorID) {</a>
+<a name="ln989">		case VENDOR_IODATA:</a>
+<a name="ln990">		case VENDOR_ATEN:</a>
+<a name="ln991">		case VENDOR_TDK:</a>
+<a name="ln992">		case VENDOR_RATOC:</a>
+<a name="ln993">		case VENDOR_PROLIFIC:</a>
+<a name="ln994">		case VENDOR_ELECOM:</a>
+<a name="ln995">		case VENDOR_SOURCENEXT:</a>
+<a name="ln996">		case VENDOR_HAL:</a>
+<a name="ln997">		{</a>
+<a name="ln998">			switch (productID) {</a>
+<a name="ln999">				case PRODUCT_PROLIFIC_RSAQ2: description = &quot;PL2303 Serial adapter (IODATA USB-RSAQ2)&quot;; break;</a>
+<a name="ln1000">				case PRODUCT_IODATA_USBRSAQ: description = &quot;I/O Data USB serial adapter USB-RSAQ1&quot;; break;</a>
+<a name="ln1001">				case PRODUCT_ATEN_UC232A: description = &quot;Aten Serial adapter&quot;; break;</a>
+<a name="ln1002">				case PRODUCT_TDK_UHA6400: description = &quot;TDK USB-PHS Adapter UHA6400&quot;; break;</a>
+<a name="ln1003">				case PRODUCT_RATOC_REXUSB60: description = &quot;Ratoc USB serial adapter REX-USB60&quot;; break;</a>
+<a name="ln1004">				case PRODUCT_PROLIFIC_PL2303: description = &quot;PL2303 Serial adapter (ATEN/IOGEAR UC232A)&quot;; break;</a>
+<a name="ln1005">				case PRODUCT_ELECOM_UCSGT: description = &quot;Elecom UC-SGT&quot;; break;</a>
+<a name="ln1006">				case PRODUCT_SOURCENEXT_KEIKAI8: description = &quot;SOURCENEXT KeikaiDenwa 8&quot;; break;</a>
+<a name="ln1007">				case PRODUCT_SOURCENEXT_KEIKAI8_CHG: description = &quot;SOURCENEXT KeikaiDenwa 8 with charger&quot;; break;</a>
+<a name="ln1008">				case PRODUCT_HAL_IMR001: description = &quot;HAL Corporation Crossam2+USB&quot;; break;</a>
+<a name="ln1009">			}</a>
+<a name="ln1010"> </a>
+<a name="ln1011">			if (!description)</a>
+<a name="ln1012">				break;</a>
+<a name="ln1013"> </a>
+<a name="ln1014">			return new(std::nothrow) ProlificDevice(device, vendorID, productID, description);</a>
+<a name="ln1015">		}</a>
+<a name="ln1016"> </a>
+<a name="ln1017">		case VENDOR_FTDI:</a>
+<a name="ln1018">		{</a>
+<a name="ln1019">			switch (productID) {</a>
+<a name="ln1020">				case PRODUCT_FTDI_8U100AX: description = &quot;FTDI 8U100AX serial converter&quot;; break;</a>
+<a name="ln1021">				case PRODUCT_FTDI_8U232AM: description = &quot;FTDI 8U232AM serial converter&quot;; break;</a>
+<a name="ln1022">			}</a>
+<a name="ln1023"> </a>
+<a name="ln1024">			if (!description)</a>
+<a name="ln1025">				break;</a>
+<a name="ln1026"> </a>
+<a name="ln1027">			return new(std::nothrow) FTDIDevice(device, vendorID, productID, description);</a>
+<a name="ln1028">		}</a>
+<a name="ln1029"> </a>
+<a name="ln1030">		case VENDOR_PALM:</a>
+<a name="ln1031">		case VENDOR_KLSI:</a>
+<a name="ln1032">		{</a>
+<a name="ln1033">			switch (productID) {</a>
+<a name="ln1034">				case PRODUCT_PALM_CONNECT: description = &quot;PalmConnect RS232&quot;; break;</a>
+<a name="ln1035">				case PRODUCT_KLSI_KL5KUSB105D: description = &quot;KLSI KL5KUSB105D&quot;; break;</a>
+<a name="ln1036">			}</a>
+<a name="ln1037"> </a>
+<a name="ln1038">			if (!description)</a>
+<a name="ln1039">				break;</a>
+<a name="ln1040"> </a>
+<a name="ln1041">			return new(std::nothrow) KLSIDevice(device, vendorID, productID, description);</a>
+<a name="ln1042">		}</a>
+<a name="ln1043">	}</a>
+<a name="ln1044"> </a>
+<a name="ln1045">	return new(std::nothrow) ACMDevice(device, vendorID, productID, &quot;CDC ACM compatible device&quot;);</a>
+<a name="ln1046">}</a>
+<a name="ln1047">#endif</a>
+<a name="ln1048"> </a>
+<a name="ln1049"> </a>
+<a name="ln1050">uint8</a>
+<a name="ln1051">SerialDevice::ReadReg8(int reg)</a>
+<a name="ln1052">{</a>
+<a name="ln1053">	uint8 ret;</a>
+<a name="ln1054">	switch (fBus) {</a>
+<a name="ln1055">	case B_ISA_BUS:</a>
+<a name="ln1056">		ret = gISAModule-&gt;read_io_8(IOBase() + reg);</a>
+<a name="ln1057">		break;</a>
+<a name="ln1058">	case B_PCI_BUS:</a>
+<a name="ln1059">		ret = gPCIModule-&gt;read_io_8(IOBase() + reg);</a>
+<a name="ln1060">		break;</a>
+<a name="ln1061">	default:</a>
+<a name="ln1062">		TRACE_ALWAYS(&quot;%s: unknown bus!\n&quot;, __FUNCTION__);</a>
+<a name="ln1063">		ret = 0;</a>
+<a name="ln1064">	//XXX:pcmcia ?</a>
+<a name="ln1065">	}</a>
+<a name="ln1066">	TRACE/*_ALWAYS*/(&quot;RR8(%d) = %d [%02x]\n&quot;, reg, ret, ret);</a>
+<a name="ln1067">	//spin(1000);</a>
+<a name="ln1068">	return ret;</a>
+<a name="ln1069">}</a>
+<a name="ln1070"> </a>
+<a name="ln1071">void</a>
+<a name="ln1072">SerialDevice::WriteReg8(int reg, uint8 value)</a>
+<a name="ln1073">{</a>
+<a name="ln1074">//	TRACE_ALWAYS(&quot;WR8(0x%04x+%d, %d [0x%x])\n&quot;, IOBase(), reg, value, value);</a>
+<a name="ln1075">	TRACE/*_ALWAYS*/(&quot;WR8(%d, %d [0x%x])\n&quot;, reg, value, value);</a>
+<a name="ln1076">	switch (fBus) {</a>
+<a name="ln1077">	case B_ISA_BUS:</a>
+<a name="ln1078">		gISAModule-&gt;write_io_8(IOBase() + reg, value);</a>
+<a name="ln1079">		break;</a>
+<a name="ln1080">	case B_PCI_BUS:</a>
+<a name="ln1081">		gPCIModule-&gt;write_io_8(IOBase() + reg, value);</a>
+<a name="ln1082">		break;</a>
+<a name="ln1083">	default:</a>
+<a name="ln1084">		TRACE_ALWAYS(&quot;%s: unknown bus!\n&quot;, __FUNCTION__);</a>
+<a name="ln1085">	//XXX:pcmcia ?</a>
+<a name="ln1086">	}</a>
+<a name="ln1087">	//spin(10000);</a>
+<a name="ln1088">}</a>
+<a name="ln1089"> </a>
+<a name="ln1090"> </a>
+<a name="ln1091">void</a>
+<a name="ln1092">SerialDevice::OrReg8(int reg, uint8 value)</a>
+<a name="ln1093">{</a>
+<a name="ln1094">	WriteReg8(reg, ReadReg8(reg) | value);</a>
+<a name="ln1095">}</a>
+<a name="ln1096"> </a>
+<a name="ln1097"> </a>
+<a name="ln1098">void</a>
+<a name="ln1099">SerialDevice::AndReg8(int reg, uint8 value)</a>
+<a name="ln1100">{</a>
+<a name="ln1101">	WriteReg8(reg, ReadReg8(reg) &amp; value);</a>
+<a name="ln1102">}</a>
+<a name="ln1103"> </a>
+<a name="ln1104"> </a>
+<a name="ln1105">void</a>
+<a name="ln1106">SerialDevice::MaskReg8(int reg, uint8 value)</a>
+<a name="ln1107">{</a>
+<a name="ln1108">	WriteReg8(reg, ReadReg8(reg) &amp; ~value);</a>
+<a name="ln1109">}</a>
+
+</code></pre>
+<div class="balloon" rel="17"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fActualLengthRead, fStatusRead, fActualLengthWrite, fStatusWrite, fActualLengthInterrupt, fStatusInterrupt.</p></div>
+<div class="balloon" rel="573"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v547/" target="_blank">V547</a> Expression 'status < ((int) 0)' is always false.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

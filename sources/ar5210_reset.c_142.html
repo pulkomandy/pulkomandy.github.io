@@ -1,0 +1,1056 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>ar5210_reset.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*-</a>
+<a name="ln2"> * SPDX-License-Identifier: ISC</a>
+<a name="ln3"> *</a>
+<a name="ln4"> * Copyright (c) 2002-2009 Sam Leffler, Errno Consulting</a>
+<a name="ln5"> * Copyright (c) 2002-2004 Atheros Communications, Inc.</a>
+<a name="ln6"> *</a>
+<a name="ln7"> * Permission to use, copy, modify, and/or distribute this software for any</a>
+<a name="ln8"> * purpose with or without fee is hereby granted, provided that the above</a>
+<a name="ln9"> * copyright notice and this permission notice appear in all copies.</a>
+<a name="ln10"> *</a>
+<a name="ln11"> * THE SOFTWARE IS PROVIDED &quot;AS IS&quot; AND THE AUTHOR DISCLAIMS ALL WARRANTIES</a>
+<a name="ln12"> * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF</a>
+<a name="ln13"> * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR</a>
+<a name="ln14"> * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES</a>
+<a name="ln15"> * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN</a>
+<a name="ln16"> * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF</a>
+<a name="ln17"> * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.</a>
+<a name="ln18"> *</a>
+<a name="ln19"> * $FreeBSD: releng/12.0/sys/dev/ath/ath_hal/ar5210/ar5210_reset.c 326695 2017-12-08 15:57:29Z pfg $</a>
+<a name="ln20"> */</a>
+<a name="ln21">#include &quot;opt_ah.h&quot;</a>
+<a name="ln22"> </a>
+<a name="ln23">#include &quot;ah.h&quot;</a>
+<a name="ln24">#include &quot;ah_internal.h&quot;</a>
+<a name="ln25"> </a>
+<a name="ln26">#include &quot;ar5210/ar5210.h&quot;</a>
+<a name="ln27">#include &quot;ar5210/ar5210reg.h&quot;</a>
+<a name="ln28">#include &quot;ar5210/ar5210phy.h&quot;</a>
+<a name="ln29"> </a>
+<a name="ln30">#include &quot;ah_eeprom_v1.h&quot;</a>
+<a name="ln31"> </a>
+<a name="ln32">typedef struct {</a>
+<a name="ln33">	uint32_t	Offset;</a>
+<a name="ln34">	uint32_t	Value;</a>
+<a name="ln35">} REGISTER_VAL;</a>
+<a name="ln36"> </a>
+<a name="ln37">static const REGISTER_VAL ar5k0007_init[] = {</a>
+<a name="ln38">#include &quot;ar5210/ar5k_0007.ini&quot;</a>
+<a name="ln39">};</a>
+<a name="ln40"> </a>
+<a name="ln41">/* Default Power Settings for channels outside of EEPROM range */</a>
+<a name="ln42">static const uint8_t ar5k0007_pwrSettings[17] = {</a>
+<a name="ln43">/*	gain delta			pc dac */</a>
+<a name="ln44">/* 54  48  36  24  18  12   9   54  48  36  24  18  12   9   6  ob  db	  */</a>
+<a name="ln45">    9,  9,  0,  0,  0,  0,  0,   2,  2,  6,  6,  6,  6,  6,  6,  2,  2</a>
+<a name="ln46">};</a>
+<a name="ln47"> </a>
+<a name="ln48">/*</a>
+<a name="ln49"> * The delay, in usecs, between writing AR_RC with a reset</a>
+<a name="ln50"> * request and waiting for the chip to settle.  If this is</a>
+<a name="ln51"> * too short then the chip does not come out of sleep state.</a>
+<a name="ln52"> * Note this value was empirically derived and may be dependent</a>
+<a name="ln53"> * on the host machine (don't know--the problem was identified</a>
+<a name="ln54"> * on an IBM 570e laptop; 10us delays worked on other systems).</a>
+<a name="ln55"> */</a>
+<a name="ln56">#define	AR_RC_SETTLE_TIME	20000</a>
+<a name="ln57"> </a>
+<a name="ln58">static HAL_BOOL ar5210SetResetReg(struct ath_hal *,</a>
+<a name="ln59">		uint32_t resetMask, u_int delay);</a>
+<a name="ln60">static HAL_BOOL ar5210SetChannel(struct ath_hal *, struct ieee80211_channel *);</a>
+<a name="ln61">static void ar5210SetOperatingMode(struct ath_hal *, int opmode);</a>
+<a name="ln62"> </a>
+<a name="ln63">/*</a>
+<a name="ln64"> * Places the device in and out of reset and then places sane</a>
+<a name="ln65"> * values in the registers based on EEPROM config, initialization</a>
+<a name="ln66"> * vectors (as determined by the mode), and station configuration</a>
+<a name="ln67"> *</a>
+<a name="ln68"> * bChannelChange is used to preserve DMA/PCU registers across</a>
+<a name="ln69"> * a HW Reset during channel change.</a>
+<a name="ln70"> */</a>
+<a name="ln71">HAL_BOOL</a>
+<a name="ln72">ar5210Reset(struct ath_hal *ah, HAL_OPMODE opmode,</a>
+<a name="ln73">	struct ieee80211_channel *chan, HAL_BOOL bChannelChange,</a>
+<a name="ln74">	HAL_RESET_TYPE resetType,</a>
+<a name="ln75">	HAL_STATUS *status)</a>
+<a name="ln76">{</a>
+<a name="ln77">#define	N(a)	(sizeof (a) /sizeof (a[0]))</a>
+<a name="ln78">#define	FAIL(_code)	do { ecode = _code; goto bad; } while (0)</a>
+<a name="ln79">	struct ath_hal_5210 *ahp = AH5210(ah);</a>
+<a name="ln80">	const HAL_EEPROM_v1 *ee = AH_PRIVATE(ah)-&gt;ah_eeprom;</a>
+<a name="ln81">	HAL_CHANNEL_INTERNAL *ichan;</a>
+<a name="ln82">	HAL_STATUS ecode;</a>
+<a name="ln83">	uint32_t ledstate;</a>
+<a name="ln84">	int i, q;</a>
+<a name="ln85"> </a>
+<a name="ln86">	HALDEBUG(ah, HAL_DEBUG_RESET,</a>
+<a name="ln87">	    &quot;%s: opmode %u channel %u/0x%x %s channel\n&quot;, __func__,</a>
+<a name="ln88">	    opmode, chan-&gt;ic_freq, chan-&gt;ic_flags,</a>
+<a name="ln89">	    bChannelChange ? &quot;change&quot; : &quot;same&quot;);</a>
+<a name="ln90"> </a>
+<a name="ln91">	if (!IEEE80211_IS_CHAN_5GHZ(chan)) {</a>
+<a name="ln92">		/* Only 11a mode */</a>
+<a name="ln93">		HALDEBUG(ah, HAL_DEBUG_ANY, &quot;%s: channel not 5GHz\n&quot;, __func__);</a>
+<a name="ln94">		FAIL(HAL_EINVAL);</a>
+<a name="ln95">	}</a>
+<a name="ln96">	/*</a>
+<a name="ln97">	 * Map public channel to private.</a>
+<a name="ln98">	 */</a>
+<a name="ln99">	ichan = ath_hal_checkchannel(ah, chan);</a>
+<a name="ln100">	if (ichan == AH_NULL) {</a>
+<a name="ln101">		HALDEBUG(ah, HAL_DEBUG_ANY,</a>
+<a name="ln102">		    &quot;%s: invalid channel %u/0x%x; no mapping\n&quot;,</a>
+<a name="ln103">		    __func__, chan-&gt;ic_freq, chan-&gt;ic_flags);</a>
+<a name="ln104">		FAIL(HAL_EINVAL);</a>
+<a name="ln105">	}</a>
+<a name="ln106">	switch (opmode) {</a>
+<a name="ln107">	case HAL_M_STA:</a>
+<a name="ln108">	case HAL_M_IBSS:</a>
+<a name="ln109">	case HAL_M_HOSTAP:</a>
+<a name="ln110">	case HAL_M_MONITOR:</a>
+<a name="ln111">		break;</a>
+<a name="ln112">	default:</a>
+<a name="ln113">		HALDEBUG(ah, HAL_DEBUG_ANY, &quot;%s: invalid operating mode %u\n&quot;,</a>
+<a name="ln114">		    __func__, opmode);</a>
+<a name="ln115">		FAIL(HAL_EINVAL);</a>
+<a name="ln116">		break;</a>
+<a name="ln117">	}</a>
+<a name="ln118"> </a>
+<a name="ln119">	ledstate = OS_REG_READ(ah, AR_PCICFG) &amp;</a>
+<a name="ln120">		(AR_PCICFG_LED_PEND | AR_PCICFG_LED_ACT);</a>
+<a name="ln121"> </a>
+<a name="ln122">	if (!ar5210ChipReset(ah, chan)) {</a>
+<a name="ln123">		HALDEBUG(ah, HAL_DEBUG_ANY, &quot;%s: chip reset failed\n&quot;,</a>
+<a name="ln124">		    __func__);</a>
+<a name="ln125">		FAIL(HAL_EIO);</a>
+<a name="ln126">	}</a>
+<a name="ln127"> </a>
+<a name="ln128">	OS_REG_WRITE(ah, AR_STA_ID0, LE_READ_4(ahp-&gt;ah_macaddr));</a>
+<a name="ln129">	OS_REG_WRITE(ah, AR_STA_ID1, LE_READ_2(ahp-&gt;ah_macaddr + 4));</a>
+<a name="ln130">	ar5210SetOperatingMode(ah, opmode);</a>
+<a name="ln131"> </a>
+<a name="ln132">	switch (opmode) {</a>
+<a name="ln133">	case HAL_M_HOSTAP:</a>
+<a name="ln134">		OS_REG_WRITE(ah, AR_BCR, INIT_BCON_CNTRL_REG);</a>
+<a name="ln135">		OS_REG_WRITE(ah, AR_PCICFG,</a>
+<a name="ln136">			AR_PCICFG_LED_ACT | AR_PCICFG_LED_BCTL);</a>
+<a name="ln137">		break;</a>
+<a name="ln138">	case HAL_M_IBSS:</a>
+<a name="ln139">		OS_REG_WRITE(ah, AR_BCR, INIT_BCON_CNTRL_REG | AR_BCR_BCMD);</a>
+<a name="ln140">		OS_REG_WRITE(ah, AR_PCICFG,</a>
+<a name="ln141">			AR_PCICFG_CLKRUNEN | AR_PCICFG_LED_PEND | AR_PCICFG_LED_BCTL);</a>
+<a name="ln142">		break;</a>
+<a name="ln143">	case HAL_M_STA:</a>
+<a name="ln144">		OS_REG_WRITE(ah, AR_BCR, INIT_BCON_CNTRL_REG);</a>
+<a name="ln145">		OS_REG_WRITE(ah, AR_PCICFG,</a>
+<a name="ln146">			AR_PCICFG_CLKRUNEN | AR_PCICFG_LED_PEND | AR_PCICFG_LED_BCTL);</a>
+<a name="ln147">		break;</a>
+<a name="ln148">	case HAL_M_MONITOR:</a>
+<a name="ln149">		OS_REG_WRITE(ah, AR_BCR, INIT_BCON_CNTRL_REG);</a>
+<a name="ln150">		OS_REG_WRITE(ah, AR_PCICFG,</a>
+<a name="ln151">			AR_PCICFG_LED_ACT | AR_PCICFG_LED_BCTL);</a>
+<a name="ln152">		break;</a>
+<a name="ln153">	}</a>
+<a name="ln154"> </a>
+<a name="ln155">	/* Restore previous led state */</a>
+<a name="ln156">	OS_REG_WRITE(ah, AR_PCICFG, OS_REG_READ(ah, AR_PCICFG) | ledstate);</a>
+<a name="ln157"> </a>
+<a name="ln158">#if 0</a>
+<a name="ln159">	OS_REG_WRITE(ah, AR_BSS_ID0, LE_READ_4(ahp-&gt;ah_bssid));</a>
+<a name="ln160">	OS_REG_WRITE(ah, AR_BSS_ID1, LE_READ_2(ahp-&gt;ah_bssid + 4));</a>
+<a name="ln161">#endif</a>
+<a name="ln162">	/* BSSID, association id, ps-poll */</a>
+<a name="ln163">	ar5210WriteAssocid(ah, ahp-&gt;ah_bssid, ahp-&gt;ah_associd);</a>
+<a name="ln164"> </a>
+<a name="ln165">	OS_REG_WRITE(ah, AR_TXDP0, 0);</a>
+<a name="ln166">	OS_REG_WRITE(ah, AR_TXDP1, 0);</a>
+<a name="ln167">	OS_REG_WRITE(ah, AR_RXDP, 0);</a>
+<a name="ln168"> </a>
+<a name="ln169">	/*</a>
+<a name="ln170">	 * Initialize interrupt state.</a>
+<a name="ln171">	 */</a>
+<a name="ln172">	(void) OS_REG_READ(ah, AR_ISR);		/* cleared on read */</a>
+<a name="ln173">	OS_REG_WRITE(ah, AR_IMR, 0);</a>
+<a name="ln174">	OS_REG_WRITE(ah, AR_IER, AR_IER_DISABLE);</a>
+<a name="ln175">	ahp-&gt;ah_maskReg = 0;</a>
+<a name="ln176"> </a>
+<a name="ln177">	(void) OS_REG_READ(ah, AR_BSR);		/* cleared on read */</a>
+<a name="ln178">	OS_REG_WRITE(ah, AR_TXCFG, AR_DMASIZE_128B);</a>
+<a name="ln179">	OS_REG_WRITE(ah, AR_RXCFG, AR_DMASIZE_128B);</a>
+<a name="ln180"> </a>
+<a name="ln181">	OS_REG_WRITE(ah, AR_TOPS, 8);		/* timeout prescale */</a>
+<a name="ln182">	OS_REG_WRITE(ah, AR_RXNOFRM, 8);	/* RX no frame timeout */</a>
+<a name="ln183">	OS_REG_WRITE(ah, AR_RPGTO, 0);		/* RX frame gap timeout */</a>
+<a name="ln184">	OS_REG_WRITE(ah, AR_TXNOFRM, 0);	/* TX no frame timeout */</a>
+<a name="ln185"> </a>
+<a name="ln186">	OS_REG_WRITE(ah, AR_SFR, 0);</a>
+<a name="ln187">	OS_REG_WRITE(ah, AR_MIBC, 0);		/* unfreeze ctrs + clr state */</a>
+<a name="ln188">	OS_REG_WRITE(ah, AR_RSSI_THR, ahp-&gt;ah_rssiThr);</a>
+<a name="ln189">	OS_REG_WRITE(ah, AR_CFP_DUR, 0);</a>
+<a name="ln190"> </a>
+<a name="ln191">	ar5210SetRxFilter(ah, 0);		/* nothing for now */</a>
+<a name="ln192">	OS_REG_WRITE(ah, AR_MCAST_FIL0, 0);	/* multicast filter */</a>
+<a name="ln193">	OS_REG_WRITE(ah, AR_MCAST_FIL1, 0);	/* XXX was 2 */</a>
+<a name="ln194"> </a>
+<a name="ln195">	OS_REG_WRITE(ah, AR_TX_MASK0, 0);</a>
+<a name="ln196">	OS_REG_WRITE(ah, AR_TX_MASK1, 0);</a>
+<a name="ln197">	OS_REG_WRITE(ah, AR_CLR_TMASK, 1);</a>
+<a name="ln198">	OS_REG_WRITE(ah, AR_TRIG_LEV, 1);	/* minimum */</a>
+<a name="ln199"> </a>
+<a name="ln200">	ar5210UpdateDiagReg(ah, 0);</a>
+<a name="ln201"> </a>
+<a name="ln202">	OS_REG_WRITE(ah, AR_CFP_PERIOD, 0);</a>
+<a name="ln203">	OS_REG_WRITE(ah, AR_TIMER0, 0);		/* next beacon time */</a>
+<a name="ln204">	OS_REG_WRITE(ah, AR_TSF_L32, 0);	/* local clock */</a>
+<a name="ln205">	OS_REG_WRITE(ah, AR_TIMER1, ~0);	/* next DMA beacon alert */</a>
+<a name="ln206">	OS_REG_WRITE(ah, AR_TIMER2, ~0);	/* next SW beacon alert */</a>
+<a name="ln207">	OS_REG_WRITE(ah, AR_TIMER3, 1);		/* next ATIM window */</a>
+<a name="ln208"> </a>
+<a name="ln209">	/* Write the INI values for PHYreg initialization */</a>
+<a name="ln210">	for (i = 0; i &lt; N(ar5k0007_init); i++) {</a>
+<a name="ln211">		uint32_t reg = ar5k0007_init[i].Offset;</a>
+<a name="ln212">		/* On channel change, don't reset the PCU registers */</a>
+<a name="ln213">		if (!(bChannelChange &amp;&amp; (0x8000 &lt;= reg &amp;&amp; reg &lt; 0x9000)))</a>
+<a name="ln214">			OS_REG_WRITE(ah, reg, ar5k0007_init[i].Value);</a>
+<a name="ln215">	}</a>
+<a name="ln216"> </a>
+<a name="ln217">	/* Setup the transmit power values for cards since 0x0[0-2]05 */</a>
+<a name="ln218">	if (!ar5210SetTransmitPower(ah, chan)) {</a>
+<a name="ln219">		HALDEBUG(ah, HAL_DEBUG_ANY,</a>
+<a name="ln220">		    &quot;%s: error init'ing transmit power\n&quot;, __func__);</a>
+<a name="ln221">		FAIL(HAL_EIO);</a>
+<a name="ln222">	}</a>
+<a name="ln223"> </a>
+<a name="ln224">	OS_REG_WRITE(ah, AR_PHY(10),</a>
+<a name="ln225">		(OS_REG_READ(ah, AR_PHY(10)) &amp; 0xFFFF00FF) |</a>
+<a name="ln226">		(ee-&gt;ee_xlnaOn &lt;&lt; 8));</a>
+<a name="ln227">	OS_REG_WRITE(ah, AR_PHY(13),</a>
+<a name="ln228">		(ee-&gt;ee_xpaOff &lt;&lt; 24) | (ee-&gt;ee_xpaOff &lt;&lt; 16) |</a>
+<a name="ln229">		(ee-&gt;ee_xpaOn &lt;&lt; 8) | ee-&gt;ee_xpaOn);</a>
+<a name="ln230">	OS_REG_WRITE(ah, AR_PHY(17),</a>
+<a name="ln231">		(OS_REG_READ(ah, AR_PHY(17)) &amp; 0xFFFFC07F) |</a>
+<a name="ln232">		((ee-&gt;ee_antenna &gt;&gt; 1) &amp; 0x3F80));</a>
+<a name="ln233">	OS_REG_WRITE(ah, AR_PHY(18),</a>
+<a name="ln234">		(OS_REG_READ(ah, AR_PHY(18)) &amp; 0xFFFC0FFF) |</a>
+<a name="ln235">		((ee-&gt;ee_antenna &lt;&lt; 10) &amp; 0x3F000));</a>
+<a name="ln236">	OS_REG_WRITE(ah, AR_PHY(25),</a>
+<a name="ln237">		(OS_REG_READ(ah, AR_PHY(25)) &amp; 0xFFF80FFF) |</a>
+<a name="ln238">		((ee-&gt;ee_thresh62 &lt;&lt; 12) &amp; 0x7F000));</a>
+<a name="ln239">	OS_REG_WRITE(ah, AR_PHY(68),</a>
+<a name="ln240">		(OS_REG_READ(ah, AR_PHY(68)) &amp; 0xFFFFFFFC) |</a>
+<a name="ln241">		(ee-&gt;ee_antenna &amp; 0x3));</a>
+<a name="ln242"> </a>
+<a name="ln243">	if (!ar5210SetChannel(ah, chan)) {</a>
+<a name="ln244">		HALDEBUG(ah, HAL_DEBUG_ANY, &quot;%s: unable to set channel\n&quot;,</a>
+<a name="ln245">		    __func__);</a>
+<a name="ln246">		FAIL(HAL_EIO);</a>
+<a name="ln247">	}</a>
+<a name="ln248">	if (bChannelChange &amp;&amp; !IEEE80211_IS_CHAN_DFS(chan)) </a>
+<a name="ln249">		chan-&gt;ic_state &amp;= ~IEEE80211_CHANSTATE_CWINT;</a>
+<a name="ln250"> </a>
+<a name="ln251">	/* Activate the PHY */</a>
+<a name="ln252">	OS_REG_WRITE(ah, AR_PHY_ACTIVE, AR_PHY_ENABLE);</a>
+<a name="ln253"> </a>
+<a name="ln254">	OS_DELAY(1000);		/* Wait a bit (1 msec) */</a>
+<a name="ln255"> </a>
+<a name="ln256">	/* calibrate the HW and poll the bit going to 0 for completion */</a>
+<a name="ln257">	OS_REG_WRITE(ah, AR_PHY_AGCCTL,</a>
+<a name="ln258">		OS_REG_READ(ah, AR_PHY_AGCCTL) | AR_PHY_AGC_CAL);</a>
+<a name="ln259">	(void) ath_hal_wait(ah, AR_PHY_AGCCTL, AR_PHY_AGC_CAL, 0);</a>
+<a name="ln260"> </a>
+<a name="ln261">	/* Perform noise floor calibration and set status */</a>
+<a name="ln262">	if (!ar5210CalNoiseFloor(ah, ichan)) {</a>
+<a name="ln263">		chan-&gt;ic_state |= IEEE80211_CHANSTATE_CWINT;</a>
+<a name="ln264">		HALDEBUG(ah, HAL_DEBUG_ANY,</a>
+<a name="ln265">		    &quot;%s: noise floor calibration failed\n&quot;, __func__);</a>
+<a name="ln266">		FAIL(HAL_EIO);</a>
+<a name="ln267">	}</a>
+<a name="ln268"> </a>
+<a name="ln269">	for (q = 0; q &lt; HAL_NUM_TX_QUEUES; q++)</a>
+<a name="ln270">		ar5210ResetTxQueue(ah, q);</a>
+<a name="ln271"> </a>
+<a name="ln272">	if (AH_PRIVATE(ah)-&gt;ah_rfkillEnabled)</a>
+<a name="ln273">		ar5210EnableRfKill(ah);</a>
+<a name="ln274"> </a>
+<a name="ln275">	/*</a>
+<a name="ln276">	 * Writing to AR_BEACON will start timers. Hence it should be</a>
+<a name="ln277">	 * the last register to be written. Do not reset tsf, do not</a>
+<a name="ln278">	 * enable beacons at this point, but preserve other values</a>
+<a name="ln279">	 * like beaconInterval.</a>
+<a name="ln280">	 */</a>
+<a name="ln281">	OS_REG_WRITE(ah, AR_BEACON,</a>
+<a name="ln282">		(OS_REG_READ(ah, AR_BEACON) &amp;</a>
+<a name="ln283">			~(AR_BEACON_EN | AR_BEACON_RESET_TSF)));</a>
+<a name="ln284"> </a>
+<a name="ln285">	/* Restore user-specified slot time and timeouts */</a>
+<a name="ln286">	if (ahp-&gt;ah_sifstime != (u_int) -1)</a>
+<a name="ln287">		ar5210SetSifsTime(ah, ahp-&gt;ah_sifstime);</a>
+<a name="ln288">	if (ahp-&gt;ah_slottime != (u_int) -1)</a>
+<a name="ln289">		ar5210SetSlotTime(ah, ahp-&gt;ah_slottime);</a>
+<a name="ln290">	if (ahp-&gt;ah_acktimeout != (u_int) -1)</a>
+<a name="ln291">		ar5210SetAckTimeout(ah, ahp-&gt;ah_acktimeout);</a>
+<a name="ln292">	if (ahp-&gt;ah_ctstimeout != (u_int) -1)</a>
+<a name="ln293">		ar5210SetCTSTimeout(ah, ahp-&gt;ah_ctstimeout);</a>
+<a name="ln294">	if (AH_PRIVATE(ah)-&gt;ah_diagreg != 0)</a>
+<a name="ln295">		ar5210UpdateDiagReg(ah, AH_PRIVATE(ah)-&gt;ah_diagreg);</a>
+<a name="ln296"> </a>
+<a name="ln297">	AH_PRIVATE(ah)-&gt;ah_opmode = opmode;	/* record operating mode */</a>
+<a name="ln298"> </a>
+<a name="ln299">	HALDEBUG(ah, HAL_DEBUG_RESET, &quot;%s: done\n&quot;, __func__);</a>
+<a name="ln300"> </a>
+<a name="ln301">	return AH_TRUE;</a>
+<a name="ln302">bad:</a>
+<a name="ln303">	if (status != AH_NULL)</a>
+<a name="ln304">		*status = ecode;</a>
+<a name="ln305">	return AH_FALSE;</a>
+<a name="ln306">#undef FAIL</a>
+<a name="ln307">#undef N</a>
+<a name="ln308">}</a>
+<a name="ln309"> </a>
+<a name="ln310">static void</a>
+<a name="ln311">ar5210SetOperatingMode(struct ath_hal *ah, int opmode)</a>
+<a name="ln312">{</a>
+<a name="ln313">	struct ath_hal_5210 *ahp = AH5210(ah);</a>
+<a name="ln314">	uint32_t val;</a>
+<a name="ln315"> </a>
+<a name="ln316">	val = OS_REG_READ(ah, AR_STA_ID1) &amp; 0xffff;</a>
+<a name="ln317">	switch (opmode) {</a>
+<a name="ln318">	case HAL_M_HOSTAP:</a>
+<a name="ln319">		OS_REG_WRITE(ah, AR_STA_ID1, val</a>
+<a name="ln320">			| AR_STA_ID1_AP</a>
+<a name="ln321">			| AR_STA_ID1_NO_PSPOLL</a>
+<a name="ln322">			| AR_STA_ID1_DESC_ANTENNA</a>
+<a name="ln323">			| ahp-&gt;ah_staId1Defaults);</a>
+<a name="ln324">		break;</a>
+<a name="ln325">	case HAL_M_IBSS:</a>
+<a name="ln326">		OS_REG_WRITE(ah, AR_STA_ID1, val</a>
+<a name="ln327">			| AR_STA_ID1_ADHOC</a>
+<a name="ln328">			| AR_STA_ID1_NO_PSPOLL</a>
+<a name="ln329">			| AR_STA_ID1_DESC_ANTENNA</a>
+<a name="ln330">			| ahp-&gt;ah_staId1Defaults);</a>
+<a name="ln331">		break;</a>
+<a name="ln332">	case HAL_M_STA:</a>
+<a name="ln333">		OS_REG_WRITE(ah, AR_STA_ID1, val</a>
+<a name="ln334">			| AR_STA_ID1_NO_PSPOLL</a>
+<a name="ln335">			| AR_STA_ID1_PWR_SV</a>
+<a name="ln336">			| ahp-&gt;ah_staId1Defaults);</a>
+<a name="ln337">		break;</a>
+<a name="ln338">	case HAL_M_MONITOR:</a>
+<a name="ln339">		OS_REG_WRITE(ah, AR_STA_ID1, val</a>
+<a name="ln340">			| AR_STA_ID1_NO_PSPOLL</a>
+<a name="ln341">			| ahp-&gt;ah_staId1Defaults);</a>
+<a name="ln342">		break;</a>
+<a name="ln343">	}</a>
+<a name="ln344">}</a>
+<a name="ln345"> </a>
+<a name="ln346">void</a>
+<a name="ln347">ar5210SetPCUConfig(struct ath_hal *ah)</a>
+<a name="ln348">{</a>
+<a name="ln349">	ar5210SetOperatingMode(ah, AH_PRIVATE(ah)-&gt;ah_opmode);</a>
+<a name="ln350">}</a>
+<a name="ln351"> </a>
+<a name="ln352">/*</a>
+<a name="ln353"> * Places the PHY and Radio chips into reset.  A full reset</a>
+<a name="ln354"> * must be called to leave this state.  The PCI/MAC/PCU are</a>
+<a name="ln355"> * not placed into reset as we must receive interrupt to</a>
+<a name="ln356"> * re-enable the hardware.</a>
+<a name="ln357"> */</a>
+<a name="ln358">HAL_BOOL</a>
+<a name="ln359">ar5210PhyDisable(struct ath_hal *ah)</a>
+<a name="ln360">{</a>
+<a name="ln361">	return ar5210SetResetReg(ah, AR_RC_RPHY, 10);</a>
+<a name="ln362">}</a>
+<a name="ln363"> </a>
+<a name="ln364">/*</a>
+<a name="ln365"> * Places all of hardware into reset</a>
+<a name="ln366"> */</a>
+<a name="ln367">HAL_BOOL</a>
+<a name="ln368">ar5210Disable(struct ath_hal *ah)</a>
+<a name="ln369">{</a>
+<a name="ln370">#define	AR_RC_HW (AR_RC_RPCU | AR_RC_RDMA | AR_RC_RPHY | AR_RC_RMAC)</a>
+<a name="ln371">	if (!ar5210SetPowerMode(ah, HAL_PM_AWAKE, AH_TRUE))</a>
+<a name="ln372">		return AH_FALSE;</a>
+<a name="ln373"> </a>
+<a name="ln374">	/*</a>
+<a name="ln375">	 * Reset the HW - PCI must be reset after the rest of the</a>
+<a name="ln376">	 * device has been reset</a>
+<a name="ln377">	 */</a>
+<a name="ln378">	if (!ar5210SetResetReg(ah, AR_RC_HW, AR_RC_SETTLE_TIME))</a>
+<a name="ln379">		return AH_FALSE;</a>
+<a name="ln380">	OS_DELAY(1000);</a>
+<a name="ln381">	(void) ar5210SetResetReg(ah, AR_RC_HW | AR_RC_RPCI, AR_RC_SETTLE_TIME);</a>
+<a name="ln382">	OS_DELAY(2100);   /* 8245 @ 96Mhz hangs with 2000us. */</a>
+<a name="ln383"> </a>
+<a name="ln384">	return AH_TRUE;</a>
+<a name="ln385">#undef AR_RC_HW</a>
+<a name="ln386">}</a>
+<a name="ln387"> </a>
+<a name="ln388">/*</a>
+<a name="ln389"> * Places the hardware into reset and then pulls it out of reset</a>
+<a name="ln390"> */</a>
+<a name="ln391">HAL_BOOL</a>
+<a name="ln392">ar5210ChipReset(struct ath_hal *ah, struct ieee80211_channel *chan)</a>
+<a name="ln393">{</a>
+<a name="ln394">#define	AR_RC_HW (AR_RC_RPCU | AR_RC_RDMA | AR_RC_RPHY | AR_RC_RMAC)</a>
+<a name="ln395"> </a>
+<a name="ln396">	HALDEBUG(ah, HAL_DEBUG_RESET, &quot;%s turbo %s\n&quot;, __func__,</a>
+<a name="ln397">		chan &amp;&amp; IEEE80211_IS_CHAN_TURBO(chan) ?</a>
+<a name="ln398">		&quot;enabled&quot; : &quot;disabled&quot;);</a>
+<a name="ln399"> </a>
+<a name="ln400">	if (!ar5210SetPowerMode(ah, HAL_PM_AWAKE, AH_TRUE))</a>
+<a name="ln401">		return AH_FALSE;</a>
+<a name="ln402"> </a>
+<a name="ln403">	/* Place chip in turbo before reset to cleanly reset clocks */</a>
+<a name="ln404">	OS_REG_WRITE(ah, AR_PHY_FRCTL,</a>
+<a name="ln405">		chan &amp;&amp; IEEE80211_IS_CHAN_TURBO(chan) ? AR_PHY_TURBO_MODE : 0);</a>
+<a name="ln406"> </a>
+<a name="ln407">	/*</a>
+<a name="ln408">	 * Reset the HW.</a>
+<a name="ln409">	 * PCI must be reset after the rest of the device has been reset.</a>
+<a name="ln410">	 */</a>
+<a name="ln411">	if (!ar5210SetResetReg(ah, AR_RC_HW, AR_RC_SETTLE_TIME))</a>
+<a name="ln412">		return AH_FALSE;</a>
+<a name="ln413">	OS_DELAY(1000);</a>
+<a name="ln414">	if (!ar5210SetResetReg(ah, AR_RC_HW | AR_RC_RPCI, AR_RC_SETTLE_TIME))</a>
+<a name="ln415">		return AH_FALSE;</a>
+<a name="ln416">	OS_DELAY(2100);   /* 8245 @ 96Mhz hangs with 2000us. */</a>
+<a name="ln417"> </a>
+<a name="ln418">	/*</a>
+<a name="ln419">	 * Bring out of sleep mode (AGAIN)</a>
+<a name="ln420">	 *</a>
+<a name="ln421">	 * WARNING WARNING WARNING</a>
+<a name="ln422">	 *</a>
+<a name="ln423">	 * There is a problem with the chip where it doesn't always indicate</a>
+<a name="ln424">	 * that it's awake, so initializePowerUp() will fail.</a>
+<a name="ln425">	 */</a>
+<a name="ln426">	if (!ar5210SetPowerMode(ah, HAL_PM_AWAKE, AH_TRUE))</a>
+<a name="ln427">		return AH_FALSE;</a>
+<a name="ln428"> </a>
+<a name="ln429">	/* Clear warm reset reg */</a>
+<a name="ln430">	return ar5210SetResetReg(ah, 0, 10);</a>
+<a name="ln431">#undef AR_RC_HW</a>
+<a name="ln432">}</a>
+<a name="ln433"> </a>
+<a name="ln434">enum {</a>
+<a name="ln435">	FIRPWR_M	= 0x03fc0000,</a>
+<a name="ln436">	FIRPWR_S	= 18,</a>
+<a name="ln437">	KCOARSEHIGH_M   = 0x003f8000,</a>
+<a name="ln438">	KCOARSEHIGH_S   = 15,</a>
+<a name="ln439">	KCOARSELOW_M	= 0x00007f80,</a>
+<a name="ln440">	KCOARSELOW_S	= 7,</a>
+<a name="ln441">	ADCSAT_ICOUNT_M	= 0x0001f800,</a>
+<a name="ln442">	ADCSAT_ICOUNT_S	= 11,</a>
+<a name="ln443">	ADCSAT_THRESH_M	= 0x000007e0,</a>
+<a name="ln444">	ADCSAT_THRESH_S	= 5</a>
+<a name="ln445">};</a>
+<a name="ln446"> </a>
+<a name="ln447">/*</a>
+<a name="ln448"> * Recalibrate the lower PHY chips to account for temperature/environment</a>
+<a name="ln449"> * changes.</a>
+<a name="ln450"> */</a>
+<a name="ln451">HAL_BOOL</a>
+<a name="ln452">ar5210PerCalibrationN(struct ath_hal *ah,</a>
+<a name="ln453">	struct ieee80211_channel *chan, u_int chainMask,</a>
+<a name="ln454">	HAL_BOOL longCal, HAL_BOOL *isCalDone)</a>
+<a name="ln455">{</a>
+<a name="ln456">	uint32_t regBeacon;</a>
+<a name="ln457">	uint32_t reg9858, reg985c, reg9868;</a>
+<a name="ln458">	HAL_CHANNEL_INTERNAL *ichan;</a>
+<a name="ln459"> </a>
+<a name="ln460">	ichan = ath_hal_checkchannel(ah, chan);</a>
+<a name="ln461">	if (ichan == AH_NULL)</a>
+<a name="ln462">		return AH_FALSE;</a>
+<a name="ln463">	/* Disable tx and rx */</a>
+<a name="ln464">	ar5210UpdateDiagReg(ah,</a>
+<a name="ln465">		OS_REG_READ(ah, AR_DIAG_SW) | (AR_DIAG_SW_DIS_TX | AR_DIAG_SW_DIS_RX));</a>
+<a name="ln466"> </a>
+<a name="ln467">	/* Disable Beacon Enable */</a>
+<a name="ln468">	regBeacon = OS_REG_READ(ah, AR_BEACON);</a>
+<a name="ln469">	OS_REG_WRITE(ah, AR_BEACON, regBeacon &amp; ~AR_BEACON_EN);</a>
+<a name="ln470"> </a>
+<a name="ln471">	/* Delay 4ms to ensure that all tx and rx activity has ceased */</a>
+<a name="ln472">	OS_DELAY(4000);</a>
+<a name="ln473"> </a>
+<a name="ln474">	/* Disable AGC to radio traffic */</a>
+<a name="ln475">	OS_REG_WRITE(ah, 0x9808, OS_REG_READ(ah, 0x9808) | 0x08000000);</a>
+<a name="ln476">	/* Wait for the AGC traffic to cease. */</a>
+<a name="ln477">	OS_DELAY(10);</a>
+<a name="ln478"> </a>
+<a name="ln479">	/* Change Channel to relock synth */</a>
+<a name="ln480">	if (!ar5210SetChannel(ah, chan))</a>
+<a name="ln481">		return AH_FALSE;</a>
+<a name="ln482"> </a>
+<a name="ln483">	/* wait for the synthesizer lock to stabilize */</a>
+<a name="ln484">	OS_DELAY(1000);</a>
+<a name="ln485"> </a>
+<a name="ln486">	/* Re-enable AGC to radio traffic */</a>
+<a name="ln487">	OS_REG_WRITE(ah, 0x9808, OS_REG_READ(ah, 0x9808) &amp; (~0x08000000));</a>
+<a name="ln488"> </a>
+<a name="ln489">	/*</a>
+<a name="ln490">	 * Configure the AGC so that it is highly unlikely (if not</a>
+<a name="ln491">	 * impossible) for it to send any gain changes to the analog</a>
+<a name="ln492">	 * chip.  We store off the current values so that they can</a>
+<a name="ln493">	 * be rewritten below. Setting the following values:</a>
+<a name="ln494">	 * firpwr	 = -1</a>
+<a name="ln495">	 * Kcoursehigh   = -1</a>
+<a name="ln496">	 * Kcourselow	 = -127</a>
+<a name="ln497">	 * ADCsat_icount = 2</a>
+<a name="ln498">	 * ADCsat_thresh = 12</a>
+<a name="ln499">	 */</a>
+<a name="ln500">	reg9858 = OS_REG_READ(ah, 0x9858);</a>
+<a name="ln501">	reg985c = OS_REG_READ(ah, 0x985c);</a>
+<a name="ln502">	reg9868 = OS_REG_READ(ah, 0x9868);</a>
+<a name="ln503"> </a>
+<a name="ln504">	OS_REG_WRITE(ah, 0x9858, (reg9858 &amp; ~FIRPWR_M) |</a>
+<a name="ln505">					 ((-1 &lt;&lt; FIRPWR_S) &amp; FIRPWR_M));</a>
+<a name="ln506">	OS_REG_WRITE(ah, 0x985c,</a>
+<a name="ln507">		 (reg985c &amp; ~(KCOARSEHIGH_M | KCOARSELOW_M)) |</a>
+<a name="ln508">		 ((-1 &lt;&lt; KCOARSEHIGH_S) &amp; KCOARSEHIGH_M) |</a>
+<a name="ln509">		 ((-127 &lt;&lt; KCOARSELOW_S) &amp; KCOARSELOW_M));</a>
+<a name="ln510">	OS_REG_WRITE(ah, 0x9868,</a>
+<a name="ln511">		 (reg9868 &amp; ~(ADCSAT_ICOUNT_M | ADCSAT_THRESH_M)) |</a>
+<a name="ln512">		 ((2 &lt;&lt; ADCSAT_ICOUNT_S) &amp; ADCSAT_ICOUNT_M) |</a>
+<a name="ln513">		 ((12 &lt;&lt; ADCSAT_THRESH_S) &amp; ADCSAT_THRESH_M));</a>
+<a name="ln514"> </a>
+<a name="ln515">	/* Wait for AGC changes to be enacted */</a>
+<a name="ln516">	OS_DELAY(20);</a>
+<a name="ln517"> </a>
+<a name="ln518">	/*</a>
+<a name="ln519">	 * We disable RF mix/gain stages for the PGA to avoid a</a>
+<a name="ln520">	 * race condition that will occur with receiving a frame</a>
+<a name="ln521">	 * and performing the AGC calibration.  This will be</a>
+<a name="ln522">	 * re-enabled at the end of offset cal.  We turn off AGC</a>
+<a name="ln523">	 * writes during this write as it will go over the analog bus.</a>
+<a name="ln524">	 */</a>
+<a name="ln525">	OS_REG_WRITE(ah, 0x9808, OS_REG_READ(ah, 0x9808) | 0x08000000);</a>
+<a name="ln526">	OS_DELAY(10);		 /* wait for the AGC traffic to cease */</a>
+<a name="ln527">	OS_REG_WRITE(ah, 0x98D4, 0x21);</a>
+<a name="ln528">	OS_REG_WRITE(ah, 0x9808, OS_REG_READ(ah, 0x9808) &amp; (~0x08000000));</a>
+<a name="ln529"> </a>
+<a name="ln530">	/* wait to make sure that additional AGC traffic has quiesced */</a>
+<a name="ln531">	OS_DELAY(1000);</a>
+<a name="ln532"> </a>
+<a name="ln533">	/* AGC calibration (this was added to make the NF threshold check work) */</a>
+<a name="ln534">	OS_REG_WRITE(ah, AR_PHY_AGCCTL,</a>
+<a name="ln535">		 OS_REG_READ(ah, AR_PHY_AGCCTL) | AR_PHY_AGC_CAL);</a>
+<a name="ln536">	if (!ath_hal_wait(ah, AR_PHY_AGCCTL, AR_PHY_AGC_CAL, 0)) {</a>
+<a name="ln537">		HALDEBUG(ah, HAL_DEBUG_ANY, &quot;%s: AGC calibration timeout\n&quot;,</a>
+<a name="ln538">		    __func__);</a>
+<a name="ln539">	}</a>
+<a name="ln540"> </a>
+<a name="ln541">	/* Rewrite our AGC values we stored off earlier (return AGC to normal operation) */</a>
+<a name="ln542">	OS_REG_WRITE(ah, 0x9858, reg9858);</a>
+<a name="ln543">	OS_REG_WRITE(ah, 0x985c, reg985c);</a>
+<a name="ln544">	OS_REG_WRITE(ah, 0x9868, reg9868);</a>
+<a name="ln545"> </a>
+<a name="ln546">	/* Perform noise floor and set status */</a>
+<a name="ln547">	if (!ar5210CalNoiseFloor(ah, ichan)) {</a>
+<a name="ln548">		/*</a>
+<a name="ln549">		 * Delay 5ms before retrying the noise floor -</a>
+<a name="ln550">		 * just to make sure.  We're in an error</a>
+<a name="ln551">		 * condition here</a>
+<a name="ln552">		 */</a>
+<a name="ln553">		HALDEBUG(ah, HAL_DEBUG_NFCAL | HAL_DEBUG_PERCAL,</a>
+<a name="ln554">		    &quot;%s: Performing 2nd Noise Cal\n&quot;, __func__);</a>
+<a name="ln555">		OS_DELAY(5000);</a>
+<a name="ln556">		if (!ar5210CalNoiseFloor(ah, ichan))</a>
+<a name="ln557">			chan-&gt;ic_state |= IEEE80211_CHANSTATE_CWINT;</a>
+<a name="ln558">	}</a>
+<a name="ln559"> </a>
+<a name="ln560">	/* Clear tx and rx disable bit */</a>
+<a name="ln561">	ar5210UpdateDiagReg(ah,</a>
+<a name="ln562">		 OS_REG_READ(ah, AR_DIAG_SW) &amp; ~(AR_DIAG_SW_DIS_TX | AR_DIAG_SW_DIS_RX));</a>
+<a name="ln563"> </a>
+<a name="ln564">	/* Re-enable Beacons */</a>
+<a name="ln565">	OS_REG_WRITE(ah, AR_BEACON, regBeacon);</a>
+<a name="ln566"> </a>
+<a name="ln567">	*isCalDone = AH_TRUE;</a>
+<a name="ln568"> </a>
+<a name="ln569">	return AH_TRUE;</a>
+<a name="ln570">}</a>
+<a name="ln571"> </a>
+<a name="ln572">HAL_BOOL</a>
+<a name="ln573">ar5210PerCalibration(struct ath_hal *ah, struct ieee80211_channel *chan,</a>
+<a name="ln574">	HAL_BOOL *isIQdone)</a>
+<a name="ln575">{</a>
+<a name="ln576">	return ar5210PerCalibrationN(ah,  chan, 0x1, AH_TRUE, isIQdone);</a>
+<a name="ln577">}</a>
+<a name="ln578"> </a>
+<a name="ln579">HAL_BOOL</a>
+<a name="ln580">ar5210ResetCalValid(struct ath_hal *ah, const struct ieee80211_channel *chan)</a>
+<a name="ln581">{</a>
+<a name="ln582">	return AH_TRUE;</a>
+<a name="ln583">}</a>
+<a name="ln584"> </a>
+<a name="ln585">/*</a>
+<a name="ln586"> * Writes the given reset bit mask into the reset register</a>
+<a name="ln587"> */</a>
+<a name="ln588">static HAL_BOOL</a>
+<a name="ln589">ar5210SetResetReg(struct ath_hal *ah, uint32_t resetMask, u_int delay)</a>
+<a name="ln590">{</a>
+<a name="ln591">	uint32_t mask = resetMask ? resetMask : ~0;</a>
+<a name="ln592">	HAL_BOOL rt;</a>
+<a name="ln593"> </a>
+<a name="ln594">	OS_REG_WRITE(ah, AR_RC, resetMask);</a>
+<a name="ln595">	/* need to wait at least 128 clocks when reseting PCI before read */</a>
+<a name="ln596">	OS_DELAY(delay);</a>
+<a name="ln597"> </a>
+<a name="ln598">	resetMask &amp;= AR_RC_RPCU | AR_RC_RDMA | AR_RC_RPHY | AR_RC_RMAC;</a>
+<a name="ln599">	mask &amp;= AR_RC_RPCU | AR_RC_RDMA | AR_RC_RPHY | AR_RC_RMAC;</a>
+<a name="ln600">	rt = ath_hal_wait(ah, AR_RC, mask, resetMask);</a>
+<a name="ln601">        if ((resetMask &amp; AR_RC_RMAC) == 0) {</a>
+<a name="ln602">		if (isBigEndian()) {</a>
+<a name="ln603">			/*</a>
+<a name="ln604">			 * Set CFG, little-endian for descriptor accesses.</a>
+<a name="ln605">			 */</a>
+<a name="ln606">			mask = INIT_CONFIG_STATUS | AR_CFG_SWTD | AR_CFG_SWRD;</a>
+<a name="ln607">			OS_REG_WRITE(ah, AR_CFG, mask);</a>
+<a name="ln608">		} else</a>
+<a name="ln609">			OS_REG_WRITE(ah, AR_CFG, INIT_CONFIG_STATUS);</a>
+<a name="ln610">	}</a>
+<a name="ln611">	return rt;</a>
+<a name="ln612">}</a>
+<a name="ln613"> </a>
+<a name="ln614"> </a>
+<a name="ln615">/*</a>
+<a name="ln616"> * Returns: the pcdac value</a>
+<a name="ln617"> */</a>
+<a name="ln618">static uint8_t</a>
+<a name="ln619">getPcdac(struct ath_hal *ah, const struct tpcMap *pRD, uint8_t dBm)</a>
+<a name="ln620">{</a>
+<a name="ln621">	int32_t	 i;</a>
+<a name="ln622">	int useNextEntry = AH_FALSE;</a>
+<a name="ln623">	uint32_t interp;</a>
+<a name="ln624"> </a>
+<a name="ln625">	for (i = AR_TP_SCALING_ENTRIES - 1; i &gt;= 0; i--) {</a>
+<a name="ln626">		/* Check for exact entry */</a>
+<a name="ln627">		if (dBm == AR_I2DBM(i)) {</a>
+<a name="ln628">			if (pRD-&gt;pcdac[i] != 63)</a>
+<a name="ln629">				return pRD-&gt;pcdac[i];</a>
+<a name="ln630">			useNextEntry = AH_TRUE;</a>
+<a name="ln631">		} else if (dBm + 1 == AR_I2DBM(i) &amp;&amp; i &gt; 0) {</a>
+<a name="ln632">			/* Interpolate for between entry with a logish scale */</a>
+<a name="ln633">			if (pRD-&gt;pcdac[i] != 63 &amp;&amp; pRD-&gt;pcdac[i-1] != 63) {</a>
+<a name="ln634">				interp = (350 * (pRD-&gt;pcdac[i] - pRD-&gt;pcdac[i-1])) + 999;</a>
+<a name="ln635">				interp = (interp / 1000) + pRD-&gt;pcdac[i-1];</a>
+<a name="ln636">				return interp;</a>
+<a name="ln637">			}</a>
+<a name="ln638">			useNextEntry = AH_TRUE;</a>
+<a name="ln639">		} else if (useNextEntry == AH_TRUE) {</a>
+<a name="ln640">			/* Grab the next lowest */</a>
+<a name="ln641">			if (pRD-&gt;pcdac[i] != 63)</a>
+<a name="ln642">				return pRD-&gt;pcdac[i];</a>
+<a name="ln643">		}</a>
+<a name="ln644">	}</a>
+<a name="ln645"> </a>
+<a name="ln646">	/* Return the lowest Entry if we haven't returned */</a>
+<a name="ln647">	for (i = 0; i &lt; AR_TP_SCALING_ENTRIES; i++)</a>
+<a name="ln648">		if (pRD-&gt;pcdac[i] != 63)</a>
+<a name="ln649">			return pRD-&gt;pcdac[i];</a>
+<a name="ln650"> </a>
+<a name="ln651">	/* No value to return from table */</a>
+<a name="ln652">#ifdef AH_DEBUG</a>
+<a name="ln653">	ath_hal_printf(ah, &quot;%s: empty transmit power table?\n&quot;, __func__);</a>
+<a name="ln654">#endif</a>
+<a name="ln655">	return 1;</a>
+<a name="ln656">}</a>
+<a name="ln657"> </a>
+<a name="ln658">/*</a>
+<a name="ln659"> * Find or interpolates the gainF value from the table ptr.</a>
+<a name="ln660"> */</a>
+<a name="ln661">static uint8_t</a>
+<a name="ln662">getGainF(struct ath_hal *ah, const struct tpcMap *pRD,</a>
+<a name="ln663">	uint8_t pcdac, uint8_t *dBm)</a>
+<a name="ln664">{</a>
+<a name="ln665">	uint32_t interp;</a>
+<a name="ln666">	int low, high, i;</a>
+<a name="ln667"> </a>
+<a name="ln668">	low = high = -1;</a>
+<a name="ln669"> </a>
+<a name="ln670">	for (i = 0; i &lt; AR_TP_SCALING_ENTRIES; i++) {</a>
+<a name="ln671">		if(pRD-&gt;pcdac[i] == 63)</a>
+<a name="ln672">			continue;</a>
+<a name="ln673">		if (pcdac == pRD-&gt;pcdac[i]) {</a>
+<a name="ln674">			*dBm = AR_I2DBM(i);</a>
+<a name="ln675">			return pRD-&gt;gainF[i];  /* Exact Match */</a>
+<a name="ln676">		}</a>
+<a name="ln677">		if (pcdac &gt; pRD-&gt;pcdac[i])</a>
+<a name="ln678">			low = i;</a>
+<a name="ln679">		if (pcdac &lt; pRD-&gt;pcdac[i]) {</a>
+<a name="ln680">			high = i;</a>
+<a name="ln681">			if (low == -1) {</a>
+<a name="ln682">				*dBm = AR_I2DBM(i);</a>
+<a name="ln683">				/* PCDAC is lower than lowest setting */</a>
+<a name="ln684">				return pRD-&gt;gainF[i];</a>
+<a name="ln685">			}</a>
+<a name="ln686">			break;</a>
+<a name="ln687">		}</a>
+<a name="ln688">	}</a>
+<a name="ln689">	if (i &gt;= AR_TP_SCALING_ENTRIES &amp;&amp; low == -1) {</a>
+<a name="ln690">		/* No settings were found */</a>
+<a name="ln691">#ifdef AH_DEBUG</a>
+<a name="ln692">		ath_hal_printf(ah,</a>
+<a name="ln693">			&quot;%s: no valid entries in the pcdac table: %d\n&quot;,</a>
+<a name="ln694">			__func__, pcdac);</a>
+<a name="ln695">#endif</a>
+<a name="ln696">		return 63;</a>
+<a name="ln697">	}</a>
+<a name="ln698">	if (i &gt;= AR_TP_SCALING_ENTRIES) {</a>
+<a name="ln699">		/* PCDAC setting was above the max setting in the table */</a>
+<a name="ln700">		*dBm = AR_I2DBM(low);</a>
+<a name="ln701">		return pRD-&gt;gainF[low];</a>
+<a name="ln702">	}</a>
+<a name="ln703">	/* Only exact if table has no missing entries */</a>
+<a name="ln704">	*dBm = (low + high) + 3;</a>
+<a name="ln705"> </a>
+<a name="ln706">	/*</a>
+<a name="ln707">	 * Perform interpolation between low and high values to find gainF</a>
+<a name="ln708">	 * linearly scale the pcdac between low and high</a>
+<a name="ln709">	 */</a>
+<a name="ln710">	interp = ((pcdac - pRD-&gt;pcdac[low]) * 1000) /</a>
+<a name="ln711">		  (pRD-&gt;pcdac[high] - pRD-&gt;pcdac[low]);</a>
+<a name="ln712">	/*</a>
+<a name="ln713">	 * Multiply the scale ratio by the gainF difference</a>
+<a name="ln714">	 * (plus a rnd up factor)</a>
+<a name="ln715">	 */</a>
+<a name="ln716">	interp = ((interp * (pRD-&gt;gainF[high] - pRD-&gt;gainF[low])) + 999) / 1000;</a>
+<a name="ln717"> </a>
+<a name="ln718">	/* Add ratioed gain_f to low gain_f value */</a>
+<a name="ln719">	return interp + pRD-&gt;gainF[low];</a>
+<a name="ln720">}</a>
+<a name="ln721"> </a>
+<a name="ln722">HAL_BOOL</a>
+<a name="ln723">ar5210SetTxPowerLimit(struct ath_hal *ah, uint32_t limit)</a>
+<a name="ln724">{</a>
+<a name="ln725">	AH_PRIVATE(ah)-&gt;ah_powerLimit = AH_MIN(limit, AR5210_MAX_RATE_POWER);</a>
+<a name="ln726">	/* XXX flush to h/w */</a>
+<a name="ln727">	return AH_TRUE;</a>
+<a name="ln728">}</a>
+<a name="ln729"> </a>
+<a name="ln730">/*</a>
+<a name="ln731"> * Get TXPower values and set them in the radio</a>
+<a name="ln732"> */</a>
+<a name="ln733">static HAL_BOOL</a>
+<a name="ln734">setupPowerSettings(struct ath_hal *ah, const struct ieee80211_channel *chan,</a>
+<a name="ln735">	uint8_t cp[17])</a>
+<a name="ln736">{</a>
+<a name="ln737">	uint16_t freq = ath_hal_gethwchannel(ah, chan);</a>
+<a name="ln738">	const HAL_EEPROM_v1 *ee = AH_PRIVATE(ah)-&gt;ah_eeprom;</a>
+<a name="ln739">	uint8_t gainFRD, gainF36, gainF48, gainF54;</a>
+<a name="ln740">	uint8_t dBmRD, dBm36, dBm48, dBm54, dontcare;</a>
+<a name="ln741">	uint32_t rd, group;</a>
+<a name="ln742">	const struct tpcMap  *pRD;</a>
+<a name="ln743"> </a>
+<a name="ln744">	/* Set OB/DB Values regardless of channel */</a>
+<a name="ln745">	cp[15] = (ee-&gt;ee_biasCurrents &gt;&gt; 4) &amp; 0x7;</a>
+<a name="ln746">	cp[16] = ee-&gt;ee_biasCurrents &amp; 0x7;</a>
+<a name="ln747"> </a>
+<a name="ln748">	if (freq &lt; 5170 || freq &gt; 5320) {</a>
+<a name="ln749">		HALDEBUG(ah, HAL_DEBUG_ANY, &quot;%s: invalid channel %u\n&quot;,</a>
+<a name="ln750">		    __func__, freq);</a>
+<a name="ln751">		return AH_FALSE;</a>
+<a name="ln752">	}</a>
+<a name="ln753"> </a>
+<a name="ln754">	HALASSERT(ee-&gt;ee_version &gt;= AR_EEPROM_VER1 &amp;&amp;</a>
+<a name="ln755">	    ee-&gt;ee_version &lt; AR_EEPROM_VER3);</a>
+<a name="ln756"> </a>
+<a name="ln757">	/* Match regulatory domain */</a>
+<a name="ln758">	for (rd = 0; rd &lt; AR_REG_DOMAINS_MAX; rd++)</a>
+<a name="ln759">		if (AH_PRIVATE(ah)-&gt;ah_currentRD == ee-&gt;ee_regDomain[rd])</a>
+<a name="ln760">			break;</a>
+<a name="ln761">	if (rd == AR_REG_DOMAINS_MAX) {</a>
+<a name="ln762">#ifdef AH_DEBUG</a>
+<a name="ln763">		ath_hal_printf(ah,</a>
+<a name="ln764">			&quot;%s: no calibrated regulatory domain matches the &quot;</a>
+<a name="ln765">			&quot;current regularly domain (0x%0x)\n&quot;, __func__, </a>
+<a name="ln766">			AH_PRIVATE(ah)-&gt;ah_currentRD);</a>
+<a name="ln767">#endif</a>
+<a name="ln768">		return AH_FALSE;</a>
+<a name="ln769">	}</a>
+<a name="ln770">	group = ((freq - 5170) / 10);</a>
+<a name="ln771"> </a>
+<a name="ln772">	if (group &gt; 11) {</a>
+<a name="ln773">		/* Pull 5.29 into the 5.27 group */</a>
+<a name="ln774">		group--;</a>
+<a name="ln775">	}</a>
+<a name="ln776"> </a>
+<a name="ln777">	/* Integer divide will set group from 0 to 4 */</a>
+<a name="ln778">	group = group / 3;</a>
+<a name="ln779">	pRD   = &amp;ee-&gt;ee_tpc[group];</a>
+<a name="ln780"> </a>
+<a name="ln781">	/* Set PC DAC Values */</a>
+<a name="ln782">	cp[14] = pRD-&gt;regdmn[rd];</a>
+<a name="ln783">	cp[9]  = AH_MIN(pRD-&gt;regdmn[rd], pRD-&gt;rate36);</a>
+<a name="ln784">	cp[8]  = AH_MIN(pRD-&gt;regdmn[rd], pRD-&gt;rate48);</a>
+<a name="ln785">	cp[7]  = AH_MIN(pRD-&gt;regdmn[rd], pRD-&gt;rate54);</a>
+<a name="ln786"> </a>
+<a name="ln787">	/* Find Corresponding gainF values for RD, 36, 48, 54 */</a>
+<a name="ln788">	gainFRD = getGainF(ah, pRD, pRD-&gt;regdmn[rd], &amp;dBmRD);</a>
+<a name="ln789">	gainF36 = getGainF(ah, pRD, cp[9], &amp;dBm36);</a>
+<a name="ln790">	gainF48 = getGainF(ah, pRD, cp[8], &amp;dBm48);</a>
+<a name="ln791">	gainF54 = getGainF(ah, pRD, cp[7], &amp;dBm54);</a>
+<a name="ln792"> </a>
+<a name="ln793">	/* Power Scale if requested */</a>
+<a name="ln794">	if (AH_PRIVATE(ah)-&gt;ah_tpScale != HAL_TP_SCALE_MAX) {</a>
+<a name="ln795">		static const uint16_t tpcScaleReductionTable[5] =</a>
+<a name="ln796">			{ 0, 3, 6, 9, AR5210_MAX_RATE_POWER };</a>
+<a name="ln797">		uint16_t tpScale;</a>
+<a name="ln798"> </a>
+<a name="ln799">		tpScale = tpcScaleReductionTable[AH_PRIVATE(ah)-&gt;ah_tpScale];</a>
+<a name="ln800">		if (dBmRD &lt; tpScale+3)</a>
+<a name="ln801">			dBmRD = 3;		/* min */</a>
+<a name="ln802">		else</a>
+<a name="ln803">			dBmRD -= tpScale;</a>
+<a name="ln804">		cp[14]  = getPcdac(ah, pRD, dBmRD);</a>
+<a name="ln805">		gainFRD = getGainF(ah, pRD, cp[14], &amp;dontcare);</a>
+<a name="ln806">		dBm36   = AH_MIN(dBm36, dBmRD);</a>
+<a name="ln807">		cp[9]   = getPcdac(ah, pRD, dBm36);</a>
+<a name="ln808">		gainF36 = getGainF(ah, pRD, cp[9], &amp;dontcare);</a>
+<a name="ln809">		dBm48   = AH_MIN(dBm48, dBmRD);</a>
+<a name="ln810">		cp[8]   = getPcdac(ah, pRD, dBm48);</a>
+<a name="ln811">		gainF48 = getGainF(ah, pRD, cp[8], &amp;dontcare);</a>
+<a name="ln812">		dBm54   = AH_MIN(dBm54, dBmRD);</a>
+<a name="ln813">		cp[7]   = getPcdac(ah, pRD, dBm54);</a>
+<a name="ln814">		gainF54 = getGainF(ah, pRD, cp[7], &amp;dontcare);</a>
+<a name="ln815">	}</a>
+<a name="ln816">	/* Record current dBm at rate 6 */</a>
+<a name="ln817">	AH_PRIVATE(ah)-&gt;ah_maxPowerLevel = 2*dBmRD;</a>
+<a name="ln818"> </a>
+<a name="ln819">	cp[13] = cp[12] = cp[11] = cp[10] = cp[14];</a>
+<a name="ln820"> </a>
+<a name="ln821">	/* Set GainF Values */</a>
+<a name="ln822">	cp[0] = gainFRD - gainF54;</a>
+<a name="ln823">	cp[1] = gainFRD - gainF48;</a>
+<a name="ln824">	cp[2] = gainFRD - gainF36;</a>
+<a name="ln825">	/* 9, 12, 18, 24 have no gain_delta from 6 */</a>
+<a name="ln826">	cp[3] = cp[4] = cp[5] = cp[6] = 0;</a>
+<a name="ln827">	return AH_TRUE;</a>
+<a name="ln828">}</a>
+<a name="ln829"> </a>
+<a name="ln830">/*</a>
+<a name="ln831"> * Places the device in and out of reset and then places sane</a>
+<a name="ln832"> * values in the registers based on EEPROM config, initialization</a>
+<a name="ln833"> * vectors (as determined by the mode), and station configuration</a>
+<a name="ln834"> */</a>
+<a name="ln835">HAL_BOOL</a>
+<a name="ln836">ar5210SetTransmitPower(struct ath_hal *ah, const struct ieee80211_channel *chan)</a>
+<a name="ln837">{</a>
+<a name="ln838">#define	N(a)	(sizeof (a) / sizeof (a[0]))</a>
+<a name="ln839">	static const uint32_t pwr_regs_start[17] = {</a>
+<a name="ln840">		0x00000000, 0x00000000, 0x00000000,</a>
+<a name="ln841">		0x00000000, 0x00000000, 0xf0000000,</a>
+<a name="ln842">		0xcc000000, 0x00000000, 0x00000000,</a>
+<a name="ln843">		0x00000000, 0x0a000000, 0x000000e2,</a>
+<a name="ln844">		0x0a000020, 0x01000002, 0x01000018,</a>
+<a name="ln845">		0x40000000, 0x00000418</a>
+<a name="ln846">	};</a>
+<a name="ln847">	uint16_t i;</a>
+<a name="ln848">	uint8_t cp[sizeof(ar5k0007_pwrSettings)];</a>
+<a name="ln849">	uint32_t pwr_regs[17];</a>
+<a name="ln850"> </a>
+<a name="ln851">	OS_MEMCPY(pwr_regs, pwr_regs_start, sizeof(pwr_regs));</a>
+<a name="ln852">	OS_MEMCPY(cp, ar5k0007_pwrSettings, sizeof(cp));</a>
+<a name="ln853"> </a>
+<a name="ln854">	/* Check the EEPROM tx power calibration settings */</a>
+<a name="ln855">	if (!setupPowerSettings(ah, chan, cp)) {</a>
+<a name="ln856">#ifdef AH_DEBUG</a>
+<a name="ln857">		ath_hal_printf(ah, &quot;%s: unable to setup power settings\n&quot;,</a>
+<a name="ln858">			__func__);</a>
+<a name="ln859">#endif</a>
+<a name="ln860">		return AH_FALSE;</a>
+<a name="ln861">	}</a>
+<a name="ln862">	if (cp[15] &lt; 1 || cp[15] &gt; 5) {</a>
+<a name="ln863">#ifdef AH_DEBUG</a>
+<a name="ln864">		ath_hal_printf(ah, &quot;%s: OB out of range (%u)\n&quot;,</a>
+<a name="ln865">			__func__, cp[15]);</a>
+<a name="ln866">#endif</a>
+<a name="ln867">		return AH_FALSE;</a>
+<a name="ln868">	}</a>
+<a name="ln869">	if (cp[16] &lt; 1 || cp[16] &gt; 5) {</a>
+<a name="ln870">#ifdef AH_DEBUG</a>
+<a name="ln871">		ath_hal_printf(ah, &quot;%s: DB out of range (%u)\n&quot;,</a>
+<a name="ln872">			__func__, cp[16]);</a>
+<a name="ln873">#endif</a>
+<a name="ln874">		return AH_FALSE;</a>
+<a name="ln875">	}</a>
+<a name="ln876"> </a>
+<a name="ln877">	/* reverse bits of the transmit power array */</a>
+<a name="ln878">	for (i = 0; i &lt; 7; i++)</a>
+<a name="ln879">		cp[i] = ath_hal_reverseBits(cp[i], 5);</a>
+<a name="ln880">	for (i = 7; i &lt; 15; i++)</a>
+<a name="ln881">		cp[i] = ath_hal_reverseBits(cp[i], 6);</a>
+<a name="ln882"> </a>
+<a name="ln883">	/* merge transmit power values into the register - quite gross */</a>
+<a name="ln884">	pwr_regs[0] |= ((cp[1] &lt;&lt; 5) &amp; 0xE0) | (cp[0] &amp; 0x1F);</a>
+<a name="ln885">	pwr_regs[1] |= ((cp[3] &lt;&lt; 7) &amp; 0x80) | ((cp[2] &lt;&lt; 2) &amp; 0x7C) | </a>
+<a name="ln886">			((cp[1] &gt;&gt; 3) &amp; 0x03);</a>
+<a name="ln887">	pwr_regs[2] |= ((cp[4] &lt;&lt; 4) &amp; 0xF0) | ((cp[3] &gt;&gt; 1) &amp; 0x0F);</a>
+<a name="ln888">	pwr_regs[3] |= ((cp[6] &lt;&lt; 6) &amp; 0xC0) | ((cp[5] &lt;&lt; 1) &amp; 0x3E) |</a>
+<a name="ln889">		       ((cp[4] &gt;&gt; 4) &amp; 0x01);</a>
+<a name="ln890">	pwr_regs[4] |= ((cp[7] &lt;&lt; 3) &amp; 0xF8) | ((cp[6] &gt;&gt; 2) &amp; 0x07);</a>
+<a name="ln891">	pwr_regs[5] |= ((cp[9] &lt;&lt; 7) &amp; 0x80) | ((cp[8] &lt;&lt; 1) &amp; 0x7E) |</a>
+<a name="ln892">			((cp[7] &gt;&gt; 5) &amp; 0x01);</a>
+<a name="ln893">	pwr_regs[6] |= ((cp[10] &lt;&lt; 5) &amp; 0xE0) | ((cp[9] &gt;&gt; 1) &amp; 0x1F);</a>
+<a name="ln894">	pwr_regs[7] |= ((cp[11] &lt;&lt; 3) &amp; 0xF8) | ((cp[10] &gt;&gt; 3) &amp; 0x07);</a>
+<a name="ln895">	pwr_regs[8] |= ((cp[12] &lt;&lt; 1) &amp; 0x7E) | ((cp[11] &gt;&gt; 5) &amp; 0x01);</a>
+<a name="ln896">	pwr_regs[9] |= ((cp[13] &lt;&lt; 5) &amp; 0xE0);</a>
+<a name="ln897">	pwr_regs[10] |= ((cp[14] &lt;&lt; 3) &amp; 0xF8) | ((cp[13] &gt;&gt; 3) &amp; 0x07);</a>
+<a name="ln898">	pwr_regs[11] |= ((cp[14] &gt;&gt; 5) &amp; 0x01);</a>
+<a name="ln899"> </a>
+<a name="ln900">	/* Set OB */</a>
+<a name="ln901">	pwr_regs[8] |=  (ath_hal_reverseBits(cp[15], 3) &lt;&lt; 7) &amp; 0x80;</a>
+<a name="ln902">	pwr_regs[9] |=  (ath_hal_reverseBits(cp[15], 3) &gt;&gt; 1) &amp; 0x03;</a>
+<a name="ln903"> </a>
+<a name="ln904">	/* Set DB */</a>
+<a name="ln905">	pwr_regs[9] |=  (ath_hal_reverseBits(cp[16], 3) &lt;&lt; 2) &amp; 0x1C;</a>
+<a name="ln906"> </a>
+<a name="ln907">	/* Write the registers */</a>
+<a name="ln908">	for (i = 0; i &lt; N(pwr_regs)-1; i++)</a>
+<a name="ln909">		OS_REG_WRITE(ah, 0x0000989c, pwr_regs[i]);</a>
+<a name="ln910">	/* last write is a flush */</a>
+<a name="ln911">	OS_REG_WRITE(ah, 0x000098d4, pwr_regs[i]);</a>
+<a name="ln912"> </a>
+<a name="ln913">	return AH_TRUE;</a>
+<a name="ln914">#undef N</a>
+<a name="ln915">}</a>
+<a name="ln916"> </a>
+<a name="ln917">/*</a>
+<a name="ln918"> * Takes the MHz channel value and sets the Channel value</a>
+<a name="ln919"> *</a>
+<a name="ln920"> * ASSUMES: Writes enabled to analog bus before AGC is active</a>
+<a name="ln921"> *   or by disabling the AGC.</a>
+<a name="ln922"> */</a>
+<a name="ln923">static HAL_BOOL</a>
+<a name="ln924">ar5210SetChannel(struct ath_hal *ah, struct ieee80211_channel *chan)</a>
+<a name="ln925">{</a>
+<a name="ln926">	uint16_t freq = ath_hal_gethwchannel(ah, chan);</a>
+<a name="ln927">	uint32_t data;</a>
+<a name="ln928"> </a>
+<a name="ln929">	/* Set the Channel */</a>
+<a name="ln930">	data = ath_hal_reverseBits((freq - 5120)/10, 5);</a>
+<a name="ln931">	data = (data &lt;&lt; 1) | 0x41;</a>
+<a name="ln932">	OS_REG_WRITE(ah, AR_PHY(0x27), data);</a>
+<a name="ln933">	OS_REG_WRITE(ah, AR_PHY(0x30), 0);</a>
+<a name="ln934">	AH_PRIVATE(ah)-&gt;ah_curchan = chan;</a>
+<a name="ln935">	return AH_TRUE;</a>
+<a name="ln936">}</a>
+<a name="ln937"> </a>
+<a name="ln938">int16_t</a>
+<a name="ln939">ar5210GetNoiseFloor(struct ath_hal *ah)</a>
+<a name="ln940">{</a>
+<a name="ln941">	int16_t nf;</a>
+<a name="ln942"> </a>
+<a name="ln943">	nf = (OS_REG_READ(ah, AR_PHY(25)) &gt;&gt; 19) &amp; 0x1ff;</a>
+<a name="ln944">	if (nf &amp; 0x100)</a>
+<a name="ln945">		nf = 0 - ((nf ^ 0x1ff) + 1);</a>
+<a name="ln946">	return nf;</a>
+<a name="ln947">}</a>
+<a name="ln948"> </a>
+<a name="ln949">#define NORMAL_NF_THRESH (-72)</a>
+<a name="ln950">/*</a>
+<a name="ln951"> * Peform the noisefloor calibration and check for</a>
+<a name="ln952"> * any constant channel interference</a>
+<a name="ln953"> *</a>
+<a name="ln954"> * Returns: TRUE for a successful noise floor calibration; else FALSE</a>
+<a name="ln955"> */</a>
+<a name="ln956">HAL_BOOL</a>
+<a name="ln957">ar5210CalNoiseFloor(struct ath_hal *ah, HAL_CHANNEL_INTERNAL *ichan)</a>
+<a name="ln958">{</a>
+<a name="ln959">	int32_t nf, nfLoops;</a>
+<a name="ln960"> </a>
+<a name="ln961">	/* Calibrate the noise floor */</a>
+<a name="ln962">	OS_REG_WRITE(ah, AR_PHY_AGCCTL,</a>
+<a name="ln963">		OS_REG_READ(ah, AR_PHY_AGCCTL) | AR_PHY_AGC_NF);</a>
+<a name="ln964"> </a>
+<a name="ln965">	/* Do not read noise floor until it has done the first update */</a>
+<a name="ln966">	if (!ath_hal_wait(ah, AR_PHY_AGCCTL, AR_PHY_AGC_NF, 0)) {</a>
+<a name="ln967">#ifdef ATH_HAL_DEBUG</a>
+<a name="ln968">		ath_hal_printf(ah, &quot; -PHY NF Reg state: 0x%x\n&quot;,</a>
+<a name="ln969">			OS_REG_READ(ah, AR_PHY_AGCCTL));</a>
+<a name="ln970">		ath_hal_printf(ah, &quot; -MAC Reset Reg state: 0x%x\n&quot;,</a>
+<a name="ln971">			OS_REG_READ(ah, AR_RC));</a>
+<a name="ln972">		ath_hal_printf(ah, &quot; -PHY Active Reg state: 0x%x\n&quot;,</a>
+<a name="ln973">			OS_REG_READ(ah, AR_PHY_ACTIVE));</a>
+<a name="ln974">#endif /* ATH_HAL_DEBUG */</a>
+<a name="ln975">		return AH_FALSE;</a>
+<a name="ln976">	}</a>
+<a name="ln977"> </a>
+<a name="ln978">	nf = 0;</a>
+<a name="ln979">	/* Keep checking until the floor is below the threshold or the nf is done */</a>
+<a name="ln980">	for (nfLoops = 0; ((nfLoops &lt; 21) &amp;&amp; (nf &gt; NORMAL_NF_THRESH)); nfLoops++) {</a>
+<a name="ln981">		OS_DELAY(1000); /* Sleep for 1 ms */</a>
+<a name="ln982">		nf = ar5210GetNoiseFloor(ah);</a>
+<a name="ln983">	}</a>
+<a name="ln984"> </a>
+<a name="ln985">	if (nf &gt; NORMAL_NF_THRESH) {</a>
+<a name="ln986">		HALDEBUG(ah, HAL_DEBUG_ANY, &quot;%s: Bad noise cal %d\n&quot;,</a>
+<a name="ln987">		    __func__, nf);</a>
+<a name="ln988">		ichan-&gt;rawNoiseFloor = 0;</a>
+<a name="ln989">		return AH_FALSE;</a>
+<a name="ln990">	}</a>
+<a name="ln991">	ichan-&gt;rawNoiseFloor = nf;</a>
+<a name="ln992">	return AH_TRUE;</a>
+<a name="ln993">}</a>
+<a name="ln994"> </a>
+<a name="ln995">/*</a>
+<a name="ln996"> * Adjust NF based on statistical values for 5GHz frequencies.</a>
+<a name="ln997"> */</a>
+<a name="ln998">int16_t</a>
+<a name="ln999">ar5210GetNfAdjust(struct ath_hal *ah, const HAL_CHANNEL_INTERNAL *c)</a>
+<a name="ln1000">{</a>
+<a name="ln1001">	return 0;</a>
+<a name="ln1002">}</a>
+<a name="ln1003"> </a>
+<a name="ln1004">HAL_RFGAIN</a>
+<a name="ln1005">ar5210GetRfgain(struct ath_hal *ah)</a>
+<a name="ln1006">{</a>
+<a name="ln1007">	return HAL_RFGAIN_INACTIVE;</a>
+<a name="ln1008">}</a>
+
+</code></pre>
+<div class="balloon" rel="506"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v610/" target="_blank">V610</a> Undefined behavior. Check the shift operator '<<'. The left operand '-127' is negative.</p></div>
+<div class="balloon" rel="506"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v610/" target="_blank">V610</a> Undefined behavior. Check the shift operator '<<'. The left operand '-1' is negative.</p></div>
+<div class="balloon" rel="504"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v610/" target="_blank">V610</a> Undefined behavior. Check the shift operator '<<'. The left operand '-1' is negative.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

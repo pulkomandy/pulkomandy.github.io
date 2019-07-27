@@ -1,0 +1,1009 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>driver_settings.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2002-2007, Axel Dörfler, axeld@pinc-software.de.</a>
+<a name="ln3"> * This file may be used under the terms of the MIT License.</a>
+<a name="ln4"> */</a>
+<a name="ln5"> </a>
+<a name="ln6">/*!	\brief Implements the driver settings API</a>
+<a name="ln7">	This file is used by three different components with different needs:</a>
+<a name="ln8">	  1) the boot loader</a>
+<a name="ln9">		Buffers a list of settings files to move over to the kernel - the</a>
+<a name="ln10">		actual buffering is located in the boot loader directly, though.</a>
+<a name="ln11">		Creates driver_settings structures out of those on demand only.</a>
+<a name="ln12">	  2) the kernel</a>
+<a name="ln13">		Maintains a list of settings so that no disk access is required</a>
+<a name="ln14">		for known settings (such as those passed over from the boot</a>
+<a name="ln15">		loader).</a>
+<a name="ln16">	  3) libroot.so</a>
+<a name="ln17">		Exports the parser to userland applications, so that they can</a>
+<a name="ln18">		easily make use of driver_settings styled files.</a>
+<a name="ln19"> </a>
+<a name="ln20">	The file has to be recompiled for every component separately, so that</a>
+<a name="ln21">	it properly exports the required functionality (which is specified by</a>
+<a name="ln22">	_BOOT_MODE for the boot loader, and _KERNEL_MODE for the kernel).</a>
+<a name="ln23">*/</a>
+<a name="ln24"> </a>
+<a name="ln25">// The boot loader is compiled with kernel rules, but we want to explicitely</a>
+<a name="ln26">// differentiate between the two here.</a>
+<a name="ln27">#ifdef _BOOT_MODE</a>
+<a name="ln28">#	undef _KERNEL_MODE</a>
+<a name="ln29">#endif</a>
+<a name="ln30"> </a>
+<a name="ln31">#include &lt;directories.h&gt;</a>
+<a name="ln32">#include &lt;driver_settings.h&gt;</a>
+<a name="ln33">#include &lt;FindDirectory.h&gt;</a>
+<a name="ln34">#include &lt;OS.h&gt;</a>
+<a name="ln35"> </a>
+<a name="ln36">#ifdef _KERNEL_MODE</a>
+<a name="ln37">#	include &lt;KernelExport.h&gt;</a>
+<a name="ln38">#	include &lt;util/list.h&gt;</a>
+<a name="ln39">#	include &lt;lock.h&gt;</a>
+<a name="ln40">#	include &lt;kdriver_settings.h&gt;</a>
+<a name="ln41">#	include &lt;kernel.h&gt;</a>
+<a name="ln42">#	include &lt;boot/kernel_args.h&gt;</a>
+<a name="ln43">#	include &lt;boot_device.h&gt;</a>
+<a name="ln44">#endif</a>
+<a name="ln45">#ifdef _BOOT_MODE</a>
+<a name="ln46">#	include &lt;boot/kernel_args.h&gt;</a>
+<a name="ln47">#	include &lt;boot/stage2.h&gt;</a>
+<a name="ln48">#else</a>
+<a name="ln49">#	include &lt;find_directory_private.h&gt;</a>
+<a name="ln50">#endif</a>
+<a name="ln51"> </a>
+<a name="ln52">#include &lt;stdlib.h&gt;</a>
+<a name="ln53">#include &lt;string.h&gt;</a>
+<a name="ln54">#include &lt;strings.h&gt;</a>
+<a name="ln55">#include &lt;unistd.h&gt;</a>
+<a name="ln56">#include &lt;fcntl.h&gt;</a>
+<a name="ln57">#include &lt;ctype.h&gt;</a>
+<a name="ln58"> </a>
+<a name="ln59">#ifndef B_BUFFER_OVERFLOW</a>
+<a name="ln60">#	define B_BUFFER_OVERFLOW B_ERROR</a>
+<a name="ln61">#endif</a>
+<a name="ln62"> </a>
+<a name="ln63">#define SETTINGS_DIRECTORY &quot;/kernel/drivers/&quot;</a>
+<a name="ln64">#define SETTINGS_MAGIC		'DrvS'</a>
+<a name="ln65"> </a>
+<a name="ln66">// Those maximum values are independent from the implementation - they</a>
+<a name="ln67">// have been chosen to make the code more robust against bad files</a>
+<a name="ln68">#define MAX_SETTINGS_SIZE	32768</a>
+<a name="ln69">#define MAX_SETTINGS_LEVEL	8</a>
+<a name="ln70"> </a>
+<a name="ln71">#define CONTINUE_PARAMETER	1</a>
+<a name="ln72">#define NO_PARAMETER 2</a>
+<a name="ln73"> </a>
+<a name="ln74"> </a>
+<a name="ln75">typedef struct settings_handle {</a>
+<a name="ln76">#ifdef _KERNEL_MODE</a>
+<a name="ln77">	list_link	link;</a>
+<a name="ln78">	char		name[B_OS_NAME_LENGTH];</a>
+<a name="ln79">	int32		ref_count;</a>
+<a name="ln80">		// A negative ref_count means the node is not reference counted and not</a>
+<a name="ln81">		// stored in the list.</a>
+<a name="ln82">#endif</a>
+<a name="ln83">	int32		magic;</a>
+<a name="ln84">	struct		driver_settings settings;</a>
+<a name="ln85">	char		*text;</a>
+<a name="ln86">} settings_handle;</a>
+<a name="ln87"> </a>
+<a name="ln88"> </a>
+<a name="ln89">enum assignment_mode {</a>
+<a name="ln90">	NO_ASSIGNMENT,</a>
+<a name="ln91">	ALLOW_ASSIGNMENT,</a>
+<a name="ln92">	IGNORE_ASSIGNMENT</a>
+<a name="ln93">};</a>
+<a name="ln94"> </a>
+<a name="ln95"> </a>
+<a name="ln96">#ifdef _KERNEL_MODE</a>
+<a name="ln97">static struct list sHandles;</a>
+<a name="ln98">static mutex sLock = MUTEX_INITIALIZER(&quot;driver settings&quot;);</a>
+<a name="ln99">#endif</a>
+<a name="ln100"> </a>
+<a name="ln101"> </a>
+<a name="ln102">//	#pragma mark - private functions</a>
+<a name="ln103"> </a>
+<a name="ln104"> </a>
+<a name="ln105">/*!</a>
+<a name="ln106">	\brief Returns true for any characters that separate parameters</a>
+<a name="ln107"> </a>
+<a name="ln108">	Those characters are ignored in the input stream and won't be added</a>
+<a name="ln109">	to any words.</a>
+<a name="ln110">*/</a>
+<a name="ln111">static inline bool</a>
+<a name="ln112">is_parameter_separator(char c)</a>
+<a name="ln113">{</a>
+<a name="ln114">	return c == '\n' || c == ';';</a>
+<a name="ln115">}</a>
+<a name="ln116"> </a>
+<a name="ln117"> </a>
+<a name="ln118">/*! Indicates if &quot;c&quot; begins a new word or not.</a>
+<a name="ln119">*/</a>
+<a name="ln120">static inline bool</a>
+<a name="ln121">is_word_break(char c)</a>
+<a name="ln122">{</a>
+<a name="ln123">	return isspace(c) || is_parameter_separator(c);</a>
+<a name="ln124">}</a>
+<a name="ln125"> </a>
+<a name="ln126"> </a>
+<a name="ln127">static inline bool</a>
+<a name="ln128">check_handle(settings_handle *handle)</a>
+<a name="ln129">{</a>
+<a name="ln130">	if (handle == NULL</a>
+<a name="ln131">		|| handle-&gt;magic != SETTINGS_MAGIC)</a>
+<a name="ln132">		return false;</a>
+<a name="ln133"> </a>
+<a name="ln134">	return true;</a>
+<a name="ln135">}</a>
+<a name="ln136"> </a>
+<a name="ln137"> </a>
+<a name="ln138">static driver_parameter *</a>
+<a name="ln139">get_parameter(settings_handle *handle, const char *name)</a>
+<a name="ln140">{</a>
+<a name="ln141">	int32 i;</a>
+<a name="ln142">	for (i = handle-&gt;settings.parameter_count; i-- &gt; 0;) {</a>
+<a name="ln143">		if (!strcmp(handle-&gt;settings.parameters[i].name, name))</a>
+<a name="ln144">			return &amp;handle-&gt;settings.parameters[i];</a>
+<a name="ln145">	}</a>
+<a name="ln146">	return NULL;</a>
+<a name="ln147">}</a>
+<a name="ln148"> </a>
+<a name="ln149"> </a>
+<a name="ln150">/*!</a>
+<a name="ln151">	Returns the next word in the input buffer passed in via &quot;_pos&quot; - if</a>
+<a name="ln152">	this function returns, it will bump the input position after the word.</a>
+<a name="ln153">	It automatically cares about quoted strings and escaped characters.</a>
+<a name="ln154">	If &quot;allowNewLine&quot; is true, it reads over comments to get to the next</a>
+<a name="ln155">	word.</a>
+<a name="ln156">	Depending on the &quot;assignmentMode&quot; parameter, the '=' sign is either</a>
+<a name="ln157">	used as a work break, or not.</a>
+<a name="ln158">	The input buffer will be changed to contain the word without quotes</a>
+<a name="ln159">	or escaped characters and adds a terminating NULL byte. The &quot;_word&quot;</a>
+<a name="ln160">	parameter will be set to the beginning of the word.</a>
+<a name="ln161">	If the word is followed by a newline it will return B_OK, if white</a>
+<a name="ln162">	spaces follows, it will return CONTINUE_PARAMETER.</a>
+<a name="ln163">*/</a>
+<a name="ln164">static status_t</a>
+<a name="ln165">get_word(char **_pos, char **_word, int32 assignmentMode, bool allowNewLine)</a>
+<a name="ln166">{</a>
+<a name="ln167">	char *pos = *_pos;</a>
+<a name="ln168">	char quoted = 0;</a>
+<a name="ln169">	bool newLine = false, end = false;</a>
+<a name="ln170">	int escaped = 0;</a>
+<a name="ln171">	bool charEscaped = false;</a>
+<a name="ln172"> </a>
+<a name="ln173">	// Skip any white space and comments</a>
+<a name="ln174">	while (pos[0]</a>
+<a name="ln175">		&amp;&amp; ((allowNewLine &amp;&amp; (isspace(pos[0]) || is_parameter_separator(pos[0])</a>
+<a name="ln176">				|| pos[0] == '#'))</a>
+<a name="ln177">			|| (!allowNewLine &amp;&amp; (pos[0] == '\t' || pos[0] == ' '))</a>
+<a name="ln178">			|| (assignmentMode == ALLOW_ASSIGNMENT &amp;&amp; pos[0] == '='))) {</a>
+<a name="ln179">		// skip any comment lines</a>
+<a name="ln180">		if (pos[0] == '#') {</a>
+<a name="ln181">			while (pos[0] &amp;&amp; pos[0] != '\n')</a>
+<a name="ln182">				pos++;</a>
+<a name="ln183">		}</a>
+<a name="ln184">		pos++;</a>
+<a name="ln185">	}</a>
+<a name="ln186"> </a>
+<a name="ln187">	if (pos[0] == '}' || pos[0] == '\0') {</a>
+<a name="ln188">		// if we just read some white space before an end of a</a>
+<a name="ln189">		// parameter, this is just no parameter at all</a>
+<a name="ln190">		*_pos = pos;</a>
+<a name="ln191">		return NO_PARAMETER;</a>
+<a name="ln192">	}</a>
+<a name="ln193"> </a>
+<a name="ln194">	// Read in a word - might contain escaped (\) spaces, or it</a>
+<a name="ln195">	// might also be quoted (&quot; or ').</a>
+<a name="ln196"> </a>
+<a name="ln197">	if (pos[0] == '&quot;' || pos[0] == '\'') {</a>
+<a name="ln198">		quoted = pos[0];</a>
+<a name="ln199">		pos++;</a>
+<a name="ln200">	}</a>
+<a name="ln201">	*_word = pos;</a>
+<a name="ln202"> </a>
+<a name="ln203">	while (pos[0]) {</a>
+<a name="ln204">		if (charEscaped)</a>
+<a name="ln205">			charEscaped = false;</a>
+<a name="ln206">		else if (pos[0] == '\\') {</a>
+<a name="ln207">			charEscaped = true;</a>
+<a name="ln208">			escaped++;</a>
+<a name="ln209">		} else if ((!quoted &amp;&amp; (is_word_break(pos[0])</a>
+<a name="ln210">				|| (assignmentMode != IGNORE_ASSIGNMENT &amp;&amp; pos[0] == '=')))</a>
+<a name="ln211">			|| (quoted &amp;&amp; pos[0] == quoted))</a>
+<a name="ln212">			break;</a>
+<a name="ln213"> </a>
+<a name="ln214">		pos++;</a>
+<a name="ln215">	}</a>
+<a name="ln216"> </a>
+<a name="ln217">	// &quot;String exceeds line&quot; - missing end quote</a>
+<a name="ln218">	if (quoted &amp;&amp; pos[0] != quoted)</a>
+<a name="ln219">		return B_BAD_DATA;</a>
+<a name="ln220"> </a>
+<a name="ln221">	// last character is a backslash</a>
+<a name="ln222">	if (charEscaped)</a>
+<a name="ln223">		return B_BAD_DATA;</a>
+<a name="ln224"> </a>
+<a name="ln225">	end = pos[0] == '\0';</a>
+<a name="ln226">	newLine = is_parameter_separator(pos[0]) || end;</a>
+<a name="ln227">	pos[0] = '\0';</a>
+<a name="ln228"> </a>
+<a name="ln229">	// Correct name if there were any escaped characters</a>
+<a name="ln230">	if (escaped) {</a>
+<a name="ln231">		char *word = *_word;</a>
+<a name="ln232">		int offset = 0;</a>
+<a name="ln233">		while (word &lt;= pos) {</a>
+<a name="ln234">			if (word[0] == '\\') {</a>
+<a name="ln235">				offset--;</a>
+<a name="ln236">				word++;</a>
+<a name="ln237">			}</a>
+<a name="ln238">			word[offset] = word[0];</a>
+<a name="ln239">			word++;</a>
+<a name="ln240">		}</a>
+<a name="ln241">	}</a>
+<a name="ln242"> </a>
+<a name="ln243">	if (end) {</a>
+<a name="ln244">		*_pos = pos;</a>
+<a name="ln245">		return B_OK;</a>
+<a name="ln246">	}</a>
+<a name="ln247"> </a>
+<a name="ln248">	// Scan for next beginning word, open brackets, or comment start</a>
+<a name="ln249"> </a>
+<a name="ln250">	pos++;</a>
+<a name="ln251">	while (true) {</a>
+<a name="ln252">		*_pos = pos;</a>
+<a name="ln253">		if (!pos[0])</a>
+<a name="ln254">			return B_NO_ERROR;</a>
+<a name="ln255"> </a>
+<a name="ln256">		if (is_parameter_separator(pos[0])) {</a>
+<a name="ln257">			// an open bracket '{' could follow after the first</a>
+<a name="ln258">			// newline, but not later</a>
+<a name="ln259">			if (newLine)</a>
+<a name="ln260">				return B_NO_ERROR;</a>
+<a name="ln261"> </a>
+<a name="ln262">			newLine = true;</a>
+<a name="ln263">		} else if (pos[0] == '{' || pos[0] == '}' || pos[0] == '#')</a>
+<a name="ln264">			return B_NO_ERROR;</a>
+<a name="ln265">		else if (!isspace(pos[0]))</a>
+<a name="ln266">			return newLine ? B_NO_ERROR : CONTINUE_PARAMETER;</a>
+<a name="ln267"> </a>
+<a name="ln268">		pos++;</a>
+<a name="ln269">	}</a>
+<a name="ln270">}</a>
+<a name="ln271"> </a>
+<a name="ln272"> </a>
+<a name="ln273">static status_t</a>
+<a name="ln274">parse_parameter(struct driver_parameter *parameter, char **_pos, int32 level)</a>
+<a name="ln275">{</a>
+<a name="ln276">	char *pos = *_pos;</a>
+<a name="ln277">	status_t status;</a>
+<a name="ln278"> </a>
+<a name="ln279">	// initialize parameter first</a>
+<a name="ln280">	memset(parameter, 0, sizeof(struct driver_parameter));</a>
+<a name="ln281"> </a>
+<a name="ln282">	status = get_word(&amp;pos, &amp;parameter-&gt;name, NO_ASSIGNMENT, true);</a>
+<a name="ln283">	if (status == CONTINUE_PARAMETER) {</a>
+<a name="ln284">		while (status == CONTINUE_PARAMETER) {</a>
+<a name="ln285">			char **newArray, *value = NULL;</a>
+<a name="ln286">			status = get_word(&amp;pos, &amp;value, parameter-&gt;value_count == 0</a>
+<a name="ln287">				? ALLOW_ASSIGNMENT : IGNORE_ASSIGNMENT, false);</a>
+<a name="ln288">			if (status &lt; B_OK)</a>
+<a name="ln289">				break;</a>
+<a name="ln290"> </a>
+<a name="ln291">			// enlarge value array and save the value</a>
+<a name="ln292"> </a>
+<a name="ln293">			newArray = (char**)realloc(parameter-&gt;values,</a>
+<a name="ln294">				(parameter-&gt;value_count + 1) * sizeof(char *));</a>
+<a name="ln295">			if (newArray == NULL)</a>
+<a name="ln296">				return B_NO_MEMORY;</a>
+<a name="ln297"> </a>
+<a name="ln298">			parameter-&gt;values = newArray;</a>
+<a name="ln299">			parameter-&gt;values[parameter-&gt;value_count++] = value;</a>
+<a name="ln300">		}</a>
+<a name="ln301">	}</a>
+<a name="ln302"> </a>
+<a name="ln303">	*_pos = pos;</a>
+<a name="ln304">	return status;</a>
+<a name="ln305">}</a>
+<a name="ln306"> </a>
+<a name="ln307"> </a>
+<a name="ln308">static status_t</a>
+<a name="ln309">parse_parameters(struct driver_parameter **_parameters, int *_count,</a>
+<a name="ln310">	char **_pos, int32 level)</a>
+<a name="ln311">{</a>
+<a name="ln312">	if (level &gt; MAX_SETTINGS_LEVEL)</a>
+<a name="ln313">		return B_LINK_LIMIT;</a>
+<a name="ln314"> </a>
+<a name="ln315">	while (true) {</a>
+<a name="ln316">		struct driver_parameter parameter;</a>
+<a name="ln317">		struct driver_parameter *newArray;</a>
+<a name="ln318">		status_t status;</a>
+<a name="ln319"> </a>
+<a name="ln320">		status = parse_parameter(&amp;parameter, _pos, level);</a>
+<a name="ln321">		if (status &lt; B_OK)</a>
+<a name="ln322">			return status;</a>
+<a name="ln323"> </a>
+<a name="ln324">		if (status != NO_PARAMETER) {</a>
+<a name="ln325">			driver_parameter *newParameter;</a>
+<a name="ln326"> </a>
+<a name="ln327">			newArray = (driver_parameter*)realloc(*_parameters, (*_count + 1)</a>
+<a name="ln328">				* sizeof(struct driver_parameter));</a>
+<a name="ln329">			if (newArray == NULL)</a>
+<a name="ln330">				return B_NO_MEMORY;</a>
+<a name="ln331"> </a>
+<a name="ln332">			memcpy(&amp;newArray[*_count], &amp;parameter, sizeof(struct driver_parameter));</a>
+<a name="ln333">			newParameter = &amp;newArray[*_count];</a>
+<a name="ln334"> </a>
+<a name="ln335">			*_parameters = newArray;</a>
+<a name="ln336">			(*_count)++;</a>
+<a name="ln337"> </a>
+<a name="ln338">			// check for level beginning and end</a>
+<a name="ln339">			if (**_pos == '{') {</a>
+<a name="ln340">				// if we go a level deeper, just start all over again...</a>
+<a name="ln341">				(*_pos)++;</a>
+<a name="ln342">				status = parse_parameters(&amp;newParameter-&gt;parameters,</a>
+<a name="ln343">							&amp;newParameter-&gt;parameter_count, _pos, level + 1);</a>
+<a name="ln344">				if (status &lt; B_OK)</a>
+<a name="ln345">					return status;</a>
+<a name="ln346">			}</a>
+<a name="ln347">		}</a>
+<a name="ln348"> </a>
+<a name="ln349">		if ((**_pos == '}' &amp;&amp; level &gt; 0)</a>
+<a name="ln350">			|| (**_pos == '\0' &amp;&amp; level == 0)) {</a>
+<a name="ln351">			// take the closing bracket from the stack</a>
+<a name="ln352">			(*_pos)++;</a>
+<a name="ln353">			return B_OK;</a>
+<a name="ln354">		}</a>
+<a name="ln355"> </a>
+<a name="ln356">		// obviously, something has gone wrong</a>
+<a name="ln357">		if (**_pos == '}' || **_pos == '\0')</a>
+<a name="ln358">			return B_ERROR;</a>
+<a name="ln359">	}</a>
+<a name="ln360">}</a>
+<a name="ln361"> </a>
+<a name="ln362"> </a>
+<a name="ln363">static status_t</a>
+<a name="ln364">parse_settings(settings_handle *handle)</a>
+<a name="ln365">{</a>
+<a name="ln366">	char *text = handle-&gt;text;</a>
+<a name="ln367"> </a>
+<a name="ln368">	memset(&amp;handle-&gt;settings, 0, sizeof(struct driver_settings));</a>
+<a name="ln369"> </a>
+<a name="ln370">	// empty settings are allowed</a>
+<a name="ln371">	if (text == NULL)</a>
+<a name="ln372">		return B_OK;</a>
+<a name="ln373"> </a>
+<a name="ln374">	return parse_parameters(&amp;handle-&gt;settings.parameters,</a>
+<a name="ln375">		&amp;handle-&gt;settings.parameter_count, &amp;text, 0);</a>
+<a name="ln376">}</a>
+<a name="ln377"> </a>
+<a name="ln378"> </a>
+<a name="ln379">static void</a>
+<a name="ln380">free_parameter(struct driver_parameter *parameter)</a>
+<a name="ln381">{</a>
+<a name="ln382">	int32 i;</a>
+<a name="ln383">	for (i = parameter-&gt;parameter_count; i-- &gt; 0;)</a>
+<a name="ln384">		free_parameter(&amp;parameter-&gt;parameters[i]);</a>
+<a name="ln385"> </a>
+<a name="ln386">	free(parameter-&gt;parameters);</a>
+<a name="ln387">	free(parameter-&gt;values);</a>
+<a name="ln388">}</a>
+<a name="ln389"> </a>
+<a name="ln390"> </a>
+<a name="ln391">static void</a>
+<a name="ln392">free_settings(settings_handle *handle)</a>
+<a name="ln393">{</a>
+<a name="ln394">	int32 i;</a>
+<a name="ln395">	for (i = handle-&gt;settings.parameter_count; i-- &gt; 0;)</a>
+<a name="ln396">		free_parameter(&amp;handle-&gt;settings.parameters[i]);</a>
+<a name="ln397"> </a>
+<a name="ln398">	free(handle-&gt;settings.parameters);</a>
+<a name="ln399">	free(handle-&gt;text);</a>
+<a name="ln400">	free(handle);</a>
+<a name="ln401">}</a>
+<a name="ln402"> </a>
+<a name="ln403"> </a>
+<a name="ln404">static settings_handle *</a>
+<a name="ln405">new_settings(char *buffer, const char *driverName)</a>
+<a name="ln406">{</a>
+<a name="ln407">	settings_handle *handle = (settings_handle*)malloc(sizeof(settings_handle));</a>
+<a name="ln408">	if (handle == NULL)</a>
+<a name="ln409">		return NULL;</a>
+<a name="ln410"> </a>
+<a name="ln411">	handle-&gt;magic = SETTINGS_MAGIC;</a>
+<a name="ln412">	handle-&gt;text = buffer;</a>
+<a name="ln413"> </a>
+<a name="ln414">#ifdef _KERNEL_MODE</a>
+<a name="ln415">	if (driverName != NULL) {</a>
+<a name="ln416">		handle-&gt;ref_count = 1;</a>
+<a name="ln417">		strlcpy(handle-&gt;name, driverName, sizeof(handle-&gt;name));</a>
+<a name="ln418">	} else {</a>
+<a name="ln419">		handle-&gt;ref_count = -1;</a>
+<a name="ln420">		handle-&gt;name[0] = 0;</a>
+<a name="ln421">	}</a>
+<a name="ln422">#endif</a>
+<a name="ln423"> </a>
+<a name="ln424">	if (parse_settings(handle) == B_OK)</a>
+<a name="ln425">		return handle;</a>
+<a name="ln426"> </a>
+<a name="ln427">	free(handle);</a>
+<a name="ln428">	return NULL;</a>
+<a name="ln429">}</a>
+<a name="ln430"> </a>
+<a name="ln431"> </a>
+<a name="ln432">static settings_handle *</a>
+<a name="ln433">load_driver_settings_from_file(int file, const char *driverName)</a>
+<a name="ln434">{</a>
+<a name="ln435">	struct stat stat;</a>
+<a name="ln436"> </a>
+<a name="ln437">	// Allocate a buffer and read the whole file into it.</a>
+<a name="ln438">	// We will keep this buffer in memory, until the settings</a>
+<a name="ln439">	// are unloaded.</a>
+<a name="ln440">	// The driver_parameter::name field will point directly</a>
+<a name="ln441">	// to this buffer.</a>
+<a name="ln442"> </a>
+<a name="ln443">	if (fstat(file, &amp;stat) &lt; B_OK)</a>
+<a name="ln444">		return NULL;</a>
+<a name="ln445"> </a>
+<a name="ln446">	if (stat.st_size &gt; B_OK &amp;&amp; stat.st_size &lt; MAX_SETTINGS_SIZE) {</a>
+<a name="ln447">		char *text = (char *)malloc(stat.st_size + 1);</a>
+<a name="ln448">		if (text != NULL &amp;&amp; read(file, text, stat.st_size) == stat.st_size) {</a>
+<a name="ln449">			settings_handle *handle;</a>
+<a name="ln450"> </a>
+<a name="ln451">			text[stat.st_size] = '\0';</a>
+<a name="ln452">				// make sure the string is null terminated</a>
+<a name="ln453">				// to avoid misbehaviour</a>
+<a name="ln454"> </a>
+<a name="ln455">			handle = new_settings(text, driverName);</a>
+<a name="ln456">			if (handle != NULL) {</a>
+<a name="ln457">				// everything went fine!</a>
+<a name="ln458">				return handle;</a>
+<a name="ln459">			}</a>
+<a name="ln460"> </a>
+<a name="ln461">			free(handle);</a>
+<a name="ln462">		}</a>
+<a name="ln463">		// &quot;text&quot; might be NULL here, but that's allowed</a>
+<a name="ln464">		free(text);</a>
+<a name="ln465">	}</a>
+<a name="ln466"> </a>
+<a name="ln467">	return NULL;</a>
+<a name="ln468">}</a>
+<a name="ln469"> </a>
+<a name="ln470"> </a>
+<a name="ln471">static bool</a>
+<a name="ln472">put_string(char **_buffer, ssize_t *_bufferSize, char *string)</a>
+<a name="ln473">{</a>
+<a name="ln474">	size_t length, reserved, quotes;</a>
+<a name="ln475">	char *buffer = *_buffer, c;</a>
+<a name="ln476">	bool quoted;</a>
+<a name="ln477"> </a>
+<a name="ln478">	if (string == NULL)</a>
+<a name="ln479">		return true;</a>
+<a name="ln480"> </a>
+<a name="ln481">	for (length = reserved = quotes = 0; (c = string[length]) != '\0'; length++) {</a>
+<a name="ln482">		if (c == '&quot;')</a>
+<a name="ln483">			quotes++;</a>
+<a name="ln484">		else if (is_word_break(c))</a>
+<a name="ln485">			reserved++;</a>
+<a name="ln486">	}</a>
+<a name="ln487">	quoted = reserved || quotes;</a>
+<a name="ln488"> </a>
+<a name="ln489">	// update _bufferSize in any way, so that we can chain several</a>
+<a name="ln490">	// of these calls without having to check the return value</a>
+<a name="ln491">	// everytime</a>
+<a name="ln492">	*_bufferSize -= length + (quoted ? 2 + quotes : 0);</a>
+<a name="ln493"> </a>
+<a name="ln494">	if (*_bufferSize &lt;= 0)</a>
+<a name="ln495">		return false;</a>
+<a name="ln496"> </a>
+<a name="ln497">	if (quoted)</a>
+<a name="ln498">		*(buffer++) = '&quot;';</a>
+<a name="ln499"> </a>
+<a name="ln500">	for (;(c = string[0]) != '\0'; string++) {</a>
+<a name="ln501">		if (c == '&quot;')</a>
+<a name="ln502">			*(buffer++) = '\\';</a>
+<a name="ln503"> </a>
+<a name="ln504">		*(buffer++) = c;</a>
+<a name="ln505">	}</a>
+<a name="ln506"> </a>
+<a name="ln507">	if (quoted)</a>
+<a name="ln508">		*(buffer++) = '&quot;';</a>
+<a name="ln509"> </a>
+<a name="ln510">	buffer[0] = '\0';</a>
+<a name="ln511"> </a>
+<a name="ln512">	// update the buffer position</a>
+<a name="ln513">	*_buffer = buffer;</a>
+<a name="ln514"> </a>
+<a name="ln515">	return true;</a>
+<a name="ln516">}</a>
+<a name="ln517"> </a>
+<a name="ln518"> </a>
+<a name="ln519">static bool</a>
+<a name="ln520">put_chars(char **_buffer, ssize_t *_bufferSize, const char *chars)</a>
+<a name="ln521">{</a>
+<a name="ln522">	char *buffer = *_buffer;</a>
+<a name="ln523">	size_t length;</a>
+<a name="ln524"> </a>
+<a name="ln525">	if (chars == NULL)</a>
+<a name="ln526">		return true;</a>
+<a name="ln527"> </a>
+<a name="ln528">	length = strlen(chars);</a>
+<a name="ln529">	*_bufferSize -= length;</a>
+<a name="ln530"> </a>
+<a name="ln531">	if (*_bufferSize &lt;= 0)</a>
+<a name="ln532">		return false;</a>
+<a name="ln533"> </a>
+<a name="ln534">	memcpy(buffer, chars, length);</a>
+<a name="ln535">	buffer += length;</a>
+<a name="ln536">	buffer[0] = '\0';</a>
+<a name="ln537"> </a>
+<a name="ln538">	// update the buffer position</a>
+<a name="ln539">	*_buffer = buffer;</a>
+<a name="ln540"> </a>
+<a name="ln541">	return true;</a>
+<a name="ln542">}</a>
+<a name="ln543"> </a>
+<a name="ln544"> </a>
+<a name="ln545">static bool</a>
+<a name="ln546">put_char(char **_buffer, ssize_t *_bufferSize, char c)</a>
+<a name="ln547">{</a>
+<a name="ln548">	char *buffer = *_buffer;</a>
+<a name="ln549"> </a>
+<a name="ln550">	*_bufferSize -= 1;</a>
+<a name="ln551"> </a>
+<a name="ln552">	if (*_bufferSize &lt;= 0)</a>
+<a name="ln553">		return false;</a>
+<a name="ln554"> </a>
+<a name="ln555">	buffer[0] = c;</a>
+<a name="ln556">	buffer[1] = '\0';</a>
+<a name="ln557"> </a>
+<a name="ln558">	// update the buffer position</a>
+<a name="ln559">	*_buffer = buffer + 1;</a>
+<a name="ln560"> </a>
+<a name="ln561">	return true;</a>
+<a name="ln562">}</a>
+<a name="ln563"> </a>
+<a name="ln564"> </a>
+<a name="ln565">static void</a>
+<a name="ln566">put_level_space(char **_buffer, ssize_t *_bufferSize, int32 level)</a>
+<a name="ln567">{</a>
+<a name="ln568">	while (level-- &gt; 0)</a>
+<a name="ln569">		put_char(_buffer, _bufferSize, '\t');</a>
+<a name="ln570">}</a>
+<a name="ln571"> </a>
+<a name="ln572"> </a>
+<a name="ln573">static void</a>
+<a name="ln574">put_parameter(char **_buffer, ssize_t *_bufferSize,</a>
+<a name="ln575">	struct driver_parameter *parameter, int32 level, bool flat)</a>
+<a name="ln576">{</a>
+<a name="ln577">	int32 i;</a>
+<a name="ln578"> </a>
+<a name="ln579">	if (!flat)</a>
+<a name="ln580">		put_level_space(_buffer, _bufferSize, level);</a>
+<a name="ln581"> </a>
+<a name="ln582">	put_string(_buffer, _bufferSize, parameter-&gt;name);</a>
+<a name="ln583">	if (flat &amp;&amp; parameter-&gt;value_count &gt; 0)</a>
+<a name="ln584">		put_chars(_buffer, _bufferSize, &quot; =&quot;);</a>
+<a name="ln585"> </a>
+<a name="ln586">	for (i = 0; i &lt; parameter-&gt;value_count; i++) {</a>
+<a name="ln587">		put_char(_buffer, _bufferSize, ' ');</a>
+<a name="ln588">		put_string(_buffer, _bufferSize, parameter-&gt;values[i]);</a>
+<a name="ln589">	}</a>
+<a name="ln590"> </a>
+<a name="ln591">	if (parameter-&gt;parameter_count &gt; 0) {</a>
+<a name="ln592">		put_chars(_buffer, _bufferSize, &quot; {&quot;);</a>
+<a name="ln593">		if (!flat)</a>
+<a name="ln594">			put_char(_buffer, _bufferSize, '\n');</a>
+<a name="ln595"> </a>
+<a name="ln596">		for (i = 0; i &lt; parameter-&gt;parameter_count; i++) {</a>
+<a name="ln597">			put_parameter(_buffer, _bufferSize, &amp;parameter-&gt;parameters[i],</a>
+<a name="ln598">				level + 1, flat);</a>
+<a name="ln599"> </a>
+<a name="ln600">			if (parameter-&gt;parameters[i].parameter_count == 0)</a>
+<a name="ln601">				put_chars(_buffer, _bufferSize, flat ? &quot;; &quot; : &quot;\n&quot;);</a>
+<a name="ln602">		}</a>
+<a name="ln603"> </a>
+<a name="ln604">		if (!flat)</a>
+<a name="ln605">			put_level_space(_buffer, _bufferSize, level);</a>
+<a name="ln606">		put_chars(_buffer, _bufferSize, flat ? &quot;}&quot; : &quot;}\n&quot;);</a>
+<a name="ln607">	}</a>
+<a name="ln608">}</a>
+<a name="ln609"> </a>
+<a name="ln610"> </a>
+<a name="ln611">//	#pragma mark - Kernel only functions</a>
+<a name="ln612"> </a>
+<a name="ln613"> </a>
+<a name="ln614">#ifdef _KERNEL_MODE</a>
+<a name="ln615">static settings_handle *</a>
+<a name="ln616">find_driver_settings(const char *name)</a>
+<a name="ln617">{</a>
+<a name="ln618">	settings_handle *handle = NULL;</a>
+<a name="ln619"> </a>
+<a name="ln620">	ASSERT_LOCKED_MUTEX(&amp;sLock);</a>
+<a name="ln621"> </a>
+<a name="ln622">	while ((handle = (settings_handle*)list_get_next_item(&amp;sHandles, handle))</a>
+<a name="ln623">			!= NULL) {</a>
+<a name="ln624">		if (!strcmp(handle-&gt;name, name))</a>
+<a name="ln625">			return handle;</a>
+<a name="ln626">	}</a>
+<a name="ln627"> </a>
+<a name="ln628">	return NULL;</a>
+<a name="ln629">}</a>
+<a name="ln630"> </a>
+<a name="ln631"> </a>
+<a name="ln632">status_t</a>
+<a name="ln633">driver_settings_init(kernel_args *args)</a>
+<a name="ln634">{</a>
+<a name="ln635">	struct driver_settings_file *settings = args-&gt;driver_settings;</a>
+<a name="ln636"> </a>
+<a name="ln637">	// Move the preloaded driver settings over to the kernel</a>
+<a name="ln638"> </a>
+<a name="ln639">	list_init(&amp;sHandles);</a>
+<a name="ln640"> </a>
+<a name="ln641">	while (settings != NULL) {</a>
+<a name="ln642">		settings_handle *handle</a>
+<a name="ln643">			= (settings_handle*)malloc(sizeof(settings_handle));</a>
+<a name="ln644">		if (handle == NULL)</a>
+<a name="ln645">			return B_NO_MEMORY;</a>
+<a name="ln646"> </a>
+<a name="ln647">		if (settings-&gt;size != 0) {</a>
+<a name="ln648">			handle-&gt;text = (char*)malloc(settings-&gt;size + 1);</a>
+<a name="ln649">			if (handle-&gt;text == NULL) {</a>
+<a name="ln650">				free(handle);</a>
+<a name="ln651">				return B_NO_MEMORY;</a>
+<a name="ln652">			}</a>
+<a name="ln653"> </a>
+<a name="ln654">			memcpy(handle-&gt;text, settings-&gt;buffer, settings-&gt;size);</a>
+<a name="ln655">			handle-&gt;text[settings-&gt;size] = '\0';</a>
+<a name="ln656">				// null terminate the buffer</a>
+<a name="ln657">		} else</a>
+<a name="ln658">			handle-&gt;text = NULL;</a>
+<a name="ln659"> </a>
+<a name="ln660">		strlcpy(handle-&gt;name, settings-&gt;name, sizeof(handle-&gt;name));</a>
+<a name="ln661">		handle-&gt;settings.parameters = NULL;</a>
+<a name="ln662">		handle-&gt;settings.parameter_count = 0;</a>
+<a name="ln663">		handle-&gt;magic = 0;</a>
+<a name="ln664">			// this triggers parsing the settings when they are actually used</a>
+<a name="ln665"> </a>
+<a name="ln666">		if (!strcmp(handle-&gt;name, B_SAFEMODE_DRIVER_SETTINGS)) {</a>
+<a name="ln667">			// These settings cannot be reloaded, so we better don't throw</a>
+<a name="ln668">			// them away.</a>
+<a name="ln669">			handle-&gt;ref_count = 1;</a>
+<a name="ln670">		} else</a>
+<a name="ln671">			handle-&gt;ref_count = 0;</a>
+<a name="ln672"> </a>
+<a name="ln673">		list_add_item(&amp;sHandles, handle);</a>
+<a name="ln674"> </a>
+<a name="ln675">		settings = settings-&gt;next;</a>
+<a name="ln676">	}</a>
+<a name="ln677"> </a>
+<a name="ln678">	return B_OK;</a>
+<a name="ln679">}</a>
+<a name="ln680">#endif</a>
+<a name="ln681"> </a>
+<a name="ln682"> </a>
+<a name="ln683">//	#pragma mark - public API</a>
+<a name="ln684"> </a>
+<a name="ln685"> </a>
+<a name="ln686">status_t</a>
+<a name="ln687">unload_driver_settings(void *_handle)</a>
+<a name="ln688">{</a>
+<a name="ln689">	settings_handle *handle = (settings_handle *)_handle;</a>
+<a name="ln690">	if (!check_handle(handle))</a>
+<a name="ln691">		return B_BAD_VALUE;</a>
+<a name="ln692"> </a>
+<a name="ln693">#ifdef _KERNEL_MODE</a>
+<a name="ln694">	mutex_lock(&amp;sLock);</a>
+<a name="ln695"> </a>
+<a name="ln696">	if (handle-&gt;ref_count &gt; 0) {</a>
+<a name="ln697">		if (--handle-&gt;ref_count == 0 &amp;&amp; gBootDevice &gt; 0) {</a>
+<a name="ln698">			// don't unload an handle when /boot is not available</a>
+<a name="ln699">			list_remove_link(&amp;handle-&gt;link);</a>
+<a name="ln700">		} else</a>
+<a name="ln701">			handle = NULL;</a>
+<a name="ln702">	}</a>
+<a name="ln703">	mutex_unlock(&amp;sLock);</a>
+<a name="ln704">#endif</a>
+<a name="ln705"> </a>
+<a name="ln706">	if (handle != NULL)</a>
+<a name="ln707">		free_settings(handle);</a>
+<a name="ln708"> </a>
+<a name="ln709">	return B_OK;</a>
+<a name="ln710">}</a>
+<a name="ln711"> </a>
+<a name="ln712"> </a>
+<a name="ln713">void *</a>
+<a name="ln714">load_driver_settings(const char *driverName)</a>
+<a name="ln715">{</a>
+<a name="ln716">	settings_handle *handle;</a>
+<a name="ln717">	int file = -1;</a>
+<a name="ln718"> </a>
+<a name="ln719">	if (driverName == NULL)</a>
+<a name="ln720">		return NULL;</a>
+<a name="ln721"> </a>
+<a name="ln722">#ifdef _KERNEL_MODE</a>
+<a name="ln723">	// see if we already have these settings loaded</a>
+<a name="ln724">	mutex_lock(&amp;sLock);</a>
+<a name="ln725">	handle = find_driver_settings(driverName);</a>
+<a name="ln726">	if (handle != NULL &amp;&amp; handle-&gt;ref_count == 0 &amp;&amp; gBootDevice &gt; 0) {</a>
+<a name="ln727">		// A handle with a zero ref_count should be unloaded if /boot is</a>
+<a name="ln728">		// available.</a>
+<a name="ln729">		list_remove_link(&amp;handle-&gt;link);</a>
+<a name="ln730">		free_settings(handle);</a>
+<a name="ln731">	} else if (handle != NULL) {</a>
+<a name="ln732">		handle-&gt;ref_count++;</a>
+<a name="ln733"> </a>
+<a name="ln734">		// we got it, now let's see if it already has been parsed</a>
+<a name="ln735">		if (handle-&gt;magic != SETTINGS_MAGIC) {</a>
+<a name="ln736">			handle-&gt;magic = SETTINGS_MAGIC;</a>
+<a name="ln737"> </a>
+<a name="ln738">			if (parse_settings(handle) != B_OK) {</a>
+<a name="ln739">				// no valid settings, let's cut down its memory requirements</a>
+<a name="ln740">				free(handle-&gt;text);</a>
+<a name="ln741">				handle-&gt;text = NULL;</a>
+<a name="ln742">				handle = NULL;</a>
+<a name="ln743">			}</a>
+<a name="ln744">		}</a>
+<a name="ln745">		mutex_unlock(&amp;sLock);</a>
+<a name="ln746">		return handle;</a>
+<a name="ln747">	}</a>
+<a name="ln748"> </a>
+<a name="ln749">	// we are allowed to call the driver settings pretty early in the boot process</a>
+<a name="ln750">	if (gKernelStartup) {</a>
+<a name="ln751">		mutex_unlock(&amp;sLock);</a>
+<a name="ln752">		return NULL;</a>
+<a name="ln753">	}</a>
+<a name="ln754">#endif	// _KERNEL_MODE</a>
+<a name="ln755">#ifdef _BOOT_MODE</a>
+<a name="ln756">	// see if we already have these settings loaded</a>
+<a name="ln757">	{</a>
+<a name="ln758">		struct driver_settings_file *settings = gKernelArgs.driver_settings;</a>
+<a name="ln759">		while (settings != NULL) {</a>
+<a name="ln760">			if (!strcmp(settings-&gt;name, driverName)) {</a>
+<a name="ln761">				// we have it - since the buffer is clobbered, we have to</a>
+<a name="ln762">				// copy its contents, though</a>
+<a name="ln763">				char *text = (char*)malloc(settings-&gt;size + 1);</a>
+<a name="ln764">				if (text == NULL)</a>
+<a name="ln765">					return NULL;</a>
+<a name="ln766"> </a>
+<a name="ln767">				memcpy(text, settings-&gt;buffer, settings-&gt;size + 1);</a>
+<a name="ln768">				return new_settings(text, driverName);</a>
+<a name="ln769">			}</a>
+<a name="ln770">			settings = settings-&gt;next;</a>
+<a name="ln771">		}</a>
+<a name="ln772">	}</a>
+<a name="ln773">#endif	// _BOOT_MODE</a>
+<a name="ln774"> </a>
+<a name="ln775">	// open the settings from the standardized location</a>
+<a name="ln776">	if (driverName[0] != '/') {</a>
+<a name="ln777">		char path[B_FILE_NAME_LENGTH + 64];</a>
+<a name="ln778"> </a>
+<a name="ln779">#ifdef _BOOT_MODE</a>
+<a name="ln780">		strcpy(path, kUserSettingsDirectory);</a>
+<a name="ln781">#else</a>
+<a name="ln782">		// TODO: use B_SYSTEM_SETTINGS_DIRECTORY instead!</a>
+<a name="ln783">		if (__find_directory(B_USER_SETTINGS_DIRECTORY, -1, false, path,</a>
+<a name="ln784">				sizeof(path)) == B_OK)</a>
+<a name="ln785">#endif</a>
+<a name="ln786">		{</a>
+<a name="ln787">			strlcat(path, SETTINGS_DIRECTORY, sizeof(path));</a>
+<a name="ln788">			strlcat(path, driverName, sizeof(path));</a>
+<a name="ln789">		}</a>
+<a name="ln790"> </a>
+<a name="ln791">		file = open(path, O_RDONLY);</a>
+<a name="ln792">	} else</a>
+<a name="ln793">		file = open(driverName, O_RDONLY);</a>
+<a name="ln794"> </a>
+<a name="ln795">	if (file &lt; B_OK) {</a>
+<a name="ln796">#ifdef _KERNEL_MODE</a>
+<a name="ln797">		mutex_unlock(&amp;sLock);</a>
+<a name="ln798">#endif</a>
+<a name="ln799">		return NULL;</a>
+<a name="ln800">	}</a>
+<a name="ln801"> </a>
+<a name="ln802">	handle = load_driver_settings_from_file(file, driverName);</a>
+<a name="ln803"> </a>
+<a name="ln804">#ifdef _KERNEL_MODE</a>
+<a name="ln805">	if (handle != NULL)</a>
+<a name="ln806">		list_add_item(&amp;sHandles, handle);</a>
+<a name="ln807">	mutex_unlock(&amp;sLock);</a>
+<a name="ln808">#endif</a>
+<a name="ln809"> </a>
+<a name="ln810">	close(file);</a>
+<a name="ln811">	return (void *)handle;</a>
+<a name="ln812">}</a>
+<a name="ln813"> </a>
+<a name="ln814"> </a>
+<a name="ln815">void*</a>
+<a name="ln816">load_driver_settings_file(int fd)</a>
+<a name="ln817">{</a>
+<a name="ln818">	return load_driver_settings_from_file(fd, NULL);</a>
+<a name="ln819">}</a>
+<a name="ln820"> </a>
+<a name="ln821"> </a>
+<a name="ln822">/*!</a>
+<a name="ln823">	Returns a new driver_settings handle that has the parsed contents</a>
+<a name="ln824">	of the passed string.</a>
+<a name="ln825">	You can get an empty driver_settings object when you pass NULL as</a>
+<a name="ln826">	the &quot;settingsString&quot; parameter.</a>
+<a name="ln827">*/</a>
+<a name="ln828">void *</a>
+<a name="ln829">parse_driver_settings_string(const char *settingsString)</a>
+<a name="ln830">{</a>
+<a name="ln831">	char *text = NULL;</a>
+<a name="ln832">	if (settingsString != NULL) {</a>
+<a name="ln833">		// we simply copy the whole string to use it as our internal buffer</a>
+<a name="ln834">		text = strdup(settingsString);</a>
+<a name="ln835">		if (text == NULL)</a>
+<a name="ln836">			return NULL;</a>
+<a name="ln837">	}</a>
+<a name="ln838"> </a>
+<a name="ln839">	settings_handle *handle = new_settings(text, NULL);</a>
+<a name="ln840">	if (handle == NULL)</a>
+<a name="ln841">		free(text);</a>
+<a name="ln842">	return handle;</a>
+<a name="ln843">}</a>
+<a name="ln844"> </a>
+<a name="ln845"> </a>
+<a name="ln846">/*!</a>
+<a name="ln847">	This function prints out a driver settings structure to a human</a>
+<a name="ln848">	readable string.</a>
+<a name="ln849">	It's either in standard style or the single line style speficied</a>
+<a name="ln850">	by the &quot;flat&quot; parameter.</a>
+<a name="ln851">	If the buffer is too small to hold the string, B_BUFFER_OVERFLOW</a>
+<a name="ln852">	is returned, and the needed amount of bytes if placed in the</a>
+<a name="ln853">	&quot;_bufferSize&quot; parameter.</a>
+<a name="ln854">	If the &quot;handle&quot; parameter is not a valid driver settings handle, or</a>
+<a name="ln855">	the &quot;buffer&quot; parameter is NULL, B_BAD_VALUE is returned.</a>
+<a name="ln856">*/</a>
+<a name="ln857">status_t</a>
+<a name="ln858">get_driver_settings_string(void *_handle, char *buffer, ssize_t *_bufferSize,</a>
+<a name="ln859">	bool flat)</a>
+<a name="ln860">{</a>
+<a name="ln861">	settings_handle *handle = (settings_handle *)_handle;</a>
+<a name="ln862">	ssize_t bufferSize = *_bufferSize;</a>
+<a name="ln863">	int32 i;</a>
+<a name="ln864"> </a>
+<a name="ln865">	if (!check_handle(handle) || !buffer || *_bufferSize == 0)</a>
+<a name="ln866">		return B_BAD_VALUE;</a>
+<a name="ln867"> </a>
+<a name="ln868">	for (i = 0; i &lt; handle-&gt;settings.parameter_count; i++) {</a>
+<a name="ln869">		put_parameter(&amp;buffer, &amp;bufferSize, &amp;handle-&gt;settings.parameters[i],</a>
+<a name="ln870">			0, flat);</a>
+<a name="ln871">	}</a>
+<a name="ln872"> </a>
+<a name="ln873">	*_bufferSize -= bufferSize;</a>
+<a name="ln874">	return bufferSize &gt;= 0 ? B_OK : B_BUFFER_OVERFLOW;</a>
+<a name="ln875">}</a>
+<a name="ln876"> </a>
+<a name="ln877"> </a>
+<a name="ln878">/*!</a>
+<a name="ln879">	Matches the first value of the parameter matching &quot;keyName&quot; with a set</a>
+<a name="ln880">	of boolean values like 1/true/yes/on/enabled/...</a>
+<a name="ln881">	Returns &quot;unknownValue&quot; if the parameter could not be found or doesn't</a>
+<a name="ln882">	have any valid boolean setting, and &quot;noArgValue&quot; if the parameter</a>
+<a name="ln883">	doesn't have any values.</a>
+<a name="ln884">	Also returns &quot;unknownValue&quot; if the handle passed in was not valid.</a>
+<a name="ln885">*/</a>
+<a name="ln886">bool</a>
+<a name="ln887">get_driver_boolean_parameter(void *_handle, const char *keyName,</a>
+<a name="ln888">	bool unknownValue, bool noArgValue)</a>
+<a name="ln889">{</a>
+<a name="ln890">	settings_handle *handle = (settings_handle*)_handle;</a>
+<a name="ln891">	driver_parameter *parameter;</a>
+<a name="ln892">	char *boolean;</a>
+<a name="ln893"> </a>
+<a name="ln894">	if (!check_handle(handle))</a>
+<a name="ln895">		return unknownValue;</a>
+<a name="ln896"> </a>
+<a name="ln897">	// check for the parameter</a>
+<a name="ln898">	if ((parameter = get_parameter(handle, keyName)) == NULL)</a>
+<a name="ln899">		return unknownValue;</a>
+<a name="ln900"> </a>
+<a name="ln901">	// check for the argument</a>
+<a name="ln902">	if (parameter-&gt;value_count &lt;= 0)</a>
+<a name="ln903">		return noArgValue;</a>
+<a name="ln904"> </a>
+<a name="ln905">	boolean = parameter-&gt;values[0];</a>
+<a name="ln906">	if (!strcmp(boolean, &quot;1&quot;)</a>
+<a name="ln907">		|| !strcasecmp(boolean, &quot;true&quot;)</a>
+<a name="ln908">		|| !strcasecmp(boolean, &quot;yes&quot;)</a>
+<a name="ln909">		|| !strcasecmp(boolean, &quot;on&quot;)</a>
+<a name="ln910">		|| !strcasecmp(boolean, &quot;enable&quot;)</a>
+<a name="ln911">		|| !strcasecmp(boolean, &quot;enabled&quot;))</a>
+<a name="ln912">		return true;</a>
+<a name="ln913"> </a>
+<a name="ln914">	if (!strcmp(boolean, &quot;0&quot;)</a>
+<a name="ln915">		|| !strcasecmp(boolean, &quot;false&quot;)</a>
+<a name="ln916">		|| !strcasecmp(boolean, &quot;no&quot;)</a>
+<a name="ln917">		|| !strcasecmp(boolean, &quot;off&quot;)</a>
+<a name="ln918">		|| !strcasecmp(boolean, &quot;disable&quot;)</a>
+<a name="ln919">		|| !strcasecmp(boolean, &quot;disabled&quot;))</a>
+<a name="ln920">		return false;</a>
+<a name="ln921"> </a>
+<a name="ln922">	// if no known keyword is found, &quot;unknownValue&quot; is returned</a>
+<a name="ln923">	return unknownValue;</a>
+<a name="ln924">}</a>
+<a name="ln925"> </a>
+<a name="ln926"> </a>
+<a name="ln927">const char *</a>
+<a name="ln928">get_driver_parameter(void *_handle, const char *keyName,</a>
+<a name="ln929">	const char *unknownValue, const char *noArgValue)</a>
+<a name="ln930">{</a>
+<a name="ln931">	settings_handle* handle = (settings_handle*)_handle;</a>
+<a name="ln932">	struct driver_parameter *parameter;</a>
+<a name="ln933"> </a>
+<a name="ln934">	if (!check_handle(handle))</a>
+<a name="ln935">		return unknownValue;</a>
+<a name="ln936"> </a>
+<a name="ln937">	// check for the parameter</a>
+<a name="ln938">	if ((parameter = get_parameter(handle, keyName)) == NULL)</a>
+<a name="ln939">		return unknownValue;</a>
+<a name="ln940"> </a>
+<a name="ln941">	// check for the argument</a>
+<a name="ln942">	if (parameter-&gt;value_count &lt;= 0)</a>
+<a name="ln943">		return noArgValue;</a>
+<a name="ln944"> </a>
+<a name="ln945">	return parameter-&gt;values[0];</a>
+<a name="ln946">}</a>
+<a name="ln947"> </a>
+<a name="ln948"> </a>
+<a name="ln949">const driver_settings *</a>
+<a name="ln950">get_driver_settings(void *handle)</a>
+<a name="ln951">{</a>
+<a name="ln952">	if (!check_handle((settings_handle*)handle))</a>
+<a name="ln953">		return NULL;</a>
+<a name="ln954"> </a>
+<a name="ln955">	return &amp;((settings_handle *)handle)-&gt;settings;</a>
+<a name="ln956">}</a>
+<a name="ln957"> </a>
+<a name="ln958"> </a>
+<a name="ln959">status_t</a>
+<a name="ln960">delete_driver_settings(void *_handle)</a>
+<a name="ln961">{</a>
+<a name="ln962">	return unload_driver_settings(_handle);</a>
+<a name="ln963">}</a>
+
+</code></pre>
+<div class="balloon" rel="461"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v575/" target="_blank">V575</a> The null pointer is passed into 'free' function. Inspect the first argument.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

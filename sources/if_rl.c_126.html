@@ -1,0 +1,2172 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>if_rl.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*-</a>
+<a name="ln2"> * Copyright (c) 1997, 1998</a>
+<a name="ln3"> *	Bill Paul &lt;wpaul@ctr.columbia.edu&gt;.  All rights reserved.</a>
+<a name="ln4"> *</a>
+<a name="ln5"> * Redistribution and use in source and binary forms, with or without</a>
+<a name="ln6"> * modification, are permitted provided that the following conditions</a>
+<a name="ln7"> * are met:</a>
+<a name="ln8"> * 1. Redistributions of source code must retain the above copyright</a>
+<a name="ln9"> *    notice, this list of conditions and the following disclaimer.</a>
+<a name="ln10"> * 2. Redistributions in binary form must reproduce the above copyright</a>
+<a name="ln11"> *    notice, this list of conditions and the following disclaimer in the</a>
+<a name="ln12"> *    documentation and/or other materials provided with the distribution.</a>
+<a name="ln13"> * 3. All advertising materials mentioning features or use of this software</a>
+<a name="ln14"> *    must display the following acknowledgement:</a>
+<a name="ln15"> *	This product includes software developed by Bill Paul.</a>
+<a name="ln16"> * 4. Neither the name of the author nor the names of any co-contributors</a>
+<a name="ln17"> *    may be used to endorse or promote products derived from this software</a>
+<a name="ln18"> *    without specific prior written permission.</a>
+<a name="ln19"> *</a>
+<a name="ln20"> * THIS SOFTWARE IS PROVIDED BY Bill Paul AND CONTRIBUTORS ``AS IS'' AND</a>
+<a name="ln21"> * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE</a>
+<a name="ln22"> * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE</a>
+<a name="ln23"> * ARE DISCLAIMED.  IN NO EVENT SHALL Bill Paul OR THE VOICES IN HIS HEAD</a>
+<a name="ln24"> * BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR</a>
+<a name="ln25"> * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF</a>
+<a name="ln26"> * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS</a>
+<a name="ln27"> * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN</a>
+<a name="ln28"> * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)</a>
+<a name="ln29"> * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF</a>
+<a name="ln30"> * THE POSSIBILITY OF SUCH DAMAGE.</a>
+<a name="ln31"> */</a>
+<a name="ln32"> </a>
+<a name="ln33">#include &lt;sys/cdefs.h&gt;</a>
+<a name="ln34">__FBSDID(&quot;$FreeBSD: releng/12.0/sys/dev/rl/if_rl.c 338951 2018-09-26 19:41:00Z imp $&quot;);</a>
+<a name="ln35"> </a>
+<a name="ln36">/*</a>
+<a name="ln37"> * RealTek 8129/8139 PCI NIC driver</a>
+<a name="ln38"> *</a>
+<a name="ln39"> * Supports several extremely cheap PCI 10/100 adapters based on</a>
+<a name="ln40"> * the RealTek chipset. Datasheets can be obtained from</a>
+<a name="ln41"> * www.realtek.com.tw.</a>
+<a name="ln42"> *</a>
+<a name="ln43"> * Written by Bill Paul &lt;wpaul@ctr.columbia.edu&gt;</a>
+<a name="ln44"> * Electrical Engineering Department</a>
+<a name="ln45"> * Columbia University, New York City</a>
+<a name="ln46"> */</a>
+<a name="ln47">/*</a>
+<a name="ln48"> * The RealTek 8139 PCI NIC redefines the meaning of 'low end.' This is</a>
+<a name="ln49"> * probably the worst PCI ethernet controller ever made, with the possible</a>
+<a name="ln50"> * exception of the FEAST chip made by SMC. The 8139 supports bus-master</a>
+<a name="ln51"> * DMA, but it has a terrible interface that nullifies any performance</a>
+<a name="ln52"> * gains that bus-master DMA usually offers.</a>
+<a name="ln53"> *</a>
+<a name="ln54"> * For transmission, the chip offers a series of four TX descriptor</a>
+<a name="ln55"> * registers. Each transmit frame must be in a contiguous buffer, aligned</a>
+<a name="ln56"> * on a longword (32-bit) boundary. This means we almost always have to</a>
+<a name="ln57"> * do mbuf copies in order to transmit a frame, except in the unlikely</a>
+<a name="ln58"> * case where a) the packet fits into a single mbuf, and b) the packet</a>
+<a name="ln59"> * is 32-bit aligned within the mbuf's data area. The presence of only</a>
+<a name="ln60"> * four descriptor registers means that we can never have more than four</a>
+<a name="ln61"> * packets queued for transmission at any one time.</a>
+<a name="ln62"> *</a>
+<a name="ln63"> * Reception is not much better. The driver has to allocate a single large</a>
+<a name="ln64"> * buffer area (up to 64K in size) into which the chip will DMA received</a>
+<a name="ln65"> * frames. Because we don't know where within this region received packets</a>
+<a name="ln66"> * will begin or end, we have no choice but to copy data from the buffer</a>
+<a name="ln67"> * area into mbufs in order to pass the packets up to the higher protocol</a>
+<a name="ln68"> * levels.</a>
+<a name="ln69"> *</a>
+<a name="ln70"> * It's impossible given this rotten design to really achieve decent</a>
+<a name="ln71"> * performance at 100Mbps, unless you happen to have a 400Mhz PII or</a>
+<a name="ln72"> * some equally overmuscled CPU to drive it.</a>
+<a name="ln73"> *</a>
+<a name="ln74"> * On the bright side, the 8139 does have a built-in PHY, although</a>
+<a name="ln75"> * rather than using an MDIO serial interface like most other NICs, the</a>
+<a name="ln76"> * PHY registers are directly accessible through the 8139's register</a>
+<a name="ln77"> * space. The 8139 supports autonegotiation, as well as a 64-bit multicast</a>
+<a name="ln78"> * filter.</a>
+<a name="ln79"> *</a>
+<a name="ln80"> * The 8129 chip is an older version of the 8139 that uses an external PHY</a>
+<a name="ln81"> * chip. The 8129 has a serial MDIO interface for accessing the MII where</a>
+<a name="ln82"> * the 8139 lets you directly access the on-board PHY registers. We need</a>
+<a name="ln83"> * to select which interface to use depending on the chip type.</a>
+<a name="ln84"> */</a>
+<a name="ln85"> </a>
+<a name="ln86">#ifdef HAVE_KERNEL_OPTION_HEADERS</a>
+<a name="ln87">#include &quot;opt_device_polling.h&quot;</a>
+<a name="ln88">#endif</a>
+<a name="ln89"> </a>
+<a name="ln90">#include &lt;sys/param.h&gt;</a>
+<a name="ln91">#include &lt;sys/endian.h&gt;</a>
+<a name="ln92">#include &lt;sys/systm.h&gt;</a>
+<a name="ln93">#include &lt;sys/sockio.h&gt;</a>
+<a name="ln94">#include &lt;sys/mbuf.h&gt;</a>
+<a name="ln95">#include &lt;sys/malloc.h&gt;</a>
+<a name="ln96">#include &lt;sys/kernel.h&gt;</a>
+<a name="ln97">#include &lt;sys/module.h&gt;</a>
+<a name="ln98">#include &lt;sys/socket.h&gt;</a>
+<a name="ln99">#include &lt;sys/sysctl.h&gt;</a>
+<a name="ln100"> </a>
+<a name="ln101">#include &lt;net/if.h&gt;</a>
+<a name="ln102">#include &lt;net/if_var.h&gt;</a>
+<a name="ln103">#include &lt;net/if_arp.h&gt;</a>
+<a name="ln104">#include &lt;net/ethernet.h&gt;</a>
+<a name="ln105">#include &lt;net/if_dl.h&gt;</a>
+<a name="ln106">#include &lt;net/if_media.h&gt;</a>
+<a name="ln107">#include &lt;net/if_types.h&gt;</a>
+<a name="ln108"> </a>
+<a name="ln109">#include &lt;net/bpf.h&gt;</a>
+<a name="ln110"> </a>
+<a name="ln111">#include &lt;machine/bus.h&gt;</a>
+<a name="ln112">#include &lt;machine/resource.h&gt;</a>
+<a name="ln113">#include &lt;sys/bus.h&gt;</a>
+<a name="ln114">#include &lt;sys/rman.h&gt;</a>
+<a name="ln115"> </a>
+<a name="ln116">#include &lt;dev/mii/mii.h&gt;</a>
+<a name="ln117">#include &lt;dev/mii/mii_bitbang.h&gt;</a>
+<a name="ln118">#include &lt;dev/mii/miivar.h&gt;</a>
+<a name="ln119"> </a>
+<a name="ln120">#include &lt;dev/pci/pcireg.h&gt;</a>
+<a name="ln121">#include &lt;dev/pci/pcivar.h&gt;</a>
+<a name="ln122"> </a>
+<a name="ln123">MODULE_DEPEND(rl, pci, 1, 1, 1);</a>
+<a name="ln124">MODULE_DEPEND(rl, ether, 1, 1, 1);</a>
+<a name="ln125">MODULE_DEPEND(rl, miibus, 1, 1, 1);</a>
+<a name="ln126"> </a>
+<a name="ln127">/* &quot;device miibus&quot; required.  See GENERIC if you get errors here. */</a>
+<a name="ln128">#include &quot;miibus_if.h&quot;</a>
+<a name="ln129"> </a>
+<a name="ln130">#include &lt;dev/rl/if_rlreg.h&gt;</a>
+<a name="ln131"> </a>
+<a name="ln132">/*</a>
+<a name="ln133"> * Various supported device vendors/types and their names.</a>
+<a name="ln134"> */</a>
+<a name="ln135">static const struct rl_type rl_devs[] = {</a>
+<a name="ln136">	{ RT_VENDORID, RT_DEVICEID_8129, RL_8129,</a>
+<a name="ln137">		&quot;RealTek 8129 10/100BaseTX&quot; },</a>
+<a name="ln138">	{ RT_VENDORID, RT_DEVICEID_8139, RL_8139,</a>
+<a name="ln139">		&quot;RealTek 8139 10/100BaseTX&quot; },</a>
+<a name="ln140">	{ RT_VENDORID, RT_DEVICEID_8139D, RL_8139,</a>
+<a name="ln141">		&quot;RealTek 8139 10/100BaseTX&quot; },</a>
+<a name="ln142">	{ RT_VENDORID, RT_DEVICEID_8138, RL_8139,</a>
+<a name="ln143">		&quot;RealTek 8139 10/100BaseTX CardBus&quot; },</a>
+<a name="ln144">	{ RT_VENDORID, RT_DEVICEID_8100, RL_8139,</a>
+<a name="ln145">		&quot;RealTek 8100 10/100BaseTX&quot; },</a>
+<a name="ln146">	{ ACCTON_VENDORID, ACCTON_DEVICEID_5030, RL_8139,</a>
+<a name="ln147">		&quot;Accton MPX 5030/5038 10/100BaseTX&quot; },</a>
+<a name="ln148">	{ DELTA_VENDORID, DELTA_DEVICEID_8139, RL_8139,</a>
+<a name="ln149">		&quot;Delta Electronics 8139 10/100BaseTX&quot; },</a>
+<a name="ln150">	{ ADDTRON_VENDORID, ADDTRON_DEVICEID_8139, RL_8139,</a>
+<a name="ln151">		&quot;Addtron Technology 8139 10/100BaseTX&quot; },</a>
+<a name="ln152">	{ DLINK_VENDORID, DLINK_DEVICEID_520TX_REVC1, RL_8139,</a>
+<a name="ln153">		&quot;D-Link DFE-520TX (rev. C1) 10/100BaseTX&quot; },</a>
+<a name="ln154">	{ DLINK_VENDORID, DLINK_DEVICEID_530TXPLUS, RL_8139,</a>
+<a name="ln155">		&quot;D-Link DFE-530TX+ 10/100BaseTX&quot; },</a>
+<a name="ln156">	{ DLINK_VENDORID, DLINK_DEVICEID_690TXD, RL_8139,</a>
+<a name="ln157">		&quot;D-Link DFE-690TXD 10/100BaseTX&quot; },</a>
+<a name="ln158">	{ NORTEL_VENDORID, ACCTON_DEVICEID_5030, RL_8139,</a>
+<a name="ln159">		&quot;Nortel Networks 10/100BaseTX&quot; },</a>
+<a name="ln160">	{ COREGA_VENDORID, COREGA_DEVICEID_FETHERCBTXD, RL_8139,</a>
+<a name="ln161">		&quot;Corega FEther CB-TXD&quot; },</a>
+<a name="ln162">	{ COREGA_VENDORID, COREGA_DEVICEID_FETHERIICBTXD, RL_8139,</a>
+<a name="ln163">		&quot;Corega FEtherII CB-TXD&quot; },</a>
+<a name="ln164">	{ PEPPERCON_VENDORID, PEPPERCON_DEVICEID_ROLF, RL_8139,</a>
+<a name="ln165">		&quot;Peppercon AG ROL-F&quot; },</a>
+<a name="ln166">	{ PLANEX_VENDORID, PLANEX_DEVICEID_FNW3603TX, RL_8139,</a>
+<a name="ln167">		&quot;Planex FNW-3603-TX&quot; },</a>
+<a name="ln168">	{ PLANEX_VENDORID, PLANEX_DEVICEID_FNW3800TX, RL_8139,</a>
+<a name="ln169">		&quot;Planex FNW-3800-TX&quot; },</a>
+<a name="ln170">	{ CP_VENDORID, RT_DEVICEID_8139, RL_8139,</a>
+<a name="ln171">		&quot;Compaq HNE-300&quot; },</a>
+<a name="ln172">	{ LEVEL1_VENDORID, LEVEL1_DEVICEID_FPC0106TX, RL_8139,</a>
+<a name="ln173">		&quot;LevelOne FPC-0106TX&quot; },</a>
+<a name="ln174">	{ EDIMAX_VENDORID, EDIMAX_DEVICEID_EP4103DL, RL_8139,</a>
+<a name="ln175">		&quot;Edimax EP-4103DL CardBus&quot; }</a>
+<a name="ln176">};</a>
+<a name="ln177"> </a>
+<a name="ln178">static int rl_attach(device_t);</a>
+<a name="ln179">static int rl_detach(device_t);</a>
+<a name="ln180">static void rl_dmamap_cb(void *, bus_dma_segment_t *, int, int);</a>
+<a name="ln181">static int rl_dma_alloc(struct rl_softc *);</a>
+<a name="ln182">static void rl_dma_free(struct rl_softc *);</a>
+<a name="ln183">static void rl_eeprom_putbyte(struct rl_softc *, int);</a>
+<a name="ln184">static void rl_eeprom_getword(struct rl_softc *, int, uint16_t *);</a>
+<a name="ln185">static int rl_encap(struct rl_softc *, struct mbuf **);</a>
+<a name="ln186">static int rl_list_tx_init(struct rl_softc *);</a>
+<a name="ln187">static int rl_list_rx_init(struct rl_softc *);</a>
+<a name="ln188">static int rl_ifmedia_upd(struct ifnet *);</a>
+<a name="ln189">static void rl_ifmedia_sts(struct ifnet *, struct ifmediareq *);</a>
+<a name="ln190">static int rl_ioctl(struct ifnet *, u_long, caddr_t);</a>
+<a name="ln191">static void rl_intr(void *);</a>
+<a name="ln192">static void rl_init(void *);</a>
+<a name="ln193">static void rl_init_locked(struct rl_softc *sc);</a>
+<a name="ln194">static int rl_miibus_readreg(device_t, int, int);</a>
+<a name="ln195">static void rl_miibus_statchg(device_t);</a>
+<a name="ln196">static int rl_miibus_writereg(device_t, int, int, int);</a>
+<a name="ln197">#ifdef DEVICE_POLLING</a>
+<a name="ln198">static int rl_poll(struct ifnet *ifp, enum poll_cmd cmd, int count);</a>
+<a name="ln199">static int rl_poll_locked(struct ifnet *ifp, enum poll_cmd cmd, int count);</a>
+<a name="ln200">#endif</a>
+<a name="ln201">static int rl_probe(device_t);</a>
+<a name="ln202">static void rl_read_eeprom(struct rl_softc *, uint8_t *, int, int, int);</a>
+<a name="ln203">static void rl_reset(struct rl_softc *);</a>
+<a name="ln204">static int rl_resume(device_t);</a>
+<a name="ln205">static int rl_rxeof(struct rl_softc *);</a>
+<a name="ln206">static void rl_rxfilter(struct rl_softc *);</a>
+<a name="ln207">static int rl_shutdown(device_t);</a>
+<a name="ln208">static void rl_start(struct ifnet *);</a>
+<a name="ln209">static void rl_start_locked(struct ifnet *);</a>
+<a name="ln210">static void rl_stop(struct rl_softc *);</a>
+<a name="ln211">static int rl_suspend(device_t);</a>
+<a name="ln212">static void rl_tick(void *);</a>
+<a name="ln213">static void rl_txeof(struct rl_softc *);</a>
+<a name="ln214">static void rl_watchdog(struct rl_softc *);</a>
+<a name="ln215">static void rl_setwol(struct rl_softc *);</a>
+<a name="ln216">static void rl_clrwol(struct rl_softc *);</a>
+<a name="ln217"> </a>
+<a name="ln218">/*</a>
+<a name="ln219"> * MII bit-bang glue</a>
+<a name="ln220"> */</a>
+<a name="ln221">static uint32_t rl_mii_bitbang_read(device_t);</a>
+<a name="ln222">static void rl_mii_bitbang_write(device_t, uint32_t);</a>
+<a name="ln223"> </a>
+<a name="ln224">static const struct mii_bitbang_ops rl_mii_bitbang_ops = {</a>
+<a name="ln225">	rl_mii_bitbang_read,</a>
+<a name="ln226">	rl_mii_bitbang_write,</a>
+<a name="ln227">	{</a>
+<a name="ln228">		RL_MII_DATAOUT,	/* MII_BIT_MDO */</a>
+<a name="ln229">		RL_MII_DATAIN,	/* MII_BIT_MDI */</a>
+<a name="ln230">		RL_MII_CLK,	/* MII_BIT_MDC */</a>
+<a name="ln231">		RL_MII_DIR,	/* MII_BIT_DIR_HOST_PHY */</a>
+<a name="ln232">		0,		/* MII_BIT_DIR_PHY_HOST */</a>
+<a name="ln233">	}</a>
+<a name="ln234">};</a>
+<a name="ln235"> </a>
+<a name="ln236">static device_method_t rl_methods[] = {</a>
+<a name="ln237">	/* Device interface */</a>
+<a name="ln238">	DEVMETHOD(device_probe,		rl_probe),</a>
+<a name="ln239">	DEVMETHOD(device_attach,	rl_attach),</a>
+<a name="ln240">	DEVMETHOD(device_detach,	rl_detach),</a>
+<a name="ln241">	DEVMETHOD(device_suspend,	rl_suspend),</a>
+<a name="ln242">	DEVMETHOD(device_resume,	rl_resume),</a>
+<a name="ln243">	DEVMETHOD(device_shutdown,	rl_shutdown),</a>
+<a name="ln244"> </a>
+<a name="ln245">	/* MII interface */</a>
+<a name="ln246">	DEVMETHOD(miibus_readreg,	rl_miibus_readreg),</a>
+<a name="ln247">	DEVMETHOD(miibus_writereg,	rl_miibus_writereg),</a>
+<a name="ln248">	DEVMETHOD(miibus_statchg,	rl_miibus_statchg),</a>
+<a name="ln249"> </a>
+<a name="ln250">	DEVMETHOD_END</a>
+<a name="ln251">};</a>
+<a name="ln252"> </a>
+<a name="ln253">static driver_t rl_driver = {</a>
+<a name="ln254">	&quot;rl&quot;,</a>
+<a name="ln255">	rl_methods,</a>
+<a name="ln256">	sizeof(struct rl_softc)</a>
+<a name="ln257">};</a>
+<a name="ln258"> </a>
+<a name="ln259">static devclass_t rl_devclass;</a>
+<a name="ln260"> </a>
+<a name="ln261">DRIVER_MODULE(rl, pci, rl_driver, rl_devclass, 0, 0);</a>
+<a name="ln262">MODULE_PNP_INFO(&quot;U16:vendor;U16:device&quot;, pci, rl, rl_devs,</a>
+<a name="ln263">    nitems(rl_devs) - 1);</a>
+<a name="ln264">DRIVER_MODULE(rl, cardbus, rl_driver, rl_devclass, 0, 0);</a>
+<a name="ln265">DRIVER_MODULE(miibus, rl, miibus_driver, miibus_devclass, 0, 0);</a>
+<a name="ln266"> </a>
+<a name="ln267">#define EE_SET(x)					\</a>
+<a name="ln268">	CSR_WRITE_1(sc, RL_EECMD,			\</a>
+<a name="ln269">		CSR_READ_1(sc, RL_EECMD) | x)</a>
+<a name="ln270"> </a>
+<a name="ln271">#define EE_CLR(x)					\</a>
+<a name="ln272">	CSR_WRITE_1(sc, RL_EECMD,			\</a>
+<a name="ln273">		CSR_READ_1(sc, RL_EECMD) &amp; ~x)</a>
+<a name="ln274"> </a>
+<a name="ln275">/*</a>
+<a name="ln276"> * Send a read command and address to the EEPROM, check for ACK.</a>
+<a name="ln277"> */</a>
+<a name="ln278">static void</a>
+<a name="ln279">rl_eeprom_putbyte(struct rl_softc *sc, int addr)</a>
+<a name="ln280">{</a>
+<a name="ln281">	int			d, i;</a>
+<a name="ln282"> </a>
+<a name="ln283">	d = addr | sc-&gt;rl_eecmd_read;</a>
+<a name="ln284"> </a>
+<a name="ln285">	/*</a>
+<a name="ln286">	 * Feed in each bit and strobe the clock.</a>
+<a name="ln287">	 */</a>
+<a name="ln288">	for (i = 0x400; i; i &gt;&gt;= 1) {</a>
+<a name="ln289">		if (d &amp; i) {</a>
+<a name="ln290">			EE_SET(RL_EE_DATAIN);</a>
+<a name="ln291">		} else {</a>
+<a name="ln292">			EE_CLR(RL_EE_DATAIN);</a>
+<a name="ln293">		}</a>
+<a name="ln294">		DELAY(100);</a>
+<a name="ln295">		EE_SET(RL_EE_CLK);</a>
+<a name="ln296">		DELAY(150);</a>
+<a name="ln297">		EE_CLR(RL_EE_CLK);</a>
+<a name="ln298">		DELAY(100);</a>
+<a name="ln299">	}</a>
+<a name="ln300">}</a>
+<a name="ln301"> </a>
+<a name="ln302">/*</a>
+<a name="ln303"> * Read a word of data stored in the EEPROM at address 'addr.'</a>
+<a name="ln304"> */</a>
+<a name="ln305">static void</a>
+<a name="ln306">rl_eeprom_getword(struct rl_softc *sc, int addr, uint16_t *dest)</a>
+<a name="ln307">{</a>
+<a name="ln308">	int			i;</a>
+<a name="ln309">	uint16_t		word = 0;</a>
+<a name="ln310"> </a>
+<a name="ln311">	/* Enter EEPROM access mode. */</a>
+<a name="ln312">	CSR_WRITE_1(sc, RL_EECMD, RL_EEMODE_PROGRAM|RL_EE_SEL);</a>
+<a name="ln313"> </a>
+<a name="ln314">	/*</a>
+<a name="ln315">	 * Send address of word we want to read.</a>
+<a name="ln316">	 */</a>
+<a name="ln317">	rl_eeprom_putbyte(sc, addr);</a>
+<a name="ln318"> </a>
+<a name="ln319">	CSR_WRITE_1(sc, RL_EECMD, RL_EEMODE_PROGRAM|RL_EE_SEL);</a>
+<a name="ln320"> </a>
+<a name="ln321">	/*</a>
+<a name="ln322">	 * Start reading bits from EEPROM.</a>
+<a name="ln323">	 */</a>
+<a name="ln324">	for (i = 0x8000; i; i &gt;&gt;= 1) {</a>
+<a name="ln325">		EE_SET(RL_EE_CLK);</a>
+<a name="ln326">		DELAY(100);</a>
+<a name="ln327">		if (CSR_READ_1(sc, RL_EECMD) &amp; RL_EE_DATAOUT)</a>
+<a name="ln328">			word |= i;</a>
+<a name="ln329">		EE_CLR(RL_EE_CLK);</a>
+<a name="ln330">		DELAY(100);</a>
+<a name="ln331">	}</a>
+<a name="ln332"> </a>
+<a name="ln333">	/* Turn off EEPROM access mode. */</a>
+<a name="ln334">	CSR_WRITE_1(sc, RL_EECMD, RL_EEMODE_OFF);</a>
+<a name="ln335"> </a>
+<a name="ln336">	*dest = word;</a>
+<a name="ln337">}</a>
+<a name="ln338"> </a>
+<a name="ln339">/*</a>
+<a name="ln340"> * Read a sequence of words from the EEPROM.</a>
+<a name="ln341"> */</a>
+<a name="ln342">static void</a>
+<a name="ln343">rl_read_eeprom(struct rl_softc *sc, uint8_t *dest, int off, int cnt, int swap)</a>
+<a name="ln344">{</a>
+<a name="ln345">	int			i;</a>
+<a name="ln346">	uint16_t		word = 0, *ptr;</a>
+<a name="ln347"> </a>
+<a name="ln348">	for (i = 0; i &lt; cnt; i++) {</a>
+<a name="ln349">		rl_eeprom_getword(sc, off + i, &amp;word);</a>
+<a name="ln350">		ptr = (uint16_t *)(dest + (i * 2));</a>
+<a name="ln351">		if (swap)</a>
+<a name="ln352">			*ptr = ntohs(word);</a>
+<a name="ln353">		else</a>
+<a name="ln354">			*ptr = word;</a>
+<a name="ln355">	}</a>
+<a name="ln356">}</a>
+<a name="ln357"> </a>
+<a name="ln358">/*</a>
+<a name="ln359"> * Read the MII serial port for the MII bit-bang module.</a>
+<a name="ln360"> */</a>
+<a name="ln361">static uint32_t</a>
+<a name="ln362">rl_mii_bitbang_read(device_t dev)</a>
+<a name="ln363">{</a>
+<a name="ln364">	struct rl_softc *sc;</a>
+<a name="ln365">	uint32_t val;</a>
+<a name="ln366"> </a>
+<a name="ln367">	sc = device_get_softc(dev);</a>
+<a name="ln368"> </a>
+<a name="ln369">	val = CSR_READ_1(sc, RL_MII);</a>
+<a name="ln370">	CSR_BARRIER(sc, RL_MII, 1,</a>
+<a name="ln371">	    BUS_SPACE_BARRIER_READ | BUS_SPACE_BARRIER_WRITE);</a>
+<a name="ln372"> </a>
+<a name="ln373">	return (val);</a>
+<a name="ln374">}</a>
+<a name="ln375"> </a>
+<a name="ln376">/*</a>
+<a name="ln377"> * Write the MII serial port for the MII bit-bang module.</a>
+<a name="ln378"> */</a>
+<a name="ln379">static void</a>
+<a name="ln380">rl_mii_bitbang_write(device_t dev, uint32_t val)</a>
+<a name="ln381">{</a>
+<a name="ln382">	struct rl_softc *sc;</a>
+<a name="ln383"> </a>
+<a name="ln384">	sc = device_get_softc(dev);</a>
+<a name="ln385"> </a>
+<a name="ln386">	CSR_WRITE_1(sc, RL_MII, val);</a>
+<a name="ln387">	CSR_BARRIER(sc, RL_MII, 1,</a>
+<a name="ln388">	    BUS_SPACE_BARRIER_READ | BUS_SPACE_BARRIER_WRITE);</a>
+<a name="ln389">}</a>
+<a name="ln390"> </a>
+<a name="ln391">static int</a>
+<a name="ln392">rl_miibus_readreg(device_t dev, int phy, int reg)</a>
+<a name="ln393">{</a>
+<a name="ln394">	struct rl_softc		*sc;</a>
+<a name="ln395">	uint16_t		rl8139_reg;</a>
+<a name="ln396"> </a>
+<a name="ln397">	sc = device_get_softc(dev);</a>
+<a name="ln398"> </a>
+<a name="ln399">	if (sc-&gt;rl_type == RL_8139) {</a>
+<a name="ln400">		switch (reg) {</a>
+<a name="ln401">		case MII_BMCR:</a>
+<a name="ln402">			rl8139_reg = RL_BMCR;</a>
+<a name="ln403">			break;</a>
+<a name="ln404">		case MII_BMSR:</a>
+<a name="ln405">			rl8139_reg = RL_BMSR;</a>
+<a name="ln406">			break;</a>
+<a name="ln407">		case MII_ANAR:</a>
+<a name="ln408">			rl8139_reg = RL_ANAR;</a>
+<a name="ln409">			break;</a>
+<a name="ln410">		case MII_ANER:</a>
+<a name="ln411">			rl8139_reg = RL_ANER;</a>
+<a name="ln412">			break;</a>
+<a name="ln413">		case MII_ANLPAR:</a>
+<a name="ln414">			rl8139_reg = RL_LPAR;</a>
+<a name="ln415">			break;</a>
+<a name="ln416">		case MII_PHYIDR1:</a>
+<a name="ln417">		case MII_PHYIDR2:</a>
+<a name="ln418">			return (0);</a>
+<a name="ln419">		/*</a>
+<a name="ln420">		 * Allow the rlphy driver to read the media status</a>
+<a name="ln421">		 * register. If we have a link partner which does not</a>
+<a name="ln422">		 * support NWAY, this is the register which will tell</a>
+<a name="ln423">		 * us the results of parallel detection.</a>
+<a name="ln424">		 */</a>
+<a name="ln425">		case RL_MEDIASTAT:</a>
+<a name="ln426">			return (CSR_READ_1(sc, RL_MEDIASTAT));</a>
+<a name="ln427">		default:</a>
+<a name="ln428">			device_printf(sc-&gt;rl_dev, &quot;bad phy register\n&quot;);</a>
+<a name="ln429">			return (0);</a>
+<a name="ln430">		}</a>
+<a name="ln431">		return (CSR_READ_2(sc, rl8139_reg));</a>
+<a name="ln432">	}</a>
+<a name="ln433"> </a>
+<a name="ln434">	return (mii_bitbang_readreg(dev, &amp;rl_mii_bitbang_ops, phy, reg));</a>
+<a name="ln435">}</a>
+<a name="ln436"> </a>
+<a name="ln437">static int</a>
+<a name="ln438">rl_miibus_writereg(device_t dev, int phy, int reg, int data)</a>
+<a name="ln439">{</a>
+<a name="ln440">	struct rl_softc		*sc;</a>
+<a name="ln441">	uint16_t		rl8139_reg;</a>
+<a name="ln442"> </a>
+<a name="ln443">	sc = device_get_softc(dev);</a>
+<a name="ln444"> </a>
+<a name="ln445">	if (sc-&gt;rl_type == RL_8139) {</a>
+<a name="ln446">		switch (reg) {</a>
+<a name="ln447">		case MII_BMCR:</a>
+<a name="ln448">			rl8139_reg = RL_BMCR;</a>
+<a name="ln449">			break;</a>
+<a name="ln450">		case MII_BMSR:</a>
+<a name="ln451">			rl8139_reg = RL_BMSR;</a>
+<a name="ln452">			break;</a>
+<a name="ln453">		case MII_ANAR:</a>
+<a name="ln454">			rl8139_reg = RL_ANAR;</a>
+<a name="ln455">			break;</a>
+<a name="ln456">		case MII_ANER:</a>
+<a name="ln457">			rl8139_reg = RL_ANER;</a>
+<a name="ln458">			break;</a>
+<a name="ln459">		case MII_ANLPAR:</a>
+<a name="ln460">			rl8139_reg = RL_LPAR;</a>
+<a name="ln461">			break;</a>
+<a name="ln462">		case MII_PHYIDR1:</a>
+<a name="ln463">		case MII_PHYIDR2:</a>
+<a name="ln464">			return (0);</a>
+<a name="ln465">			break;</a>
+<a name="ln466">		default:</a>
+<a name="ln467">			device_printf(sc-&gt;rl_dev, &quot;bad phy register\n&quot;);</a>
+<a name="ln468">			return (0);</a>
+<a name="ln469">		}</a>
+<a name="ln470">		CSR_WRITE_2(sc, rl8139_reg, data);</a>
+<a name="ln471">		return (0);</a>
+<a name="ln472">	}</a>
+<a name="ln473"> </a>
+<a name="ln474">	mii_bitbang_writereg(dev, &amp;rl_mii_bitbang_ops, phy, reg, data);</a>
+<a name="ln475"> </a>
+<a name="ln476">	return (0);</a>
+<a name="ln477">}</a>
+<a name="ln478"> </a>
+<a name="ln479">static void</a>
+<a name="ln480">rl_miibus_statchg(device_t dev)</a>
+<a name="ln481">{</a>
+<a name="ln482">	struct rl_softc		*sc;</a>
+<a name="ln483">	struct ifnet		*ifp;</a>
+<a name="ln484">	struct mii_data		*mii;</a>
+<a name="ln485"> </a>
+<a name="ln486">	sc = device_get_softc(dev);</a>
+<a name="ln487">	mii = device_get_softc(sc-&gt;rl_miibus);</a>
+<a name="ln488">	ifp = sc-&gt;rl_ifp;</a>
+<a name="ln489">	if (mii == NULL || ifp == NULL ||</a>
+<a name="ln490">	    (ifp-&gt;if_drv_flags &amp; IFF_DRV_RUNNING) == 0)</a>
+<a name="ln491">		return;</a>
+<a name="ln492"> </a>
+<a name="ln493">	sc-&gt;rl_flags &amp;= ~RL_FLAG_LINK;</a>
+<a name="ln494">	if ((mii-&gt;mii_media_status &amp; (IFM_ACTIVE | IFM_AVALID)) ==</a>
+<a name="ln495">	    (IFM_ACTIVE | IFM_AVALID)) {</a>
+<a name="ln496">		switch (IFM_SUBTYPE(mii-&gt;mii_media_active)) {</a>
+<a name="ln497">		case IFM_10_T:</a>
+<a name="ln498">		case IFM_100_TX:</a>
+<a name="ln499">			sc-&gt;rl_flags |= RL_FLAG_LINK;</a>
+<a name="ln500">			break;</a>
+<a name="ln501">		default:</a>
+<a name="ln502">			break;</a>
+<a name="ln503">		}</a>
+<a name="ln504">	}</a>
+<a name="ln505">	/*</a>
+<a name="ln506">	 * RealTek controllers do not provide any interface to</a>
+<a name="ln507">	 * Tx/Rx MACs for resolved speed, duplex and flow-control</a>
+<a name="ln508">	 * parameters.</a>
+<a name="ln509">	 */</a>
+<a name="ln510">}</a>
+<a name="ln511"> </a>
+<a name="ln512">/*</a>
+<a name="ln513"> * Program the 64-bit multicast hash filter.</a>
+<a name="ln514"> */</a>
+<a name="ln515">static void</a>
+<a name="ln516">rl_rxfilter(struct rl_softc *sc)</a>
+<a name="ln517">{</a>
+<a name="ln518">	struct ifnet		*ifp = sc-&gt;rl_ifp;</a>
+<a name="ln519">	int			h = 0;</a>
+<a name="ln520">	uint32_t		hashes[2] = { 0, 0 };</a>
+<a name="ln521">	struct ifmultiaddr	*ifma;</a>
+<a name="ln522">	uint32_t		rxfilt;</a>
+<a name="ln523"> </a>
+<a name="ln524">	RL_LOCK_ASSERT(sc);</a>
+<a name="ln525"> </a>
+<a name="ln526">	rxfilt = CSR_READ_4(sc, RL_RXCFG);</a>
+<a name="ln527">	rxfilt &amp;= ~(RL_RXCFG_RX_ALLPHYS | RL_RXCFG_RX_BROAD |</a>
+<a name="ln528">	    RL_RXCFG_RX_MULTI);</a>
+<a name="ln529">	/* Always accept frames destined for this host. */</a>
+<a name="ln530">	rxfilt |= RL_RXCFG_RX_INDIV;</a>
+<a name="ln531">	/* Set capture broadcast bit to capture broadcast frames. */</a>
+<a name="ln532">	if (ifp-&gt;if_flags &amp; IFF_BROADCAST)</a>
+<a name="ln533">		rxfilt |= RL_RXCFG_RX_BROAD;</a>
+<a name="ln534">	if (ifp-&gt;if_flags &amp; IFF_ALLMULTI || ifp-&gt;if_flags &amp; IFF_PROMISC) {</a>
+<a name="ln535">		rxfilt |= RL_RXCFG_RX_MULTI;</a>
+<a name="ln536">		if (ifp-&gt;if_flags &amp; IFF_PROMISC)</a>
+<a name="ln537">			rxfilt |= RL_RXCFG_RX_ALLPHYS;</a>
+<a name="ln538">		hashes[0] = 0xFFFFFFFF;</a>
+<a name="ln539">		hashes[1] = 0xFFFFFFFF;</a>
+<a name="ln540">	} else {</a>
+<a name="ln541">		/* Now program new ones. */</a>
+<a name="ln542">		if_maddr_rlock(ifp);</a>
+<a name="ln543">		TAILQ_FOREACH(ifma, &amp;ifp-&gt;if_multiaddrs, ifma_link) {</a>
+<a name="ln544">			if (ifma-&gt;ifma_addr-&gt;sa_family != AF_LINK)</a>
+<a name="ln545">				continue;</a>
+<a name="ln546">			h = ether_crc32_be(LLADDR((struct sockaddr_dl *)</a>
+<a name="ln547">			    ifma-&gt;ifma_addr), ETHER_ADDR_LEN) &gt;&gt; 26;</a>
+<a name="ln548">			if (h &lt; 32)</a>
+<a name="ln549">				hashes[0] |= (1 &lt;&lt; h);</a>
+<a name="ln550">			else</a>
+<a name="ln551">				hashes[1] |= (1 &lt;&lt; (h - 32));</a>
+<a name="ln552">		}</a>
+<a name="ln553">		if_maddr_runlock(ifp);</a>
+<a name="ln554">		if (hashes[0] != 0 || hashes[1] != 0)</a>
+<a name="ln555">			rxfilt |= RL_RXCFG_RX_MULTI;</a>
+<a name="ln556">	}</a>
+<a name="ln557"> </a>
+<a name="ln558">	CSR_WRITE_4(sc, RL_MAR0, hashes[0]);</a>
+<a name="ln559">	CSR_WRITE_4(sc, RL_MAR4, hashes[1]);</a>
+<a name="ln560">	CSR_WRITE_4(sc, RL_RXCFG, rxfilt);</a>
+<a name="ln561">}</a>
+<a name="ln562"> </a>
+<a name="ln563">static void</a>
+<a name="ln564">rl_reset(struct rl_softc *sc)</a>
+<a name="ln565">{</a>
+<a name="ln566">	int			i;</a>
+<a name="ln567"> </a>
+<a name="ln568">	RL_LOCK_ASSERT(sc);</a>
+<a name="ln569"> </a>
+<a name="ln570">	CSR_WRITE_1(sc, RL_COMMAND, RL_CMD_RESET);</a>
+<a name="ln571"> </a>
+<a name="ln572">	for (i = 0; i &lt; RL_TIMEOUT; i++) {</a>
+<a name="ln573">		DELAY(10);</a>
+<a name="ln574">		if (!(CSR_READ_1(sc, RL_COMMAND) &amp; RL_CMD_RESET))</a>
+<a name="ln575">			break;</a>
+<a name="ln576">	}</a>
+<a name="ln577">	if (i == RL_TIMEOUT)</a>
+<a name="ln578">		device_printf(sc-&gt;rl_dev, &quot;reset never completed!\n&quot;);</a>
+<a name="ln579">}</a>
+<a name="ln580"> </a>
+<a name="ln581">/*</a>
+<a name="ln582"> * Probe for a RealTek 8129/8139 chip. Check the PCI vendor and device</a>
+<a name="ln583"> * IDs against our list and return a device name if we find a match.</a>
+<a name="ln584"> */</a>
+<a name="ln585">static int</a>
+<a name="ln586">rl_probe(device_t dev)</a>
+<a name="ln587">{</a>
+<a name="ln588">	const struct rl_type	*t;</a>
+<a name="ln589">	uint16_t		devid, revid, vendor;</a>
+<a name="ln590">	int			i;</a>
+<a name="ln591"> </a>
+<a name="ln592">	vendor = pci_get_vendor(dev);</a>
+<a name="ln593">	devid = pci_get_device(dev);</a>
+<a name="ln594">	revid = pci_get_revid(dev);</a>
+<a name="ln595"> </a>
+<a name="ln596">	if (vendor == RT_VENDORID &amp;&amp; devid == RT_DEVICEID_8139) {</a>
+<a name="ln597">		if (revid == 0x20) {</a>
+<a name="ln598">			/* 8139C+, let re(4) take care of this device. */</a>
+<a name="ln599">			return (ENXIO);</a>
+<a name="ln600">		}</a>
+<a name="ln601">	}</a>
+<a name="ln602">	t = rl_devs;</a>
+<a name="ln603">	for (i = 0; i &lt; nitems(rl_devs); i++, t++) {</a>
+<a name="ln604">		if (vendor == t-&gt;rl_vid &amp;&amp; devid == t-&gt;rl_did) {</a>
+<a name="ln605">			device_set_desc(dev, t-&gt;rl_name);</a>
+<a name="ln606">			return (BUS_PROBE_DEFAULT);</a>
+<a name="ln607">		}</a>
+<a name="ln608">	}</a>
+<a name="ln609"> </a>
+<a name="ln610">	return (ENXIO);</a>
+<a name="ln611">}</a>
+<a name="ln612"> </a>
+<a name="ln613">struct rl_dmamap_arg {</a>
+<a name="ln614">	bus_addr_t	rl_busaddr;</a>
+<a name="ln615">};</a>
+<a name="ln616"> </a>
+<a name="ln617">static void</a>
+<a name="ln618">rl_dmamap_cb(void *arg, bus_dma_segment_t *segs, int nsegs, int error)</a>
+<a name="ln619">{</a>
+<a name="ln620">	struct rl_dmamap_arg	*ctx;</a>
+<a name="ln621"> </a>
+<a name="ln622">	if (error != 0)</a>
+<a name="ln623">		return;</a>
+<a name="ln624"> </a>
+<a name="ln625">	KASSERT(nsegs == 1, (&quot;%s: %d segments returned!&quot;, __func__, nsegs));</a>
+<a name="ln626"> </a>
+<a name="ln627">        ctx = (struct rl_dmamap_arg *)arg;</a>
+<a name="ln628">        ctx-&gt;rl_busaddr = segs[0].ds_addr;</a>
+<a name="ln629">}</a>
+<a name="ln630"> </a>
+<a name="ln631">/*</a>
+<a name="ln632"> * Attach the interface. Allocate softc structures, do ifmedia</a>
+<a name="ln633"> * setup and ethernet/BPF attach.</a>
+<a name="ln634"> */</a>
+<a name="ln635">static int</a>
+<a name="ln636">rl_attach(device_t dev)</a>
+<a name="ln637">{</a>
+<a name="ln638">	uint8_t			eaddr[ETHER_ADDR_LEN];</a>
+<a name="ln639">	uint16_t		as[3];</a>
+<a name="ln640">	struct ifnet		*ifp;</a>
+<a name="ln641">	struct rl_softc		*sc;</a>
+<a name="ln642">	const struct rl_type	*t;</a>
+<a name="ln643">	struct sysctl_ctx_list	*ctx;</a>
+<a name="ln644">	struct sysctl_oid_list	*children;</a>
+<a name="ln645">	int			error = 0, hwrev, i, phy, pmc, rid;</a>
+<a name="ln646">	int			prefer_iomap, unit;</a>
+<a name="ln647">	uint16_t		rl_did = 0;</a>
+<a name="ln648">	char			tn[32];</a>
+<a name="ln649"> </a>
+<a name="ln650">	sc = device_get_softc(dev);</a>
+<a name="ln651">	unit = device_get_unit(dev);</a>
+<a name="ln652">	sc-&gt;rl_dev = dev;</a>
+<a name="ln653"> </a>
+<a name="ln654">	sc-&gt;rl_twister_enable = 0;</a>
+<a name="ln655">	snprintf(tn, sizeof(tn), &quot;dev.rl.%d.twister_enable&quot;, unit);</a>
+<a name="ln656">	TUNABLE_INT_FETCH(tn, &amp;sc-&gt;rl_twister_enable);</a>
+<a name="ln657">	ctx = device_get_sysctl_ctx(sc-&gt;rl_dev);</a>
+<a name="ln658">	children = SYSCTL_CHILDREN(device_get_sysctl_tree(sc-&gt;rl_dev));</a>
+<a name="ln659">	SYSCTL_ADD_INT(ctx, children, OID_AUTO, &quot;twister_enable&quot;, CTLFLAG_RD,</a>
+<a name="ln660">	   &amp;sc-&gt;rl_twister_enable, 0, &quot;&quot;);</a>
+<a name="ln661"> </a>
+<a name="ln662">	mtx_init(&amp;sc-&gt;rl_mtx, device_get_nameunit(dev), MTX_NETWORK_LOCK,</a>
+<a name="ln663">	    MTX_DEF);</a>
+<a name="ln664">	callout_init_mtx(&amp;sc-&gt;rl_stat_callout, &amp;sc-&gt;rl_mtx, 0);</a>
+<a name="ln665"> </a>
+<a name="ln666">	pci_enable_busmaster(dev);</a>
+<a name="ln667"> </a>
+<a name="ln668"> </a>
+<a name="ln669">	/*</a>
+<a name="ln670">	 * Map control/status registers.</a>
+<a name="ln671">	 * Default to using PIO access for this driver. On SMP systems,</a>
+<a name="ln672">	 * there appear to be problems with memory mapped mode: it looks</a>
+<a name="ln673">	 * like doing too many memory mapped access back to back in rapid</a>
+<a name="ln674">	 * succession can hang the bus. I'm inclined to blame this on</a>
+<a name="ln675">	 * crummy design/construction on the part of RealTek. Memory</a>
+<a name="ln676">	 * mapped mode does appear to work on uniprocessor systems though.</a>
+<a name="ln677">	 */</a>
+<a name="ln678">	prefer_iomap = 1;</a>
+<a name="ln679">	snprintf(tn, sizeof(tn), &quot;dev.rl.%d.prefer_iomap&quot;, unit);</a>
+<a name="ln680">	TUNABLE_INT_FETCH(tn, &amp;prefer_iomap);</a>
+<a name="ln681">	if (prefer_iomap) {</a>
+<a name="ln682">		sc-&gt;rl_res_id = PCIR_BAR(0);</a>
+<a name="ln683">		sc-&gt;rl_res_type = SYS_RES_IOPORT;</a>
+<a name="ln684">		sc-&gt;rl_res = bus_alloc_resource_any(dev, sc-&gt;rl_res_type,</a>
+<a name="ln685">		    &amp;sc-&gt;rl_res_id, RF_ACTIVE);</a>
+<a name="ln686">	}</a>
+<a name="ln687">	if (prefer_iomap == 0 || sc-&gt;rl_res == NULL) {</a>
+<a name="ln688">		sc-&gt;rl_res_id = PCIR_BAR(1);</a>
+<a name="ln689">		sc-&gt;rl_res_type = SYS_RES_MEMORY;</a>
+<a name="ln690">		sc-&gt;rl_res = bus_alloc_resource_any(dev, sc-&gt;rl_res_type,</a>
+<a name="ln691">		    &amp;sc-&gt;rl_res_id, RF_ACTIVE);</a>
+<a name="ln692">	}</a>
+<a name="ln693">	if (sc-&gt;rl_res == NULL) {</a>
+<a name="ln694">		device_printf(dev, &quot;couldn't map ports/memory\n&quot;);</a>
+<a name="ln695">		error = ENXIO;</a>
+<a name="ln696">		goto fail;</a>
+<a name="ln697">	}</a>
+<a name="ln698"> </a>
+<a name="ln699">#ifdef notdef</a>
+<a name="ln700">	/*</a>
+<a name="ln701">	 * Detect the Realtek 8139B. For some reason, this chip is very</a>
+<a name="ln702">	 * unstable when left to autoselect the media</a>
+<a name="ln703">	 * The best workaround is to set the device to the required</a>
+<a name="ln704">	 * media type or to set it to the 10 Meg speed.</a>
+<a name="ln705">	 */</a>
+<a name="ln706">	if ((rman_get_end(sc-&gt;rl_res) - rman_get_start(sc-&gt;rl_res)) == 0xFF)</a>
+<a name="ln707">		device_printf(dev,</a>
+<a name="ln708">&quot;Realtek 8139B detected. Warning, this may be unstable in autoselect mode\n&quot;);</a>
+<a name="ln709">#endif</a>
+<a name="ln710"> </a>
+<a name="ln711">	sc-&gt;rl_btag = rman_get_bustag(sc-&gt;rl_res);</a>
+<a name="ln712">	sc-&gt;rl_bhandle = rman_get_bushandle(sc-&gt;rl_res);</a>
+<a name="ln713"> </a>
+<a name="ln714">	/* Allocate interrupt */</a>
+<a name="ln715">	rid = 0;</a>
+<a name="ln716">	sc-&gt;rl_irq[0] = bus_alloc_resource_any(dev, SYS_RES_IRQ, &amp;rid,</a>
+<a name="ln717">	    RF_SHAREABLE | RF_ACTIVE);</a>
+<a name="ln718"> </a>
+<a name="ln719">	if (sc-&gt;rl_irq[0] == NULL) {</a>
+<a name="ln720">		device_printf(dev, &quot;couldn't map interrupt\n&quot;);</a>
+<a name="ln721">		error = ENXIO;</a>
+<a name="ln722">		goto fail;</a>
+<a name="ln723">	}</a>
+<a name="ln724"> </a>
+<a name="ln725">	sc-&gt;rl_cfg0 = RL_8139_CFG0;</a>
+<a name="ln726">	sc-&gt;rl_cfg1 = RL_8139_CFG1;</a>
+<a name="ln727">	sc-&gt;rl_cfg2 = 0;</a>
+<a name="ln728">	sc-&gt;rl_cfg3 = RL_8139_CFG3;</a>
+<a name="ln729">	sc-&gt;rl_cfg4 = RL_8139_CFG4;</a>
+<a name="ln730">	sc-&gt;rl_cfg5 = RL_8139_CFG5;</a>
+<a name="ln731"> </a>
+<a name="ln732">	/*</a>
+<a name="ln733">	 * Reset the adapter. Only take the lock here as it's needed in</a>
+<a name="ln734">	 * order to call rl_reset().</a>
+<a name="ln735">	 */</a>
+<a name="ln736">	RL_LOCK(sc);</a>
+<a name="ln737">	rl_reset(sc);</a>
+<a name="ln738">	RL_UNLOCK(sc);</a>
+<a name="ln739"> </a>
+<a name="ln740">	sc-&gt;rl_eecmd_read = RL_EECMD_READ_6BIT;</a>
+<a name="ln741">	rl_read_eeprom(sc, (uint8_t *)&amp;rl_did, 0, 1, 0);</a>
+<a name="ln742">	if (rl_did != 0x8129)</a>
+<a name="ln743">		sc-&gt;rl_eecmd_read = RL_EECMD_READ_8BIT;</a>
+<a name="ln744"> </a>
+<a name="ln745">	/*</a>
+<a name="ln746">	 * Get station address from the EEPROM.</a>
+<a name="ln747">	 */</a>
+<a name="ln748">	rl_read_eeprom(sc, (uint8_t *)as, RL_EE_EADDR, 3, 0);</a>
+<a name="ln749">	for (i = 0; i &lt; 3; i++) {</a>
+<a name="ln750">		eaddr[(i * 2) + 0] = as[i] &amp; 0xff;</a>
+<a name="ln751">		eaddr[(i * 2) + 1] = as[i] &gt;&gt; 8;</a>
+<a name="ln752">	}</a>
+<a name="ln753"> </a>
+<a name="ln754">	/*</a>
+<a name="ln755">	 * Now read the exact device type from the EEPROM to find</a>
+<a name="ln756">	 * out if it's an 8129 or 8139.</a>
+<a name="ln757">	 */</a>
+<a name="ln758">	rl_read_eeprom(sc, (uint8_t *)&amp;rl_did, RL_EE_PCI_DID, 1, 0);</a>
+<a name="ln759"> </a>
+<a name="ln760">	t = rl_devs;</a>
+<a name="ln761">	sc-&gt;rl_type = 0;</a>
+<a name="ln762">	while(t-&gt;rl_name != NULL) {</a>
+<a name="ln763">		if (rl_did == t-&gt;rl_did) {</a>
+<a name="ln764">			sc-&gt;rl_type = t-&gt;rl_basetype;</a>
+<a name="ln765">			break;</a>
+<a name="ln766">		}</a>
+<a name="ln767">		t++;</a>
+<a name="ln768">	}</a>
+<a name="ln769"> </a>
+<a name="ln770">	if (sc-&gt;rl_type == 0) {</a>
+<a name="ln771">		device_printf(dev, &quot;unknown device ID: %x assuming 8139\n&quot;,</a>
+<a name="ln772">		    rl_did);</a>
+<a name="ln773">		sc-&gt;rl_type = RL_8139;</a>
+<a name="ln774">		/*</a>
+<a name="ln775">		 * Read RL_IDR register to get ethernet address as accessing</a>
+<a name="ln776">		 * EEPROM may not extract correct address.</a>
+<a name="ln777">		 */</a>
+<a name="ln778">		for (i = 0; i &lt; ETHER_ADDR_LEN; i++)</a>
+<a name="ln779">			eaddr[i] = CSR_READ_1(sc, RL_IDR0 + i);</a>
+<a name="ln780">	}</a>
+<a name="ln781"> </a>
+<a name="ln782">	if ((error = rl_dma_alloc(sc)) != 0)</a>
+<a name="ln783">		goto fail;</a>
+<a name="ln784"> </a>
+<a name="ln785">	ifp = sc-&gt;rl_ifp = if_alloc(IFT_ETHER);</a>
+<a name="ln786">	if (ifp == NULL) {</a>
+<a name="ln787">		device_printf(dev, &quot;can not if_alloc()\n&quot;);</a>
+<a name="ln788">		error = ENOSPC;</a>
+<a name="ln789">		goto fail;</a>
+<a name="ln790">	}</a>
+<a name="ln791"> </a>
+<a name="ln792">#define	RL_PHYAD_INTERNAL	0</a>
+<a name="ln793"> </a>
+<a name="ln794">	/* Do MII setup */</a>
+<a name="ln795">	phy = MII_PHY_ANY;</a>
+<a name="ln796">	if (sc-&gt;rl_type == RL_8139)</a>
+<a name="ln797">		phy = RL_PHYAD_INTERNAL;</a>
+<a name="ln798">	error = mii_attach(dev, &amp;sc-&gt;rl_miibus, ifp, rl_ifmedia_upd,</a>
+<a name="ln799">	    rl_ifmedia_sts, BMSR_DEFCAPMASK, phy, MII_OFFSET_ANY, 0);</a>
+<a name="ln800">	if (error != 0) {</a>
+<a name="ln801">		device_printf(dev, &quot;attaching PHYs failed\n&quot;);</a>
+<a name="ln802">		goto fail;</a>
+<a name="ln803">	}</a>
+<a name="ln804"> </a>
+<a name="ln805">	ifp-&gt;if_softc = sc;</a>
+<a name="ln806">	if_initname(ifp, device_get_name(dev), device_get_unit(dev));</a>
+<a name="ln807">	ifp-&gt;if_mtu = ETHERMTU;</a>
+<a name="ln808">	ifp-&gt;if_flags = IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST;</a>
+<a name="ln809">	ifp-&gt;if_ioctl = rl_ioctl;</a>
+<a name="ln810">	ifp-&gt;if_start = rl_start;</a>
+<a name="ln811">	ifp-&gt;if_init = rl_init;</a>
+<a name="ln812">	ifp-&gt;if_capabilities = IFCAP_VLAN_MTU;</a>
+<a name="ln813">	/* Check WOL for RTL8139B or newer controllers. */</a>
+<a name="ln814">	if (sc-&gt;rl_type == RL_8139 &amp;&amp;</a>
+<a name="ln815">	    pci_find_cap(sc-&gt;rl_dev, PCIY_PMG, &amp;pmc) == 0) {</a>
+<a name="ln816">		hwrev = CSR_READ_4(sc, RL_TXCFG) &amp; RL_TXCFG_HWREV;</a>
+<a name="ln817">		switch (hwrev) {</a>
+<a name="ln818">		case RL_HWREV_8139B:</a>
+<a name="ln819">		case RL_HWREV_8130:</a>
+<a name="ln820">		case RL_HWREV_8139C:</a>
+<a name="ln821">		case RL_HWREV_8139D:</a>
+<a name="ln822">		case RL_HWREV_8101:</a>
+<a name="ln823">		case RL_HWREV_8100:</a>
+<a name="ln824">			ifp-&gt;if_capabilities |= IFCAP_WOL;</a>
+<a name="ln825">			/* Disable WOL. */</a>
+<a name="ln826">			rl_clrwol(sc);</a>
+<a name="ln827">			break;</a>
+<a name="ln828">		default:</a>
+<a name="ln829">			break;</a>
+<a name="ln830">		}</a>
+<a name="ln831">	}</a>
+<a name="ln832">	ifp-&gt;if_capenable = ifp-&gt;if_capabilities;</a>
+<a name="ln833">	ifp-&gt;if_capenable &amp;= ~(IFCAP_WOL_UCAST | IFCAP_WOL_MCAST);</a>
+<a name="ln834">#ifdef DEVICE_POLLING</a>
+<a name="ln835">	ifp-&gt;if_capabilities |= IFCAP_POLLING;</a>
+<a name="ln836">#endif</a>
+<a name="ln837">	IFQ_SET_MAXLEN(&amp;ifp-&gt;if_snd, ifqmaxlen);</a>
+<a name="ln838">	ifp-&gt;if_snd.ifq_drv_maxlen = ifqmaxlen;</a>
+<a name="ln839">	IFQ_SET_READY(&amp;ifp-&gt;if_snd);</a>
+<a name="ln840"> </a>
+<a name="ln841">	/*</a>
+<a name="ln842">	 * Call MI attach routine.</a>
+<a name="ln843">	 */</a>
+<a name="ln844">	ether_ifattach(ifp, eaddr);</a>
+<a name="ln845"> </a>
+<a name="ln846">	/* Hook interrupt last to avoid having to lock softc */</a>
+<a name="ln847">	error = bus_setup_intr(dev, sc-&gt;rl_irq[0], INTR_TYPE_NET | INTR_MPSAFE,</a>
+<a name="ln848">	    NULL, rl_intr, sc, &amp;sc-&gt;rl_intrhand[0]);</a>
+<a name="ln849">	if (error) {</a>
+<a name="ln850">		device_printf(sc-&gt;rl_dev, &quot;couldn't set up irq\n&quot;);</a>
+<a name="ln851">		ether_ifdetach(ifp);</a>
+<a name="ln852">	}</a>
+<a name="ln853"> </a>
+<a name="ln854">fail:</a>
+<a name="ln855">	if (error)</a>
+<a name="ln856">		rl_detach(dev);</a>
+<a name="ln857"> </a>
+<a name="ln858">	return (error);</a>
+<a name="ln859">}</a>
+<a name="ln860"> </a>
+<a name="ln861">/*</a>
+<a name="ln862"> * Shutdown hardware and free up resources. This can be called any</a>
+<a name="ln863"> * time after the mutex has been initialized. It is called in both</a>
+<a name="ln864"> * the error case in attach and the normal detach case so it needs</a>
+<a name="ln865"> * to be careful about only freeing resources that have actually been</a>
+<a name="ln866"> * allocated.</a>
+<a name="ln867"> */</a>
+<a name="ln868">static int</a>
+<a name="ln869">rl_detach(device_t dev)</a>
+<a name="ln870">{</a>
+<a name="ln871">	struct rl_softc		*sc;</a>
+<a name="ln872">	struct ifnet		*ifp;</a>
+<a name="ln873"> </a>
+<a name="ln874">	sc = device_get_softc(dev);</a>
+<a name="ln875">	ifp = sc-&gt;rl_ifp;</a>
+<a name="ln876"> </a>
+<a name="ln877">	KASSERT(mtx_initialized(&amp;sc-&gt;rl_mtx), (&quot;rl mutex not initialized&quot;));</a>
+<a name="ln878"> </a>
+<a name="ln879">#ifdef DEVICE_POLLING</a>
+<a name="ln880">	if (ifp-&gt;if_capenable &amp; IFCAP_POLLING)</a>
+<a name="ln881">		ether_poll_deregister(ifp);</a>
+<a name="ln882">#endif</a>
+<a name="ln883">	/* These should only be active if attach succeeded */</a>
+<a name="ln884">	if (device_is_attached(dev)) {</a>
+<a name="ln885">		RL_LOCK(sc);</a>
+<a name="ln886">		rl_stop(sc);</a>
+<a name="ln887">		RL_UNLOCK(sc);</a>
+<a name="ln888">		callout_drain(&amp;sc-&gt;rl_stat_callout);</a>
+<a name="ln889">		ether_ifdetach(ifp);</a>
+<a name="ln890">	}</a>
+<a name="ln891">#if 0</a>
+<a name="ln892">	sc-&gt;suspended = 1;</a>
+<a name="ln893">#endif</a>
+<a name="ln894">	if (sc-&gt;rl_miibus)</a>
+<a name="ln895">		device_delete_child(dev, sc-&gt;rl_miibus);</a>
+<a name="ln896">	bus_generic_detach(dev);</a>
+<a name="ln897"> </a>
+<a name="ln898">	if (sc-&gt;rl_intrhand[0])</a>
+<a name="ln899">		bus_teardown_intr(dev, sc-&gt;rl_irq[0], sc-&gt;rl_intrhand[0]);</a>
+<a name="ln900">	if (sc-&gt;rl_irq[0])</a>
+<a name="ln901">		bus_release_resource(dev, SYS_RES_IRQ, 0, sc-&gt;rl_irq[0]);</a>
+<a name="ln902">	if (sc-&gt;rl_res)</a>
+<a name="ln903">		bus_release_resource(dev, sc-&gt;rl_res_type, sc-&gt;rl_res_id,</a>
+<a name="ln904">		    sc-&gt;rl_res);</a>
+<a name="ln905"> </a>
+<a name="ln906">	if (ifp)</a>
+<a name="ln907">		if_free(ifp);</a>
+<a name="ln908"> </a>
+<a name="ln909">	rl_dma_free(sc);</a>
+<a name="ln910"> </a>
+<a name="ln911">	mtx_destroy(&amp;sc-&gt;rl_mtx);</a>
+<a name="ln912"> </a>
+<a name="ln913">	return (0);</a>
+<a name="ln914">}</a>
+<a name="ln915"> </a>
+<a name="ln916">static int</a>
+<a name="ln917">rl_dma_alloc(struct rl_softc *sc)</a>
+<a name="ln918">{</a>
+<a name="ln919">	struct rl_dmamap_arg	ctx;</a>
+<a name="ln920">	int			error, i;</a>
+<a name="ln921"> </a>
+<a name="ln922">	/*</a>
+<a name="ln923">	 * Allocate the parent bus DMA tag appropriate for PCI.</a>
+<a name="ln924">	 */</a>
+<a name="ln925">	error = bus_dma_tag_create(bus_get_dma_tag(sc-&gt;rl_dev),	/* parent */</a>
+<a name="ln926">	    1, 0,			/* alignment, boundary */</a>
+<a name="ln927">	    BUS_SPACE_MAXADDR_32BIT,	/* lowaddr */</a>
+<a name="ln928">	    BUS_SPACE_MAXADDR,		/* highaddr */</a>
+<a name="ln929">	    NULL, NULL,			/* filter, filterarg */</a>
+<a name="ln930">	    BUS_SPACE_MAXSIZE_32BIT, 0,	/* maxsize, nsegments */</a>
+<a name="ln931">	    BUS_SPACE_MAXSIZE_32BIT,	/* maxsegsize */</a>
+<a name="ln932">	    0,				/* flags */</a>
+<a name="ln933">	    NULL, NULL,			/* lockfunc, lockarg */</a>
+<a name="ln934">	    &amp;sc-&gt;rl_parent_tag);</a>
+<a name="ln935">	if (error) {</a>
+<a name="ln936">                device_printf(sc-&gt;rl_dev,</a>
+<a name="ln937">		    &quot;failed to create parent DMA tag.\n&quot;);</a>
+<a name="ln938">		goto fail;</a>
+<a name="ln939">	}</a>
+<a name="ln940">	/* Create DMA tag for Rx memory block. */</a>
+<a name="ln941">	error = bus_dma_tag_create(sc-&gt;rl_parent_tag,	/* parent */</a>
+<a name="ln942">	    RL_RX_8139_BUF_ALIGN, 0,	/* alignment, boundary */</a>
+<a name="ln943">	    BUS_SPACE_MAXADDR,		/* lowaddr */</a>
+<a name="ln944">	    BUS_SPACE_MAXADDR,		/* highaddr */</a>
+<a name="ln945">	    NULL, NULL,			/* filter, filterarg */</a>
+<a name="ln946">	    RL_RXBUFLEN + RL_RX_8139_BUF_GUARD_SZ, 1,	/* maxsize,nsegments */</a>
+<a name="ln947">	    RL_RXBUFLEN + RL_RX_8139_BUF_GUARD_SZ,	/* maxsegsize */</a>
+<a name="ln948">	    0,				/* flags */</a>
+<a name="ln949">	    NULL, NULL,			/* lockfunc, lockarg */</a>
+<a name="ln950">	    &amp;sc-&gt;rl_cdata.rl_rx_tag);</a>
+<a name="ln951">	if (error) {</a>
+<a name="ln952">                device_printf(sc-&gt;rl_dev,</a>
+<a name="ln953">		    &quot;failed to create Rx memory block DMA tag.\n&quot;);</a>
+<a name="ln954">		goto fail;</a>
+<a name="ln955">	}</a>
+<a name="ln956">	/* Create DMA tag for Tx buffer. */</a>
+<a name="ln957">	error = bus_dma_tag_create(sc-&gt;rl_parent_tag,	/* parent */</a>
+<a name="ln958">	    RL_TX_8139_BUF_ALIGN, 0,	/* alignment, boundary */</a>
+<a name="ln959">	    BUS_SPACE_MAXADDR,		/* lowaddr */</a>
+<a name="ln960">	    BUS_SPACE_MAXADDR,		/* highaddr */</a>
+<a name="ln961">	    NULL, NULL,			/* filter, filterarg */</a>
+<a name="ln962">	    MCLBYTES, 1,		/* maxsize, nsegments */</a>
+<a name="ln963">	    MCLBYTES,			/* maxsegsize */</a>
+<a name="ln964">	    0,				/* flags */</a>
+<a name="ln965">	    NULL, NULL,			/* lockfunc, lockarg */</a>
+<a name="ln966">	    &amp;sc-&gt;rl_cdata.rl_tx_tag);</a>
+<a name="ln967">	if (error) {</a>
+<a name="ln968">                device_printf(sc-&gt;rl_dev, &quot;failed to create Tx DMA tag.\n&quot;);</a>
+<a name="ln969">		goto fail;</a>
+<a name="ln970">	}</a>
+<a name="ln971"> </a>
+<a name="ln972">	/*</a>
+<a name="ln973">	 * Allocate DMA'able memory and load DMA map for Rx memory block.</a>
+<a name="ln974">	 */</a>
+<a name="ln975">	error = bus_dmamem_alloc(sc-&gt;rl_cdata.rl_rx_tag,</a>
+<a name="ln976">	    (void **)&amp;sc-&gt;rl_cdata.rl_rx_buf, BUS_DMA_WAITOK |</a>
+<a name="ln977">	    BUS_DMA_COHERENT | BUS_DMA_ZERO, &amp;sc-&gt;rl_cdata.rl_rx_dmamap);</a>
+<a name="ln978">	if (error != 0) {</a>
+<a name="ln979">		device_printf(sc-&gt;rl_dev,</a>
+<a name="ln980">		    &quot;failed to allocate Rx DMA memory block.\n&quot;);</a>
+<a name="ln981">		goto fail;</a>
+<a name="ln982">	}</a>
+<a name="ln983">	ctx.rl_busaddr = 0;</a>
+<a name="ln984">	error = bus_dmamap_load(sc-&gt;rl_cdata.rl_rx_tag,</a>
+<a name="ln985">	    sc-&gt;rl_cdata.rl_rx_dmamap, sc-&gt;rl_cdata.rl_rx_buf,</a>
+<a name="ln986">	    RL_RXBUFLEN + RL_RX_8139_BUF_GUARD_SZ, rl_dmamap_cb, &amp;ctx,</a>
+<a name="ln987">	    BUS_DMA_NOWAIT);</a>
+<a name="ln988">	if (error != 0 || ctx.rl_busaddr == 0) {</a>
+<a name="ln989">		device_printf(sc-&gt;rl_dev,</a>
+<a name="ln990">		    &quot;could not load Rx DMA memory block.\n&quot;);</a>
+<a name="ln991">		goto fail;</a>
+<a name="ln992">	}</a>
+<a name="ln993">	sc-&gt;rl_cdata.rl_rx_buf_paddr = ctx.rl_busaddr;</a>
+<a name="ln994"> </a>
+<a name="ln995">	/* Create DMA maps for Tx buffers. */</a>
+<a name="ln996">	for (i = 0; i &lt; RL_TX_LIST_CNT; i++) {</a>
+<a name="ln997">		sc-&gt;rl_cdata.rl_tx_chain[i] = NULL;</a>
+<a name="ln998">		sc-&gt;rl_cdata.rl_tx_dmamap[i] = NULL;</a>
+<a name="ln999">		error = bus_dmamap_create(sc-&gt;rl_cdata.rl_tx_tag, 0,</a>
+<a name="ln1000">		    &amp;sc-&gt;rl_cdata.rl_tx_dmamap[i]);</a>
+<a name="ln1001">		if (error != 0) {</a>
+<a name="ln1002">			device_printf(sc-&gt;rl_dev,</a>
+<a name="ln1003">			    &quot;could not create Tx dmamap.\n&quot;);</a>
+<a name="ln1004">			goto fail;</a>
+<a name="ln1005">		}</a>
+<a name="ln1006">	}</a>
+<a name="ln1007"> </a>
+<a name="ln1008">	/* Leave a few bytes before the start of the RX ring buffer. */</a>
+<a name="ln1009">	sc-&gt;rl_cdata.rl_rx_buf_ptr = sc-&gt;rl_cdata.rl_rx_buf;</a>
+<a name="ln1010">	sc-&gt;rl_cdata.rl_rx_buf += RL_RX_8139_BUF_RESERVE;</a>
+<a name="ln1011"> </a>
+<a name="ln1012">fail:</a>
+<a name="ln1013">	return (error);</a>
+<a name="ln1014">}</a>
+<a name="ln1015"> </a>
+<a name="ln1016">static void</a>
+<a name="ln1017">rl_dma_free(struct rl_softc *sc)</a>
+<a name="ln1018">{</a>
+<a name="ln1019">	int			i;</a>
+<a name="ln1020"> </a>
+<a name="ln1021">	/* Rx memory block. */</a>
+<a name="ln1022">	if (sc-&gt;rl_cdata.rl_rx_tag != NULL) {</a>
+<a name="ln1023">		if (sc-&gt;rl_cdata.rl_rx_buf_paddr != 0)</a>
+<a name="ln1024">			bus_dmamap_unload(sc-&gt;rl_cdata.rl_rx_tag,</a>
+<a name="ln1025">			    sc-&gt;rl_cdata.rl_rx_dmamap);</a>
+<a name="ln1026">		if (sc-&gt;rl_cdata.rl_rx_buf_ptr != NULL)</a>
+<a name="ln1027">			bus_dmamem_free(sc-&gt;rl_cdata.rl_rx_tag,</a>
+<a name="ln1028">			    sc-&gt;rl_cdata.rl_rx_buf_ptr,</a>
+<a name="ln1029">			    sc-&gt;rl_cdata.rl_rx_dmamap);</a>
+<a name="ln1030">		sc-&gt;rl_cdata.rl_rx_buf_ptr = NULL;</a>
+<a name="ln1031">		sc-&gt;rl_cdata.rl_rx_buf = NULL;</a>
+<a name="ln1032">		sc-&gt;rl_cdata.rl_rx_buf_paddr = 0;</a>
+<a name="ln1033">		bus_dma_tag_destroy(sc-&gt;rl_cdata.rl_rx_tag);</a>
+<a name="ln1034">		sc-&gt;rl_cdata.rl_tx_tag = NULL;</a>
+<a name="ln1035">	}</a>
+<a name="ln1036"> </a>
+<a name="ln1037">	/* Tx buffers. */</a>
+<a name="ln1038">	if (sc-&gt;rl_cdata.rl_tx_tag != NULL) {</a>
+<a name="ln1039">		for (i = 0; i &lt; RL_TX_LIST_CNT; i++) {</a>
+<a name="ln1040">			if (sc-&gt;rl_cdata.rl_tx_dmamap[i] != NULL) {</a>
+<a name="ln1041">				bus_dmamap_destroy(</a>
+<a name="ln1042">				    sc-&gt;rl_cdata.rl_tx_tag,</a>
+<a name="ln1043">				    sc-&gt;rl_cdata.rl_tx_dmamap[i]);</a>
+<a name="ln1044">				sc-&gt;rl_cdata.rl_tx_dmamap[i] = NULL;</a>
+<a name="ln1045">			}</a>
+<a name="ln1046">		}</a>
+<a name="ln1047">		bus_dma_tag_destroy(sc-&gt;rl_cdata.rl_tx_tag);</a>
+<a name="ln1048">		sc-&gt;rl_cdata.rl_tx_tag = NULL;</a>
+<a name="ln1049">	}</a>
+<a name="ln1050"> </a>
+<a name="ln1051">	if (sc-&gt;rl_parent_tag != NULL) {</a>
+<a name="ln1052">		bus_dma_tag_destroy(sc-&gt;rl_parent_tag);</a>
+<a name="ln1053">		sc-&gt;rl_parent_tag = NULL;</a>
+<a name="ln1054">	}</a>
+<a name="ln1055">}</a>
+<a name="ln1056"> </a>
+<a name="ln1057">/*</a>
+<a name="ln1058"> * Initialize the transmit descriptors.</a>
+<a name="ln1059"> */</a>
+<a name="ln1060">static int</a>
+<a name="ln1061">rl_list_tx_init(struct rl_softc *sc)</a>
+<a name="ln1062">{</a>
+<a name="ln1063">	struct rl_chain_data	*cd;</a>
+<a name="ln1064">	int			i;</a>
+<a name="ln1065"> </a>
+<a name="ln1066">	RL_LOCK_ASSERT(sc);</a>
+<a name="ln1067"> </a>
+<a name="ln1068">	cd = &amp;sc-&gt;rl_cdata;</a>
+<a name="ln1069">	for (i = 0; i &lt; RL_TX_LIST_CNT; i++) {</a>
+<a name="ln1070">		cd-&gt;rl_tx_chain[i] = NULL;</a>
+<a name="ln1071">		CSR_WRITE_4(sc,</a>
+<a name="ln1072">		    RL_TXADDR0 + (i * sizeof(uint32_t)), 0x0000000);</a>
+<a name="ln1073">	}</a>
+<a name="ln1074"> </a>
+<a name="ln1075">	sc-&gt;rl_cdata.cur_tx = 0;</a>
+<a name="ln1076">	sc-&gt;rl_cdata.last_tx = 0;</a>
+<a name="ln1077"> </a>
+<a name="ln1078">	return (0);</a>
+<a name="ln1079">}</a>
+<a name="ln1080"> </a>
+<a name="ln1081">static int</a>
+<a name="ln1082">rl_list_rx_init(struct rl_softc *sc)</a>
+<a name="ln1083">{</a>
+<a name="ln1084"> </a>
+<a name="ln1085">	RL_LOCK_ASSERT(sc);</a>
+<a name="ln1086"> </a>
+<a name="ln1087">	bzero(sc-&gt;rl_cdata.rl_rx_buf_ptr,</a>
+<a name="ln1088">	    RL_RXBUFLEN + RL_RX_8139_BUF_GUARD_SZ);</a>
+<a name="ln1089">	bus_dmamap_sync(sc-&gt;rl_cdata.rl_tx_tag, sc-&gt;rl_cdata.rl_rx_dmamap,</a>
+<a name="ln1090">	    BUS_DMASYNC_PREREAD | BUS_DMASYNC_PREWRITE);</a>
+<a name="ln1091"> </a>
+<a name="ln1092">	return (0);</a>
+<a name="ln1093">}</a>
+<a name="ln1094"> </a>
+<a name="ln1095">/*</a>
+<a name="ln1096"> * A frame has been uploaded: pass the resulting mbuf chain up to</a>
+<a name="ln1097"> * the higher level protocols.</a>
+<a name="ln1098"> *</a>
+<a name="ln1099"> * You know there's something wrong with a PCI bus-master chip design</a>
+<a name="ln1100"> * when you have to use m_devget().</a>
+<a name="ln1101"> *</a>
+<a name="ln1102"> * The receive operation is badly documented in the datasheet, so I'll</a>
+<a name="ln1103"> * attempt to document it here. The driver provides a buffer area and</a>
+<a name="ln1104"> * places its base address in the RX buffer start address register.</a>
+<a name="ln1105"> * The chip then begins copying frames into the RX buffer. Each frame</a>
+<a name="ln1106"> * is preceded by a 32-bit RX status word which specifies the length</a>
+<a name="ln1107"> * of the frame and certain other status bits. Each frame (starting with</a>
+<a name="ln1108"> * the status word) is also 32-bit aligned. The frame length is in the</a>
+<a name="ln1109"> * first 16 bits of the status word; the lower 15 bits correspond with</a>
+<a name="ln1110"> * the 'rx status register' mentioned in the datasheet.</a>
+<a name="ln1111"> *</a>
+<a name="ln1112"> * Note: to make the Alpha happy, the frame payload needs to be aligned</a>
+<a name="ln1113"> * on a 32-bit boundary. To achieve this, we pass RL_ETHER_ALIGN (2 bytes)</a>
+<a name="ln1114"> * as the offset argument to m_devget().</a>
+<a name="ln1115"> */</a>
+<a name="ln1116">static int</a>
+<a name="ln1117">rl_rxeof(struct rl_softc *sc)</a>
+<a name="ln1118">{</a>
+<a name="ln1119">	struct mbuf		*m;</a>
+<a name="ln1120">	struct ifnet		*ifp = sc-&gt;rl_ifp;</a>
+<a name="ln1121">	uint8_t			*rxbufpos;</a>
+<a name="ln1122">	int			total_len = 0;</a>
+<a name="ln1123">	int			wrap = 0;</a>
+<a name="ln1124">	int			rx_npkts = 0;</a>
+<a name="ln1125">	uint32_t		rxstat;</a>
+<a name="ln1126">	uint16_t		cur_rx;</a>
+<a name="ln1127">	uint16_t		limit;</a>
+<a name="ln1128">	uint16_t		max_bytes, rx_bytes = 0;</a>
+<a name="ln1129"> </a>
+<a name="ln1130">	RL_LOCK_ASSERT(sc);</a>
+<a name="ln1131"> </a>
+<a name="ln1132">	bus_dmamap_sync(sc-&gt;rl_cdata.rl_rx_tag, sc-&gt;rl_cdata.rl_rx_dmamap,</a>
+<a name="ln1133">	    BUS_DMASYNC_POSTREAD | BUS_DMASYNC_POSTWRITE);</a>
+<a name="ln1134"> </a>
+<a name="ln1135">	cur_rx = (CSR_READ_2(sc, RL_CURRXADDR) + 16) % RL_RXBUFLEN;</a>
+<a name="ln1136"> </a>
+<a name="ln1137">	/* Do not try to read past this point. */</a>
+<a name="ln1138">	limit = CSR_READ_2(sc, RL_CURRXBUF) % RL_RXBUFLEN;</a>
+<a name="ln1139"> </a>
+<a name="ln1140">	if (limit &lt; cur_rx)</a>
+<a name="ln1141">		max_bytes = (RL_RXBUFLEN - cur_rx) + limit;</a>
+<a name="ln1142">	else</a>
+<a name="ln1143">		max_bytes = limit - cur_rx;</a>
+<a name="ln1144"> </a>
+<a name="ln1145">	while((CSR_READ_1(sc, RL_COMMAND) &amp; RL_CMD_EMPTY_RXBUF) == 0) {</a>
+<a name="ln1146">#ifdef DEVICE_POLLING</a>
+<a name="ln1147">		if (ifp-&gt;if_capenable &amp; IFCAP_POLLING) {</a>
+<a name="ln1148">			if (sc-&gt;rxcycles &lt;= 0)</a>
+<a name="ln1149">				break;</a>
+<a name="ln1150">			sc-&gt;rxcycles--;</a>
+<a name="ln1151">		}</a>
+<a name="ln1152">#endif</a>
+<a name="ln1153">		rxbufpos = sc-&gt;rl_cdata.rl_rx_buf + cur_rx;</a>
+<a name="ln1154">		rxstat = le32toh(*(uint32_t *)rxbufpos);</a>
+<a name="ln1155"> </a>
+<a name="ln1156">		/*</a>
+<a name="ln1157">		 * Here's a totally undocumented fact for you. When the</a>
+<a name="ln1158">		 * RealTek chip is in the process of copying a packet into</a>
+<a name="ln1159">		 * RAM for you, the length will be 0xfff0. If you spot a</a>
+<a name="ln1160">		 * packet header with this value, you need to stop. The</a>
+<a name="ln1161">		 * datasheet makes absolutely no mention of this and</a>
+<a name="ln1162">		 * RealTek should be shot for this.</a>
+<a name="ln1163">		 */</a>
+<a name="ln1164">		total_len = rxstat &gt;&gt; 16;</a>
+<a name="ln1165">		if (total_len == RL_RXSTAT_UNFINISHED)</a>
+<a name="ln1166">			break;</a>
+<a name="ln1167"> </a>
+<a name="ln1168">		if (!(rxstat &amp; RL_RXSTAT_RXOK) ||</a>
+<a name="ln1169">		    total_len &lt; ETHER_MIN_LEN ||</a>
+<a name="ln1170">		    total_len &gt; ETHER_MAX_LEN + ETHER_VLAN_ENCAP_LEN) {</a>
+<a name="ln1171">			if_inc_counter(ifp, IFCOUNTER_IERRORS, 1);</a>
+<a name="ln1172">			ifp-&gt;if_drv_flags &amp;= ~IFF_DRV_RUNNING;</a>
+<a name="ln1173">			rl_init_locked(sc);</a>
+<a name="ln1174">			return (rx_npkts);</a>
+<a name="ln1175">		}</a>
+<a name="ln1176"> </a>
+<a name="ln1177">		/* No errors; receive the packet. */</a>
+<a name="ln1178">		rx_bytes += total_len + 4;</a>
+<a name="ln1179"> </a>
+<a name="ln1180">		/*</a>
+<a name="ln1181">		 * XXX The RealTek chip includes the CRC with every</a>
+<a name="ln1182">		 * received frame, and there's no way to turn this</a>
+<a name="ln1183">		 * behavior off (at least, I can't find anything in</a>
+<a name="ln1184">		 * the manual that explains how to do it) so we have</a>
+<a name="ln1185">		 * to trim off the CRC manually.</a>
+<a name="ln1186">		 */</a>
+<a name="ln1187">		total_len -= ETHER_CRC_LEN;</a>
+<a name="ln1188"> </a>
+<a name="ln1189">		/*</a>
+<a name="ln1190">		 * Avoid trying to read more bytes than we know</a>
+<a name="ln1191">		 * the chip has prepared for us.</a>
+<a name="ln1192">		 */</a>
+<a name="ln1193">		if (rx_bytes &gt; max_bytes)</a>
+<a name="ln1194">			break;</a>
+<a name="ln1195"> </a>
+<a name="ln1196">		rxbufpos = sc-&gt;rl_cdata.rl_rx_buf +</a>
+<a name="ln1197">			((cur_rx + sizeof(uint32_t)) % RL_RXBUFLEN);</a>
+<a name="ln1198">		if (rxbufpos == (sc-&gt;rl_cdata.rl_rx_buf + RL_RXBUFLEN))</a>
+<a name="ln1199">			rxbufpos = sc-&gt;rl_cdata.rl_rx_buf;</a>
+<a name="ln1200"> </a>
+<a name="ln1201">		wrap = (sc-&gt;rl_cdata.rl_rx_buf + RL_RXBUFLEN) - rxbufpos;</a>
+<a name="ln1202">		if (total_len &gt; wrap) {</a>
+<a name="ln1203">			m = m_devget(rxbufpos, total_len, RL_ETHER_ALIGN, ifp,</a>
+<a name="ln1204">			    NULL);</a>
+<a name="ln1205">			if (m != NULL)</a>
+<a name="ln1206">				m_copyback(m, wrap, total_len - wrap,</a>
+<a name="ln1207">					sc-&gt;rl_cdata.rl_rx_buf);</a>
+<a name="ln1208">			cur_rx = (total_len - wrap + ETHER_CRC_LEN);</a>
+<a name="ln1209">		} else {</a>
+<a name="ln1210">			m = m_devget(rxbufpos, total_len, RL_ETHER_ALIGN, ifp,</a>
+<a name="ln1211">			    NULL);</a>
+<a name="ln1212">			cur_rx += total_len + 4 + ETHER_CRC_LEN;</a>
+<a name="ln1213">		}</a>
+<a name="ln1214"> </a>
+<a name="ln1215">		/* Round up to 32-bit boundary. */</a>
+<a name="ln1216">		cur_rx = (cur_rx + 3) &amp; ~3;</a>
+<a name="ln1217">		CSR_WRITE_2(sc, RL_CURRXADDR, cur_rx - 16);</a>
+<a name="ln1218"> </a>
+<a name="ln1219">		if (m == NULL) {</a>
+<a name="ln1220">			if_inc_counter(ifp, IFCOUNTER_IQDROPS, 1);</a>
+<a name="ln1221">			continue;</a>
+<a name="ln1222">		}</a>
+<a name="ln1223"> </a>
+<a name="ln1224">		if_inc_counter(ifp, IFCOUNTER_IPACKETS, 1);</a>
+<a name="ln1225">		RL_UNLOCK(sc);</a>
+<a name="ln1226">		(*ifp-&gt;if_input)(ifp, m);</a>
+<a name="ln1227">		RL_LOCK(sc);</a>
+<a name="ln1228">		rx_npkts++;</a>
+<a name="ln1229">	}</a>
+<a name="ln1230"> </a>
+<a name="ln1231">	/* No need to sync Rx memory block as we didn't modify it. */</a>
+<a name="ln1232">	return (rx_npkts);</a>
+<a name="ln1233">}</a>
+<a name="ln1234"> </a>
+<a name="ln1235">/*</a>
+<a name="ln1236"> * A frame was downloaded to the chip. It's safe for us to clean up</a>
+<a name="ln1237"> * the list buffers.</a>
+<a name="ln1238"> */</a>
+<a name="ln1239">static void</a>
+<a name="ln1240">rl_txeof(struct rl_softc *sc)</a>
+<a name="ln1241">{</a>
+<a name="ln1242">	struct ifnet		*ifp = sc-&gt;rl_ifp;</a>
+<a name="ln1243">	uint32_t		txstat;</a>
+<a name="ln1244"> </a>
+<a name="ln1245">	RL_LOCK_ASSERT(sc);</a>
+<a name="ln1246"> </a>
+<a name="ln1247">	/*</a>
+<a name="ln1248">	 * Go through our tx list and free mbufs for those</a>
+<a name="ln1249">	 * frames that have been uploaded.</a>
+<a name="ln1250">	 */</a>
+<a name="ln1251">	do {</a>
+<a name="ln1252">		if (RL_LAST_TXMBUF(sc) == NULL)</a>
+<a name="ln1253">			break;</a>
+<a name="ln1254">		txstat = CSR_READ_4(sc, RL_LAST_TXSTAT(sc));</a>
+<a name="ln1255">		if (!(txstat &amp; (RL_TXSTAT_TX_OK|</a>
+<a name="ln1256">		    RL_TXSTAT_TX_UNDERRUN|RL_TXSTAT_TXABRT)))</a>
+<a name="ln1257">			break;</a>
+<a name="ln1258"> </a>
+<a name="ln1259">		if_inc_counter(ifp, IFCOUNTER_COLLISIONS, (txstat &amp; RL_TXSTAT_COLLCNT) &gt;&gt; 24);</a>
+<a name="ln1260"> </a>
+<a name="ln1261">		bus_dmamap_sync(sc-&gt;rl_cdata.rl_tx_tag, RL_LAST_DMAMAP(sc),</a>
+<a name="ln1262">		    BUS_DMASYNC_POSTWRITE);</a>
+<a name="ln1263">		bus_dmamap_unload(sc-&gt;rl_cdata.rl_tx_tag, RL_LAST_DMAMAP(sc));</a>
+<a name="ln1264">		m_freem(RL_LAST_TXMBUF(sc));</a>
+<a name="ln1265">		RL_LAST_TXMBUF(sc) = NULL;</a>
+<a name="ln1266">		/*</a>
+<a name="ln1267">		 * If there was a transmit underrun, bump the TX threshold.</a>
+<a name="ln1268">		 * Make sure not to overflow the 63 * 32byte we can address</a>
+<a name="ln1269">		 * with the 6 available bit.</a>
+<a name="ln1270">		 */</a>
+<a name="ln1271">		if ((txstat &amp; RL_TXSTAT_TX_UNDERRUN) &amp;&amp;</a>
+<a name="ln1272">		    (sc-&gt;rl_txthresh &lt; 2016))</a>
+<a name="ln1273">			sc-&gt;rl_txthresh += 32;</a>
+<a name="ln1274">		if (txstat &amp; RL_TXSTAT_TX_OK)</a>
+<a name="ln1275">			if_inc_counter(ifp, IFCOUNTER_OPACKETS, 1);</a>
+<a name="ln1276">		else {</a>
+<a name="ln1277">			int			oldthresh;</a>
+<a name="ln1278">			if_inc_counter(ifp, IFCOUNTER_OERRORS, 1);</a>
+<a name="ln1279">			if ((txstat &amp; RL_TXSTAT_TXABRT) ||</a>
+<a name="ln1280">			    (txstat &amp; RL_TXSTAT_OUTOFWIN))</a>
+<a name="ln1281">				CSR_WRITE_4(sc, RL_TXCFG, RL_TXCFG_CONFIG);</a>
+<a name="ln1282">			oldthresh = sc-&gt;rl_txthresh;</a>
+<a name="ln1283">			/* error recovery */</a>
+<a name="ln1284">			ifp-&gt;if_drv_flags &amp;= ~IFF_DRV_RUNNING;</a>
+<a name="ln1285">			rl_init_locked(sc);</a>
+<a name="ln1286">			/* restore original threshold */</a>
+<a name="ln1287">			sc-&gt;rl_txthresh = oldthresh;</a>
+<a name="ln1288">			return;</a>
+<a name="ln1289">		}</a>
+<a name="ln1290">		RL_INC(sc-&gt;rl_cdata.last_tx);</a>
+<a name="ln1291">		ifp-&gt;if_drv_flags &amp;= ~IFF_DRV_OACTIVE;</a>
+<a name="ln1292">	} while (sc-&gt;rl_cdata.last_tx != sc-&gt;rl_cdata.cur_tx);</a>
+<a name="ln1293"> </a>
+<a name="ln1294">	if (RL_LAST_TXMBUF(sc) == NULL)</a>
+<a name="ln1295">		sc-&gt;rl_watchdog_timer = 0;</a>
+<a name="ln1296">}</a>
+<a name="ln1297"> </a>
+<a name="ln1298">static void</a>
+<a name="ln1299">rl_twister_update(struct rl_softc *sc)</a>
+<a name="ln1300">{</a>
+<a name="ln1301">	uint16_t linktest;</a>
+<a name="ln1302">	/*</a>
+<a name="ln1303">	 * Table provided by RealTek (Kinston &lt;shangh@realtek.com.tw&gt;) for</a>
+<a name="ln1304">	 * Linux driver.  Values undocumented otherwise.</a>
+<a name="ln1305">	 */</a>
+<a name="ln1306">	static const uint32_t param[4][4] = {</a>
+<a name="ln1307">		{0xcb39de43, 0xcb39ce43, 0xfb38de03, 0xcb38de43},</a>
+<a name="ln1308">		{0xcb39de43, 0xcb39ce43, 0xcb39ce83, 0xcb39ce83},</a>
+<a name="ln1309">		{0xcb39de43, 0xcb39ce43, 0xcb39ce83, 0xcb39ce83},</a>
+<a name="ln1310">		{0xbb39de43, 0xbb39ce43, 0xbb39ce83, 0xbb39ce83}</a>
+<a name="ln1311">	};</a>
+<a name="ln1312"> </a>
+<a name="ln1313">	/*</a>
+<a name="ln1314">	 * Tune the so-called twister registers of the RTL8139.  These</a>
+<a name="ln1315">	 * are used to compensate for impedance mismatches.  The</a>
+<a name="ln1316">	 * method for tuning these registers is undocumented and the</a>
+<a name="ln1317">	 * following procedure is collected from public sources.</a>
+<a name="ln1318">	 */</a>
+<a name="ln1319">	switch (sc-&gt;rl_twister)</a>
+<a name="ln1320">	{</a>
+<a name="ln1321">	case CHK_LINK:</a>
+<a name="ln1322">		/*</a>
+<a name="ln1323">		 * If we have a sufficient link, then we can proceed in</a>
+<a name="ln1324">		 * the state machine to the next stage.  If not, then</a>
+<a name="ln1325">		 * disable further tuning after writing sane defaults.</a>
+<a name="ln1326">		 */</a>
+<a name="ln1327">		if (CSR_READ_2(sc, RL_CSCFG) &amp; RL_CSCFG_LINK_OK) {</a>
+<a name="ln1328">			CSR_WRITE_2(sc, RL_CSCFG, RL_CSCFG_LINK_DOWN_OFF_CMD);</a>
+<a name="ln1329">			sc-&gt;rl_twister = FIND_ROW;</a>
+<a name="ln1330">		} else {</a>
+<a name="ln1331">			CSR_WRITE_2(sc, RL_CSCFG, RL_CSCFG_LINK_DOWN_CMD);</a>
+<a name="ln1332">			CSR_WRITE_4(sc, RL_NWAYTST, RL_NWAYTST_CBL_TEST);</a>
+<a name="ln1333">			CSR_WRITE_4(sc, RL_PARA78, RL_PARA78_DEF);</a>
+<a name="ln1334">			CSR_WRITE_4(sc, RL_PARA7C, RL_PARA7C_DEF);</a>
+<a name="ln1335">			sc-&gt;rl_twister = DONE;</a>
+<a name="ln1336">		}</a>
+<a name="ln1337">		break;</a>
+<a name="ln1338">	case FIND_ROW:</a>
+<a name="ln1339">		/*</a>
+<a name="ln1340">		 * Read how long it took to see the echo to find the tuning</a>
+<a name="ln1341">		 * row to use.</a>
+<a name="ln1342">		 */</a>
+<a name="ln1343">		linktest = CSR_READ_2(sc, RL_CSCFG) &amp; RL_CSCFG_STATUS;</a>
+<a name="ln1344">		if (linktest == RL_CSCFG_ROW3)</a>
+<a name="ln1345">			sc-&gt;rl_twist_row = 3;</a>
+<a name="ln1346">		else if (linktest == RL_CSCFG_ROW2)</a>
+<a name="ln1347">			sc-&gt;rl_twist_row = 2;</a>
+<a name="ln1348">		else if (linktest == RL_CSCFG_ROW1)</a>
+<a name="ln1349">			sc-&gt;rl_twist_row = 1;</a>
+<a name="ln1350">		else</a>
+<a name="ln1351">			sc-&gt;rl_twist_row = 0;</a>
+<a name="ln1352">		sc-&gt;rl_twist_col = 0;</a>
+<a name="ln1353">		sc-&gt;rl_twister = SET_PARAM;</a>
+<a name="ln1354">		break;</a>
+<a name="ln1355">	case SET_PARAM:</a>
+<a name="ln1356">		if (sc-&gt;rl_twist_col == 0)</a>
+<a name="ln1357">			CSR_WRITE_4(sc, RL_NWAYTST, RL_NWAYTST_RESET);</a>
+<a name="ln1358">		CSR_WRITE_4(sc, RL_PARA7C,</a>
+<a name="ln1359">		    param[sc-&gt;rl_twist_row][sc-&gt;rl_twist_col]);</a>
+<a name="ln1360">		if (++sc-&gt;rl_twist_col == 4) {</a>
+<a name="ln1361">			if (sc-&gt;rl_twist_row == 3)</a>
+<a name="ln1362">				sc-&gt;rl_twister = RECHK_LONG;</a>
+<a name="ln1363">			else</a>
+<a name="ln1364">				sc-&gt;rl_twister = DONE;</a>
+<a name="ln1365">		}</a>
+<a name="ln1366">		break;</a>
+<a name="ln1367">	case RECHK_LONG:</a>
+<a name="ln1368">		/*</a>
+<a name="ln1369">		 * For long cables, we have to double check to make sure we</a>
+<a name="ln1370">		 * don't mistune.</a>
+<a name="ln1371">		 */</a>
+<a name="ln1372">		linktest = CSR_READ_2(sc, RL_CSCFG) &amp; RL_CSCFG_STATUS;</a>
+<a name="ln1373">		if (linktest == RL_CSCFG_ROW3)</a>
+<a name="ln1374">			sc-&gt;rl_twister = DONE;</a>
+<a name="ln1375">		else {</a>
+<a name="ln1376">			CSR_WRITE_4(sc, RL_PARA7C, RL_PARA7C_RETUNE);</a>
+<a name="ln1377">			sc-&gt;rl_twister = RETUNE;</a>
+<a name="ln1378">		}</a>
+<a name="ln1379">		break;</a>
+<a name="ln1380">	case RETUNE:</a>
+<a name="ln1381">		/* Retune for a shorter cable (try column 2) */</a>
+<a name="ln1382">		CSR_WRITE_4(sc, RL_NWAYTST, RL_NWAYTST_CBL_TEST);</a>
+<a name="ln1383">		CSR_WRITE_4(sc, RL_PARA78, RL_PARA78_DEF);</a>
+<a name="ln1384">		CSR_WRITE_4(sc, RL_PARA7C, RL_PARA7C_DEF);</a>
+<a name="ln1385">		CSR_WRITE_4(sc, RL_NWAYTST, RL_NWAYTST_RESET);</a>
+<a name="ln1386">		sc-&gt;rl_twist_row--;</a>
+<a name="ln1387">		sc-&gt;rl_twist_col = 0;</a>
+<a name="ln1388">		sc-&gt;rl_twister = SET_PARAM;</a>
+<a name="ln1389">		break;</a>
+<a name="ln1390"> </a>
+<a name="ln1391">	case DONE:</a>
+<a name="ln1392">		break;</a>
+<a name="ln1393">	}</a>
+<a name="ln1394"> </a>
+<a name="ln1395">}</a>
+<a name="ln1396"> </a>
+<a name="ln1397">static void</a>
+<a name="ln1398">rl_tick(void *xsc)</a>
+<a name="ln1399">{</a>
+<a name="ln1400">	struct rl_softc		*sc = xsc;</a>
+<a name="ln1401">	struct mii_data		*mii;</a>
+<a name="ln1402">	int _ticks;</a>
+<a name="ln1403"> </a>
+<a name="ln1404">	RL_LOCK_ASSERT(sc);</a>
+<a name="ln1405">	/*</a>
+<a name="ln1406">	 * If we're doing the twister cable calibration, then we need to defer</a>
+<a name="ln1407">	 * watchdog timeouts.  This is a no-op in normal operations, but</a>
+<a name="ln1408">	 * can falsely trigger when the cable calibration takes a while and</a>
+<a name="ln1409">	 * there was traffic ready to go when rl was started.</a>
+<a name="ln1410">	 *</a>
+<a name="ln1411">	 * We don't defer mii_tick since that updates the mii status, which</a>
+<a name="ln1412">	 * helps the twister process, at least according to similar patches</a>
+<a name="ln1413">	 * for the Linux driver I found online while doing the fixes.  Worst</a>
+<a name="ln1414">	 * case is a few extra mii reads during calibration.</a>
+<a name="ln1415">	 */</a>
+<a name="ln1416">	mii = device_get_softc(sc-&gt;rl_miibus);</a>
+<a name="ln1417">	mii_tick(mii);</a>
+<a name="ln1418">	if ((sc-&gt;rl_flags &amp; RL_FLAG_LINK) == 0)</a>
+<a name="ln1419">		rl_miibus_statchg(sc-&gt;rl_dev);</a>
+<a name="ln1420">	if (sc-&gt;rl_twister_enable) {</a>
+<a name="ln1421">		if (sc-&gt;rl_twister == DONE)</a>
+<a name="ln1422">			rl_watchdog(sc);</a>
+<a name="ln1423">		else</a>
+<a name="ln1424">			rl_twister_update(sc);</a>
+<a name="ln1425">		if (sc-&gt;rl_twister == DONE)</a>
+<a name="ln1426">			_ticks = hz;</a>
+<a name="ln1427">		else</a>
+<a name="ln1428">			_ticks = hz / 10;</a>
+<a name="ln1429">	} else {</a>
+<a name="ln1430">		rl_watchdog(sc);</a>
+<a name="ln1431">		_ticks = hz;</a>
+<a name="ln1432">	}</a>
+<a name="ln1433"> </a>
+<a name="ln1434">	callout_reset(&amp;sc-&gt;rl_stat_callout, _ticks, rl_tick, sc);</a>
+<a name="ln1435">}</a>
+<a name="ln1436"> </a>
+<a name="ln1437">#ifdef DEVICE_POLLING</a>
+<a name="ln1438">static int</a>
+<a name="ln1439">rl_poll(struct ifnet *ifp, enum poll_cmd cmd, int count)</a>
+<a name="ln1440">{</a>
+<a name="ln1441">	struct rl_softc *sc = ifp-&gt;if_softc;</a>
+<a name="ln1442">	int rx_npkts = 0;</a>
+<a name="ln1443"> </a>
+<a name="ln1444">	RL_LOCK(sc);</a>
+<a name="ln1445">	if (ifp-&gt;if_drv_flags &amp; IFF_DRV_RUNNING)</a>
+<a name="ln1446">		rx_npkts = rl_poll_locked(ifp, cmd, count);</a>
+<a name="ln1447">	RL_UNLOCK(sc);</a>
+<a name="ln1448">	return (rx_npkts);</a>
+<a name="ln1449">}</a>
+<a name="ln1450"> </a>
+<a name="ln1451">static int</a>
+<a name="ln1452">rl_poll_locked(struct ifnet *ifp, enum poll_cmd cmd, int count)</a>
+<a name="ln1453">{</a>
+<a name="ln1454">	struct rl_softc *sc = ifp-&gt;if_softc;</a>
+<a name="ln1455">	int rx_npkts;</a>
+<a name="ln1456"> </a>
+<a name="ln1457">	RL_LOCK_ASSERT(sc);</a>
+<a name="ln1458"> </a>
+<a name="ln1459">	sc-&gt;rxcycles = count;</a>
+<a name="ln1460">	rx_npkts = rl_rxeof(sc);</a>
+<a name="ln1461">	rl_txeof(sc);</a>
+<a name="ln1462"> </a>
+<a name="ln1463">	if (!IFQ_DRV_IS_EMPTY(&amp;ifp-&gt;if_snd))</a>
+<a name="ln1464">		rl_start_locked(ifp);</a>
+<a name="ln1465"> </a>
+<a name="ln1466">	if (cmd == POLL_AND_CHECK_STATUS) {</a>
+<a name="ln1467">		uint16_t	status;</a>
+<a name="ln1468"> </a>
+<a name="ln1469">		/* We should also check the status register. */</a>
+<a name="ln1470">		status = CSR_READ_2(sc, RL_ISR);</a>
+<a name="ln1471">		if (status == 0xffff)</a>
+<a name="ln1472">			return (rx_npkts);</a>
+<a name="ln1473">		if (status != 0)</a>
+<a name="ln1474">			CSR_WRITE_2(sc, RL_ISR, status);</a>
+<a name="ln1475"> </a>
+<a name="ln1476">		/* XXX We should check behaviour on receiver stalls. */</a>
+<a name="ln1477"> </a>
+<a name="ln1478">		if (status &amp; RL_ISR_SYSTEM_ERR) {</a>
+<a name="ln1479">			ifp-&gt;if_drv_flags &amp;= ~IFF_DRV_RUNNING;</a>
+<a name="ln1480">			rl_init_locked(sc);</a>
+<a name="ln1481">		}</a>
+<a name="ln1482">	}</a>
+<a name="ln1483">	return (rx_npkts);</a>
+<a name="ln1484">}</a>
+<a name="ln1485">#endif /* DEVICE_POLLING */</a>
+<a name="ln1486"> </a>
+<a name="ln1487">static void</a>
+<a name="ln1488">rl_intr(void *arg)</a>
+<a name="ln1489">{</a>
+<a name="ln1490">	struct rl_softc		*sc = arg;</a>
+<a name="ln1491">	struct ifnet		*ifp = sc-&gt;rl_ifp;</a>
+<a name="ln1492">	uint16_t		status;</a>
+<a name="ln1493">	int			count;</a>
+<a name="ln1494"> </a>
+<a name="ln1495">	RL_LOCK(sc);</a>
+<a name="ln1496"> </a>
+<a name="ln1497">	if (sc-&gt;suspended)</a>
+<a name="ln1498">		goto done_locked;</a>
+<a name="ln1499"> </a>
+<a name="ln1500">#ifdef DEVICE_POLLING</a>
+<a name="ln1501">	if  (ifp-&gt;if_capenable &amp; IFCAP_POLLING)</a>
+<a name="ln1502">		goto done_locked;</a>
+<a name="ln1503">#endif</a>
+<a name="ln1504"> </a>
+<a name="ln1505">	if ((ifp-&gt;if_drv_flags &amp; IFF_DRV_RUNNING) == 0)</a>
+<a name="ln1506">		goto done_locked2;</a>
+<a name="ln1507">	status = CSR_READ_2(sc, RL_ISR);</a>
+<a name="ln1508">	if (status == 0xffff || (status &amp; RL_INTRS) == 0)</a>
+<a name="ln1509">		goto done_locked;</a>
+<a name="ln1510">	/*</a>
+<a name="ln1511">	 * Ours, disable further interrupts.</a>
+<a name="ln1512">	 */</a>
+<a name="ln1513">	CSR_WRITE_2(sc, RL_IMR, 0);</a>
+<a name="ln1514">	for (count = 16; count &gt; 0; count--) {</a>
+<a name="ln1515">		CSR_WRITE_2(sc, RL_ISR, status);</a>
+<a name="ln1516">		if (ifp-&gt;if_drv_flags &amp; IFF_DRV_RUNNING) {</a>
+<a name="ln1517">			if (status &amp; (RL_ISR_RX_OK | RL_ISR_RX_ERR))</a>
+<a name="ln1518">				rl_rxeof(sc);</a>
+<a name="ln1519">			if (status &amp; (RL_ISR_TX_OK | RL_ISR_TX_ERR))</a>
+<a name="ln1520">				rl_txeof(sc);</a>
+<a name="ln1521">			if (status &amp; RL_ISR_SYSTEM_ERR) {</a>
+<a name="ln1522">				ifp-&gt;if_drv_flags &amp;= ~IFF_DRV_RUNNING;</a>
+<a name="ln1523">				rl_init_locked(sc);</a>
+<a name="ln1524">				RL_UNLOCK(sc);</a>
+<a name="ln1525">				return;</a>
+<a name="ln1526">			}</a>
+<a name="ln1527">		}</a>
+<a name="ln1528">		status = CSR_READ_2(sc, RL_ISR);</a>
+<a name="ln1529">		/* If the card has gone away, the read returns 0xffff. */</a>
+<a name="ln1530">		if (status == 0xffff || (status &amp; RL_INTRS) == 0)</a>
+<a name="ln1531">			break;</a>
+<a name="ln1532">	}</a>
+<a name="ln1533"> </a>
+<a name="ln1534">	if (!IFQ_DRV_IS_EMPTY(&amp;ifp-&gt;if_snd))</a>
+<a name="ln1535">		rl_start_locked(ifp);</a>
+<a name="ln1536"> </a>
+<a name="ln1537">done_locked2:</a>
+<a name="ln1538">	if (ifp-&gt;if_drv_flags &amp; IFF_DRV_RUNNING)</a>
+<a name="ln1539">		CSR_WRITE_2(sc, RL_IMR, RL_INTRS);</a>
+<a name="ln1540">done_locked:</a>
+<a name="ln1541">	RL_UNLOCK(sc);</a>
+<a name="ln1542">}</a>
+<a name="ln1543"> </a>
+<a name="ln1544">/*</a>
+<a name="ln1545"> * Encapsulate an mbuf chain in a descriptor by coupling the mbuf data</a>
+<a name="ln1546"> * pointers to the fragment pointers.</a>
+<a name="ln1547"> */</a>
+<a name="ln1548">static int</a>
+<a name="ln1549">rl_encap(struct rl_softc *sc, struct mbuf **m_head)</a>
+<a name="ln1550">{</a>
+<a name="ln1551">	struct mbuf		*m;</a>
+<a name="ln1552">	bus_dma_segment_t	txsegs[1];</a>
+<a name="ln1553">	int			error, nsegs, padlen;</a>
+<a name="ln1554"> </a>
+<a name="ln1555">	RL_LOCK_ASSERT(sc);</a>
+<a name="ln1556"> </a>
+<a name="ln1557">	m = *m_head;</a>
+<a name="ln1558">	padlen = 0;</a>
+<a name="ln1559">	/*</a>
+<a name="ln1560">	 * Hardware doesn't auto-pad, so we have to make sure</a>
+<a name="ln1561">	 * pad short frames out to the minimum frame length.</a>
+<a name="ln1562">	 */</a>
+<a name="ln1563">	if (m-&gt;m_pkthdr.len &lt; RL_MIN_FRAMELEN)</a>
+<a name="ln1564">		padlen = RL_MIN_FRAMELEN - m-&gt;m_pkthdr.len;</a>
+<a name="ln1565">	/*</a>
+<a name="ln1566">	 * The RealTek is brain damaged and wants longword-aligned</a>
+<a name="ln1567">	 * TX buffers, plus we can only have one fragment buffer</a>
+<a name="ln1568">	 * per packet. We have to copy pretty much all the time.</a>
+<a name="ln1569">	 */</a>
+<a name="ln1570">	if (m-&gt;m_next != NULL || (mtod(m, uintptr_t) &amp; 3) != 0 ||</a>
+<a name="ln1571">	    (padlen &gt; 0 &amp;&amp; M_TRAILINGSPACE(m) &lt; padlen)) {</a>
+<a name="ln1572">		m = m_defrag(*m_head, M_NOWAIT);</a>
+<a name="ln1573">		if (m == NULL) {</a>
+<a name="ln1574">			m_freem(*m_head);</a>
+<a name="ln1575">			*m_head = NULL;</a>
+<a name="ln1576">			return (ENOMEM);</a>
+<a name="ln1577">		}</a>
+<a name="ln1578">	}</a>
+<a name="ln1579">	*m_head = m;</a>
+<a name="ln1580"> </a>
+<a name="ln1581">	if (padlen &gt; 0) {</a>
+<a name="ln1582">		/*</a>
+<a name="ln1583">		 * Make security-conscious people happy: zero out the</a>
+<a name="ln1584">		 * bytes in the pad area, since we don't know what</a>
+<a name="ln1585">		 * this mbuf cluster buffer's previous user might</a>
+<a name="ln1586">		 * have left in it.</a>
+<a name="ln1587">		 */</a>
+<a name="ln1588">		bzero(mtod(m, char *) + m-&gt;m_pkthdr.len, padlen);</a>
+<a name="ln1589">		m-&gt;m_pkthdr.len += padlen;</a>
+<a name="ln1590">		m-&gt;m_len = m-&gt;m_pkthdr.len;</a>
+<a name="ln1591">	}</a>
+<a name="ln1592"> </a>
+<a name="ln1593">	error = bus_dmamap_load_mbuf_sg(sc-&gt;rl_cdata.rl_tx_tag,</a>
+<a name="ln1594">	    RL_CUR_DMAMAP(sc), m, txsegs, &amp;nsegs, 0);</a>
+<a name="ln1595">	if (error != 0)</a>
+<a name="ln1596">		return (error);</a>
+<a name="ln1597">	if (nsegs == 0) {</a>
+<a name="ln1598">		m_freem(*m_head);</a>
+<a name="ln1599">		*m_head = NULL;</a>
+<a name="ln1600">		return (EIO);</a>
+<a name="ln1601">	}</a>
+<a name="ln1602"> </a>
+<a name="ln1603">	RL_CUR_TXMBUF(sc) = m;</a>
+<a name="ln1604">	bus_dmamap_sync(sc-&gt;rl_cdata.rl_tx_tag, RL_CUR_DMAMAP(sc),</a>
+<a name="ln1605">	    BUS_DMASYNC_PREWRITE);</a>
+<a name="ln1606">	CSR_WRITE_4(sc, RL_CUR_TXADDR(sc), RL_ADDR_LO(txsegs[0].ds_addr));</a>
+<a name="ln1607"> </a>
+<a name="ln1608">	return (0);</a>
+<a name="ln1609">}</a>
+<a name="ln1610"> </a>
+<a name="ln1611">/*</a>
+<a name="ln1612"> * Main transmit routine.</a>
+<a name="ln1613"> */</a>
+<a name="ln1614">static void</a>
+<a name="ln1615">rl_start(struct ifnet *ifp)</a>
+<a name="ln1616">{</a>
+<a name="ln1617">	struct rl_softc		*sc = ifp-&gt;if_softc;</a>
+<a name="ln1618"> </a>
+<a name="ln1619">	RL_LOCK(sc);</a>
+<a name="ln1620">	rl_start_locked(ifp);</a>
+<a name="ln1621">	RL_UNLOCK(sc);</a>
+<a name="ln1622">}</a>
+<a name="ln1623"> </a>
+<a name="ln1624">static void</a>
+<a name="ln1625">rl_start_locked(struct ifnet *ifp)</a>
+<a name="ln1626">{</a>
+<a name="ln1627">	struct rl_softc		*sc = ifp-&gt;if_softc;</a>
+<a name="ln1628">	struct mbuf		*m_head = NULL;</a>
+<a name="ln1629"> </a>
+<a name="ln1630">	RL_LOCK_ASSERT(sc);</a>
+<a name="ln1631"> </a>
+<a name="ln1632">	if ((ifp-&gt;if_drv_flags &amp; (IFF_DRV_RUNNING | IFF_DRV_OACTIVE)) !=</a>
+<a name="ln1633">	    IFF_DRV_RUNNING || (sc-&gt;rl_flags &amp; RL_FLAG_LINK) == 0)</a>
+<a name="ln1634">		return;</a>
+<a name="ln1635"> </a>
+<a name="ln1636">	while (RL_CUR_TXMBUF(sc) == NULL) {</a>
+<a name="ln1637"> </a>
+<a name="ln1638">		IFQ_DRV_DEQUEUE(&amp;ifp-&gt;if_snd, m_head);</a>
+<a name="ln1639"> </a>
+<a name="ln1640">		if (m_head == NULL)</a>
+<a name="ln1641">			break;</a>
+<a name="ln1642"> </a>
+<a name="ln1643">		if (rl_encap(sc, &amp;m_head)) {</a>
+<a name="ln1644">			if (m_head == NULL)</a>
+<a name="ln1645">				break;</a>
+<a name="ln1646">			IFQ_DRV_PREPEND(&amp;ifp-&gt;if_snd, m_head);</a>
+<a name="ln1647">			ifp-&gt;if_drv_flags |= IFF_DRV_OACTIVE;</a>
+<a name="ln1648">			break;</a>
+<a name="ln1649">		}</a>
+<a name="ln1650"> </a>
+<a name="ln1651">		/* Pass a copy of this mbuf chain to the bpf subsystem. */</a>
+<a name="ln1652">		BPF_MTAP(ifp, RL_CUR_TXMBUF(sc));</a>
+<a name="ln1653"> </a>
+<a name="ln1654">		/* Transmit the frame. */</a>
+<a name="ln1655">		CSR_WRITE_4(sc, RL_CUR_TXSTAT(sc),</a>
+<a name="ln1656">		    RL_TXTHRESH(sc-&gt;rl_txthresh) |</a>
+<a name="ln1657">		    RL_CUR_TXMBUF(sc)-&gt;m_pkthdr.len);</a>
+<a name="ln1658"> </a>
+<a name="ln1659">		RL_INC(sc-&gt;rl_cdata.cur_tx);</a>
+<a name="ln1660"> </a>
+<a name="ln1661">		/* Set a timeout in case the chip goes out to lunch. */</a>
+<a name="ln1662">		sc-&gt;rl_watchdog_timer = 5;</a>
+<a name="ln1663">	}</a>
+<a name="ln1664"> </a>
+<a name="ln1665">	/*</a>
+<a name="ln1666">	 * We broke out of the loop because all our TX slots are</a>
+<a name="ln1667">	 * full. Mark the NIC as busy until it drains some of the</a>
+<a name="ln1668">	 * packets from the queue.</a>
+<a name="ln1669">	 */</a>
+<a name="ln1670">	if (RL_CUR_TXMBUF(sc) != NULL)</a>
+<a name="ln1671">		ifp-&gt;if_drv_flags |= IFF_DRV_OACTIVE;</a>
+<a name="ln1672">}</a>
+<a name="ln1673"> </a>
+<a name="ln1674">static void</a>
+<a name="ln1675">rl_init(void *xsc)</a>
+<a name="ln1676">{</a>
+<a name="ln1677">	struct rl_softc		*sc = xsc;</a>
+<a name="ln1678"> </a>
+<a name="ln1679">	RL_LOCK(sc);</a>
+<a name="ln1680">	rl_init_locked(sc);</a>
+<a name="ln1681">	RL_UNLOCK(sc);</a>
+<a name="ln1682">}</a>
+<a name="ln1683"> </a>
+<a name="ln1684">static void</a>
+<a name="ln1685">rl_init_locked(struct rl_softc *sc)</a>
+<a name="ln1686">{</a>
+<a name="ln1687">	struct ifnet		*ifp = sc-&gt;rl_ifp;</a>
+<a name="ln1688">	struct mii_data		*mii;</a>
+<a name="ln1689">	uint32_t		eaddr[2];</a>
+<a name="ln1690"> </a>
+<a name="ln1691">	RL_LOCK_ASSERT(sc);</a>
+<a name="ln1692"> </a>
+<a name="ln1693">	mii = device_get_softc(sc-&gt;rl_miibus);</a>
+<a name="ln1694"> </a>
+<a name="ln1695">	if ((ifp-&gt;if_drv_flags &amp; IFF_DRV_RUNNING) != 0)</a>
+<a name="ln1696">		return;</a>
+<a name="ln1697"> </a>
+<a name="ln1698">	/*</a>
+<a name="ln1699">	 * Cancel pending I/O and free all RX/TX buffers.</a>
+<a name="ln1700">	 */</a>
+<a name="ln1701">	rl_stop(sc);</a>
+<a name="ln1702"> </a>
+<a name="ln1703">	rl_reset(sc);</a>
+<a name="ln1704">	if (sc-&gt;rl_twister_enable) {</a>
+<a name="ln1705">		/*</a>
+<a name="ln1706">		 * Reset twister register tuning state.  The twister</a>
+<a name="ln1707">		 * registers and their tuning are undocumented, but</a>
+<a name="ln1708">		 * are necessary to cope with bad links.  rl_twister =</a>
+<a name="ln1709">		 * DONE here will disable this entirely.</a>
+<a name="ln1710">		 */</a>
+<a name="ln1711">		sc-&gt;rl_twister = CHK_LINK;</a>
+<a name="ln1712">	}</a>
+<a name="ln1713"> </a>
+<a name="ln1714">	/*</a>
+<a name="ln1715">	 * Init our MAC address.  Even though the chipset</a>
+<a name="ln1716">	 * documentation doesn't mention it, we need to enter &quot;Config</a>
+<a name="ln1717">	 * register write enable&quot; mode to modify the ID registers.</a>
+<a name="ln1718">	 */</a>
+<a name="ln1719">	CSR_WRITE_1(sc, RL_EECMD, RL_EEMODE_WRITECFG);</a>
+<a name="ln1720">	bzero(eaddr, sizeof(eaddr));</a>
+<a name="ln1721">	bcopy(IF_LLADDR(sc-&gt;rl_ifp), eaddr, ETHER_ADDR_LEN);</a>
+<a name="ln1722">	CSR_WRITE_STREAM_4(sc, RL_IDR0, eaddr[0]);</a>
+<a name="ln1723">	CSR_WRITE_STREAM_4(sc, RL_IDR4, eaddr[1]);</a>
+<a name="ln1724">	CSR_WRITE_1(sc, RL_EECMD, RL_EEMODE_OFF);</a>
+<a name="ln1725"> </a>
+<a name="ln1726">	/* Init the RX memory block pointer register. */</a>
+<a name="ln1727">	CSR_WRITE_4(sc, RL_RXADDR, sc-&gt;rl_cdata.rl_rx_buf_paddr +</a>
+<a name="ln1728">	    RL_RX_8139_BUF_RESERVE);</a>
+<a name="ln1729">	/* Init TX descriptors. */</a>
+<a name="ln1730">	rl_list_tx_init(sc);</a>
+<a name="ln1731">	/* Init Rx memory block. */</a>
+<a name="ln1732">	rl_list_rx_init(sc);</a>
+<a name="ln1733"> </a>
+<a name="ln1734">	/*</a>
+<a name="ln1735">	 * Enable transmit and receive.</a>
+<a name="ln1736">	 */</a>
+<a name="ln1737">	CSR_WRITE_1(sc, RL_COMMAND, RL_CMD_TX_ENB|RL_CMD_RX_ENB);</a>
+<a name="ln1738"> </a>
+<a name="ln1739">	/*</a>
+<a name="ln1740">	 * Set the initial TX and RX configuration.</a>
+<a name="ln1741">	 */</a>
+<a name="ln1742">	CSR_WRITE_4(sc, RL_TXCFG, RL_TXCFG_CONFIG);</a>
+<a name="ln1743">	CSR_WRITE_4(sc, RL_RXCFG, RL_RXCFG_CONFIG);</a>
+<a name="ln1744"> </a>
+<a name="ln1745">	/* Set RX filter. */</a>
+<a name="ln1746">	rl_rxfilter(sc);</a>
+<a name="ln1747"> </a>
+<a name="ln1748">#ifdef DEVICE_POLLING</a>
+<a name="ln1749">	/* Disable interrupts if we are polling. */</a>
+<a name="ln1750">	if (ifp-&gt;if_capenable &amp; IFCAP_POLLING)</a>
+<a name="ln1751">		CSR_WRITE_2(sc, RL_IMR, 0);</a>
+<a name="ln1752">	else</a>
+<a name="ln1753">#endif</a>
+<a name="ln1754">	/* Enable interrupts. */</a>
+<a name="ln1755">	CSR_WRITE_2(sc, RL_IMR, RL_INTRS);</a>
+<a name="ln1756"> </a>
+<a name="ln1757">	/* Set initial TX threshold */</a>
+<a name="ln1758">	sc-&gt;rl_txthresh = RL_TX_THRESH_INIT;</a>
+<a name="ln1759"> </a>
+<a name="ln1760">	/* Start RX/TX process. */</a>
+<a name="ln1761">	CSR_WRITE_4(sc, RL_MISSEDPKT, 0);</a>
+<a name="ln1762"> </a>
+<a name="ln1763">	/* Enable receiver and transmitter. */</a>
+<a name="ln1764">	CSR_WRITE_1(sc, RL_COMMAND, RL_CMD_TX_ENB|RL_CMD_RX_ENB);</a>
+<a name="ln1765"> </a>
+<a name="ln1766">	sc-&gt;rl_flags &amp;= ~RL_FLAG_LINK;</a>
+<a name="ln1767">	mii_mediachg(mii);</a>
+<a name="ln1768"> </a>
+<a name="ln1769">	CSR_WRITE_1(sc, sc-&gt;rl_cfg1, RL_CFG1_DRVLOAD|RL_CFG1_FULLDUPLEX);</a>
+<a name="ln1770"> </a>
+<a name="ln1771">	ifp-&gt;if_drv_flags |= IFF_DRV_RUNNING;</a>
+<a name="ln1772">	ifp-&gt;if_drv_flags &amp;= ~IFF_DRV_OACTIVE;</a>
+<a name="ln1773"> </a>
+<a name="ln1774">	callout_reset(&amp;sc-&gt;rl_stat_callout, hz, rl_tick, sc);</a>
+<a name="ln1775">}</a>
+<a name="ln1776"> </a>
+<a name="ln1777">/*</a>
+<a name="ln1778"> * Set media options.</a>
+<a name="ln1779"> */</a>
+<a name="ln1780">static int</a>
+<a name="ln1781">rl_ifmedia_upd(struct ifnet *ifp)</a>
+<a name="ln1782">{</a>
+<a name="ln1783">	struct rl_softc		*sc = ifp-&gt;if_softc;</a>
+<a name="ln1784">	struct mii_data		*mii;</a>
+<a name="ln1785"> </a>
+<a name="ln1786">	mii = device_get_softc(sc-&gt;rl_miibus);</a>
+<a name="ln1787"> </a>
+<a name="ln1788">	RL_LOCK(sc);</a>
+<a name="ln1789">	mii_mediachg(mii);</a>
+<a name="ln1790">	RL_UNLOCK(sc);</a>
+<a name="ln1791"> </a>
+<a name="ln1792">	return (0);</a>
+<a name="ln1793">}</a>
+<a name="ln1794"> </a>
+<a name="ln1795">/*</a>
+<a name="ln1796"> * Report current media status.</a>
+<a name="ln1797"> */</a>
+<a name="ln1798">static void</a>
+<a name="ln1799">rl_ifmedia_sts(struct ifnet *ifp, struct ifmediareq *ifmr)</a>
+<a name="ln1800">{</a>
+<a name="ln1801">	struct rl_softc		*sc = ifp-&gt;if_softc;</a>
+<a name="ln1802">	struct mii_data		*mii;</a>
+<a name="ln1803"> </a>
+<a name="ln1804">	mii = device_get_softc(sc-&gt;rl_miibus);</a>
+<a name="ln1805"> </a>
+<a name="ln1806">	RL_LOCK(sc);</a>
+<a name="ln1807">	mii_pollstat(mii);</a>
+<a name="ln1808">	ifmr-&gt;ifm_active = mii-&gt;mii_media_active;</a>
+<a name="ln1809">	ifmr-&gt;ifm_status = mii-&gt;mii_media_status;</a>
+<a name="ln1810">	RL_UNLOCK(sc);</a>
+<a name="ln1811">}</a>
+<a name="ln1812"> </a>
+<a name="ln1813">static int</a>
+<a name="ln1814">rl_ioctl(struct ifnet *ifp, u_long command, caddr_t data)</a>
+<a name="ln1815">{</a>
+<a name="ln1816">	struct ifreq		*ifr = (struct ifreq *)data;</a>
+<a name="ln1817">	struct mii_data		*mii;</a>
+<a name="ln1818">	struct rl_softc		*sc = ifp-&gt;if_softc;</a>
+<a name="ln1819">	int			error = 0, mask;</a>
+<a name="ln1820"> </a>
+<a name="ln1821">	switch (command) {</a>
+<a name="ln1822">	case SIOCSIFFLAGS:</a>
+<a name="ln1823">		RL_LOCK(sc);</a>
+<a name="ln1824">		if (ifp-&gt;if_flags &amp; IFF_UP) {</a>
+<a name="ln1825">			if (ifp-&gt;if_drv_flags &amp; IFF_DRV_RUNNING &amp;&amp;</a>
+<a name="ln1826">			    ((ifp-&gt;if_flags ^ sc-&gt;rl_if_flags) &amp;</a>
+<a name="ln1827">                            (IFF_PROMISC | IFF_ALLMULTI)))</a>
+<a name="ln1828">				rl_rxfilter(sc);</a>
+<a name="ln1829">                        else</a>
+<a name="ln1830">				rl_init_locked(sc);</a>
+<a name="ln1831">                } else if (ifp-&gt;if_drv_flags &amp; IFF_DRV_RUNNING)</a>
+<a name="ln1832">			rl_stop(sc);</a>
+<a name="ln1833">		sc-&gt;rl_if_flags = ifp-&gt;if_flags;</a>
+<a name="ln1834">		RL_UNLOCK(sc);</a>
+<a name="ln1835">		break;</a>
+<a name="ln1836">	case SIOCADDMULTI:</a>
+<a name="ln1837">	case SIOCDELMULTI:</a>
+<a name="ln1838">		RL_LOCK(sc);</a>
+<a name="ln1839">		rl_rxfilter(sc);</a>
+<a name="ln1840">		RL_UNLOCK(sc);</a>
+<a name="ln1841">		break;</a>
+<a name="ln1842">	case SIOCGIFMEDIA:</a>
+<a name="ln1843">	case SIOCSIFMEDIA:</a>
+<a name="ln1844">		mii = device_get_softc(sc-&gt;rl_miibus);</a>
+<a name="ln1845">		error = ifmedia_ioctl(ifp, ifr, &amp;mii-&gt;mii_media, command);</a>
+<a name="ln1846">		break;</a>
+<a name="ln1847">	case SIOCSIFCAP:</a>
+<a name="ln1848">		mask = ifr-&gt;ifr_reqcap ^ ifp-&gt;if_capenable;</a>
+<a name="ln1849">#ifdef DEVICE_POLLING</a>
+<a name="ln1850">		if (ifr-&gt;ifr_reqcap &amp; IFCAP_POLLING &amp;&amp;</a>
+<a name="ln1851">		    !(ifp-&gt;if_capenable &amp; IFCAP_POLLING)) {</a>
+<a name="ln1852">			error = ether_poll_register(rl_poll, ifp);</a>
+<a name="ln1853">			if (error)</a>
+<a name="ln1854">				return(error);</a>
+<a name="ln1855">			RL_LOCK(sc);</a>
+<a name="ln1856">			/* Disable interrupts */</a>
+<a name="ln1857">			CSR_WRITE_2(sc, RL_IMR, 0x0000);</a>
+<a name="ln1858">			ifp-&gt;if_capenable |= IFCAP_POLLING;</a>
+<a name="ln1859">			RL_UNLOCK(sc);</a>
+<a name="ln1860">			return (error);</a>
+<a name="ln1861"> </a>
+<a name="ln1862">		}</a>
+<a name="ln1863">		if (!(ifr-&gt;ifr_reqcap &amp; IFCAP_POLLING) &amp;&amp;</a>
+<a name="ln1864">		    ifp-&gt;if_capenable &amp; IFCAP_POLLING) {</a>
+<a name="ln1865">			error = ether_poll_deregister(ifp);</a>
+<a name="ln1866">			/* Enable interrupts. */</a>
+<a name="ln1867">			RL_LOCK(sc);</a>
+<a name="ln1868">			CSR_WRITE_2(sc, RL_IMR, RL_INTRS);</a>
+<a name="ln1869">			ifp-&gt;if_capenable &amp;= ~IFCAP_POLLING;</a>
+<a name="ln1870">			RL_UNLOCK(sc);</a>
+<a name="ln1871">			return (error);</a>
+<a name="ln1872">		}</a>
+<a name="ln1873">#endif /* DEVICE_POLLING */</a>
+<a name="ln1874">		if ((mask &amp; IFCAP_WOL) != 0 &amp;&amp;</a>
+<a name="ln1875">		    (ifp-&gt;if_capabilities &amp; IFCAP_WOL) != 0) {</a>
+<a name="ln1876">			if ((mask &amp; IFCAP_WOL_UCAST) != 0)</a>
+<a name="ln1877">				ifp-&gt;if_capenable ^= IFCAP_WOL_UCAST;</a>
+<a name="ln1878">			if ((mask &amp; IFCAP_WOL_MCAST) != 0)</a>
+<a name="ln1879">				ifp-&gt;if_capenable ^= IFCAP_WOL_MCAST;</a>
+<a name="ln1880">			if ((mask &amp; IFCAP_WOL_MAGIC) != 0)</a>
+<a name="ln1881">				ifp-&gt;if_capenable ^= IFCAP_WOL_MAGIC;</a>
+<a name="ln1882">		}</a>
+<a name="ln1883">		break;</a>
+<a name="ln1884">	default:</a>
+<a name="ln1885">		error = ether_ioctl(ifp, command, data);</a>
+<a name="ln1886">		break;</a>
+<a name="ln1887">	}</a>
+<a name="ln1888"> </a>
+<a name="ln1889">	return (error);</a>
+<a name="ln1890">}</a>
+<a name="ln1891"> </a>
+<a name="ln1892">static void</a>
+<a name="ln1893">rl_watchdog(struct rl_softc *sc)</a>
+<a name="ln1894">{</a>
+<a name="ln1895"> </a>
+<a name="ln1896">	RL_LOCK_ASSERT(sc);</a>
+<a name="ln1897"> </a>
+<a name="ln1898">	if (sc-&gt;rl_watchdog_timer == 0 || --sc-&gt;rl_watchdog_timer &gt;0)</a>
+<a name="ln1899">		return;</a>
+<a name="ln1900"> </a>
+<a name="ln1901">	device_printf(sc-&gt;rl_dev, &quot;watchdog timeout\n&quot;);</a>
+<a name="ln1902">	if_inc_counter(sc-&gt;rl_ifp, IFCOUNTER_OERRORS, 1);</a>
+<a name="ln1903"> </a>
+<a name="ln1904">	rl_txeof(sc);</a>
+<a name="ln1905">	rl_rxeof(sc);</a>
+<a name="ln1906">	sc-&gt;rl_ifp-&gt;if_drv_flags &amp;= ~IFF_DRV_RUNNING;</a>
+<a name="ln1907">	rl_init_locked(sc);</a>
+<a name="ln1908">}</a>
+<a name="ln1909"> </a>
+<a name="ln1910">/*</a>
+<a name="ln1911"> * Stop the adapter and free any mbufs allocated to the</a>
+<a name="ln1912"> * RX and TX lists.</a>
+<a name="ln1913"> */</a>
+<a name="ln1914">static void</a>
+<a name="ln1915">rl_stop(struct rl_softc *sc)</a>
+<a name="ln1916">{</a>
+<a name="ln1917">	int			i;</a>
+<a name="ln1918">	struct ifnet		*ifp = sc-&gt;rl_ifp;</a>
+<a name="ln1919"> </a>
+<a name="ln1920">	RL_LOCK_ASSERT(sc);</a>
+<a name="ln1921"> </a>
+<a name="ln1922">	sc-&gt;rl_watchdog_timer = 0;</a>
+<a name="ln1923">	callout_stop(&amp;sc-&gt;rl_stat_callout);</a>
+<a name="ln1924">	ifp-&gt;if_drv_flags &amp;= ~(IFF_DRV_RUNNING | IFF_DRV_OACTIVE);</a>
+<a name="ln1925">	sc-&gt;rl_flags &amp;= ~RL_FLAG_LINK;</a>
+<a name="ln1926"> </a>
+<a name="ln1927">	CSR_WRITE_1(sc, RL_COMMAND, 0x00);</a>
+<a name="ln1928">	CSR_WRITE_2(sc, RL_IMR, 0x0000);</a>
+<a name="ln1929">	for (i = 0; i &lt; RL_TIMEOUT; i++) {</a>
+<a name="ln1930">		DELAY(10);</a>
+<a name="ln1931">		if ((CSR_READ_1(sc, RL_COMMAND) &amp;</a>
+<a name="ln1932">		    (RL_CMD_RX_ENB | RL_CMD_TX_ENB)) == 0)</a>
+<a name="ln1933">			break;</a>
+<a name="ln1934">	}</a>
+<a name="ln1935">	if (i == RL_TIMEOUT)</a>
+<a name="ln1936">		device_printf(sc-&gt;rl_dev, &quot;Unable to stop Tx/Rx MAC\n&quot;);</a>
+<a name="ln1937"> </a>
+<a name="ln1938">	/*</a>
+<a name="ln1939">	 * Free the TX list buffers.</a>
+<a name="ln1940">	 */</a>
+<a name="ln1941">	for (i = 0; i &lt; RL_TX_LIST_CNT; i++) {</a>
+<a name="ln1942">		if (sc-&gt;rl_cdata.rl_tx_chain[i] != NULL) {</a>
+<a name="ln1943">			bus_dmamap_sync(sc-&gt;rl_cdata.rl_tx_tag,</a>
+<a name="ln1944">			    sc-&gt;rl_cdata.rl_tx_dmamap[i],</a>
+<a name="ln1945">			    BUS_DMASYNC_POSTWRITE);</a>
+<a name="ln1946">			bus_dmamap_unload(sc-&gt;rl_cdata.rl_tx_tag,</a>
+<a name="ln1947">			    sc-&gt;rl_cdata.rl_tx_dmamap[i]);</a>
+<a name="ln1948">			m_freem(sc-&gt;rl_cdata.rl_tx_chain[i]);</a>
+<a name="ln1949">			sc-&gt;rl_cdata.rl_tx_chain[i] = NULL;</a>
+<a name="ln1950">			CSR_WRITE_4(sc, RL_TXADDR0 + (i * sizeof(uint32_t)),</a>
+<a name="ln1951">			    0x0000000);</a>
+<a name="ln1952">		}</a>
+<a name="ln1953">	}</a>
+<a name="ln1954">}</a>
+<a name="ln1955"> </a>
+<a name="ln1956">/*</a>
+<a name="ln1957"> * Device suspend routine.  Stop the interface and save some PCI</a>
+<a name="ln1958"> * settings in case the BIOS doesn't restore them properly on</a>
+<a name="ln1959"> * resume.</a>
+<a name="ln1960"> */</a>
+<a name="ln1961">static int</a>
+<a name="ln1962">rl_suspend(device_t dev)</a>
+<a name="ln1963">{</a>
+<a name="ln1964">	struct rl_softc		*sc;</a>
+<a name="ln1965"> </a>
+<a name="ln1966">	sc = device_get_softc(dev);</a>
+<a name="ln1967"> </a>
+<a name="ln1968">	RL_LOCK(sc);</a>
+<a name="ln1969">	rl_stop(sc);</a>
+<a name="ln1970">	rl_setwol(sc);</a>
+<a name="ln1971">	sc-&gt;suspended = 1;</a>
+<a name="ln1972">	RL_UNLOCK(sc);</a>
+<a name="ln1973"> </a>
+<a name="ln1974">	return (0);</a>
+<a name="ln1975">}</a>
+<a name="ln1976"> </a>
+<a name="ln1977">/*</a>
+<a name="ln1978"> * Device resume routine.  Restore some PCI settings in case the BIOS</a>
+<a name="ln1979"> * doesn't, re-enable busmastering, and restart the interface if</a>
+<a name="ln1980"> * appropriate.</a>
+<a name="ln1981"> */</a>
+<a name="ln1982">static int</a>
+<a name="ln1983">rl_resume(device_t dev)</a>
+<a name="ln1984">{</a>
+<a name="ln1985">	struct rl_softc		*sc;</a>
+<a name="ln1986">	struct ifnet		*ifp;</a>
+<a name="ln1987">	int			pmc;</a>
+<a name="ln1988">	uint16_t		pmstat;</a>
+<a name="ln1989"> </a>
+<a name="ln1990">	sc = device_get_softc(dev);</a>
+<a name="ln1991">	ifp = sc-&gt;rl_ifp;</a>
+<a name="ln1992"> </a>
+<a name="ln1993">	RL_LOCK(sc);</a>
+<a name="ln1994"> </a>
+<a name="ln1995">	if ((ifp-&gt;if_capabilities &amp; IFCAP_WOL) != 0 &amp;&amp;</a>
+<a name="ln1996">	    pci_find_cap(sc-&gt;rl_dev, PCIY_PMG, &amp;pmc) == 0) {</a>
+<a name="ln1997">		/* Disable PME and clear PME status. */</a>
+<a name="ln1998">		pmstat = pci_read_config(sc-&gt;rl_dev,</a>
+<a name="ln1999">		    pmc + PCIR_POWER_STATUS, 2);</a>
+<a name="ln2000">		if ((pmstat &amp; PCIM_PSTAT_PMEENABLE) != 0) {</a>
+<a name="ln2001">			pmstat &amp;= ~PCIM_PSTAT_PMEENABLE;</a>
+<a name="ln2002">			pci_write_config(sc-&gt;rl_dev,</a>
+<a name="ln2003">			    pmc + PCIR_POWER_STATUS, pmstat, 2);</a>
+<a name="ln2004">		}</a>
+<a name="ln2005">		/*</a>
+<a name="ln2006">		 * Clear WOL matching such that normal Rx filtering</a>
+<a name="ln2007">		 * wouldn't interfere with WOL patterns.</a>
+<a name="ln2008">		 */</a>
+<a name="ln2009">		rl_clrwol(sc);</a>
+<a name="ln2010">	}</a>
+<a name="ln2011"> </a>
+<a name="ln2012">	/* reinitialize interface if necessary */</a>
+<a name="ln2013">	if (ifp-&gt;if_flags &amp; IFF_UP)</a>
+<a name="ln2014">		rl_init_locked(sc);</a>
+<a name="ln2015"> </a>
+<a name="ln2016">	sc-&gt;suspended = 0;</a>
+<a name="ln2017"> </a>
+<a name="ln2018">	RL_UNLOCK(sc);</a>
+<a name="ln2019"> </a>
+<a name="ln2020">	return (0);</a>
+<a name="ln2021">}</a>
+<a name="ln2022"> </a>
+<a name="ln2023">/*</a>
+<a name="ln2024"> * Stop all chip I/O so that the kernel's probe routines don't</a>
+<a name="ln2025"> * get confused by errant DMAs when rebooting.</a>
+<a name="ln2026"> */</a>
+<a name="ln2027">static int</a>
+<a name="ln2028">rl_shutdown(device_t dev)</a>
+<a name="ln2029">{</a>
+<a name="ln2030">	struct rl_softc		*sc;</a>
+<a name="ln2031"> </a>
+<a name="ln2032">	sc = device_get_softc(dev);</a>
+<a name="ln2033"> </a>
+<a name="ln2034">	RL_LOCK(sc);</a>
+<a name="ln2035">	rl_stop(sc);</a>
+<a name="ln2036">	/*</a>
+<a name="ln2037">	 * Mark interface as down since otherwise we will panic if</a>
+<a name="ln2038">	 * interrupt comes in later on, which can happen in some</a>
+<a name="ln2039">	 * cases.</a>
+<a name="ln2040">	 */</a>
+<a name="ln2041">	sc-&gt;rl_ifp-&gt;if_flags &amp;= ~IFF_UP;</a>
+<a name="ln2042">	rl_setwol(sc);</a>
+<a name="ln2043">	RL_UNLOCK(sc);</a>
+<a name="ln2044"> </a>
+<a name="ln2045">	return (0);</a>
+<a name="ln2046">}</a>
+<a name="ln2047"> </a>
+<a name="ln2048">static void</a>
+<a name="ln2049">rl_setwol(struct rl_softc *sc)</a>
+<a name="ln2050">{</a>
+<a name="ln2051">	struct ifnet		*ifp;</a>
+<a name="ln2052">	int			pmc;</a>
+<a name="ln2053">	uint16_t		pmstat;</a>
+<a name="ln2054">	uint8_t			v;</a>
+<a name="ln2055"> </a>
+<a name="ln2056">	RL_LOCK_ASSERT(sc);</a>
+<a name="ln2057"> </a>
+<a name="ln2058">	ifp = sc-&gt;rl_ifp;</a>
+<a name="ln2059">	if ((ifp-&gt;if_capabilities &amp; IFCAP_WOL) == 0)</a>
+<a name="ln2060">		return;</a>
+<a name="ln2061">	if (pci_find_cap(sc-&gt;rl_dev, PCIY_PMG, &amp;pmc) != 0)</a>
+<a name="ln2062">		return;</a>
+<a name="ln2063"> </a>
+<a name="ln2064">	/* Enable config register write. */</a>
+<a name="ln2065">	CSR_WRITE_1(sc, RL_EECMD, RL_EE_MODE);</a>
+<a name="ln2066"> </a>
+<a name="ln2067">	/* Enable PME. */</a>
+<a name="ln2068">	v = CSR_READ_1(sc, sc-&gt;rl_cfg1);</a>
+<a name="ln2069">	v &amp;= ~RL_CFG1_PME;</a>
+<a name="ln2070">	if ((ifp-&gt;if_capenable &amp; IFCAP_WOL) != 0)</a>
+<a name="ln2071">		v |= RL_CFG1_PME;</a>
+<a name="ln2072">	CSR_WRITE_1(sc, sc-&gt;rl_cfg1, v);</a>
+<a name="ln2073"> </a>
+<a name="ln2074">	v = CSR_READ_1(sc, sc-&gt;rl_cfg3);</a>
+<a name="ln2075">	v &amp;= ~(RL_CFG3_WOL_LINK | RL_CFG3_WOL_MAGIC);</a>
+<a name="ln2076">	if ((ifp-&gt;if_capenable &amp; IFCAP_WOL_MAGIC) != 0)</a>
+<a name="ln2077">		v |= RL_CFG3_WOL_MAGIC;</a>
+<a name="ln2078">	CSR_WRITE_1(sc, sc-&gt;rl_cfg3, v);</a>
+<a name="ln2079"> </a>
+<a name="ln2080">	v = CSR_READ_1(sc, sc-&gt;rl_cfg5);</a>
+<a name="ln2081">	v &amp;= ~(RL_CFG5_WOL_BCAST | RL_CFG5_WOL_MCAST | RL_CFG5_WOL_UCAST);</a>
+<a name="ln2082">	v &amp;= ~RL_CFG5_WOL_LANWAKE;</a>
+<a name="ln2083">	if ((ifp-&gt;if_capenable &amp; IFCAP_WOL_UCAST) != 0)</a>
+<a name="ln2084">		v |= RL_CFG5_WOL_UCAST;</a>
+<a name="ln2085">	if ((ifp-&gt;if_capenable &amp; IFCAP_WOL_MCAST) != 0)</a>
+<a name="ln2086">		v |= RL_CFG5_WOL_MCAST | RL_CFG5_WOL_BCAST;</a>
+<a name="ln2087">	if ((ifp-&gt;if_capenable &amp; IFCAP_WOL) != 0)</a>
+<a name="ln2088">		v |= RL_CFG5_WOL_LANWAKE;</a>
+<a name="ln2089">	CSR_WRITE_1(sc, sc-&gt;rl_cfg5, v);</a>
+<a name="ln2090"> </a>
+<a name="ln2091">	/* Config register write done. */</a>
+<a name="ln2092">	CSR_WRITE_1(sc, RL_EECMD, RL_EEMODE_OFF);</a>
+<a name="ln2093"> </a>
+<a name="ln2094">	/* Request PME if WOL is requested. */</a>
+<a name="ln2095">	pmstat = pci_read_config(sc-&gt;rl_dev, pmc + PCIR_POWER_STATUS, 2);</a>
+<a name="ln2096">	pmstat &amp;= ~(PCIM_PSTAT_PME | PCIM_PSTAT_PMEENABLE);</a>
+<a name="ln2097">	if ((ifp-&gt;if_capenable &amp; IFCAP_WOL) != 0)</a>
+<a name="ln2098">		pmstat |= PCIM_PSTAT_PME | PCIM_PSTAT_PMEENABLE;</a>
+<a name="ln2099">	pci_write_config(sc-&gt;rl_dev, pmc + PCIR_POWER_STATUS, pmstat, 2);</a>
+<a name="ln2100">}</a>
+<a name="ln2101"> </a>
+<a name="ln2102">static void</a>
+<a name="ln2103">rl_clrwol(struct rl_softc *sc)</a>
+<a name="ln2104">{</a>
+<a name="ln2105">	struct ifnet		*ifp;</a>
+<a name="ln2106">	uint8_t			v;</a>
+<a name="ln2107"> </a>
+<a name="ln2108">	ifp = sc-&gt;rl_ifp;</a>
+<a name="ln2109">	if ((ifp-&gt;if_capabilities &amp; IFCAP_WOL) == 0)</a>
+<a name="ln2110">		return;</a>
+<a name="ln2111"> </a>
+<a name="ln2112">	/* Enable config register write. */</a>
+<a name="ln2113">	CSR_WRITE_1(sc, RL_EECMD, RL_EE_MODE);</a>
+<a name="ln2114"> </a>
+<a name="ln2115">	v = CSR_READ_1(sc, sc-&gt;rl_cfg3);</a>
+<a name="ln2116">	v &amp;= ~(RL_CFG3_WOL_LINK | RL_CFG3_WOL_MAGIC);</a>
+<a name="ln2117">	CSR_WRITE_1(sc, sc-&gt;rl_cfg3, v);</a>
+<a name="ln2118"> </a>
+<a name="ln2119">	/* Config register write done. */</a>
+<a name="ln2120">	CSR_WRITE_1(sc, RL_EECMD, RL_EEMODE_OFF);</a>
+<a name="ln2121"> </a>
+<a name="ln2122">	v = CSR_READ_1(sc, sc-&gt;rl_cfg5);</a>
+<a name="ln2123">	v &amp;= ~(RL_CFG5_WOL_BCAST | RL_CFG5_WOL_MCAST | RL_CFG5_WOL_UCAST);</a>
+<a name="ln2124">	v &amp;= ~RL_CFG5_WOL_LANWAKE;</a>
+<a name="ln2125">	CSR_WRITE_1(sc, sc-&gt;rl_cfg5, v);</a>
+<a name="ln2126">}</a>
+
+</code></pre>
+<div class="balloon" rel="1721"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v512/" target="_blank">V512</a> A call of the 'memmove' function will lead to underflow of the buffer 'eaddr'.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

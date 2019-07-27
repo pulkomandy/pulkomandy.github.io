@@ -1,0 +1,963 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>xsi_message_queue.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2008-2011, Haiku, Inc. All rights reserved.</a>
+<a name="ln3"> * Distributed under the terms of the MIT License.</a>
+<a name="ln4"> *</a>
+<a name="ln5"> * Authors:</a>
+<a name="ln6"> *		Salvatore Benedetto &lt;salvatore.benedetto@gmail.com&gt;</a>
+<a name="ln7"> */</a>
+<a name="ln8"> </a>
+<a name="ln9">#include &lt;posix/xsi_message_queue.h&gt;</a>
+<a name="ln10"> </a>
+<a name="ln11">#include &lt;new&gt;</a>
+<a name="ln12"> </a>
+<a name="ln13">#include &lt;sys/ipc.h&gt;</a>
+<a name="ln14">#include &lt;sys/types.h&gt;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &lt;OS.h&gt;</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &lt;kernel.h&gt;</a>
+<a name="ln19">#include &lt;syscall_restart.h&gt;</a>
+<a name="ln20"> </a>
+<a name="ln21">#include &lt;util/atomic.h&gt;</a>
+<a name="ln22">#include &lt;util/AutoLock.h&gt;</a>
+<a name="ln23">#include &lt;util/DoublyLinkedList.h&gt;</a>
+<a name="ln24">#include &lt;util/OpenHashTable.h&gt;</a>
+<a name="ln25"> </a>
+<a name="ln26"> </a>
+<a name="ln27">#define TRACE_XSI_MSG_QUEUE</a>
+<a name="ln28">#ifdef TRACE_XSI_MSG_QUEUE</a>
+<a name="ln29">#	define TRACE(x)			dprintf x</a>
+<a name="ln30">#	define TRACE_ERROR(x)	dprintf x</a>
+<a name="ln31">#else</a>
+<a name="ln32">#	define TRACE(x)			/* nothing */</a>
+<a name="ln33">#	define TRACE_ERROR(x)	dprintf x</a>
+<a name="ln34">#endif</a>
+<a name="ln35"> </a>
+<a name="ln36"> </a>
+<a name="ln37">namespace {</a>
+<a name="ln38"> </a>
+<a name="ln39">// Queue for holding blocked threads</a>
+<a name="ln40">struct queued_thread : DoublyLinkedListLinkImpl&lt;queued_thread&gt; {</a>
+<a name="ln41">	queued_thread(Thread *_thread, int32 _message_length)</a>
+<a name="ln42">		:</a>
+<a name="ln43">		thread(_thread),</a>
+<a name="ln44">		message_length(_message_length),</a>
+<a name="ln45">		queued(false)</a>
+<a name="ln46">	{</a>
+<a name="ln47">	}</a>
+<a name="ln48"> </a>
+<a name="ln49">	Thread	*thread;</a>
+<a name="ln50">	int32	message_length;</a>
+<a name="ln51">	bool	queued;</a>
+<a name="ln52">};</a>
+<a name="ln53"> </a>
+<a name="ln54">typedef DoublyLinkedList&lt;queued_thread&gt; ThreadQueue;</a>
+<a name="ln55"> </a>
+<a name="ln56"> </a>
+<a name="ln57">struct queued_message : DoublyLinkedListLinkImpl&lt;queued_message&gt; {</a>
+<a name="ln58">	queued_message(const void *_message, ssize_t _length)</a>
+<a name="ln59">		:</a>
+<a name="ln60">		initOK(false),</a>
+<a name="ln61">		length(_length)</a>
+<a name="ln62">	{</a>
+<a name="ln63">		message = (char *)malloc(sizeof(char) * _length);</a>
+<a name="ln64">		if (message == NULL)</a>
+<a name="ln65">			return;</a>
+<a name="ln66"> </a>
+<a name="ln67">		if (user_memcpy(&amp;type, _message, sizeof(long)) != B_OK</a>
+<a name="ln68">			|| user_memcpy(message, (void *)((char *)_message + sizeof(long)),</a>
+<a name="ln69">			_length) != B_OK) {</a>
+<a name="ln70">			free(message);</a>
+<a name="ln71">			return;</a>
+<a name="ln72">		}</a>
+<a name="ln73">		initOK = true;</a>
+<a name="ln74">	}</a>
+<a name="ln75"> </a>
+<a name="ln76">	~queued_message()</a>
+<a name="ln77">	{</a>
+<a name="ln78">		if (initOK)</a>
+<a name="ln79">			free(message);</a>
+<a name="ln80">	}</a>
+<a name="ln81"> </a>
+<a name="ln82">	ssize_t copy_to_user_buffer(void *_message, ssize_t _length)</a>
+<a name="ln83">	{</a>
+<a name="ln84">		if (_length &gt; length)</a>
+<a name="ln85">			_length = length;</a>
+<a name="ln86"> </a>
+<a name="ln87">		if (user_memcpy(_message, &amp;type, sizeof(long)) != B_OK</a>
+<a name="ln88">			|| user_memcpy((void *)((char *)_message + sizeof(long)), message,</a>
+<a name="ln89">			_length) != B_OK)</a>
+<a name="ln90">			return B_ERROR;</a>
+<a name="ln91">		return _length;</a>
+<a name="ln92">	}</a>
+<a name="ln93"> </a>
+<a name="ln94">	bool		initOK;</a>
+<a name="ln95">	ssize_t		length;</a>
+<a name="ln96">	char		*message;</a>
+<a name="ln97">	long		type;</a>
+<a name="ln98">};</a>
+<a name="ln99"> </a>
+<a name="ln100">typedef DoublyLinkedList&lt;queued_message&gt; MessageQueue;</a>
+<a name="ln101"> </a>
+<a name="ln102">// Arbitrary limit</a>
+<a name="ln103">#define MAX_BYTES_PER_QUEUE		2048</a>
+<a name="ln104"> </a>
+<a name="ln105">class XsiMessageQueue {</a>
+<a name="ln106">public:</a>
+<a name="ln107">	XsiMessageQueue(int flags)</a>
+<a name="ln108">		:</a>
+<a name="ln109">		fBytesInQueue(0),</a>
+<a name="ln110">		fThreadsWaitingToReceive(0),</a>
+<a name="ln111">		fThreadsWaitingToSend(0)</a>
+<a name="ln112">	{</a>
+<a name="ln113">		mutex_init(&amp;fLock, &quot;XsiMessageQueue private mutex&quot;);</a>
+<a name="ln114">		SetIpcKey((key_t)-1);</a>
+<a name="ln115">		SetPermissions(flags);</a>
+<a name="ln116">		// Initialize all fields to zero</a>
+<a name="ln117">		memset((void *)&amp;fMessageQueue, 0, sizeof(struct msqid_ds));</a>
+<a name="ln118">		fMessageQueue.msg_ctime = (time_t)real_time_clock();</a>
+<a name="ln119">		fMessageQueue.msg_qbytes = MAX_BYTES_PER_QUEUE;</a>
+<a name="ln120">	}</a>
+<a name="ln121"> </a>
+<a name="ln122">	// Implemented after sXsiMessageCount is declared</a>
+<a name="ln123">	~XsiMessageQueue();</a>
+<a name="ln124"> </a>
+<a name="ln125">	status_t BlockAndUnlock(Thread *thread, MutexLocker *queueLocker)</a>
+<a name="ln126">	{</a>
+<a name="ln127">		thread_prepare_to_block(thread, B_CAN_INTERRUPT,</a>
+<a name="ln128">				THREAD_BLOCK_TYPE_OTHER, (void*)&quot;xsi message queue&quot;);</a>
+<a name="ln129">		// Unlock the queue before blocking</a>
+<a name="ln130">		queueLocker-&gt;Unlock();</a>
+<a name="ln131"> </a>
+<a name="ln132">// TODO: We've got a serious race condition: If BlockAndUnlock() returned due to</a>
+<a name="ln133">// interruption, we will still be queued. A WakeUpThread() at this point will</a>
+<a name="ln134">// call thread_unblock() and might thus screw with our trying to re-lock the</a>
+<a name="ln135">// mutex.</a>
+<a name="ln136">		return thread_block();</a>
+<a name="ln137">	}</a>
+<a name="ln138"> </a>
+<a name="ln139">	void DoIpcSet(struct msqid_ds *result)</a>
+<a name="ln140">	{</a>
+<a name="ln141">		fMessageQueue.msg_perm.uid = result-&gt;msg_perm.uid;</a>
+<a name="ln142">		fMessageQueue.msg_perm.gid = result-&gt;msg_perm.gid;</a>
+<a name="ln143">		fMessageQueue.msg_perm.mode = (fMessageQueue.msg_perm.mode &amp; ~0x01ff)</a>
+<a name="ln144">			| (result-&gt;msg_perm.mode &amp; 0x01ff);</a>
+<a name="ln145">		fMessageQueue.msg_qbytes = result-&gt;msg_qbytes;</a>
+<a name="ln146">		fMessageQueue.msg_ctime = (time_t)real_time_clock();</a>
+<a name="ln147">	}</a>
+<a name="ln148"> </a>
+<a name="ln149">	void Deque(queued_thread *queueEntry, bool waitForMessage)</a>
+<a name="ln150">	{</a>
+<a name="ln151">		if (queueEntry-&gt;queued) {</a>
+<a name="ln152">			if (waitForMessage) {</a>
+<a name="ln153">				fWaitingToReceive.Remove(queueEntry);</a>
+<a name="ln154">				fThreadsWaitingToReceive--;</a>
+<a name="ln155">			} else {</a>
+<a name="ln156">				fWaitingToSend.Remove(queueEntry);</a>
+<a name="ln157">				fThreadsWaitingToSend--;</a>
+<a name="ln158">			}</a>
+<a name="ln159">		}</a>
+<a name="ln160">	}</a>
+<a name="ln161"> </a>
+<a name="ln162">	void Enqueue(queued_thread *queueEntry, bool waitForMessage)</a>
+<a name="ln163">	{</a>
+<a name="ln164">		if (waitForMessage) {</a>
+<a name="ln165">			fWaitingToReceive.Add(queueEntry);</a>
+<a name="ln166">			fThreadsWaitingToReceive++;</a>
+<a name="ln167">		} else {</a>
+<a name="ln168">			fWaitingToSend.Add(queueEntry);</a>
+<a name="ln169">			fThreadsWaitingToSend++;</a>
+<a name="ln170">		}</a>
+<a name="ln171">		queueEntry-&gt;queued = true;</a>
+<a name="ln172">	}</a>
+<a name="ln173"> </a>
+<a name="ln174">	struct msqid_ds &amp;GetMessageQueue()</a>
+<a name="ln175">	{</a>
+<a name="ln176">		return fMessageQueue;</a>
+<a name="ln177">	}</a>
+<a name="ln178"> </a>
+<a name="ln179">	bool HasPermission() const</a>
+<a name="ln180">	{</a>
+<a name="ln181">		if ((fMessageQueue.msg_perm.mode &amp; S_IWOTH) != 0)</a>
+<a name="ln182">			return true;</a>
+<a name="ln183"> </a>
+<a name="ln184">		uid_t uid = geteuid();</a>
+<a name="ln185">		if (uid == 0 || (uid == fMessageQueue.msg_perm.uid</a>
+<a name="ln186">			&amp;&amp; (fMessageQueue.msg_perm.mode &amp; S_IWUSR) != 0))</a>
+<a name="ln187">			return true;</a>
+<a name="ln188"> </a>
+<a name="ln189">		gid_t gid = getegid();</a>
+<a name="ln190">		if (gid == fMessageQueue.msg_perm.gid</a>
+<a name="ln191">			&amp;&amp; (fMessageQueue.msg_perm.mode &amp; S_IWGRP) != 0)</a>
+<a name="ln192">			return true;</a>
+<a name="ln193"> </a>
+<a name="ln194">		return false;</a>
+<a name="ln195">	}</a>
+<a name="ln196"> </a>
+<a name="ln197">	bool HasReadPermission() const</a>
+<a name="ln198">	{</a>
+<a name="ln199">		// TODO: fix this</a>
+<a name="ln200">		return HasPermission();</a>
+<a name="ln201">	}</a>
+<a name="ln202"> </a>
+<a name="ln203">	int ID() const</a>
+<a name="ln204">	{</a>
+<a name="ln205">		return fID;</a>
+<a name="ln206">	}</a>
+<a name="ln207"> </a>
+<a name="ln208">	// Implemented after sXsiMessageCount is declared</a>
+<a name="ln209">	bool Insert(queued_message *message);</a>
+<a name="ln210"> </a>
+<a name="ln211">	key_t IpcKey() const</a>
+<a name="ln212">	{</a>
+<a name="ln213">		return fMessageQueue.msg_perm.key;</a>
+<a name="ln214">	}</a>
+<a name="ln215"> </a>
+<a name="ln216">	mutex &amp;Lock()</a>
+<a name="ln217">	{</a>
+<a name="ln218">		return fLock;</a>
+<a name="ln219">	}</a>
+<a name="ln220"> </a>
+<a name="ln221">	msglen_t MaxBytes() const</a>
+<a name="ln222">	{</a>
+<a name="ln223">		return fMessageQueue.msg_qbytes;</a>
+<a name="ln224">	}</a>
+<a name="ln225"> </a>
+<a name="ln226">	// Implemented after sXsiMessageCount is declared</a>
+<a name="ln227">	queued_message *Remove(long typeRequested);</a>
+<a name="ln228"> </a>
+<a name="ln229">	uint32 SequenceNumber() const</a>
+<a name="ln230">	{</a>
+<a name="ln231">		return fSequenceNumber;</a>
+<a name="ln232">	}</a>
+<a name="ln233"> </a>
+<a name="ln234">	// Implemented after sMessageQueueHashTable is declared</a>
+<a name="ln235">	void SetID();</a>
+<a name="ln236"> </a>
+<a name="ln237">	void SetIpcKey(key_t key)</a>
+<a name="ln238">	{</a>
+<a name="ln239">		fMessageQueue.msg_perm.key = key;</a>
+<a name="ln240">	}</a>
+<a name="ln241"> </a>
+<a name="ln242">	void SetPermissions(int flags)</a>
+<a name="ln243">	{</a>
+<a name="ln244">		fMessageQueue.msg_perm.uid = fMessageQueue.msg_perm.cuid = geteuid();</a>
+<a name="ln245">		fMessageQueue.msg_perm.gid = fMessageQueue.msg_perm.cgid = getegid();</a>
+<a name="ln246">		fMessageQueue.msg_perm.mode = (flags &amp; 0x01ff);</a>
+<a name="ln247">	}</a>
+<a name="ln248"> </a>
+<a name="ln249">	void WakeUpThread(bool waitForMessage)</a>
+<a name="ln250">	{</a>
+<a name="ln251">		if (waitForMessage) {</a>
+<a name="ln252">			// Wake up all waiting thread for a message</a>
+<a name="ln253">			// TODO: this can cause starvation for any</a>
+<a name="ln254">			// very-unlucky-and-slow thread</a>
+<a name="ln255">			while (queued_thread *entry = fWaitingToReceive.RemoveHead()) {</a>
+<a name="ln256">				entry-&gt;queued = false;</a>
+<a name="ln257">				fThreadsWaitingToReceive--;</a>
+<a name="ln258">				thread_unblock(entry-&gt;thread, 0);</a>
+<a name="ln259">			}</a>
+<a name="ln260">		} else {</a>
+<a name="ln261">			// Wake up only one thread waiting to send</a>
+<a name="ln262">			if (queued_thread *entry = fWaitingToSend.RemoveHead()) {</a>
+<a name="ln263">				entry-&gt;queued = false;</a>
+<a name="ln264">				fThreadsWaitingToSend--;</a>
+<a name="ln265">				thread_unblock(entry-&gt;thread, 0);</a>
+<a name="ln266">			}</a>
+<a name="ln267">		}</a>
+<a name="ln268">	}</a>
+<a name="ln269"> </a>
+<a name="ln270">	XsiMessageQueue*&amp; Link()</a>
+<a name="ln271">	{</a>
+<a name="ln272">		return fLink;</a>
+<a name="ln273">	}</a>
+<a name="ln274"> </a>
+<a name="ln275">private:</a>
+<a name="ln276">	msglen_t			fBytesInQueue;</a>
+<a name="ln277">	int					fID;</a>
+<a name="ln278">	mutex				fLock;</a>
+<a name="ln279">	MessageQueue		fMessage;</a>
+<a name="ln280">	struct msqid_ds		fMessageQueue;</a>
+<a name="ln281">	uint32				fSequenceNumber;</a>
+<a name="ln282">	uint32				fThreadsWaitingToReceive;</a>
+<a name="ln283">	uint32				fThreadsWaitingToSend;</a>
+<a name="ln284"> </a>
+<a name="ln285">	ThreadQueue			fWaitingToReceive;</a>
+<a name="ln286">	ThreadQueue			fWaitingToSend;</a>
+<a name="ln287"> </a>
+<a name="ln288">	XsiMessageQueue*	fLink;</a>
+<a name="ln289">};</a>
+<a name="ln290"> </a>
+<a name="ln291"> </a>
+<a name="ln292">// Xsi message queue hash table</a>
+<a name="ln293">struct MessageQueueHashTableDefinition {</a>
+<a name="ln294">	typedef int					KeyType;</a>
+<a name="ln295">	typedef XsiMessageQueue		ValueType;</a>
+<a name="ln296"> </a>
+<a name="ln297">	size_t HashKey (const int key) const</a>
+<a name="ln298">	{</a>
+<a name="ln299">		return (size_t)key;</a>
+<a name="ln300">	}</a>
+<a name="ln301"> </a>
+<a name="ln302">	size_t Hash(XsiMessageQueue *variable) const</a>
+<a name="ln303">	{</a>
+<a name="ln304">		return (size_t)variable-&gt;ID();</a>
+<a name="ln305">	}</a>
+<a name="ln306"> </a>
+<a name="ln307">	bool Compare(const int key, XsiMessageQueue *variable) const</a>
+<a name="ln308">	{</a>
+<a name="ln309">		return (int)key == (int)variable-&gt;ID();</a>
+<a name="ln310">	}</a>
+<a name="ln311"> </a>
+<a name="ln312">	XsiMessageQueue*&amp; GetLink(XsiMessageQueue *variable) const</a>
+<a name="ln313">	{</a>
+<a name="ln314">		return variable-&gt;Link();</a>
+<a name="ln315">	}</a>
+<a name="ln316">};</a>
+<a name="ln317"> </a>
+<a name="ln318"> </a>
+<a name="ln319">// IPC class</a>
+<a name="ln320">class Ipc {</a>
+<a name="ln321">public:</a>
+<a name="ln322">	Ipc(key_t key)</a>
+<a name="ln323">		: fKey(key),</a>
+<a name="ln324">		fMessageQueueId(-1)</a>
+<a name="ln325">	{</a>
+<a name="ln326">	}</a>
+<a name="ln327"> </a>
+<a name="ln328">	key_t Key() const</a>
+<a name="ln329">	{</a>
+<a name="ln330">		return fKey;</a>
+<a name="ln331">	}</a>
+<a name="ln332"> </a>
+<a name="ln333">	int MessageQueueID() const</a>
+<a name="ln334">	{</a>
+<a name="ln335">		return fMessageQueueId;</a>
+<a name="ln336">	}</a>
+<a name="ln337"> </a>
+<a name="ln338">	void SetMessageQueueID(XsiMessageQueue *messageQueue)</a>
+<a name="ln339">	{</a>
+<a name="ln340">		fMessageQueueId = messageQueue-&gt;ID();</a>
+<a name="ln341">	}</a>
+<a name="ln342"> </a>
+<a name="ln343">	Ipc*&amp; Link()</a>
+<a name="ln344">	{</a>
+<a name="ln345">		return fLink;</a>
+<a name="ln346">	}</a>
+<a name="ln347"> </a>
+<a name="ln348">private:</a>
+<a name="ln349">	key_t				fKey;</a>
+<a name="ln350">	int					fMessageQueueId;</a>
+<a name="ln351">	Ipc*				fLink;</a>
+<a name="ln352">};</a>
+<a name="ln353"> </a>
+<a name="ln354"> </a>
+<a name="ln355">struct IpcHashTableDefinition {</a>
+<a name="ln356">	typedef key_t	KeyType;</a>
+<a name="ln357">	typedef Ipc		ValueType;</a>
+<a name="ln358"> </a>
+<a name="ln359">	size_t HashKey (const key_t key) const</a>
+<a name="ln360">	{</a>
+<a name="ln361">		return (size_t)(key);</a>
+<a name="ln362">	}</a>
+<a name="ln363"> </a>
+<a name="ln364">	size_t Hash(Ipc *variable) const</a>
+<a name="ln365">	{</a>
+<a name="ln366">		return (size_t)HashKey(variable-&gt;Key());</a>
+<a name="ln367">	}</a>
+<a name="ln368"> </a>
+<a name="ln369">	bool Compare(const key_t key, Ipc *variable) const</a>
+<a name="ln370">	{</a>
+<a name="ln371">		return (key_t)key == (key_t)variable-&gt;Key();</a>
+<a name="ln372">	}</a>
+<a name="ln373"> </a>
+<a name="ln374">	Ipc*&amp; GetLink(Ipc *variable) const</a>
+<a name="ln375">	{</a>
+<a name="ln376">		return variable-&gt;Link();</a>
+<a name="ln377">	}</a>
+<a name="ln378">};</a>
+<a name="ln379"> </a>
+<a name="ln380">} // namespace</a>
+<a name="ln381"> </a>
+<a name="ln382"> </a>
+<a name="ln383">// Arbitrary limits</a>
+<a name="ln384">#define MAX_XSI_MESSAGE			4096</a>
+<a name="ln385">#define MAX_XSI_MESSAGE_QUEUE	1024</a>
+<a name="ln386">static BOpenHashTable&lt;IpcHashTableDefinition&gt; sIpcHashTable;</a>
+<a name="ln387">static BOpenHashTable&lt;MessageQueueHashTableDefinition&gt; sMessageQueueHashTable;</a>
+<a name="ln388"> </a>
+<a name="ln389">static mutex sIpcLock;</a>
+<a name="ln390">static mutex sXsiMessageQueueLock;</a>
+<a name="ln391"> </a>
+<a name="ln392">static uint32 sGlobalSequenceNumber = 1;</a>
+<a name="ln393">static int32 sXsiMessageCount = 0;</a>
+<a name="ln394">static int32 sXsiMessageQueueCount = 0;</a>
+<a name="ln395"> </a>
+<a name="ln396"> </a>
+<a name="ln397">//	#pragma mark -</a>
+<a name="ln398"> </a>
+<a name="ln399"> </a>
+<a name="ln400">XsiMessageQueue::~XsiMessageQueue()</a>
+<a name="ln401">{</a>
+<a name="ln402">	mutex_destroy(&amp;fLock);</a>
+<a name="ln403"> </a>
+<a name="ln404">	// Wake up any threads still waiting</a>
+<a name="ln405">	if (fThreadsWaitingToSend || fThreadsWaitingToReceive) {</a>
+<a name="ln406">		while (queued_thread *entry = fWaitingToReceive.RemoveHead()) {</a>
+<a name="ln407">			entry-&gt;queued = false;</a>
+<a name="ln408">			thread_unblock(entry-&gt;thread, EIDRM);</a>
+<a name="ln409">		}</a>
+<a name="ln410">		while (queued_thread *entry = fWaitingToSend.RemoveHead()) {</a>
+<a name="ln411">			entry-&gt;queued = false;</a>
+<a name="ln412">			thread_unblock(entry-&gt;thread, EIDRM);</a>
+<a name="ln413">		}</a>
+<a name="ln414">	}</a>
+<a name="ln415"> </a>
+<a name="ln416">	// Free up any remaining messages</a>
+<a name="ln417">	if (fMessageQueue.msg_qnum) {</a>
+<a name="ln418">		while (queued_message *message = fMessage.RemoveHead()) {</a>
+<a name="ln419">			atomic_add(&amp;sXsiMessageCount, -1);</a>
+<a name="ln420">			delete message;</a>
+<a name="ln421">		}</a>
+<a name="ln422">	}</a>
+<a name="ln423">}</a>
+<a name="ln424"> </a>
+<a name="ln425"> </a>
+<a name="ln426">bool</a>
+<a name="ln427">XsiMessageQueue::Insert(queued_message *message)</a>
+<a name="ln428">{</a>
+<a name="ln429">	// The only situation that would make us (potentially) wait</a>
+<a name="ln430">	// is that we exceed with bytes or with the total number of messages</a>
+<a name="ln431">	if (fBytesInQueue + message-&gt;length &gt; fMessageQueue.msg_qbytes)</a>
+<a name="ln432">		return true;</a>
+<a name="ln433"> </a>
+<a name="ln434">	while (true) {</a>
+<a name="ln435">		int32 oldCount = atomic_get(&amp;sXsiMessageCount);</a>
+<a name="ln436">		if (oldCount &gt;= MAX_XSI_MESSAGE)</a>
+<a name="ln437">			return true;</a>
+<a name="ln438">		// If another thread updates the counter we keep</a>
+<a name="ln439">		// iterating</a>
+<a name="ln440">		if (atomic_test_and_set(&amp;sXsiMessageCount, oldCount + 1, oldCount)</a>
+<a name="ln441">			== oldCount)</a>
+<a name="ln442">			break;</a>
+<a name="ln443">	}</a>
+<a name="ln444"> </a>
+<a name="ln445">	fMessage.Add(message);</a>
+<a name="ln446">	fMessageQueue.msg_qnum++;</a>
+<a name="ln447">	fMessageQueue.msg_lspid = getpid();</a>
+<a name="ln448">	fMessageQueue.msg_stime = real_time_clock();</a>
+<a name="ln449">	fBytesInQueue += message-&gt;length;</a>
+<a name="ln450">	if (fThreadsWaitingToReceive)</a>
+<a name="ln451">		WakeUpThread(true /* WaitForMessage */);</a>
+<a name="ln452">	return false;</a>
+<a name="ln453">}</a>
+<a name="ln454"> </a>
+<a name="ln455"> </a>
+<a name="ln456">queued_message*</a>
+<a name="ln457">XsiMessageQueue::Remove(long typeRequested)</a>
+<a name="ln458">{</a>
+<a name="ln459">	queued_message *message = NULL;</a>
+<a name="ln460">	if (typeRequested &lt; 0) {</a>
+<a name="ln461">		// Return first message of the lowest type</a>
+<a name="ln462">		// that is less than or equal to the absolute</a>
+<a name="ln463">		// value of type requested.</a>
+<a name="ln464">		MessageQueue::Iterator iterator = fMessage.GetIterator();</a>
+<a name="ln465">		while (iterator.HasNext()) {</a>
+<a name="ln466">			queued_message *current = iterator.Next();</a>
+<a name="ln467">			if (current-&gt;type &lt;= -typeRequested) {</a>
+<a name="ln468">				message = iterator.Remove();</a>
+<a name="ln469">				break;</a>
+<a name="ln470">			}</a>
+<a name="ln471">		}</a>
+<a name="ln472">	} else if (typeRequested == 0) {</a>
+<a name="ln473">		// Return the first message on the queue</a>
+<a name="ln474">		message = fMessage.RemoveHead();</a>
+<a name="ln475">	} else {</a>
+<a name="ln476">		// Return the first message of type requested</a>
+<a name="ln477">		MessageQueue::Iterator iterator = fMessage.GetIterator();</a>
+<a name="ln478">		while (iterator.HasNext()) {</a>
+<a name="ln479">			queued_message *current = iterator.Next();</a>
+<a name="ln480">			if (current-&gt;type == typeRequested) {</a>
+<a name="ln481">				message = iterator.Remove();</a>
+<a name="ln482">				break;</a>
+<a name="ln483">			}</a>
+<a name="ln484">		}</a>
+<a name="ln485">	}</a>
+<a name="ln486"> </a>
+<a name="ln487">	if (message == NULL)</a>
+<a name="ln488">		return NULL;</a>
+<a name="ln489"> </a>
+<a name="ln490">	fMessageQueue.msg_qnum--;</a>
+<a name="ln491">	fMessageQueue.msg_lrpid = getpid();</a>
+<a name="ln492">	fMessageQueue.msg_rtime = real_time_clock();</a>
+<a name="ln493">	fBytesInQueue -= message-&gt;length;</a>
+<a name="ln494">	atomic_add(&amp;sXsiMessageCount, -1);</a>
+<a name="ln495">	if (fThreadsWaitingToSend)</a>
+<a name="ln496">		WakeUpThread(false /* WaitForMessage */);</a>
+<a name="ln497">	return message;</a>
+<a name="ln498">}</a>
+<a name="ln499"> </a>
+<a name="ln500"> </a>
+<a name="ln501">void</a>
+<a name="ln502">XsiMessageQueue::SetID()</a>
+<a name="ln503">{</a>
+<a name="ln504">	fID = real_time_clock();</a>
+<a name="ln505">	// The lock is held before calling us</a>
+<a name="ln506">	while (true) {</a>
+<a name="ln507">		if (sMessageQueueHashTable.Lookup(fID) == NULL)</a>
+<a name="ln508">			break;</a>
+<a name="ln509">		fID++;</a>
+<a name="ln510">	}</a>
+<a name="ln511">	sGlobalSequenceNumber = (sGlobalSequenceNumber + 1) % UINT_MAX;</a>
+<a name="ln512">	fSequenceNumber = sGlobalSequenceNumber;</a>
+<a name="ln513">}</a>
+<a name="ln514"> </a>
+<a name="ln515"> </a>
+<a name="ln516">//	#pragma mark - Kernel exported API</a>
+<a name="ln517"> </a>
+<a name="ln518"> </a>
+<a name="ln519">void</a>
+<a name="ln520">xsi_msg_init()</a>
+<a name="ln521">{</a>
+<a name="ln522">	// Initialize hash tables</a>
+<a name="ln523">	status_t status = sIpcHashTable.Init();</a>
+<a name="ln524">	if (status != B_OK)</a>
+<a name="ln525">		panic(&quot;xsi_msg_init() failed to initialize ipc hash table\n&quot;);</a>
+<a name="ln526">	status =  sMessageQueueHashTable.Init();</a>
+<a name="ln527">	if (status != B_OK)</a>
+<a name="ln528">		panic(&quot;xsi_msg_init() failed to initialize message queue hash table\n&quot;);</a>
+<a name="ln529"> </a>
+<a name="ln530">	mutex_init(&amp;sIpcLock, &quot;global POSIX message queue IPC table&quot;);</a>
+<a name="ln531">	mutex_init(&amp;sXsiMessageQueueLock, &quot;global POSIX xsi message queue table&quot;);</a>
+<a name="ln532">}</a>
+<a name="ln533"> </a>
+<a name="ln534"> </a>
+<a name="ln535">//	#pragma mark - Syscalls</a>
+<a name="ln536"> </a>
+<a name="ln537"> </a>
+<a name="ln538">int</a>
+<a name="ln539">_user_xsi_msgctl(int messageQueueID, int command, struct msqid_ds *buffer)</a>
+<a name="ln540">{</a>
+<a name="ln541">	TRACE((&quot;xsi_msgctl: messageQueueID = %d, command = %d\n&quot;, messageQueueID, command));</a>
+<a name="ln542">	MutexLocker ipcHashLocker(sIpcLock);</a>
+<a name="ln543">	MutexLocker messageQueueHashLocker(sXsiMessageQueueLock);</a>
+<a name="ln544">	XsiMessageQueue *messageQueue = sMessageQueueHashTable.Lookup(messageQueueID);</a>
+<a name="ln545">	if (messageQueue == NULL) {</a>
+<a name="ln546">		TRACE_ERROR((&quot;xsi_msgctl: message queue id %d not valid\n&quot;, messageQueueID));</a>
+<a name="ln547">		return EINVAL;</a>
+<a name="ln548">	}</a>
+<a name="ln549">	if (!IS_USER_ADDRESS(buffer)) {</a>
+<a name="ln550">		TRACE_ERROR((&quot;xsi_msgctl: buffer address is not valid\n&quot;));</a>
+<a name="ln551">		return B_BAD_ADDRESS;</a>
+<a name="ln552">	}</a>
+<a name="ln553"> </a>
+<a name="ln554">	// Lock the message queue itself and release both the ipc hash table lock</a>
+<a name="ln555">	// and the message queue hash table lock _only_ if the command it's not</a>
+<a name="ln556">	// IPC_RMID, this prevents undesidered situation from happening while</a>
+<a name="ln557">	// (hopefully) improving the concurrency.</a>
+<a name="ln558">	MutexLocker messageQueueLocker;</a>
+<a name="ln559">	if (command != IPC_RMID) {</a>
+<a name="ln560">		messageQueueLocker.SetTo(&amp;messageQueue-&gt;Lock(), false);</a>
+<a name="ln561">		messageQueueHashLocker.Unlock();</a>
+<a name="ln562">		ipcHashLocker.Unlock();</a>
+<a name="ln563">	} else</a>
+<a name="ln564">		// Since we are going to delete the message queue object</a>
+<a name="ln565">		// along with its mutex, we can't use a MutexLocker object,</a>
+<a name="ln566">		// as the mutex itself won't exist on function exit</a>
+<a name="ln567">		mutex_lock(&amp;messageQueue-&gt;Lock());</a>
+<a name="ln568"> </a>
+<a name="ln569">	switch (command) {</a>
+<a name="ln570">		case IPC_STAT: {</a>
+<a name="ln571">			if (!messageQueue-&gt;HasReadPermission()) {</a>
+<a name="ln572">				TRACE_ERROR((&quot;xsi_msgctl: calling process has not read &quot;</a>
+<a name="ln573">					&quot;permission on message queue %d, key %d\n&quot;, messageQueueID,</a>
+<a name="ln574">					(int)messageQueue-&gt;IpcKey()));</a>
+<a name="ln575">				return EACCES;</a>
+<a name="ln576">			}</a>
+<a name="ln577">			struct msqid_ds msg = messageQueue-&gt;GetMessageQueue();</a>
+<a name="ln578">			if (user_memcpy(buffer, &amp;msg, sizeof(struct msqid_ds)) &lt; B_OK) {</a>
+<a name="ln579">				TRACE_ERROR((&quot;xsi_msgctl: user_memcpy failed\n&quot;));</a>
+<a name="ln580">				return B_BAD_ADDRESS;</a>
+<a name="ln581">			}</a>
+<a name="ln582">			break;</a>
+<a name="ln583">		}</a>
+<a name="ln584"> </a>
+<a name="ln585">		case IPC_SET: {</a>
+<a name="ln586">			if (!messageQueue-&gt;HasPermission()) {</a>
+<a name="ln587">				TRACE_ERROR((&quot;xsi_msgctl: calling process has not permission &quot;</a>
+<a name="ln588">					&quot;on message queue %d, key %d\n&quot;, messageQueueID,</a>
+<a name="ln589">					(int)messageQueue-&gt;IpcKey()));</a>
+<a name="ln590">				return EPERM;</a>
+<a name="ln591">			}</a>
+<a name="ln592">			struct msqid_ds msg;</a>
+<a name="ln593">			if (user_memcpy(&amp;msg, buffer, sizeof(struct msqid_ds)) &lt; B_OK) {</a>
+<a name="ln594">				TRACE_ERROR((&quot;xsi_msgctl: user_memcpy failed\n&quot;));</a>
+<a name="ln595">				return B_BAD_ADDRESS;</a>
+<a name="ln596">			}</a>
+<a name="ln597">			if (msg.msg_qbytes &gt; messageQueue-&gt;MaxBytes() &amp;&amp; getuid() != 0) {</a>
+<a name="ln598">				TRACE_ERROR((&quot;xsi_msgctl: user does not have permission to &quot;</a>
+<a name="ln599">					&quot;increase the maximum number of bytes allowed on queue\n&quot;));</a>
+<a name="ln600">				return EPERM;</a>
+<a name="ln601">			}</a>
+<a name="ln602">			if (msg.msg_qbytes == 0) {</a>
+<a name="ln603">				TRACE_ERROR((&quot;xsi_msgctl: can't set msg_qbytes to 0!\n&quot;));</a>
+<a name="ln604">				return EINVAL;</a>
+<a name="ln605">			}</a>
+<a name="ln606"> </a>
+<a name="ln607">			messageQueue-&gt;DoIpcSet(&amp;msg);</a>
+<a name="ln608">			break;</a>
+<a name="ln609">		}</a>
+<a name="ln610"> </a>
+<a name="ln611">		case IPC_RMID: {</a>
+<a name="ln612">			// If this was the command, we are still holding the message</a>
+<a name="ln613">			// queue hash table lock along with the ipc one, but not the</a>
+<a name="ln614">			// message queue lock itself. This prevents other process</a>
+<a name="ln615">			// to try and acquire a destroyed mutex</a>
+<a name="ln616">			if (!messageQueue-&gt;HasPermission()) {</a>
+<a name="ln617">				TRACE_ERROR((&quot;xsi_msgctl: calling process has not permission &quot;</a>
+<a name="ln618">					&quot;on message queue %d, key %d\n&quot;, messageQueueID,</a>
+<a name="ln619">					(int)messageQueue-&gt;IpcKey()));</a>
+<a name="ln620">				return EPERM;</a>
+<a name="ln621">			}</a>
+<a name="ln622">			key_t key = messageQueue-&gt;IpcKey();</a>
+<a name="ln623">			Ipc *ipcKey = NULL;</a>
+<a name="ln624">			if (key != -1) {</a>
+<a name="ln625">				ipcKey = sIpcHashTable.Lookup(key);</a>
+<a name="ln626">				sIpcHashTable.Remove(ipcKey);</a>
+<a name="ln627">			}</a>
+<a name="ln628">			sMessageQueueHashTable.Remove(messageQueue);</a>
+<a name="ln629">			// Wake up of any threads waiting on this</a>
+<a name="ln630">			// queue happens in destructor</a>
+<a name="ln631">			if (key != -1)</a>
+<a name="ln632">				delete ipcKey;</a>
+<a name="ln633">			atomic_add(&amp;sXsiMessageQueueCount, -1);</a>
+<a name="ln634"> </a>
+<a name="ln635">			delete messageQueue;</a>
+<a name="ln636">			break;</a>
+<a name="ln637">		}</a>
+<a name="ln638"> </a>
+<a name="ln639">		default:</a>
+<a name="ln640">			TRACE_ERROR((&quot;xsi_semctl: command %d not valid\n&quot;, command));</a>
+<a name="ln641">			return EINVAL;</a>
+<a name="ln642">	}</a>
+<a name="ln643"> </a>
+<a name="ln644">	return B_OK;</a>
+<a name="ln645">}</a>
+<a name="ln646"> </a>
+<a name="ln647"> </a>
+<a name="ln648">int</a>
+<a name="ln649">_user_xsi_msgget(key_t key, int flags)</a>
+<a name="ln650">{</a>
+<a name="ln651">	TRACE((&quot;xsi_msgget: key = %d, flags = %d\n&quot;, (int)key, flags));</a>
+<a name="ln652">	XsiMessageQueue *messageQueue = NULL;</a>
+<a name="ln653">	Ipc *ipcKey = NULL;</a>
+<a name="ln654">	// Default assumptions</a>
+<a name="ln655">	bool isPrivate = true;</a>
+<a name="ln656">	bool create = true;</a>
+<a name="ln657"> </a>
+<a name="ln658">	if (key != IPC_PRIVATE) {</a>
+<a name="ln659">		isPrivate = false;</a>
+<a name="ln660">		// Check if key already exist, if it does it already has a message</a>
+<a name="ln661">		// queue associated with it</a>
+<a name="ln662">		ipcKey = sIpcHashTable.Lookup(key);</a>
+<a name="ln663">		if (ipcKey == NULL) {</a>
+<a name="ln664">			if (!(flags &amp; IPC_CREAT)) {</a>
+<a name="ln665">				TRACE_ERROR((&quot;xsi_msgget: key %d does not exist, but the &quot;</a>
+<a name="ln666">					&quot;caller did not ask for creation\n&quot;, (int)key));</a>
+<a name="ln667">				return ENOENT;</a>
+<a name="ln668">			}</a>
+<a name="ln669">			ipcKey = new(std::nothrow) Ipc(key);</a>
+<a name="ln670">			if (ipcKey == NULL) {</a>
+<a name="ln671">				TRACE_ERROR((&quot;xsi_msgget: failed to create new Ipc object &quot;</a>
+<a name="ln672">					&quot;for key %d\n&quot;, (int)key));</a>
+<a name="ln673">				return ENOMEM;</a>
+<a name="ln674">			}</a>
+<a name="ln675">			sIpcHashTable.Insert(ipcKey);</a>
+<a name="ln676">		} else {</a>
+<a name="ln677">			// The IPC key exist and it already has a message queue</a>
+<a name="ln678">			if ((flags &amp; IPC_CREAT) &amp;&amp; (flags &amp; IPC_EXCL)) {</a>
+<a name="ln679">				TRACE_ERROR((&quot;xsi_msgget: key %d already exist\n&quot;, (int)key));</a>
+<a name="ln680">				return EEXIST;</a>
+<a name="ln681">			}</a>
+<a name="ln682">			int messageQueueID = ipcKey-&gt;MessageQueueID();</a>
+<a name="ln683"> </a>
+<a name="ln684">			MutexLocker _(sXsiMessageQueueLock);</a>
+<a name="ln685">			messageQueue = sMessageQueueHashTable.Lookup(messageQueueID);</a>
+<a name="ln686">			if (!messageQueue-&gt;HasPermission()) {</a>
+<a name="ln687">				TRACE_ERROR((&quot;xsi_msgget: calling process has not permission &quot;</a>
+<a name="ln688">					&quot;on message queue %d, key %d\n&quot;, messageQueue-&gt;ID(),</a>
+<a name="ln689">					(int)key));</a>
+<a name="ln690">				return EACCES;</a>
+<a name="ln691">			}</a>
+<a name="ln692">			create = false;</a>
+<a name="ln693">		}</a>
+<a name="ln694">	}</a>
+<a name="ln695"> </a>
+<a name="ln696">	if (create) {</a>
+<a name="ln697">		// Create a new message queue for this key</a>
+<a name="ln698">		if (atomic_get(&amp;sXsiMessageQueueCount) &gt;= MAX_XSI_MESSAGE_QUEUE) {</a>
+<a name="ln699">			TRACE_ERROR((&quot;xsi_msgget: reached limit of maximun number of &quot;</a>
+<a name="ln700">				&quot;message queues\n&quot;));</a>
+<a name="ln701">			return ENOSPC;</a>
+<a name="ln702">		}</a>
+<a name="ln703"> </a>
+<a name="ln704">		messageQueue = new(std::nothrow) XsiMessageQueue(flags);</a>
+<a name="ln705">		if (messageQueue == NULL) {</a>
+<a name="ln706">			TRACE_ERROR((&quot;xsi_msgget: failed to allocate new xsi &quot;</a>
+<a name="ln707">				&quot;message queue\n&quot;));</a>
+<a name="ln708">			return ENOMEM;</a>
+<a name="ln709">		}</a>
+<a name="ln710">		atomic_add(&amp;sXsiMessageQueueCount, 1);</a>
+<a name="ln711"> </a>
+<a name="ln712">		MutexLocker _(sXsiMessageQueueLock);</a>
+<a name="ln713">		messageQueue-&gt;SetID();</a>
+<a name="ln714">		if (isPrivate)</a>
+<a name="ln715">			messageQueue-&gt;SetIpcKey((key_t)-1);</a>
+<a name="ln716">		else {</a>
+<a name="ln717">			messageQueue-&gt;SetIpcKey(key);</a>
+<a name="ln718">			ipcKey-&gt;SetMessageQueueID(messageQueue);</a>
+<a name="ln719">		}</a>
+<a name="ln720">		sMessageQueueHashTable.Insert(messageQueue);</a>
+<a name="ln721">	}</a>
+<a name="ln722"> </a>
+<a name="ln723">	return messageQueue-&gt;ID();</a>
+<a name="ln724">}</a>
+<a name="ln725"> </a>
+<a name="ln726"> </a>
+<a name="ln727">ssize_t</a>
+<a name="ln728">_user_xsi_msgrcv(int messageQueueID, void *messagePointer,</a>
+<a name="ln729">	size_t messageSize, long messageType, int messageFlags)</a>
+<a name="ln730">{</a>
+<a name="ln731">	TRACE((&quot;xsi_msgrcv: messageQueueID = %d, messageSize = %ld\n&quot;,</a>
+<a name="ln732">		messageQueueID, messageSize));</a>
+<a name="ln733">	MutexLocker messageQueueHashLocker(sXsiMessageQueueLock);</a>
+<a name="ln734">	XsiMessageQueue *messageQueue = sMessageQueueHashTable.Lookup(messageQueueID);</a>
+<a name="ln735">	if (messageQueue == NULL) {</a>
+<a name="ln736">		TRACE_ERROR((&quot;xsi_msgrcv: message queue id %d not valid\n&quot;,</a>
+<a name="ln737">			messageQueueID));</a>
+<a name="ln738">		return EINVAL;</a>
+<a name="ln739">	}</a>
+<a name="ln740">	MutexLocker messageQueueLocker(messageQueue-&gt;Lock());</a>
+<a name="ln741">	messageQueueHashLocker.Unlock();</a>
+<a name="ln742"> </a>
+<a name="ln743">	if (messageSize &gt; MAX_BYTES_PER_QUEUE) {</a>
+<a name="ln744">		TRACE_ERROR((&quot;xsi_msgrcv: message size is out of range\n&quot;));</a>
+<a name="ln745">		return EINVAL;</a>
+<a name="ln746">	}</a>
+<a name="ln747">	if (!messageQueue-&gt;HasPermission()) {</a>
+<a name="ln748">		TRACE_ERROR((&quot;xsi_msgrcv: calling process has not permission &quot;</a>
+<a name="ln749">			&quot;on message queue id %d, key %d\n&quot;, messageQueueID,</a>
+<a name="ln750">			(int)messageQueue-&gt;IpcKey()));</a>
+<a name="ln751">		return EACCES;</a>
+<a name="ln752">	}</a>
+<a name="ln753">	if (!IS_USER_ADDRESS(messagePointer)) {</a>
+<a name="ln754">		TRACE_ERROR((&quot;xsi_msgrcv: message address is not valid\n&quot;));</a>
+<a name="ln755">		return B_BAD_ADDRESS;</a>
+<a name="ln756">	}</a>
+<a name="ln757"> </a>
+<a name="ln758">	queued_message *message = NULL;</a>
+<a name="ln759">	while (true) {</a>
+<a name="ln760">		message = messageQueue-&gt;Remove(messageType);</a>
+<a name="ln761"> </a>
+<a name="ln762">		if (message == NULL &amp;&amp; !(messageFlags &amp; IPC_NOWAIT)) {</a>
+<a name="ln763">			// We are going to sleep</a>
+<a name="ln764">			Thread *thread = thread_get_current_thread();</a>
+<a name="ln765">			queued_thread queueEntry(thread, messageSize);</a>
+<a name="ln766">			messageQueue-&gt;Enqueue(&amp;queueEntry, /* waitForMessage */ true);</a>
+<a name="ln767"> </a>
+<a name="ln768">			uint32 sequenceNumber = messageQueue-&gt;SequenceNumber();</a>
+<a name="ln769"> </a>
+<a name="ln770">			TRACE((&quot;xsi_msgrcv: thread %d going to sleep\n&quot;, (int)thread-&gt;id));</a>
+<a name="ln771">			status_t result</a>
+<a name="ln772">				= messageQueue-&gt;BlockAndUnlock(thread, &amp;messageQueueLocker);</a>
+<a name="ln773">			TRACE((&quot;xsi_msgrcv: thread %d back to life\n&quot;, (int)thread-&gt;id));</a>
+<a name="ln774"> </a>
+<a name="ln775">			messageQueueHashLocker.Lock();</a>
+<a name="ln776">			messageQueue = sMessageQueueHashTable.Lookup(messageQueueID);</a>
+<a name="ln777">			if (result == EIDRM || messageQueue == NULL || (messageQueue != NULL</a>
+<a name="ln778">				&amp;&amp; sequenceNumber != messageQueue-&gt;SequenceNumber())) {</a>
+<a name="ln779">				TRACE_ERROR((&quot;xsi_msgrcv: message queue id %d (sequence = &quot;</a>
+<a name="ln780">					&quot;%&quot; B_PRIu32 &quot;) got destroyed\n&quot;, messageQueueID,</a>
+<a name="ln781">					sequenceNumber));</a>
+<a name="ln782">				return EIDRM;</a>
+<a name="ln783">			} else if (result == B_INTERRUPTED) {</a>
+<a name="ln784">				TRACE_ERROR((&quot;xsi_msgrcv: thread %d got interrupted while &quot;</a>
+<a name="ln785">					&quot;waiting on message queue %d\n&quot;,(int)thread-&gt;id,</a>
+<a name="ln786">					messageQueueID));</a>
+<a name="ln787">				messageQueue-&gt;Deque(&amp;queueEntry, /* waitForMessage */ true);</a>
+<a name="ln788">				return EINTR;</a>
+<a name="ln789">			} else {</a>
+<a name="ln790">				messageQueueLocker.Lock();</a>
+<a name="ln791">				messageQueueHashLocker.Unlock();</a>
+<a name="ln792">			}</a>
+<a name="ln793">		} else if (message == NULL) {</a>
+<a name="ln794">			// There is not message of type requested and</a>
+<a name="ln795">			// we can't wait</a>
+<a name="ln796">			return ENOMSG;</a>
+<a name="ln797">		} else {</a>
+<a name="ln798">			// Message received correctly (so far)</a>
+<a name="ln799">			if ((ssize_t)messageSize &lt; message-&gt;length</a>
+<a name="ln800">				&amp;&amp; !(messageFlags &amp; MSG_NOERROR)) {</a>
+<a name="ln801">				TRACE_ERROR((&quot;xsi_msgrcv: message too big!\n&quot;));</a>
+<a name="ln802">				// Put the message back inside. Since we hold the</a>
+<a name="ln803">				// queue message lock, not one else could have filled</a>
+<a name="ln804">				// up the queue meanwhile</a>
+<a name="ln805">				messageQueue-&gt;Insert(message);</a>
+<a name="ln806">				return E2BIG;</a>
+<a name="ln807">			}</a>
+<a name="ln808"> </a>
+<a name="ln809">			ssize_t result</a>
+<a name="ln810">				= message-&gt;copy_to_user_buffer(messagePointer, messageSize);</a>
+<a name="ln811">			if (result &lt; 0) {</a>
+<a name="ln812">				messageQueue-&gt;Insert(message);</a>
+<a name="ln813">				return B_BAD_ADDRESS;</a>
+<a name="ln814">			}</a>
+<a name="ln815"> </a>
+<a name="ln816">			delete message;</a>
+<a name="ln817">			TRACE((&quot;xsi_msgrcv: message received correctly\n&quot;));</a>
+<a name="ln818">			return result;</a>
+<a name="ln819">		}</a>
+<a name="ln820">	}</a>
+<a name="ln821"> </a>
+<a name="ln822">	return B_OK;</a>
+<a name="ln823">}</a>
+<a name="ln824"> </a>
+<a name="ln825"> </a>
+<a name="ln826">int</a>
+<a name="ln827">_user_xsi_msgsnd(int messageQueueID, const void *messagePointer,</a>
+<a name="ln828">	size_t messageSize, int messageFlags)</a>
+<a name="ln829">{</a>
+<a name="ln830">	TRACE((&quot;xsi_msgsnd: messageQueueID = %d, messageSize = %ld\n&quot;,</a>
+<a name="ln831">		messageQueueID, messageSize));</a>
+<a name="ln832">	MutexLocker messageQueueHashLocker(sXsiMessageQueueLock);</a>
+<a name="ln833">	XsiMessageQueue *messageQueue = sMessageQueueHashTable.Lookup(messageQueueID);</a>
+<a name="ln834">	if (messageQueue == NULL) {</a>
+<a name="ln835">		TRACE_ERROR((&quot;xsi_msgsnd: message queue id %d not valid\n&quot;,</a>
+<a name="ln836">			messageQueueID));</a>
+<a name="ln837">		return EINVAL;</a>
+<a name="ln838">	}</a>
+<a name="ln839">	MutexLocker messageQueueLocker(messageQueue-&gt;Lock());</a>
+<a name="ln840">	messageQueueHashLocker.Unlock();</a>
+<a name="ln841"> </a>
+<a name="ln842">	if (messageSize &gt; MAX_BYTES_PER_QUEUE) {</a>
+<a name="ln843">		TRACE_ERROR((&quot;xsi_msgsnd: message size is out of range\n&quot;));</a>
+<a name="ln844">		return EINVAL;</a>
+<a name="ln845">	}</a>
+<a name="ln846">	if (!messageQueue-&gt;HasPermission()) {</a>
+<a name="ln847">		TRACE_ERROR((&quot;xsi_msgsnd: calling process has not permission &quot;</a>
+<a name="ln848">			&quot;on message queue id %d, key %d\n&quot;, messageQueueID,</a>
+<a name="ln849">			(int)messageQueue-&gt;IpcKey()));</a>
+<a name="ln850">		return EACCES;</a>
+<a name="ln851">	}</a>
+<a name="ln852">	if (!IS_USER_ADDRESS(messagePointer)) {</a>
+<a name="ln853">		TRACE_ERROR((&quot;xsi_msgsnd: message address is not valid\n&quot;));</a>
+<a name="ln854">		return B_BAD_ADDRESS;</a>
+<a name="ln855">	}</a>
+<a name="ln856"> </a>
+<a name="ln857">	queued_message *message</a>
+<a name="ln858">		= new(std::nothrow) queued_message(messagePointer, messageSize);</a>
+<a name="ln859">	if (message == NULL || message-&gt;initOK != true) {</a>
+<a name="ln860">		TRACE_ERROR((&quot;xsi_msgsnd: failed to create new message to queue\n&quot;));</a>
+<a name="ln861">		delete message;</a>
+<a name="ln862">		return ENOMEM;</a>
+<a name="ln863">	}</a>
+<a name="ln864"> </a>
+<a name="ln865">	bool notSent = true;</a>
+<a name="ln866">	status_t result = B_OK;</a>
+<a name="ln867">	while (notSent) {</a>
+<a name="ln868">		bool goToSleep = messageQueue-&gt;Insert(message);</a>
+<a name="ln869"> </a>
+<a name="ln870">		if (goToSleep &amp;&amp; !(messageFlags &amp; IPC_NOWAIT)) {</a>
+<a name="ln871">			// We are going to sleep</a>
+<a name="ln872">			Thread *thread = thread_get_current_thread();</a>
+<a name="ln873">			queued_thread queueEntry(thread, messageSize);</a>
+<a name="ln874">			messageQueue-&gt;Enqueue(&amp;queueEntry, /* waitForMessage */ false);</a>
+<a name="ln875"> </a>
+<a name="ln876">			uint32 sequenceNumber = messageQueue-&gt;SequenceNumber();</a>
+<a name="ln877"> </a>
+<a name="ln878">			TRACE((&quot;xsi_msgsnd: thread %d going to sleep\n&quot;, (int)thread-&gt;id));</a>
+<a name="ln879">			result = messageQueue-&gt;BlockAndUnlock(thread, &amp;messageQueueLocker);</a>
+<a name="ln880">			TRACE((&quot;xsi_msgsnd: thread %d back to life\n&quot;, (int)thread-&gt;id));</a>
+<a name="ln881"> </a>
+<a name="ln882">			messageQueueHashLocker.Lock();</a>
+<a name="ln883">			messageQueue = sMessageQueueHashTable.Lookup(messageQueueID);</a>
+<a name="ln884">			if (result == EIDRM || messageQueue == NULL || (messageQueue != NULL</a>
+<a name="ln885">				&amp;&amp; sequenceNumber != messageQueue-&gt;SequenceNumber())) {</a>
+<a name="ln886">				TRACE_ERROR((&quot;xsi_msgsnd: message queue id %d (sequence = &quot;</a>
+<a name="ln887">					&quot;%&quot; B_PRIu32 &quot;) got destroyed\n&quot;, messageQueueID,</a>
+<a name="ln888">					sequenceNumber));</a>
+<a name="ln889">				delete message;</a>
+<a name="ln890">				notSent = false;</a>
+<a name="ln891">				result = EIDRM;</a>
+<a name="ln892">			} else if (result == B_INTERRUPTED) {</a>
+<a name="ln893">				TRACE_ERROR((&quot;xsi_msgsnd: thread %d got interrupted while &quot;</a>
+<a name="ln894">					&quot;waiting on message queue %d\n&quot;,(int)thread-&gt;id,</a>
+<a name="ln895">					messageQueueID));</a>
+<a name="ln896">				messageQueue-&gt;Deque(&amp;queueEntry, /* waitForMessage */ false);</a>
+<a name="ln897">				delete message;</a>
+<a name="ln898">				notSent = false;</a>
+<a name="ln899">				result = EINTR;</a>
+<a name="ln900">			} else {</a>
+<a name="ln901">				messageQueueLocker.Lock();</a>
+<a name="ln902">				messageQueueHashLocker.Unlock();</a>
+<a name="ln903">			}</a>
+<a name="ln904">		} else if (goToSleep) {</a>
+<a name="ln905">			// We did not send the message and we can't wait</a>
+<a name="ln906">			delete message;</a>
+<a name="ln907">			notSent = false;</a>
+<a name="ln908">			result = EAGAIN;</a>
+<a name="ln909">		} else {</a>
+<a name="ln910">			// Message delivered correctly</a>
+<a name="ln911">			TRACE((&quot;xsi_msgsnd: message sent correctly\n&quot;));</a>
+<a name="ln912">			notSent = false;</a>
+<a name="ln913">		}</a>
+<a name="ln914">	}</a>
+<a name="ln915"> </a>
+<a name="ln916">	return result;</a>
+<a name="ln917">}</a>
+
+</code></pre>
+<div class="balloon" rel="322"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fLink.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

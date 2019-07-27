@@ -1,0 +1,617 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>SetDisplayMode.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2">	Copyright (c) 2002-2004, Thomas Kurschel</a>
+<a name="ln3">	</a>
+<a name="ln4"> </a>
+<a name="ln5">	Part of Radeon accelerant</a>
+<a name="ln6">		</a>
+<a name="ln7">	Sets display modes, colour palette and handles DPMS</a>
+<a name="ln8">*/</a>
+<a name="ln9"> </a>
+<a name="ln10"> </a>
+<a name="ln11">#include &quot;GlobalData.h&quot;</a>
+<a name="ln12">#include &quot;generic.h&quot;</a>
+<a name="ln13">#include &lt;sys/ioctl.h&gt;</a>
+<a name="ln14">#include &quot;radeon_regs.h&quot;</a>
+<a name="ln15">#include &quot;mmio.h&quot;</a>
+<a name="ln16">#include &quot;crtc_regs.h&quot;</a>
+<a name="ln17">#include &lt;GraphicsDefs.h&gt;</a>
+<a name="ln18"> </a>
+<a name="ln19">#include &quot;crtc_regs.h&quot;</a>
+<a name="ln20">#include &quot;overlay_regs.h&quot;</a>
+<a name="ln21">#include &quot;rbbm_regs.h&quot;</a>
+<a name="ln22">#include &quot;dac_regs.h&quot;</a>
+<a name="ln23">#include &quot;fp_regs.h&quot;</a>
+<a name="ln24">#include &quot;gpiopad_regs.h&quot;</a>
+<a name="ln25"> </a>
+<a name="ln26">#include &quot;pll_regs.h&quot;</a>
+<a name="ln27">#include &quot;tv_out_regs.h&quot;</a>
+<a name="ln28">#include &quot;config_regs.h&quot;</a>
+<a name="ln29">#include &quot;ddc_regs.h&quot;</a>
+<a name="ln30">#include &quot;pll_access.h&quot;</a>
+<a name="ln31">#include &quot;theatre_regs.h&quot;</a>
+<a name="ln32">#include &quot;set_mode.h&quot;</a>
+<a name="ln33">#include &quot;ddc.h&quot;</a>
+<a name="ln34"> </a>
+<a name="ln35">#include &quot;set_mode.h&quot;</a>
+<a name="ln36"> </a>
+<a name="ln37">#include &lt;string.h&gt;</a>
+<a name="ln38"> </a>
+<a name="ln39">status_t Radeon_SetMode( </a>
+<a name="ln40">	accelerator_info *ai, crtc_info *crtc, display_mode *mode, impactv_params *tv_params );</a>
+<a name="ln41"> </a>
+<a name="ln42">// round virtual width up to next valid size</a>
+<a name="ln43">uint32 Radeon_RoundVWidth( </a>
+<a name="ln44">	int virtual_width, int bpp )</a>
+<a name="ln45">{</a>
+<a name="ln46">	// we have to make both the CRTC and the accelerator happy:</a>
+<a name="ln47">	// - the CRTC wants virtual width in pixels to be a multiple of 8</a>
+<a name="ln48">	// - the accelerator expects width in bytes to be a multiple of 64</a>
+<a name="ln49"> </a>
+<a name="ln50">	// to put that together, width (in bytes) must be a multiple of the least </a>
+<a name="ln51">	// common nominator of bytes-per-pixel*8 (CRTC) and 64 (accelerator);</a>
+<a name="ln52">	</a>
+<a name="ln53">	// if bytes-per-pixel is a power of two and less than 8, the LCM is 64;</a>
+<a name="ln54">	// almost all colour depth satisfy that apart from 24 bit; in this case,</a>
+<a name="ln55">	// the LCM is 64*3=192</a>
+<a name="ln56">	</a>
+<a name="ln57">	// after dividing by bytes-per-pixel we get pixels: in first case,</a>
+<a name="ln58">	// width must be multiple of 64/bytes-per-pixel; in second case,</a>
+<a name="ln59">	// width must be multiple of 64*3/3=64</a>
+<a name="ln60">	</a>
+<a name="ln61">	if( bpp != 3 )</a>
+<a name="ln62">		return (virtual_width + 64/bpp - 1) &amp; ~(64/bpp - 1);</a>
+<a name="ln63">	else</a>
+<a name="ln64">		return (virtual_width + 63) &amp; ~63;</a>
+<a name="ln65">}</a>
+<a name="ln66"> </a>
+<a name="ln67"> </a>
+<a name="ln68">// list of registers that must be reset before display mode switch</a>
+<a name="ln69">// to avoid interferences</a>
+<a name="ln70">static struct {</a>
+<a name="ln71">	uint16 reg;</a>
+<a name="ln72">	uint32 val;</a>
+<a name="ln73">} common_regs[] = {</a>
+<a name="ln74">	{ RADEON_OVR_CLR, 0 },	</a>
+<a name="ln75">	{ RADEON_OVR_WID_LEFT_RIGHT, 0 },</a>
+<a name="ln76">	{ RADEON_OVR_WID_TOP_BOTTOM, 0 },</a>
+<a name="ln77">	{ RADEON_OV0_SCALE_CNTL, 0 },		// disable overlay</a>
+<a name="ln78">	{ RADEON_SUBPIC_CNTL, 0 },</a>
+<a name="ln79">	{ RADEON_I2C_CNTL_1, 0 },</a>
+<a name="ln80">};</a>
+<a name="ln81"> </a>
+<a name="ln82"> </a>
+<a name="ln83">static void Radeon_InitCommonRegs( </a>
+<a name="ln84">	accelerator_info *ai )</a>
+<a name="ln85">{</a>
+<a name="ln86">	vuint8 *regs = ai-&gt;regs;</a>
+<a name="ln87">	uint i;</a>
+<a name="ln88">	</a>
+<a name="ln89">	for( i = 0; i &lt; sizeof( common_regs) / sizeof( common_regs[0] ); ++i )</a>
+<a name="ln90">		OUTREG( regs, common_regs[i].reg, common_regs[i].val );</a>
+<a name="ln91">		</a>
+<a name="ln92">	// enable extended display modes</a>
+<a name="ln93">	OUTREGP( regs, RADEON_CRTC_GEN_CNTL, </a>
+<a name="ln94">		RADEON_CRTC_EXT_DISP_EN, ~RADEON_CRTC_EXT_DISP_EN );</a>
+<a name="ln95">		</a>
+<a name="ln96">	// disable flat panel auto-centering </a>
+<a name="ln97">	// (if we have a CRT on CRTC1, this must be disabled;</a>
+<a name="ln98">	//  if we have a flat panel on CRTC1, we setup CRTC manually, not</a>
+<a name="ln99">	//  using the auto-centre, automatic-sync-override magic)</a>
+<a name="ln100">	OUTREG( regs, RADEON_CRTC_MORE_CNTL, 0 );</a>
+<a name="ln101">}</a>
+<a name="ln102"> </a>
+<a name="ln103"> </a>
+<a name="ln104">// set display mode of one head;</a>
+<a name="ln105">// port restrictions, like fixed-sync TFTs connected to it, are taken care of</a>
+<a name="ln106">status_t Radeon_SetMode( </a>
+<a name="ln107">	accelerator_info *ai, crtc_info *crtc, display_mode *mode, impactv_params *tv_params )</a>
+<a name="ln108">{</a>
+<a name="ln109">	virtual_card *vc = ai-&gt;vc;</a>
+<a name="ln110">	shared_info *si = ai-&gt;si;</a>
+<a name="ln111">	vuint8 *regs = ai-&gt;regs;</a>
+<a name="ln112">	int    format;</a>
+<a name="ln113">	int    bpp;</a>
+<a name="ln114">	display_device_e disp_devices;</a>
+<a name="ln115">	fp_info *fp_info;</a>
+<a name="ln116">	</a>
+<a name="ln117">	crtc_regs		crtc_values;</a>
+<a name="ln118">	pll_regs		pll_values;</a>
+<a name="ln119">	fp_regs			fp_values;</a>
+<a name="ln120">	impactv_regs	impactv_values;</a>
+<a name="ln121">	uint32			surface_cntl;</a>
+<a name="ln122">	</a>
+<a name="ln123">	bool internal_tv_encoder;</a>
+<a name="ln124">	pll_dividers dividers;</a>
+<a name="ln125">	</a>
+<a name="ln126">	crtc-&gt;mode = *mode;</a>
+<a name="ln127">	</a>
+<a name="ln128">	// don't destroy passed values, use our copy instead</a>
+<a name="ln129">	mode = &amp;crtc-&gt;mode;</a>
+<a name="ln130">	</a>
+<a name="ln131">	disp_devices = crtc-&gt;chosen_displays;</a>
+<a name="ln132">	fp_info = &amp;si-&gt;flatpanels[crtc-&gt;flatpanel_port];</a>
+<a name="ln133">	</a>
+<a name="ln134">	// if using an flat panel or LCD, maximum resolution</a>
+<a name="ln135">	// is determined by the physical resolution; </a>
+<a name="ln136">	// also, all timing is fixed</a>
+<a name="ln137">	if( (disp_devices &amp; (dd_lvds | dd_dvi | dd_dvi_ext)) != 0 ) {</a>
+<a name="ln138">		SHOW_FLOW0( 0, &quot;requested resolution higher than native panel&quot; );</a>
+<a name="ln139">		if( mode-&gt;timing.h_display &gt; fp_info-&gt;panel_xres )</a>
+<a name="ln140">			mode-&gt;timing.h_display = fp_info-&gt;panel_xres;</a>
+<a name="ln141">		if(	mode-&gt;timing.v_display &gt; fp_info-&gt;panel_yres )</a>
+<a name="ln142">			mode-&gt;timing.v_display = fp_info-&gt;panel_yres;</a>
+<a name="ln143">		</a>
+<a name="ln144">		if( (disp_devices &amp; dd_dvi_ext) != 0 ) {</a>
+<a name="ln145">			SHOW_FLOW0( 0, &quot;requested resolution less than second native panel&quot; );</a>
+<a name="ln146">			if( mode-&gt;timing.h_display &lt; fp_info-&gt;panel_xres )</a>
+<a name="ln147">				mode-&gt;timing.h_display = fp_info-&gt;panel_xres;</a>
+<a name="ln148">			if(	mode-&gt;timing.v_display &lt; fp_info-&gt;panel_yres )</a>
+<a name="ln149">				mode-&gt;timing.v_display = fp_info-&gt;panel_yres;</a>
+<a name="ln150"> </a>
+<a name="ln151">			//TODO at this point we know we are going to do centered timing</a>
+<a name="ln152">			//need to set flags to a. blank the unused memory, b.center screen</a>
+<a name="ln153">			//for now it's in the top corner, and surrounded by garbage.</a>
+<a name="ln154">			// although if the DVI panels are the same size and we are cloning</a>
+<a name="ln155">			// we can switch the FP2 source to RMX, and drive both screens from</a>
+<a name="ln156">			// the RMX unit.</a>
+<a name="ln157">		}</a>
+<a name="ln158">		mode-&gt;timing.h_total = mode-&gt;timing.h_display + fp_info-&gt;h_blank;</a>
+<a name="ln159">		mode-&gt;timing.h_sync_start = mode-&gt;timing.h_display + fp_info-&gt;h_over_plus;</a>
+<a name="ln160">		mode-&gt;timing.h_sync_end = mode-&gt;timing.h_sync_start + fp_info-&gt;h_sync_width;</a>
+<a name="ln161">		mode-&gt;timing.v_total = mode-&gt;timing.v_display + fp_info-&gt;v_blank;</a>
+<a name="ln162">		mode-&gt;timing.v_sync_start = mode-&gt;timing.v_display + fp_info-&gt;v_over_plus;</a>
+<a name="ln163">		mode-&gt;timing.v_sync_end = mode-&gt;timing.v_sync_start + fp_info-&gt;v_sync_width;</a>
+<a name="ln164">		</a>
+<a name="ln165">		mode-&gt;timing.pixel_clock = fp_info-&gt;dot_clock;</a>
+<a name="ln166">	}</a>
+<a name="ln167">	</a>
+<a name="ln168">	// TV-out supports at most 1024x768</a>
+<a name="ln169">	if( (disp_devices &amp; (dd_ctv | dd_stv)) != 0 ) {</a>
+<a name="ln170">		if( mode-&gt;timing.h_display &gt; 1024 )</a>
+<a name="ln171">			mode-&gt;timing.h_display = 1024;</a>
+<a name="ln172">			</a>
+<a name="ln173">		if( mode-&gt;timing.v_display &gt; 768 )</a>
+<a name="ln174">			mode-&gt;timing.v_display = 768;</a>
+<a name="ln175">	}</a>
+<a name="ln176"> </a>
+<a name="ln177">	// if using TV-Out, the timing of the source signal must be tweaked to</a>
+<a name="ln178">	// get proper timing</a>
+<a name="ln179">	internal_tv_encoder = IS_INTERNAL_TV_OUT( si-&gt;tv_chip );</a>
+<a name="ln180">	</a>
+<a name="ln181">	// we need higher accuracy then Be thought of</a>
+<a name="ln182">	mode-&gt;timing.pixel_clock *= 1000;</a>
+<a name="ln183"> </a>
+<a name="ln184">	// TV stuff must be done first as it tweaks the display mode</a>
+<a name="ln185">	if( (disp_devices &amp; (dd_ctv | dd_stv)) != 0 ) {</a>
+<a name="ln186">		display_mode tweaked_mode;</a>
+<a name="ln187">		</a>
+<a name="ln188">		Radeon_CalcImpacTVParams( </a>
+<a name="ln189">			&amp;si-&gt;pll, tv_params, vc-&gt;tv_standard, internal_tv_encoder, </a>
+<a name="ln190">			mode, &amp;tweaked_mode );</a>
+<a name="ln191">			</a>
+<a name="ln192">		*mode = tweaked_mode;</a>
+<a name="ln193">	}</a>
+<a name="ln194">	</a>
+<a name="ln195">	Radeon_GetFormat( mode-&gt;space, &amp;format, &amp;bpp );</a>
+<a name="ln196">	</a>
+<a name="ln197">	vc-&gt;bpp = bpp;</a>
+<a name="ln198">	vc-&gt;datatype = format;  </a>
+<a name="ln199">	</a>
+<a name="ln200">	// time to read original register content</a>
+<a name="ln201">	// lock hardware so noone bothers us</a>
+<a name="ln202">	Radeon_WaitForIdle( ai, true );</a>
+<a name="ln203">		</a>
+<a name="ln204">	if( (disp_devices &amp; (dd_dvi | dd_lvds | dd_dvi_ext)) != 0 ) {</a>
+<a name="ln205">		if( crtc-&gt;crtc_idx == 0 )</a>
+<a name="ln206">			Radeon_ReadRMXRegisters( ai, &amp;fp_values );</a>
+<a name="ln207">			</a>
+<a name="ln208">		Radeon_ReadFPRegisters( ai, &amp;fp_values );</a>
+<a name="ln209">	}</a>
+<a name="ln210"> </a>
+<a name="ln211">	if( (disp_devices &amp; (dd_ctv | dd_stv)) != 0 ) {</a>
+<a name="ln212">		// some register's content isn't created from scratch but</a>
+<a name="ln213">		// only modified, so we need the original content first</a>
+<a name="ln214">		if( internal_tv_encoder )</a>
+<a name="ln215">			Radeon_InternalTVOutReadRegisters( ai, &amp;impactv_values );</a>
+<a name="ln216">		else</a>
+<a name="ln217">			Radeon_TheatreReadTVRegisters( ai, &amp;impactv_values );</a>
+<a name="ln218">	}</a>
+<a name="ln219"> </a>
+<a name="ln220"> </a>
+<a name="ln221">	// calculate all hardware register values</a>
+<a name="ln222">	Radeon_CalcCRTCRegisters( ai, crtc, mode, &amp;crtc_values );</a>
+<a name="ln223"> </a>
+<a name="ln224">	surface_cntl = RADEON_SURF_TRANSLATION_DIS;</a>
+<a name="ln225"> </a>
+<a name="ln226">	if( (disp_devices &amp; (dd_ctv | dd_stv)) != 0 ) {</a>
+<a name="ln227">		Radeon_CalcImpacTVRegisters( ai, mode, tv_params, &amp;impactv_values, </a>
+<a name="ln228">			crtc-&gt;crtc_idx, internal_tv_encoder, vc-&gt;tv_standard, disp_devices );</a>
+<a name="ln229">	}</a>
+<a name="ln230"> </a>
+<a name="ln231">	if( (disp_devices &amp; (dd_stv | dd_ctv)) == 0 )</a>
+<a name="ln232">		Radeon_CalcCRTPLLDividers( &amp;si-&gt;pll, mode, &amp;dividers );</a>
+<a name="ln233">	else</a>
+<a name="ln234">		dividers = tv_params-&gt;crt_dividers;</a>
+<a name="ln235"> </a>
+<a name="ln236">	if( (disp_devices &amp; dd_lvds) != 0 &amp;&amp; si-&gt;flatpanels[0].fixed_dividers ) {</a>
+<a name="ln237">		SHOW_FLOW0( 0, &quot;Using fixed dividers for laptop panel&quot; );</a>
+<a name="ln238">		dividers.feedback = si-&gt;flatpanels[0].feedback_div;</a>
+<a name="ln239">		dividers.post_code = si-&gt;flatpanels[0].post_div;</a>
+<a name="ln240">		dividers.ref = si-&gt;flatpanels[0].ref_div;</a>
+<a name="ln241">	}</a>
+<a name="ln242">	</a>
+<a name="ln243">	Radeon_CalcPLLRegisters( mode, &amp;dividers, &amp;pll_values );</a>
+<a name="ln244">	</a>
+<a name="ln245">	// for first CRTC1, we need to setup RMX properly</a>
+<a name="ln246">	if( crtc-&gt;crtc_idx == 0 )</a>
+<a name="ln247">		Radeon_CalcRMXRegisters( fp_info, mode, </a>
+<a name="ln248">			(disp_devices &amp; (dd_lvds | dd_dvi | dd_dvi_ext)) != 0,</a>
+<a name="ln249">			&amp;fp_values );</a>
+<a name="ln250">			</a>
+<a name="ln251">	if( (disp_devices &amp; (dd_lvds | dd_dvi | dd_dvi_ext)) != 0 )</a>
+<a name="ln252">		Radeon_CalcFPRegisters( ai, crtc, fp_info, &amp;crtc_values, &amp;fp_values );</a>
+<a name="ln253">	</a>
+<a name="ln254">	// we don't use pixel clock anymore, so it can be reset to Be's kHz</a>
+<a name="ln255">	mode-&gt;timing.pixel_clock /= 1000;</a>
+<a name="ln256">	</a>
+<a name="ln257">	// write values to registers</a>
+<a name="ln258">	</a>
+<a name="ln259">	Radeon_InitCommonRegs( ai );</a>
+<a name="ln260">	</a>
+<a name="ln261">	Radeon_ProgramCRTCRegisters( ai, crtc-&gt;crtc_idx, &amp;crtc_values );</a>
+<a name="ln262">	</a>
+<a name="ln263">	OUTREG( regs, RADEON_SURFACE_CNTL, surface_cntl );</a>
+<a name="ln264"> </a>
+<a name="ln265">	if( crtc-&gt;crtc_idx == 0 )</a>
+<a name="ln266">		Radeon_ProgramRMXRegisters( ai, &amp;fp_values );</a>
+<a name="ln267"> </a>
+<a name="ln268">	if( (disp_devices &amp; (dd_lvds | dd_dvi | dd_dvi_ext)) != 0 )</a>
+<a name="ln269">		Radeon_ProgramFPRegisters( ai, crtc, fp_info, &amp;fp_values );</a>
+<a name="ln270">		</a>
+<a name="ln271">	//if( mode-&gt;timing.pixel_clock )</a>
+<a name="ln272">	Radeon_ProgramPLL( ai, crtc-&gt;crtc_idx, &amp;pll_values );</a>
+<a name="ln273">	</a>
+<a name="ln274">	if( (disp_devices &amp; (dd_ctv | dd_stv)) != 0 ) {</a>
+<a name="ln275">		if( internal_tv_encoder )</a>
+<a name="ln276">			Radeon_InternalTVOutProgramRegisters( ai, &amp;impactv_values );</a>
+<a name="ln277">		else</a>
+<a name="ln278">			Radeon_TheatreProgramTVRegisters( ai, &amp;impactv_values );</a>
+<a name="ln279">	}</a>
+<a name="ln280"> </a>
+<a name="ln281">	// spit out some debug stuff in a radeontool stylee</a>
+<a name="ln282">	SHOW_FLOW0( 0, &quot;&quot; );</a>
+<a name="ln283">	SHOW_FLOW( 0, &quot;RADEON_DAC_CNTL %08X &quot;, INREG( regs, RADEON_DAC_CNTL ));</a>
+<a name="ln284">	SHOW_FLOW( 0, &quot;RADEON_DAC_CNTL2 %08X &quot;, INREG( regs, RADEON_DAC_CNTL2 ));</a>
+<a name="ln285">	SHOW_FLOW( 0, &quot;RADEON_TV_DAC_CNTL %08X &quot;, INREG( regs, RADEON_TV_DAC_CNTL ));</a>
+<a name="ln286">	SHOW_FLOW( 0, &quot;RADEON_DISP_OUTPUT_CNTL %08X &quot;, INREG( regs, RADEON_DISP_OUTPUT_CNTL ));</a>
+<a name="ln287">	SHOW_FLOW( 0, &quot;RADEON_AUX_SC_CNTL %08X &quot;, INREG( regs, RADEON_AUX_SC_CNTL ));</a>
+<a name="ln288">	SHOW_FLOW( 0, &quot;RADEON_CRTC_EXT_CNTL %08X &quot;, INREG( regs, RADEON_CRTC_EXT_CNTL ));</a>
+<a name="ln289">	SHOW_FLOW( 0, &quot;RADEON_CRTC_GEN_CNTL %08X &quot;, INREG( regs, RADEON_CRTC_GEN_CNTL ));</a>
+<a name="ln290">	SHOW_FLOW( 0, &quot;RADEON_CRTC2_GEN_CNTL %08X &quot;, INREG( regs, RADEON_CRTC2_GEN_CNTL ));</a>
+<a name="ln291">	SHOW_FLOW( 0, &quot;RADEON_DISP_MISC_CNTL %08X &quot;, INREG( regs, RADEON_DISP_MISC_CNTL ));</a>
+<a name="ln292">	SHOW_FLOW( 0, &quot;RADEON_FP_GEN_CNTL %08X &quot;, INREG( regs, RADEON_FP_GEN_CNTL ));</a>
+<a name="ln293">	SHOW_FLOW( 0, &quot;RADEON_FP2_GEN_CNTL %08X &quot;, INREG( regs, RADEON_FP2_GEN_CNTL ));</a>
+<a name="ln294">	SHOW_FLOW( 0, &quot;RADEON_LVDS_GEN_CNTL %08X &quot;, INREG( regs, RADEON_LVDS_GEN_CNTL ));</a>
+<a name="ln295">	SHOW_FLOW( 0, &quot;RADEON_TMDS_PLL_CNTL %08X &quot;, INREG( regs, RADEON_TMDS_PLL_CNTL ));</a>
+<a name="ln296">	SHOW_FLOW( 0, &quot;RADEON_TMDS_TRANSMITTER_CNTL %08X &quot;, INREG( regs, RADEON_TMDS_TRANSMITTER_CNTL ));</a>
+<a name="ln297">	SHOW_FLOW( 0, &quot;RADEON_FP_H_SYNC_STRT_WID %08X &quot;, INREG( regs, RADEON_FP_H_SYNC_STRT_WID ));</a>
+<a name="ln298">	SHOW_FLOW( 0, &quot;RADEON_FP_V_SYNC_STRT_WID %08X &quot;, INREG( regs, RADEON_FP_V_SYNC_STRT_WID ));</a>
+<a name="ln299">	SHOW_FLOW( 0, &quot;RADEON_FP_H2_SYNC_STRT_WID %08X &quot;, INREG( regs, RADEON_FP_H2_SYNC_STRT_WID ));</a>
+<a name="ln300">	SHOW_FLOW( 0, &quot;RADEON_FP_V2_SYNC_STRT_WID %08X &quot;, INREG( regs, RADEON_FP_V2_SYNC_STRT_WID ));</a>
+<a name="ln301">	// spit end</a>
+<a name="ln302"> </a>
+<a name="ln303">	crtc-&gt;active_displays = disp_devices;</a>
+<a name="ln304">	</a>
+<a name="ln305">	// programming is over, so hardware can be used again</a>
+<a name="ln306">	RELEASE_BEN( si-&gt;cp.lock );</a>
+<a name="ln307">	</a>
+<a name="ln308">	// overlay must be setup again after modeswitch (whoever was using it)</a>
+<a name="ln309">	// TBD: this won't work if another virtual card was using it,</a>
+<a name="ln310">	// but currently, virtual cards don't work anyway...</a>
+<a name="ln311">	si-&gt;active_overlay.crtc_idx = -1;</a>
+<a name="ln312"> </a>
+<a name="ln313">	return B_OK;</a>
+<a name="ln314">}</a>
+<a name="ln315"> </a>
+<a name="ln316"> </a>
+<a name="ln317">// enable or disable VBlank interrupts</a>
+<a name="ln318">void Radeon_EnableIRQ( </a>
+<a name="ln319">	accelerator_info *ai, bool enable )</a>
+<a name="ln320">{</a>
+<a name="ln321">	shared_info *si = ai-&gt;si;</a>
+<a name="ln322">	uint32 int_cntl, int_mask;</a>
+<a name="ln323">	</a>
+<a name="ln324">	int_cntl = INREG( ai-&gt;regs, RADEON_GEN_INT_CNTL );</a>
+<a name="ln325">	int_mask = </a>
+<a name="ln326">		RADEON_CRTC_VBLANK_MASK</a>
+<a name="ln327">		| (si-&gt;num_crtc &gt; 1 ? RADEON_CRTC2_VBLANK_MASK : 0);</a>
+<a name="ln328">		</a>
+<a name="ln329">	if( enable )</a>
+<a name="ln330">		int_cntl |= int_mask;</a>
+<a name="ln331">	else</a>
+<a name="ln332">		int_cntl &amp;= ~int_mask;</a>
+<a name="ln333">		</a>
+<a name="ln334">	OUTREG( ai-&gt;regs, RADEON_GEN_INT_CNTL, int_cntl );</a>
+<a name="ln335">	</a>
+<a name="ln336">	if( enable ) {</a>
+<a name="ln337">		// on enable, we have to acknowledge all IRQs as the graphics card</a>
+<a name="ln338">		// waits for that before it issues further IRQs</a>
+<a name="ln339">		OUTREG( ai-&gt;regs, RADEON_GEN_INT_STATUS, int_cntl );</a>
+<a name="ln340">	}</a>
+<a name="ln341"> </a>
+<a name="ln342">	si-&gt;enable_virtual_irq = enable;</a>
+<a name="ln343">}</a>
+<a name="ln344"> </a>
+<a name="ln345"> </a>
+<a name="ln346">// public function: set display mode</a>
+<a name="ln347">status_t SET_DISPLAY_MODE( </a>
+<a name="ln348">	display_mode *mode_in ) </a>
+<a name="ln349">{</a>
+<a name="ln350">	virtual_card *vc = ai-&gt;vc;</a>
+<a name="ln351">	shared_info *si = ai-&gt;si;</a>
+<a name="ln352">	display_mode bounds, mode;</a>
+<a name="ln353"> </a>
+<a name="ln354">	mode = bounds = *mode_in;</a>
+<a name="ln355">	</a>
+<a name="ln356">	ACQUIRE_BEN( si-&gt;engine.lock );</a>
+<a name="ln357">	</a>
+<a name="ln358">	SHOW_FLOW( 2, &quot;width=%d, height=%d&quot;, mode.timing.h_display, mode.timing.v_display );</a>
+<a name="ln359"> </a>
+<a name="ln360">	// check mode and tweak parameters so we can program hardware</a>
+<a name="ln361">	// without any further checks			</a>
+<a name="ln362">	if( PROPOSE_DISPLAY_MODE( &amp;mode, &amp;bounds, &amp;bounds ) == B_ERROR ) {</a>
+<a name="ln363">		SHOW_ERROR0( 2, &quot;invalid mode&quot; );</a>
+<a name="ln364">		</a>
+<a name="ln365">		RELEASE_BEN( si-&gt;engine.lock );</a>
+<a name="ln366">		return B_ERROR;</a>
+<a name="ln367">	}</a>
+<a name="ln368"> </a>
+<a name="ln369">	// already done by propose_display_mode, but it was undone on return;</a>
+<a name="ln370">	// do this before equality check to recognize changes of multi-monitor mode </a>
+<a name="ln371">	Radeon_DetectMultiMode( vc, &amp;mode );</a>
+<a name="ln372">	</a>
+<a name="ln373">	// mode switches can take quite long and are visible, </a>
+<a name="ln374">	// so avoid them if possible</a>
+<a name="ln375">	if( memcmp( &amp;mode, &amp;vc-&gt;mode, sizeof( display_mode )) == 0 &amp;&amp;</a>
+<a name="ln376">		!vc-&gt;enforce_mode_change ) {</a>
+<a name="ln377">		RELEASE_BEN( si-&gt;engine.lock );</a>
+<a name="ln378">		return B_OK;</a>
+<a name="ln379">	}</a>
+<a name="ln380">	</a>
+<a name="ln381">	// this flag was set when some internal parameter has changed that</a>
+<a name="ln382">	// affects effective display mode</a>
+<a name="ln383">	vc-&gt;enforce_mode_change = false;</a>
+<a name="ln384">	</a>
+<a name="ln385">	// make sure, we don't get disturbed</a>
+<a name="ln386">	//Radeon_Finish( ai );</a>
+<a name="ln387">	Radeon_EnableIRQ( ai, false );</a>
+<a name="ln388"> </a>
+<a name="ln389">	// free cursor and framebuffer memory</a>
+<a name="ln390">	{</a>
+<a name="ln391">		radeon_free_mem fm;</a>
+<a name="ln392">		</a>
+<a name="ln393">		fm.magic = RADEON_PRIVATE_DATA_MAGIC;</a>
+<a name="ln394">		fm.memory_type = mt_local;</a>
+<a name="ln395">		fm.global = true;</a>
+<a name="ln396">	</a>
+<a name="ln397">		if( vc-&gt;cursor.mem_handle ) {</a>
+<a name="ln398">			fm.handle = vc-&gt;cursor.mem_handle;</a>
+<a name="ln399">			ioctl( ai-&gt;fd, RADEON_FREE_MEM, &amp;fm );</a>
+<a name="ln400">		}</a>
+<a name="ln401">		</a>
+<a name="ln402">		if( vc-&gt;fb_mem_handle ) {</a>
+<a name="ln403">			fm.handle = vc-&gt;fb_mem_handle;</a>
+<a name="ln404">			ioctl( ai-&gt;fd, RADEON_FREE_MEM, &amp;fm );</a>
+<a name="ln405">		}</a>
+<a name="ln406">	}</a>
+<a name="ln407">	</a>
+<a name="ln408">	memcpy( &amp;vc-&gt;mode, &amp;mode, sizeof( display_mode ));</a>
+<a name="ln409">	</a>
+<a name="ln410">	// verify hardware restrictions *after* saving mode</a>
+<a name="ln411">	// e.g. if you want a span mode but have one monitor disconnected,</a>
+<a name="ln412">	// configuration shouldn't be touched, so you can continue working</a>
+<a name="ln413">	// with two monitors later on just like nothing has happened</a>
+<a name="ln414">	Radeon_VerifyMultiMode( vc, si, &amp;mode );</a>
+<a name="ln415"> </a>
+<a name="ln416">	// set main flags	</a>
+<a name="ln417">	vc-&gt;independant_heads = vc-&gt;assigned_crtc[0] &amp;&amp; si-&gt;crtc[0].chosen_displays != dd_none;</a>
+<a name="ln418">	</a>
+<a name="ln419">	if( si-&gt;num_crtc &gt; 1 )</a>
+<a name="ln420">		vc-&gt;independant_heads += vc-&gt;assigned_crtc[1] &amp;&amp; si-&gt;crtc[1].chosen_displays != dd_none;</a>
+<a name="ln421">		</a>
+<a name="ln422">	vc-&gt;different_heads = Radeon_DifferentPorts( &amp;mode );</a>
+<a name="ln423">	SHOW_FLOW( 2, &quot;independant heads: %d, different heads: %d&quot;, </a>
+<a name="ln424">		vc-&gt;independant_heads, vc-&gt;different_heads );</a>
+<a name="ln425">	vc-&gt;scroll = mode.flags &amp; B_SCROLL;</a>
+<a name="ln426">	SHOW_FLOW( 2, &quot;scrolling %s&quot;, vc-&gt;scroll ? &quot;enabled&quot; : &quot;disabled&quot; );</a>
+<a name="ln427"> </a>
+<a name="ln428">	// allocate frame buffer and cursor image memory</a>
+<a name="ln429">	{</a>
+<a name="ln430">		radeon_alloc_mem am;</a>
+<a name="ln431">		int format, bpp;</a>
+<a name="ln432">		</a>
+<a name="ln433">		// alloc cursor memory		</a>
+<a name="ln434">		am.magic = RADEON_PRIVATE_DATA_MAGIC;</a>
+<a name="ln435">		am.size = 1024;</a>
+<a name="ln436">		am.memory_type = mt_local;</a>
+<a name="ln437">		am.global = true;</a>
+<a name="ln438">		</a>
+<a name="ln439">		if( ioctl( ai-&gt;fd, RADEON_ALLOC_MEM, &amp;am ) == B_OK ) {</a>
+<a name="ln440">			vc-&gt;cursor.mem_handle = am.handle;</a>
+<a name="ln441">			vc-&gt;cursor.fb_offset = am.offset;</a>
+<a name="ln442">		} else {</a>
+<a name="ln443">			// too bad that we are out of mem -&gt; set reasonable values as</a>
+<a name="ln444">			// it's too late to give up (ouch!)</a>
+<a name="ln445">			SHOW_ERROR0( 2, &quot;no memory for cursor image!&quot; );</a>
+<a name="ln446">			vc-&gt;cursor.mem_handle = 0;</a>
+<a name="ln447">			vc-&gt;cursor.fb_offset = 0;</a>
+<a name="ln448">		}</a>
+<a name="ln449">		</a>
+<a name="ln450">		vc-&gt;cursor.data = si-&gt;local_mem + vc-&gt;cursor.fb_offset;</a>
+<a name="ln451">	</a>
+<a name="ln452">		// alloc frame buffer</a>
+<a name="ln453">		Radeon_GetFormat( mode.space, &amp;format, &amp;bpp );</a>
+<a name="ln454">		vc-&gt;pitch = Radeon_RoundVWidth( mode.virtual_width, bpp ) * bpp;</a>
+<a name="ln455">		am.size = vc-&gt;pitch * mode.virtual_height;</a>
+<a name="ln456">		</a>
+<a name="ln457">		if( ioctl( ai-&gt;fd, RADEON_ALLOC_MEM, &amp;am ) == B_OK ) {</a>
+<a name="ln458">			vc-&gt;fb_mem_handle = am.handle;</a>
+<a name="ln459">			vc-&gt;fb_offset = am.offset;</a>
+<a name="ln460">		} else 	{</a>
+<a name="ln461">			// ouch again - set reasonable values</a>
+<a name="ln462">			SHOW_ERROR0( 2, &quot;no memory for frame buffer!&quot; );</a>
+<a name="ln463">			vc-&gt;fb_mem_handle = 0;</a>
+<a name="ln464">			vc-&gt;fb_offset = 1024;</a>
+<a name="ln465">		}</a>
+<a name="ln466">		</a>
+<a name="ln467">		vc-&gt;fbc.frame_buffer = si-&gt;local_mem + vc-&gt;fb_offset;</a>
+<a name="ln468">		vc-&gt;fbc.frame_buffer_dma = (void *)((uint8 *)si-&gt;framebuffer_pci + vc-&gt;fb_offset);</a>
+<a name="ln469">		vc-&gt;fbc.bytes_per_row = vc-&gt;pitch;</a>
+<a name="ln470">		</a>
+<a name="ln471">		SHOW_FLOW( 0, &quot;frame buffer CPU-address=%x, phys-address=%x&quot;, </a>
+<a name="ln472">			vc-&gt;fbc.frame_buffer, vc-&gt;fbc.frame_buffer_dma );</a>
+<a name="ln473">	}</a>
+<a name="ln474">	</a>
+<a name="ln475">	// multi-screen stuff</a>
+<a name="ln476">	Radeon_InitMultiModeVars( ai, &amp;mode );</a>
+<a name="ln477">	</a>
+<a name="ln478">	// GO!	</a>
+<a name="ln479"> </a>
+<a name="ln480">	{</a>
+<a name="ln481">		routing_regs routing_values;</a>
+<a name="ln482">		impactv_params tv_params;</a>
+<a name="ln483">		status_t err1 , err2;</a>
+<a name="ln484">		err1 = err2 = B_OK;</a>
+<a name="ln485">	</a>
+<a name="ln486">		// we first switch off all output, so the monitor(s) won't get invalid signals</a>
+<a name="ln487">		if( vc-&gt;assigned_crtc[0] ) {</a>
+<a name="ln488">			// overwrite list of active displays to switch off displays </a>
+<a name="ln489">			// someone else turned on</a>
+<a name="ln490">			si-&gt;crtc[0].active_displays = vc-&gt;controlled_displays;</a>
+<a name="ln491">			Radeon_SetDPMS( ai, 0, B_DPMS_SUSPEND );</a>
+<a name="ln492">		}</a>
+<a name="ln493">		if( vc-&gt;assigned_crtc[1] ) {</a>
+<a name="ln494">			si-&gt;crtc[1].active_displays = vc-&gt;controlled_displays;</a>
+<a name="ln495">			Radeon_SetDPMS( ai, 1, B_DPMS_SUSPEND );</a>
+<a name="ln496">		}</a>
+<a name="ln497">		</a>
+<a name="ln498">		// mark crtc that will be used from now on</a>
+<a name="ln499">		vc-&gt;used_crtc[0] = vc-&gt;assigned_crtc[0] &amp;&amp; si-&gt;crtc[0].chosen_displays != dd_none;</a>
+<a name="ln500">		vc-&gt;used_crtc[1] = vc-&gt;assigned_crtc[1] &amp;&amp; si-&gt;crtc[1].chosen_displays != dd_none;</a>
+<a name="ln501">	</a>
+<a name="ln502">		// then change the mode</a>
+<a name="ln503">		if( vc-&gt;used_crtc[0] )</a>
+<a name="ln504">			err1 = Radeon_SetMode( ai, &amp;si-&gt;crtc[0], &amp;mode, &amp;tv_params );</a>
+<a name="ln505">		if( vc-&gt;used_crtc[1] )</a>
+<a name="ln506">			err2 = Radeon_SetMode( ai, &amp;si-&gt;crtc[1], &amp;mode, &amp;tv_params );</a>
+<a name="ln507">			</a>
+<a name="ln508">		</a>
+<a name="ln509">		SHOW_FLOW( 2, &quot;SetModes 1=%s, 2=%s&quot;, </a>
+<a name="ln510">			(err1 == B_OK) ? &quot;OK&quot; : &quot;FAIL&quot;, (err2 == B_OK) ? &quot;OK&quot; : &quot;FAIL&quot;);</a>
+<a name="ln511"> </a>
+<a name="ln512">		// setup signal routing</a>
+<a name="ln513">		Radeon_ReadMonitorRoutingRegs( ai, &amp;routing_values );</a>
+<a name="ln514">		Radeon_CalcMonitorRouting( ai, &amp;tv_params, &amp;routing_values );</a>
+<a name="ln515">		Radeon_ProgramMonitorRouting( ai, &amp;routing_values );</a>
+<a name="ln516">	   	</a>
+<a name="ln517">		// finally, switch display(s) on</a>
+<a name="ln518">		if( vc-&gt;used_crtc[0] )</a>
+<a name="ln519">			Radeon_SetDPMS( ai, 0, (err1 == B_OK) ? B_DPMS_ON : B_DPMS_SUSPEND );</a>
+<a name="ln520">		if( vc-&gt;used_crtc[1] )</a>
+<a name="ln521">			Radeon_SetDPMS( ai, 1, (err2 == B_OK) ? B_DPMS_ON : B_DPMS_SUSPEND );</a>
+<a name="ln522">			</a>
+<a name="ln523">		OUTREGP( ai-&gt;regs, RADEON_CRTC_EXT_CNTL, 0, ~RADEON_CRTC_DISPLAY_DIS );</a>
+<a name="ln524">	}</a>
+<a name="ln525">	</a>
+<a name="ln526">   	SHOW_FLOW( 3, &quot;pitch=%ld&quot;, vc-&gt;pitch );</a>
+<a name="ln527">   	</a>
+<a name="ln528">   	// we'll modify bits of this reg, so save it for async access</a>
+<a name="ln529">	si-&gt;dac_cntl2 = INREG( ai-&gt;regs, RADEON_DAC_CNTL2 );</a>
+<a name="ln530">	</a>
+<a name="ln531">	// setup 2D registers</a>
+<a name="ln532">	Radeon_Init2D( ai );</a>
+<a name="ln533">	// setup position of framebuffer for 2D commands</a>
+<a name="ln534">	Radeon_FillStateBuffer( ai, vc-&gt;datatype );</a>
+<a name="ln535">	</a>
+<a name="ln536">	// remember that 2D accelerator is not prepared for any virtual card</a>
+<a name="ln537">	si-&gt;active_vc = -1;</a>
+<a name="ln538">	</a>
+<a name="ln539">	// first move to well-defined position (to setup CRTC offset)</a>
+<a name="ln540">	Radeon_MoveDisplay( ai, 0, 0 );		</a>
+<a name="ln541">	// then to (probably faulty) user-defined pos</a>
+<a name="ln542">	Radeon_MoveDisplay( ai, mode.h_display_start, mode.v_display_start );</a>
+<a name="ln543"> </a>
+<a name="ln544">	// set standard palette in direct-colour modes</a>
+<a name="ln545">	if( vc-&gt;used_crtc[0] )</a>
+<a name="ln546">		Radeon_InitPalette( ai, 0 );</a>
+<a name="ln547">	if( vc-&gt;used_crtc[1] )</a>
+<a name="ln548">		Radeon_InitPalette( ai, 1 );</a>
+<a name="ln549">	</a>
+<a name="ln550">	// initialize cursor data</a>
+<a name="ln551">	if( vc-&gt;used_crtc[0] )</a>
+<a name="ln552">		Radeon_SetCursorColors( ai, 0 );</a>
+<a name="ln553">	if( vc-&gt;used_crtc[1] )</a>
+<a name="ln554">		Radeon_SetCursorColors( ai, 1 );</a>
+<a name="ln555">		</a>
+<a name="ln556">	// sync should be settled now, so we can reenable IRQs</a>
+<a name="ln557">	Radeon_EnableIRQ( ai, true );</a>
+<a name="ln558">		</a>
+<a name="ln559">	RELEASE_BEN( si-&gt;engine.lock );</a>
+<a name="ln560"> </a>
+<a name="ln561">	// !! all this must be done after lock has been </a>
+<a name="ln562">	//    released to avoid dead-lock !!</a>
+<a name="ln563">	// TBD: any invalid intermediate states?</a>
+<a name="ln564"> </a>
+<a name="ln565">	// move_cursor sets all cursor-related variables and registers</a>
+<a name="ln566">	vc-&gt;cursor.is_visible = false;</a>
+<a name="ln567">	MOVE_CURSOR( 0, 0 );</a>
+<a name="ln568"> </a>
+<a name="ln569">	return B_OK;</a>
+<a name="ln570">}</a>
+
+</code></pre>
+<div class="balloon" rel="521"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v547/" target="_blank">V547</a> Expression 'err2 == ((int) 0)' is always true.</p></div>
+<div class="balloon" rel="519"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v547/" target="_blank">V547</a> Expression 'err1 == ((int) 0)' is always true.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

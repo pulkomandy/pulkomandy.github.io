@@ -1,0 +1,498 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>i2c.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2007, Axel Dörfler, axeld@pinc-software.de. All Rights Reserved.</a>
+<a name="ln3"> * Copyright 2003, Thomas Kurschel. All Rights Reserved.</a>
+<a name="ln4"> * Distributed under the terms of the MIT License.</a>
+<a name="ln5"> */</a>
+<a name="ln6"> </a>
+<a name="ln7">/*!</a>
+<a name="ln8">	I2C protocol</a>
+<a name="ln9">*/</a>
+<a name="ln10"> </a>
+<a name="ln11">#include &quot;i2c.h&quot;</a>
+<a name="ln12"> </a>
+<a name="ln13">#include &lt;KernelExport.h&gt;</a>
+<a name="ln14">#include &lt;OS.h&gt;</a>
+<a name="ln15">#include &lt;string.h&gt;</a>
+<a name="ln16"> </a>
+<a name="ln17"> </a>
+<a name="ln18">//#define TRACE_I2C</a>
+<a name="ln19">#ifdef TRACE_I2C</a>
+<a name="ln20">#ifdef __cplusplus</a>
+<a name="ln21">extern &quot;C&quot; </a>
+<a name="ln22">#endif</a>
+<a name="ln23">void _sPrintf(const char *format, ...);</a>
+<a name="ln24">#	define TRACE(x...) _sPrintf(&quot;I2C: &quot; x)</a>
+<a name="ln25">#else</a>
+<a name="ln26">#	define TRACE(x...) ;</a>
+<a name="ln27">#endif</a>
+<a name="ln28"> </a>
+<a name="ln29"> </a>
+<a name="ln30">/*!</a>
+<a name="ln31">	I2c timings, rounded up (Philips 1995 i2c bus specification, p20)</a>
+<a name="ln32">*/</a>
+<a name="ln33"> </a>
+<a name="ln34">//! Timing for standard mode i2c (100kHz max)</a>
+<a name="ln35">const static i2c_timing kTiming100k = {</a>
+<a name="ln36">	.buf = 5,</a>
+<a name="ln37">	.hd_sta = 4,</a>
+<a name="ln38">	.low = 5,</a>
+<a name="ln39">	.high = 4,</a>
+<a name="ln40">	.su_sta = 5,</a>
+<a name="ln41">	.hd_dat = 1,</a>
+<a name="ln42">	.su_dat = 2,</a>
+<a name="ln43">	.r = 2,</a>
+<a name="ln44">	.f = 2,</a>
+<a name="ln45">	.su_sto = 4,</a>
+<a name="ln46"> </a>
+<a name="ln47">	// these are unspecified, use half a clock cycle as a safe guess</a>
+<a name="ln48">	.start_timeout = 5,</a>
+<a name="ln49">	.byte_timeout = 5,</a>
+<a name="ln50">	.bit_timeout = 5,</a>
+<a name="ln51">	.ack_start_timeout = 5,</a>
+<a name="ln52">	.ack_timeout = 5</a>
+<a name="ln53">};</a>
+<a name="ln54"> </a>
+<a name="ln55">//! Timing for fast mode i2c (400kHz max)</a>
+<a name="ln56">const static i2c_timing kTiming400k = {</a>
+<a name="ln57">	.buf = 2,</a>
+<a name="ln58">	.hd_sta = 1,</a>
+<a name="ln59">	.low = 2,</a>
+<a name="ln60">	.high = 1,</a>
+<a name="ln61">	.su_sta = 1,</a>
+<a name="ln62">	.hd_dat = 0,</a>
+<a name="ln63">	.su_dat = 1,</a>
+<a name="ln64">	.r = 1,</a>
+<a name="ln65">	.f = 1,</a>
+<a name="ln66">	.su_sto = 1,</a>
+<a name="ln67"> </a>
+<a name="ln68">	// these are unspecified, use half a clock cycle as a safe guess</a>
+<a name="ln69">	.start_timeout = 2,</a>
+<a name="ln70">	.byte_timeout = 2,</a>
+<a name="ln71">	.bit_timeout = 2,</a>
+<a name="ln72">	.ack_start_timeout = 2,</a>
+<a name="ln73">	.ack_timeout = 2</a>
+<a name="ln74">};</a>
+<a name="ln75"> </a>
+<a name="ln76"> </a>
+<a name="ln77">/*!</a>
+<a name="ln78">	There's no spin in user space, but we need it to wait a couple</a>
+<a name="ln79">	of microseconds only</a>
+<a name="ln80">	(in this case, snooze has much too much overhead)</a>
+<a name="ln81">*/</a>
+<a name="ln82">void</a>
+<a name="ln83">spin(bigtime_t delay)</a>
+<a name="ln84">{</a>
+<a name="ln85">	bigtime_t startTime = system_time();</a>
+<a name="ln86"> </a>
+<a name="ln87">	while (system_time() - startTime &lt; delay)</a>
+<a name="ln88">		;</a>
+<a name="ln89">}</a>
+<a name="ln90"> </a>
+<a name="ln91"> </a>
+<a name="ln92">//! Wait until slave releases clock signal (&quot;clock stretching&quot;)</a>
+<a name="ln93">static status_t</a>
+<a name="ln94">wait_for_clk(const i2c_bus *bus, bigtime_t timeout)</a>
+<a name="ln95">{</a>
+<a name="ln96">	bigtime_t startTime;</a>
+<a name="ln97"> </a>
+<a name="ln98">	// wait for clock signal to raise</a>
+<a name="ln99">	spin(bus-&gt;timing.r);</a>
+<a name="ln100"> </a>
+<a name="ln101">	startTime = system_time();</a>
+<a name="ln102"> </a>
+<a name="ln103">	while (true) {</a>
+<a name="ln104">		int clk, data;</a>
+<a name="ln105"> </a>
+<a name="ln106">		bus-&gt;get_signals(bus-&gt;cookie, &amp;clk, &amp;data);</a>
+<a name="ln107">		if (clk != 0)</a>
+<a name="ln108">			return B_OK;</a>
+<a name="ln109"> </a>
+<a name="ln110">		if (system_time() - startTime &gt; timeout) {</a>
+<a name="ln111">			TRACE(&quot;%s: Timeout waiting on clock (r)\n&quot;);</a>
+<a name="ln112">			return B_TIMEOUT;</a>
+<a name="ln113">		}</a>
+<a name="ln114"> </a>
+<a name="ln115">		spin(bus-&gt;timing.r);</a>
+<a name="ln116">	}</a>
+<a name="ln117">}</a>
+<a name="ln118"> </a>
+<a name="ln119"> </a>
+<a name="ln120">//!	Send start or repeated start condition</a>
+<a name="ln121">static status_t</a>
+<a name="ln122">send_start_condition(const i2c_bus *bus)</a>
+<a name="ln123">{</a>
+<a name="ln124">	status_t status;</a>
+<a name="ln125"> </a>
+<a name="ln126">	bus-&gt;set_signals(bus-&gt;cookie, 1, 1);</a>
+<a name="ln127"> </a>
+<a name="ln128">	status = wait_for_clk(bus, bus-&gt;timing.start_timeout);</a>
+<a name="ln129">	if (status != B_OK) {</a>
+<a name="ln130">		TRACE(&quot;%s: Timeout sending start condition\n&quot;, __func__);</a>
+<a name="ln131">		return status;</a>
+<a name="ln132">	}</a>
+<a name="ln133"> </a>
+<a name="ln134">	spin(bus-&gt;timing.su_sta);</a>
+<a name="ln135">	bus-&gt;set_signals(bus-&gt;cookie, 1, 0);</a>
+<a name="ln136">	spin(bus-&gt;timing.hd_sta);</a>
+<a name="ln137">	bus-&gt;set_signals(bus-&gt;cookie, 0, 0);</a>
+<a name="ln138">	spin(bus-&gt;timing.f);</a>
+<a name="ln139"> </a>
+<a name="ln140">	return B_OK;</a>
+<a name="ln141">}</a>
+<a name="ln142"> </a>
+<a name="ln143"> </a>
+<a name="ln144">//!	Send stop condition</a>
+<a name="ln145">static status_t</a>
+<a name="ln146">send_stop_condition(const i2c_bus *bus)</a>
+<a name="ln147">{</a>
+<a name="ln148">	status_t status;</a>
+<a name="ln149"> </a>
+<a name="ln150">	bus-&gt;set_signals(bus-&gt;cookie, 0, 0);</a>
+<a name="ln151">	spin(bus-&gt;timing.r);</a>
+<a name="ln152">	bus-&gt;set_signals(bus-&gt;cookie, 1, 0);</a>
+<a name="ln153"> </a>
+<a name="ln154">	// a slave may wait for us, so let elapse the acknowledge timeout</a>
+<a name="ln155">	// to make the slave release bus control</a>
+<a name="ln156">	status = wait_for_clk(bus, bus-&gt;timing.ack_timeout);</a>
+<a name="ln157">	if (status != B_OK) {</a>
+<a name="ln158">		TRACE(&quot;%s: Timeout sending stop condition\n&quot;, __func__);</a>
+<a name="ln159">		return status;</a>
+<a name="ln160">	}</a>
+<a name="ln161"> </a>
+<a name="ln162">	spin(bus-&gt;timing.su_sto);</a>
+<a name="ln163">	bus-&gt;set_signals(bus-&gt;cookie, 1, 1);</a>
+<a name="ln164">	spin(bus-&gt;timing.buf);</a>
+<a name="ln165"> </a>
+<a name="ln166">	return B_OK;</a>
+<a name="ln167">}</a>
+<a name="ln168"> </a>
+<a name="ln169"> </a>
+<a name="ln170">//!	Send one bit</a>
+<a name="ln171">static status_t</a>
+<a name="ln172">send_bit(const i2c_bus *bus, uint8 bit, int timeout)</a>
+<a name="ln173">{</a>
+<a name="ln174">	status_t status;</a>
+<a name="ln175"> </a>
+<a name="ln176">	//TRACE(&quot;send_bit(bit = %d)\n&quot;, bit &amp; 1);</a>
+<a name="ln177"> </a>
+<a name="ln178">	bus-&gt;set_signals(bus-&gt;cookie, 0, bit &amp; 1);</a>
+<a name="ln179">	spin(bus-&gt;timing.su_dat);</a>
+<a name="ln180">	bus-&gt;set_signals(bus-&gt;cookie, 1, bit &amp; 1);</a>
+<a name="ln181"> </a>
+<a name="ln182">	status = wait_for_clk(bus, timeout);</a>
+<a name="ln183">	if (status != B_OK) {</a>
+<a name="ln184">		TRACE(&quot;%s: Timeout when sending next bit\n&quot;, __func__);</a>
+<a name="ln185">		return status;</a>
+<a name="ln186">	}</a>
+<a name="ln187"> </a>
+<a name="ln188">	spin(bus-&gt;timing.high);</a>
+<a name="ln189">	bus-&gt;set_signals(bus-&gt;cookie, 0, bit &amp; 1);</a>
+<a name="ln190">	spin(bus-&gt;timing.f + bus-&gt;timing.low);</a>
+<a name="ln191"> </a>
+<a name="ln192">	return B_OK;</a>
+<a name="ln193">}</a>
+<a name="ln194"> </a>
+<a name="ln195"> </a>
+<a name="ln196">//!	Send acknowledge and wait for reply</a>
+<a name="ln197">static status_t</a>
+<a name="ln198">send_acknowledge(const i2c_bus *bus)</a>
+<a name="ln199">{</a>
+<a name="ln200">	status_t status;</a>
+<a name="ln201">	bigtime_t startTime;</a>
+<a name="ln202"> </a>
+<a name="ln203">	// release data so slave can modify it</a>
+<a name="ln204">	bus-&gt;set_signals(bus-&gt;cookie, 0, 1);</a>
+<a name="ln205">	spin(bus-&gt;timing.su_dat);</a>
+<a name="ln206">	bus-&gt;set_signals(bus-&gt;cookie, 1, 1);</a>
+<a name="ln207"> </a>
+<a name="ln208">	status = wait_for_clk(bus, bus-&gt;timing.ack_start_timeout);</a>
+<a name="ln209">	if (status != B_OK) {</a>
+<a name="ln210">		TRACE(&quot;%s: Timeout when sending acknowledge\n&quot;, __func__);</a>
+<a name="ln211">		return status;</a>
+<a name="ln212">	}</a>
+<a name="ln213"> </a>
+<a name="ln214">	// data and clock is high, now wait for slave to pull data low</a>
+<a name="ln215">	// (according to spec, this can happen any time once clock is high)</a>
+<a name="ln216">	startTime = system_time();</a>
+<a name="ln217"> </a>
+<a name="ln218">	while (true) {</a>
+<a name="ln219">		int clk, data;</a>
+<a name="ln220"> </a>
+<a name="ln221">		bus-&gt;get_signals(bus-&gt;cookie, &amp;clk, &amp;data);</a>
+<a name="ln222"> </a>
+<a name="ln223">		if (data == 0)</a>
+<a name="ln224">			break;</a>
+<a name="ln225"> </a>
+<a name="ln226">		if (system_time() - startTime &gt; bus-&gt;timing.ack_timeout) {</a>
+<a name="ln227">			TRACE(&quot;%s: slave didn't acknowledge byte within ack_timeout: %ld\n&quot;,</a>
+<a name="ln228">				__func__, bus-&gt;timing.ack_timeout);</a>
+<a name="ln229">			return B_TIMEOUT;</a>
+<a name="ln230">		}</a>
+<a name="ln231"> </a>
+<a name="ln232">		spin(bus-&gt;timing.r);</a>
+<a name="ln233">	}</a>
+<a name="ln234"> </a>
+<a name="ln235">	TRACE(&quot;send_acknowledge(): Success!\n&quot;);</a>
+<a name="ln236"> </a>
+<a name="ln237">	// make sure we've waited at least t_high</a>
+<a name="ln238">	spin(bus-&gt;timing.high);</a>
+<a name="ln239"> </a>
+<a name="ln240">	bus-&gt;set_signals(bus-&gt;cookie, 0, 1);</a>
+<a name="ln241">	spin(bus-&gt;timing.f + bus-&gt;timing.low);	</a>
+<a name="ln242"> </a>
+<a name="ln243">	return B_OK;</a>
+<a name="ln244">}</a>
+<a name="ln245"> </a>
+<a name="ln246"> </a>
+<a name="ln247">//!	Send byte and wait for acknowledge if &lt;ackowledge&gt; is true</a>
+<a name="ln248">static status_t</a>
+<a name="ln249">send_byte(const i2c_bus *bus, uint8 byte, bool acknowledge)</a>
+<a name="ln250">{</a>
+<a name="ln251">	int i;</a>
+<a name="ln252"> </a>
+<a name="ln253">	//TRACE(&quot;%s: (byte = %x)\n&quot;, __func__, byte);</a>
+<a name="ln254"> </a>
+<a name="ln255">	for (i = 7; i &gt;= 0; --i) {</a>
+<a name="ln256">		status_t status = send_bit(bus, byte &gt;&gt; i,</a>
+<a name="ln257">			i == 7 ? bus-&gt;timing.byte_timeout : bus-&gt;timing.bit_timeout);</a>
+<a name="ln258">		if (status != B_OK)</a>
+<a name="ln259">			return status;</a>
+<a name="ln260">	}</a>
+<a name="ln261"> </a>
+<a name="ln262">	if (acknowledge)</a>
+<a name="ln263">		return send_acknowledge(bus);</a>
+<a name="ln264"> </a>
+<a name="ln265">	return B_OK;</a>
+<a name="ln266">}</a>
+<a name="ln267"> </a>
+<a name="ln268"> </a>
+<a name="ln269">//!	Send slave address, obeying 10-bit addresses and general call addresses</a>
+<a name="ln270">static status_t</a>
+<a name="ln271">send_slave_address(const i2c_bus *bus, int slaveAddress, bool isWrite)</a>
+<a name="ln272">{</a>
+<a name="ln273">	status_t status;</a>
+<a name="ln274"> </a>
+<a name="ln275">	TRACE(&quot;%s: 0x%X\n&quot;, __func__, slaveAddress);</a>
+<a name="ln276">	status = send_byte(bus, (slaveAddress &amp; 0xfe) | !isWrite, true);</a>
+<a name="ln277">	if (status != B_OK)</a>
+<a name="ln278">		return status;</a>
+<a name="ln279"> </a>
+<a name="ln280">	// there are the following special cases if the first byte looks like:</a>
+<a name="ln281">	// - 0000 0000 - general call address (second byte with address follows)</a>
+<a name="ln282">	// - 0000 0001 - start byte</a>
+<a name="ln283">	// - 0000 001x - CBus address</a>
+<a name="ln284">	// - 0000 010x - address reserved for different bus format</a>
+<a name="ln285">	// - 0000 011x |</a>
+<a name="ln286">	// - 0000 1xxx |-&gt; reserved</a>
+<a name="ln287">	// - 1111 1xxx |</a>
+<a name="ln288">	// - 1111 0xxx - 10 bit address  (second byte contains remaining 8 bits)</a>
+<a name="ln289"> </a>
+<a name="ln290">	// the lsb is 0 for write and 1 for read (except for general call address)</a>
+<a name="ln291">	if ((slaveAddress &amp; 0xff) != 0 &amp;&amp; (slaveAddress &amp; 0xf8) != 0xf0)</a>
+<a name="ln292">		return B_OK;</a>
+<a name="ln293"> </a>
+<a name="ln294">	return send_byte(bus, slaveAddress &gt;&gt; 8, true);</a>
+<a name="ln295">		// send second byte if required</a>
+<a name="ln296">}</a>
+<a name="ln297"> </a>
+<a name="ln298"> </a>
+<a name="ln299">//!	Receive one bit</a>
+<a name="ln300">static status_t</a>
+<a name="ln301">receive_bit(const i2c_bus *bus, bool *bit, int timeout)</a>
+<a name="ln302">{</a>
+<a name="ln303">	status_t status;</a>
+<a name="ln304">	int clk, data;</a>
+<a name="ln305"> </a>
+<a name="ln306">	bus-&gt;set_signals(bus-&gt;cookie, 1, 1);</a>
+<a name="ln307">		// release clock</a>
+<a name="ln308"> </a>
+<a name="ln309">	// wait for slave to raise clock</a>
+<a name="ln310">	status = wait_for_clk(bus, timeout);</a>
+<a name="ln311">	if (status != B_OK) {</a>
+<a name="ln312">		TRACE(&quot;%s: Timeout waiting for bit sent by slave\n&quot;, __func__);</a>
+<a name="ln313">		return status;</a>
+<a name="ln314">	}</a>
+<a name="ln315"> </a>
+<a name="ln316">	bus-&gt;get_signals(bus-&gt;cookie, &amp;clk, &amp;data);</a>
+<a name="ln317">		// sample data</a>
+<a name="ln318"> </a>
+<a name="ln319">	spin(bus-&gt;timing.high);</a>
+<a name="ln320">		// leave clock high for minimal time</a>
+<a name="ln321"> </a>
+<a name="ln322">	bus-&gt;set_signals(bus-&gt;cookie, 0, 1);</a>
+<a name="ln323">		// pull clock low so slave waits for us before next bit</a>
+<a name="ln324"> </a>
+<a name="ln325">	spin(bus-&gt;timing.f + bus-&gt;timing.low);</a>
+<a name="ln326">		// let it settle and leave it low for minimal time</a>
+<a name="ln327">		// to make sure slave has finished bit transmission too</a>
+<a name="ln328"> </a>
+<a name="ln329">	*bit = data;</a>
+<a name="ln330">	return B_OK;</a>
+<a name="ln331">}</a>
+<a name="ln332"> </a>
+<a name="ln333"> </a>
+<a name="ln334">/*!</a>
+<a name="ln335">	Send positive acknowledge afterwards if &lt;acknowledge&gt; is true,</a>
+<a name="ln336">	else send negative one</a>
+<a name="ln337">*/</a>
+<a name="ln338">static status_t</a>
+<a name="ln339">receive_byte(const i2c_bus *bus, uint8 *resultByte, bool acknowledge)</a>
+<a name="ln340">{</a>
+<a name="ln341">	uint8 byte = 0;</a>
+<a name="ln342">	int i;</a>
+<a name="ln343"> </a>
+<a name="ln344">	// pull clock low to let slave wait for us</a>
+<a name="ln345">	bus-&gt;set_signals(bus-&gt;cookie, 0, 1);</a>
+<a name="ln346"> </a>
+<a name="ln347">	for (i = 7; i &gt;= 0; i--) {</a>
+<a name="ln348">		bool bit;</a>
+<a name="ln349"> </a>
+<a name="ln350">		status_t status = receive_bit(bus, &amp;bit,</a>
+<a name="ln351">			i == 7 ? bus-&gt;timing.byte_timeout : bus-&gt;timing.bit_timeout);</a>
+<a name="ln352">		if (status != B_OK)</a>
+<a name="ln353">			return status;</a>
+<a name="ln354"> </a>
+<a name="ln355">		byte = (byte &lt;&lt; 1) | bit;</a>
+<a name="ln356">	}</a>
+<a name="ln357"> </a>
+<a name="ln358">	//SHOW_FLOW(3, &quot;%x &quot;, byte);</a>
+<a name="ln359"> </a>
+<a name="ln360">	*resultByte = byte;</a>
+<a name="ln361"> </a>
+<a name="ln362">	return send_bit(bus, acknowledge ? 0 : 1, bus-&gt;timing.bit_timeout);</a>
+<a name="ln363">}</a>
+<a name="ln364"> </a>
+<a name="ln365"> </a>
+<a name="ln366">//!	Send multiple bytes</a>
+<a name="ln367">static status_t</a>
+<a name="ln368">send_bytes(const i2c_bus *bus, const uint8 *writeBuffer, ssize_t writeLength)</a>
+<a name="ln369">{</a>
+<a name="ln370">	TRACE(&quot;%s: (length = %ld)\n&quot;, __func__, writeLength);</a>
+<a name="ln371"> </a>
+<a name="ln372">	for (; writeLength &gt; 0; --writeLength, ++writeBuffer) {</a>
+<a name="ln373">		status_t status = send_byte(bus, *writeBuffer, true);</a>
+<a name="ln374">		if (status != B_OK)</a>
+<a name="ln375">			return status;</a>
+<a name="ln376">	}</a>
+<a name="ln377"> </a>
+<a name="ln378">	return B_OK;</a>
+<a name="ln379">}</a>
+<a name="ln380"> </a>
+<a name="ln381"> </a>
+<a name="ln382">//!	Receive multiple bytes</a>
+<a name="ln383">static status_t</a>
+<a name="ln384">receive_bytes(const i2c_bus *bus, uint8 *readBuffer, ssize_t readLength)</a>
+<a name="ln385">{</a>
+<a name="ln386">	TRACE(&quot;%s: (length = %ld)\n&quot;, __func__, readLength);</a>
+<a name="ln387"> </a>
+<a name="ln388">	for (; readLength &gt; 0; --readLength, ++readBuffer) {</a>
+<a name="ln389">		status_t status = receive_byte(bus, readBuffer, readLength &gt; 1);</a>
+<a name="ln390">		if (status != B_OK)</a>
+<a name="ln391">			return status;</a>
+<a name="ln392">	}</a>
+<a name="ln393"> </a>
+<a name="ln394">	return B_OK;</a>
+<a name="ln395">}</a>
+<a name="ln396"> </a>
+<a name="ln397"> </a>
+<a name="ln398">//	#pragma mark - exported functions</a>
+<a name="ln399"> </a>
+<a name="ln400"> </a>
+<a name="ln401">//!	Combined i2c send+receive format</a>
+<a name="ln402">status_t</a>
+<a name="ln403">i2c_send_receive(const i2c_bus *bus, int slaveAddress, const uint8 *writeBuffer,</a>
+<a name="ln404">	size_t writeLength, uint8 *readBuffer, size_t readLength)</a>
+<a name="ln405">{</a>
+<a name="ln406">	status_t status = send_start_condition(bus);</a>
+<a name="ln407">	if (status != B_OK)</a>
+<a name="ln408">		return status;</a>
+<a name="ln409"> </a>
+<a name="ln410">	status = send_slave_address(bus, slaveAddress, true);</a>
+<a name="ln411">	if (status != B_OK)</a>
+<a name="ln412">		goto err;</a>
+<a name="ln413"> </a>
+<a name="ln414">	status = send_bytes(bus, writeBuffer, writeLength);</a>
+<a name="ln415">	if (status != B_OK)</a>
+<a name="ln416">		goto err;</a>
+<a name="ln417"> </a>
+<a name="ln418">	status = send_start_condition(bus);</a>
+<a name="ln419">	if (status != B_OK)</a>
+<a name="ln420">		return status;</a>
+<a name="ln421"> </a>
+<a name="ln422">	status = send_slave_address(bus, slaveAddress, false);</a>
+<a name="ln423">	if (status != B_OK)</a>
+<a name="ln424">		goto err;</a>
+<a name="ln425"> </a>
+<a name="ln426">	status = receive_bytes(bus, readBuffer, readLength);</a>
+<a name="ln427">	if (status != B_OK)</a>
+<a name="ln428">		goto err;</a>
+<a name="ln429"> </a>
+<a name="ln430">	return send_stop_condition(bus);</a>
+<a name="ln431"> </a>
+<a name="ln432">err:</a>
+<a name="ln433">	TRACE(&quot;%s: Cancelling transmission\n&quot;, __func__);</a>
+<a name="ln434">	send_stop_condition(bus);</a>
+<a name="ln435">	return status;</a>
+<a name="ln436">}</a>
+<a name="ln437"> </a>
+<a name="ln438"> </a>
+<a name="ln439">void</a>
+<a name="ln440">i2c_get100k_timing(i2c_timing *timing)</a>
+<a name="ln441">{</a>
+<a name="ln442">	// AKA standard i2c mode</a>
+<a name="ln443">	memcpy(timing, &amp;kTiming100k, sizeof(i2c_timing));</a>
+<a name="ln444">}</a>
+<a name="ln445"> </a>
+<a name="ln446"> </a>
+<a name="ln447">void</a>
+<a name="ln448">i2c_get400k_timing(i2c_timing *timing)</a>
+<a name="ln449">{</a>
+<a name="ln450">	// AKA fast i2c mode</a>
+<a name="ln451">	memcpy(timing, &amp;kTiming400k, sizeof(i2c_timing));</a>
+<a name="ln452">}</a>
+
+</code></pre>
+<div class="balloon" rel="276"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v564/" target="_blank">V564</a> The '|' operator is applied to bool type value. You've probably forgotten to include parentheses or intended to use the '||' operator.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,403 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>busses.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2002/03, Thomas Kurschel. All rights reserved.</a>
+<a name="ln3"> * Distributed under the terms of the MIT License.</a>
+<a name="ln4"> */</a>
+<a name="ln5"> </a>
+<a name="ln6">/*</a>
+<a name="ln7">	Part of Open SCSI bus manager</a>
+<a name="ln8"> </a>
+<a name="ln9">	Bus node layer.</a>
+<a name="ln10"> </a>
+<a name="ln11">	Whenever a controller driver publishes a new controller, a new SCSI bus</a>
+<a name="ln12">	for public and internal use is registered in turn. After that, this</a>
+<a name="ln13">	bus is told to rescan for devices. For each device, there is a</a>
+<a name="ln14">	device registered for peripheral drivers. (see devices.c)</a>
+<a name="ln15">*/</a>
+<a name="ln16"> </a>
+<a name="ln17">#include &quot;scsi_internal.h&quot;</a>
+<a name="ln18"> </a>
+<a name="ln19">#include &lt;string.h&gt;</a>
+<a name="ln20">#include &lt;malloc.h&gt;</a>
+<a name="ln21"> </a>
+<a name="ln22"> </a>
+<a name="ln23">// bus service should hurry up a bit - good controllers don't take much time</a>
+<a name="ln24">// but are very happy to be busy; don't make it realtime though as we</a>
+<a name="ln25">// don't really need that but would risk to steel processing power of</a>
+<a name="ln26">// realtime-demanding threads</a>
+<a name="ln27">#define BUS_SERVICE_PRIORITY B_URGENT_DISPLAY_PRIORITY</a>
+<a name="ln28"> </a>
+<a name="ln29"> </a>
+<a name="ln30">/**	implementation of service thread:</a>
+<a name="ln31"> *	it handles DPC and pending requests</a>
+<a name="ln32"> */</a>
+<a name="ln33"> </a>
+<a name="ln34">static void</a>
+<a name="ln35">scsi_do_service(scsi_bus_info *bus)</a>
+<a name="ln36">{</a>
+<a name="ln37">	while (true) {</a>
+<a name="ln38">		SHOW_FLOW0( 3, &quot;&quot; );</a>
+<a name="ln39"> </a>
+<a name="ln40">		// handle DPCs first as they are more urgent</a>
+<a name="ln41">		if (scsi_check_exec_dpc(bus))</a>
+<a name="ln42">			continue;</a>
+<a name="ln43"> </a>
+<a name="ln44">		if (scsi_check_exec_service(bus))</a>
+<a name="ln45">			continue;</a>
+<a name="ln46"> </a>
+<a name="ln47">		break;</a>
+<a name="ln48">	}</a>
+<a name="ln49">}</a>
+<a name="ln50"> </a>
+<a name="ln51"> </a>
+<a name="ln52">/** main loop of service thread */</a>
+<a name="ln53"> </a>
+<a name="ln54">static int32</a>
+<a name="ln55">scsi_service_threadproc(void *arg)</a>
+<a name="ln56">{</a>
+<a name="ln57">	scsi_bus_info *bus = (scsi_bus_info *)arg;</a>
+<a name="ln58">	int32 processed_notifications = 0;</a>
+<a name="ln59"> </a>
+<a name="ln60">	SHOW_FLOW(3, &quot;bus = %p&quot;, bus);</a>
+<a name="ln61"> </a>
+<a name="ln62">	while (true) {</a>
+<a name="ln63">		// we handle multiple requests in scsi_do_service at once;</a>
+<a name="ln64">		// to save time, we will acquire all notifications that are sent</a>
+<a name="ln65">		// up to now at once.</a>
+<a name="ln66">		// (Sadly, there is no &quot;set semaphore to zero&quot; function, so this</a>
+<a name="ln67">		//  is a poor-man emulation)</a>
+<a name="ln68">		acquire_sem_etc(bus-&gt;start_service, processed_notifications + 1, 0, 0);</a>
+<a name="ln69"> </a>
+<a name="ln70">		SHOW_FLOW0( 3, &quot;1&quot; );</a>
+<a name="ln71"> </a>
+<a name="ln72">		if (bus-&gt;shutting_down)</a>
+<a name="ln73">			break;</a>
+<a name="ln74"> </a>
+<a name="ln75">		// get number of notifications _before_ servicing to make sure no new</a>
+<a name="ln76">		// notifications are sent after do_service()</a>
+<a name="ln77">		get_sem_count(bus-&gt;start_service, &amp;processed_notifications);</a>
+<a name="ln78"> </a>
+<a name="ln79">		scsi_do_service(bus);</a>
+<a name="ln80">	}</a>
+<a name="ln81"> </a>
+<a name="ln82">	return 0;</a>
+<a name="ln83">}</a>
+<a name="ln84"> </a>
+<a name="ln85"> </a>
+<a name="ln86">static scsi_bus_info *</a>
+<a name="ln87">scsi_create_bus(device_node *node, uint8 path_id)</a>
+<a name="ln88">{</a>
+<a name="ln89">	scsi_bus_info *bus;</a>
+<a name="ln90">	int res;</a>
+<a name="ln91"> </a>
+<a name="ln92">	SHOW_FLOW0(3, &quot;&quot;);</a>
+<a name="ln93"> </a>
+<a name="ln94">	bus = (scsi_bus_info *)malloc(sizeof(*bus));</a>
+<a name="ln95">	if (bus == NULL)</a>
+<a name="ln96">		return NULL;</a>
+<a name="ln97"> </a>
+<a name="ln98">	memset(bus, 0, sizeof(*bus));</a>
+<a name="ln99"> </a>
+<a name="ln100">	bus-&gt;path_id = path_id;</a>
+<a name="ln101"> </a>
+<a name="ln102">	if (pnp-&gt;get_attr_uint32(node, SCSI_DEVICE_MAX_TARGET_COUNT, &amp;bus-&gt;max_target_count, true) != B_OK)</a>
+<a name="ln103">		bus-&gt;max_target_count = MAX_TARGET_ID + 1;</a>
+<a name="ln104">	if (pnp-&gt;get_attr_uint32(node, SCSI_DEVICE_MAX_LUN_COUNT, &amp;bus-&gt;max_lun_count, true) != B_OK)</a>
+<a name="ln105">		bus-&gt;max_lun_count = MAX_LUN_ID + 1;</a>
+<a name="ln106"> </a>
+<a name="ln107">	// our scsi_ccb only has a uchar for target_id</a>
+<a name="ln108">	if (bus-&gt;max_target_count &gt; 256)</a>
+<a name="ln109">		bus-&gt;max_target_count = 256;</a>
+<a name="ln110">	// our scsi_ccb only has a uchar for target_lun</a>
+<a name="ln111">	if (bus-&gt;max_lun_count &gt; 256)</a>
+<a name="ln112">		bus-&gt;max_lun_count = 256;</a>
+<a name="ln113"> </a>
+<a name="ln114">	bus-&gt;node = node;</a>
+<a name="ln115">	bus-&gt;lock_count = bus-&gt;blocked[0] = bus-&gt;blocked[1] = 0;</a>
+<a name="ln116">	bus-&gt;sim_overflow = 0;</a>
+<a name="ln117">	bus-&gt;shutting_down = false;</a>
+<a name="ln118"> </a>
+<a name="ln119">	bus-&gt;waiting_devices = NULL;</a>
+<a name="ln120">	//bus-&gt;resubmitted_req = NULL;</a>
+<a name="ln121"> </a>
+<a name="ln122">	bus-&gt;dpc_list = NULL;</a>
+<a name="ln123"> </a>
+<a name="ln124">	if ((bus-&gt;scan_lun_lock = create_sem(1, &quot;scsi_scan_lun_lock&quot;)) &lt; 0) {</a>
+<a name="ln125">		res = bus-&gt;scan_lun_lock;</a>
+<a name="ln126">		goto err6;</a>
+<a name="ln127">	}</a>
+<a name="ln128"> </a>
+<a name="ln129">	bus-&gt;start_service = create_sem(0, &quot;scsi_start_service&quot;);</a>
+<a name="ln130">	if (bus-&gt;start_service &lt; 0) {</a>
+<a name="ln131">		res = bus-&gt;start_service;</a>
+<a name="ln132">		goto err4;</a>
+<a name="ln133">	}</a>
+<a name="ln134"> </a>
+<a name="ln135">	res = INIT_BEN(&amp;bus-&gt;mutex, &quot;scsi_bus_mutex&quot;);</a>
+<a name="ln136">	if (res &lt; B_OK)</a>
+<a name="ln137">		goto err3;</a>
+<a name="ln138"> </a>
+<a name="ln139">	spinlock_irq_init(&amp;bus-&gt;dpc_lock);</a>
+<a name="ln140"> </a>
+<a name="ln141">	res = scsi_init_ccb_alloc(bus);</a>
+<a name="ln142">	if (res &lt; B_OK)</a>
+<a name="ln143">		goto err2;</a>
+<a name="ln144"> </a>
+<a name="ln145">	bus-&gt;service_thread = spawn_kernel_thread(scsi_service_threadproc,</a>
+<a name="ln146">		&quot;scsi_bus_service&quot;, BUS_SERVICE_PRIORITY, bus);</a>
+<a name="ln147"> </a>
+<a name="ln148">	if (bus-&gt;service_thread &lt; 0) {</a>
+<a name="ln149">		res = bus-&gt;service_thread;</a>
+<a name="ln150">		goto err1;</a>
+<a name="ln151">	}</a>
+<a name="ln152"> </a>
+<a name="ln153">	resume_thread(bus-&gt;service_thread);</a>
+<a name="ln154"> </a>
+<a name="ln155">	return bus;</a>
+<a name="ln156"> </a>
+<a name="ln157">err1:</a>
+<a name="ln158">	scsi_uninit_ccb_alloc(bus);</a>
+<a name="ln159">err2:</a>
+<a name="ln160">	DELETE_BEN(&amp;bus-&gt;mutex);</a>
+<a name="ln161">err3:</a>
+<a name="ln162">	delete_sem(bus-&gt;start_service);</a>
+<a name="ln163">err4:</a>
+<a name="ln164">	delete_sem(bus-&gt;scan_lun_lock);</a>
+<a name="ln165">err6:</a>
+<a name="ln166">	free(bus);</a>
+<a name="ln167">	return NULL;</a>
+<a name="ln168">}</a>
+<a name="ln169"> </a>
+<a name="ln170"> </a>
+<a name="ln171">static status_t</a>
+<a name="ln172">scsi_destroy_bus(scsi_bus_info *bus)</a>
+<a name="ln173">{</a>
+<a name="ln174">	int32 retcode;</a>
+<a name="ln175"> </a>
+<a name="ln176">	// noone is using this bus now, time to clean it up</a>
+<a name="ln177">	bus-&gt;shutting_down = true;</a>
+<a name="ln178">	release_sem(bus-&gt;start_service);</a>
+<a name="ln179"> </a>
+<a name="ln180">	wait_for_thread(bus-&gt;service_thread, &amp;retcode);</a>
+<a name="ln181"> </a>
+<a name="ln182">	delete_sem(bus-&gt;start_service);</a>
+<a name="ln183">	DELETE_BEN(&amp;bus-&gt;mutex);</a>
+<a name="ln184">	delete_sem(bus-&gt;scan_lun_lock);</a>
+<a name="ln185"> </a>
+<a name="ln186">	scsi_uninit_ccb_alloc(bus);</a>
+<a name="ln187"> </a>
+<a name="ln188">	return B_OK;</a>
+<a name="ln189">}</a>
+<a name="ln190"> </a>
+<a name="ln191"> </a>
+<a name="ln192">static status_t</a>
+<a name="ln193">scsi_init_bus(device_node *node, void **cookie)</a>
+<a name="ln194">{</a>
+<a name="ln195">	uint8 path_id;</a>
+<a name="ln196">	scsi_bus_info *bus;</a>
+<a name="ln197">	status_t res;</a>
+<a name="ln198"> </a>
+<a name="ln199">	SHOW_FLOW0( 3, &quot;&quot; );</a>
+<a name="ln200"> </a>
+<a name="ln201">	if (pnp-&gt;get_attr_uint8(node, SCSI_BUS_PATH_ID_ITEM, &amp;path_id, false) != B_OK)</a>
+<a name="ln202">		return B_ERROR;</a>
+<a name="ln203"> </a>
+<a name="ln204">	bus = scsi_create_bus(node, path_id);</a>
+<a name="ln205">	if (bus == NULL)</a>
+<a name="ln206">		return B_NO_MEMORY;</a>
+<a name="ln207"> </a>
+<a name="ln208">	// extract controller/protocoll restrictions from node</a>
+<a name="ln209">	if (pnp-&gt;get_attr_uint32(node, B_DMA_ALIGNMENT, &amp;bus-&gt;dma_params.alignment,</a>
+<a name="ln210">			true) != B_OK)</a>
+<a name="ln211">		bus-&gt;dma_params.alignment = 0;</a>
+<a name="ln212">	if (pnp-&gt;get_attr_uint32(node, B_DMA_MAX_TRANSFER_BLOCKS,</a>
+<a name="ln213">			&amp;bus-&gt;dma_params.max_blocks, true) != B_OK)</a>
+<a name="ln214">		bus-&gt;dma_params.max_blocks = 0xffffffff;</a>
+<a name="ln215">	if (pnp-&gt;get_attr_uint32(node, B_DMA_BOUNDARY,</a>
+<a name="ln216">			&amp;bus-&gt;dma_params.dma_boundary, true) != B_OK)</a>
+<a name="ln217">		bus-&gt;dma_params.dma_boundary = ~0;</a>
+<a name="ln218">	if (pnp-&gt;get_attr_uint32(node, B_DMA_MAX_SEGMENT_BLOCKS,</a>
+<a name="ln219">			&amp;bus-&gt;dma_params.max_sg_block_size, true) != B_OK)</a>
+<a name="ln220">		bus-&gt;dma_params.max_sg_block_size = 0xffffffff;</a>
+<a name="ln221">	if (pnp-&gt;get_attr_uint32(node, B_DMA_MAX_SEGMENT_COUNT,</a>
+<a name="ln222">			&amp;bus-&gt;dma_params.max_sg_blocks, true) != B_OK)</a>
+<a name="ln223">		bus-&gt;dma_params.max_sg_blocks = ~0;</a>
+<a name="ln224"> </a>
+<a name="ln225">	// do some sanity check:</a>
+<a name="ln226">	bus-&gt;dma_params.max_sg_block_size &amp;= ~bus-&gt;dma_params.alignment;</a>
+<a name="ln227"> </a>
+<a name="ln228">	if (bus-&gt;dma_params.alignment &gt; B_PAGE_SIZE) {</a>
+<a name="ln229">		SHOW_ERROR(0, &quot;Alignment (0x%&quot; B_PRIx32 &quot;) must be less then &quot;</a>
+<a name="ln230">			&quot;B_PAGE_SIZE&quot;, bus-&gt;dma_params.alignment);</a>
+<a name="ln231">		res = B_ERROR;</a>
+<a name="ln232">		goto err;</a>
+<a name="ln233">	}</a>
+<a name="ln234"> </a>
+<a name="ln235">	if (bus-&gt;dma_params.max_sg_block_size &lt; 1) {</a>
+<a name="ln236">		SHOW_ERROR(0, &quot;Max s/g block size (0x%&quot; B_PRIx32 &quot;) is too small&quot;,</a>
+<a name="ln237">			bus-&gt;dma_params.max_sg_block_size);</a>
+<a name="ln238">		res = B_ERROR;</a>
+<a name="ln239">		goto err;</a>
+<a name="ln240">	}</a>
+<a name="ln241"> </a>
+<a name="ln242">	if (bus-&gt;dma_params.dma_boundary &lt; B_PAGE_SIZE - 1) {</a>
+<a name="ln243">		SHOW_ERROR(0, &quot;DMA boundary (0x%&quot; B_PRIx32 &quot;) must be at least &quot;</a>
+<a name="ln244">			&quot;B_PAGE_SIZE&quot;, bus-&gt;dma_params.dma_boundary);</a>
+<a name="ln245">		res = B_ERROR;</a>
+<a name="ln246">		goto err;</a>
+<a name="ln247">	}</a>
+<a name="ln248"> </a>
+<a name="ln249">	if (bus-&gt;dma_params.max_blocks &lt; 1 || bus-&gt;dma_params.max_sg_blocks &lt; 1) {</a>
+<a name="ln250">		SHOW_ERROR(0, &quot;Max blocks (%&quot; B_PRIu32 &quot;) and max s/g blocks (%&quot;</a>
+<a name="ln251">			B_PRIu32 &quot;) must be at least 1&quot;, bus-&gt;dma_params.max_blocks,</a>
+<a name="ln252">			bus-&gt;dma_params.max_sg_blocks);</a>
+<a name="ln253">		res = B_ERROR;</a>
+<a name="ln254">		goto err;</a>
+<a name="ln255">	}</a>
+<a name="ln256"> </a>
+<a name="ln257">	{</a>
+<a name="ln258">		device_node *parent = pnp-&gt;get_parent_node(node);</a>
+<a name="ln259">		pnp-&gt;get_driver(parent, (driver_module_info **)&amp;bus-&gt;interface,</a>
+<a name="ln260">			(void **)&amp;bus-&gt;sim_cookie);</a>
+<a name="ln261">		pnp-&gt;put_node(parent);</a>
+<a name="ln262"> </a>
+<a name="ln263">		bus-&gt;interface-&gt;set_scsi_bus(bus-&gt;sim_cookie, bus);</a>
+<a name="ln264">	}</a>
+<a name="ln265"> </a>
+<a name="ln266">	// cache inquiry data</a>
+<a name="ln267">	scsi_inquiry_path(bus, &amp;bus-&gt;inquiry_data);</a>
+<a name="ln268"> </a>
+<a name="ln269">	// get max. number of commands on bus</a>
+<a name="ln270">	bus-&gt;left_slots = bus-&gt;inquiry_data.hba_queue_size;</a>
+<a name="ln271">	SHOW_FLOW( 3, &quot;Bus has %d slots&quot;, bus-&gt;left_slots );</a>
+<a name="ln272"> </a>
+<a name="ln273">	*cookie = bus;</a>
+<a name="ln274"> </a>
+<a name="ln275">	return B_OK;</a>
+<a name="ln276"> </a>
+<a name="ln277">err:</a>
+<a name="ln278">	scsi_destroy_bus(bus);</a>
+<a name="ln279">	return res;</a>
+<a name="ln280">}</a>
+<a name="ln281"> </a>
+<a name="ln282"> </a>
+<a name="ln283">static void</a>
+<a name="ln284">scsi_uninit_bus(scsi_bus_info *bus)</a>
+<a name="ln285">{</a>
+<a name="ln286">	scsi_destroy_bus(bus);</a>
+<a name="ln287">}</a>
+<a name="ln288"> </a>
+<a name="ln289"> </a>
+<a name="ln290">uchar</a>
+<a name="ln291">scsi_inquiry_path(scsi_bus bus, scsi_path_inquiry *inquiry_data)</a>
+<a name="ln292">{</a>
+<a name="ln293">	SHOW_FLOW(4, &quot;path_id=%d&quot;, bus-&gt;path_id);</a>
+<a name="ln294">	return bus-&gt;interface-&gt;path_inquiry(bus-&gt;sim_cookie, inquiry_data);</a>
+<a name="ln295">}</a>
+<a name="ln296"> </a>
+<a name="ln297"> </a>
+<a name="ln298">static uchar</a>
+<a name="ln299">scsi_reset_bus(scsi_bus_info *bus)</a>
+<a name="ln300">{</a>
+<a name="ln301">	return bus-&gt;interface-&gt;reset_bus(bus-&gt;sim_cookie);</a>
+<a name="ln302">}</a>
+<a name="ln303"> </a>
+<a name="ln304"> </a>
+<a name="ln305">static status_t</a>
+<a name="ln306">scsi_bus_module_init(void)</a>
+<a name="ln307">{</a>
+<a name="ln308">	SHOW_FLOW0(4, &quot;&quot;);</a>
+<a name="ln309">	return init_temp_sg();</a>
+<a name="ln310">}</a>
+<a name="ln311"> </a>
+<a name="ln312"> </a>
+<a name="ln313">static status_t</a>
+<a name="ln314">scsi_bus_module_uninit(void)</a>
+<a name="ln315">{</a>
+<a name="ln316">	SHOW_INFO0(4, &quot;&quot;);</a>
+<a name="ln317"> </a>
+<a name="ln318">	uninit_temp_sg();</a>
+<a name="ln319">	return B_OK;</a>
+<a name="ln320">}</a>
+<a name="ln321"> </a>
+<a name="ln322"> </a>
+<a name="ln323">static status_t</a>
+<a name="ln324">std_ops(int32 op, ...)</a>
+<a name="ln325">{</a>
+<a name="ln326">	switch (op) {</a>
+<a name="ln327">		case B_MODULE_INIT:</a>
+<a name="ln328">			return scsi_bus_module_init();</a>
+<a name="ln329">		case B_MODULE_UNINIT:</a>
+<a name="ln330">			return scsi_bus_module_uninit();</a>
+<a name="ln331"> </a>
+<a name="ln332">		default:</a>
+<a name="ln333">			return B_ERROR;</a>
+<a name="ln334">	}</a>
+<a name="ln335">}</a>
+<a name="ln336"> </a>
+<a name="ln337"> </a>
+<a name="ln338">scsi_bus_interface scsi_bus_module = {</a>
+<a name="ln339">	{</a>
+<a name="ln340">		{</a>
+<a name="ln341">			SCSI_BUS_MODULE_NAME,</a>
+<a name="ln342">			0,</a>
+<a name="ln343">			std_ops</a>
+<a name="ln344">		},</a>
+<a name="ln345"> </a>
+<a name="ln346">		NULL,	// supported devices</a>
+<a name="ln347">		NULL,	// register node</a>
+<a name="ln348">		scsi_init_bus,</a>
+<a name="ln349">		(void (*)(void *))scsi_uninit_bus,</a>
+<a name="ln350">		(status_t (*)(void *))scsi_scan_bus,</a>
+<a name="ln351">		(status_t (*)(void *))scsi_scan_bus,</a>
+<a name="ln352">		NULL</a>
+<a name="ln353">	},</a>
+<a name="ln354"> </a>
+<a name="ln355">	scsi_inquiry_path,</a>
+<a name="ln356">	scsi_reset_bus,</a>
+<a name="ln357">};</a>
+
+</code></pre>
+<div class="balloon" rel="136"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v547/" target="_blank">V547</a> Expression 'res < ((int) 0)' is always false.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

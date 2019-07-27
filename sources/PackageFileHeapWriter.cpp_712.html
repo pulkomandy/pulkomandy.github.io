@@ -1,0 +1,711 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>PackageFileHeapWriter.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2013-2014, Ingo Weinhold, ingo_weinhold@gmx.de.</a>
+<a name="ln3"> * Distributed under the terms of the MIT License.</a>
+<a name="ln4"> */</a>
+<a name="ln5"> </a>
+<a name="ln6"> </a>
+<a name="ln7">#include &lt;package/hpkg/PackageFileHeapWriter.h&gt;</a>
+<a name="ln8"> </a>
+<a name="ln9">#include &lt;algorithm&gt;</a>
+<a name="ln10">#include &lt;new&gt;</a>
+<a name="ln11"> </a>
+<a name="ln12">#include &lt;ByteOrder.h&gt;</a>
+<a name="ln13">#include &lt;List.h&gt;</a>
+<a name="ln14">#include &lt;package/hpkg/ErrorOutput.h&gt;</a>
+<a name="ln15">#include &lt;package/hpkg/HPKGDefs.h&gt;</a>
+<a name="ln16"> </a>
+<a name="ln17">#include &lt;AutoDeleter.h&gt;</a>
+<a name="ln18">#include &lt;package/hpkg/DataReader.h&gt;</a>
+<a name="ln19">#include &lt;package/hpkg/PackageFileHeapReader.h&gt;</a>
+<a name="ln20">#include &lt;RangeArray.h&gt;</a>
+<a name="ln21">#include &lt;CompressionAlgorithm.h&gt;</a>
+<a name="ln22"> </a>
+<a name="ln23"> </a>
+<a name="ln24">// minimum length of data we require before trying to compress them</a>
+<a name="ln25">static const size_t kCompressionSizeThreshold = 64;</a>
+<a name="ln26"> </a>
+<a name="ln27"> </a>
+<a name="ln28">namespace BPackageKit {</a>
+<a name="ln29"> </a>
+<a name="ln30">namespace BHPKG {</a>
+<a name="ln31"> </a>
+<a name="ln32">namespace BPrivate {</a>
+<a name="ln33"> </a>
+<a name="ln34"> </a>
+<a name="ln35">struct PackageFileHeapWriter::Chunk {</a>
+<a name="ln36">	uint64	offset;</a>
+<a name="ln37">	uint32	compressedSize;</a>
+<a name="ln38">	uint32	uncompressedSize;</a>
+<a name="ln39">	void*	buffer;</a>
+<a name="ln40">};</a>
+<a name="ln41"> </a>
+<a name="ln42"> </a>
+<a name="ln43">struct PackageFileHeapWriter::ChunkSegment {</a>
+<a name="ln44">	ssize_t	chunkIndex;</a>
+<a name="ln45">	uint32	toKeepOffset;</a>
+<a name="ln46">	uint32	toKeepSize;</a>
+<a name="ln47">};</a>
+<a name="ln48"> </a>
+<a name="ln49"> </a>
+<a name="ln50">struct PackageFileHeapWriter::ChunkBuffer {</a>
+<a name="ln51">	ChunkBuffer(PackageFileHeapWriter* writer, size_t bufferSize)</a>
+<a name="ln52">		:</a>
+<a name="ln53">		fWriter(writer),</a>
+<a name="ln54">		fChunks(),</a>
+<a name="ln55">		fCurrentChunkIndex(0),</a>
+<a name="ln56">		fNextReadIndex(0),</a>
+<a name="ln57">		fSegments(),</a>
+<a name="ln58">		fCurrentSegmentIndex(0),</a>
+<a name="ln59">		fBuffers(),</a>
+<a name="ln60">		fUnusedBuffers(),</a>
+<a name="ln61">		fBufferSize(bufferSize)</a>
+<a name="ln62">	{</a>
+<a name="ln63">	}</a>
+<a name="ln64"> </a>
+<a name="ln65">	~ChunkBuffer()</a>
+<a name="ln66">	{</a>
+<a name="ln67">		for (int32 i = 0; void* buffer = fBuffers.ItemAt(i); i++)</a>
+<a name="ln68">			free(buffer);</a>
+<a name="ln69">	}</a>
+<a name="ln70"> </a>
+<a name="ln71">	bool PushChunkSegment(uint64 chunkOffset, uint32 compressedSize,</a>
+<a name="ln72">		uint32 uncompressedSize, uint32 toKeepOffset, uint32 toKeepSize)</a>
+<a name="ln73">	{</a>
+<a name="ln74">		ChunkSegment segment;</a>
+<a name="ln75">		segment.toKeepOffset = toKeepOffset;</a>
+<a name="ln76">		segment.toKeepSize = toKeepSize;</a>
+<a name="ln77"> </a>
+<a name="ln78">		// might refer to the last chunk</a>
+<a name="ln79">		segment.chunkIndex = fChunks.Count() - 1;</a>
+<a name="ln80"> </a>
+<a name="ln81">		if (segment.chunkIndex &lt; 0</a>
+<a name="ln82">			|| fChunks.ElementAt(segment.chunkIndex).offset != chunkOffset) {</a>
+<a name="ln83">			// no, need to push a new chunk</a>
+<a name="ln84">			segment.chunkIndex++;</a>
+<a name="ln85"> </a>
+<a name="ln86">			Chunk chunk;</a>
+<a name="ln87">			chunk.offset = chunkOffset;</a>
+<a name="ln88">			chunk.compressedSize = compressedSize;</a>
+<a name="ln89">			chunk.uncompressedSize = uncompressedSize;</a>
+<a name="ln90">			chunk.buffer = NULL;</a>
+<a name="ln91">			if (!fChunks.Add(chunk))</a>
+<a name="ln92">				return false;</a>
+<a name="ln93">		}</a>
+<a name="ln94"> </a>
+<a name="ln95">		return fSegments.Add(segment);</a>
+<a name="ln96">	}</a>
+<a name="ln97"> </a>
+<a name="ln98">	bool IsEmpty() const</a>
+<a name="ln99">	{</a>
+<a name="ln100">		return fSegments.IsEmpty();</a>
+<a name="ln101">	}</a>
+<a name="ln102"> </a>
+<a name="ln103">	bool HasMoreSegments() const</a>
+<a name="ln104">	{</a>
+<a name="ln105">		return fCurrentSegmentIndex &lt; fSegments.Count();</a>
+<a name="ln106">	}</a>
+<a name="ln107"> </a>
+<a name="ln108">	const ChunkSegment&amp; CurrentSegment() const</a>
+<a name="ln109">	{</a>
+<a name="ln110">		return fSegments[fCurrentSegmentIndex];</a>
+<a name="ln111">	}</a>
+<a name="ln112"> </a>
+<a name="ln113">	const Chunk&amp; ChunkAt(ssize_t index) const</a>
+<a name="ln114">	{</a>
+<a name="ln115">		return fChunks[index];</a>
+<a name="ln116">	}</a>
+<a name="ln117"> </a>
+<a name="ln118">	bool HasMoreChunksToRead() const</a>
+<a name="ln119">	{</a>
+<a name="ln120">		return fNextReadIndex &lt; fChunks.Count();</a>
+<a name="ln121">	}</a>
+<a name="ln122"> </a>
+<a name="ln123">	bool HasBufferedChunk() const</a>
+<a name="ln124">	{</a>
+<a name="ln125">		return fCurrentChunkIndex &lt; fNextReadIndex;</a>
+<a name="ln126">	}</a>
+<a name="ln127"> </a>
+<a name="ln128">	uint64 NextReadOffset() const</a>
+<a name="ln129">	{</a>
+<a name="ln130">		return fChunks[fNextReadIndex].offset;</a>
+<a name="ln131">	}</a>
+<a name="ln132"> </a>
+<a name="ln133">	void ReadNextChunk()</a>
+<a name="ln134">	{</a>
+<a name="ln135">		if (!HasMoreChunksToRead())</a>
+<a name="ln136">			throw status_t(B_BAD_VALUE);</a>
+<a name="ln137"> </a>
+<a name="ln138">		Chunk&amp; chunk = fChunks[fNextReadIndex++];</a>
+<a name="ln139">		chunk.buffer = _GetBuffer();</a>
+<a name="ln140"> </a>
+<a name="ln141">		status_t error = fWriter-&gt;ReadFileData(chunk.offset, chunk.buffer,</a>
+<a name="ln142">			chunk.compressedSize);</a>
+<a name="ln143">		if (error != B_OK)</a>
+<a name="ln144">			throw error;</a>
+<a name="ln145">	}</a>
+<a name="ln146"> </a>
+<a name="ln147">	void CurrentSegmentDone()</a>
+<a name="ln148">	{</a>
+<a name="ln149">		// Unless the next segment refers to the same chunk, advance to the next</a>
+<a name="ln150">		// chunk.</a>
+<a name="ln151">		const ChunkSegment&amp; segment = fSegments[fCurrentSegmentIndex++];</a>
+<a name="ln152">		if (!HasMoreSegments()</a>
+<a name="ln153">			|| segment.chunkIndex != CurrentSegment().chunkIndex) {</a>
+<a name="ln154">			_PutBuffer(fChunks[fCurrentChunkIndex++].buffer);</a>
+<a name="ln155">		}</a>
+<a name="ln156">	}</a>
+<a name="ln157"> </a>
+<a name="ln158">private:</a>
+<a name="ln159">	void* _GetBuffer()</a>
+<a name="ln160">	{</a>
+<a name="ln161">		if (!fUnusedBuffers.IsEmpty())</a>
+<a name="ln162">			return fUnusedBuffers.RemoveItem(fUnusedBuffers.CountItems() - 1);</a>
+<a name="ln163"> </a>
+<a name="ln164">		void* buffer = malloc(fBufferSize);</a>
+<a name="ln165">		if (buffer == NULL &amp;&amp; !fBuffers.AddItem(buffer)) {</a>
+<a name="ln166">			free(buffer);</a>
+<a name="ln167">			throw std::bad_alloc();</a>
+<a name="ln168">		}</a>
+<a name="ln169"> </a>
+<a name="ln170">		return buffer;</a>
+<a name="ln171">	}</a>
+<a name="ln172"> </a>
+<a name="ln173">	void _PutBuffer(void* buffer)</a>
+<a name="ln174">	{</a>
+<a name="ln175">		if (buffer != NULL &amp;&amp; !fUnusedBuffers.AddItem(buffer)) {</a>
+<a name="ln176">			fBuffers.RemoveItem(buffer);</a>
+<a name="ln177">			free(buffer);</a>
+<a name="ln178">		}</a>
+<a name="ln179">	}</a>
+<a name="ln180"> </a>
+<a name="ln181">private:</a>
+<a name="ln182">	PackageFileHeapWriter*	fWriter;</a>
+<a name="ln183"> </a>
+<a name="ln184">	Array&lt;Chunk&gt;			fChunks;</a>
+<a name="ln185">	ssize_t					fCurrentChunkIndex;</a>
+<a name="ln186">	ssize_t					fNextReadIndex;</a>
+<a name="ln187"> </a>
+<a name="ln188">	Array&lt;ChunkSegment&gt;		fSegments;</a>
+<a name="ln189">	ssize_t					fCurrentSegmentIndex;</a>
+<a name="ln190"> </a>
+<a name="ln191">	BList					fBuffers;</a>
+<a name="ln192">	BList					fUnusedBuffers;</a>
+<a name="ln193">	size_t					fBufferSize;</a>
+<a name="ln194">};</a>
+<a name="ln195"> </a>
+<a name="ln196"> </a>
+<a name="ln197">PackageFileHeapWriter::PackageFileHeapWriter(BErrorOutput* errorOutput,</a>
+<a name="ln198">	BPositionIO* file, off_t heapOffset,</a>
+<a name="ln199">	CompressionAlgorithmOwner* compressionAlgorithm,</a>
+<a name="ln200">	DecompressionAlgorithmOwner* decompressionAlgorithm)</a>
+<a name="ln201">	:</a>
+<a name="ln202">	PackageFileHeapAccessorBase(errorOutput, file, heapOffset,</a>
+<a name="ln203">		decompressionAlgorithm),</a>
+<a name="ln204">	fPendingDataBuffer(NULL),</a>
+<a name="ln205">	fCompressedDataBuffer(NULL),</a>
+<a name="ln206">	fPendingDataSize(0),</a>
+<a name="ln207">	fOffsets(),</a>
+<a name="ln208">	fCompressionAlgorithm(compressionAlgorithm)</a>
+<a name="ln209">{</a>
+<a name="ln210">	if (fCompressionAlgorithm != NULL)</a>
+<a name="ln211">		fCompressionAlgorithm-&gt;AcquireReference();</a>
+<a name="ln212">}</a>
+<a name="ln213"> </a>
+<a name="ln214"> </a>
+<a name="ln215">PackageFileHeapWriter::~PackageFileHeapWriter()</a>
+<a name="ln216">{</a>
+<a name="ln217">	_Uninit();</a>
+<a name="ln218"> </a>
+<a name="ln219">	if (fCompressionAlgorithm != NULL)</a>
+<a name="ln220">		fCompressionAlgorithm-&gt;ReleaseReference();</a>
+<a name="ln221">}</a>
+<a name="ln222"> </a>
+<a name="ln223"> </a>
+<a name="ln224">void</a>
+<a name="ln225">PackageFileHeapWriter::Init()</a>
+<a name="ln226">{</a>
+<a name="ln227">	// allocate data buffers</a>
+<a name="ln228">	fPendingDataBuffer = malloc(kChunkSize);</a>
+<a name="ln229">	fCompressedDataBuffer = malloc(kChunkSize);</a>
+<a name="ln230">	if (fPendingDataBuffer == NULL || fCompressedDataBuffer == NULL)</a>
+<a name="ln231">		throw std::bad_alloc();</a>
+<a name="ln232">}</a>
+<a name="ln233"> </a>
+<a name="ln234"> </a>
+<a name="ln235">void</a>
+<a name="ln236">PackageFileHeapWriter::Reinit(PackageFileHeapReader* heapReader)</a>
+<a name="ln237">{</a>
+<a name="ln238">	fHeapOffset = heapReader-&gt;HeapOffset();</a>
+<a name="ln239">	fCompressedHeapSize = heapReader-&gt;CompressedHeapSize();</a>
+<a name="ln240">	fUncompressedHeapSize = heapReader-&gt;UncompressedHeapSize();</a>
+<a name="ln241">	fPendingDataSize = 0;</a>
+<a name="ln242"> </a>
+<a name="ln243">	// copy the offsets array</a>
+<a name="ln244">	size_t chunkCount = (fUncompressedHeapSize + kChunkSize - 1) / kChunkSize;</a>
+<a name="ln245">	if (chunkCount &gt; 0) {</a>
+<a name="ln246">		if (!fOffsets.AddUninitialized(chunkCount))</a>
+<a name="ln247">			throw std::bad_alloc();</a>
+<a name="ln248"> </a>
+<a name="ln249">		for (size_t i = 0; i &lt; chunkCount; i++)</a>
+<a name="ln250">			fOffsets[i] = heapReader-&gt;Offsets()[i];</a>
+<a name="ln251">	}</a>
+<a name="ln252"> </a>
+<a name="ln253">	_UnwriteLastPartialChunk();</a>
+<a name="ln254">}</a>
+<a name="ln255"> </a>
+<a name="ln256"> </a>
+<a name="ln257">status_t</a>
+<a name="ln258">PackageFileHeapWriter::AddData(BDataReader&amp; dataReader, off_t size,</a>
+<a name="ln259">	uint64&amp; _offset)</a>
+<a name="ln260">{</a>
+<a name="ln261">	_offset = fUncompressedHeapSize;</a>
+<a name="ln262"> </a>
+<a name="ln263">	// copy the data to the heap</a>
+<a name="ln264">	off_t readOffset = 0;</a>
+<a name="ln265">	off_t remainingSize = size;</a>
+<a name="ln266">	while (remainingSize &gt; 0) {</a>
+<a name="ln267">		// read data into pending data buffer</a>
+<a name="ln268">		size_t toCopy = std::min(remainingSize,</a>
+<a name="ln269">			off_t(kChunkSize - fPendingDataSize));</a>
+<a name="ln270">		status_t error = dataReader.ReadData(readOffset,</a>
+<a name="ln271">			(uint8*)fPendingDataBuffer + fPendingDataSize, toCopy);</a>
+<a name="ln272">		if (error != B_OK) {</a>
+<a name="ln273">			fErrorOutput-&gt;PrintError(&quot;Failed to read data: %s\n&quot;,</a>
+<a name="ln274">				strerror(error));</a>
+<a name="ln275">			return error;</a>
+<a name="ln276">		}</a>
+<a name="ln277"> </a>
+<a name="ln278">		fPendingDataSize += toCopy;</a>
+<a name="ln279">		fUncompressedHeapSize += toCopy;</a>
+<a name="ln280">		remainingSize -= toCopy;</a>
+<a name="ln281">		readOffset += toCopy;</a>
+<a name="ln282"> </a>
+<a name="ln283">		if (fPendingDataSize == kChunkSize) {</a>
+<a name="ln284">			error = _FlushPendingData();</a>
+<a name="ln285">			if (error != B_OK)</a>
+<a name="ln286">				return error;</a>
+<a name="ln287">		}</a>
+<a name="ln288">	}</a>
+<a name="ln289"> </a>
+<a name="ln290">	return B_OK;</a>
+<a name="ln291">}</a>
+<a name="ln292"> </a>
+<a name="ln293"> </a>
+<a name="ln294">void</a>
+<a name="ln295">PackageFileHeapWriter::AddDataThrows(const void* buffer, size_t size)</a>
+<a name="ln296">{</a>
+<a name="ln297">	BBufferDataReader reader(buffer, size);</a>
+<a name="ln298">	uint64 dummyOffset;</a>
+<a name="ln299">	status_t error = AddData(reader, size, dummyOffset);</a>
+<a name="ln300">	if (error != B_OK)</a>
+<a name="ln301">		throw status_t(error);</a>
+<a name="ln302">}</a>
+<a name="ln303"> </a>
+<a name="ln304"> </a>
+<a name="ln305">void</a>
+<a name="ln306">PackageFileHeapWriter::RemoveDataRanges(</a>
+<a name="ln307">	const ::BPrivate::RangeArray&lt;uint64&gt;&amp; ranges)</a>
+<a name="ln308">{</a>
+<a name="ln309">	ssize_t rangeCount = ranges.CountRanges();</a>
+<a name="ln310">	if (rangeCount == 0)</a>
+<a name="ln311">		return;</a>
+<a name="ln312"> </a>
+<a name="ln313">	if (fUncompressedHeapSize == 0) {</a>
+<a name="ln314">		fErrorOutput-&gt;PrintError(&quot;Can't remove ranges from empty heap\n&quot;);</a>
+<a name="ln315">		throw status_t(B_BAD_VALUE);</a>
+<a name="ln316">	}</a>
+<a name="ln317"> </a>
+<a name="ln318">	// Before we begin flush any pending data, so we don't need any special</a>
+<a name="ln319">	// handling and also can use the pending data buffer.</a>
+<a name="ln320">	_FlushPendingData();</a>
+<a name="ln321"> </a>
+<a name="ln322">	// We potentially have to recompress all data from the first affected chunk</a>
+<a name="ln323">	// to the end (minus the removed ranges, of course). As a basic algorithm we</a>
+<a name="ln324">	// can use our usual data writing strategy, i.e. read a chunk, decompress it</a>
+<a name="ln325">	// to a temporary buffer, and write the data to keep via AddData(). There</a>
+<a name="ln326">	// are a few complications/optimizations, though:</a>
+<a name="ln327">	// * As data moves to other chunks, it may actually compress worse than</a>
+<a name="ln328">	//   before. While unlikely, we still have to take care of this case by</a>
+<a name="ln329">	//   making sure our reading end is at least a complete uncompressed chunk</a>
+<a name="ln330">	//   ahead of the writing end.</a>
+<a name="ln331">	// * When we run into the situation that we have to move complete aligned</a>
+<a name="ln332">	//   chunks, we want to avoid uncompressing and recompressing them</a>
+<a name="ln333">	//   needlessly.</a>
+<a name="ln334"> </a>
+<a name="ln335">	// Build a list of (possibly partial) chunks we want to keep.</a>
+<a name="ln336"> </a>
+<a name="ln337">	// the first partial chunk (if any) and all chunks between ranges</a>
+<a name="ln338">	ChunkBuffer chunkBuffer(this, kChunkSize);</a>
+<a name="ln339">	uint64 writeOffset = ranges[0].offset - ranges[0].offset % kChunkSize;</a>
+<a name="ln340">	uint64 readOffset = writeOffset;</a>
+<a name="ln341">	for (ssize_t i = 0; i &lt; rangeCount; i++) {</a>
+<a name="ln342">		const Range&lt;uint64&gt;&amp; range = ranges[i];</a>
+<a name="ln343">		if (range.size &gt; 0) {</a>
+<a name="ln344">			_PushChunks(chunkBuffer, readOffset, range.offset);</a>
+<a name="ln345">			readOffset = range.offset + range.size;</a>
+<a name="ln346">		}</a>
+<a name="ln347">	}</a>
+<a name="ln348"> </a>
+<a name="ln349">	if (readOffset == writeOffset) {</a>
+<a name="ln350">		fErrorOutput-&gt;PrintError(&quot;Only empty ranges to remove from heap\n&quot;);</a>
+<a name="ln351">		throw status_t(B_BAD_VALUE);</a>
+<a name="ln352">	}</a>
+<a name="ln353"> </a>
+<a name="ln354">	// all chunks after the last range</a>
+<a name="ln355">	_PushChunks(chunkBuffer, readOffset, fUncompressedHeapSize);</a>
+<a name="ln356"> </a>
+<a name="ln357">	// Reset our state to look like all chunks from the first affected one have</a>
+<a name="ln358">	// been removed and re-add all data we want to keep.</a>
+<a name="ln359"> </a>
+<a name="ln360">	// truncate the offsets array and reset the heap sizes</a>
+<a name="ln361">	ssize_t firstChunkIndex = ssize_t(writeOffset / kChunkSize);</a>
+<a name="ln362">	fCompressedHeapSize = fOffsets[firstChunkIndex];</a>
+<a name="ln363">	fUncompressedHeapSize = (uint64)firstChunkIndex * kChunkSize;</a>
+<a name="ln364">	fOffsets.Remove(firstChunkIndex, fOffsets.Count() - firstChunkIndex);</a>
+<a name="ln365"> </a>
+<a name="ln366">	// we need a decompression buffer</a>
+<a name="ln367">	void* decompressionBuffer = malloc(kChunkSize);</a>
+<a name="ln368">	if (decompressionBuffer == NULL)</a>
+<a name="ln369">		throw std::bad_alloc();</a>
+<a name="ln370">	MemoryDeleter decompressionBufferDeleter(decompressionBuffer);</a>
+<a name="ln371"> </a>
+<a name="ln372">	const Chunk* decompressedChunk = NULL;</a>
+<a name="ln373"> </a>
+<a name="ln374">	while (chunkBuffer.HasMoreSegments()) {</a>
+<a name="ln375">		const ChunkSegment&amp; segment = chunkBuffer.CurrentSegment();</a>
+<a name="ln376"> </a>
+<a name="ln377">		// If we have an aligned, complete chunk, copy its compressed data.</a>
+<a name="ln378">		bool copyCompressed = fPendingDataSize == 0 &amp;&amp; segment.toKeepOffset == 0</a>
+<a name="ln379">			&amp;&amp; segment.toKeepSize == kChunkSize;</a>
+<a name="ln380"> </a>
+<a name="ln381">		// Read more chunks. We need at least one buffered one to do anything</a>
+<a name="ln382">		// and we want to buffer as many as necessary to ensure we don't</a>
+<a name="ln383">		// overwrite one we haven't buffered yet.</a>
+<a name="ln384">		while (chunkBuffer.HasMoreChunksToRead()</a>
+<a name="ln385">			&amp;&amp; (!chunkBuffer.HasBufferedChunk()</a>
+<a name="ln386">				|| (!copyCompressed</a>
+<a name="ln387">					&amp;&amp; chunkBuffer.NextReadOffset()</a>
+<a name="ln388">						&lt; fCompressedHeapSize + kChunkSize))) {</a>
+<a name="ln389">			// read chunk</a>
+<a name="ln390">			chunkBuffer.ReadNextChunk();</a>
+<a name="ln391">		}</a>
+<a name="ln392"> </a>
+<a name="ln393">		// copy compressed chunk data, if possible</a>
+<a name="ln394">		const Chunk&amp; chunk = chunkBuffer.ChunkAt(segment.chunkIndex);</a>
+<a name="ln395">		if (copyCompressed) {</a>
+<a name="ln396">			status_t error = _WriteChunk(chunk.buffer, chunk.compressedSize,</a>
+<a name="ln397">				false);</a>
+<a name="ln398">			if (error != B_OK)</a>
+<a name="ln399">				throw error;</a>
+<a name="ln400">			continue;</a>
+<a name="ln401">		}</a>
+<a name="ln402"> </a>
+<a name="ln403">		// decompress chunk, if compressed</a>
+<a name="ln404">		void* uncompressedData;</a>
+<a name="ln405">		if (chunk.uncompressedSize == chunk.compressedSize) {</a>
+<a name="ln406">			uncompressedData = chunk.buffer;</a>
+<a name="ln407">		} else if (decompressedChunk == &amp;chunk) {</a>
+<a name="ln408">			uncompressedData = decompressionBuffer;</a>
+<a name="ln409">		} else {</a>
+<a name="ln410">			status_t error = DecompressChunkData(chunk.buffer,</a>
+<a name="ln411">				chunk.compressedSize, decompressionBuffer,</a>
+<a name="ln412">				chunk.uncompressedSize);</a>
+<a name="ln413">			if (error != B_OK)</a>
+<a name="ln414">				throw error;</a>
+<a name="ln415"> </a>
+<a name="ln416">			decompressedChunk = &amp;chunk;</a>
+<a name="ln417">			uncompressedData = decompressionBuffer;</a>
+<a name="ln418">		}</a>
+<a name="ln419"> </a>
+<a name="ln420">		// add chunk data</a>
+<a name="ln421">		AddDataThrows((uint8*)uncompressedData + segment.toKeepOffset,</a>
+<a name="ln422">			segment.toKeepSize);</a>
+<a name="ln423"> </a>
+<a name="ln424">		chunkBuffer.CurrentSegmentDone();</a>
+<a name="ln425">	}</a>
+<a name="ln426"> </a>
+<a name="ln427">	// Make sure a last partial chunk ends up in the pending data buffer. This</a>
+<a name="ln428">	// is only necessary when we didn't have to move any chunk segments, since</a>
+<a name="ln429">	// the loop would otherwise have read it in and left it in the pending data</a>
+<a name="ln430">	// buffer.</a>
+<a name="ln431">	if (chunkBuffer.IsEmpty())</a>
+<a name="ln432">		_UnwriteLastPartialChunk();</a>
+<a name="ln433">}</a>
+<a name="ln434"> </a>
+<a name="ln435"> </a>
+<a name="ln436">status_t</a>
+<a name="ln437">PackageFileHeapWriter::Finish()</a>
+<a name="ln438">{</a>
+<a name="ln439">	// flush pending data, if any</a>
+<a name="ln440">	status_t error = _FlushPendingData();</a>
+<a name="ln441">	if (error != B_OK)</a>
+<a name="ln442">		return error;</a>
+<a name="ln443"> </a>
+<a name="ln444">	// write chunk sizes table</a>
+<a name="ln445"> </a>
+<a name="ln446">	// We don't need to do that, if we don't use any compression.</a>
+<a name="ln447">	if (fCompressionAlgorithm == NULL)</a>
+<a name="ln448">		return B_OK;</a>
+<a name="ln449"> </a>
+<a name="ln450">	// We don't need to write the last chunk size, since it is implied by the</a>
+<a name="ln451">	// total size minus the sum of all other chunk sizes.</a>
+<a name="ln452">	ssize_t offsetCount = fOffsets.Count();</a>
+<a name="ln453">	if (offsetCount &lt; 2)</a>
+<a name="ln454">		return B_OK;</a>
+<a name="ln455"> </a>
+<a name="ln456">	// Convert the offsets to 16 bit sizes and write them. We use the (no longer</a>
+<a name="ln457">	// used) pending data buffer for the conversion.</a>
+<a name="ln458">	uint16* buffer = (uint16*)fPendingDataBuffer;</a>
+<a name="ln459">	for (ssize_t offsetIndex = 1; offsetIndex &lt; offsetCount;) {</a>
+<a name="ln460">		ssize_t toWrite = std::min(offsetCount - offsetIndex,</a>
+<a name="ln461">			ssize_t(kChunkSize / 2));</a>
+<a name="ln462"> </a>
+<a name="ln463">		for (ssize_t i = 0; i &lt; toWrite; i++, offsetIndex++) {</a>
+<a name="ln464">			// store chunkSize - 1, so it fits 16 bit (chunks cannot be empty)</a>
+<a name="ln465">			buffer[i] = B_HOST_TO_BENDIAN_INT16(</a>
+<a name="ln466">				uint16(fOffsets[offsetIndex] - fOffsets[offsetIndex - 1] - 1));</a>
+<a name="ln467">		}</a>
+<a name="ln468"> </a>
+<a name="ln469">		error = _WriteDataUncompressed(buffer, toWrite * 2);</a>
+<a name="ln470">		if (error != B_OK)</a>
+<a name="ln471">			return error;</a>
+<a name="ln472">	}</a>
+<a name="ln473"> </a>
+<a name="ln474">	return B_OK;</a>
+<a name="ln475">}</a>
+<a name="ln476"> </a>
+<a name="ln477"> </a>
+<a name="ln478">status_t</a>
+<a name="ln479">PackageFileHeapWriter::ReadAndDecompressChunk(size_t chunkIndex,</a>
+<a name="ln480">	void* compressedDataBuffer, void* uncompressedDataBuffer)</a>
+<a name="ln481">{</a>
+<a name="ln482">	if (uint64(chunkIndex + 1) * kChunkSize &gt; fUncompressedHeapSize) {</a>
+<a name="ln483">		// The chunk has not been written to disk yet. Its data are still in the</a>
+<a name="ln484">		// pending data buffer.</a>
+<a name="ln485">		memcpy(uncompressedDataBuffer, fPendingDataBuffer, fPendingDataSize);</a>
+<a name="ln486">		// TODO: This can be optimized. Since we write to a BDataIO anyway,</a>
+<a name="ln487">		// there's no need to copy the data.</a>
+<a name="ln488">		return B_OK;</a>
+<a name="ln489">	}</a>
+<a name="ln490"> </a>
+<a name="ln491">	uint64 offset = fOffsets[chunkIndex];</a>
+<a name="ln492">	size_t compressedSize = chunkIndex + 1 == (size_t)fOffsets.Count()</a>
+<a name="ln493">		? fCompressedHeapSize - offset</a>
+<a name="ln494">		: fOffsets[chunkIndex + 1] - offset;</a>
+<a name="ln495"> </a>
+<a name="ln496">	return ReadAndDecompressChunkData(offset, compressedSize, kChunkSize,</a>
+<a name="ln497">		compressedDataBuffer, uncompressedDataBuffer);</a>
+<a name="ln498">}</a>
+<a name="ln499"> </a>
+<a name="ln500"> </a>
+<a name="ln501">void</a>
+<a name="ln502">PackageFileHeapWriter::_Uninit()</a>
+<a name="ln503">{</a>
+<a name="ln504">	free(fPendingDataBuffer);</a>
+<a name="ln505">	free(fCompressedDataBuffer);</a>
+<a name="ln506">	fPendingDataBuffer = NULL;</a>
+<a name="ln507">	fCompressedDataBuffer = NULL;</a>
+<a name="ln508">}</a>
+<a name="ln509"> </a>
+<a name="ln510"> </a>
+<a name="ln511">status_t</a>
+<a name="ln512">PackageFileHeapWriter::_FlushPendingData()</a>
+<a name="ln513">{</a>
+<a name="ln514">	if (fPendingDataSize == 0)</a>
+<a name="ln515">		return B_OK;</a>
+<a name="ln516"> </a>
+<a name="ln517">	status_t error = _WriteChunk(fPendingDataBuffer, fPendingDataSize, true);</a>
+<a name="ln518">	if (error == B_OK)</a>
+<a name="ln519">		fPendingDataSize = 0;</a>
+<a name="ln520"> </a>
+<a name="ln521">	return error;</a>
+<a name="ln522">}</a>
+<a name="ln523"> </a>
+<a name="ln524"> </a>
+<a name="ln525">status_t</a>
+<a name="ln526">PackageFileHeapWriter::_WriteChunk(const void* data, size_t size,</a>
+<a name="ln527">	bool mayCompress)</a>
+<a name="ln528">{</a>
+<a name="ln529">	// add offset</a>
+<a name="ln530">	if (!fOffsets.Add(fCompressedHeapSize)) {</a>
+<a name="ln531">		fErrorOutput-&gt;PrintError(&quot;Out of memory!\n&quot;);</a>
+<a name="ln532">		return B_NO_MEMORY;</a>
+<a name="ln533">	}</a>
+<a name="ln534"> </a>
+<a name="ln535">	// Try to use compression only for data large enough.</a>
+<a name="ln536">	bool compress = mayCompress &amp;&amp; size &gt;= (off_t)kCompressionSizeThreshold;</a>
+<a name="ln537">	if (compress) {</a>
+<a name="ln538">		status_t error = _WriteDataCompressed(data, size);</a>
+<a name="ln539">		if (error != B_OK) {</a>
+<a name="ln540">			if (error != B_BUFFER_OVERFLOW)</a>
+<a name="ln541">				return error;</a>
+<a name="ln542">			compress = false;</a>
+<a name="ln543">		}</a>
+<a name="ln544">	}</a>
+<a name="ln545"> </a>
+<a name="ln546">	// Write uncompressed, if necessary.</a>
+<a name="ln547">	if (!compress) {</a>
+<a name="ln548">		status_t error = _WriteDataUncompressed(data, size);</a>
+<a name="ln549">		if (error != B_OK)</a>
+<a name="ln550">			return error;</a>
+<a name="ln551">	}</a>
+<a name="ln552"> </a>
+<a name="ln553">	return B_OK;</a>
+<a name="ln554">}</a>
+<a name="ln555"> </a>
+<a name="ln556"> </a>
+<a name="ln557">status_t</a>
+<a name="ln558">PackageFileHeapWriter::_WriteDataCompressed(const void* data, size_t size)</a>
+<a name="ln559">{</a>
+<a name="ln560">	if (fCompressionAlgorithm == NULL)</a>
+<a name="ln561">		return B_BUFFER_OVERFLOW;</a>
+<a name="ln562"> </a>
+<a name="ln563">	size_t compressedSize;</a>
+<a name="ln564">	status_t error = fCompressionAlgorithm-&gt;algorithm-&gt;CompressBuffer(data,</a>
+<a name="ln565">		size, fCompressedDataBuffer, size, compressedSize,</a>
+<a name="ln566">		fCompressionAlgorithm-&gt;parameters);</a>
+<a name="ln567">	if (error != B_OK) {</a>
+<a name="ln568">		if (error != B_BUFFER_OVERFLOW) {</a>
+<a name="ln569">			fErrorOutput-&gt;PrintError(&quot;Failed to compress chunk data: %s\n&quot;,</a>
+<a name="ln570">				strerror(error));</a>
+<a name="ln571">		}</a>
+<a name="ln572">		return error;</a>
+<a name="ln573">	}</a>
+<a name="ln574"> </a>
+<a name="ln575">	// only use compressed data when we've actually saved space</a>
+<a name="ln576">	if (compressedSize == size)</a>
+<a name="ln577">		return B_BUFFER_OVERFLOW;</a>
+<a name="ln578"> </a>
+<a name="ln579">	return _WriteDataUncompressed(fCompressedDataBuffer, compressedSize);</a>
+<a name="ln580">}</a>
+<a name="ln581"> </a>
+<a name="ln582"> </a>
+<a name="ln583">status_t</a>
+<a name="ln584">PackageFileHeapWriter::_WriteDataUncompressed(const void* data, size_t size)</a>
+<a name="ln585">{</a>
+<a name="ln586">	status_t error = fFile-&gt;WriteAtExactly(</a>
+<a name="ln587">		fHeapOffset + (off_t)fCompressedHeapSize, data, size);</a>
+<a name="ln588">	if (error != B_OK) {</a>
+<a name="ln589">		fErrorOutput-&gt;PrintError(&quot;Failed to write data: %s\n&quot;, strerror(error));</a>
+<a name="ln590">		return error;</a>
+<a name="ln591">	}</a>
+<a name="ln592"> </a>
+<a name="ln593">	fCompressedHeapSize += size;</a>
+<a name="ln594"> </a>
+<a name="ln595">	return B_OK;</a>
+<a name="ln596">}</a>
+<a name="ln597"> </a>
+<a name="ln598"> </a>
+<a name="ln599">void</a>
+<a name="ln600">PackageFileHeapWriter::_PushChunks(ChunkBuffer&amp; chunkBuffer, uint64 startOffset,</a>
+<a name="ln601">	uint64 endOffset)</a>
+<a name="ln602">{</a>
+<a name="ln603">	if (endOffset &gt; fUncompressedHeapSize) {</a>
+<a name="ln604">		fErrorOutput-&gt;PrintError(&quot;Invalid range to remove from heap\n&quot;);</a>
+<a name="ln605">		throw status_t(B_BAD_VALUE);</a>
+<a name="ln606">	}</a>
+<a name="ln607"> </a>
+<a name="ln608">	ssize_t chunkIndex = startOffset / kChunkSize;</a>
+<a name="ln609">	uint64 uncompressedChunkOffset = (uint64)chunkIndex * kChunkSize;</a>
+<a name="ln610"> </a>
+<a name="ln611">	while (startOffset &lt; endOffset) {</a>
+<a name="ln612">		bool isLastChunk = fUncompressedHeapSize - uncompressedChunkOffset</a>
+<a name="ln613">			&lt;= kChunkSize;</a>
+<a name="ln614">		uint32 inChunkOffset = uint32(startOffset - uncompressedChunkOffset);</a>
+<a name="ln615">		uint32 uncompressedChunkSize = isLastChunk</a>
+<a name="ln616">			? fUncompressedHeapSize - uncompressedChunkOffset</a>
+<a name="ln617">			: kChunkSize;</a>
+<a name="ln618">		uint64 compressedChunkOffset = fOffsets[chunkIndex];</a>
+<a name="ln619">		uint32 compressedChunkSize = isLastChunk</a>
+<a name="ln620">			? fCompressedHeapSize - compressedChunkOffset</a>
+<a name="ln621">			: fOffsets[chunkIndex + 1] - compressedChunkOffset;</a>
+<a name="ln622">		uint32 toKeepSize = uint32(std::min(</a>
+<a name="ln623">			(uint64)uncompressedChunkSize - inChunkOffset,</a>
+<a name="ln624">			endOffset - startOffset));</a>
+<a name="ln625"> </a>
+<a name="ln626">		if (!chunkBuffer.PushChunkSegment(compressedChunkOffset,</a>
+<a name="ln627">				compressedChunkSize, uncompressedChunkSize, inChunkOffset,</a>
+<a name="ln628">				toKeepSize)) {</a>
+<a name="ln629">			throw std::bad_alloc();</a>
+<a name="ln630">		}</a>
+<a name="ln631"> </a>
+<a name="ln632">		startOffset += toKeepSize;</a>
+<a name="ln633">		chunkIndex++;</a>
+<a name="ln634">		uncompressedChunkOffset += uncompressedChunkSize;</a>
+<a name="ln635">	}</a>
+<a name="ln636">}</a>
+<a name="ln637"> </a>
+<a name="ln638"> </a>
+<a name="ln639">void</a>
+<a name="ln640">PackageFileHeapWriter::_UnwriteLastPartialChunk()</a>
+<a name="ln641">{</a>
+<a name="ln642">	// If the last chunk is partial, read it in and remove it from the offsets.</a>
+<a name="ln643">	size_t lastChunkSize = fUncompressedHeapSize % kChunkSize;</a>
+<a name="ln644">	if (lastChunkSize != 0) {</a>
+<a name="ln645">		uint64 lastChunkOffset = fOffsets[fOffsets.Count() - 1];</a>
+<a name="ln646">		size_t compressedSize = fCompressedHeapSize - lastChunkOffset;</a>
+<a name="ln647"> </a>
+<a name="ln648">		status_t error = ReadAndDecompressChunkData(lastChunkOffset,</a>
+<a name="ln649">			compressedSize, lastChunkSize, fCompressedDataBuffer,</a>
+<a name="ln650">			fPendingDataBuffer);</a>
+<a name="ln651">		if (error != B_OK)</a>
+<a name="ln652">			throw error;</a>
+<a name="ln653"> </a>
+<a name="ln654">		fPendingDataSize = lastChunkSize;</a>
+<a name="ln655">		fCompressedHeapSize = lastChunkOffset;</a>
+<a name="ln656">		fOffsets.Remove(fOffsets.Count() - 1);</a>
+<a name="ln657">	}</a>
+<a name="ln658">}</a>
+<a name="ln659"> </a>
+<a name="ln660"> </a>
+<a name="ln661">}	// namespace BPrivate</a>
+<a name="ln662"> </a>
+<a name="ln663">}	// namespace BHPKG</a>
+<a name="ln664"> </a>
+<a name="ln665">}	// namespace BPackageKit</a>
+
+</code></pre>
+<div class="balloon" rel="166"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v575/" target="_blank">V575</a> The null pointer is passed into 'free' function. Inspect the first argument.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

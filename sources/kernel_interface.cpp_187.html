@@ -1,0 +1,788 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>kernel_interface.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2008-2010, Axel Dörfler, axeld@pinc-software.de.</a>
+<a name="ln3"> * Copyright 2011, Jérôme Duval, korli@users.berlios.de.</a>
+<a name="ln4"> * Copyright 2014 Haiku, Inc. All rights reserved.</a>
+<a name="ln5"> *</a>
+<a name="ln6"> * Distributed under the terms of the MIT License.</a>
+<a name="ln7"> *</a>
+<a name="ln8"> * Authors:</a>
+<a name="ln9"> *		Axel Dörfler, axeld@pinc-software.de</a>
+<a name="ln10"> *		Jérôme Duval, korli@users.berlios.de</a>
+<a name="ln11"> *		John Scipione, jscipione@gmail.com</a>
+<a name="ln12"> */</a>
+<a name="ln13"> </a>
+<a name="ln14"> </a>
+<a name="ln15">#include &lt;dirent.h&gt;</a>
+<a name="ln16">#include &lt;unistd.h&gt;</a>
+<a name="ln17">#include &lt;util/kernel_cpp.h&gt;</a>
+<a name="ln18">#include &lt;string.h&gt;</a>
+<a name="ln19"> </a>
+<a name="ln20">#include &lt;new&gt;</a>
+<a name="ln21"> </a>
+<a name="ln22">#include &lt;AutoDeleter.h&gt;</a>
+<a name="ln23">#include &lt;fs_cache.h&gt;</a>
+<a name="ln24">#include &lt;fs_info.h&gt;</a>
+<a name="ln25">#include &lt;io_requests.h&gt;</a>
+<a name="ln26">#include &lt;NodeMonitor.h&gt;</a>
+<a name="ln27">#include &lt;StorageDefs.h&gt;</a>
+<a name="ln28">#include &lt;util/AutoLock.h&gt;</a>
+<a name="ln29"> </a>
+<a name="ln30">#include &quot;DirectoryIterator.h&quot;</a>
+<a name="ln31">#include &quot;exfat.h&quot;</a>
+<a name="ln32">#include &quot;Inode.h&quot;</a>
+<a name="ln33">#include &quot;Utility.h&quot;</a>
+<a name="ln34"> </a>
+<a name="ln35"> </a>
+<a name="ln36">//#define TRACE_EXFAT</a>
+<a name="ln37">#ifdef TRACE_EXFAT</a>
+<a name="ln38">#	define TRACE(x...) dprintf(&quot;\33[34mexfat:\33[0m &quot; x)</a>
+<a name="ln39">#else</a>
+<a name="ln40">#	define TRACE(x...) ;</a>
+<a name="ln41">#endif</a>
+<a name="ln42">#define ERROR(x...) dprintf(&quot;\33[34mexfat:\33[0m &quot; x)</a>
+<a name="ln43"> </a>
+<a name="ln44"> </a>
+<a name="ln45">#define EXFAT_IO_SIZE	65536</a>
+<a name="ln46"> </a>
+<a name="ln47"> </a>
+<a name="ln48">struct identify_cookie {</a>
+<a name="ln49">	exfat_super_block super_block;</a>
+<a name="ln50">	char name[B_FILE_NAME_LENGTH];</a>
+<a name="ln51">};</a>
+<a name="ln52"> </a>
+<a name="ln53"> </a>
+<a name="ln54">//!	exfat_io() callback hook</a>
+<a name="ln55">static status_t</a>
+<a name="ln56">iterative_io_get_vecs_hook(void* cookie, io_request* request, off_t offset,</a>
+<a name="ln57">	size_t size, struct file_io_vec* vecs, size_t* _count)</a>
+<a name="ln58">{</a>
+<a name="ln59">	Inode* inode = (Inode*)cookie;</a>
+<a name="ln60"> </a>
+<a name="ln61">	return file_map_translate(inode-&gt;Map(), offset, size, vecs, _count,</a>
+<a name="ln62">		inode-&gt;GetVolume()-&gt;BlockSize());</a>
+<a name="ln63">}</a>
+<a name="ln64"> </a>
+<a name="ln65"> </a>
+<a name="ln66">//!	exfat_io() callback hook</a>
+<a name="ln67">static status_t</a>
+<a name="ln68">iterative_io_finished_hook(void* cookie, io_request* request, status_t status,</a>
+<a name="ln69">	bool partialTransfer, size_t bytesTransferred)</a>
+<a name="ln70">{</a>
+<a name="ln71">	Inode* inode = (Inode*)cookie;</a>
+<a name="ln72">	rw_lock_read_unlock(inode-&gt;Lock());</a>
+<a name="ln73">	return B_OK;</a>
+<a name="ln74">}</a>
+<a name="ln75"> </a>
+<a name="ln76"> </a>
+<a name="ln77">//	#pragma mark - Scanning</a>
+<a name="ln78"> </a>
+<a name="ln79"> </a>
+<a name="ln80">static float</a>
+<a name="ln81">exfat_identify_partition(int fd, partition_data* partition, void** _cookie)</a>
+<a name="ln82">{</a>
+<a name="ln83">	struct exfat_super_block superBlock;</a>
+<a name="ln84">	status_t status = Volume::Identify(fd, &amp;superBlock);</a>
+<a name="ln85">	if (status != B_OK)</a>
+<a name="ln86">		return -1;</a>
+<a name="ln87"> </a>
+<a name="ln88">	identify_cookie* cookie = new (std::nothrow)identify_cookie;</a>
+<a name="ln89">	if (cookie == NULL)</a>
+<a name="ln90">		return -1;</a>
+<a name="ln91"> </a>
+<a name="ln92">	memcpy(&amp;cookie-&gt;super_block, &amp;superBlock, sizeof(exfat_super_block));</a>
+<a name="ln93">	memset(cookie-&gt;name, 0, sizeof(cookie-&gt;name));</a>
+<a name="ln94">		// zero out volume name</a>
+<a name="ln95"> </a>
+<a name="ln96">	uint32 rootDirCluster = superBlock.RootDirCluster();</a>
+<a name="ln97">	uint32 blockSize = 1 &lt;&lt; superBlock.BlockShift();</a>
+<a name="ln98">	uint32 clusterSize = blockSize &lt;&lt; superBlock.BlocksPerClusterShift();</a>
+<a name="ln99">	uint64 rootDirectoryOffset = (uint64)(EXFAT_SUPER_BLOCK_OFFSET</a>
+<a name="ln100">		+ superBlock.FirstDataBlock() * blockSize</a>
+<a name="ln101">		+ (rootDirCluster - 2) * clusterSize);</a>
+<a name="ln102">	struct exfat_entry entry;</a>
+<a name="ln103">	size_t entrySize = sizeof(struct exfat_entry);</a>
+<a name="ln104">	for (uint32 i = 0; read_pos(fd, rootDirectoryOffset + i * entrySize,</a>
+<a name="ln105">			&amp;entry, entrySize) == (ssize_t)entrySize; i++) {</a>
+<a name="ln106">		if (entry.type == EXFAT_ENTRY_TYPE_NOT_IN_USE</a>
+<a name="ln107">			|| entry.type == EXFAT_ENTRY_TYPE_LABEL) {</a>
+<a name="ln108">			if (get_volume_name(&amp;entry, cookie-&gt;name, sizeof(cookie-&gt;name))</a>
+<a name="ln109">					!= B_OK) {</a>
+<a name="ln110">				delete cookie;</a>
+<a name="ln111">				return -1;</a>
+<a name="ln112">			}</a>
+<a name="ln113">			break;</a>
+<a name="ln114">		}</a>
+<a name="ln115">	}</a>
+<a name="ln116"> </a>
+<a name="ln117">	if (cookie-&gt;name[0] == '\0') {</a>
+<a name="ln118">		off_t fileSystemSize = (off_t)superBlock.NumBlocks()</a>
+<a name="ln119">			&lt;&lt; superBlock.BlockShift();</a>
+<a name="ln120">		get_default_volume_name(fileSystemSize, cookie-&gt;name,</a>
+<a name="ln121">			sizeof(cookie-&gt;name));</a>
+<a name="ln122">	}</a>
+<a name="ln123"> </a>
+<a name="ln124">	*_cookie = cookie;</a>
+<a name="ln125">	return 0.8f;</a>
+<a name="ln126">}</a>
+<a name="ln127"> </a>
+<a name="ln128"> </a>
+<a name="ln129">static status_t</a>
+<a name="ln130">exfat_scan_partition(int fd, partition_data* partition, void* _cookie)</a>
+<a name="ln131">{</a>
+<a name="ln132">	identify_cookie* cookie = (identify_cookie*)_cookie;</a>
+<a name="ln133"> </a>
+<a name="ln134">	partition-&gt;status = B_PARTITION_VALID;</a>
+<a name="ln135">	partition-&gt;flags |= B_PARTITION_FILE_SYSTEM;</a>
+<a name="ln136">	partition-&gt;content_size = cookie-&gt;super_block.NumBlocks()</a>
+<a name="ln137">		&lt;&lt; cookie-&gt;super_block.BlockShift();</a>
+<a name="ln138">	partition-&gt;block_size = 1 &lt;&lt; cookie-&gt;super_block.BlockShift();</a>
+<a name="ln139">	partition-&gt;content_name = strdup(cookie-&gt;name);</a>
+<a name="ln140"> </a>
+<a name="ln141">	return partition-&gt;content_name != NULL ? B_OK : B_NO_MEMORY;</a>
+<a name="ln142">}</a>
+<a name="ln143"> </a>
+<a name="ln144"> </a>
+<a name="ln145">static void</a>
+<a name="ln146">exfat_free_identify_partition_cookie(partition_data* partition, void* _cookie)</a>
+<a name="ln147">{</a>
+<a name="ln148">	delete (identify_cookie*)_cookie;</a>
+<a name="ln149">}</a>
+<a name="ln150"> </a>
+<a name="ln151"> </a>
+<a name="ln152">//	#pragma mark -</a>
+<a name="ln153"> </a>
+<a name="ln154"> </a>
+<a name="ln155">static status_t</a>
+<a name="ln156">exfat_mount(fs_volume* _volume, const char* device, uint32 flags,</a>
+<a name="ln157">	const char* args, ino_t* _rootID)</a>
+<a name="ln158">{</a>
+<a name="ln159">	Volume* volume = new(std::nothrow) Volume(_volume);</a>
+<a name="ln160">	if (volume == NULL)</a>
+<a name="ln161">		return B_NO_MEMORY;</a>
+<a name="ln162"> </a>
+<a name="ln163">	// TODO: this is a bit hacky: we can't use publish_vnode() to publish</a>
+<a name="ln164">	// the root node, or else its file cache cannot be created (we could</a>
+<a name="ln165">	// create it later, though). Therefore we're using get_vnode() in Mount(),</a>
+<a name="ln166">	// but that requires us to export our volume data before calling it.</a>
+<a name="ln167">	_volume-&gt;private_volume = volume;</a>
+<a name="ln168">	_volume-&gt;ops = &amp;gExfatVolumeOps;</a>
+<a name="ln169"> </a>
+<a name="ln170">	status_t status = volume-&gt;Mount(device, flags);</a>
+<a name="ln171">	if (status != B_OK) {</a>
+<a name="ln172">		ERROR(&quot;Failed mounting the volume. Error: %s\n&quot;, strerror(status));</a>
+<a name="ln173">		delete volume;</a>
+<a name="ln174">		return status;</a>
+<a name="ln175">	}</a>
+<a name="ln176"> </a>
+<a name="ln177">	*_rootID = volume-&gt;RootNode()-&gt;ID();</a>
+<a name="ln178">	return B_OK;</a>
+<a name="ln179">}</a>
+<a name="ln180"> </a>
+<a name="ln181"> </a>
+<a name="ln182">static status_t</a>
+<a name="ln183">exfat_unmount(fs_volume *_volume)</a>
+<a name="ln184">{</a>
+<a name="ln185">	Volume* volume = (Volume *)_volume-&gt;private_volume;</a>
+<a name="ln186"> </a>
+<a name="ln187">	status_t status = volume-&gt;Unmount();</a>
+<a name="ln188">	delete volume;</a>
+<a name="ln189"> </a>
+<a name="ln190">	return status;</a>
+<a name="ln191">}</a>
+<a name="ln192"> </a>
+<a name="ln193"> </a>
+<a name="ln194">static status_t</a>
+<a name="ln195">exfat_read_fs_info(fs_volume* _volume, struct fs_info* info)</a>
+<a name="ln196">{</a>
+<a name="ln197">	Volume* volume = (Volume*)_volume-&gt;private_volume;</a>
+<a name="ln198"> </a>
+<a name="ln199">	// File system flags</a>
+<a name="ln200">	info-&gt;flags = B_FS_IS_PERSISTENT</a>
+<a name="ln201">		| (volume-&gt;IsReadOnly() ? B_FS_IS_READONLY : 0);</a>
+<a name="ln202">	info-&gt;io_size = EXFAT_IO_SIZE;</a>
+<a name="ln203">	info-&gt;block_size = volume-&gt;BlockSize();</a>
+<a name="ln204">	info-&gt;total_blocks = volume-&gt;SuperBlock().NumBlocks();</a>
+<a name="ln205">	info-&gt;free_blocks = 0; //volume-&gt;NumFreeBlocks();</a>
+<a name="ln206"> </a>
+<a name="ln207">	// Volume name</a>
+<a name="ln208">	strlcpy(info-&gt;volume_name, volume-&gt;Name(), sizeof(info-&gt;volume_name));</a>
+<a name="ln209"> </a>
+<a name="ln210">	// File system name</a>
+<a name="ln211">	strlcpy(info-&gt;fsh_name, &quot;exfat&quot;, sizeof(info-&gt;fsh_name));</a>
+<a name="ln212"> </a>
+<a name="ln213">	return B_OK;</a>
+<a name="ln214">}</a>
+<a name="ln215"> </a>
+<a name="ln216"> </a>
+<a name="ln217">//	#pragma mark -</a>
+<a name="ln218"> </a>
+<a name="ln219"> </a>
+<a name="ln220">static status_t</a>
+<a name="ln221">exfat_get_vnode(fs_volume* _volume, ino_t id, fs_vnode* _node, int* _type,</a>
+<a name="ln222">	uint32* _flags, bool reenter)</a>
+<a name="ln223">{</a>
+<a name="ln224">	TRACE(&quot;get_vnode %&quot; B_PRIdINO &quot;\n&quot;, id);</a>
+<a name="ln225">	Volume* volume = (Volume*)_volume-&gt;private_volume;</a>
+<a name="ln226"> </a>
+<a name="ln227">	Inode* inode = new(std::nothrow) Inode(volume, id);</a>
+<a name="ln228">	if (inode == NULL)</a>
+<a name="ln229">		return B_NO_MEMORY;</a>
+<a name="ln230"> </a>
+<a name="ln231">	status_t status = inode-&gt;InitCheck();</a>
+<a name="ln232">	if (status != B_OK)</a>
+<a name="ln233">		delete inode;</a>
+<a name="ln234"> </a>
+<a name="ln235">	if (status == B_OK) {</a>
+<a name="ln236">		_node-&gt;private_node = inode;</a>
+<a name="ln237">		_node-&gt;ops = &amp;gExfatVnodeOps;</a>
+<a name="ln238">		*_type = inode-&gt;Mode();</a>
+<a name="ln239">		*_flags = 0;</a>
+<a name="ln240">	} else</a>
+<a name="ln241">		ERROR(&quot;get_vnode: InitCheck() failed. Error: %s\n&quot;, strerror(status));</a>
+<a name="ln242"> </a>
+<a name="ln243">	return status;</a>
+<a name="ln244">}</a>
+<a name="ln245"> </a>
+<a name="ln246"> </a>
+<a name="ln247">static status_t</a>
+<a name="ln248">exfat_put_vnode(fs_volume* _volume, fs_vnode* _node, bool reenter)</a>
+<a name="ln249">{</a>
+<a name="ln250">	delete (Inode*)_node-&gt;private_node;</a>
+<a name="ln251">	return B_OK;</a>
+<a name="ln252">}</a>
+<a name="ln253"> </a>
+<a name="ln254"> </a>
+<a name="ln255">static bool</a>
+<a name="ln256">exfat_can_page(fs_volume* _volume, fs_vnode* _node, void* _cookie)</a>
+<a name="ln257">{</a>
+<a name="ln258">	return true;</a>
+<a name="ln259">}</a>
+<a name="ln260"> </a>
+<a name="ln261"> </a>
+<a name="ln262">static status_t</a>
+<a name="ln263">exfat_read_pages(fs_volume* _volume, fs_vnode* _node, void* _cookie,</a>
+<a name="ln264">	off_t pos, const iovec* vecs, size_t count, size_t* _numBytes)</a>
+<a name="ln265">{</a>
+<a name="ln266">	Volume* volume = (Volume*)_volume-&gt;private_volume;</a>
+<a name="ln267">	Inode* inode = (Inode*)_node-&gt;private_node;</a>
+<a name="ln268"> </a>
+<a name="ln269">	if (inode-&gt;FileCache() == NULL)</a>
+<a name="ln270">		return B_BAD_VALUE;</a>
+<a name="ln271"> </a>
+<a name="ln272">	rw_lock_read_lock(inode-&gt;Lock());</a>
+<a name="ln273"> </a>
+<a name="ln274">	uint32 vecIndex = 0;</a>
+<a name="ln275">	size_t vecOffset = 0;</a>
+<a name="ln276">	size_t bytesLeft = *_numBytes;</a>
+<a name="ln277">	status_t status;</a>
+<a name="ln278"> </a>
+<a name="ln279">	while (true) {</a>
+<a name="ln280">		file_io_vec fileVecs[8];</a>
+<a name="ln281">		size_t fileVecCount = 8;</a>
+<a name="ln282"> </a>
+<a name="ln283">		status = file_map_translate(inode-&gt;Map(), pos, bytesLeft, fileVecs,</a>
+<a name="ln284">			&amp;fileVecCount, 0);</a>
+<a name="ln285">		if (status != B_OK &amp;&amp; status != B_BUFFER_OVERFLOW)</a>
+<a name="ln286">			break;</a>
+<a name="ln287"> </a>
+<a name="ln288">		bool bufferOverflow = status == B_BUFFER_OVERFLOW;</a>
+<a name="ln289"> </a>
+<a name="ln290">		size_t bytes = bytesLeft;</a>
+<a name="ln291">		status = read_file_io_vec_pages(volume-&gt;Device(), fileVecs,</a>
+<a name="ln292">			fileVecCount, vecs, count, &amp;vecIndex, &amp;vecOffset, &amp;bytes);</a>
+<a name="ln293">		if (status != B_OK || !bufferOverflow)</a>
+<a name="ln294">			break;</a>
+<a name="ln295"> </a>
+<a name="ln296">		pos += bytes;</a>
+<a name="ln297">		bytesLeft -= bytes;</a>
+<a name="ln298">	}</a>
+<a name="ln299"> </a>
+<a name="ln300">	rw_lock_read_unlock(inode-&gt;Lock());</a>
+<a name="ln301"> </a>
+<a name="ln302">	return status;</a>
+<a name="ln303">}</a>
+<a name="ln304"> </a>
+<a name="ln305"> </a>
+<a name="ln306">static status_t</a>
+<a name="ln307">exfat_io(fs_volume* _volume, fs_vnode* _node, void* _cookie,</a>
+<a name="ln308">	io_request* request)</a>
+<a name="ln309">{</a>
+<a name="ln310">	Volume* volume = (Volume*)_volume-&gt;private_volume;</a>
+<a name="ln311">	Inode* inode = (Inode*)_node-&gt;private_node;</a>
+<a name="ln312"> </a>
+<a name="ln313">#ifndef EXFAT_SHELL</a>
+<a name="ln314">	if (io_request_is_write(request) &amp;&amp; volume-&gt;IsReadOnly()) {</a>
+<a name="ln315">		notify_io_request(request, B_READ_ONLY_DEVICE);</a>
+<a name="ln316">		return B_READ_ONLY_DEVICE;</a>
+<a name="ln317">	}</a>
+<a name="ln318">#endif</a>
+<a name="ln319"> </a>
+<a name="ln320">	if (inode-&gt;FileCache() == NULL) {</a>
+<a name="ln321">#ifndef EXFAT_SHELL</a>
+<a name="ln322">		notify_io_request(request, B_BAD_VALUE);</a>
+<a name="ln323">#endif</a>
+<a name="ln324">		return B_BAD_VALUE;</a>
+<a name="ln325">	}</a>
+<a name="ln326"> </a>
+<a name="ln327">	// We lock the node here and will unlock it in the &quot;finished&quot; hook.</a>
+<a name="ln328">	rw_lock_read_lock(inode-&gt;Lock());</a>
+<a name="ln329"> </a>
+<a name="ln330">	return do_iterative_fd_io(volume-&gt;Device(), request,</a>
+<a name="ln331">		iterative_io_get_vecs_hook, iterative_io_finished_hook, inode);</a>
+<a name="ln332">}</a>
+<a name="ln333"> </a>
+<a name="ln334"> </a>
+<a name="ln335">static status_t</a>
+<a name="ln336">exfat_get_file_map(fs_volume* _volume, fs_vnode* _node, off_t offset,</a>
+<a name="ln337">	size_t size, struct file_io_vec* vecs, size_t* _count)</a>
+<a name="ln338">{</a>
+<a name="ln339">	TRACE(&quot;exfat_get_file_map()\n&quot;);</a>
+<a name="ln340">	Inode* inode = (Inode*)_node-&gt;private_node;</a>
+<a name="ln341">	size_t index = 0, max = *_count;</a>
+<a name="ln342"> </a>
+<a name="ln343">	while (true) {</a>
+<a name="ln344">		off_t blockOffset;</a>
+<a name="ln345">		off_t blockLength;</a>
+<a name="ln346">		status_t status = inode-&gt;FindBlock(offset, blockOffset, &amp;blockLength);</a>
+<a name="ln347">		if (status != B_OK)</a>
+<a name="ln348">			return status;</a>
+<a name="ln349"> </a>
+<a name="ln350">		if (index &gt; 0 &amp;&amp; (vecs[index - 1].offset</a>
+<a name="ln351">				== blockOffset - vecs[index - 1].length)) {</a>
+<a name="ln352">			vecs[index - 1].length += blockLength;</a>
+<a name="ln353">		} else {</a>
+<a name="ln354">			if (index &gt;= max) {</a>
+<a name="ln355">				// we're out of file_io_vecs; let's bail out</a>
+<a name="ln356">				*_count = index;</a>
+<a name="ln357">				return B_BUFFER_OVERFLOW;</a>
+<a name="ln358">			}</a>
+<a name="ln359"> </a>
+<a name="ln360">			vecs[index].offset = blockOffset;</a>
+<a name="ln361">			vecs[index].length = blockLength;</a>
+<a name="ln362">			index++;</a>
+<a name="ln363">		}</a>
+<a name="ln364"> </a>
+<a name="ln365">		offset += blockLength;</a>
+<a name="ln366">		size -= blockLength;</a>
+<a name="ln367"> </a>
+<a name="ln368">		if ((off_t)size &lt;= vecs[index - 1].length || offset &gt;= inode-&gt;Size()) {</a>
+<a name="ln369">			// We're done!</a>
+<a name="ln370">			*_count = index;</a>
+<a name="ln371">			TRACE(&quot;exfat_get_file_map for inode %&quot; B_PRIdINO&quot;\n&quot;, inode-&gt;ID());</a>
+<a name="ln372">			return B_OK;</a>
+<a name="ln373">		}</a>
+<a name="ln374">	}</a>
+<a name="ln375"> </a>
+<a name="ln376">	// can never get here</a>
+<a name="ln377">	return B_ERROR;</a>
+<a name="ln378">}</a>
+<a name="ln379"> </a>
+<a name="ln380"> </a>
+<a name="ln381">//	#pragma mark -</a>
+<a name="ln382"> </a>
+<a name="ln383"> </a>
+<a name="ln384">static status_t</a>
+<a name="ln385">exfat_lookup(fs_volume* _volume, fs_vnode* _directory, const char* name,</a>
+<a name="ln386">	ino_t* _vnodeID)</a>
+<a name="ln387">{</a>
+<a name="ln388">	TRACE(&quot;exfat_lookup: name address: %p (%s)\n&quot;, name, name);</a>
+<a name="ln389">	Volume* volume = (Volume*)_volume-&gt;private_volume;</a>
+<a name="ln390">	Inode* directory = (Inode*)_directory-&gt;private_node;</a>
+<a name="ln391"> </a>
+<a name="ln392">	// check access permissions</a>
+<a name="ln393">	status_t status = directory-&gt;CheckPermissions(X_OK);</a>
+<a name="ln394">	if (status &lt; B_OK)</a>
+<a name="ln395">		return status;</a>
+<a name="ln396"> </a>
+<a name="ln397">	status = DirectoryIterator(directory).Lookup(name, strlen(name), _vnodeID);</a>
+<a name="ln398">	if (status != B_OK) {</a>
+<a name="ln399">		ERROR(&quot;exfat_lookup: name %s (%s)\n&quot;, name, strerror(status));</a>
+<a name="ln400">		return status;</a>
+<a name="ln401">	}</a>
+<a name="ln402"> </a>
+<a name="ln403">	TRACE(&quot;exfat_lookup: ID %&quot; B_PRIdINO &quot;\n&quot;, *_vnodeID);</a>
+<a name="ln404"> </a>
+<a name="ln405">	return get_vnode(volume-&gt;FSVolume(), *_vnodeID, NULL);</a>
+<a name="ln406">}</a>
+<a name="ln407"> </a>
+<a name="ln408"> </a>
+<a name="ln409">static status_t</a>
+<a name="ln410">exfat_ioctl(fs_volume* _volume, fs_vnode* _node, void* _cookie, uint32 cmd,</a>
+<a name="ln411">	void* buffer, size_t bufferLength)</a>
+<a name="ln412">{</a>
+<a name="ln413">	TRACE(&quot;ioctl: %&quot; B_PRIu32 &quot;\n&quot;, cmd);</a>
+<a name="ln414"> </a>
+<a name="ln415">	/*Volume* volume = (Volume*)_volume-&gt;private_volume;*/</a>
+<a name="ln416">	return B_DEV_INVALID_IOCTL;</a>
+<a name="ln417">}</a>
+<a name="ln418"> </a>
+<a name="ln419"> </a>
+<a name="ln420">static status_t</a>
+<a name="ln421">exfat_read_stat(fs_volume* _volume, fs_vnode* _node, struct stat* stat)</a>
+<a name="ln422">{</a>
+<a name="ln423">	Inode* inode = (Inode*)_node-&gt;private_node;</a>
+<a name="ln424"> </a>
+<a name="ln425">	stat-&gt;st_dev = inode-&gt;GetVolume()-&gt;ID();</a>
+<a name="ln426">	stat-&gt;st_ino = inode-&gt;ID();</a>
+<a name="ln427">	stat-&gt;st_nlink = 1;</a>
+<a name="ln428">	stat-&gt;st_blksize = EXFAT_IO_SIZE;</a>
+<a name="ln429"> </a>
+<a name="ln430">	stat-&gt;st_uid = inode-&gt;UserID();</a>
+<a name="ln431">	stat-&gt;st_gid = inode-&gt;GroupID();</a>
+<a name="ln432">	stat-&gt;st_mode = inode-&gt;Mode();</a>
+<a name="ln433">	stat-&gt;st_type = 0;</a>
+<a name="ln434"> </a>
+<a name="ln435">	inode-&gt;GetAccessTime(stat-&gt;st_atim);</a>
+<a name="ln436">	inode-&gt;GetModificationTime(stat-&gt;st_mtim);</a>
+<a name="ln437">	inode-&gt;GetChangeTime(stat-&gt;st_ctim);</a>
+<a name="ln438">	inode-&gt;GetCreationTime(stat-&gt;st_crtim);</a>
+<a name="ln439"> </a>
+<a name="ln440">	stat-&gt;st_size = inode-&gt;Size();</a>
+<a name="ln441">	stat-&gt;st_blocks = (inode-&gt;Size() + 511) / 512;</a>
+<a name="ln442"> </a>
+<a name="ln443">	return B_OK;</a>
+<a name="ln444">}</a>
+<a name="ln445"> </a>
+<a name="ln446"> </a>
+<a name="ln447">static status_t</a>
+<a name="ln448">exfat_open(fs_volume* /*_volume*/, fs_vnode* _node, int openMode,</a>
+<a name="ln449">	void** _cookie)</a>
+<a name="ln450">{</a>
+<a name="ln451">	Inode* inode = (Inode*)_node-&gt;private_node;</a>
+<a name="ln452"> </a>
+<a name="ln453">	// opening a directory read-only is allowed, although you can't read</a>
+<a name="ln454">	// any data from it.</a>
+<a name="ln455">	if (inode-&gt;IsDirectory() &amp;&amp; (openMode &amp; O_RWMASK) != 0)</a>
+<a name="ln456">		return B_IS_A_DIRECTORY;</a>
+<a name="ln457"> </a>
+<a name="ln458">	status_t status =  inode-&gt;CheckPermissions(open_mode_to_access(openMode)</a>
+<a name="ln459">		| (openMode &amp; O_TRUNC ? W_OK : 0));</a>
+<a name="ln460">	if (status != B_OK)</a>
+<a name="ln461">		return status;</a>
+<a name="ln462"> </a>
+<a name="ln463">	// Prepare the cookie</a>
+<a name="ln464">	file_cookie* cookie = new(std::nothrow) file_cookie;</a>
+<a name="ln465">	if (cookie == NULL)</a>
+<a name="ln466">		return B_NO_MEMORY;</a>
+<a name="ln467">	ObjectDeleter&lt;file_cookie&gt; cookieDeleter(cookie);</a>
+<a name="ln468"> </a>
+<a name="ln469">	cookie-&gt;open_mode = openMode &amp; EXFAT_OPEN_MODE_USER_MASK;</a>
+<a name="ln470">	cookie-&gt;last_size = inode-&gt;Size();</a>
+<a name="ln471">	cookie-&gt;last_notification = system_time();</a>
+<a name="ln472"> </a>
+<a name="ln473">	if ((openMode &amp; O_NOCACHE) != 0 &amp;&amp; inode-&gt;FileCache() != NULL) {</a>
+<a name="ln474">		// Disable the file cache, if requested?</a>
+<a name="ln475">		status = file_cache_disable(inode-&gt;FileCache());</a>
+<a name="ln476">		if (status != B_OK)</a>
+<a name="ln477">			return status;</a>
+<a name="ln478">	}</a>
+<a name="ln479"> </a>
+<a name="ln480">	cookieDeleter.Detach();</a>
+<a name="ln481">	*_cookie = cookie;</a>
+<a name="ln482"> </a>
+<a name="ln483">	return B_OK;</a>
+<a name="ln484">}</a>
+<a name="ln485"> </a>
+<a name="ln486"> </a>
+<a name="ln487">static status_t</a>
+<a name="ln488">exfat_read(fs_volume* _volume, fs_vnode* _node, void* _cookie, off_t pos,</a>
+<a name="ln489">	void* buffer, size_t* _length)</a>
+<a name="ln490">{</a>
+<a name="ln491">	Inode* inode = (Inode*)_node-&gt;private_node;</a>
+<a name="ln492"> </a>
+<a name="ln493">	if (!inode-&gt;IsFile()) {</a>
+<a name="ln494">		*_length = 0;</a>
+<a name="ln495">		return inode-&gt;IsDirectory() ? B_IS_A_DIRECTORY : B_BAD_VALUE;</a>
+<a name="ln496">	}</a>
+<a name="ln497"> </a>
+<a name="ln498">	return inode-&gt;ReadAt(pos, (uint8*)buffer, _length);</a>
+<a name="ln499">}</a>
+<a name="ln500"> </a>
+<a name="ln501"> </a>
+<a name="ln502">static status_t</a>
+<a name="ln503">exfat_close(fs_volume *_volume, fs_vnode *_node, void *_cookie)</a>
+<a name="ln504">{</a>
+<a name="ln505">	return B_OK;</a>
+<a name="ln506">}</a>
+<a name="ln507"> </a>
+<a name="ln508"> </a>
+<a name="ln509">static status_t</a>
+<a name="ln510">exfat_free_cookie(fs_volume* _volume, fs_vnode* _node, void* _cookie)</a>
+<a name="ln511">{</a>
+<a name="ln512">	file_cookie* cookie = (file_cookie*)_cookie;</a>
+<a name="ln513">	Volume* volume = (Volume*)_volume-&gt;private_volume;</a>
+<a name="ln514">	Inode* inode = (Inode*)_node-&gt;private_node;</a>
+<a name="ln515"> </a>
+<a name="ln516">	if (inode-&gt;Size() != cookie-&gt;last_size)</a>
+<a name="ln517">		notify_stat_changed(volume-&gt;ID(), -1, inode-&gt;ID(), B_STAT_SIZE);</a>
+<a name="ln518"> </a>
+<a name="ln519">	delete cookie;</a>
+<a name="ln520">	return B_OK;</a>
+<a name="ln521">}</a>
+<a name="ln522"> </a>
+<a name="ln523"> </a>
+<a name="ln524">static status_t</a>
+<a name="ln525">exfat_access(fs_volume* _volume, fs_vnode* _node, int accessMode)</a>
+<a name="ln526">{</a>
+<a name="ln527">	Inode* inode = (Inode*)_node-&gt;private_node;</a>
+<a name="ln528">	return inode-&gt;CheckPermissions(accessMode);</a>
+<a name="ln529">}</a>
+<a name="ln530"> </a>
+<a name="ln531"> </a>
+<a name="ln532">static status_t</a>
+<a name="ln533">exfat_read_link(fs_volume *_volume, fs_vnode *_node, char *buffer,</a>
+<a name="ln534">	size_t *_bufferSize)</a>
+<a name="ln535">{</a>
+<a name="ln536">	Inode* inode = (Inode*)_node-&gt;private_node;</a>
+<a name="ln537">	return inode-&gt;ReadAt(0, (uint8*)buffer, _bufferSize);</a>
+<a name="ln538">}</a>
+<a name="ln539"> </a>
+<a name="ln540"> </a>
+<a name="ln541">//	#pragma mark - Directory functions</a>
+<a name="ln542"> </a>
+<a name="ln543"> </a>
+<a name="ln544">static status_t</a>
+<a name="ln545">exfat_open_dir(fs_volume* /*_volume*/, fs_vnode* _node, void** _cookie)</a>
+<a name="ln546">{</a>
+<a name="ln547">	Inode* inode = (Inode*)_node-&gt;private_node;</a>
+<a name="ln548">	status_t status = inode-&gt;CheckPermissions(R_OK);</a>
+<a name="ln549">	if (status &lt; B_OK)</a>
+<a name="ln550">		return status;</a>
+<a name="ln551"> </a>
+<a name="ln552">	if (!inode-&gt;IsDirectory())</a>
+<a name="ln553">		return B_NOT_A_DIRECTORY;</a>
+<a name="ln554"> </a>
+<a name="ln555">	DirectoryIterator* iterator = new(std::nothrow) DirectoryIterator(inode);</a>
+<a name="ln556">	if (iterator == NULL || iterator-&gt;InitCheck() != B_OK) {</a>
+<a name="ln557">		delete iterator;</a>
+<a name="ln558">		return B_NO_MEMORY;</a>
+<a name="ln559">	}</a>
+<a name="ln560"> </a>
+<a name="ln561">	*_cookie = iterator;</a>
+<a name="ln562">	return B_OK;</a>
+<a name="ln563">}</a>
+<a name="ln564"> </a>
+<a name="ln565"> </a>
+<a name="ln566">static status_t</a>
+<a name="ln567">exfat_read_dir(fs_volume *_volume, fs_vnode *_node, void *_cookie,</a>
+<a name="ln568">	struct dirent *dirent, size_t bufferSize, uint32 *_num)</a>
+<a name="ln569">{</a>
+<a name="ln570">	TRACE(&quot;exfat_read_dir\n&quot;);</a>
+<a name="ln571">	DirectoryIterator* iterator = (DirectoryIterator*)_cookie;</a>
+<a name="ln572">	Volume* volume = (Volume*)_volume-&gt;private_volume;</a>
+<a name="ln573"> </a>
+<a name="ln574">	uint32 maxCount = *_num;</a>
+<a name="ln575">	uint32 count = 0;</a>
+<a name="ln576"> </a>
+<a name="ln577">	while (count &lt; maxCount &amp;&amp; bufferSize &gt; sizeof(struct dirent)) {</a>
+<a name="ln578">		ino_t id;</a>
+<a name="ln579">		size_t length = bufferSize - sizeof(struct dirent) + 1;</a>
+<a name="ln580"> </a>
+<a name="ln581">		status_t status = iterator-&gt;GetNext(dirent-&gt;d_name, &amp;length, &amp;id);</a>
+<a name="ln582">		if (status == B_ENTRY_NOT_FOUND)</a>
+<a name="ln583">			break;</a>
+<a name="ln584"> </a>
+<a name="ln585">		if (status == B_BUFFER_OVERFLOW) {</a>
+<a name="ln586">			// the remaining name buffer length was too small</a>
+<a name="ln587">			if (count == 0)</a>
+<a name="ln588">				return B_BUFFER_OVERFLOW;</a>
+<a name="ln589">			break;</a>
+<a name="ln590">		}</a>
+<a name="ln591"> </a>
+<a name="ln592">		if (status != B_OK)</a>
+<a name="ln593">			return status;</a>
+<a name="ln594"> </a>
+<a name="ln595">		dirent-&gt;d_dev = volume-&gt;ID();</a>
+<a name="ln596">		dirent-&gt;d_ino = id;</a>
+<a name="ln597">		dirent-&gt;d_reclen = sizeof(struct dirent) + length;</a>
+<a name="ln598"> </a>
+<a name="ln599">		bufferSize -= dirent-&gt;d_reclen;</a>
+<a name="ln600">		dirent = (struct dirent*)((uint8*)dirent + dirent-&gt;d_reclen);</a>
+<a name="ln601">		count++;</a>
+<a name="ln602">	}</a>
+<a name="ln603"> </a>
+<a name="ln604">	*_num = count;</a>
+<a name="ln605">	TRACE(&quot;exfat_read_dir end\n&quot;);</a>
+<a name="ln606">	return B_OK;</a>
+<a name="ln607">}</a>
+<a name="ln608"> </a>
+<a name="ln609"> </a>
+<a name="ln610">static status_t</a>
+<a name="ln611">exfat_rewind_dir(fs_volume * /*_volume*/, fs_vnode * /*node*/, void *_cookie)</a>
+<a name="ln612">{</a>
+<a name="ln613">	DirectoryIterator* iterator = (DirectoryIterator*)_cookie;</a>
+<a name="ln614"> </a>
+<a name="ln615">	return iterator-&gt;Rewind();</a>
+<a name="ln616">}</a>
+<a name="ln617"> </a>
+<a name="ln618"> </a>
+<a name="ln619">static status_t</a>
+<a name="ln620">exfat_close_dir(fs_volume * /*_volume*/, fs_vnode * /*node*/, void * /*_cookie*/)</a>
+<a name="ln621">{</a>
+<a name="ln622">	return B_OK;</a>
+<a name="ln623">}</a>
+<a name="ln624"> </a>
+<a name="ln625"> </a>
+<a name="ln626">static status_t</a>
+<a name="ln627">exfat_free_dir_cookie(fs_volume *_volume, fs_vnode *_node, void *_cookie)</a>
+<a name="ln628">{</a>
+<a name="ln629">	delete (DirectoryIterator*)_cookie;</a>
+<a name="ln630">	return B_OK;</a>
+<a name="ln631">}</a>
+<a name="ln632"> </a>
+<a name="ln633"> </a>
+<a name="ln634">fs_volume_ops gExfatVolumeOps = {</a>
+<a name="ln635">	&amp;exfat_unmount,</a>
+<a name="ln636">	&amp;exfat_read_fs_info,</a>
+<a name="ln637">	NULL,	// write_fs_info()</a>
+<a name="ln638">	NULL,	// fs_sync,</a>
+<a name="ln639">	&amp;exfat_get_vnode,</a>
+<a name="ln640">};</a>
+<a name="ln641"> </a>
+<a name="ln642"> </a>
+<a name="ln643">fs_vnode_ops gExfatVnodeOps = {</a>
+<a name="ln644">	/* vnode operations */</a>
+<a name="ln645">	&amp;exfat_lookup,</a>
+<a name="ln646">	NULL,</a>
+<a name="ln647">	&amp;exfat_put_vnode,</a>
+<a name="ln648">	NULL,	// exfat_remove_vnode,</a>
+<a name="ln649"> </a>
+<a name="ln650">	/* VM file access */</a>
+<a name="ln651">	&amp;exfat_can_page,</a>
+<a name="ln652">	&amp;exfat_read_pages,</a>
+<a name="ln653">	NULL,	// exfat_write_pages,</a>
+<a name="ln654"> </a>
+<a name="ln655">	NULL,	// io()</a>
+<a name="ln656">	NULL,	// cancel_io()</a>
+<a name="ln657"> </a>
+<a name="ln658">	&amp;exfat_get_file_map,</a>
+<a name="ln659"> </a>
+<a name="ln660">	&amp;exfat_ioctl,</a>
+<a name="ln661">	NULL,</a>
+<a name="ln662">	NULL,	// fs_select</a>
+<a name="ln663">	NULL,	// fs_deselect</a>
+<a name="ln664">	NULL,	// fs_fsync,</a>
+<a name="ln665"> </a>
+<a name="ln666">	&amp;exfat_read_link,</a>
+<a name="ln667">	NULL,	// fs_create_symlink,</a>
+<a name="ln668"> </a>
+<a name="ln669">	NULL,	// fs_link,</a>
+<a name="ln670">	NULL,	// fs_unlink,</a>
+<a name="ln671">	NULL,	// fs_rename,</a>
+<a name="ln672"> </a>
+<a name="ln673">	&amp;exfat_access,</a>
+<a name="ln674">	&amp;exfat_read_stat,</a>
+<a name="ln675">	NULL,	// fs_write_stat,</a>
+<a name="ln676">	NULL,	// fs_preallocate</a>
+<a name="ln677"> </a>
+<a name="ln678">	/* file operations */</a>
+<a name="ln679">	NULL,	// fs_create,</a>
+<a name="ln680">	&amp;exfat_open,</a>
+<a name="ln681">	&amp;exfat_close,</a>
+<a name="ln682">	&amp;exfat_free_cookie,</a>
+<a name="ln683">	&amp;exfat_read,</a>
+<a name="ln684">	NULL,	//	fs_write,</a>
+<a name="ln685"> </a>
+<a name="ln686">	/* directory operations */</a>
+<a name="ln687">	NULL, 	// fs_create_dir,</a>
+<a name="ln688">	NULL, 	// fs_remove_dir,</a>
+<a name="ln689">	&amp;exfat_open_dir,</a>
+<a name="ln690">	&amp;exfat_close_dir,</a>
+<a name="ln691">	&amp;exfat_free_dir_cookie,</a>
+<a name="ln692">	&amp;exfat_read_dir,</a>
+<a name="ln693">	&amp;exfat_rewind_dir,</a>
+<a name="ln694"> </a>
+<a name="ln695">	/* attribute directory operations */</a>
+<a name="ln696">	NULL, 	// fs_open_attr_dir,</a>
+<a name="ln697">	NULL,	// fs_close_attr_dir,</a>
+<a name="ln698">	NULL,	// fs_free_attr_dir_cookie,</a>
+<a name="ln699">	NULL,	// fs_read_attr_dir,</a>
+<a name="ln700">	NULL,	// fs_rewind_attr_dir,</a>
+<a name="ln701"> </a>
+<a name="ln702">	/* attribute operations */</a>
+<a name="ln703">	NULL,	// fs_create_attr,</a>
+<a name="ln704">	NULL,	// fs_open_attr,</a>
+<a name="ln705">	NULL,	// fs_close_attr,</a>
+<a name="ln706">	NULL,	// fs_free_attr_cookie,</a>
+<a name="ln707">	NULL,	// fs_read_attr,</a>
+<a name="ln708">	NULL,	// fs_write_attr,</a>
+<a name="ln709">	NULL,	// fs_read_attr_stat,</a>
+<a name="ln710">	NULL,	// fs_write_attr_stat,</a>
+<a name="ln711">	NULL,	// fs_rename_attr,</a>
+<a name="ln712">	NULL,	// fs_remove_attr,</a>
+<a name="ln713">};</a>
+<a name="ln714"> </a>
+<a name="ln715"> </a>
+<a name="ln716">static file_system_module_info sExfatFileSystem = {</a>
+<a name="ln717">	{</a>
+<a name="ln718">		&quot;file_systems/exfat&quot; B_CURRENT_FS_API_VERSION,</a>
+<a name="ln719">		0,</a>
+<a name="ln720">		NULL,</a>
+<a name="ln721">	},</a>
+<a name="ln722"> </a>
+<a name="ln723">	&quot;exfat&quot;,						// short_name</a>
+<a name="ln724">	&quot;ExFAT File System&quot;,			// pretty_name</a>
+<a name="ln725">	0,								// DDM flags</a>
+<a name="ln726"> </a>
+<a name="ln727">	// scanning</a>
+<a name="ln728">	exfat_identify_partition,</a>
+<a name="ln729">	exfat_scan_partition,</a>
+<a name="ln730">	exfat_free_identify_partition_cookie,</a>
+<a name="ln731">	NULL,	// free_partition_content_cookie()</a>
+<a name="ln732"> </a>
+<a name="ln733">	&amp;exfat_mount,</a>
+<a name="ln734"> </a>
+<a name="ln735">	NULL,</a>
+<a name="ln736">};</a>
+<a name="ln737"> </a>
+<a name="ln738"> </a>
+<a name="ln739">module_info *modules[] = {</a>
+<a name="ln740">	(module_info *)&amp;sExfatFileSystem,</a>
+<a name="ln741">	NULL,</a>
+<a name="ln742">};</a>
+
+</code></pre>
+<div class="balloon" rel="99"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v1028/" target="_blank">V1028</a> Possible overflow. Consider casting operands, not the result.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,1734 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>system_profiler.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2009-2011, Ingo Weinhold, ingo_weinhold@gmx.de.</a>
+<a name="ln3"> * Distributed under the terms of the MIT License.</a>
+<a name="ln4"> */</a>
+<a name="ln5"> </a>
+<a name="ln6"> </a>
+<a name="ln7">#include &lt;system_profiler.h&gt;</a>
+<a name="ln8"> </a>
+<a name="ln9">#include &lt;AutoDeleter.h&gt;</a>
+<a name="ln10">#include &lt;Referenceable.h&gt;</a>
+<a name="ln11"> </a>
+<a name="ln12">#include &lt;util/AutoLock.h&gt;</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &lt;system_profiler_defs.h&gt;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &lt;cpu.h&gt;</a>
+<a name="ln17">#include &lt;kernel.h&gt;</a>
+<a name="ln18">#include &lt;kimage.h&gt;</a>
+<a name="ln19">#include &lt;kscheduler.h&gt;</a>
+<a name="ln20">#include &lt;listeners.h&gt;</a>
+<a name="ln21">#include &lt;Notifications.h&gt;</a>
+<a name="ln22">#include &lt;sem.h&gt;</a>
+<a name="ln23">#include &lt;team.h&gt;</a>
+<a name="ln24">#include &lt;thread.h&gt;</a>
+<a name="ln25">#include &lt;user_debugger.h&gt;</a>
+<a name="ln26">#include &lt;vm/vm.h&gt;</a>
+<a name="ln27"> </a>
+<a name="ln28">#include &lt;arch/debug.h&gt;</a>
+<a name="ln29"> </a>
+<a name="ln30">#include &quot;IOSchedulerRoster.h&quot;</a>
+<a name="ln31"> </a>
+<a name="ln32"> </a>
+<a name="ln33">// This is the kernel-side implementation of the system profiling support.</a>
+<a name="ln34">// A userland team can register as system profiler, providing an area as buffer</a>
+<a name="ln35">// for events. Those events are team, thread, and image changes (added/removed),</a>
+<a name="ln36">// periodic sampling of the return address stack for each CPU, as well as</a>
+<a name="ln37">// scheduling and I/O scheduling events.</a>
+<a name="ln38"> </a>
+<a name="ln39"> </a>
+<a name="ln40">class SystemProfiler;</a>
+<a name="ln41"> </a>
+<a name="ln42"> </a>
+<a name="ln43">// minimum/maximum size of the table used for wait object caching</a>
+<a name="ln44">#define MIN_WAIT_OBJECT_COUNT	128</a>
+<a name="ln45">#define MAX_WAIT_OBJECT_COUNT	1024</a>
+<a name="ln46"> </a>
+<a name="ln47"> </a>
+<a name="ln48">static spinlock sProfilerLock = B_SPINLOCK_INITIALIZER;</a>
+<a name="ln49">static SystemProfiler* sProfiler = NULL;</a>
+<a name="ln50">static struct system_profiler_parameters* sRecordedParameters = NULL;</a>
+<a name="ln51"> </a>
+<a name="ln52"> </a>
+<a name="ln53">class SystemProfiler : public BReferenceable, private NotificationListener,</a>
+<a name="ln54">	private SchedulerListener, private WaitObjectListener {</a>
+<a name="ln55">public:</a>
+<a name="ln56">								SystemProfiler(team_id team,</a>
+<a name="ln57">									const area_info&amp; userAreaInfo,</a>
+<a name="ln58">									const system_profiler_parameters&amp;</a>
+<a name="ln59">										parameters);</a>
+<a name="ln60">								~SystemProfiler();</a>
+<a name="ln61"> </a>
+<a name="ln62">			team_id				TeamID() const	{ return fTeam; }</a>
+<a name="ln63"> </a>
+<a name="ln64">			status_t			Init();</a>
+<a name="ln65">			status_t			NextBuffer(size_t bytesRead,</a>
+<a name="ln66">									uint64* _droppedEvents);</a>
+<a name="ln67"> </a>
+<a name="ln68">private:</a>
+<a name="ln69">	virtual	void				EventOccurred(NotificationService&amp; service,</a>
+<a name="ln70">									const KMessage* event);</a>
+<a name="ln71"> </a>
+<a name="ln72">	virtual	void				ThreadEnqueuedInRunQueue(Thread* thread);</a>
+<a name="ln73">	virtual	void				ThreadRemovedFromRunQueue(Thread* thread);</a>
+<a name="ln74">	virtual	void				ThreadScheduled(Thread* oldThread,</a>
+<a name="ln75">									Thread* newThread);</a>
+<a name="ln76"> </a>
+<a name="ln77">	virtual	void				SemaphoreCreated(sem_id id,</a>
+<a name="ln78">									const char* name);</a>
+<a name="ln79">	virtual	void				ConditionVariableInitialized(</a>
+<a name="ln80">									ConditionVariable* variable);</a>
+<a name="ln81">	virtual	void				MutexInitialized(mutex* lock);</a>
+<a name="ln82">	virtual	void				RWLockInitialized(rw_lock* lock);</a>
+<a name="ln83"> </a>
+<a name="ln84">			bool				_TeamAdded(Team* team);</a>
+<a name="ln85">			bool				_TeamRemoved(Team* team);</a>
+<a name="ln86">			bool				_TeamExec(Team* team);</a>
+<a name="ln87"> </a>
+<a name="ln88">			bool				_ThreadAdded(Thread* thread);</a>
+<a name="ln89">			bool				_ThreadRemoved(Thread* thread);</a>
+<a name="ln90"> </a>
+<a name="ln91">			bool				_ImageAdded(struct image* image);</a>
+<a name="ln92">			bool				_ImageRemoved(struct image* image);</a>
+<a name="ln93"> </a>
+<a name="ln94">			bool				_IOSchedulerAdded(IOScheduler* scheduler);</a>
+<a name="ln95">			bool				_IOSchedulerRemoved(IOScheduler* scheduler);</a>
+<a name="ln96">			bool				_IORequestScheduled(IOScheduler* scheduler,</a>
+<a name="ln97">									IORequest* request);</a>
+<a name="ln98">			bool				_IORequestFinished(IOScheduler* scheduler,</a>
+<a name="ln99">									IORequest* request);</a>
+<a name="ln100">			bool				_IOOperationStarted(IOScheduler* scheduler,</a>
+<a name="ln101">									IORequest* request, IOOperation* operation);</a>
+<a name="ln102">			bool				_IOOperationFinished(IOScheduler* scheduler,</a>
+<a name="ln103">									IORequest* request, IOOperation* operation);</a>
+<a name="ln104"> </a>
+<a name="ln105">			void				_WaitObjectCreated(addr_t object, uint32 type);</a>
+<a name="ln106">			void				_WaitObjectUsed(addr_t object, uint32 type);</a>
+<a name="ln107"> </a>
+<a name="ln108">	inline	void				_MaybeNotifyProfilerThreadLocked();</a>
+<a name="ln109">	inline	void				_MaybeNotifyProfilerThread();</a>
+<a name="ln110"> </a>
+<a name="ln111">	static	bool				_InitialImageIterator(struct image* image,</a>
+<a name="ln112">									void* cookie);</a>
+<a name="ln113"> </a>
+<a name="ln114">			void*				_AllocateBuffer(size_t size, int event, int cpu,</a>
+<a name="ln115">									int count);</a>
+<a name="ln116"> </a>
+<a name="ln117">	static	void				_InitTimers(void* cookie, int cpu);</a>
+<a name="ln118">	static	void				_UninitTimers(void* cookie, int cpu);</a>
+<a name="ln119">			void				_ScheduleTimer(int cpu);</a>
+<a name="ln120"> </a>
+<a name="ln121">			void				_DoSample();</a>
+<a name="ln122"> </a>
+<a name="ln123">	static	int32				_ProfilingEvent(struct timer* timer);</a>
+<a name="ln124"> </a>
+<a name="ln125">private:</a>
+<a name="ln126">			struct CPUProfileData {</a>
+<a name="ln127">				struct timer	timer;</a>
+<a name="ln128">				bigtime_t		timerEnd;</a>
+<a name="ln129">				bool			timerScheduled;</a>
+<a name="ln130">				addr_t			buffer[B_DEBUG_STACK_TRACE_DEPTH];</a>
+<a name="ln131">			};</a>
+<a name="ln132"> </a>
+<a name="ln133">			struct WaitObjectKey {</a>
+<a name="ln134">				addr_t	object;</a>
+<a name="ln135">				uint32	type;</a>
+<a name="ln136">			};</a>
+<a name="ln137"> </a>
+<a name="ln138">			struct WaitObject : DoublyLinkedListLinkImpl&lt;WaitObject&gt;,</a>
+<a name="ln139">					WaitObjectKey {</a>
+<a name="ln140">				struct WaitObject* hash_link;</a>
+<a name="ln141">			};</a>
+<a name="ln142"> </a>
+<a name="ln143">			struct WaitObjectTableDefinition {</a>
+<a name="ln144">				typedef WaitObjectKey	KeyType;</a>
+<a name="ln145">				typedef	WaitObject		ValueType;</a>
+<a name="ln146"> </a>
+<a name="ln147">				size_t HashKey(const WaitObjectKey&amp; key) const</a>
+<a name="ln148">				{</a>
+<a name="ln149">					return (size_t)key.object ^ (size_t)key.type;</a>
+<a name="ln150">				}</a>
+<a name="ln151"> </a>
+<a name="ln152">				size_t Hash(const WaitObject* value) const</a>
+<a name="ln153">				{</a>
+<a name="ln154">					return HashKey(*value);</a>
+<a name="ln155">				}</a>
+<a name="ln156"> </a>
+<a name="ln157">				bool Compare(const WaitObjectKey&amp; key,</a>
+<a name="ln158">					const WaitObject* value) const</a>
+<a name="ln159">				{</a>
+<a name="ln160">					return value-&gt;type == key.type</a>
+<a name="ln161">						&amp;&amp; value-&gt;object == key.object;</a>
+<a name="ln162">				}</a>
+<a name="ln163"> </a>
+<a name="ln164">				WaitObject*&amp; GetLink(WaitObject* value) const</a>
+<a name="ln165">				{</a>
+<a name="ln166">					return value-&gt;hash_link;</a>
+<a name="ln167">				}</a>
+<a name="ln168">			};</a>
+<a name="ln169"> </a>
+<a name="ln170">			typedef DoublyLinkedList&lt;WaitObject&gt; WaitObjectList;</a>
+<a name="ln171">			typedef BOpenHashTable&lt;WaitObjectTableDefinition&gt; WaitObjectTable;</a>
+<a name="ln172"> </a>
+<a name="ln173">private:</a>
+<a name="ln174">			spinlock			fLock;</a>
+<a name="ln175">			team_id				fTeam;</a>
+<a name="ln176">			area_id				fUserArea;</a>
+<a name="ln177">			area_id				fKernelArea;</a>
+<a name="ln178">			size_t				fAreaSize;</a>
+<a name="ln179">			uint32				fFlags;</a>
+<a name="ln180">			uint32				fStackDepth;</a>
+<a name="ln181">			bigtime_t			fInterval;</a>
+<a name="ln182">			system_profiler_buffer_header* fHeader;</a>
+<a name="ln183">			uint8*				fBufferBase;</a>
+<a name="ln184">			size_t				fBufferCapacity;</a>
+<a name="ln185">			size_t				fBufferStart;</a>
+<a name="ln186">			size_t				fBufferSize;</a>
+<a name="ln187">			uint64				fDroppedEvents;</a>
+<a name="ln188">			int64				fLastTeamAddedSerialNumber;</a>
+<a name="ln189">			int64				fLastThreadAddedSerialNumber;</a>
+<a name="ln190">			bool				fTeamNotificationsRequested;</a>
+<a name="ln191">			bool				fTeamNotificationsEnabled;</a>
+<a name="ln192">			bool				fThreadNotificationsRequested;</a>
+<a name="ln193">			bool				fThreadNotificationsEnabled;</a>
+<a name="ln194">			bool				fImageNotificationsRequested;</a>
+<a name="ln195">			bool				fImageNotificationsEnabled;</a>
+<a name="ln196">			bool				fIONotificationsRequested;</a>
+<a name="ln197">			bool				fIONotificationsEnabled;</a>
+<a name="ln198">			bool				fSchedulerNotificationsRequested;</a>
+<a name="ln199">			bool				fWaitObjectNotificationsRequested;</a>
+<a name="ln200">			Thread* volatile	fWaitingProfilerThread;</a>
+<a name="ln201">			bool				fProfilingActive;</a>
+<a name="ln202">			bool				fReentered[SMP_MAX_CPUS];</a>
+<a name="ln203">			CPUProfileData		fCPUData[SMP_MAX_CPUS];</a>
+<a name="ln204">			WaitObject*			fWaitObjectBuffer;</a>
+<a name="ln205">			int32				fWaitObjectCount;</a>
+<a name="ln206">			WaitObjectList		fUsedWaitObjects;</a>
+<a name="ln207">			WaitObjectList		fFreeWaitObjects;</a>
+<a name="ln208">			WaitObjectTable		fWaitObjectTable;</a>
+<a name="ln209">};</a>
+<a name="ln210"> </a>
+<a name="ln211"> </a>
+<a name="ln212">/*!	Notifies the profiler thread when the profiling buffer is full enough.</a>
+<a name="ln213">	The caller must hold fLock.</a>
+<a name="ln214">*/</a>
+<a name="ln215">inline void</a>
+<a name="ln216">SystemProfiler::_MaybeNotifyProfilerThreadLocked()</a>
+<a name="ln217">{</a>
+<a name="ln218">	// If the buffer is full enough, notify the profiler.</a>
+<a name="ln219">	if (fWaitingProfilerThread != NULL &amp;&amp; fBufferSize &gt; fBufferCapacity / 2) {</a>
+<a name="ln220">		int cpu = smp_get_current_cpu();</a>
+<a name="ln221">		fReentered[cpu] = true;</a>
+<a name="ln222"> </a>
+<a name="ln223">		Thread* profilerThread = fWaitingProfilerThread;</a>
+<a name="ln224">		fWaitingProfilerThread = NULL;</a>
+<a name="ln225"> </a>
+<a name="ln226">		SpinLocker _(profilerThread-&gt;scheduler_lock);</a>
+<a name="ln227">		thread_unblock_locked(profilerThread, B_OK);</a>
+<a name="ln228"> </a>
+<a name="ln229">		fReentered[cpu] = false;</a>
+<a name="ln230">	}</a>
+<a name="ln231">}</a>
+<a name="ln232"> </a>
+<a name="ln233"> </a>
+<a name="ln234">inline void</a>
+<a name="ln235">SystemProfiler::_MaybeNotifyProfilerThread()</a>
+<a name="ln236">{</a>
+<a name="ln237">	if (fWaitingProfilerThread == NULL)</a>
+<a name="ln238">		return;</a>
+<a name="ln239"> </a>
+<a name="ln240">	InterruptsSpinLocker locker(fLock);</a>
+<a name="ln241"> </a>
+<a name="ln242">	_MaybeNotifyProfilerThreadLocked();</a>
+<a name="ln243">}</a>
+<a name="ln244"> </a>
+<a name="ln245"> </a>
+<a name="ln246">// #pragma mark - SystemProfiler public</a>
+<a name="ln247"> </a>
+<a name="ln248"> </a>
+<a name="ln249">SystemProfiler::SystemProfiler(team_id team, const area_info&amp; userAreaInfo,</a>
+<a name="ln250">	const system_profiler_parameters&amp; parameters)</a>
+<a name="ln251">	:</a>
+<a name="ln252">	fTeam(team),</a>
+<a name="ln253">	fUserArea(userAreaInfo.area),</a>
+<a name="ln254">	fKernelArea(-1),</a>
+<a name="ln255">	fAreaSize(userAreaInfo.size),</a>
+<a name="ln256">	fFlags(parameters.flags),</a>
+<a name="ln257">	fStackDepth(parameters.stack_depth),</a>
+<a name="ln258">	fInterval(parameters.interval),</a>
+<a name="ln259">	fHeader(NULL),</a>
+<a name="ln260">	fBufferBase(NULL),</a>
+<a name="ln261">	fBufferCapacity(0),</a>
+<a name="ln262">	fBufferStart(0),</a>
+<a name="ln263">	fBufferSize(0),</a>
+<a name="ln264">	fDroppedEvents(0),</a>
+<a name="ln265">	fLastTeamAddedSerialNumber(0),</a>
+<a name="ln266">	fLastThreadAddedSerialNumber(0),</a>
+<a name="ln267">	fTeamNotificationsRequested(false),</a>
+<a name="ln268">	fTeamNotificationsEnabled(false),</a>
+<a name="ln269">	fThreadNotificationsRequested(false),</a>
+<a name="ln270">	fThreadNotificationsEnabled(false),</a>
+<a name="ln271">	fImageNotificationsRequested(false),</a>
+<a name="ln272">	fImageNotificationsEnabled(false),</a>
+<a name="ln273">	fIONotificationsRequested(false),</a>
+<a name="ln274">	fIONotificationsEnabled(false),</a>
+<a name="ln275">	fSchedulerNotificationsRequested(false),</a>
+<a name="ln276">	fWaitObjectNotificationsRequested(false),</a>
+<a name="ln277">	fWaitingProfilerThread(NULL),</a>
+<a name="ln278">	fWaitObjectBuffer(NULL),</a>
+<a name="ln279">	fWaitObjectCount(0),</a>
+<a name="ln280">	fUsedWaitObjects(),</a>
+<a name="ln281">	fFreeWaitObjects(),</a>
+<a name="ln282">	fWaitObjectTable()</a>
+<a name="ln283">{</a>
+<a name="ln284">	B_INITIALIZE_SPINLOCK(&amp;fLock);</a>
+<a name="ln285"> </a>
+<a name="ln286">	memset(fReentered, 0, sizeof(fReentered));</a>
+<a name="ln287"> </a>
+<a name="ln288">	// compute the number wait objects we want to cache</a>
+<a name="ln289">	if ((fFlags &amp; B_SYSTEM_PROFILER_SCHEDULING_EVENTS) != 0) {</a>
+<a name="ln290">		fWaitObjectCount = parameters.locking_lookup_size</a>
+<a name="ln291">			/ (sizeof(WaitObject) + (sizeof(void*) * 3 / 2));</a>
+<a name="ln292">		if (fWaitObjectCount &lt; MIN_WAIT_OBJECT_COUNT)</a>
+<a name="ln293">			fWaitObjectCount = MIN_WAIT_OBJECT_COUNT;</a>
+<a name="ln294">		if (fWaitObjectCount &gt; MAX_WAIT_OBJECT_COUNT)</a>
+<a name="ln295">			fWaitObjectCount = MAX_WAIT_OBJECT_COUNT;</a>
+<a name="ln296">	}</a>
+<a name="ln297">}</a>
+<a name="ln298"> </a>
+<a name="ln299"> </a>
+<a name="ln300">SystemProfiler::~SystemProfiler()</a>
+<a name="ln301">{</a>
+<a name="ln302">	// Wake up the user thread, if it is waiting, and mark profiling</a>
+<a name="ln303">	// inactive.</a>
+<a name="ln304">	InterruptsSpinLocker locker(fLock);</a>
+<a name="ln305">	if (fWaitingProfilerThread != NULL) {</a>
+<a name="ln306">		thread_unblock(fWaitingProfilerThread, B_OK);</a>
+<a name="ln307">		fWaitingProfilerThread = NULL;</a>
+<a name="ln308">	}</a>
+<a name="ln309">	fProfilingActive = false;</a>
+<a name="ln310">	locker.Unlock();</a>
+<a name="ln311"> </a>
+<a name="ln312">	// stop scheduler listening</a>
+<a name="ln313">	if (fSchedulerNotificationsRequested)</a>
+<a name="ln314">		scheduler_remove_listener(this);</a>
+<a name="ln315"> </a>
+<a name="ln316">	// stop wait object listening</a>
+<a name="ln317">	if (fWaitObjectNotificationsRequested) {</a>
+<a name="ln318">		InterruptsSpinLocker locker(gWaitObjectListenerLock);</a>
+<a name="ln319">		remove_wait_object_listener(this);</a>
+<a name="ln320">	}</a>
+<a name="ln321"> </a>
+<a name="ln322">	// deactivate the profiling timers on all CPUs</a>
+<a name="ln323">	if ((fFlags &amp; B_SYSTEM_PROFILER_SAMPLING_EVENTS) != 0)</a>
+<a name="ln324">		call_all_cpus(_UninitTimers, this);</a>
+<a name="ln325"> </a>
+<a name="ln326">	// cancel notifications</a>
+<a name="ln327">	NotificationManager&amp; notificationManager</a>
+<a name="ln328">		= NotificationManager::Manager();</a>
+<a name="ln329"> </a>
+<a name="ln330">	// images</a>
+<a name="ln331">	if (fImageNotificationsRequested) {</a>
+<a name="ln332">		fImageNotificationsRequested = false;</a>
+<a name="ln333">		notificationManager.RemoveListener(&quot;images&quot;, NULL, *this);</a>
+<a name="ln334">	}</a>
+<a name="ln335"> </a>
+<a name="ln336">	// threads</a>
+<a name="ln337">	if (fThreadNotificationsRequested) {</a>
+<a name="ln338">		fThreadNotificationsRequested = false;</a>
+<a name="ln339">		notificationManager.RemoveListener(&quot;threads&quot;, NULL, *this);</a>
+<a name="ln340">	}</a>
+<a name="ln341"> </a>
+<a name="ln342">	// teams</a>
+<a name="ln343">	if (fTeamNotificationsRequested) {</a>
+<a name="ln344">		fTeamNotificationsRequested = false;</a>
+<a name="ln345">		notificationManager.RemoveListener(&quot;teams&quot;, NULL, *this);</a>
+<a name="ln346">	}</a>
+<a name="ln347"> </a>
+<a name="ln348">	// I/O</a>
+<a name="ln349">	if (fIONotificationsRequested) {</a>
+<a name="ln350">		fIONotificationsRequested = false;</a>
+<a name="ln351">		notificationManager.RemoveListener(&quot;I/O&quot;, NULL, *this);</a>
+<a name="ln352">	}</a>
+<a name="ln353"> </a>
+<a name="ln354">	// delete wait object related allocations</a>
+<a name="ln355">	fWaitObjectTable.Clear();</a>
+<a name="ln356">	delete[] fWaitObjectBuffer;</a>
+<a name="ln357"> </a>
+<a name="ln358">	// unlock the memory and delete the area</a>
+<a name="ln359">	if (fKernelArea &gt;= 0) {</a>
+<a name="ln360">		unlock_memory(fHeader, fAreaSize, B_READ_DEVICE);</a>
+<a name="ln361">		delete_area(fKernelArea);</a>
+<a name="ln362">		fKernelArea = -1;</a>
+<a name="ln363">	}</a>
+<a name="ln364">}</a>
+<a name="ln365"> </a>
+<a name="ln366"> </a>
+<a name="ln367">status_t</a>
+<a name="ln368">SystemProfiler::Init()</a>
+<a name="ln369">{</a>
+<a name="ln370">	// clone the user area</a>
+<a name="ln371">	void* areaBase;</a>
+<a name="ln372">	fKernelArea = clone_area(&quot;profiling samples&quot;, &amp;areaBase,</a>
+<a name="ln373">		B_ANY_KERNEL_ADDRESS, B_READ_AREA | B_WRITE_AREA,</a>
+<a name="ln374">		fUserArea);</a>
+<a name="ln375">	if (fKernelArea &lt; 0)</a>
+<a name="ln376">		return fKernelArea;</a>
+<a name="ln377"> </a>
+<a name="ln378">	// we need the memory locked</a>
+<a name="ln379">	status_t error = lock_memory(areaBase, fAreaSize, B_READ_DEVICE);</a>
+<a name="ln380">	if (error != B_OK) {</a>
+<a name="ln381">		delete_area(fKernelArea);</a>
+<a name="ln382">		fKernelArea = -1;</a>
+<a name="ln383">		return error;</a>
+<a name="ln384">	}</a>
+<a name="ln385"> </a>
+<a name="ln386">	// the buffer is ready for use</a>
+<a name="ln387">	fHeader = (system_profiler_buffer_header*)areaBase;</a>
+<a name="ln388">	fBufferBase = (uint8*)(fHeader + 1);</a>
+<a name="ln389">	fBufferCapacity = fAreaSize - (fBufferBase - (uint8*)areaBase);</a>
+<a name="ln390">	fHeader-&gt;start = 0;</a>
+<a name="ln391">	fHeader-&gt;size = 0;</a>
+<a name="ln392"> </a>
+<a name="ln393">	// allocate the wait object buffer and init the hash table</a>
+<a name="ln394">	if (fWaitObjectCount &gt; 0) {</a>
+<a name="ln395">		fWaitObjectBuffer = new(std::nothrow) WaitObject[fWaitObjectCount];</a>
+<a name="ln396">		if (fWaitObjectBuffer == NULL)</a>
+<a name="ln397">			return B_NO_MEMORY;</a>
+<a name="ln398"> </a>
+<a name="ln399">		for (int32 i = 0; i &lt; fWaitObjectCount; i++)</a>
+<a name="ln400">			fFreeWaitObjects.Add(fWaitObjectBuffer + i);</a>
+<a name="ln401"> </a>
+<a name="ln402">		error = fWaitObjectTable.Init(fWaitObjectCount * 3 / 2);</a>
+<a name="ln403">		if (error != B_OK)</a>
+<a name="ln404">			return error;</a>
+<a name="ln405">	}</a>
+<a name="ln406"> </a>
+<a name="ln407">	// start listening for notifications</a>
+<a name="ln408"> </a>
+<a name="ln409">	// teams</a>
+<a name="ln410">	NotificationManager&amp; notificationManager</a>
+<a name="ln411">		= NotificationManager::Manager();</a>
+<a name="ln412">	if ((fFlags &amp; B_SYSTEM_PROFILER_TEAM_EVENTS) != 0) {</a>
+<a name="ln413">		error = notificationManager.AddListener(&quot;teams&quot;,</a>
+<a name="ln414">			TEAM_ADDED | TEAM_REMOVED | TEAM_EXEC, *this);</a>
+<a name="ln415">		if (error != B_OK)</a>
+<a name="ln416">			return error;</a>
+<a name="ln417">		fTeamNotificationsRequested = true;</a>
+<a name="ln418">	}</a>
+<a name="ln419"> </a>
+<a name="ln420">	// threads</a>
+<a name="ln421">	if ((fFlags &amp; B_SYSTEM_PROFILER_THREAD_EVENTS) != 0) {</a>
+<a name="ln422">		error = notificationManager.AddListener(&quot;threads&quot;,</a>
+<a name="ln423">			THREAD_ADDED | THREAD_REMOVED, *this);</a>
+<a name="ln424">		if (error != B_OK)</a>
+<a name="ln425">			return error;</a>
+<a name="ln426">		fThreadNotificationsRequested = true;</a>
+<a name="ln427">	}</a>
+<a name="ln428"> </a>
+<a name="ln429">	// images</a>
+<a name="ln430">	if ((fFlags &amp; B_SYSTEM_PROFILER_IMAGE_EVENTS) != 0) {</a>
+<a name="ln431">		error = notificationManager.AddListener(&quot;images&quot;,</a>
+<a name="ln432">			IMAGE_ADDED | IMAGE_REMOVED, *this);</a>
+<a name="ln433">		if (error != B_OK)</a>
+<a name="ln434">			return error;</a>
+<a name="ln435">		fImageNotificationsRequested = true;</a>
+<a name="ln436">	}</a>
+<a name="ln437"> </a>
+<a name="ln438">	// I/O events</a>
+<a name="ln439">	if ((fFlags &amp; B_SYSTEM_PROFILER_IO_SCHEDULING_EVENTS) != 0) {</a>
+<a name="ln440">		error = notificationManager.AddListener(&quot;I/O&quot;,</a>
+<a name="ln441">			IO_SCHEDULER_ADDED | IO_SCHEDULER_REMOVED</a>
+<a name="ln442">				| IO_SCHEDULER_REQUEST_SCHEDULED | IO_SCHEDULER_REQUEST_FINISHED</a>
+<a name="ln443">				| IO_SCHEDULER_OPERATION_STARTED</a>
+<a name="ln444">				| IO_SCHEDULER_OPERATION_FINISHED,</a>
+<a name="ln445">			*this);</a>
+<a name="ln446">		if (error != B_OK)</a>
+<a name="ln447">			return error;</a>
+<a name="ln448">		fIONotificationsRequested = true;</a>
+<a name="ln449">	}</a>
+<a name="ln450"> </a>
+<a name="ln451">	// We need to fill the buffer with the initial state of teams, threads,</a>
+<a name="ln452">	// and images.</a>
+<a name="ln453"> </a>
+<a name="ln454">	// teams</a>
+<a name="ln455">	if ((fFlags &amp; B_SYSTEM_PROFILER_TEAM_EVENTS) != 0) {</a>
+<a name="ln456">		InterruptsSpinLocker locker(fLock);</a>
+<a name="ln457"> </a>
+<a name="ln458">		TeamListIterator iterator;</a>
+<a name="ln459">		while (Team* team = iterator.Next()) {</a>
+<a name="ln460">			locker.Unlock();</a>
+<a name="ln461"> </a>
+<a name="ln462">			bool added = _TeamAdded(team);</a>
+<a name="ln463"> </a>
+<a name="ln464">			// release the reference returned by the iterator</a>
+<a name="ln465">			team-&gt;ReleaseReference();</a>
+<a name="ln466"> </a>
+<a name="ln467">			if (!added)</a>
+<a name="ln468">				return B_BUFFER_OVERFLOW;</a>
+<a name="ln469"> </a>
+<a name="ln470">			locker.Lock();</a>
+<a name="ln471">		}</a>
+<a name="ln472"> </a>
+<a name="ln473">		fTeamNotificationsEnabled = true;</a>
+<a name="ln474">	}</a>
+<a name="ln475"> </a>
+<a name="ln476">	// images</a>
+<a name="ln477">	if ((fFlags &amp; B_SYSTEM_PROFILER_IMAGE_EVENTS) != 0) {</a>
+<a name="ln478">		if (image_iterate_through_images(&amp;_InitialImageIterator, this) != NULL)</a>
+<a name="ln479">			return B_BUFFER_OVERFLOW;</a>
+<a name="ln480">	}</a>
+<a name="ln481"> </a>
+<a name="ln482">	// threads</a>
+<a name="ln483">	if ((fFlags &amp; B_SYSTEM_PROFILER_THREAD_EVENTS) != 0) {</a>
+<a name="ln484">		InterruptsSpinLocker locker(fLock);</a>
+<a name="ln485"> </a>
+<a name="ln486">		ThreadListIterator iterator;</a>
+<a name="ln487">		while (Thread* thread = iterator.Next()) {</a>
+<a name="ln488">			locker.Unlock();</a>
+<a name="ln489"> </a>
+<a name="ln490">			bool added = _ThreadAdded(thread);</a>
+<a name="ln491"> </a>
+<a name="ln492">			// release the reference returned by the iterator</a>
+<a name="ln493">			thread-&gt;ReleaseReference();</a>
+<a name="ln494"> </a>
+<a name="ln495">			if (!added)</a>
+<a name="ln496">				return B_BUFFER_OVERFLOW;</a>
+<a name="ln497"> </a>
+<a name="ln498">			locker.Lock();</a>
+<a name="ln499">		}</a>
+<a name="ln500"> </a>
+<a name="ln501">		fThreadNotificationsEnabled = true;</a>
+<a name="ln502">	}</a>
+<a name="ln503"> </a>
+<a name="ln504">	fProfilingActive = true;</a>
+<a name="ln505"> </a>
+<a name="ln506">	// start scheduler and wait object listening</a>
+<a name="ln507">	if ((fFlags &amp; B_SYSTEM_PROFILER_SCHEDULING_EVENTS) != 0) {</a>
+<a name="ln508">		scheduler_add_listener(this);</a>
+<a name="ln509">		fSchedulerNotificationsRequested = true;</a>
+<a name="ln510"> </a>
+<a name="ln511">		InterruptsSpinLocker waitObjectLocker(gWaitObjectListenerLock);</a>
+<a name="ln512">		add_wait_object_listener(this);</a>
+<a name="ln513">		fWaitObjectNotificationsRequested = true;</a>
+<a name="ln514">		waitObjectLocker.Unlock();</a>
+<a name="ln515"> </a>
+<a name="ln516">		// fake schedule events for the initially running threads</a>
+<a name="ln517">		int32 cpuCount = smp_get_num_cpus();</a>
+<a name="ln518">		for (int32 i = 0; i &lt; cpuCount; i++) {</a>
+<a name="ln519">			Thread* thread = gCPU[i].running_thread;</a>
+<a name="ln520">			if (thread != NULL)</a>
+<a name="ln521">				ThreadScheduled(thread, thread);</a>
+<a name="ln522">		}</a>
+<a name="ln523">	}</a>
+<a name="ln524"> </a>
+<a name="ln525">	// I/O scheduling</a>
+<a name="ln526">	if ((fFlags &amp; B_SYSTEM_PROFILER_IO_SCHEDULING_EVENTS) != 0) {</a>
+<a name="ln527">		IOSchedulerRoster* roster = IOSchedulerRoster::Default();</a>
+<a name="ln528">		AutoLocker&lt;IOSchedulerRoster&gt; rosterLocker(roster);</a>
+<a name="ln529"> </a>
+<a name="ln530">		for (IOSchedulerList::ConstIterator it</a>
+<a name="ln531">				= roster-&gt;SchedulerList().GetIterator();</a>
+<a name="ln532">			IOScheduler* scheduler = it.Next();) {</a>
+<a name="ln533">			_IOSchedulerAdded(scheduler);</a>
+<a name="ln534">		}</a>
+<a name="ln535"> </a>
+<a name="ln536">		fIONotificationsEnabled = true;</a>
+<a name="ln537">	}</a>
+<a name="ln538"> </a>
+<a name="ln539">	// activate the profiling timers on all CPUs</a>
+<a name="ln540">	if ((fFlags &amp; B_SYSTEM_PROFILER_SAMPLING_EVENTS) != 0)</a>
+<a name="ln541">		call_all_cpus(_InitTimers, this);</a>
+<a name="ln542"> </a>
+<a name="ln543">	return B_OK;</a>
+<a name="ln544">}</a>
+<a name="ln545"> </a>
+<a name="ln546"> </a>
+<a name="ln547">status_t</a>
+<a name="ln548">SystemProfiler::NextBuffer(size_t bytesRead, uint64* _droppedEvents)</a>
+<a name="ln549">{</a>
+<a name="ln550">	InterruptsSpinLocker locker(fLock);</a>
+<a name="ln551"> </a>
+<a name="ln552">	if (fWaitingProfilerThread != NULL || !fProfilingActive</a>
+<a name="ln553">		|| bytesRead &gt; fBufferSize) {</a>
+<a name="ln554">		return B_BAD_VALUE;</a>
+<a name="ln555">	}</a>
+<a name="ln556"> </a>
+<a name="ln557">	fBufferSize -= bytesRead;</a>
+<a name="ln558">	fBufferStart += bytesRead;</a>
+<a name="ln559">	if (fBufferStart &gt; fBufferCapacity)</a>
+<a name="ln560">		fBufferStart -= fBufferCapacity;</a>
+<a name="ln561">	fHeader-&gt;size = fBufferSize;</a>
+<a name="ln562">	fHeader-&gt;start = fBufferStart;</a>
+<a name="ln563"> </a>
+<a name="ln564">	// already enough data in the buffer to return?</a>
+<a name="ln565">	if (fBufferSize &gt; fBufferCapacity / 2)</a>
+<a name="ln566">		return B_OK;</a>
+<a name="ln567"> </a>
+<a name="ln568">	// Wait until the buffer gets too full or an error or a timeout occurs.</a>
+<a name="ln569">	while (true) {</a>
+<a name="ln570">		Thread* thread = thread_get_current_thread();</a>
+<a name="ln571">		fWaitingProfilerThread = thread;</a>
+<a name="ln572"> </a>
+<a name="ln573">		thread_prepare_to_block(thread, B_CAN_INTERRUPT,</a>
+<a name="ln574">			THREAD_BLOCK_TYPE_OTHER, &quot;system profiler buffer&quot;);</a>
+<a name="ln575"> </a>
+<a name="ln576">		locker.Unlock();</a>
+<a name="ln577"> </a>
+<a name="ln578">		status_t error = thread_block_with_timeout(B_RELATIVE_TIMEOUT, 1000000);</a>
+<a name="ln579"> </a>
+<a name="ln580">		locker.Lock();</a>
+<a name="ln581"> </a>
+<a name="ln582">		if (error == B_OK) {</a>
+<a name="ln583">			// the caller has unset fWaitingProfilerThread for us</a>
+<a name="ln584">			break;</a>
+<a name="ln585">		}</a>
+<a name="ln586"> </a>
+<a name="ln587">		fWaitingProfilerThread = NULL;</a>
+<a name="ln588"> </a>
+<a name="ln589">		if (error != B_TIMED_OUT)</a>
+<a name="ln590">			return error;</a>
+<a name="ln591"> </a>
+<a name="ln592">		// just the timeout -- return, if the buffer is not empty</a>
+<a name="ln593">		if (fBufferSize &gt; 0)</a>
+<a name="ln594">			break;</a>
+<a name="ln595">	}</a>
+<a name="ln596"> </a>
+<a name="ln597">	if (_droppedEvents != NULL) {</a>
+<a name="ln598">		*_droppedEvents = fDroppedEvents;</a>
+<a name="ln599">		fDroppedEvents = 0;</a>
+<a name="ln600">	}</a>
+<a name="ln601"> </a>
+<a name="ln602">	return B_OK;</a>
+<a name="ln603">}</a>
+<a name="ln604"> </a>
+<a name="ln605"> </a>
+<a name="ln606">// #pragma mark - NotificationListener interface</a>
+<a name="ln607"> </a>
+<a name="ln608"> </a>
+<a name="ln609">void</a>
+<a name="ln610">SystemProfiler::EventOccurred(NotificationService&amp; service,</a>
+<a name="ln611">	const KMessage* event)</a>
+<a name="ln612">{</a>
+<a name="ln613">	int32 eventCode;</a>
+<a name="ln614">	if (event-&gt;FindInt32(&quot;event&quot;, &amp;eventCode) != B_OK)</a>
+<a name="ln615">		return;</a>
+<a name="ln616"> </a>
+<a name="ln617">	if (strcmp(service.Name(), &quot;teams&quot;) == 0) {</a>
+<a name="ln618">		Team* team = (Team*)event-&gt;GetPointer(&quot;teamStruct&quot;, NULL);</a>
+<a name="ln619">		if (team == NULL)</a>
+<a name="ln620">			return;</a>
+<a name="ln621"> </a>
+<a name="ln622">		switch (eventCode) {</a>
+<a name="ln623">			case TEAM_ADDED:</a>
+<a name="ln624">				if (fTeamNotificationsEnabled)</a>
+<a name="ln625">					_TeamAdded(team);</a>
+<a name="ln626">				break;</a>
+<a name="ln627"> </a>
+<a name="ln628">			case TEAM_REMOVED:</a>
+<a name="ln629">				if (team-&gt;id == fTeam) {</a>
+<a name="ln630">					// The profiling team is gone -- uninstall the profiler!</a>
+<a name="ln631">					InterruptsSpinLocker locker(sProfilerLock);</a>
+<a name="ln632">					if (sProfiler != this)</a>
+<a name="ln633">						return;</a>
+<a name="ln634"> </a>
+<a name="ln635">					sProfiler = NULL;</a>
+<a name="ln636">					locker.Unlock();</a>
+<a name="ln637"> </a>
+<a name="ln638">					ReleaseReference();</a>
+<a name="ln639">					return;</a>
+<a name="ln640">				}</a>
+<a name="ln641"> </a>
+<a name="ln642">				// When we're still doing the initial team list scan, we are</a>
+<a name="ln643">				// also interested in removals that happened to teams we have</a>
+<a name="ln644">				// already seen.</a>
+<a name="ln645">				if (fTeamNotificationsEnabled</a>
+<a name="ln646">					|| team-&gt;serial_number &lt;= fLastTeamAddedSerialNumber) {</a>
+<a name="ln647">					_TeamRemoved(team);</a>
+<a name="ln648">				}</a>
+<a name="ln649">				break;</a>
+<a name="ln650"> </a>
+<a name="ln651">			case TEAM_EXEC:</a>
+<a name="ln652">				if (fTeamNotificationsEnabled)</a>
+<a name="ln653">					_TeamExec(team);</a>
+<a name="ln654">				break;</a>
+<a name="ln655">		}</a>
+<a name="ln656">	} else if (strcmp(service.Name(), &quot;threads&quot;) == 0) {</a>
+<a name="ln657">		Thread* thread = (Thread*)event-&gt;GetPointer(&quot;threadStruct&quot;, NULL);</a>
+<a name="ln658">		if (thread == NULL)</a>
+<a name="ln659">			return;</a>
+<a name="ln660"> </a>
+<a name="ln661">		switch (eventCode) {</a>
+<a name="ln662">			case THREAD_ADDED:</a>
+<a name="ln663">				if (fThreadNotificationsEnabled)</a>
+<a name="ln664">					_ThreadAdded(thread);</a>
+<a name="ln665">				break;</a>
+<a name="ln666"> </a>
+<a name="ln667">			case THREAD_REMOVED:</a>
+<a name="ln668">				// When we're still doing the initial thread list scan, we are</a>
+<a name="ln669">				// also interested in removals that happened to threads we have</a>
+<a name="ln670">				// already seen.</a>
+<a name="ln671">				if (fThreadNotificationsEnabled</a>
+<a name="ln672">					|| thread-&gt;serial_number &lt;= fLastThreadAddedSerialNumber) {</a>
+<a name="ln673">					_ThreadRemoved(thread);</a>
+<a name="ln674">				}</a>
+<a name="ln675">				break;</a>
+<a name="ln676">		}</a>
+<a name="ln677">	} else if (strcmp(service.Name(), &quot;images&quot;) == 0) {</a>
+<a name="ln678">		if (!fImageNotificationsEnabled)</a>
+<a name="ln679">			return;</a>
+<a name="ln680"> </a>
+<a name="ln681">		struct image* image = (struct image*)event-&gt;GetPointer(</a>
+<a name="ln682">			&quot;imageStruct&quot;, NULL);</a>
+<a name="ln683">		if (image == NULL)</a>
+<a name="ln684">			return;</a>
+<a name="ln685"> </a>
+<a name="ln686">		switch (eventCode) {</a>
+<a name="ln687">			case IMAGE_ADDED:</a>
+<a name="ln688">				_ImageAdded(image);</a>
+<a name="ln689">				break;</a>
+<a name="ln690"> </a>
+<a name="ln691">			case IMAGE_REMOVED:</a>
+<a name="ln692">				_ImageRemoved(image);</a>
+<a name="ln693">				break;</a>
+<a name="ln694">		}</a>
+<a name="ln695">	} else if (strcmp(service.Name(), &quot;I/O&quot;) == 0) {</a>
+<a name="ln696">		if (!fIONotificationsEnabled)</a>
+<a name="ln697">			return;</a>
+<a name="ln698"> </a>
+<a name="ln699">		IOScheduler* scheduler = (IOScheduler*)event-&gt;GetPointer(&quot;scheduler&quot;,</a>
+<a name="ln700">			NULL);</a>
+<a name="ln701">		if (scheduler == NULL)</a>
+<a name="ln702">			return;</a>
+<a name="ln703"> </a>
+<a name="ln704">		IORequest* request = (IORequest*)event-&gt;GetPointer(&quot;request&quot;, NULL);</a>
+<a name="ln705">		IOOperation* operation = (IOOperation*)event-&gt;GetPointer(&quot;operation&quot;,</a>
+<a name="ln706">			NULL);</a>
+<a name="ln707"> </a>
+<a name="ln708">		switch (eventCode) {</a>
+<a name="ln709">			case IO_SCHEDULER_ADDED:</a>
+<a name="ln710">				_IOSchedulerAdded(scheduler);</a>
+<a name="ln711">				break;</a>
+<a name="ln712"> </a>
+<a name="ln713">			case IO_SCHEDULER_REMOVED:</a>
+<a name="ln714">				_IOSchedulerRemoved(scheduler);</a>
+<a name="ln715">				break;</a>
+<a name="ln716"> </a>
+<a name="ln717">			case IO_SCHEDULER_REQUEST_SCHEDULED:</a>
+<a name="ln718">				_IORequestScheduled(scheduler, request);</a>
+<a name="ln719">				break;</a>
+<a name="ln720"> </a>
+<a name="ln721">			case IO_SCHEDULER_REQUEST_FINISHED:</a>
+<a name="ln722">				_IORequestFinished(scheduler, request);</a>
+<a name="ln723">				break;</a>
+<a name="ln724"> </a>
+<a name="ln725">			case IO_SCHEDULER_OPERATION_STARTED:</a>
+<a name="ln726">				_IOOperationStarted(scheduler, request, operation);</a>
+<a name="ln727">				break;</a>
+<a name="ln728"> </a>
+<a name="ln729">			case IO_SCHEDULER_OPERATION_FINISHED:</a>
+<a name="ln730">				_IOOperationFinished(scheduler, request, operation);</a>
+<a name="ln731">				break;</a>
+<a name="ln732">		}</a>
+<a name="ln733">	}</a>
+<a name="ln734"> </a>
+<a name="ln735">	_MaybeNotifyProfilerThread();</a>
+<a name="ln736">}</a>
+<a name="ln737"> </a>
+<a name="ln738"> </a>
+<a name="ln739">// #pragma mark - SchedulerListener interface</a>
+<a name="ln740"> </a>
+<a name="ln741"> </a>
+<a name="ln742">void</a>
+<a name="ln743">SystemProfiler::ThreadEnqueuedInRunQueue(Thread* thread)</a>
+<a name="ln744">{</a>
+<a name="ln745">	int cpu = smp_get_current_cpu();</a>
+<a name="ln746"> </a>
+<a name="ln747">	InterruptsSpinLocker locker(fLock, false, !fReentered[cpu]);</a>
+<a name="ln748">		// When re-entering, we already hold the lock.</a>
+<a name="ln749"> </a>
+<a name="ln750">	system_profiler_thread_enqueued_in_run_queue* event</a>
+<a name="ln751">		= (system_profiler_thread_enqueued_in_run_queue*)</a>
+<a name="ln752">			_AllocateBuffer(</a>
+<a name="ln753">				sizeof(system_profiler_thread_enqueued_in_run_queue),</a>
+<a name="ln754">				B_SYSTEM_PROFILER_THREAD_ENQUEUED_IN_RUN_QUEUE, cpu, 0);</a>
+<a name="ln755">	if (event == NULL)</a>
+<a name="ln756">		return;</a>
+<a name="ln757"> </a>
+<a name="ln758">	event-&gt;time = system_time_nsecs();</a>
+<a name="ln759">	event-&gt;thread = thread-&gt;id;</a>
+<a name="ln760">	event-&gt;priority = thread-&gt;priority;</a>
+<a name="ln761"> </a>
+<a name="ln762">	fHeader-&gt;size = fBufferSize;</a>
+<a name="ln763"> </a>
+<a name="ln764">	// Unblock the profiler thread, if necessary, but don't unblock the thread,</a>
+<a name="ln765">	// if it had been waiting on a condition variable, since then we'd likely</a>
+<a name="ln766">	// deadlock in ConditionVariable::NotifyOne(), as it acquires a static</a>
+<a name="ln767">	// spinlock.</a>
+<a name="ln768">	if (thread-&gt;wait.type != THREAD_BLOCK_TYPE_CONDITION_VARIABLE)</a>
+<a name="ln769">		_MaybeNotifyProfilerThreadLocked();</a>
+<a name="ln770">}</a>
+<a name="ln771"> </a>
+<a name="ln772"> </a>
+<a name="ln773">void</a>
+<a name="ln774">SystemProfiler::ThreadRemovedFromRunQueue(Thread* thread)</a>
+<a name="ln775">{</a>
+<a name="ln776">	int cpu = smp_get_current_cpu();</a>
+<a name="ln777"> </a>
+<a name="ln778">	InterruptsSpinLocker locker(fLock, false, !fReentered[cpu]);</a>
+<a name="ln779">		// When re-entering, we already hold the lock.</a>
+<a name="ln780"> </a>
+<a name="ln781">	system_profiler_thread_removed_from_run_queue* event</a>
+<a name="ln782">		= (system_profiler_thread_removed_from_run_queue*)</a>
+<a name="ln783">			_AllocateBuffer(</a>
+<a name="ln784">				sizeof(system_profiler_thread_removed_from_run_queue),</a>
+<a name="ln785">				B_SYSTEM_PROFILER_THREAD_REMOVED_FROM_RUN_QUEUE, cpu, 0);</a>
+<a name="ln786">	if (event == NULL)</a>
+<a name="ln787">		return;</a>
+<a name="ln788"> </a>
+<a name="ln789">	event-&gt;time = system_time_nsecs();</a>
+<a name="ln790">	event-&gt;thread = thread-&gt;id;</a>
+<a name="ln791"> </a>
+<a name="ln792">	fHeader-&gt;size = fBufferSize;</a>
+<a name="ln793"> </a>
+<a name="ln794">	// unblock the profiler thread, if necessary</a>
+<a name="ln795">	_MaybeNotifyProfilerThreadLocked();</a>
+<a name="ln796">}</a>
+<a name="ln797"> </a>
+<a name="ln798"> </a>
+<a name="ln799">void</a>
+<a name="ln800">SystemProfiler::ThreadScheduled(Thread* oldThread, Thread* newThread)</a>
+<a name="ln801">{</a>
+<a name="ln802">	int cpu = smp_get_current_cpu();</a>
+<a name="ln803"> </a>
+<a name="ln804">	InterruptsSpinLocker locker(fLock, false, !fReentered[cpu]);</a>
+<a name="ln805">		// When re-entering, we already hold the lock.</a>
+<a name="ln806"> </a>
+<a name="ln807">	// If the old thread starts waiting, handle the wait object.</a>
+<a name="ln808">	if (oldThread-&gt;state == B_THREAD_WAITING)</a>
+<a name="ln809">		_WaitObjectUsed((addr_t)oldThread-&gt;wait.object, oldThread-&gt;wait.type);</a>
+<a name="ln810"> </a>
+<a name="ln811">	system_profiler_thread_scheduled* event</a>
+<a name="ln812">		= (system_profiler_thread_scheduled*)</a>
+<a name="ln813">			_AllocateBuffer(sizeof(system_profiler_thread_scheduled),</a>
+<a name="ln814">				B_SYSTEM_PROFILER_THREAD_SCHEDULED, cpu, 0);</a>
+<a name="ln815">	if (event == NULL)</a>
+<a name="ln816">		return;</a>
+<a name="ln817"> </a>
+<a name="ln818">	event-&gt;time = system_time_nsecs();</a>
+<a name="ln819">	event-&gt;thread = newThread-&gt;id;</a>
+<a name="ln820">	event-&gt;previous_thread = oldThread-&gt;id;</a>
+<a name="ln821">	event-&gt;previous_thread_state = oldThread-&gt;state;</a>
+<a name="ln822">	event-&gt;previous_thread_wait_object_type = oldThread-&gt;wait.type;</a>
+<a name="ln823">	event-&gt;previous_thread_wait_object = (addr_t)oldThread-&gt;wait.object;</a>
+<a name="ln824"> </a>
+<a name="ln825">	fHeader-&gt;size = fBufferSize;</a>
+<a name="ln826"> </a>
+<a name="ln827">	// unblock the profiler thread, if necessary</a>
+<a name="ln828">	_MaybeNotifyProfilerThreadLocked();</a>
+<a name="ln829">}</a>
+<a name="ln830"> </a>
+<a name="ln831"> </a>
+<a name="ln832">// #pragma mark - WaitObjectListener interface</a>
+<a name="ln833"> </a>
+<a name="ln834"> </a>
+<a name="ln835">void</a>
+<a name="ln836">SystemProfiler::SemaphoreCreated(sem_id id, const char* name)</a>
+<a name="ln837">{</a>
+<a name="ln838">	_WaitObjectCreated((addr_t)id, THREAD_BLOCK_TYPE_SEMAPHORE);</a>
+<a name="ln839">}</a>
+<a name="ln840"> </a>
+<a name="ln841"> </a>
+<a name="ln842">void</a>
+<a name="ln843">SystemProfiler::ConditionVariableInitialized(ConditionVariable* variable)</a>
+<a name="ln844">{</a>
+<a name="ln845">	_WaitObjectCreated((addr_t)variable, THREAD_BLOCK_TYPE_CONDITION_VARIABLE);</a>
+<a name="ln846">}</a>
+<a name="ln847"> </a>
+<a name="ln848"> </a>
+<a name="ln849">void</a>
+<a name="ln850">SystemProfiler::MutexInitialized(mutex* lock)</a>
+<a name="ln851">{</a>
+<a name="ln852">	_WaitObjectCreated((addr_t)lock, THREAD_BLOCK_TYPE_MUTEX);</a>
+<a name="ln853">}</a>
+<a name="ln854"> </a>
+<a name="ln855"> </a>
+<a name="ln856">void</a>
+<a name="ln857">SystemProfiler::RWLockInitialized(rw_lock* lock)</a>
+<a name="ln858">{</a>
+<a name="ln859">	_WaitObjectCreated((addr_t)lock, THREAD_BLOCK_TYPE_RW_LOCK);</a>
+<a name="ln860">}</a>
+<a name="ln861"> </a>
+<a name="ln862"> </a>
+<a name="ln863">// #pragma mark - SystemProfiler private</a>
+<a name="ln864"> </a>
+<a name="ln865"> </a>
+<a name="ln866">bool</a>
+<a name="ln867">SystemProfiler::_TeamAdded(Team* team)</a>
+<a name="ln868">{</a>
+<a name="ln869">	TeamLocker teamLocker(team);</a>
+<a name="ln870"> </a>
+<a name="ln871">	size_t nameLen = strlen(team-&gt;Name());</a>
+<a name="ln872">	size_t argsLen = strlen(team-&gt;Args());</a>
+<a name="ln873"> </a>
+<a name="ln874">	InterruptsSpinLocker locker(fLock);</a>
+<a name="ln875"> </a>
+<a name="ln876">	// During the initial scan check whether the team is already gone again.</a>
+<a name="ln877">	// Later this cannot happen, since the team creator notifies us before</a>
+<a name="ln878">	// actually starting the team.</a>
+<a name="ln879">	if (!fTeamNotificationsEnabled &amp;&amp; team-&gt;state &gt;= TEAM_STATE_DEATH)</a>
+<a name="ln880">		return true;</a>
+<a name="ln881"> </a>
+<a name="ln882">	if (team-&gt;serial_number &gt; fLastTeamAddedSerialNumber)</a>
+<a name="ln883">		fLastTeamAddedSerialNumber = team-&gt;serial_number;</a>
+<a name="ln884"> </a>
+<a name="ln885">	system_profiler_team_added* event = (system_profiler_team_added*)</a>
+<a name="ln886">		_AllocateBuffer(</a>
+<a name="ln887">			sizeof(system_profiler_team_added) + nameLen + 1 + argsLen,</a>
+<a name="ln888">			B_SYSTEM_PROFILER_TEAM_ADDED, 0, 0);</a>
+<a name="ln889">	if (event == NULL)</a>
+<a name="ln890">		return false;</a>
+<a name="ln891"> </a>
+<a name="ln892">	event-&gt;team = team-&gt;id;</a>
+<a name="ln893">	strcpy(event-&gt;name, team-&gt;Name());</a>
+<a name="ln894">	event-&gt;args_offset = nameLen + 1;</a>
+<a name="ln895">	strcpy(event-&gt;name + nameLen + 1, team-&gt;Args());</a>
+<a name="ln896"> </a>
+<a name="ln897">	fHeader-&gt;size = fBufferSize;</a>
+<a name="ln898"> </a>
+<a name="ln899">	return true;</a>
+<a name="ln900">}</a>
+<a name="ln901"> </a>
+<a name="ln902"> </a>
+<a name="ln903">bool</a>
+<a name="ln904">SystemProfiler::_TeamRemoved(Team* team)</a>
+<a name="ln905">{</a>
+<a name="ln906">	// TODO: It is possible that we get remove notifications for teams that</a>
+<a name="ln907">	// had already been removed from the global team list when we did the</a>
+<a name="ln908">	// initial scan, but were still in the process of dying. ATM it is not</a>
+<a name="ln909">	// really possible to identify such a case.</a>
+<a name="ln910"> </a>
+<a name="ln911">	TeamLocker teamLocker(team);</a>
+<a name="ln912">	InterruptsSpinLocker locker(fLock);</a>
+<a name="ln913"> </a>
+<a name="ln914">	system_profiler_team_removed* event = (system_profiler_team_removed*)</a>
+<a name="ln915">		_AllocateBuffer(sizeof(system_profiler_team_removed),</a>
+<a name="ln916">			B_SYSTEM_PROFILER_TEAM_REMOVED, 0, 0);</a>
+<a name="ln917">	if (event == NULL)</a>
+<a name="ln918">		return false;</a>
+<a name="ln919"> </a>
+<a name="ln920">	event-&gt;team = team-&gt;id;</a>
+<a name="ln921"> </a>
+<a name="ln922">	fHeader-&gt;size = fBufferSize;</a>
+<a name="ln923"> </a>
+<a name="ln924">	return true;</a>
+<a name="ln925">}</a>
+<a name="ln926"> </a>
+<a name="ln927"> </a>
+<a name="ln928">bool</a>
+<a name="ln929">SystemProfiler::_TeamExec(Team* team)</a>
+<a name="ln930">{</a>
+<a name="ln931">	TeamLocker teamLocker(team);</a>
+<a name="ln932"> </a>
+<a name="ln933">	size_t argsLen = strlen(team-&gt;Args());</a>
+<a name="ln934"> </a>
+<a name="ln935">	InterruptsSpinLocker locker(fLock);</a>
+<a name="ln936"> </a>
+<a name="ln937">	system_profiler_team_exec* event = (system_profiler_team_exec*)</a>
+<a name="ln938">		_AllocateBuffer(sizeof(system_profiler_team_exec) + argsLen,</a>
+<a name="ln939">			B_SYSTEM_PROFILER_TEAM_EXEC, 0, 0);</a>
+<a name="ln940">	if (event == NULL)</a>
+<a name="ln941">		return false;</a>
+<a name="ln942"> </a>
+<a name="ln943">	event-&gt;team = team-&gt;id;</a>
+<a name="ln944">	strlcpy(event-&gt;thread_name, team-&gt;main_thread-&gt;name,</a>
+<a name="ln945">		sizeof(event-&gt;thread_name));</a>
+<a name="ln946">	strcpy(event-&gt;args, team-&gt;Args());</a>
+<a name="ln947"> </a>
+<a name="ln948">	fHeader-&gt;size = fBufferSize;</a>
+<a name="ln949"> </a>
+<a name="ln950">	return true;</a>
+<a name="ln951">}</a>
+<a name="ln952"> </a>
+<a name="ln953"> </a>
+<a name="ln954">bool</a>
+<a name="ln955">SystemProfiler::_ThreadAdded(Thread* thread)</a>
+<a name="ln956">{</a>
+<a name="ln957">	ThreadLocker threadLocker(thread);</a>
+<a name="ln958">	InterruptsSpinLocker locker(fLock);</a>
+<a name="ln959"> </a>
+<a name="ln960">	// During the initial scan check whether the team is already gone again.</a>
+<a name="ln961">	// Later this cannot happen, since the team creator notifies us before</a>
+<a name="ln962">	// actually starting the thread.</a>
+<a name="ln963">	if (!fThreadNotificationsEnabled &amp;&amp; !thread-&gt;IsAlive())</a>
+<a name="ln964">		return true;</a>
+<a name="ln965"> </a>
+<a name="ln966">	if (thread-&gt;serial_number &gt; fLastThreadAddedSerialNumber)</a>
+<a name="ln967">		fLastThreadAddedSerialNumber = thread-&gt;serial_number;</a>
+<a name="ln968"> </a>
+<a name="ln969">	system_profiler_thread_added* event = (system_profiler_thread_added*)</a>
+<a name="ln970">		_AllocateBuffer(sizeof(system_profiler_thread_added),</a>
+<a name="ln971">			B_SYSTEM_PROFILER_THREAD_ADDED, 0, 0);</a>
+<a name="ln972">	if (event == NULL)</a>
+<a name="ln973">		return false;</a>
+<a name="ln974"> </a>
+<a name="ln975">	event-&gt;team = thread-&gt;team-&gt;id;</a>
+<a name="ln976">	event-&gt;thread = thread-&gt;id;</a>
+<a name="ln977">	strlcpy(event-&gt;name, thread-&gt;name, sizeof(event-&gt;name));</a>
+<a name="ln978"> </a>
+<a name="ln979">	fHeader-&gt;size = fBufferSize;</a>
+<a name="ln980"> </a>
+<a name="ln981">	return true;</a>
+<a name="ln982">}</a>
+<a name="ln983"> </a>
+<a name="ln984"> </a>
+<a name="ln985">bool</a>
+<a name="ln986">SystemProfiler::_ThreadRemoved(Thread* thread)</a>
+<a name="ln987">{</a>
+<a name="ln988">	// TODO: It is possible that we get remove notifications for threads that</a>
+<a name="ln989">	// had already been removed from the global thread list when we did the</a>
+<a name="ln990">	// initial scan, but were still in the process of dying. ATM it is not</a>
+<a name="ln991">	// really possible to identify such a case.</a>
+<a name="ln992"> </a>
+<a name="ln993">	ThreadLocker threadLocker(thread);</a>
+<a name="ln994">	InterruptsSpinLocker locker(fLock);</a>
+<a name="ln995"> </a>
+<a name="ln996">	system_profiler_thread_removed* event</a>
+<a name="ln997">		= (system_profiler_thread_removed*)</a>
+<a name="ln998">			_AllocateBuffer(sizeof(system_profiler_thread_removed),</a>
+<a name="ln999">				B_SYSTEM_PROFILER_THREAD_REMOVED, 0, 0);</a>
+<a name="ln1000">	if (event == NULL)</a>
+<a name="ln1001">		return false;</a>
+<a name="ln1002"> </a>
+<a name="ln1003">	event-&gt;team = thread-&gt;team-&gt;id;</a>
+<a name="ln1004">	event-&gt;thread = thread-&gt;id;</a>
+<a name="ln1005"> </a>
+<a name="ln1006">	fHeader-&gt;size = fBufferSize;</a>
+<a name="ln1007"> </a>
+<a name="ln1008">	return true;</a>
+<a name="ln1009">}</a>
+<a name="ln1010"> </a>
+<a name="ln1011"> </a>
+<a name="ln1012">bool</a>
+<a name="ln1013">SystemProfiler::_ImageAdded(struct image* image)</a>
+<a name="ln1014">{</a>
+<a name="ln1015">	InterruptsSpinLocker locker(fLock);</a>
+<a name="ln1016"> </a>
+<a name="ln1017">	system_profiler_image_added* event = (system_profiler_image_added*)</a>
+<a name="ln1018">		_AllocateBuffer(sizeof(system_profiler_image_added),</a>
+<a name="ln1019">			B_SYSTEM_PROFILER_IMAGE_ADDED, 0, 0);</a>
+<a name="ln1020">	if (event == NULL)</a>
+<a name="ln1021">		return false;</a>
+<a name="ln1022"> </a>
+<a name="ln1023">	event-&gt;team = image-&gt;team;</a>
+<a name="ln1024">	event-&gt;info = image-&gt;info.basic_info;</a>
+<a name="ln1025"> </a>
+<a name="ln1026">	fHeader-&gt;size = fBufferSize;</a>
+<a name="ln1027"> </a>
+<a name="ln1028">	return true;</a>
+<a name="ln1029">}</a>
+<a name="ln1030"> </a>
+<a name="ln1031"> </a>
+<a name="ln1032">bool</a>
+<a name="ln1033">SystemProfiler::_ImageRemoved(struct image* image)</a>
+<a name="ln1034">{</a>
+<a name="ln1035">	InterruptsSpinLocker locker(fLock);</a>
+<a name="ln1036"> </a>
+<a name="ln1037">	system_profiler_image_removed* event = (system_profiler_image_removed*)</a>
+<a name="ln1038">		_AllocateBuffer(sizeof(system_profiler_image_removed),</a>
+<a name="ln1039">			B_SYSTEM_PROFILER_IMAGE_REMOVED, 0, 0);</a>
+<a name="ln1040">	if (event == NULL)</a>
+<a name="ln1041">		return false;</a>
+<a name="ln1042"> </a>
+<a name="ln1043">	event-&gt;team = image-&gt;team;</a>
+<a name="ln1044">	event-&gt;image = image-&gt;info.basic_info.id;</a>
+<a name="ln1045"> </a>
+<a name="ln1046">	fHeader-&gt;size = fBufferSize;</a>
+<a name="ln1047"> </a>
+<a name="ln1048">	return true;</a>
+<a name="ln1049">}</a>
+<a name="ln1050"> </a>
+<a name="ln1051"> </a>
+<a name="ln1052">bool</a>
+<a name="ln1053">SystemProfiler::_IOSchedulerAdded(IOScheduler* scheduler)</a>
+<a name="ln1054">{</a>
+<a name="ln1055">	size_t nameLen = strlen(scheduler-&gt;Name());</a>
+<a name="ln1056"> </a>
+<a name="ln1057">	InterruptsSpinLocker locker(fLock);</a>
+<a name="ln1058"> </a>
+<a name="ln1059">	system_profiler_io_scheduler_added* event</a>
+<a name="ln1060">		= (system_profiler_io_scheduler_added*)_AllocateBuffer(</a>
+<a name="ln1061">			sizeof(system_profiler_io_scheduler_added) + nameLen,</a>
+<a name="ln1062">			B_SYSTEM_PROFILER_IO_SCHEDULER_ADDED, 0, 0);</a>
+<a name="ln1063">	if (event == NULL)</a>
+<a name="ln1064">		return false;</a>
+<a name="ln1065"> </a>
+<a name="ln1066">	event-&gt;scheduler = scheduler-&gt;ID();</a>
+<a name="ln1067">	strcpy(event-&gt;name, scheduler-&gt;Name());</a>
+<a name="ln1068"> </a>
+<a name="ln1069">	fHeader-&gt;size = fBufferSize;</a>
+<a name="ln1070"> </a>
+<a name="ln1071">	return true;</a>
+<a name="ln1072">}</a>
+<a name="ln1073"> </a>
+<a name="ln1074"> </a>
+<a name="ln1075">bool</a>
+<a name="ln1076">SystemProfiler::_IOSchedulerRemoved(IOScheduler* scheduler)</a>
+<a name="ln1077">{</a>
+<a name="ln1078">	InterruptsSpinLocker locker(fLock);</a>
+<a name="ln1079"> </a>
+<a name="ln1080">	system_profiler_io_scheduler_removed* event</a>
+<a name="ln1081">		= (system_profiler_io_scheduler_removed*)_AllocateBuffer(</a>
+<a name="ln1082">			sizeof(system_profiler_io_scheduler_removed),</a>
+<a name="ln1083">			B_SYSTEM_PROFILER_IO_SCHEDULER_REMOVED, 0, 0);</a>
+<a name="ln1084">	if (event == NULL)</a>
+<a name="ln1085">		return false;</a>
+<a name="ln1086"> </a>
+<a name="ln1087">	event-&gt;scheduler = scheduler-&gt;ID();</a>
+<a name="ln1088"> </a>
+<a name="ln1089">	fHeader-&gt;size = fBufferSize;</a>
+<a name="ln1090"> </a>
+<a name="ln1091">	return true;</a>
+<a name="ln1092">}</a>
+<a name="ln1093"> </a>
+<a name="ln1094"> </a>
+<a name="ln1095">bool</a>
+<a name="ln1096">SystemProfiler::_IORequestScheduled(IOScheduler* scheduler, IORequest* request)</a>
+<a name="ln1097">{</a>
+<a name="ln1098">	InterruptsSpinLocker locker(fLock);</a>
+<a name="ln1099"> </a>
+<a name="ln1100">	system_profiler_io_request_scheduled* event</a>
+<a name="ln1101">		= (system_profiler_io_request_scheduled*)_AllocateBuffer(</a>
+<a name="ln1102">			sizeof(system_profiler_io_request_scheduled),</a>
+<a name="ln1103">			B_SYSTEM_PROFILER_IO_REQUEST_SCHEDULED, 0, 0);</a>
+<a name="ln1104">	if (event == NULL)</a>
+<a name="ln1105">		return false;</a>
+<a name="ln1106"> </a>
+<a name="ln1107">	IORequestOwner* owner = request-&gt;Owner();</a>
+<a name="ln1108"> </a>
+<a name="ln1109">	event-&gt;time = system_time_nsecs();</a>
+<a name="ln1110">	event-&gt;scheduler = scheduler-&gt;ID();</a>
+<a name="ln1111">	event-&gt;team = owner-&gt;team;</a>
+<a name="ln1112">	event-&gt;thread = owner-&gt;thread;</a>
+<a name="ln1113">	event-&gt;request = request;</a>
+<a name="ln1114">	event-&gt;offset = request-&gt;Offset();</a>
+<a name="ln1115">	event-&gt;length = request-&gt;Length();</a>
+<a name="ln1116">	event-&gt;write = request-&gt;IsWrite();</a>
+<a name="ln1117">	event-&gt;priority = owner-&gt;priority;</a>
+<a name="ln1118"> </a>
+<a name="ln1119">	fHeader-&gt;size = fBufferSize;</a>
+<a name="ln1120"> </a>
+<a name="ln1121">	return true;</a>
+<a name="ln1122">}</a>
+<a name="ln1123"> </a>
+<a name="ln1124"> </a>
+<a name="ln1125">bool</a>
+<a name="ln1126">SystemProfiler::_IORequestFinished(IOScheduler* scheduler, IORequest* request)</a>
+<a name="ln1127">{</a>
+<a name="ln1128">	InterruptsSpinLocker locker(fLock);</a>
+<a name="ln1129"> </a>
+<a name="ln1130">	system_profiler_io_request_finished* event</a>
+<a name="ln1131">		= (system_profiler_io_request_finished*)_AllocateBuffer(</a>
+<a name="ln1132">			sizeof(system_profiler_io_request_finished),</a>
+<a name="ln1133">			B_SYSTEM_PROFILER_IO_REQUEST_FINISHED, 0, 0);</a>
+<a name="ln1134">	if (event == NULL)</a>
+<a name="ln1135">		return false;</a>
+<a name="ln1136"> </a>
+<a name="ln1137">	event-&gt;time = system_time_nsecs();</a>
+<a name="ln1138">	event-&gt;scheduler = scheduler-&gt;ID();</a>
+<a name="ln1139">	event-&gt;request = request;</a>
+<a name="ln1140">	event-&gt;status = request-&gt;Status();</a>
+<a name="ln1141">	event-&gt;transferred = request-&gt;TransferredBytes();</a>
+<a name="ln1142"> </a>
+<a name="ln1143">	fHeader-&gt;size = fBufferSize;</a>
+<a name="ln1144"> </a>
+<a name="ln1145">	return true;</a>
+<a name="ln1146">}</a>
+<a name="ln1147"> </a>
+<a name="ln1148"> </a>
+<a name="ln1149">bool</a>
+<a name="ln1150">SystemProfiler::_IOOperationStarted(IOScheduler* scheduler, IORequest* request,</a>
+<a name="ln1151">	IOOperation* operation)</a>
+<a name="ln1152">{</a>
+<a name="ln1153">	InterruptsSpinLocker locker(fLock);</a>
+<a name="ln1154"> </a>
+<a name="ln1155">	system_profiler_io_operation_started* event</a>
+<a name="ln1156">		= (system_profiler_io_operation_started*)_AllocateBuffer(</a>
+<a name="ln1157">			sizeof(system_profiler_io_operation_started),</a>
+<a name="ln1158">			B_SYSTEM_PROFILER_IO_OPERATION_STARTED, 0, 0);</a>
+<a name="ln1159">	if (event == NULL)</a>
+<a name="ln1160">		return false;</a>
+<a name="ln1161"> </a>
+<a name="ln1162">	event-&gt;time = system_time_nsecs();</a>
+<a name="ln1163">	event-&gt;scheduler = scheduler-&gt;ID();</a>
+<a name="ln1164">	event-&gt;request = request;</a>
+<a name="ln1165">	event-&gt;operation = operation;</a>
+<a name="ln1166">	event-&gt;offset = request-&gt;Offset();</a>
+<a name="ln1167">	event-&gt;length = request-&gt;Length();</a>
+<a name="ln1168">	event-&gt;write = request-&gt;IsWrite();</a>
+<a name="ln1169"> </a>
+<a name="ln1170">	fHeader-&gt;size = fBufferSize;</a>
+<a name="ln1171"> </a>
+<a name="ln1172">	return true;</a>
+<a name="ln1173">}</a>
+<a name="ln1174"> </a>
+<a name="ln1175"> </a>
+<a name="ln1176">bool</a>
+<a name="ln1177">SystemProfiler::_IOOperationFinished(IOScheduler* scheduler, IORequest* request,</a>
+<a name="ln1178">	IOOperation* operation)</a>
+<a name="ln1179">{</a>
+<a name="ln1180">	InterruptsSpinLocker locker(fLock);</a>
+<a name="ln1181"> </a>
+<a name="ln1182">	system_profiler_io_operation_finished* event</a>
+<a name="ln1183">		= (system_profiler_io_operation_finished*)_AllocateBuffer(</a>
+<a name="ln1184">			sizeof(system_profiler_io_operation_finished),</a>
+<a name="ln1185">			B_SYSTEM_PROFILER_IO_OPERATION_FINISHED, 0, 0);</a>
+<a name="ln1186">	if (event == NULL)</a>
+<a name="ln1187">		return false;</a>
+<a name="ln1188"> </a>
+<a name="ln1189">	event-&gt;time = system_time_nsecs();</a>
+<a name="ln1190">	event-&gt;scheduler = scheduler-&gt;ID();</a>
+<a name="ln1191">	event-&gt;request = request;</a>
+<a name="ln1192">	event-&gt;operation = operation;</a>
+<a name="ln1193">	event-&gt;status = request-&gt;Status();</a>
+<a name="ln1194">	event-&gt;transferred = request-&gt;TransferredBytes();</a>
+<a name="ln1195"> </a>
+<a name="ln1196">	fHeader-&gt;size = fBufferSize;</a>
+<a name="ln1197"> </a>
+<a name="ln1198">	return true;</a>
+<a name="ln1199">}</a>
+<a name="ln1200"> </a>
+<a name="ln1201"> </a>
+<a name="ln1202">void</a>
+<a name="ln1203">SystemProfiler::_WaitObjectCreated(addr_t object, uint32 type)</a>
+<a name="ln1204">{</a>
+<a name="ln1205">	SpinLocker locker(fLock);</a>
+<a name="ln1206"> </a>
+<a name="ln1207">	// look up the object</a>
+<a name="ln1208">	WaitObjectKey key;</a>
+<a name="ln1209">	key.object = object;</a>
+<a name="ln1210">	key.type = type;</a>
+<a name="ln1211">	WaitObject* waitObject = fWaitObjectTable.Lookup(key);</a>
+<a name="ln1212"> </a>
+<a name="ln1213">	// If found, remove it and add it to the free list. This might sound weird,</a>
+<a name="ln1214">	// but it makes sense, since we lazily track *used* wait objects only.</a>
+<a name="ln1215">	// I.e. the object in the table is now guaranteedly obsolete.</a>
+<a name="ln1216">	if (waitObject) {</a>
+<a name="ln1217">		fWaitObjectTable.RemoveUnchecked(waitObject);</a>
+<a name="ln1218">		fUsedWaitObjects.Remove(waitObject);</a>
+<a name="ln1219">		fFreeWaitObjects.Add(waitObject, false);</a>
+<a name="ln1220">	}</a>
+<a name="ln1221">}</a>
+<a name="ln1222"> </a>
+<a name="ln1223">void</a>
+<a name="ln1224">SystemProfiler::_WaitObjectUsed(addr_t object, uint32 type)</a>
+<a name="ln1225">{</a>
+<a name="ln1226">	// look up the object</a>
+<a name="ln1227">	WaitObjectKey key;</a>
+<a name="ln1228">	key.object = object;</a>
+<a name="ln1229">	key.type = type;</a>
+<a name="ln1230">	WaitObject* waitObject = fWaitObjectTable.Lookup(key);</a>
+<a name="ln1231"> </a>
+<a name="ln1232">	// If already known, re-queue it as most recently used and be done.</a>
+<a name="ln1233">	if (waitObject != NULL) {</a>
+<a name="ln1234">		fUsedWaitObjects.Remove(waitObject);</a>
+<a name="ln1235">		fUsedWaitObjects.Add(waitObject);</a>
+<a name="ln1236">		return;</a>
+<a name="ln1237">	}</a>
+<a name="ln1238"> </a>
+<a name="ln1239">	// not known yet -- get the info</a>
+<a name="ln1240">	const char* name = NULL;</a>
+<a name="ln1241">	const void* referencedObject = NULL;</a>
+<a name="ln1242"> </a>
+<a name="ln1243">	switch (type) {</a>
+<a name="ln1244">		case THREAD_BLOCK_TYPE_SEMAPHORE:</a>
+<a name="ln1245">		{</a>
+<a name="ln1246">			name = sem_get_name_unsafe((sem_id)object);</a>
+<a name="ln1247">			break;</a>
+<a name="ln1248">		}</a>
+<a name="ln1249"> </a>
+<a name="ln1250">		case THREAD_BLOCK_TYPE_CONDITION_VARIABLE:</a>
+<a name="ln1251">		{</a>
+<a name="ln1252">			ConditionVariable* variable = (ConditionVariable*)object;</a>
+<a name="ln1253">			name = variable-&gt;ObjectType();</a>
+<a name="ln1254">			referencedObject = variable-&gt;Object();</a>
+<a name="ln1255">			break;</a>
+<a name="ln1256">		}</a>
+<a name="ln1257"> </a>
+<a name="ln1258">		case THREAD_BLOCK_TYPE_MUTEX:</a>
+<a name="ln1259">		{</a>
+<a name="ln1260">			mutex* lock = (mutex*)object;</a>
+<a name="ln1261">			name = lock-&gt;name;</a>
+<a name="ln1262">			break;</a>
+<a name="ln1263">		}</a>
+<a name="ln1264"> </a>
+<a name="ln1265">		case THREAD_BLOCK_TYPE_RW_LOCK:</a>
+<a name="ln1266">		{</a>
+<a name="ln1267">			rw_lock* lock = (rw_lock*)object;</a>
+<a name="ln1268">			name = lock-&gt;name;</a>
+<a name="ln1269">			break;</a>
+<a name="ln1270">		}</a>
+<a name="ln1271"> </a>
+<a name="ln1272">		case THREAD_BLOCK_TYPE_OTHER:</a>
+<a name="ln1273">		{</a>
+<a name="ln1274">			name = (const char*)(void*)object;</a>
+<a name="ln1275">			break;</a>
+<a name="ln1276">		}</a>
+<a name="ln1277"> </a>
+<a name="ln1278">		case THREAD_BLOCK_TYPE_SNOOZE:</a>
+<a name="ln1279">		case THREAD_BLOCK_TYPE_SIGNAL:</a>
+<a name="ln1280">		default:</a>
+<a name="ln1281">			return;</a>
+<a name="ln1282">	}</a>
+<a name="ln1283"> </a>
+<a name="ln1284">	// add the event</a>
+<a name="ln1285">	size_t nameLen = name != NULL ? strlen(name) : 0;</a>
+<a name="ln1286"> </a>
+<a name="ln1287">	system_profiler_wait_object_info* event</a>
+<a name="ln1288">		= (system_profiler_wait_object_info*)</a>
+<a name="ln1289">			_AllocateBuffer(sizeof(system_profiler_wait_object_info) + nameLen,</a>
+<a name="ln1290">				B_SYSTEM_PROFILER_WAIT_OBJECT_INFO, 0, 0);</a>
+<a name="ln1291">	if (event == NULL)</a>
+<a name="ln1292">		return;</a>
+<a name="ln1293"> </a>
+<a name="ln1294">	event-&gt;type = type;</a>
+<a name="ln1295">	event-&gt;object = object;</a>
+<a name="ln1296">	event-&gt;referenced_object = (addr_t)referencedObject;</a>
+<a name="ln1297">	if (name != NULL)</a>
+<a name="ln1298">		strcpy(event-&gt;name, name);</a>
+<a name="ln1299">	else</a>
+<a name="ln1300">		event-&gt;name[0] = '\0';</a>
+<a name="ln1301"> </a>
+<a name="ln1302">	fHeader-&gt;size = fBufferSize;</a>
+<a name="ln1303"> </a>
+<a name="ln1304">	// add the wait object</a>
+<a name="ln1305"> </a>
+<a name="ln1306">	// get a free one or steal the least recently used one</a>
+<a name="ln1307">	waitObject = fFreeWaitObjects.RemoveHead();</a>
+<a name="ln1308">	if (waitObject == NULL) {</a>
+<a name="ln1309">		waitObject = fUsedWaitObjects.RemoveHead();</a>
+<a name="ln1310">		fWaitObjectTable.RemoveUnchecked(waitObject);</a>
+<a name="ln1311">	}</a>
+<a name="ln1312"> </a>
+<a name="ln1313">	waitObject-&gt;object = object;</a>
+<a name="ln1314">	waitObject-&gt;type = type;</a>
+<a name="ln1315">	fWaitObjectTable.InsertUnchecked(waitObject);</a>
+<a name="ln1316">	fUsedWaitObjects.Add(waitObject);</a>
+<a name="ln1317">}</a>
+<a name="ln1318"> </a>
+<a name="ln1319"> </a>
+<a name="ln1320">/*static*/ bool</a>
+<a name="ln1321">SystemProfiler::_InitialImageIterator(struct image* image, void* cookie)</a>
+<a name="ln1322">{</a>
+<a name="ln1323">	SystemProfiler* self = (SystemProfiler*)cookie;</a>
+<a name="ln1324">	self-&gt;fImageNotificationsEnabled = true;</a>
+<a name="ln1325">		// Set that here, since the image lock is being held now.</a>
+<a name="ln1326">	return !self-&gt;_ImageAdded(image);</a>
+<a name="ln1327">}</a>
+<a name="ln1328"> </a>
+<a name="ln1329"> </a>
+<a name="ln1330">void*</a>
+<a name="ln1331">SystemProfiler::_AllocateBuffer(size_t size, int event, int cpu, int count)</a>
+<a name="ln1332">{</a>
+<a name="ln1333">	size = (size + 3) / 4 * 4;</a>
+<a name="ln1334">	size += sizeof(system_profiler_event_header);</a>
+<a name="ln1335"> </a>
+<a name="ln1336">	size_t end = fBufferStart + fBufferSize;</a>
+<a name="ln1337">	if (end + size &gt; fBufferCapacity) {</a>
+<a name="ln1338">		// Buffer is wrapped or needs wrapping.</a>
+<a name="ln1339">		if (end &lt; fBufferCapacity) {</a>
+<a name="ln1340">			// not wrapped yet, but needed</a>
+<a name="ln1341">			system_profiler_event_header* header</a>
+<a name="ln1342">				= (system_profiler_event_header*)(fBufferBase + end);</a>
+<a name="ln1343">			header-&gt;event = B_SYSTEM_PROFILER_BUFFER_END;</a>
+<a name="ln1344">			fBufferSize = fBufferCapacity - fBufferStart;</a>
+<a name="ln1345">			end = 0;</a>
+<a name="ln1346">		} else</a>
+<a name="ln1347">			end -= fBufferCapacity;</a>
+<a name="ln1348"> </a>
+<a name="ln1349">		if (end + size &gt; fBufferStart) {</a>
+<a name="ln1350">			fDroppedEvents++;</a>
+<a name="ln1351">			return NULL;</a>
+<a name="ln1352">		}</a>
+<a name="ln1353">	}</a>
+<a name="ln1354"> </a>
+<a name="ln1355">	system_profiler_event_header* header</a>
+<a name="ln1356">		= (system_profiler_event_header*)(fBufferBase + end);</a>
+<a name="ln1357">	header-&gt;event = event;</a>
+<a name="ln1358">	header-&gt;cpu = cpu;</a>
+<a name="ln1359">	header-&gt;size = size - sizeof(system_profiler_event_header);</a>
+<a name="ln1360"> </a>
+<a name="ln1361">	fBufferSize += size;</a>
+<a name="ln1362"> </a>
+<a name="ln1363">	return header + 1;</a>
+<a name="ln1364">}</a>
+<a name="ln1365"> </a>
+<a name="ln1366"> </a>
+<a name="ln1367">/*static*/ void</a>
+<a name="ln1368">SystemProfiler::_InitTimers(void* cookie, int cpu)</a>
+<a name="ln1369">{</a>
+<a name="ln1370">	SystemProfiler* self = (SystemProfiler*)cookie;</a>
+<a name="ln1371">	self-&gt;_ScheduleTimer(cpu);</a>
+<a name="ln1372">}</a>
+<a name="ln1373"> </a>
+<a name="ln1374"> </a>
+<a name="ln1375">/*static*/ void</a>
+<a name="ln1376">SystemProfiler::_UninitTimers(void* cookie, int cpu)</a>
+<a name="ln1377">{</a>
+<a name="ln1378">	SystemProfiler* self = (SystemProfiler*)cookie;</a>
+<a name="ln1379"> </a>
+<a name="ln1380">	CPUProfileData&amp; cpuData = self-&gt;fCPUData[cpu];</a>
+<a name="ln1381">	cancel_timer(&amp;cpuData.timer);</a>
+<a name="ln1382">	cpuData.timerScheduled = false;</a>
+<a name="ln1383">}</a>
+<a name="ln1384"> </a>
+<a name="ln1385"> </a>
+<a name="ln1386">void</a>
+<a name="ln1387">SystemProfiler::_ScheduleTimer(int cpu)</a>
+<a name="ln1388">{</a>
+<a name="ln1389">	CPUProfileData&amp; cpuData = fCPUData[cpu];</a>
+<a name="ln1390">	cpuData.timerEnd = system_time() + fInterval;</a>
+<a name="ln1391">	cpuData.timer.user_data = this;</a>
+<a name="ln1392">	add_timer(&amp;cpuData.timer, &amp;_ProfilingEvent, fInterval,</a>
+<a name="ln1393">		B_ONE_SHOT_RELATIVE_TIMER);</a>
+<a name="ln1394">	cpuData.timerScheduled = true;</a>
+<a name="ln1395">}</a>
+<a name="ln1396"> </a>
+<a name="ln1397"> </a>
+<a name="ln1398">void</a>
+<a name="ln1399">SystemProfiler::_DoSample()</a>
+<a name="ln1400">{</a>
+<a name="ln1401">	Thread* thread = thread_get_current_thread();</a>
+<a name="ln1402">	int cpu = thread-&gt;cpu-&gt;cpu_num;</a>
+<a name="ln1403">	CPUProfileData&amp; cpuData = fCPUData[cpu];</a>
+<a name="ln1404"> </a>
+<a name="ln1405">	// get the samples</a>
+<a name="ln1406">	int32 count = arch_debug_get_stack_trace(cpuData.buffer, fStackDepth, 1,</a>
+<a name="ln1407">		0, STACK_TRACE_KERNEL | STACK_TRACE_USER);</a>
+<a name="ln1408"> </a>
+<a name="ln1409">	InterruptsSpinLocker locker(fLock);</a>
+<a name="ln1410"> </a>
+<a name="ln1411">	system_profiler_samples* event = (system_profiler_samples*)</a>
+<a name="ln1412">		_AllocateBuffer(sizeof(system_profiler_samples)</a>
+<a name="ln1413">				+ count * sizeof(addr_t),</a>
+<a name="ln1414">			B_SYSTEM_PROFILER_SAMPLES, cpu, count);</a>
+<a name="ln1415">	if (event == NULL)</a>
+<a name="ln1416">		return;</a>
+<a name="ln1417"> </a>
+<a name="ln1418">	event-&gt;thread = thread-&gt;id;</a>
+<a name="ln1419">	memcpy(event-&gt;samples, cpuData.buffer, count * sizeof(addr_t));</a>
+<a name="ln1420"> </a>
+<a name="ln1421">	fHeader-&gt;size = fBufferSize;</a>
+<a name="ln1422">}</a>
+<a name="ln1423"> </a>
+<a name="ln1424"> </a>
+<a name="ln1425">/*static*/ int32</a>
+<a name="ln1426">SystemProfiler::_ProfilingEvent(struct timer* timer)</a>
+<a name="ln1427">{</a>
+<a name="ln1428">	SystemProfiler* self = (SystemProfiler*)timer-&gt;user_data;</a>
+<a name="ln1429"> </a>
+<a name="ln1430">	self-&gt;_DoSample();</a>
+<a name="ln1431">	self-&gt;_ScheduleTimer(timer-&gt;cpu);</a>
+<a name="ln1432"> </a>
+<a name="ln1433">	return B_HANDLED_INTERRUPT;</a>
+<a name="ln1434">}</a>
+<a name="ln1435"> </a>
+<a name="ln1436"> </a>
+<a name="ln1437">// #pragma mark - private kernel API</a>
+<a name="ln1438"> </a>
+<a name="ln1439"> </a>
+<a name="ln1440">#if SYSTEM_PROFILER</a>
+<a name="ln1441"> </a>
+<a name="ln1442">status_t</a>
+<a name="ln1443">start_system_profiler(size_t areaSize, uint32 stackDepth, bigtime_t interval)</a>
+<a name="ln1444">{</a>
+<a name="ln1445">	struct ParameterDeleter {</a>
+<a name="ln1446">		ParameterDeleter(area_id area)</a>
+<a name="ln1447">			:</a>
+<a name="ln1448">			fArea(area),</a>
+<a name="ln1449">			fDetached(false)</a>
+<a name="ln1450">		{</a>
+<a name="ln1451">		}</a>
+<a name="ln1452"> </a>
+<a name="ln1453">		~ParameterDeleter()</a>
+<a name="ln1454">		{</a>
+<a name="ln1455">			if (!fDetached) {</a>
+<a name="ln1456">				delete_area(fArea);</a>
+<a name="ln1457">				delete sRecordedParameters;</a>
+<a name="ln1458">				sRecordedParameters = NULL;</a>
+<a name="ln1459">			}</a>
+<a name="ln1460">		}</a>
+<a name="ln1461"> </a>
+<a name="ln1462">		void Detach()</a>
+<a name="ln1463">		{</a>
+<a name="ln1464">			fDetached = true;</a>
+<a name="ln1465">		}</a>
+<a name="ln1466"> </a>
+<a name="ln1467">	private:</a>
+<a name="ln1468">		area_id	fArea;</a>
+<a name="ln1469">		bool	fDetached;</a>
+<a name="ln1470">	};</a>
+<a name="ln1471"> </a>
+<a name="ln1472">	void* address;</a>
+<a name="ln1473">	area_id area = create_area(&quot;kernel profile data&quot;, &amp;address,</a>
+<a name="ln1474">		B_ANY_KERNEL_ADDRESS, areaSize, B_FULL_LOCK,</a>
+<a name="ln1475">		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);</a>
+<a name="ln1476">	if (area &lt; 0)</a>
+<a name="ln1477">		return area;</a>
+<a name="ln1478"> </a>
+<a name="ln1479">	ParameterDeleter parameterDeleter(area);</a>
+<a name="ln1480"> </a>
+<a name="ln1481">	sRecordedParameters = new(std::nothrow) system_profiler_parameters;</a>
+<a name="ln1482">	if (sRecordedParameters == NULL)</a>
+<a name="ln1483">		return B_NO_MEMORY;</a>
+<a name="ln1484"> </a>
+<a name="ln1485">	sRecordedParameters-&gt;buffer_area = area;</a>
+<a name="ln1486">	sRecordedParameters-&gt;flags = B_SYSTEM_PROFILER_TEAM_EVENTS</a>
+<a name="ln1487">		| B_SYSTEM_PROFILER_THREAD_EVENTS | B_SYSTEM_PROFILER_IMAGE_EVENTS</a>
+<a name="ln1488">		| B_SYSTEM_PROFILER_IO_SCHEDULING_EVENTS</a>
+<a name="ln1489">		| B_SYSTEM_PROFILER_SAMPLING_EVENTS;</a>
+<a name="ln1490">	sRecordedParameters-&gt;locking_lookup_size = 4096;</a>
+<a name="ln1491">	sRecordedParameters-&gt;interval = interval;</a>
+<a name="ln1492">	sRecordedParameters-&gt;stack_depth = stackDepth;</a>
+<a name="ln1493"> </a>
+<a name="ln1494">	area_info areaInfo;</a>
+<a name="ln1495">	get_area_info(area, &amp;areaInfo);</a>
+<a name="ln1496"> </a>
+<a name="ln1497">	// initialize the profiler</a>
+<a name="ln1498">	SystemProfiler* profiler = new(std::nothrow) SystemProfiler(B_SYSTEM_TEAM,</a>
+<a name="ln1499">		areaInfo, *sRecordedParameters);</a>
+<a name="ln1500">	if (profiler == NULL)</a>
+<a name="ln1501">		return B_NO_MEMORY;</a>
+<a name="ln1502"> </a>
+<a name="ln1503">	ObjectDeleter&lt;SystemProfiler&gt; profilerDeleter(profiler);</a>
+<a name="ln1504"> </a>
+<a name="ln1505">	status_t error = profiler-&gt;Init();</a>
+<a name="ln1506">	if (error != B_OK)</a>
+<a name="ln1507">		return error;</a>
+<a name="ln1508"> </a>
+<a name="ln1509">	// set the new profiler</a>
+<a name="ln1510">	InterruptsSpinLocker locker(sProfilerLock);</a>
+<a name="ln1511">	if (sProfiler != NULL)</a>
+<a name="ln1512">		return B_BUSY;</a>
+<a name="ln1513"> </a>
+<a name="ln1514">	parameterDeleter.Detach();</a>
+<a name="ln1515">	profilerDeleter.Detach();</a>
+<a name="ln1516">	sProfiler = profiler;</a>
+<a name="ln1517">	locker.Unlock();</a>
+<a name="ln1518"> </a>
+<a name="ln1519">	return B_OK;</a>
+<a name="ln1520">}</a>
+<a name="ln1521"> </a>
+<a name="ln1522"> </a>
+<a name="ln1523">void</a>
+<a name="ln1524">stop_system_profiler()</a>
+<a name="ln1525">{</a>
+<a name="ln1526">	InterruptsSpinLocker locker(sProfilerLock);</a>
+<a name="ln1527">	if (sProfiler == NULL)</a>
+<a name="ln1528">		return;</a>
+<a name="ln1529"> </a>
+<a name="ln1530">	SystemProfiler* profiler = sProfiler;</a>
+<a name="ln1531">	sProfiler = NULL;</a>
+<a name="ln1532">	locker.Unlock();</a>
+<a name="ln1533"> </a>
+<a name="ln1534">	profiler-&gt;ReleaseReference();</a>
+<a name="ln1535">}</a>
+<a name="ln1536"> </a>
+<a name="ln1537">#endif	// SYSTEM_PROFILER</a>
+<a name="ln1538"> </a>
+<a name="ln1539"> </a>
+<a name="ln1540">// #pragma mark - syscalls</a>
+<a name="ln1541"> </a>
+<a name="ln1542"> </a>
+<a name="ln1543">status_t</a>
+<a name="ln1544">_user_system_profiler_start(struct system_profiler_parameters* userParameters)</a>
+<a name="ln1545">{</a>
+<a name="ln1546">	// copy params to the kernel</a>
+<a name="ln1547">	struct system_profiler_parameters parameters;</a>
+<a name="ln1548">	if (userParameters == NULL || !IS_USER_ADDRESS(userParameters)</a>
+<a name="ln1549">		|| user_memcpy(&amp;parameters, userParameters, sizeof(parameters))</a>
+<a name="ln1550">			!= B_OK) {</a>
+<a name="ln1551">		return B_BAD_ADDRESS;</a>
+<a name="ln1552">	}</a>
+<a name="ln1553"> </a>
+<a name="ln1554">	// check the parameters</a>
+<a name="ln1555">	team_id team = thread_get_current_thread()-&gt;team-&gt;id;</a>
+<a name="ln1556"> </a>
+<a name="ln1557">	area_info areaInfo;</a>
+<a name="ln1558">	status_t error = get_area_info(parameters.buffer_area, &amp;areaInfo);</a>
+<a name="ln1559">	if (error != B_OK)</a>
+<a name="ln1560">		return error;</a>
+<a name="ln1561"> </a>
+<a name="ln1562">	if (areaInfo.team != team)</a>
+<a name="ln1563">		return B_BAD_VALUE;</a>
+<a name="ln1564"> </a>
+<a name="ln1565">	if ((parameters.flags &amp; B_SYSTEM_PROFILER_SAMPLING_EVENTS) != 0) {</a>
+<a name="ln1566">		if (parameters.stack_depth &lt; 1)</a>
+<a name="ln1567">			return B_BAD_VALUE;</a>
+<a name="ln1568"> </a>
+<a name="ln1569">		if (parameters.interval &lt; B_DEBUG_MIN_PROFILE_INTERVAL)</a>
+<a name="ln1570">			parameters.interval = B_DEBUG_MIN_PROFILE_INTERVAL;</a>
+<a name="ln1571"> </a>
+<a name="ln1572">		if (parameters.stack_depth &gt; B_DEBUG_STACK_TRACE_DEPTH)</a>
+<a name="ln1573">			parameters.stack_depth = B_DEBUG_STACK_TRACE_DEPTH;</a>
+<a name="ln1574">	}</a>
+<a name="ln1575"> </a>
+<a name="ln1576">	// quick check to see whether we do already have a profiler installed</a>
+<a name="ln1577">	InterruptsSpinLocker locker(sProfilerLock);</a>
+<a name="ln1578">	if (sProfiler != NULL)</a>
+<a name="ln1579">		return B_BUSY;</a>
+<a name="ln1580">	locker.Unlock();</a>
+<a name="ln1581"> </a>
+<a name="ln1582">	// initialize the profiler</a>
+<a name="ln1583">	SystemProfiler* profiler = new(std::nothrow) SystemProfiler(team, areaInfo,</a>
+<a name="ln1584">		parameters);</a>
+<a name="ln1585">	if (profiler == NULL)</a>
+<a name="ln1586">		return B_NO_MEMORY;</a>
+<a name="ln1587">	ObjectDeleter&lt;SystemProfiler&gt; profilerDeleter(profiler);</a>
+<a name="ln1588"> </a>
+<a name="ln1589">	error = profiler-&gt;Init();</a>
+<a name="ln1590">	if (error != B_OK)</a>
+<a name="ln1591">		return error;</a>
+<a name="ln1592"> </a>
+<a name="ln1593">	// set the new profiler</a>
+<a name="ln1594">	locker.Lock();</a>
+<a name="ln1595">	if (sProfiler != NULL)</a>
+<a name="ln1596">		return B_BUSY;</a>
+<a name="ln1597"> </a>
+<a name="ln1598">	profilerDeleter.Detach();</a>
+<a name="ln1599">	sProfiler = profiler;</a>
+<a name="ln1600">	locker.Unlock();</a>
+<a name="ln1601"> </a>
+<a name="ln1602">	return B_OK;</a>
+<a name="ln1603">}</a>
+<a name="ln1604"> </a>
+<a name="ln1605"> </a>
+<a name="ln1606">status_t</a>
+<a name="ln1607">_user_system_profiler_next_buffer(size_t bytesRead, uint64* _droppedEvents)</a>
+<a name="ln1608">{</a>
+<a name="ln1609">	if (_droppedEvents != NULL &amp;&amp; !IS_USER_ADDRESS(_droppedEvents))</a>
+<a name="ln1610">		return B_BAD_ADDRESS;</a>
+<a name="ln1611"> </a>
+<a name="ln1612">	team_id team = thread_get_current_thread()-&gt;team-&gt;id;</a>
+<a name="ln1613"> </a>
+<a name="ln1614">	InterruptsSpinLocker locker(sProfilerLock);</a>
+<a name="ln1615">	if (sProfiler == NULL || sProfiler-&gt;TeamID() != team)</a>
+<a name="ln1616">		return B_BAD_VALUE;</a>
+<a name="ln1617"> </a>
+<a name="ln1618">	// get a reference to the profiler</a>
+<a name="ln1619">	SystemProfiler* profiler = sProfiler;</a>
+<a name="ln1620">	BReference&lt;SystemProfiler&gt; reference(profiler);</a>
+<a name="ln1621">	locker.Unlock();</a>
+<a name="ln1622"> </a>
+<a name="ln1623">	uint64 droppedEvents;</a>
+<a name="ln1624">	status_t error = profiler-&gt;NextBuffer(bytesRead,</a>
+<a name="ln1625">		_droppedEvents != NULL ? &amp;droppedEvents : NULL);</a>
+<a name="ln1626">	if (error == B_OK &amp;&amp; _droppedEvents != NULL)</a>
+<a name="ln1627">		user_memcpy(_droppedEvents, &amp;droppedEvents, sizeof(droppedEvents));</a>
+<a name="ln1628"> </a>
+<a name="ln1629">	return error;</a>
+<a name="ln1630">}</a>
+<a name="ln1631"> </a>
+<a name="ln1632"> </a>
+<a name="ln1633">status_t</a>
+<a name="ln1634">_user_system_profiler_stop()</a>
+<a name="ln1635">{</a>
+<a name="ln1636">	team_id team = thread_get_current_thread()-&gt;team-&gt;id;</a>
+<a name="ln1637"> </a>
+<a name="ln1638">	InterruptsSpinLocker locker(sProfilerLock);</a>
+<a name="ln1639">	if (sProfiler == NULL || sProfiler-&gt;TeamID() != team)</a>
+<a name="ln1640">		return B_BAD_VALUE;</a>
+<a name="ln1641"> </a>
+<a name="ln1642">	SystemProfiler* profiler = sProfiler;</a>
+<a name="ln1643">	sProfiler = NULL;</a>
+<a name="ln1644">	locker.Unlock();</a>
+<a name="ln1645"> </a>
+<a name="ln1646">	profiler-&gt;ReleaseReference();</a>
+<a name="ln1647"> </a>
+<a name="ln1648">	return B_OK;</a>
+<a name="ln1649">}</a>
+<a name="ln1650"> </a>
+<a name="ln1651"> </a>
+<a name="ln1652">status_t</a>
+<a name="ln1653">_user_system_profiler_recorded(system_profiler_parameters* userParameters)</a>
+<a name="ln1654">{</a>
+<a name="ln1655">	if (userParameters == NULL || !IS_USER_ADDRESS(userParameters))</a>
+<a name="ln1656">		return B_BAD_ADDRESS;</a>
+<a name="ln1657">	if (sRecordedParameters == NULL)</a>
+<a name="ln1658">		return B_ERROR;</a>
+<a name="ln1659"> </a>
+<a name="ln1660">#if SYSTEM_PROFILER</a>
+<a name="ln1661">	stop_system_profiler();</a>
+<a name="ln1662"> </a>
+<a name="ln1663">	// Transfer the area to the userland process</a>
+<a name="ln1664"> </a>
+<a name="ln1665">	void* address;</a>
+<a name="ln1666">	area_id newArea = transfer_area(sRecordedParameters-&gt;buffer_area, &amp;address,</a>
+<a name="ln1667">		B_ANY_ADDRESS, team_get_current_team_id(), true);</a>
+<a name="ln1668">	if (newArea &lt; 0)</a>
+<a name="ln1669">		return newArea;</a>
+<a name="ln1670"> </a>
+<a name="ln1671">	status_t status = set_area_protection(newArea, B_READ_AREA);</a>
+<a name="ln1672">	if (status == B_OK) {</a>
+<a name="ln1673">		sRecordedParameters-&gt;buffer_area = newArea;</a>
+<a name="ln1674"> </a>
+<a name="ln1675">		status = user_memcpy(userParameters, sRecordedParameters,</a>
+<a name="ln1676">			sizeof(system_profiler_parameters));</a>
+<a name="ln1677">	}</a>
+<a name="ln1678">	if (status != B_OK)</a>
+<a name="ln1679">		delete_area(newArea);</a>
+<a name="ln1680"> </a>
+<a name="ln1681">	delete sRecordedParameters;</a>
+<a name="ln1682">	sRecordedParameters = NULL;</a>
+<a name="ln1683"> </a>
+<a name="ln1684">	return status;</a>
+<a name="ln1685">#else</a>
+<a name="ln1686">	return B_NOT_SUPPORTED;</a>
+<a name="ln1687">#endif // SYSTEM_PROFILER</a>
+<a name="ln1688">}</a>
+
+</code></pre>
+<div class="balloon" rel="249"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fLock, fProfilingActive, fCPUData.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

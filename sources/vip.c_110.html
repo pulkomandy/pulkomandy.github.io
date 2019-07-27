@@ -1,0 +1,488 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>vip.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2">	Copyright (c) 2002-05, Thomas Kurschel</a>
+<a name="ln3">	</a>
+<a name="ln4"> </a>
+<a name="ln5">	Part of Radeon accelerant</a>
+<a name="ln6">		</a>
+<a name="ln7">	Access to VIP</a>
+<a name="ln8">	</a>
+<a name="ln9">	This code must be in kernel because we need for FIFO to become empty</a>
+<a name="ln10">	during VIP access (which in turn requires locking the card, and locking</a>
+<a name="ln11">	is a dangerous thing in user mode as the app can suddenly die, taking</a>
+<a name="ln12">	the lock with it)</a>
+<a name="ln13">*/</a>
+<a name="ln14"> </a>
+<a name="ln15">#include &quot;radeon_driver.h&quot;</a>
+<a name="ln16">#include &quot;mmio.h&quot;</a>
+<a name="ln17">#include &quot;vip_regs.h&quot;</a>
+<a name="ln18">#include &quot;bios_regs.h&quot;</a>
+<a name="ln19">#include &quot;theatre_regs.h&quot;</a>
+<a name="ln20"> </a>
+<a name="ln21"> </a>
+<a name="ln22">// moved to bottom to avoid inlining</a>
+<a name="ln23">static bool Radeon_VIPWaitForIdle( device_info *di );</a>
+<a name="ln24">static status_t RADEON_VIPFifoIdle(device_info *di, uint8 channel);</a>
+<a name="ln25"> </a>
+<a name="ln26"> </a>
+<a name="ln27">// read data from VIP</a>
+<a name="ln28">// CP lock must be hold</a>
+<a name="ln29">static bool do_VIPRead( </a>
+<a name="ln30">	device_info *di, uint channel, uint address, uint32 *data )</a>
+<a name="ln31">{</a>
+<a name="ln32">	vuint8 *regs = di-&gt;regs;</a>
+<a name="ln33"> </a>
+<a name="ln34">	Radeon_WaitForFifo( di, 2 );</a>
+<a name="ln35">	// the 0x2000 is the nameless &quot;register-read&quot; flag</a>
+<a name="ln36">	OUTREG( regs, RADEON_VIPH_REG_ADDR, (channel &lt;&lt; 14) | address | 0x2000 );</a>
+<a name="ln37">	</a>
+<a name="ln38">	if( !Radeon_VIPWaitForIdle( di ))</a>
+<a name="ln39">		return false;</a>
+<a name="ln40"> </a>
+<a name="ln41">	// enable VIP register cycle reads</a>
+<a name="ln42">	Radeon_WaitForFifo( di, 2 );</a>
+<a name="ln43">	OUTREGP( regs, RADEON_VIPH_TIMEOUT_STAT, 0, </a>
+<a name="ln44">		~RADEON_VIPH_TIMEOUT_STAT_AK_MASK &amp; ~RADEON_VIPH_TIMEOUT_STAT_VIPH_REGR_DIS );</a>
+<a name="ln45">	//Radeon_WaitForIdle( di, false, false );</a>
+<a name="ln46">	</a>
+<a name="ln47">	// this read starts a register cycle; the returned value has no meaning</a>
+<a name="ln48">	INREG( regs, RADEON_VIPH_REG_DATA );</a>
+<a name="ln49">	</a>
+<a name="ln50">	if( !Radeon_VIPWaitForIdle( di ))</a>
+<a name="ln51">		return false;</a>
+<a name="ln52">		</a>
+<a name="ln53">	//Radeon_WaitForIdle( di, false, false );</a>
+<a name="ln54">	</a>
+<a name="ln55">	// register cycle is done, so disable any further cycle</a>
+<a name="ln56">	Radeon_WaitForFifo( di, 2 );</a>
+<a name="ln57">	OUTREGP( regs, RADEON_VIPH_TIMEOUT_STAT, RADEON_VIPH_TIMEOUT_STAT_VIPH_REGR_DIS, </a>
+<a name="ln58">		~RADEON_VIPH_TIMEOUT_STAT_AK_MASK &amp; ~RADEON_VIPH_TIMEOUT_STAT_VIPH_REGR_DIS );</a>
+<a name="ln59">	//Radeon_WaitForIdle( di, false, false );</a>
+<a name="ln60">	</a>
+<a name="ln61">	// get the data</a>
+<a name="ln62">	*data = INREG( regs, RADEON_VIPH_REG_DATA );</a>
+<a name="ln63">	</a>
+<a name="ln64">	//SHOW_FLOW( 4, &quot;channel=%d, address=%x, data=%lx&quot;, channel, address, *data );</a>
+<a name="ln65"> </a>
+<a name="ln66">	if( !Radeon_VIPWaitForIdle( di ))</a>
+<a name="ln67">		return false;</a>
+<a name="ln68"> </a>
+<a name="ln69">	// disable register cycle again (according to sample code)</a>
+<a name="ln70">	// IMHO, this is not necessary as it has been done before</a>
+<a name="ln71">	Radeon_WaitForFifo( di, 2 );</a>
+<a name="ln72">	OUTREGP( regs, RADEON_VIPH_TIMEOUT_STAT, RADEON_VIPH_TIMEOUT_STAT_VIPH_REGR_DIS, </a>
+<a name="ln73">		~RADEON_VIPH_TIMEOUT_STAT_AK_MASK &amp; ~RADEON_VIPH_TIMEOUT_STAT_VIPH_REGR_DIS );</a>
+<a name="ln74"> </a>
+<a name="ln75">	return true;</a>
+<a name="ln76">}</a>
+<a name="ln77"> </a>
+<a name="ln78">// public function: read data from VIP</a>
+<a name="ln79">bool Radeon_VIPRead( </a>
+<a name="ln80">	device_info *di, uint channel, uint address, uint32 *data, bool lock )</a>
+<a name="ln81">{</a>
+<a name="ln82">	bool res;</a>
+<a name="ln83"> </a>
+<a name="ln84">	if( lock )</a>
+<a name="ln85">		ACQUIRE_BEN( di-&gt;si-&gt;cp.lock );</a>
+<a name="ln86">	</a>
+<a name="ln87">	res = do_VIPRead( di, channel, address, data );</a>
+<a name="ln88"> </a>
+<a name="ln89">	if( lock )</a>
+<a name="ln90">		RELEASE_BEN( di-&gt;si-&gt;cp.lock );</a>
+<a name="ln91">		</a>
+<a name="ln92">//	SHOW_FLOW( 2, &quot;address=%x, data=%lx, lock=%d&quot;, address, *data, lock );</a>
+<a name="ln93"> </a>
+<a name="ln94">	return res;</a>
+<a name="ln95">}</a>
+<a name="ln96"> </a>
+<a name="ln97">static bool do_VIPFifoRead(device_info *di, uint8 channel, uint32 address, uint32 count, uint8 *buffer)</a>
+<a name="ln98">{</a>
+<a name="ln99">   	vuint8 *regs = di-&gt;regs;</a>
+<a name="ln100">	uint32 status, tmp;</a>
+<a name="ln101"> </a>
+<a name="ln102">	if(count!=1)</a>
+<a name="ln103">	{</a>
+<a name="ln104">		SHOW_FLOW0( 2, &quot;Attempt to access VIP bus with non-stadard transaction length\n&quot;);</a>
+<a name="ln105">		return false;</a>
+<a name="ln106">	}</a>
+<a name="ln107">		</a>
+<a name="ln108">	SHOW_FLOW( 2, &quot;address=%lx, count=%ld &quot;, address, count );</a>
+<a name="ln109">	</a>
+<a name="ln110">	Radeon_WaitForFifo( di, 2);</a>
+<a name="ln111">	SHOW_FLOW0( 2, &quot;1&quot;);</a>
+<a name="ln112">	OUTREG( regs, RADEON_VIPH_REG_ADDR,  (channel &lt;&lt; 14) | address | 0x3000);</a>
+<a name="ln113">	SHOW_FLOW0( 2, &quot;3&quot;);</a>
+<a name="ln114">	while(B_BUSY == (status = RADEON_VIPFifoIdle( di , 0xff)));</a>
+<a name="ln115">	if(B_OK != status) return false;</a>
+<a name="ln116">	</a>
+<a name="ln117">	//	disable VIPH_REGR_DIS to enable VIP cycle.</a>
+<a name="ln118">	//	The LSB of VIPH_TIMEOUT_STAT are set to 0</a>
+<a name="ln119">	//	because 1 would have acknowledged various VIP</a>
+<a name="ln120">	//	interrupts unexpectedly       </a>
+<a name="ln121">	</a>
+<a name="ln122">	SHOW_FLOW0( 2, &quot;4&quot;);</a>
+<a name="ln123">	Radeon_WaitForFifo( di, 2 ); // Radeon_WaitForIdle( di, false, false );</a>
+<a name="ln124">	SHOW_FLOW0( 2, &quot;5&quot;);</a>
+<a name="ln125">	OUTREG( regs, RADEON_VIPH_TIMEOUT_STAT, </a>
+<a name="ln126">		INREG( regs, RADEON_VIPH_TIMEOUT_STAT) &amp; </a>
+<a name="ln127">			(0xffffff00 &amp; ~RADEON_VIPH_TIMEOUT_STAT_VIPH_REGR_DIS) );</a>
+<a name="ln128">	</a>
+<a name="ln129">	//	the value returned here is garbage.  The read merely initiates</a>
+<a name="ln130">	//	a register cycle</a>
+<a name="ln131">	SHOW_FLOW0( 2, &quot;6&quot;);</a>
+<a name="ln132">	Radeon_WaitForFifo( di, 2 ); // Radeon_WaitForIdle( di, false, false );</a>
+<a name="ln133">	INREG( regs, RADEON_VIPH_REG_DATA);</a>
+<a name="ln134">	SHOW_FLOW0( 2, &quot;7&quot;);</a>
+<a name="ln135">	while(B_BUSY == (status = RADEON_VIPFifoIdle( di , 0xff)));</a>
+<a name="ln136">	if(B_OK != status)  return false;</a>
+<a name="ln137">	</a>
+<a name="ln138">	//	set VIPH_REGR_DIS so that the read won't take too long.</a>
+<a name="ln139">	SHOW_FLOW0( 2, &quot;8&quot;);</a>
+<a name="ln140">	Radeon_WaitForFifo( di, 2 ); // Radeon_WaitForIdle( di, false, false );</a>
+<a name="ln141">	SHOW_FLOW0( 2, &quot;9&quot;);</a>
+<a name="ln142">	tmp = INREG( regs, RADEON_VIPH_TIMEOUT_STAT);</a>
+<a name="ln143">	OUTREG( regs, RADEON_VIPH_TIMEOUT_STAT, (tmp &amp; 0xffffff00) | RADEON_VIPH_TIMEOUT_STAT_VIPH_REGR_DIS);</a>
+<a name="ln144">	</a>
+<a name="ln145">	SHOW_FLOW0( 2, &quot;10&quot;);</a>
+<a name="ln146">	Radeon_WaitForFifo( di, 2 ); // Radeon_WaitForIdle( di, false, false );</a>
+<a name="ln147">	switch(count){</a>
+<a name="ln148">	   case 1:</a>
+<a name="ln149">	        *buffer=(uint8)(INREG( regs, RADEON_VIPH_REG_DATA) &amp; 0xff);</a>
+<a name="ln150">	        break;</a>
+<a name="ln151">	   case 2:</a>
+<a name="ln152">	        *(uint16 *)buffer=(uint16) (INREG( regs, RADEON_VIPH_REG_DATA) &amp; 0xffff);</a>
+<a name="ln153">	        break;</a>
+<a name="ln154">	   case 4:</a>
+<a name="ln155">	        *(uint32 *)buffer=(uint32) ( INREG( regs, RADEON_VIPH_REG_DATA) &amp; 0xffffffff);</a>
+<a name="ln156">	        break;</a>
+<a name="ln157">	   }</a>
+<a name="ln158">	SHOW_FLOW0( 2, &quot;11&quot;);</a>
+<a name="ln159">	while(B_BUSY == (status = RADEON_VIPFifoIdle( di , 0xff)));</a>
+<a name="ln160">	if(B_OK != status) return false;</a>
+<a name="ln161">	</a>
+<a name="ln162">	// so that reading VIPH_REG_DATA would not trigger unnecessary vip cycles.</a>
+<a name="ln163">	SHOW_FLOW0( 2, &quot;12&quot;);</a>
+<a name="ln164">	OUTREG( regs, RADEON_VIPH_TIMEOUT_STAT, </a>
+<a name="ln165">		(INREG( regs, RADEON_VIPH_TIMEOUT_STAT) &amp; 0xffffff00) | RADEON_VIPH_TIMEOUT_STAT_VIPH_REGR_DIS);</a>
+<a name="ln166">	return true;</a>
+<a name="ln167">		</a>
+<a name="ln168">}</a>
+<a name="ln169"> </a>
+<a name="ln170">bool Radeon_VIPFifoRead(device_info *di, uint8 channel, uint32 address, uint32 count, uint8 *buffer, bool lock)</a>
+<a name="ln171">{</a>
+<a name="ln172">	bool res;</a>
+<a name="ln173"> </a>
+<a name="ln174">	if( lock )</a>
+<a name="ln175">		ACQUIRE_BEN( di-&gt;si-&gt;cp.lock );</a>
+<a name="ln176">	</a>
+<a name="ln177">	res = do_VIPFifoRead( di, channel, address, count, buffer );</a>
+<a name="ln178">	</a>
+<a name="ln179">	if( lock )</a>
+<a name="ln180">		RELEASE_BEN( di-&gt;si-&gt;cp.lock );</a>
+<a name="ln181">		</a>
+<a name="ln182">	//SHOW_FLOW( 2, &quot;address=%x, data=%lx, lock=%d&quot;, address, *data, lock );</a>
+<a name="ln183"> </a>
+<a name="ln184">	return res;</a>
+<a name="ln185">}</a>
+<a name="ln186"> </a>
+<a name="ln187">// write data to VIP</a>
+<a name="ln188">// CP must be hold</a>
+<a name="ln189">static bool do_VIPWrite( device_info *di, uint8 channel, uint address, uint32 data )</a>
+<a name="ln190">{</a>
+<a name="ln191">	vuint8 *regs = di-&gt;regs;</a>
+<a name="ln192"> </a>
+<a name="ln193">	Radeon_WaitForFifo( di, 2 );</a>
+<a name="ln194">	OUTREG( regs, RADEON_VIPH_REG_ADDR, (channel &lt;&lt; 14) | (address &amp; ~0x2000) );</a>
+<a name="ln195"> </a>
+<a name="ln196">	if( !Radeon_VIPWaitForIdle( di )) return false;</a>
+<a name="ln197">		</a>
+<a name="ln198">	//SHOW_FLOW( 4, &quot;channel=%d, address=%x, data=%lx&quot;, channel, address, data );</a>
+<a name="ln199">		</a>
+<a name="ln200">	Radeon_WaitForFifo( di, 2 );</a>
+<a name="ln201">	OUTREG( regs, RADEON_VIPH_REG_DATA, data );</a>
+<a name="ln202">	</a>
+<a name="ln203">	return Radeon_VIPWaitForIdle( di );</a>
+<a name="ln204">		</a>
+<a name="ln205">}</a>
+<a name="ln206"> </a>
+<a name="ln207">// public function: write data to VIP</a>
+<a name="ln208">bool Radeon_VIPWrite(device_info *di, uint8 channel, uint address, uint32 data, bool lock )</a>
+<a name="ln209">{</a>
+<a name="ln210">	bool res;</a>
+<a name="ln211"> </a>
+<a name="ln212">	//SHOW_FLOW( 2, &quot;address=%x, data=%lx, lock=%d&quot;, address, data, lock );</a>
+<a name="ln213"> </a>
+<a name="ln214">	if( lock )</a>
+<a name="ln215">		ACQUIRE_BEN( di-&gt;si-&gt;cp.lock );</a>
+<a name="ln216">	</a>
+<a name="ln217">	res = do_VIPWrite( di, channel, address, data );</a>
+<a name="ln218">	</a>
+<a name="ln219">	if( lock )</a>
+<a name="ln220">		RELEASE_BEN( di-&gt;si-&gt;cp.lock );</a>
+<a name="ln221">	</a>
+<a name="ln222">	return res;</a>
+<a name="ln223">}</a>
+<a name="ln224"> </a>
+<a name="ln225"> </a>
+<a name="ln226">static bool do_VIPFifoWrite(device_info *di, uint8 channel, uint32 address, uint32 count, uint8 *buffer)</a>
+<a name="ln227">{</a>
+<a name="ln228">	vuint8 *regs = di-&gt;regs;</a>
+<a name="ln229">    </a>
+<a name="ln230">    uint32 status;</a>
+<a name="ln231">	uint32 i;</a>
+<a name="ln232">	</a>
+<a name="ln233">	SHOW_FLOW( 2, &quot;address=%lx, count=%ld, &quot;, address, count );</a>
+<a name="ln234"> </a>
+<a name="ln235">    Radeon_WaitForFifo( di, 2 );</a>
+<a name="ln236">    OUTREG( regs, RADEON_VIPH_REG_ADDR, ((channel &lt;&lt; 14) | address | 0x1000) &amp; ~0x2000 );</a>
+<a name="ln237">   	SHOW_FLOW0( 2, &quot;1&quot;);</a>
+<a name="ln238">    while(B_BUSY == (status = RADEON_VIPFifoIdle( di, 0x0f)));</a>
+<a name="ln239">	</a>
+<a name="ln240">    </a>
+<a name="ln241">    if(B_OK != status){</a>
+<a name="ln242">		SHOW_FLOW( 2 ,&quot;cannot write %x to VIPH_REG_ADDR\n&quot;, (unsigned int)address);</a>
+<a name="ln243">		return false;</a>
+<a name="ln244">	}</a>
+<a name="ln245">    </a>
+<a name="ln246">    SHOW_FLOW0( 2, &quot;2&quot;);</a>
+<a name="ln247">	for (i = 0; i &lt; count; i+=4)</a>
+<a name="ln248">	{</a>
+<a name="ln249">		Radeon_WaitForFifo( di, 2);</a>
+<a name="ln250">		SHOW_FLOW( 2, &quot;count %ld&quot;, count);</a>
+<a name="ln251">		OUTREG( regs, RADEON_VIPH_REG_DATA, *(uint32*)(buffer + i));</a>
+<a name="ln252">		while(B_BUSY == (status = RADEON_VIPFifoIdle( di, 0x0f)));</a>
+<a name="ln253">    	if(B_OK != status)</a>
+<a name="ln254">		{</a>
+<a name="ln255">    		SHOW_FLOW0( 2 , &quot;cannot write to VIPH_REG_DATA\n&quot;);</a>
+<a name="ln256">			return false;</a>
+<a name="ln257">	 	}</a>
+<a name="ln258">	}</a>
+<a name="ln259">				</a>
+<a name="ln260">    return true;</a>
+<a name="ln261">}</a>
+<a name="ln262"> </a>
+<a name="ln263">bool Radeon_VIPFifoWrite(device_info *di, uint8 channel, uint32 address, uint32 count, uint8 *buffer, bool lock)</a>
+<a name="ln264">{</a>
+<a name="ln265">    bool res;</a>
+<a name="ln266"> </a>
+<a name="ln267">	//SHOW_FLOW( 2, &quot;address=%x, data=%lx, lock=%d&quot;, address, data, lock );</a>
+<a name="ln268"> </a>
+<a name="ln269">	if( lock )</a>
+<a name="ln270">		ACQUIRE_BEN( di-&gt;si-&gt;cp.lock );</a>
+<a name="ln271">	</a>
+<a name="ln272">	Radeon_VIPReset( di, false);</a>
+<a name="ln273">	res = do_VIPFifoWrite( di, channel, address, count, buffer );</a>
+<a name="ln274">	</a>
+<a name="ln275">	if( lock )</a>
+<a name="ln276">		RELEASE_BEN( di-&gt;si-&gt;cp.lock );</a>
+<a name="ln277">	</a>
+<a name="ln278">	return res;</a>
+<a name="ln279">}</a>
+<a name="ln280"> </a>
+<a name="ln281"> </a>
+<a name="ln282">// reset VIP</a>
+<a name="ln283">void Radeon_VIPReset( </a>
+<a name="ln284">	device_info *di, bool lock )</a>
+<a name="ln285">{</a>
+<a name="ln286">	vuint8 *regs = di-&gt;regs;</a>
+<a name="ln287"> </a>
+<a name="ln288">	if( lock )</a>
+<a name="ln289">		ACQUIRE_BEN( di-&gt;si-&gt;cp.lock );</a>
+<a name="ln290"> </a>
+<a name="ln291">	Radeon_WaitForFifo( di, 5 ); // Radeon_WaitForIdle( di, false, false );</a>
+<a name="ln292">	switch(di-&gt;asic){</a>
+<a name="ln293">	    case rt_r200:</a>
+<a name="ln294">	    case rt_rs200:</a>
+<a name="ln295">	    case rt_rv200:</a>
+<a name="ln296">	    case rt_rs100:</a>
+<a name="ln297">		case rt_rv100:</a>
+<a name="ln298">		case rt_r100:</a>
+<a name="ln299">	    OUTREG( regs, RADEON_VIPH_CONTROL, 4 | 	(15 &lt;&lt; RADEON_VIPH_CONTROL_VIPH_MAX_WAIT_SHIFT) |</a>
+<a name="ln300">			RADEON_VIPH_CONTROL_VIPH_DMA_MODE |	RADEON_VIPH_CONTROL_VIPH_EN ); // slowest, timeout in 16 phases</a>
+<a name="ln301">	    OUTREG( regs, RADEON_VIPH_TIMEOUT_STAT, (INREG( regs, RADEON_VIPH_TIMEOUT_STAT) &amp; 0xFFFFFF00) | </a>
+<a name="ln302">	    	RADEON_VIPH_TIMEOUT_STAT_VIPH_REGR_DIS);</a>
+<a name="ln303">	    OUTREG( regs, RADEON_VIPH_DV_LAT, </a>
+<a name="ln304">	    		0xff |</a>
+<a name="ln305">				(4 &lt;&lt; RADEON_VIPH_DV_LAT_VIPH_DV0_LAT_SHIFT) |</a>
+<a name="ln306">				(4 &lt;&lt; RADEON_VIPH_DV_LAT_VIPH_DV1_LAT_SHIFT) |</a>
+<a name="ln307">				(4 &lt;&lt; RADEON_VIPH_DV_LAT_VIPH_DV2_LAT_SHIFT) |</a>
+<a name="ln308">				(4 &lt;&lt; RADEON_VIPH_DV_LAT_VIPH_DV3_LAT_SHIFT)); // set timeslice</a>
+<a name="ln309">	    OUTREG( regs, RADEON_VIPH_DMA_CHUNK, 0x151);</a>
+<a name="ln310">	    OUTREG( regs, RADEON_TEST_DEBUG_CNTL, INREG( regs, RADEON_TEST_DEBUG_CNTL) &amp; (~RADEON_TEST_DEBUG_CNTL_OUT_EN));</a>
+<a name="ln311">	default:</a>
+<a name="ln312">		    OUTREG( regs, RADEON_VIPH_CONTROL, 9 | 	(15 &lt;&lt; RADEON_VIPH_CONTROL_VIPH_MAX_WAIT_SHIFT) |</a>
+<a name="ln313">				RADEON_VIPH_CONTROL_VIPH_DMA_MODE |	RADEON_VIPH_CONTROL_VIPH_EN ); // slowest, timeout in 16 phases</a>
+<a name="ln314">	    OUTREG( regs, RADEON_VIPH_TIMEOUT_STAT, (INREG( regs, RADEON_VIPH_TIMEOUT_STAT) &amp; 0xFFFFFF00) | </a>
+<a name="ln315">		    	RADEON_VIPH_TIMEOUT_STAT_VIPH_REGR_DIS);</a>
+<a name="ln316">	    OUTREG( regs, RADEON_VIPH_DV_LAT, </a>
+<a name="ln317">			    0xff |</a>
+<a name="ln318">				(4 &lt;&lt; RADEON_VIPH_DV_LAT_VIPH_DV0_LAT_SHIFT) |</a>
+<a name="ln319">				(4 &lt;&lt; RADEON_VIPH_DV_LAT_VIPH_DV1_LAT_SHIFT) |</a>
+<a name="ln320">				(4 &lt;&lt; RADEON_VIPH_DV_LAT_VIPH_DV2_LAT_SHIFT) |</a>
+<a name="ln321">				(4 &lt;&lt; RADEON_VIPH_DV_LAT_VIPH_DV3_LAT_SHIFT)); // set timeslice</a>
+<a name="ln322">	    OUTREG( regs, RADEON_VIPH_DMA_CHUNK, 0x0);</a>
+<a name="ln323">	    OUTREG( regs, RADEON_TEST_DEBUG_CNTL, INREG( regs, RADEON_TEST_DEBUG_CNTL) &amp; (~RADEON_TEST_DEBUG_CNTL_OUT_EN));</a>
+<a name="ln324">	    break;</a>
+<a name="ln325"> </a>
+<a name="ln326">	} </a>
+<a name="ln327">		</a>
+<a name="ln328">	if( lock )</a>
+<a name="ln329">		RELEASE_BEN( di-&gt;si-&gt;cp.lock );</a>
+<a name="ln330">}</a>
+<a name="ln331"> </a>
+<a name="ln332"> </a>
+<a name="ln333">// check whether VIP host is idle</a>
+<a name="ln334">// lock must be hold</a>
+<a name="ln335">static status_t Radeon_VIPIdle( </a>
+<a name="ln336">	device_info *di )</a>
+<a name="ln337">{</a>
+<a name="ln338">	vuint8 *regs = di-&gt;regs;</a>
+<a name="ln339">	uint32 timeout;</a>
+<a name="ln340">	</a>
+<a name="ln341">	//Radeon_WaitForIdle( di, false, false );</a>
+<a name="ln342">	</a>
+<a name="ln343">	// if there is a stuck transaction, acknowledge that</a>
+<a name="ln344">	timeout = INREG( regs, RADEON_VIPH_TIMEOUT_STAT );</a>
+<a name="ln345">	if( (timeout &amp; RADEON_VIPH_TIMEOUT_STAT_VIPH_REG_STAT) != 0 ) </a>
+<a name="ln346">	{</a>
+<a name="ln347">		OUTREG( regs, RADEON_VIPH_TIMEOUT_STAT, </a>
+<a name="ln348">			(timeout &amp; 0xffffff00) | RADEON_VIPH_TIMEOUT_STAT_VIPH_REG_AK);</a>
+<a name="ln349">		return (INREG( regs, RADEON_VIPH_CONTROL) &amp; 0x2000) ? B_BUSY : B_ERROR;</a>
+<a name="ln350">	}</a>
+<a name="ln351">	return (INREG( regs, RADEON_VIPH_CONTROL) &amp; 0x2000) ? B_BUSY : B_OK;</a>
+<a name="ln352">}</a>
+<a name="ln353"> </a>
+<a name="ln354">static status_t RADEON_VIPFifoIdle(device_info *di, uint8 channel)</a>
+<a name="ln355">{</a>
+<a name="ln356">	vuint8 *regs = di-&gt;regs;</a>
+<a name="ln357">	uint32 timeout;</a>
+<a name="ln358"> </a>
+<a name="ln359">	timeout = INREG( regs, RADEON_VIPH_TIMEOUT_STAT);</a>
+<a name="ln360">	if((timeout &amp; 0x0000000f) &amp; channel) /* lockup ?? */</a>
+<a name="ln361">	{</a>
+<a name="ln362">		OUTREG( regs, RADEON_VIPH_TIMEOUT_STAT, (timeout &amp; 0xfffffff0) | channel);</a>
+<a name="ln363">		return (INREG( regs, RADEON_VIPH_CONTROL) &amp; 0x2000) ? B_BUSY : B_ERROR;</a>
+<a name="ln364">	}</a>
+<a name="ln365">	return (INREG( regs, RADEON_VIPH_CONTROL) &amp; 0x2000) ? B_BUSY : B_OK ;</a>
+<a name="ln366">}</a>
+<a name="ln367">  	 </a>
+<a name="ln368">  	 </a>
+<a name="ln369">// wait until VIP host is idle</a>
+<a name="ln370">// lock must be hold</a>
+<a name="ln371">static bool Radeon_VIPWaitForIdle( </a>
+<a name="ln372">	device_info *di )</a>
+<a name="ln373">{</a>
+<a name="ln374">	int i;</a>
+<a name="ln375">	</a>
+<a name="ln376">	// wait 100x 1ms before giving up</a>
+<a name="ln377">	for( i = 0; i &lt; 100; ++i ) {</a>
+<a name="ln378">		status_t res;</a>
+<a name="ln379">		</a>
+<a name="ln380">		res = Radeon_VIPIdle( di );</a>
+<a name="ln381">		if( res != B_BUSY ) {</a>
+<a name="ln382">			if( res == B_OK )</a>
+<a name="ln383">				return true;</a>
+<a name="ln384">			else</a>
+<a name="ln385">				return false;</a>
+<a name="ln386">		}</a>
+<a name="ln387">			</a>
+<a name="ln388">		snooze( 1000 );</a>
+<a name="ln389">	}</a>
+<a name="ln390">	</a>
+<a name="ln391">	return false;</a>
+<a name="ln392">}</a>
+<a name="ln393"> </a>
+<a name="ln394"> </a>
+<a name="ln395">// find VIP channel of a device</a>
+<a name="ln396">// return:	&gt;= 0 channel of device</a>
+<a name="ln397">//			&lt; 0 no device found</a>
+<a name="ln398">int Radeon_FindVIPDevice( </a>
+<a name="ln399">	device_info *di, uint32 device_id )</a>
+<a name="ln400">{</a>
+<a name="ln401">	uint channel;</a>
+<a name="ln402">	uint32 cur_device_id;</a>
+<a name="ln403">	</a>
+<a name="ln404">	// if card has no VIP port, let hardware detection fail;</a>
+<a name="ln405">	// in this case, noone will bother us again</a>
+<a name="ln406">	if( !di-&gt;has_vip ) {</a>
+<a name="ln407">		SHOW_FLOW0( 3, &quot;This Device has no VIP Bus.&quot;);</a>
+<a name="ln408">		return -1;</a>
+<a name="ln409">	}</a>
+<a name="ln410"> </a>
+<a name="ln411">	ACQUIRE_BEN( di-&gt;si-&gt;cp.lock );</a>
+<a name="ln412"> </a>
+<a name="ln413">	Radeon_VIPReset( di, false );</a>
+<a name="ln414"> </a>
+<a name="ln415">	// there are up to 4 devices, connected to one of 4 channels	</a>
+<a name="ln416">	for( channel = 0; channel &lt; 4; ++channel ) {</a>
+<a name="ln417">	</a>
+<a name="ln418">		// read device id</a>
+<a name="ln419">		if( !Radeon_VIPRead( di, channel, RADEON_VIP_VENDOR_DEVICE_ID, &amp;cur_device_id, false ))	{</a>
+<a name="ln420">			SHOW_FLOW( 3, &quot;No device found on channel %d&quot;, channel);</a>
+<a name="ln421">			continue;</a>
+<a name="ln422">		}</a>
+<a name="ln423">		</a>
+<a name="ln424">		// compare device id directly</a>
+<a name="ln425">		if( cur_device_id == device_id ) {</a>
+<a name="ln426">			SHOW_FLOW( 3, &quot;Device %08lx found on channel %d&quot;, device_id, channel);</a>
+<a name="ln427">			RELEASE_BEN( di-&gt;si-&gt;cp.lock );</a>
+<a name="ln428">			return channel;</a>
+<a name="ln429">		}</a>
+<a name="ln430">	}</a>
+<a name="ln431">	</a>
+<a name="ln432">	RELEASE_BEN( di-&gt;si-&gt;cp.lock );</a>
+<a name="ln433">	</a>
+<a name="ln434">	// couldn't find device</a>
+<a name="ln435">	return -1;</a>
+<a name="ln436">}</a>
+
+</code></pre>
+<div class="balloon" rel="252"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v529/" target="_blank">V529</a> Odd semicolon ';' after 'while' operator.</p></div>
+<div class="balloon" rel="426"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the fourth actual argument of the 'dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="250"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the fourth actual argument of the 'dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="233"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the fourth actual argument of the 'dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="108"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the fifth actual argument of the 'dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="108"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the fourth actual argument of the 'dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="233"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the fifth actual argument of the 'dprintf' function. The memsize type argument is expected.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

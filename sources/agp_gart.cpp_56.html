@@ -1,0 +1,1332 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>agp_gart.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2008-2010, Axel Dörfler, axeld@pinc-software.de.</a>
+<a name="ln3"> * Copyright 2004-2006, Rudolf Cornelissen. All rights reserved.</a>
+<a name="ln4"> *</a>
+<a name="ln5"> * Distributed under the terms of the MIT License.</a>
+<a name="ln6"> */</a>
+<a name="ln7"> </a>
+<a name="ln8">// TODO: rethink the AGP interface for more than one bridge/device!</a>
+<a name="ln9">//	(should be done with the new driver API then)</a>
+<a name="ln10"> </a>
+<a name="ln11">/*</a>
+<a name="ln12">	Notes:</a>
+<a name="ln13">	- currently we just setup all found devices with AGP interface to the same</a>
+<a name="ln14">	highest common mode, we don't distinquish different AGP busses.</a>
+<a name="ln15">	TODO: it might be a better idea to just setup one instead.</a>
+<a name="ln16"> </a>
+<a name="ln17">	- AGP3 defines 'asynchronous request size' and 'calibration cycle' fields</a>
+<a name="ln18">	in the status and command registers. Currently programming zero's which will</a>
+<a name="ln19">	make it work, although further optimisation is possible.</a>
+<a name="ln20"> </a>
+<a name="ln21">	- AGP3.5 also defines isochronous transfers which are not implemented here:</a>
+<a name="ln22">	the hardware keeps them disabled by default.</a>
+<a name="ln23">*/</a>
+<a name="ln24"> </a>
+<a name="ln25"> </a>
+<a name="ln26">#include &lt;AGP.h&gt;</a>
+<a name="ln27"> </a>
+<a name="ln28">#include &lt;stdlib.h&gt;</a>
+<a name="ln29"> </a>
+<a name="ln30">#include &lt;KernelExport.h&gt;</a>
+<a name="ln31">#include &lt;PCI.h&gt;</a>
+<a name="ln32"> </a>
+<a name="ln33">#include &lt;util/OpenHashTable.h&gt;</a>
+<a name="ln34">#include &lt;kernel/lock.h&gt;</a>
+<a name="ln35">#include &lt;vm/vm_page.h&gt;</a>
+<a name="ln36">#include &lt;vm/vm_types.h&gt;</a>
+<a name="ln37"> </a>
+<a name="ln38">#include &lt;lock.h&gt;</a>
+<a name="ln39"> </a>
+<a name="ln40"> </a>
+<a name="ln41">#define TRACE_AGP</a>
+<a name="ln42">#ifdef TRACE_AGP</a>
+<a name="ln43">#	define TRACE(x...) dprintf(&quot;\33[36mAGP:\33[0m &quot; x)</a>
+<a name="ln44">#else</a>
+<a name="ln45">#	define TRACE(x...) ;</a>
+<a name="ln46">#endif</a>
+<a name="ln47">#define ERROR(x...) dprintf(&quot;\33[36mAGP:\33[0m &quot; x)</a>
+<a name="ln48"> </a>
+<a name="ln49"> </a>
+<a name="ln50">#define MAX_DEVICES	  8</a>
+<a name="ln51"> </a>
+<a name="ln52">#define AGP_ID(address) (address)</a>
+<a name="ln53">#define AGP_STATUS(address) (address + 4)</a>
+<a name="ln54">#define AGP_COMMAND(address) (address + 8)</a>
+<a name="ln55"> </a>
+<a name="ln56">/* read and write to PCI config space */</a>
+<a name="ln57">#define get_pci_config(info, offset, size) \</a>
+<a name="ln58">	(sPCI-&gt;read_pci_config((info).bus, (info).device, (info).function, \</a>
+<a name="ln59">		(offset), (size)))</a>
+<a name="ln60">#define set_pci_config(info, offset, size, value) \</a>
+<a name="ln61">	(sPCI-&gt;write_pci_config((info).bus, (info).device, (info).function, \</a>
+<a name="ln62">		(offset), (size), (value)))</a>
+<a name="ln63"> </a>
+<a name="ln64">#define RESERVED_APERTURE			0x80000000</a>
+<a name="ln65">#define ALLOCATED_APERTURE			0x40000000</a>
+<a name="ln66">#define BIND_APERTURE				0x20000000</a>
+<a name="ln67">#define APERTURE_PUBLIC_FLAGS_MASK	0x0000ffff</a>
+<a name="ln68"> </a>
+<a name="ln69">struct aperture_memory {</a>
+<a name="ln70">	aperture_memory *next;</a>
+<a name="ln71">	aperture_memory *hash_link;</a>
+<a name="ln72">	addr_t		base;</a>
+<a name="ln73">	size_t		size;</a>
+<a name="ln74">	uint32		flags;</a>
+<a name="ln75">#if !defined(GART_TEST)</a>
+<a name="ln76">	union {</a>
+<a name="ln77">		vm_page	**pages;</a>
+<a name="ln78">		vm_page *page;</a>
+<a name="ln79">	};</a>
+<a name="ln80">#ifdef DEBUG_PAGE_ACCESS</a>
+<a name="ln81">	thread_id	allocating_thread;</a>
+<a name="ln82">#endif</a>
+<a name="ln83">#else</a>
+<a name="ln84">	area_id		area;</a>
+<a name="ln85">#endif</a>
+<a name="ln86">};</a>
+<a name="ln87"> </a>
+<a name="ln88">class Aperture;</a>
+<a name="ln89"> </a>
+<a name="ln90">class MemoryHashDefinition {</a>
+<a name="ln91">public:</a>
+<a name="ln92">	typedef addr_t KeyType;</a>
+<a name="ln93">	typedef aperture_memory ValueType;</a>
+<a name="ln94"> </a>
+<a name="ln95">	MemoryHashDefinition(aperture_info &amp;info) : fInfo(info) {}</a>
+<a name="ln96"> </a>
+<a name="ln97">	size_t HashKey(const KeyType &amp;base) const</a>
+<a name="ln98">		{ return (base - fInfo.base) / B_PAGE_SIZE; }</a>
+<a name="ln99">	size_t Hash(aperture_memory *memory) const</a>
+<a name="ln100">		{ return (memory-&gt;base - fInfo.base) / B_PAGE_SIZE; }</a>
+<a name="ln101">	bool Compare(const KeyType &amp;base, aperture_memory *memory) const</a>
+<a name="ln102">		{ return base == memory-&gt;base; }</a>
+<a name="ln103">	aperture_memory *&amp;GetLink(aperture_memory *memory) const</a>
+<a name="ln104">		{ return memory-&gt;hash_link; }</a>
+<a name="ln105"> </a>
+<a name="ln106">private:</a>
+<a name="ln107">	aperture_info	&amp;fInfo;</a>
+<a name="ln108">};</a>
+<a name="ln109"> </a>
+<a name="ln110">typedef BOpenHashTable&lt;MemoryHashDefinition&gt; MemoryHashTable;</a>
+<a name="ln111"> </a>
+<a name="ln112">struct agp_device_info {</a>
+<a name="ln113">	uint8		address;	/* location of AGP interface in PCI capabilities */</a>
+<a name="ln114">	agp_info	info;</a>
+<a name="ln115">};</a>
+<a name="ln116"> </a>
+<a name="ln117">class Aperture {</a>
+<a name="ln118">public:</a>
+<a name="ln119">	Aperture(agp_gart_bus_module_info *module, void *aperture);</a>
+<a name="ln120">	~Aperture();</a>
+<a name="ln121"> </a>
+<a name="ln122">	status_t InitCheck() const { return fLock.sem &gt;= B_OK ? B_OK : fLock.sem; }</a>
+<a name="ln123"> </a>
+<a name="ln124">	void DeleteMemory(aperture_memory *memory);</a>
+<a name="ln125">	aperture_memory *CreateMemory(size_t size, size_t alignment, uint32 flags);</a>
+<a name="ln126"> </a>
+<a name="ln127">	status_t AllocateMemory(aperture_memory *memory, uint32 flags);</a>
+<a name="ln128"> </a>
+<a name="ln129">	status_t UnbindMemory(aperture_memory *memory);</a>
+<a name="ln130">	status_t BindMemory(aperture_memory *memory, addr_t base, size_t size);</a>
+<a name="ln131"> </a>
+<a name="ln132">	status_t GetInfo(aperture_info *info);</a>
+<a name="ln133"> </a>
+<a name="ln134">	aperture_memory *GetMemory(addr_t base) { return fHashTable.Lookup(base); }</a>
+<a name="ln135"> </a>
+<a name="ln136">	addr_t Base() const { return fInfo.base; }</a>
+<a name="ln137">	addr_t Size() const { return fInfo.size; }</a>
+<a name="ln138">	int32 ID() const { return fID; }</a>
+<a name="ln139">	struct lock &amp;Lock() { return fLock; }</a>
+<a name="ln140"> </a>
+<a name="ln141">private:</a>
+<a name="ln142">	bool _AdaptToReserved(addr_t &amp;base, size_t &amp;size, int32 *_offset = NULL);</a>
+<a name="ln143">	void _Free(aperture_memory *memory);</a>
+<a name="ln144">	void _Remove(aperture_memory *memory);</a>
+<a name="ln145">	status_t _Insert(aperture_memory *memory, size_t size, size_t alignment,</a>
+<a name="ln146">		uint32 flags);</a>
+<a name="ln147"> </a>
+<a name="ln148">	struct lock					fLock;</a>
+<a name="ln149">	agp_gart_bus_module_info	*fModule;</a>
+<a name="ln150">	int32						fID;</a>
+<a name="ln151">	aperture_info				fInfo;</a>
+<a name="ln152">	MemoryHashTable				fHashTable;</a>
+<a name="ln153">	aperture_memory				*fFirstMemory;</a>
+<a name="ln154">	void						*fPrivateAperture;</a>
+<a name="ln155"> </a>
+<a name="ln156">public:</a>
+<a name="ln157">	Aperture					*fNext;</a>
+<a name="ln158">};</a>
+<a name="ln159"> </a>
+<a name="ln160">class ApertureHashDefinition {</a>
+<a name="ln161">public:</a>
+<a name="ln162">	typedef int32 KeyType;</a>
+<a name="ln163">	typedef Aperture ValueType;</a>
+<a name="ln164"> </a>
+<a name="ln165">	size_t HashKey(const KeyType &amp;id) const</a>
+<a name="ln166">		{ return id; }</a>
+<a name="ln167">	size_t Hash(Aperture *aperture) const</a>
+<a name="ln168">		{ return aperture-&gt;ID(); }</a>
+<a name="ln169">	bool Compare(const KeyType &amp;id, Aperture *aperture) const</a>
+<a name="ln170">		{ return id == aperture-&gt;ID(); }</a>
+<a name="ln171">	Aperture *&amp;GetLink(Aperture *aperture) const</a>
+<a name="ln172">		{ return aperture-&gt;fNext; }</a>
+<a name="ln173">};</a>
+<a name="ln174"> </a>
+<a name="ln175">typedef BOpenHashTable&lt;ApertureHashDefinition&gt; ApertureHashTable;</a>
+<a name="ln176"> </a>
+<a name="ln177"> </a>
+<a name="ln178">static agp_device_info sDeviceInfos[MAX_DEVICES];</a>
+<a name="ln179">static uint32 sDeviceCount;</a>
+<a name="ln180">static pci_module_info *sPCI;</a>
+<a name="ln181">static int32 sAcquired;</a>
+<a name="ln182">static ApertureHashTable sApertureHashTable;</a>
+<a name="ln183">static int32 sNextApertureID;</a>
+<a name="ln184">static struct lock sLock;</a>
+<a name="ln185"> </a>
+<a name="ln186"> </a>
+<a name="ln187">//	#pragma mark - private support functions</a>
+<a name="ln188"> </a>
+<a name="ln189"> </a>
+<a name="ln190">/*!	Makes sure that all bits lower than the maximum supported rate is set. */</a>
+<a name="ln191">static uint32</a>
+<a name="ln192">fix_rate_support(uint32 command)</a>
+<a name="ln193">{</a>
+<a name="ln194">	if ((command &amp; AGP_3_MODE) != 0) {</a>
+<a name="ln195">		if ((command &amp; AGP_3_8x) != 0)</a>
+<a name="ln196">			command |= AGP_3_4x;</a>
+<a name="ln197"> </a>
+<a name="ln198">		command &amp;= ~AGP_RATE_MASK | AGP_3_8x | AGP_3_4x;</a>
+<a name="ln199">		command |= AGP_SBA;</a>
+<a name="ln200">			// SBA is required for AGP3</a>
+<a name="ln201">	} else {</a>
+<a name="ln202">		/* AGP 2.0 scheme applies */</a>
+<a name="ln203">		if ((command &amp; AGP_2_4x) != 0)</a>
+<a name="ln204">			command |= AGP_2_2x;</a>
+<a name="ln205">		if ((command &amp; AGP_2_2x) != 0)</a>
+<a name="ln206">			command |= AGP_2_1x;</a>
+<a name="ln207">	}</a>
+<a name="ln208"> </a>
+<a name="ln209">	return command;</a>
+<a name="ln210">}</a>
+<a name="ln211"> </a>
+<a name="ln212"> </a>
+<a name="ln213">/*!	Makes sure that only the highest rate bit is set. */</a>
+<a name="ln214">static uint32</a>
+<a name="ln215">fix_rate_command(uint32 command)</a>
+<a name="ln216">{</a>
+<a name="ln217">	if ((command &amp; AGP_3_MODE) != 0) {</a>
+<a name="ln218">		if ((command &amp; AGP_3_8x) != 0)</a>
+<a name="ln219">			command &amp;= ~AGP_3_4x;</a>
+<a name="ln220">	} else {</a>
+<a name="ln221">		/* AGP 2.0 scheme applies */</a>
+<a name="ln222">		if ((command &amp; AGP_2_4x) != 0)</a>
+<a name="ln223">			command &amp;= ~(AGP_2_2x | AGP_2_1x);</a>
+<a name="ln224">		if ((command &amp; AGP_2_2x) != 0)</a>
+<a name="ln225">			command &amp;= ~AGP_2_1x;</a>
+<a name="ln226">	}</a>
+<a name="ln227"> </a>
+<a name="ln228">	return command;</a>
+<a name="ln229">}</a>
+<a name="ln230"> </a>
+<a name="ln231"> </a>
+<a name="ln232">/*!	Checks the capabilities of the device, and removes everything from</a>
+<a name="ln233">	\a command that the device does not support.</a>
+<a name="ln234">*/</a>
+<a name="ln235">static void</a>
+<a name="ln236">check_capabilities(agp_device_info &amp;deviceInfo, uint32 &amp;command)</a>
+<a name="ln237">{</a>
+<a name="ln238">	uint32 agpStatus = deviceInfo.info.interface.status;</a>
+<a name="ln239">	if (deviceInfo.info.class_base == PCI_bridge) {</a>
+<a name="ln240">		// make sure the AGP rate support mask is correct</a>
+<a name="ln241">		// (ie. has the lower bits set)</a>
+<a name="ln242">		agpStatus = fix_rate_support(agpStatus);</a>
+<a name="ln243">	}</a>
+<a name="ln244"> </a>
+<a name="ln245">	TRACE(&quot;device %u.%u.%u has AGP capabilities %&quot; B_PRIx32 &quot;\n&quot;, deviceInfo.info.bus,</a>
+<a name="ln246">		deviceInfo.info.device, deviceInfo.info.function, agpStatus);</a>
+<a name="ln247"> </a>
+<a name="ln248">	// block non-supported AGP modes</a>
+<a name="ln249">	command &amp;= (agpStatus &amp; (AGP_3_MODE | AGP_RATE_MASK))</a>
+<a name="ln250">		| ~(AGP_3_MODE | AGP_RATE_MASK);</a>
+<a name="ln251"> </a>
+<a name="ln252">	// If no AGP mode is supported at all, nothing remains:</a>
+<a name="ln253">	// devices exist that have the AGP style connector with AGP style registers,</a>
+<a name="ln254">	// but not the features!</a>
+<a name="ln255">	// (confirmed Matrox Millenium II AGP for instance)</a>
+<a name="ln256">	if ((agpStatus &amp; AGP_RATE_MASK) == 0)</a>
+<a name="ln257">		command = 0;</a>
+<a name="ln258"> </a>
+<a name="ln259">	// block side band adressing if not supported</a>
+<a name="ln260">	if ((agpStatus &amp; AGP_SBA) == 0)</a>
+<a name="ln261">		command &amp;= ~AGP_SBA;</a>
+<a name="ln262"> </a>
+<a name="ln263">	// block fast writes if not supported</a>
+<a name="ln264">	if ((agpStatus &amp; AGP_FAST_WRITE) == 0)</a>
+<a name="ln265">		command &amp;= ~AGP_FAST_WRITE;</a>
+<a name="ln266"> </a>
+<a name="ln267">	// adjust maximum request depth to least depth supported</a>
+<a name="ln268">	// note: this is writable only in the graphics card</a>
+<a name="ln269">	uint8 requestDepth = ((agpStatus &amp; AGP_REQUEST) &gt;&gt; AGP_REQUEST_SHIFT);</a>
+<a name="ln270">	if (requestDepth &lt; ((command &amp; AGP_REQUEST) &gt;&gt; AGP_REQUEST_SHIFT)) {</a>
+<a name="ln271">		command &amp;= ~AGP_REQUEST;</a>
+<a name="ln272">		command |= (requestDepth &lt;&lt; AGP_REQUEST_SHIFT);</a>
+<a name="ln273">	}</a>
+<a name="ln274">}</a>
+<a name="ln275"> </a>
+<a name="ln276"> </a>
+<a name="ln277">/*!	Checks the PCI capabilities if the device is an AGP device</a>
+<a name="ln278">*/</a>
+<a name="ln279">static bool</a>
+<a name="ln280">is_agp_device(pci_info &amp;info, uint8 *_address)</a>
+<a name="ln281">{</a>
+<a name="ln282">	// Check if device implements a list of capabilities</a>
+<a name="ln283">	if ((get_pci_config(info, PCI_status, 2) &amp; PCI_status_capabilities) == 0)</a>
+<a name="ln284">		return false;</a>
+<a name="ln285"> </a>
+<a name="ln286">	// Get pointer to PCI capabilities list</a>
+<a name="ln287">	// (AGP devices only, no need to take cardbus into account)</a>
+<a name="ln288">	uint8 address = get_pci_config(info, PCI_capabilities_ptr, 1);</a>
+<a name="ln289"> </a>
+<a name="ln290">	while (true) {</a>
+<a name="ln291">		uint8 id = get_pci_config(info, address, 1);</a>
+<a name="ln292">		uint8 next = get_pci_config(info, address + 1, 1) &amp; ~0x3;</a>
+<a name="ln293"> </a>
+<a name="ln294">		if (id == PCI_cap_id_agp) {</a>
+<a name="ln295">			// is an AGP device</a>
+<a name="ln296">			if (_address != NULL)</a>
+<a name="ln297">				*_address = address;</a>
+<a name="ln298">			return true;</a>
+<a name="ln299">		}</a>
+<a name="ln300">		if (next == 0) {</a>
+<a name="ln301">			// end of list</a>
+<a name="ln302">			break;</a>
+<a name="ln303">		}</a>
+<a name="ln304"> </a>
+<a name="ln305">		address = next;</a>
+<a name="ln306">	}</a>
+<a name="ln307"> </a>
+<a name="ln308">	return false;</a>
+<a name="ln309">}</a>
+<a name="ln310"> </a>
+<a name="ln311"> </a>
+<a name="ln312">static status_t</a>
+<a name="ln313">get_next_agp_device(uint32 *_cookie, pci_info &amp;info, agp_device_info &amp;device)</a>
+<a name="ln314">{</a>
+<a name="ln315">	uint32 index = *_cookie;</a>
+<a name="ln316"> </a>
+<a name="ln317">	// find devices</a>
+<a name="ln318"> </a>
+<a name="ln319">	for (; sPCI-&gt;get_nth_pci_info(index, &amp;info) == B_OK; index++) {</a>
+<a name="ln320">		// is it a bridge or a graphics card?</a>
+<a name="ln321">		if ((info.class_base != PCI_bridge || info.class_sub != PCI_host)</a>
+<a name="ln322">			&amp;&amp; info.class_base != PCI_display)</a>
+<a name="ln323">			continue;</a>
+<a name="ln324"> </a>
+<a name="ln325">		if (is_agp_device(info, &amp;device.address)) {</a>
+<a name="ln326">			device.info.vendor_id = info.vendor_id;</a>
+<a name="ln327">			device.info.device_id = info.device_id;</a>
+<a name="ln328">			device.info.bus = info.bus;</a>
+<a name="ln329">			device.info.device = info.device;</a>
+<a name="ln330">			device.info.function = info.function;</a>
+<a name="ln331">			device.info.class_sub = info.class_sub;</a>
+<a name="ln332">			device.info.class_base = info.class_base;</a>
+<a name="ln333"> </a>
+<a name="ln334">			/* get the contents of the AGP registers from this device */</a>
+<a name="ln335">			device.info.interface.capability_id = get_pci_config(info,</a>
+<a name="ln336">				AGP_ID(device.address), 4);</a>
+<a name="ln337">			device.info.interface.status = get_pci_config(info,</a>
+<a name="ln338">				AGP_STATUS(device.address), 4);</a>
+<a name="ln339">			device.info.interface.command = get_pci_config(info,</a>
+<a name="ln340">				AGP_COMMAND(device.address), 4);</a>
+<a name="ln341"> </a>
+<a name="ln342">			*_cookie = index + 1;</a>
+<a name="ln343">			return B_OK;</a>
+<a name="ln344">		}</a>
+<a name="ln345">	}</a>
+<a name="ln346"> </a>
+<a name="ln347">	return B_ENTRY_NOT_FOUND;</a>
+<a name="ln348">}</a>
+<a name="ln349"> </a>
+<a name="ln350"> </a>
+<a name="ln351">static void</a>
+<a name="ln352">set_agp_command(agp_device_info &amp;deviceInfo, uint32 command)</a>
+<a name="ln353">{</a>
+<a name="ln354">	set_pci_config(deviceInfo.info, AGP_COMMAND(deviceInfo.address), 4, command);</a>
+<a name="ln355">	deviceInfo.info.interface.command = get_pci_config(deviceInfo.info,</a>
+<a name="ln356">		AGP_COMMAND(deviceInfo.address), 4);</a>
+<a name="ln357">}</a>
+<a name="ln358"> </a>
+<a name="ln359"> </a>
+<a name="ln360">static void</a>
+<a name="ln361">set_pci_mode()</a>
+<a name="ln362">{</a>
+<a name="ln363">	TRACE(&quot;set PCI mode on all AGP capable devices.\n&quot;);</a>
+<a name="ln364"> </a>
+<a name="ln365">	// First program all graphics cards</a>
+<a name="ln366"> </a>
+<a name="ln367">	for (uint32 index = 0; index &lt; sDeviceCount; index++) {</a>
+<a name="ln368">		agp_device_info &amp;deviceInfo = sDeviceInfos[index];</a>
+<a name="ln369">		if (deviceInfo.info.class_base != PCI_display)</a>
+<a name="ln370">			continue;</a>
+<a name="ln371"> </a>
+<a name="ln372">		set_agp_command(deviceInfo, 0);</a>
+<a name="ln373">	}</a>
+<a name="ln374"> </a>
+<a name="ln375">	// Then program all bridges - it's the other around for AGP mode</a>
+<a name="ln376"> </a>
+<a name="ln377">	for (uint32 index = 0; index &lt; sDeviceCount; index++) {</a>
+<a name="ln378">		agp_device_info &amp;deviceInfo = sDeviceInfos[index];</a>
+<a name="ln379">		if (deviceInfo.info.class_base != PCI_bridge)</a>
+<a name="ln380">			continue;</a>
+<a name="ln381"> </a>
+<a name="ln382">		set_agp_command(deviceInfo, 0);</a>
+<a name="ln383">	}</a>
+<a name="ln384"> </a>
+<a name="ln385">	// Wait 10mS for the bridges to recover (failsafe!)</a>
+<a name="ln386">	// Note: some SiS bridge chipsets apparantly require 5mS to recover</a>
+<a name="ln387">	// or the master (graphics card) cannot be initialized correctly!</a>
+<a name="ln388">	snooze(10000);</a>
+<a name="ln389">}</a>
+<a name="ln390"> </a>
+<a name="ln391"> </a>
+<a name="ln392">status_t</a>
+<a name="ln393">get_area_base_and_size(area_id area, addr_t &amp;base, size_t &amp;size)</a>
+<a name="ln394">{</a>
+<a name="ln395">	area_info info;</a>
+<a name="ln396">	status_t status = get_area_info(area, &amp;info);</a>
+<a name="ln397">	if (status &lt; B_OK)</a>
+<a name="ln398">		return status;</a>
+<a name="ln399"> </a>
+<a name="ln400">	base = (addr_t)info.address;</a>
+<a name="ln401">	size = info.size;</a>
+<a name="ln402">	return B_OK;</a>
+<a name="ln403">}</a>
+<a name="ln404"> </a>
+<a name="ln405"> </a>
+<a name="ln406">Aperture *</a>
+<a name="ln407">get_aperture(aperture_id id)</a>
+<a name="ln408">{</a>
+<a name="ln409">	Autolock _(sLock);</a>
+<a name="ln410">	return sApertureHashTable.Lookup(id);</a>
+<a name="ln411">}</a>
+<a name="ln412"> </a>
+<a name="ln413"> </a>
+<a name="ln414">//	#pragma mark - Aperture</a>
+<a name="ln415"> </a>
+<a name="ln416"> </a>
+<a name="ln417">Aperture::Aperture(agp_gart_bus_module_info *module, void *aperture)</a>
+<a name="ln418">	:</a>
+<a name="ln419">	fModule(module),</a>
+<a name="ln420">	fHashTable(fInfo),</a>
+<a name="ln421">	fFirstMemory(NULL),</a>
+<a name="ln422">	fPrivateAperture(aperture)</a>
+<a name="ln423">{</a>
+<a name="ln424">	fModule-&gt;get_aperture_info(fPrivateAperture, &amp;fInfo);</a>
+<a name="ln425">	fID = atomic_add(&amp;sNextApertureID, 1);</a>
+<a name="ln426">	init_lock(&amp;fLock, &quot;aperture&quot;);</a>
+<a name="ln427">}</a>
+<a name="ln428"> </a>
+<a name="ln429"> </a>
+<a name="ln430">Aperture::~Aperture()</a>
+<a name="ln431">{</a>
+<a name="ln432">	while (fFirstMemory != NULL) {</a>
+<a name="ln433">		DeleteMemory(fFirstMemory);</a>
+<a name="ln434">	}</a>
+<a name="ln435"> </a>
+<a name="ln436">	fModule-&gt;delete_aperture(fPrivateAperture);</a>
+<a name="ln437">	put_module(fModule-&gt;info.name);</a>
+<a name="ln438">}</a>
+<a name="ln439"> </a>
+<a name="ln440"> </a>
+<a name="ln441">status_t</a>
+<a name="ln442">Aperture::GetInfo(aperture_info *info)</a>
+<a name="ln443">{</a>
+<a name="ln444">	if (info == NULL)</a>
+<a name="ln445">		return B_BAD_VALUE;</a>
+<a name="ln446"> </a>
+<a name="ln447">	*info = fInfo;</a>
+<a name="ln448">	return B_OK;</a>
+<a name="ln449">}</a>
+<a name="ln450"> </a>
+<a name="ln451"> </a>
+<a name="ln452">void</a>
+<a name="ln453">Aperture::DeleteMemory(aperture_memory *memory)</a>
+<a name="ln454">{</a>
+<a name="ln455">	TRACE(&quot;delete memory %p\n&quot;, memory);</a>
+<a name="ln456"> </a>
+<a name="ln457">	UnbindMemory(memory);</a>
+<a name="ln458">	_Free(memory);</a>
+<a name="ln459">	_Remove(memory);</a>
+<a name="ln460">	fHashTable.Remove(memory);</a>
+<a name="ln461">	delete memory;</a>
+<a name="ln462">}</a>
+<a name="ln463"> </a>
+<a name="ln464"> </a>
+<a name="ln465">aperture_memory *</a>
+<a name="ln466">Aperture::CreateMemory(size_t size, size_t alignment, uint32 flags)</a>
+<a name="ln467">{</a>
+<a name="ln468">	aperture_memory *memory = new(std::nothrow) aperture_memory;</a>
+<a name="ln469">	if (memory == NULL)</a>
+<a name="ln470">		return NULL;</a>
+<a name="ln471"> </a>
+<a name="ln472">	status_t status = _Insert(memory, size, alignment, flags);</a>
+<a name="ln473">	if (status &lt; B_OK) {</a>
+<a name="ln474">		ERROR(&quot;Aperture::CreateMemory(): did not find a free space large for &quot;</a>
+<a name="ln475">			&quot;this memory object\n&quot;);</a>
+<a name="ln476">		delete memory;</a>
+<a name="ln477">		return NULL;</a>
+<a name="ln478">	}</a>
+<a name="ln479"> </a>
+<a name="ln480">	TRACE(&quot;create memory %p, base %&quot; B_PRIxADDR &quot;, size %&quot; B_PRIxSIZE</a>
+<a name="ln481">		&quot;, flags %&quot; B_PRIx32 &quot;\n&quot;, memory, memory-&gt;base, memory-&gt;size, flags);</a>
+<a name="ln482"> </a>
+<a name="ln483">	memory-&gt;flags = flags;</a>
+<a name="ln484">#if !defined(GART_TEST)</a>
+<a name="ln485">	memory-&gt;pages = NULL;</a>
+<a name="ln486">#else</a>
+<a name="ln487">	memory-&gt;area = -1;</a>
+<a name="ln488">#endif</a>
+<a name="ln489"> </a>
+<a name="ln490">	fHashTable.Insert(memory);</a>
+<a name="ln491">	return memory;</a>
+<a name="ln492">}</a>
+<a name="ln493"> </a>
+<a name="ln494"> </a>
+<a name="ln495">bool</a>
+<a name="ln496">Aperture::_AdaptToReserved(addr_t &amp;base, size_t &amp;size, int32 *_offset)</a>
+<a name="ln497">{</a>
+<a name="ln498">	addr_t reservedEnd = fInfo.base + fInfo.reserved_size;</a>
+<a name="ln499">	if (reservedEnd &lt;= base)</a>
+<a name="ln500">		return false;</a>
+<a name="ln501"> </a>
+<a name="ln502">	if (reservedEnd &gt;= base + size) {</a>
+<a name="ln503">		size = 0;</a>
+<a name="ln504">		return true;</a>
+<a name="ln505">	}</a>
+<a name="ln506"> </a>
+<a name="ln507">	if (_offset != NULL)</a>
+<a name="ln508">		*_offset = reservedEnd - base;</a>
+<a name="ln509"> </a>
+<a name="ln510">	size -= reservedEnd - base;</a>
+<a name="ln511">	base = reservedEnd;</a>
+<a name="ln512">	return true;</a>
+<a name="ln513">}</a>
+<a name="ln514"> </a>
+<a name="ln515"> </a>
+<a name="ln516">status_t</a>
+<a name="ln517">Aperture::AllocateMemory(aperture_memory *memory, uint32 flags)</a>
+<a name="ln518">{</a>
+<a name="ln519">	// We don't need to allocate reserved memory - it's</a>
+<a name="ln520">	// already there for us to use</a>
+<a name="ln521">	addr_t base = memory-&gt;base;</a>
+<a name="ln522">	size_t size = memory-&gt;size;</a>
+<a name="ln523">	if (_AdaptToReserved(base, size)) {</a>
+<a name="ln524">		if (size == 0) {</a>
+<a name="ln525">			TRACE(&quot;allocation is made of reserved memory\n&quot;);</a>
+<a name="ln526">			return B_OK;</a>
+<a name="ln527">		}</a>
+<a name="ln528"> </a>
+<a name="ln529">		memset((void *)memory-&gt;base, 0, memory-&gt;size - size);</a>
+<a name="ln530">	}</a>
+<a name="ln531">	TRACE(&quot;allocate %ld bytes out of %ld\n&quot;, size, memory-&gt;size);</a>
+<a name="ln532"> </a>
+<a name="ln533">#if !defined(GART_TEST)</a>
+<a name="ln534">	uint32 count = size / B_PAGE_SIZE;</a>
+<a name="ln535"> </a>
+<a name="ln536">	if ((flags &amp; B_APERTURE_NEED_PHYSICAL) != 0) {</a>
+<a name="ln537">		physical_address_restrictions restrictions = {};</a>
+<a name="ln538">#if B_HAIKU_PHYSICAL_BITS &gt; 32</a>
+<a name="ln539">		restrictions.high_address = (phys_addr_t)1 &lt;&lt; 32;</a>
+<a name="ln540">			// TODO: Work-around until intel_gart can deal with physical</a>
+<a name="ln541">			// addresses &gt; 4 GB.</a>
+<a name="ln542">#endif</a>
+<a name="ln543">		memory-&gt;page = vm_page_allocate_page_run(</a>
+<a name="ln544">			PAGE_STATE_WIRED | VM_PAGE_ALLOC_CLEAR, count, &amp;restrictions,</a>
+<a name="ln545">			VM_PRIORITY_SYSTEM);</a>
+<a name="ln546">		if (memory-&gt;page == NULL) {</a>
+<a name="ln547">			ERROR(&quot;Aperture::AllocateMemory(): vm_page_allocate_page_run() &quot;</a>
+<a name="ln548">				&quot;failed (with B_APERTURE_NEED_PHYSICAL)\n&quot;);</a>
+<a name="ln549">			return B_NO_MEMORY;</a>
+<a name="ln550">		}</a>
+<a name="ln551">	} else {</a>
+<a name="ln552">		// Allocate table to hold the pages</a>
+<a name="ln553">		memory-&gt;pages = (vm_page **)malloc(count * sizeof(vm_page *));</a>
+<a name="ln554">		if (memory-&gt;pages == NULL)</a>
+<a name="ln555">			return B_NO_MEMORY;</a>
+<a name="ln556"> </a>
+<a name="ln557">#if B_HAIKU_PHYSICAL_BITS &gt; 32</a>
+<a name="ln558">		// TODO: Work-around until intel_gart can deal with physical</a>
+<a name="ln559">		// addresses &gt; 4 GB.</a>
+<a name="ln560">		physical_address_restrictions restrictions = {};</a>
+<a name="ln561">		restrictions.high_address = (phys_addr_t)1 &lt;&lt; 32;</a>
+<a name="ln562">		vm_page* page = vm_page_allocate_page_run(</a>
+<a name="ln563">			PAGE_STATE_WIRED | VM_PAGE_ALLOC_CLEAR, count, &amp;restrictions,</a>
+<a name="ln564">			VM_PRIORITY_SYSTEM);</a>
+<a name="ln565">		if (page == NULL) {</a>
+<a name="ln566">			ERROR(&quot;Aperture::AllocateMemory(): vm_page_allocate_page_run() &quot;</a>
+<a name="ln567">				&quot;failed (without B_APERTURE_NEED_PHYSICAL)\n&quot;);</a>
+<a name="ln568">			return B_NO_MEMORY;</a>
+<a name="ln569">		}</a>
+<a name="ln570"> </a>
+<a name="ln571">		for (uint32 i = 0; i &lt; count; i++)</a>
+<a name="ln572">			memory-&gt;pages[i] = page + i;</a>
+<a name="ln573">#else</a>
+<a name="ln574">		vm_page_reservation reservation;</a>
+<a name="ln575">		vm_page_reserve_pages(&amp;reservation, count, VM_PRIORITY_SYSTEM);</a>
+<a name="ln576">		for (uint32 i = 0; i &lt; count; i++) {</a>
+<a name="ln577">			memory-&gt;pages[i] = vm_page_allocate_page(&amp;reservation,</a>
+<a name="ln578">				PAGE_STATE_WIRED | VM_PAGE_ALLOC_CLEAR);</a>
+<a name="ln579">		}</a>
+<a name="ln580">		vm_page_unreserve_pages(&amp;reservation);</a>
+<a name="ln581">#endif</a>
+<a name="ln582">	}</a>
+<a name="ln583"> </a>
+<a name="ln584">#ifdef DEBUG_PAGE_ACCESS</a>
+<a name="ln585">	memory-&gt;allocating_thread = find_thread(NULL);</a>
+<a name="ln586">#endif</a>
+<a name="ln587"> </a>
+<a name="ln588">#else	// GART_TEST</a>
+<a name="ln589">	void *address;</a>
+<a name="ln590">	memory-&gt;area = create_area(&quot;GART memory&quot;, &amp;address, B_ANY_KERNEL_ADDRESS,</a>
+<a name="ln591">		size, B_FULL_LOCK | ((flags &amp; B_APERTURE_NEED_PHYSICAL) != 0</a>
+<a name="ln592">			? B_CONTIGUOUS : 0), 0);</a>
+<a name="ln593">	if (memory-&gt;area &lt; B_OK) {</a>
+<a name="ln594">		ERROR(&quot;Aperture::AllocateMemory(): create_area() failed\n&quot;);</a>
+<a name="ln595">		return B_NO_MEMORY;</a>
+<a name="ln596">	}</a>
+<a name="ln597">#endif</a>
+<a name="ln598"> </a>
+<a name="ln599">	memory-&gt;flags |= ALLOCATED_APERTURE;</a>
+<a name="ln600">	return B_OK;</a>
+<a name="ln601">}</a>
+<a name="ln602"> </a>
+<a name="ln603"> </a>
+<a name="ln604">status_t</a>
+<a name="ln605">Aperture::UnbindMemory(aperture_memory *memory)</a>
+<a name="ln606">{</a>
+<a name="ln607">	if ((memory-&gt;flags &amp; BIND_APERTURE) == 0)</a>
+<a name="ln608">		return B_BAD_VALUE;</a>
+<a name="ln609"> </a>
+<a name="ln610">	// We must not unbind reserved memory</a>
+<a name="ln611">	addr_t base = memory-&gt;base;</a>
+<a name="ln612">	size_t size = memory-&gt;size;</a>
+<a name="ln613">	if (_AdaptToReserved(base, size) &amp;&amp; size == 0) {</a>
+<a name="ln614">		memory-&gt;flags &amp;= ~BIND_APERTURE;</a>
+<a name="ln615">		return B_OK;</a>
+<a name="ln616">	}</a>
+<a name="ln617"> </a>
+<a name="ln618">	addr_t start = base - Base();</a>
+<a name="ln619">	TRACE(&quot;unbind %ld bytes at %lx\n&quot;, size, start);</a>
+<a name="ln620"> </a>
+<a name="ln621">	for (addr_t offset = 0; offset &lt; memory-&gt;size; offset += B_PAGE_SIZE) {</a>
+<a name="ln622">		status_t status = fModule-&gt;unbind_page(fPrivateAperture, start + offset);</a>
+<a name="ln623">		if (status &lt; B_OK)</a>
+<a name="ln624">			return status;</a>
+<a name="ln625">	}</a>
+<a name="ln626"> </a>
+<a name="ln627">	memory-&gt;flags &amp;= ~BIND_APERTURE;</a>
+<a name="ln628">	fModule-&gt;flush_tlbs(fPrivateAperture);</a>
+<a name="ln629">	return B_OK;</a>
+<a name="ln630">}</a>
+<a name="ln631"> </a>
+<a name="ln632"> </a>
+<a name="ln633">status_t</a>
+<a name="ln634">Aperture::BindMemory(aperture_memory *memory, addr_t address, size_t size)</a>
+<a name="ln635">{</a>
+<a name="ln636">	bool physical = false;</a>
+<a name="ln637"> </a>
+<a name="ln638">	if ((memory-&gt;flags &amp; ALLOCATED_APERTURE) != 0) {</a>
+<a name="ln639">		// We allocated this memory, get the base and size from there</a>
+<a name="ln640">		size = memory-&gt;size;</a>
+<a name="ln641">		physical = true;</a>
+<a name="ln642">	}</a>
+<a name="ln643"> </a>
+<a name="ln644">	// We don't need to bind reserved memory</a>
+<a name="ln645">	addr_t base = memory-&gt;base;</a>
+<a name="ln646">	int32 offset;</a>
+<a name="ln647">	if (_AdaptToReserved(base, size, &amp;offset)) {</a>
+<a name="ln648">		if (size == 0) {</a>
+<a name="ln649">			TRACE(&quot;reserved memory already bound\n&quot;);</a>
+<a name="ln650">			memory-&gt;flags |= BIND_APERTURE;</a>
+<a name="ln651">			return B_OK;</a>
+<a name="ln652">		}</a>
+<a name="ln653"> </a>
+<a name="ln654">		address += offset;</a>
+<a name="ln655">	}</a>
+<a name="ln656"> </a>
+<a name="ln657">	addr_t start = base - Base();</a>
+<a name="ln658">	TRACE(&quot;bind %ld bytes at %lx\n&quot;, size, base);</a>
+<a name="ln659"> </a>
+<a name="ln660">	for (addr_t offset = 0; offset &lt; size; offset += B_PAGE_SIZE) {</a>
+<a name="ln661">		phys_addr_t physicalAddress = 0;</a>
+<a name="ln662">		status_t status;</a>
+<a name="ln663"> </a>
+<a name="ln664">		if (!physical) {</a>
+<a name="ln665">			physical_entry entry;</a>
+<a name="ln666">			status = get_memory_map((void *)(address + offset), B_PAGE_SIZE,</a>
+<a name="ln667">				&amp;entry, 1);</a>
+<a name="ln668">			if (status &lt; B_OK) {</a>
+<a name="ln669">				ERROR(&quot;Aperture::BindMemory(): get_memory_map() failed\n&quot;);</a>
+<a name="ln670">				return status;</a>
+<a name="ln671">			}</a>
+<a name="ln672"> </a>
+<a name="ln673">			physicalAddress = entry.address;</a>
+<a name="ln674">		} else {</a>
+<a name="ln675">			uint32 index = offset &gt;&gt; PAGE_SHIFT;</a>
+<a name="ln676">			vm_page *page;</a>
+<a name="ln677">			if ((memory-&gt;flags &amp; B_APERTURE_NEED_PHYSICAL) != 0)</a>
+<a name="ln678">				page = memory-&gt;page + index;</a>
+<a name="ln679">			else</a>
+<a name="ln680">				page = memory-&gt;pages[index];</a>
+<a name="ln681"> </a>
+<a name="ln682">			physicalAddress</a>
+<a name="ln683">				= (phys_addr_t)page-&gt;physical_page_number &lt;&lt; PAGE_SHIFT;</a>
+<a name="ln684">		}</a>
+<a name="ln685"> </a>
+<a name="ln686">		status = fModule-&gt;bind_page(fPrivateAperture, start + offset,</a>
+<a name="ln687">			physicalAddress);</a>
+<a name="ln688">		if (status &lt; B_OK) {</a>
+<a name="ln689">			ERROR(&quot;Aperture::BindMemory(): bind_page() failed\n&quot;);</a>
+<a name="ln690">			return status;</a>
+<a name="ln691">		}</a>
+<a name="ln692">	}</a>
+<a name="ln693"> </a>
+<a name="ln694">	memory-&gt;flags |= BIND_APERTURE;</a>
+<a name="ln695">	fModule-&gt;flush_tlbs(fPrivateAperture);</a>
+<a name="ln696">	return B_OK;</a>
+<a name="ln697">}</a>
+<a name="ln698"> </a>
+<a name="ln699"> </a>
+<a name="ln700">void</a>
+<a name="ln701">Aperture::_Free(aperture_memory *memory)</a>
+<a name="ln702">{</a>
+<a name="ln703">	if ((memory-&gt;flags &amp; ALLOCATED_APERTURE) == 0)</a>
+<a name="ln704">		return;</a>
+<a name="ln705"> </a>
+<a name="ln706">#if !defined(GART_TEST)</a>
+<a name="ln707">	// Remove the stolen area from the allocation</a>
+<a name="ln708">	size_t size = memory-&gt;size;</a>
+<a name="ln709">	addr_t reservedEnd = fInfo.base + fInfo.reserved_size;</a>
+<a name="ln710">	if (memory-&gt;base &lt; reservedEnd)</a>
+<a name="ln711">		size -= reservedEnd - memory-&gt;base;</a>
+<a name="ln712"> </a>
+<a name="ln713">	// Free previously allocated pages and page table</a>
+<a name="ln714">	uint32 count = size / B_PAGE_SIZE;</a>
+<a name="ln715"> </a>
+<a name="ln716">	if ((memory-&gt;flags &amp; B_APERTURE_NEED_PHYSICAL) != 0) {</a>
+<a name="ln717">		vm_page *page = memory-&gt;page;</a>
+<a name="ln718">		for (uint32 i = 0; i &lt; count; i++, page++) {</a>
+<a name="ln719">			DEBUG_PAGE_ACCESS_TRANSFER(page, memory-&gt;allocating_thread);</a>
+<a name="ln720">			vm_page_set_state(page, PAGE_STATE_FREE);</a>
+<a name="ln721">		}</a>
+<a name="ln722"> </a>
+<a name="ln723">		memory-&gt;page = NULL;</a>
+<a name="ln724">	} else {</a>
+<a name="ln725">		for (uint32 i = 0; i &lt; count; i++) {</a>
+<a name="ln726">			DEBUG_PAGE_ACCESS_TRANSFER(memory-&gt;pages[i],</a>
+<a name="ln727">				memory-&gt;allocating_thread);</a>
+<a name="ln728">			vm_page_set_state(memory-&gt;pages[i], PAGE_STATE_FREE);</a>
+<a name="ln729">		}</a>
+<a name="ln730"> </a>
+<a name="ln731">		free(memory-&gt;pages);</a>
+<a name="ln732">		memory-&gt;pages = NULL;</a>
+<a name="ln733">	}</a>
+<a name="ln734">#else</a>
+<a name="ln735">	delete_area(memory-&gt;area);</a>
+<a name="ln736">	memory-&gt;area = -1;</a>
+<a name="ln737">#endif</a>
+<a name="ln738"> </a>
+<a name="ln739">	memory-&gt;flags &amp;= ~ALLOCATED_APERTURE;</a>
+<a name="ln740">}</a>
+<a name="ln741"> </a>
+<a name="ln742"> </a>
+<a name="ln743">void</a>
+<a name="ln744">Aperture::_Remove(aperture_memory *memory)</a>
+<a name="ln745">{</a>
+<a name="ln746">	aperture_memory *current = fFirstMemory, *last = NULL;</a>
+<a name="ln747"> </a>
+<a name="ln748">	while (current != NULL) {</a>
+<a name="ln749">		if (memory == current) {</a>
+<a name="ln750">			if (last != NULL) {</a>
+<a name="ln751">				last-&gt;next = current-&gt;next;</a>
+<a name="ln752">			} else {</a>
+<a name="ln753">				fFirstMemory = current-&gt;next;</a>
+<a name="ln754">			}</a>
+<a name="ln755">			break;</a>
+<a name="ln756">		}</a>
+<a name="ln757"> </a>
+<a name="ln758">		last = current;</a>
+<a name="ln759">		current = current-&gt;next;</a>
+<a name="ln760">	}</a>
+<a name="ln761">}</a>
+<a name="ln762"> </a>
+<a name="ln763"> </a>
+<a name="ln764">status_t</a>
+<a name="ln765">Aperture::_Insert(aperture_memory *memory, size_t size, size_t alignment,</a>
+<a name="ln766">	uint32 flags)</a>
+<a name="ln767">{</a>
+<a name="ln768">	aperture_memory *last = NULL;</a>
+<a name="ln769">	aperture_memory *next;</a>
+<a name="ln770">	bool foundSpot = false;</a>
+<a name="ln771"> </a>
+<a name="ln772">	// do some sanity checking</a>
+<a name="ln773">	if (size == 0 || size &gt; fInfo.size)</a>
+<a name="ln774">		return B_BAD_VALUE;</a>
+<a name="ln775"> </a>
+<a name="ln776">	if (alignment &lt; B_PAGE_SIZE)</a>
+<a name="ln777">		alignment = B_PAGE_SIZE;</a>
+<a name="ln778"> </a>
+<a name="ln779">	addr_t start = fInfo.base;</a>
+<a name="ln780">	if ((flags &amp; (B_APERTURE_NON_RESERVED | B_APERTURE_NEED_PHYSICAL)) != 0)</a>
+<a name="ln781">		start += fInfo.reserved_size;</a>
+<a name="ln782"> </a>
+<a name="ln783">	start = ROUNDUP(start, alignment);</a>
+<a name="ln784">	if (start &gt; fInfo.base - 1 + fInfo.size || start &lt; fInfo.base)</a>
+<a name="ln785">		return B_NO_MEMORY;</a>
+<a name="ln786"> </a>
+<a name="ln787">	// walk up to the spot where we should start searching</a>
+<a name="ln788"> </a>
+<a name="ln789">	next = fFirstMemory;</a>
+<a name="ln790">	while (next) {</a>
+<a name="ln791">		if (next-&gt;base &gt;= start + size) {</a>
+<a name="ln792">			// we have a winner</a>
+<a name="ln793">			break;</a>
+<a name="ln794">		}</a>
+<a name="ln795">		last = next;</a>
+<a name="ln796">		next = next-&gt;next;</a>
+<a name="ln797">	}</a>
+<a name="ln798"> </a>
+<a name="ln799">	// find a big enough hole</a>
+<a name="ln800">	if (last == NULL) {</a>
+<a name="ln801">		// see if we can build it at the beginning of the virtual map</a>
+<a name="ln802">		if (next == NULL || (next-&gt;base &gt;= ROUNDUP(start, alignment) + size)) {</a>
+<a name="ln803">			memory-&gt;base = ROUNDUP(start, alignment);</a>
+<a name="ln804">			foundSpot = true;</a>
+<a name="ln805">		} else {</a>
+<a name="ln806">			last = next;</a>
+<a name="ln807">			next = next-&gt;next;</a>
+<a name="ln808">		}</a>
+<a name="ln809">	}</a>
+<a name="ln810"> </a>
+<a name="ln811">	if (!foundSpot) {</a>
+<a name="ln812">		// keep walking</a>
+<a name="ln813">		while (next != NULL) {</a>
+<a name="ln814">			if (next-&gt;base &gt;= ROUNDUP(last-&gt;base + last-&gt;size, alignment) + size) {</a>
+<a name="ln815">				// we found a spot (it'll be filled up below)</a>
+<a name="ln816">				break;</a>
+<a name="ln817">			}</a>
+<a name="ln818">			last = next;</a>
+<a name="ln819">			next = next-&gt;next;</a>
+<a name="ln820">		}</a>
+<a name="ln821"> </a>
+<a name="ln822">		if ((fInfo.base + (fInfo.size - 1)) &gt;= (ROUNDUP(last-&gt;base + last-&gt;size,</a>
+<a name="ln823">				alignment) + (size - 1))) {</a>
+<a name="ln824">			// got a spot</a>
+<a name="ln825">			foundSpot = true;</a>
+<a name="ln826">			memory-&gt;base = ROUNDUP(last-&gt;base + last-&gt;size, alignment);</a>
+<a name="ln827">			if (memory-&gt;base &lt; start)</a>
+<a name="ln828">				memory-&gt;base = start;</a>
+<a name="ln829">		}</a>
+<a name="ln830"> </a>
+<a name="ln831">		if (!foundSpot)</a>
+<a name="ln832">			return B_NO_MEMORY;</a>
+<a name="ln833">	}</a>
+<a name="ln834"> </a>
+<a name="ln835">	memory-&gt;size = size;</a>
+<a name="ln836">	if (last) {</a>
+<a name="ln837">		memory-&gt;next = last-&gt;next;</a>
+<a name="ln838">		last-&gt;next = memory;</a>
+<a name="ln839">	} else {</a>
+<a name="ln840">		memory-&gt;next = fFirstMemory;</a>
+<a name="ln841">		fFirstMemory = memory;</a>
+<a name="ln842">	}</a>
+<a name="ln843"> </a>
+<a name="ln844">	return B_OK;</a>
+<a name="ln845">}</a>
+<a name="ln846"> </a>
+<a name="ln847"> </a>
+<a name="ln848">//	#pragma mark - AGP module interface</a>
+<a name="ln849"> </a>
+<a name="ln850"> </a>
+<a name="ln851">status_t</a>
+<a name="ln852">get_nth_agp_info(uint32 index, agp_info *info)</a>
+<a name="ln853">{</a>
+<a name="ln854">	TRACE(&quot;get_nth_agp_info(index %&quot; B_PRIu32 &quot;)\n&quot;, index);</a>
+<a name="ln855"> </a>
+<a name="ln856">	if (index &gt;= sDeviceCount)</a>
+<a name="ln857">		return B_BAD_VALUE;</a>
+<a name="ln858"> </a>
+<a name="ln859">	// refresh from the contents of the AGP registers from this device</a>
+<a name="ln860">	sDeviceInfos[index].info.interface.status = get_pci_config(</a>
+<a name="ln861">		sDeviceInfos[index].info, AGP_STATUS(sDeviceInfos[index].address), 4);</a>
+<a name="ln862">	sDeviceInfos[index].info.interface.command = get_pci_config(</a>
+<a name="ln863">		sDeviceInfos[index].info, AGP_COMMAND(sDeviceInfos[index].address), 4);</a>
+<a name="ln864"> </a>
+<a name="ln865">	*info = sDeviceInfos[index].info;</a>
+<a name="ln866">	return B_OK;</a>
+<a name="ln867">}</a>
+<a name="ln868"> </a>
+<a name="ln869"> </a>
+<a name="ln870">status_t</a>
+<a name="ln871">acquire_agp(void)</a>
+<a name="ln872">{</a>
+<a name="ln873">	if (atomic_or(&amp;sAcquired, 1) == 1)</a>
+<a name="ln874">		return B_BUSY;</a>
+<a name="ln875"> </a>
+<a name="ln876">	return B_OK;</a>
+<a name="ln877">}</a>
+<a name="ln878"> </a>
+<a name="ln879"> </a>
+<a name="ln880">void</a>
+<a name="ln881">release_agp(void)</a>
+<a name="ln882">{</a>
+<a name="ln883">	atomic_and(&amp;sAcquired, 0);</a>
+<a name="ln884">}</a>
+<a name="ln885"> </a>
+<a name="ln886"> </a>
+<a name="ln887">uint32</a>
+<a name="ln888">set_agp_mode(uint32 command)</a>
+<a name="ln889">{</a>
+<a name="ln890">	TRACE(&quot;set_agp_mode(command %&quot; B_PRIx32 &quot;)\n&quot;, command);</a>
+<a name="ln891"> </a>
+<a name="ln892">	if ((command &amp; AGP_ENABLE) == 0) {</a>
+<a name="ln893">		set_pci_mode();</a>
+<a name="ln894">		return 0;</a>
+<a name="ln895">	}</a>
+<a name="ln896"> </a>
+<a name="ln897">	// Make sure we accept all modes lower than requested one and we</a>
+<a name="ln898">	// reset reserved bits</a>
+<a name="ln899">	command = fix_rate_support(command);</a>
+<a name="ln900"> </a>
+<a name="ln901">	// iterate through our device list to find the common capabilities supported</a>
+<a name="ln902">	for (uint32 index = 0; index &lt; sDeviceCount; index++) {</a>
+<a name="ln903">		agp_device_info &amp;deviceInfo = sDeviceInfos[index];</a>
+<a name="ln904"> </a>
+<a name="ln905">		// Refresh from the contents of the AGP capability registers</a>
+<a name="ln906">		// (note: some graphics driver may have been tweaking, like nvidia)</a>
+<a name="ln907">		deviceInfo.info.interface.status = get_pci_config(deviceInfo.info,</a>
+<a name="ln908">			AGP_STATUS(deviceInfo.address), 4);</a>
+<a name="ln909"> </a>
+<a name="ln910">		check_capabilities(deviceInfo, command);</a>
+<a name="ln911">	}</a>
+<a name="ln912"> </a>
+<a name="ln913">	command = fix_rate_command(command);</a>
+<a name="ln914">	TRACE(&quot;set AGP command %&quot; B_PRIx32 &quot; on all capable devices.\n&quot;, command);</a>
+<a name="ln915"> </a>
+<a name="ln916">	// The order of programming differs for enabling/disabling AGP mode</a>
+<a name="ln917">	// (see AGP specification)</a>
+<a name="ln918"> </a>
+<a name="ln919">	// First program all bridges (master)</a>
+<a name="ln920"> </a>
+<a name="ln921">	for (uint32 index = 0; index &lt; sDeviceCount; index++) {</a>
+<a name="ln922">		agp_device_info &amp;deviceInfo = sDeviceInfos[index];</a>
+<a name="ln923">		if (deviceInfo.info.class_base != PCI_bridge)</a>
+<a name="ln924">			continue;</a>
+<a name="ln925"> </a>
+<a name="ln926">		set_agp_command(deviceInfo, command);</a>
+<a name="ln927">	}</a>
+<a name="ln928"> </a>
+<a name="ln929">	// Wait 10mS for the bridges to recover (failsafe, see set_pci_mode()!)</a>
+<a name="ln930">	snooze(10000);</a>
+<a name="ln931"> </a>
+<a name="ln932">	// Then all graphics cards (target)</a>
+<a name="ln933"> </a>
+<a name="ln934">	for (uint32 index = 0; index &lt; sDeviceCount; index++) {</a>
+<a name="ln935">		agp_device_info &amp;deviceInfo = sDeviceInfos[index];</a>
+<a name="ln936">		if (deviceInfo.info.class_base != PCI_display)</a>
+<a name="ln937">			continue;</a>
+<a name="ln938"> </a>
+<a name="ln939">		set_agp_command(deviceInfo, command);</a>
+<a name="ln940">	}</a>
+<a name="ln941"> </a>
+<a name="ln942">	return command;</a>
+<a name="ln943">}</a>
+<a name="ln944"> </a>
+<a name="ln945"> </a>
+<a name="ln946">//	#pragma mark - GART module interface</a>
+<a name="ln947"> </a>
+<a name="ln948"> </a>
+<a name="ln949">static aperture_id</a>
+<a name="ln950">map_aperture(uint8 bus, uint8 device, uint8 function, size_t size,</a>
+<a name="ln951">	addr_t *_apertureBase)</a>
+<a name="ln952">{</a>
+<a name="ln953">	void *iterator = open_module_list(&quot;busses/agp_gart&quot;);</a>
+<a name="ln954">	status_t status = B_ENTRY_NOT_FOUND;</a>
+<a name="ln955">	Aperture *aperture = NULL;</a>
+<a name="ln956"> </a>
+<a name="ln957">	Autolock _(sLock);</a>
+<a name="ln958"> </a>
+<a name="ln959">	while (true) {</a>
+<a name="ln960">		char name[256];</a>
+<a name="ln961">		size_t nameLength = sizeof(name);</a>
+<a name="ln962">		if (read_next_module_name(iterator, name, &amp;nameLength) != B_OK)</a>
+<a name="ln963">			break;</a>
+<a name="ln964"> </a>
+<a name="ln965">		agp_gart_bus_module_info *module;</a>
+<a name="ln966">		if (get_module(name, (module_info **)&amp;module) == B_OK) {</a>
+<a name="ln967">			void *privateAperture;</a>
+<a name="ln968">			status = module-&gt;create_aperture(bus, device, function, size,</a>
+<a name="ln969">				&amp;privateAperture);</a>
+<a name="ln970">			if (status &lt; B_OK) {</a>
+<a name="ln971">				put_module(name);</a>
+<a name="ln972">				continue;</a>
+<a name="ln973">			}</a>
+<a name="ln974"> </a>
+<a name="ln975">			aperture = new(std::nothrow) Aperture(module, privateAperture);</a>
+<a name="ln976">			status = aperture-&gt;InitCheck();</a>
+<a name="ln977">			if (status == B_OK) {</a>
+<a name="ln978">				if (_apertureBase != NULL)</a>
+<a name="ln979">					*_apertureBase = aperture-&gt;Base();</a>
+<a name="ln980"> </a>
+<a name="ln981">				sApertureHashTable.Insert(aperture);</a>
+<a name="ln982">			} else {</a>
+<a name="ln983">				delete aperture;</a>
+<a name="ln984">				aperture = NULL;</a>
+<a name="ln985">			}</a>
+<a name="ln986">			break;</a>
+<a name="ln987">		}</a>
+<a name="ln988">	}</a>
+<a name="ln989"> </a>
+<a name="ln990">	close_module_list(iterator);</a>
+<a name="ln991">	return aperture != NULL ? aperture-&gt;ID() : status;</a>
+<a name="ln992">}</a>
+<a name="ln993"> </a>
+<a name="ln994"> </a>
+<a name="ln995">static aperture_id</a>
+<a name="ln996">map_custom_aperture(gart_bus_module_info *module, addr_t *_apertureBase)</a>
+<a name="ln997">{</a>
+<a name="ln998">	return B_ERROR;</a>
+<a name="ln999">}</a>
+<a name="ln1000"> </a>
+<a name="ln1001"> </a>
+<a name="ln1002">static status_t</a>
+<a name="ln1003">unmap_aperture(aperture_id id)</a>
+<a name="ln1004">{</a>
+<a name="ln1005">	Autolock _(sLock);</a>
+<a name="ln1006">	Aperture *aperture = sApertureHashTable.Lookup(id);</a>
+<a name="ln1007">	if (aperture == NULL)</a>
+<a name="ln1008">		return B_ENTRY_NOT_FOUND;</a>
+<a name="ln1009"> </a>
+<a name="ln1010">	sApertureHashTable.Remove(aperture);</a>
+<a name="ln1011">	delete aperture;</a>
+<a name="ln1012">	return B_OK;</a>
+<a name="ln1013">}</a>
+<a name="ln1014"> </a>
+<a name="ln1015"> </a>
+<a name="ln1016">static status_t</a>
+<a name="ln1017">get_aperture_info(aperture_id id, aperture_info *info)</a>
+<a name="ln1018">{</a>
+<a name="ln1019">	Aperture *aperture = get_aperture(id);</a>
+<a name="ln1020">	if (aperture == NULL)</a>
+<a name="ln1021">		return B_ENTRY_NOT_FOUND;</a>
+<a name="ln1022"> </a>
+<a name="ln1023">	Autolock _(aperture-&gt;Lock());</a>
+<a name="ln1024">	return aperture-&gt;GetInfo(info);</a>
+<a name="ln1025">}</a>
+<a name="ln1026"> </a>
+<a name="ln1027"> </a>
+<a name="ln1028">static status_t</a>
+<a name="ln1029">allocate_memory(aperture_id id, size_t size, size_t alignment, uint32 flags,</a>
+<a name="ln1030">	addr_t *_apertureBase, phys_addr_t *_physicalBase)</a>
+<a name="ln1031">{</a>
+<a name="ln1032">	if ((flags &amp; ~APERTURE_PUBLIC_FLAGS_MASK) != 0 || _apertureBase == NULL)</a>
+<a name="ln1033">		return B_BAD_VALUE;</a>
+<a name="ln1034"> </a>
+<a name="ln1035">	Aperture *aperture = get_aperture(id);</a>
+<a name="ln1036">	if (aperture == NULL)</a>
+<a name="ln1037">		return B_ENTRY_NOT_FOUND;</a>
+<a name="ln1038"> </a>
+<a name="ln1039">	size = ROUNDUP(size, B_PAGE_SIZE);</a>
+<a name="ln1040"> </a>
+<a name="ln1041">	Autolock _(aperture-&gt;Lock());</a>
+<a name="ln1042"> </a>
+<a name="ln1043">	aperture_memory *memory = aperture-&gt;CreateMemory(size, alignment, flags);</a>
+<a name="ln1044">	if (memory == NULL)</a>
+<a name="ln1045">		return B_NO_MEMORY;</a>
+<a name="ln1046"> </a>
+<a name="ln1047">	status_t status = aperture-&gt;AllocateMemory(memory, flags);</a>
+<a name="ln1048">	if (status == B_OK)</a>
+<a name="ln1049">		status = aperture-&gt;BindMemory(memory, 0, 0);</a>
+<a name="ln1050">	if (status &lt; B_OK) {</a>
+<a name="ln1051">		aperture-&gt;DeleteMemory(memory);</a>
+<a name="ln1052">		return status;</a>
+<a name="ln1053">	}</a>
+<a name="ln1054"> </a>
+<a name="ln1055">	if (_physicalBase != NULL &amp;&amp; (flags &amp; B_APERTURE_NEED_PHYSICAL) != 0) {</a>
+<a name="ln1056">#if !defined(GART_TEST)</a>
+<a name="ln1057">		*_physicalBase</a>
+<a name="ln1058">			= (phys_addr_t)memory-&gt;page-&gt;physical_page_number * B_PAGE_SIZE;</a>
+<a name="ln1059">#else</a>
+<a name="ln1060">		physical_entry entry;</a>
+<a name="ln1061">		status = get_memory_map((void *)memory-&gt;base, B_PAGE_SIZE, &amp;entry, 1);</a>
+<a name="ln1062">		if (status &lt; B_OK) {</a>
+<a name="ln1063">			aperture-&gt;DeleteMemory(memory);</a>
+<a name="ln1064">			return status;</a>
+<a name="ln1065">		}</a>
+<a name="ln1066"> </a>
+<a name="ln1067">		*_physicalBase = entry.address;</a>
+<a name="ln1068">#endif</a>
+<a name="ln1069">	}</a>
+<a name="ln1070"> </a>
+<a name="ln1071">	*_apertureBase = memory-&gt;base;</a>
+<a name="ln1072">	return B_OK;</a>
+<a name="ln1073">}</a>
+<a name="ln1074"> </a>
+<a name="ln1075"> </a>
+<a name="ln1076">static status_t</a>
+<a name="ln1077">free_memory(aperture_id id, addr_t base)</a>
+<a name="ln1078">{</a>
+<a name="ln1079">	Aperture *aperture = get_aperture(id);</a>
+<a name="ln1080">	if (aperture == NULL)</a>
+<a name="ln1081">		return B_ENTRY_NOT_FOUND;</a>
+<a name="ln1082"> </a>
+<a name="ln1083">	Autolock _(aperture-&gt;Lock());</a>
+<a name="ln1084">	aperture_memory *memory = aperture-&gt;GetMemory(base);</a>
+<a name="ln1085">	if (memory == NULL)</a>
+<a name="ln1086">		return B_BAD_VALUE;</a>
+<a name="ln1087"> </a>
+<a name="ln1088">	aperture-&gt;DeleteMemory(memory);</a>
+<a name="ln1089">	return B_OK;</a>
+<a name="ln1090">}</a>
+<a name="ln1091"> </a>
+<a name="ln1092"> </a>
+<a name="ln1093">static status_t</a>
+<a name="ln1094">reserve_aperture(aperture_id id, size_t size, addr_t *_apertureBase)</a>
+<a name="ln1095">{</a>
+<a name="ln1096">	Aperture *aperture = get_aperture(id);</a>
+<a name="ln1097">	if (aperture == NULL)</a>
+<a name="ln1098">		return B_ENTRY_NOT_FOUND;</a>
+<a name="ln1099"> </a>
+<a name="ln1100">	return B_ERROR;</a>
+<a name="ln1101">}</a>
+<a name="ln1102"> </a>
+<a name="ln1103"> </a>
+<a name="ln1104">static status_t</a>
+<a name="ln1105">unreserve_aperture(aperture_id id, addr_t apertureBase)</a>
+<a name="ln1106">{</a>
+<a name="ln1107">	Aperture *aperture = get_aperture(id);</a>
+<a name="ln1108">	if (aperture == NULL)</a>
+<a name="ln1109">		return B_ENTRY_NOT_FOUND;</a>
+<a name="ln1110"> </a>
+<a name="ln1111">	return B_ERROR;</a>
+<a name="ln1112">}</a>
+<a name="ln1113"> </a>
+<a name="ln1114"> </a>
+<a name="ln1115">static status_t</a>
+<a name="ln1116">bind_aperture(aperture_id id, area_id area, addr_t base, size_t size,</a>
+<a name="ln1117">	size_t alignment, addr_t reservedBase, addr_t *_apertureBase)</a>
+<a name="ln1118">{</a>
+<a name="ln1119">	Aperture *aperture = get_aperture(id);</a>
+<a name="ln1120">	if (aperture == NULL)</a>
+<a name="ln1121">		return B_ENTRY_NOT_FOUND;</a>
+<a name="ln1122"> </a>
+<a name="ln1123">	if (area &lt; 0) {</a>
+<a name="ln1124">		if (size == 0 || size &gt; aperture-&gt;Size()</a>
+<a name="ln1125">			|| (base &amp; (B_PAGE_SIZE - 1)) != 0</a>
+<a name="ln1126">			|| base == 0)</a>
+<a name="ln1127">			return B_BAD_VALUE;</a>
+<a name="ln1128"> </a>
+<a name="ln1129">		size = ROUNDUP(size, B_PAGE_SIZE);</a>
+<a name="ln1130">	}</a>
+<a name="ln1131"> </a>
+<a name="ln1132">	if (area &gt;= 0) {</a>
+<a name="ln1133">		status_t status = get_area_base_and_size(area, base, size);</a>
+<a name="ln1134">		if (status &lt; B_OK)</a>
+<a name="ln1135">			return status;</a>
+<a name="ln1136">	}</a>
+<a name="ln1137"> </a>
+<a name="ln1138">	Autolock _(aperture-&gt;Lock());</a>
+<a name="ln1139">	aperture_memory *memory = NULL;</a>
+<a name="ln1140">	if (reservedBase != 0) {</a>
+<a name="ln1141">		// use reserved aperture to bind the pages</a>
+<a name="ln1142">		memory = aperture-&gt;GetMemory(reservedBase);</a>
+<a name="ln1143">		if (memory == NULL)</a>
+<a name="ln1144">			return B_BAD_VALUE;</a>
+<a name="ln1145">	} else {</a>
+<a name="ln1146">		// create new memory object</a>
+<a name="ln1147">		memory = aperture-&gt;CreateMemory(size, alignment,</a>
+<a name="ln1148">			B_APERTURE_NON_RESERVED);</a>
+<a name="ln1149">		if (memory == NULL)</a>
+<a name="ln1150">			return B_NO_MEMORY;</a>
+<a name="ln1151">	}</a>
+<a name="ln1152"> </a>
+<a name="ln1153">	// just bind the physical pages backing the memory into the GART</a>
+<a name="ln1154"> </a>
+<a name="ln1155">	status_t status = aperture-&gt;BindMemory(memory, base, size);</a>
+<a name="ln1156">	if (status &lt; B_OK) {</a>
+<a name="ln1157">		if (reservedBase &lt; 0)</a>
+<a name="ln1158">			aperture-&gt;DeleteMemory(memory);</a>
+<a name="ln1159"> </a>
+<a name="ln1160">		return status;</a>
+<a name="ln1161">	}</a>
+<a name="ln1162"> </a>
+<a name="ln1163">	if (_apertureBase != NULL)</a>
+<a name="ln1164">		*_apertureBase = memory-&gt;base;</a>
+<a name="ln1165"> </a>
+<a name="ln1166">	return B_OK;</a>
+<a name="ln1167">}</a>
+<a name="ln1168"> </a>
+<a name="ln1169"> </a>
+<a name="ln1170">static status_t</a>
+<a name="ln1171">unbind_aperture(aperture_id id, addr_t base)</a>
+<a name="ln1172">{</a>
+<a name="ln1173">	Aperture *aperture = get_aperture(id);</a>
+<a name="ln1174">	if (aperture == NULL)</a>
+<a name="ln1175">		return B_ENTRY_NOT_FOUND;</a>
+<a name="ln1176"> </a>
+<a name="ln1177">	Autolock _(aperture-&gt;Lock());</a>
+<a name="ln1178">	aperture_memory *memory = aperture-&gt;GetMemory(base);</a>
+<a name="ln1179">	if (memory == NULL || (memory-&gt;flags &amp; BIND_APERTURE) == 0)</a>
+<a name="ln1180">		return B_BAD_VALUE;</a>
+<a name="ln1181"> </a>
+<a name="ln1182">	if ((memory-&gt;flags &amp; ALLOCATED_APERTURE) != 0)</a>
+<a name="ln1183">		panic(&quot;unbind memory %lx (%p) allocated by agp_gart.&quot;, base, memory);</a>
+<a name="ln1184"> </a>
+<a name="ln1185">	status_t status = aperture-&gt;UnbindMemory(memory);</a>
+<a name="ln1186">	if (status &lt; B_OK)</a>
+<a name="ln1187">		return status;</a>
+<a name="ln1188"> </a>
+<a name="ln1189">	if ((memory-&gt;flags &amp; RESERVED_APERTURE) == 0)</a>
+<a name="ln1190">		aperture-&gt;DeleteMemory(memory);</a>
+<a name="ln1191"> </a>
+<a name="ln1192">	return B_OK;</a>
+<a name="ln1193">}</a>
+<a name="ln1194"> </a>
+<a name="ln1195"> </a>
+<a name="ln1196">//	#pragma mark -</a>
+<a name="ln1197"> </a>
+<a name="ln1198"> </a>
+<a name="ln1199">static status_t</a>
+<a name="ln1200">agp_init(void)</a>
+<a name="ln1201">{</a>
+<a name="ln1202">	TRACE(&quot;bus manager init\n&quot;);</a>
+<a name="ln1203"> </a>
+<a name="ln1204">	if (get_module(B_PCI_MODULE_NAME, (module_info **)&amp;sPCI) != B_OK)</a>
+<a name="ln1205">		return B_ERROR;</a>
+<a name="ln1206"> </a>
+<a name="ln1207">	uint32 cookie = 0;</a>
+<a name="ln1208">	sDeviceCount = 0;</a>
+<a name="ln1209">	pci_info info;</a>
+<a name="ln1210">	while (get_next_agp_device(&amp;cookie, info, sDeviceInfos[sDeviceCount])</a>
+<a name="ln1211">			== B_OK) {</a>
+<a name="ln1212">		sDeviceCount++;</a>
+<a name="ln1213">	}</a>
+<a name="ln1214"> </a>
+<a name="ln1215">	TRACE(&quot;found %&quot; B_PRId32 &quot; AGP devices\n&quot;, sDeviceCount);</a>
+<a name="ln1216"> </a>
+<a name="ln1217">	// Since there can be custom aperture modules (for memory management only),</a>
+<a name="ln1218">	// we always succeed if we could get the resources we need.</a>
+<a name="ln1219"> </a>
+<a name="ln1220">	new(&amp;sApertureHashTable) ApertureHashTable();</a>
+<a name="ln1221">	return init_lock(&amp;sLock, &quot;agp_gart&quot;);</a>
+<a name="ln1222">}</a>
+<a name="ln1223"> </a>
+<a name="ln1224"> </a>
+<a name="ln1225">void</a>
+<a name="ln1226">agp_uninit(void)</a>
+<a name="ln1227">{</a>
+<a name="ln1228">	TRACE(&quot;bus manager uninit\n&quot;);</a>
+<a name="ln1229"> </a>
+<a name="ln1230">	ApertureHashTable::Iterator iterator = sApertureHashTable.GetIterator();</a>
+<a name="ln1231">	while (iterator.HasNext()) {</a>
+<a name="ln1232">		Aperture *aperture = iterator.Next();</a>
+<a name="ln1233">		sApertureHashTable.Remove(aperture);</a>
+<a name="ln1234">		delete aperture;</a>
+<a name="ln1235">	}</a>
+<a name="ln1236"> </a>
+<a name="ln1237">	put_module(B_PCI_MODULE_NAME);</a>
+<a name="ln1238">}</a>
+<a name="ln1239"> </a>
+<a name="ln1240"> </a>
+<a name="ln1241">static int32</a>
+<a name="ln1242">agp_std_ops(int32 op, ...)</a>
+<a name="ln1243">{</a>
+<a name="ln1244">	switch (op) {</a>
+<a name="ln1245">		case B_MODULE_INIT:</a>
+<a name="ln1246">			return agp_init();</a>
+<a name="ln1247">		case B_MODULE_UNINIT:</a>
+<a name="ln1248">			agp_uninit();</a>
+<a name="ln1249">			return B_OK;</a>
+<a name="ln1250">	}</a>
+<a name="ln1251"> </a>
+<a name="ln1252">	return B_BAD_VALUE;</a>
+<a name="ln1253">}</a>
+<a name="ln1254"> </a>
+<a name="ln1255"> </a>
+<a name="ln1256">static struct agp_gart_module_info sAGPModuleInfo = {</a>
+<a name="ln1257">	{</a>
+<a name="ln1258">		{</a>
+<a name="ln1259">			B_AGP_GART_MODULE_NAME,</a>
+<a name="ln1260">			B_KEEP_LOADED,		// Keep loaded, even if no driver requires it</a>
+<a name="ln1261">			agp_std_ops</a>
+<a name="ln1262">		},</a>
+<a name="ln1263">		NULL 					// the rescan function</a>
+<a name="ln1264">	},</a>
+<a name="ln1265">	get_nth_agp_info,</a>
+<a name="ln1266">	acquire_agp,</a>
+<a name="ln1267">	release_agp,</a>
+<a name="ln1268">	set_agp_mode,</a>
+<a name="ln1269"> </a>
+<a name="ln1270">	map_aperture,</a>
+<a name="ln1271">	map_custom_aperture,</a>
+<a name="ln1272">	unmap_aperture,</a>
+<a name="ln1273">	get_aperture_info,</a>
+<a name="ln1274">	allocate_memory,</a>
+<a name="ln1275">	free_memory,</a>
+<a name="ln1276">	reserve_aperture,</a>
+<a name="ln1277">	unreserve_aperture,</a>
+<a name="ln1278">	bind_aperture,</a>
+<a name="ln1279">	unbind_aperture,</a>
+<a name="ln1280">};</a>
+<a name="ln1281"> </a>
+<a name="ln1282">module_info *modules[] = {</a>
+<a name="ln1283">	(module_info *)&amp;sAGPModuleInfo,</a>
+<a name="ln1284">	NULL</a>
+<a name="ln1285">};</a>
+
+</code></pre>
+<div class="balloon" rel="417"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fNext.</p></div>
+<div class="balloon" rel="1157"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v547/" target="_blank">V547</a> Expression 'reservedBase < 0' is always false. Unsigned type value is never < 0.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

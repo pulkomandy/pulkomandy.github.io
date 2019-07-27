@@ -1,0 +1,2237 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>PathMonitor.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2007-2013, Haiku, Inc. All Rights Reserved.</a>
+<a name="ln3"> * Distributed under the terms of the MIT License.</a>
+<a name="ln4"> *</a>
+<a name="ln5"> * Authors:</a>
+<a name="ln6"> *		Axel Dörfler, axeld@pinc-software.de</a>
+<a name="ln7"> *		Stephan Aßmus, superstippi@gmx.de</a>
+<a name="ln8"> *		Ingo Weinhold, ingo_weinhold@gmx.de</a>
+<a name="ln9"> */</a>
+<a name="ln10"> </a>
+<a name="ln11"> </a>
+<a name="ln12">#include &lt;PathMonitor.h&gt;</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &lt;pthread.h&gt;</a>
+<a name="ln15">#include &lt;stdio.h&gt;</a>
+<a name="ln16"> </a>
+<a name="ln17">#include &lt;Autolock.h&gt;</a>
+<a name="ln18">#include &lt;Directory.h&gt;</a>
+<a name="ln19">#include &lt;Entry.h&gt;</a>
+<a name="ln20">#include &lt;Handler.h&gt;</a>
+<a name="ln21">#include &lt;Locker.h&gt;</a>
+<a name="ln22">#include &lt;Looper.h&gt;</a>
+<a name="ln23">#include &lt;Path.h&gt;</a>
+<a name="ln24">#include &lt;String.h&gt;</a>
+<a name="ln25"> </a>
+<a name="ln26">#include &lt;AutoDeleter.h&gt;</a>
+<a name="ln27">#include &lt;NotOwningEntryRef.h&gt;</a>
+<a name="ln28">#include &lt;ObjectList.h&gt;</a>
+<a name="ln29">#include &lt;util/OpenHashTable.h&gt;</a>
+<a name="ln30">#include &lt;util/SinglyLinkedList.h&gt;</a>
+<a name="ln31"> </a>
+<a name="ln32"> </a>
+<a name="ln33">#undef TRACE</a>
+<a name="ln34">//#define TRACE_PATH_MONITOR</a>
+<a name="ln35">#ifdef TRACE_PATH_MONITOR</a>
+<a name="ln36">#	define TRACE(...) debug_printf(&quot;BPathMonitor: &quot; __VA_ARGS__)</a>
+<a name="ln37">#else</a>
+<a name="ln38">#	define TRACE(...) ;</a>
+<a name="ln39">#endif</a>
+<a name="ln40"> </a>
+<a name="ln41"> </a>
+<a name="ln42">// TODO: Support symlink components in the path.</a>
+<a name="ln43">// TODO: Support mounting/unmounting of volumes in path components and within</a>
+<a name="ln44">// the watched path tree.</a>
+<a name="ln45"> </a>
+<a name="ln46"> </a>
+<a name="ln47">#define WATCH_NODE_FLAG_MASK	0x00ff</a>
+<a name="ln48"> </a>
+<a name="ln49"> </a>
+<a name="ln50">namespace {</a>
+<a name="ln51"> </a>
+<a name="ln52"> </a>
+<a name="ln53">class Directory;</a>
+<a name="ln54">class Node;</a>
+<a name="ln55">struct WatcherHashDefinition;</a>
+<a name="ln56">typedef BOpenHashTable&lt;WatcherHashDefinition&gt; WatcherMap;</a>
+<a name="ln57"> </a>
+<a name="ln58"> </a>
+<a name="ln59">static pthread_once_t sInitOnce = PTHREAD_ONCE_INIT;</a>
+<a name="ln60">static WatcherMap* sWatchers = NULL;</a>
+<a name="ln61">static BLooper* sLooper = NULL;</a>
+<a name="ln62">static BPathMonitor::BWatchingInterface* sDefaultWatchingInterface = NULL;</a>
+<a name="ln63">static BPathMonitor::BWatchingInterface* sWatchingInterface = NULL;</a>
+<a name="ln64"> </a>
+<a name="ln65"> </a>
+<a name="ln66">//	#pragma mark -</a>
+<a name="ln67"> </a>
+<a name="ln68"> </a>
+<a name="ln69">/*! Returns empty path, if either \a parent or \a subPath is empty or an</a>
+<a name="ln70">	allocation fails.</a>
+<a name="ln71"> */</a>
+<a name="ln72">static BString</a>
+<a name="ln73">make_path(const BString&amp; parent, const char* subPath)</a>
+<a name="ln74">{</a>
+<a name="ln75">	BString path = parent;</a>
+<a name="ln76">	int32 length = path.Length();</a>
+<a name="ln77">	if (length == 0 || subPath[0] == '\0')</a>
+<a name="ln78">		return BString();</a>
+<a name="ln79"> </a>
+<a name="ln80">	if (parent.ByteAt(length - 1) != '/') {</a>
+<a name="ln81">		path &lt;&lt; '/';</a>
+<a name="ln82">		if (path.Length() &lt; ++length)</a>
+<a name="ln83">			return BString();</a>
+<a name="ln84">	}</a>
+<a name="ln85"> </a>
+<a name="ln86">	path &lt;&lt; subPath;</a>
+<a name="ln87">	if (path.Length() &lt;= length)</a>
+<a name="ln88">		return BString();</a>
+<a name="ln89">	return path;</a>
+<a name="ln90">}</a>
+<a name="ln91"> </a>
+<a name="ln92"> </a>
+<a name="ln93">//	#pragma mark - Ancestor</a>
+<a name="ln94"> </a>
+<a name="ln95"> </a>
+<a name="ln96">class Ancestor {</a>
+<a name="ln97">public:</a>
+<a name="ln98">	Ancestor(Ancestor* parent, const BString&amp; path, size_t pathComponentOffset)</a>
+<a name="ln99">		:</a>
+<a name="ln100">		fParent(parent),</a>
+<a name="ln101">		fChild(NULL),</a>
+<a name="ln102">		fPath(path),</a>
+<a name="ln103">		fEntryRef(-1, -1, fPath.String() + pathComponentOffset),</a>
+<a name="ln104">		fNodeRef(),</a>
+<a name="ln105">		fWatchingFlags(0),</a>
+<a name="ln106">		fIsDirectory(false)</a>
+<a name="ln107">	{</a>
+<a name="ln108">		if (pathComponentOffset == 0) {</a>
+<a name="ln109">			// must be &quot;/&quot;</a>
+<a name="ln110">			fEntryRef.SetTo(-1, -1, &quot;.&quot;);</a>
+<a name="ln111">		}</a>
+<a name="ln112"> </a>
+<a name="ln113">		if (fParent != NULL)</a>
+<a name="ln114">			fParent-&gt;fChild = this;</a>
+<a name="ln115">	}</a>
+<a name="ln116"> </a>
+<a name="ln117">	Ancestor* Parent() const</a>
+<a name="ln118">	{</a>
+<a name="ln119">		return fParent;</a>
+<a name="ln120">	}</a>
+<a name="ln121"> </a>
+<a name="ln122">	Ancestor* Child() const</a>
+<a name="ln123">	{</a>
+<a name="ln124">		return fChild;</a>
+<a name="ln125">	}</a>
+<a name="ln126"> </a>
+<a name="ln127">	const BString&amp; Path() const</a>
+<a name="ln128">	{</a>
+<a name="ln129">		return fPath;</a>
+<a name="ln130">	}</a>
+<a name="ln131"> </a>
+<a name="ln132">	const char* Name() const</a>
+<a name="ln133">	{</a>
+<a name="ln134">		return fEntryRef.name;</a>
+<a name="ln135">	}</a>
+<a name="ln136"> </a>
+<a name="ln137">	bool Exists() const</a>
+<a name="ln138">	{</a>
+<a name="ln139">		return fNodeRef.device &gt;= 0;</a>
+<a name="ln140">	}</a>
+<a name="ln141"> </a>
+<a name="ln142">	const NotOwningEntryRef&amp; EntryRef() const</a>
+<a name="ln143">	{</a>
+<a name="ln144">		return fEntryRef;</a>
+<a name="ln145">	}</a>
+<a name="ln146"> </a>
+<a name="ln147">	const node_ref&amp; NodeRef() const</a>
+<a name="ln148">	{</a>
+<a name="ln149">		return fNodeRef;</a>
+<a name="ln150">	}</a>
+<a name="ln151"> </a>
+<a name="ln152">	bool IsDirectory() const</a>
+<a name="ln153">	{</a>
+<a name="ln154">		return fIsDirectory;</a>
+<a name="ln155">	}</a>
+<a name="ln156"> </a>
+<a name="ln157">	status_t StartWatching(uint32 pathFlags, BHandler* target)</a>
+<a name="ln158">	{</a>
+<a name="ln159">		// init entry ref</a>
+<a name="ln160">		BEntry entry;</a>
+<a name="ln161">		status_t error = entry.SetTo(fPath);</a>
+<a name="ln162">		if (error != B_OK)</a>
+<a name="ln163">			return error;</a>
+<a name="ln164"> </a>
+<a name="ln165">		entry_ref entryRef;</a>
+<a name="ln166">		error = entry.GetRef(&amp;entryRef);</a>
+<a name="ln167">		if (error != B_OK)</a>
+<a name="ln168">			return error;</a>
+<a name="ln169"> </a>
+<a name="ln170">		fEntryRef.device = entryRef.device;</a>
+<a name="ln171">		fEntryRef.directory = entryRef.directory;</a>
+<a name="ln172"> </a>
+<a name="ln173">		// init node ref</a>
+<a name="ln174">		struct stat st;</a>
+<a name="ln175">		error = entry.GetStat(&amp;st);</a>
+<a name="ln176">		if (error != B_OK)</a>
+<a name="ln177">			return error == B_ENTRY_NOT_FOUND ? B_OK : error;</a>
+<a name="ln178"> </a>
+<a name="ln179">		fNodeRef = node_ref(st.st_dev, st.st_ino);</a>
+<a name="ln180">		fIsDirectory = S_ISDIR(st.st_mode);</a>
+<a name="ln181"> </a>
+<a name="ln182">		// start watching</a>
+<a name="ln183">		uint32 flags = fChild == NULL ? pathFlags : B_WATCH_DIRECTORY;</a>
+<a name="ln184">			// In theory B_WATCH_NAME would suffice for all existing ancestors,</a>
+<a name="ln185">			// plus B_WATCH_DIRECTORY for the parent of the first not existing</a>
+<a name="ln186">			// ancestor. In practice this complicates the transitions when an</a>
+<a name="ln187">			// ancestor is created/removed/moved.</a>
+<a name="ln188">		if (flags != 0) {</a>
+<a name="ln189">			error = sWatchingInterface-&gt;WatchNode(&amp;fNodeRef, flags, target);</a>
+<a name="ln190">			TRACE(&quot;  started to watch ancestor %p (\&quot;%s\&quot;, %#&quot; B_PRIx32</a>
+<a name="ln191">				&quot;) -&gt; %s\n&quot;, this, Name(), flags, strerror(error));</a>
+<a name="ln192">			if (error != B_OK)</a>
+<a name="ln193">				return error;</a>
+<a name="ln194">		}</a>
+<a name="ln195"> </a>
+<a name="ln196">		fWatchingFlags = flags;</a>
+<a name="ln197">		return B_OK;</a>
+<a name="ln198">	}</a>
+<a name="ln199"> </a>
+<a name="ln200">	void StopWatching(BHandler* target)</a>
+<a name="ln201">	{</a>
+<a name="ln202">		// stop watching</a>
+<a name="ln203">		if (fWatchingFlags != 0) {</a>
+<a name="ln204">			sWatchingInterface-&gt;WatchNode(&amp;fNodeRef, B_STOP_WATCHING, target);</a>
+<a name="ln205">			fWatchingFlags = 0;</a>
+<a name="ln206">		}</a>
+<a name="ln207"> </a>
+<a name="ln208">		// uninitialize node and entry ref</a>
+<a name="ln209">		fIsDirectory = false;</a>
+<a name="ln210">		fNodeRef = node_ref();</a>
+<a name="ln211">		fEntryRef.SetDirectoryNodeRef(node_ref());</a>
+<a name="ln212">	}</a>
+<a name="ln213"> </a>
+<a name="ln214">	Ancestor*&amp; HashNext()</a>
+<a name="ln215">	{</a>
+<a name="ln216">		return fHashNext;</a>
+<a name="ln217">	}</a>
+<a name="ln218"> </a>
+<a name="ln219">private:</a>
+<a name="ln220">	Ancestor*			fParent;</a>
+<a name="ln221">	Ancestor*			fChild;</a>
+<a name="ln222">	Ancestor*			fHashNext;</a>
+<a name="ln223">	BString				fPath;</a>
+<a name="ln224">	NotOwningEntryRef	fEntryRef;</a>
+<a name="ln225">	node_ref			fNodeRef;</a>
+<a name="ln226">	uint32				fWatchingFlags;</a>
+<a name="ln227">	bool				fIsDirectory;</a>
+<a name="ln228">};</a>
+<a name="ln229"> </a>
+<a name="ln230"> </a>
+<a name="ln231">//	#pragma mark - AncestorMap</a>
+<a name="ln232"> </a>
+<a name="ln233"> </a>
+<a name="ln234">struct AncestorHashDefinition {</a>
+<a name="ln235">	typedef	node_ref	KeyType;</a>
+<a name="ln236">	typedef	Ancestor	ValueType;</a>
+<a name="ln237"> </a>
+<a name="ln238">	size_t HashKey(const node_ref&amp; key) const</a>
+<a name="ln239">	{</a>
+<a name="ln240">		return size_t(key.device ^ key.node);</a>
+<a name="ln241">	}</a>
+<a name="ln242"> </a>
+<a name="ln243">	size_t Hash(Ancestor* value) const</a>
+<a name="ln244">	{</a>
+<a name="ln245">		return HashKey(value-&gt;NodeRef());</a>
+<a name="ln246">	}</a>
+<a name="ln247"> </a>
+<a name="ln248">	bool Compare(const node_ref&amp; key, Ancestor* value) const</a>
+<a name="ln249">	{</a>
+<a name="ln250">		return key == value-&gt;NodeRef();</a>
+<a name="ln251">	}</a>
+<a name="ln252"> </a>
+<a name="ln253">	Ancestor*&amp; GetLink(Ancestor* value) const</a>
+<a name="ln254">	{</a>
+<a name="ln255">		return value-&gt;HashNext();</a>
+<a name="ln256">	}</a>
+<a name="ln257">};</a>
+<a name="ln258"> </a>
+<a name="ln259"> </a>
+<a name="ln260">typedef BOpenHashTable&lt;AncestorHashDefinition&gt; AncestorMap;</a>
+<a name="ln261"> </a>
+<a name="ln262"> </a>
+<a name="ln263">//	#pragma mark - Entry</a>
+<a name="ln264"> </a>
+<a name="ln265"> </a>
+<a name="ln266">class Entry : public SinglyLinkedListLinkImpl&lt;Entry&gt; {</a>
+<a name="ln267">public:</a>
+<a name="ln268">	Entry(Directory* parent, const BString&amp; name, ::Node* node)</a>
+<a name="ln269">		:</a>
+<a name="ln270">		fParent(parent),</a>
+<a name="ln271">		fName(name),</a>
+<a name="ln272">		fNode(node)</a>
+<a name="ln273">	{</a>
+<a name="ln274">	}</a>
+<a name="ln275"> </a>
+<a name="ln276">	Directory* Parent() const</a>
+<a name="ln277">	{</a>
+<a name="ln278">		return fParent;</a>
+<a name="ln279">	}</a>
+<a name="ln280"> </a>
+<a name="ln281">	const BString&amp; Name() const</a>
+<a name="ln282">	{</a>
+<a name="ln283">		return fName;</a>
+<a name="ln284">	}</a>
+<a name="ln285"> </a>
+<a name="ln286">	::Node* Node() const</a>
+<a name="ln287">	{</a>
+<a name="ln288">		return fNode;</a>
+<a name="ln289">	}</a>
+<a name="ln290"> </a>
+<a name="ln291">	void SetNode(::Node* node)</a>
+<a name="ln292">	{</a>
+<a name="ln293">		fNode = node;</a>
+<a name="ln294">	}</a>
+<a name="ln295"> </a>
+<a name="ln296">	inline NotOwningEntryRef EntryRef() const;</a>
+<a name="ln297"> </a>
+<a name="ln298">	Entry*&amp; HashNext()</a>
+<a name="ln299">	{</a>
+<a name="ln300">		return fHashNext;</a>
+<a name="ln301">	}</a>
+<a name="ln302"> </a>
+<a name="ln303">private:</a>
+<a name="ln304">	Directory*	fParent;</a>
+<a name="ln305">	BString		fName;</a>
+<a name="ln306">	::Node*		fNode;</a>
+<a name="ln307">	Entry*		fHashNext;</a>
+<a name="ln308">};</a>
+<a name="ln309"> </a>
+<a name="ln310">typedef SinglyLinkedList&lt;Entry&gt; EntryList;</a>
+<a name="ln311"> </a>
+<a name="ln312"> </a>
+<a name="ln313">// EntryMap</a>
+<a name="ln314"> </a>
+<a name="ln315"> </a>
+<a name="ln316">struct EntryHashDefinition {</a>
+<a name="ln317">	typedef	const char*	KeyType;</a>
+<a name="ln318">	typedef	Entry		ValueType;</a>
+<a name="ln319"> </a>
+<a name="ln320">	size_t HashKey(const char* key) const</a>
+<a name="ln321">	{</a>
+<a name="ln322">		return BString::HashValue(key);</a>
+<a name="ln323">	}</a>
+<a name="ln324"> </a>
+<a name="ln325">	size_t Hash(Entry* value) const</a>
+<a name="ln326">	{</a>
+<a name="ln327">		return value-&gt;Name().HashValue();</a>
+<a name="ln328">	}</a>
+<a name="ln329"> </a>
+<a name="ln330">	bool Compare(const char* key, Entry* value) const</a>
+<a name="ln331">	{</a>
+<a name="ln332">		return value-&gt;Name() == key;</a>
+<a name="ln333">	}</a>
+<a name="ln334"> </a>
+<a name="ln335">	Entry*&amp; GetLink(Entry* value) const</a>
+<a name="ln336">	{</a>
+<a name="ln337">		return value-&gt;HashNext();</a>
+<a name="ln338">	}</a>
+<a name="ln339">};</a>
+<a name="ln340"> </a>
+<a name="ln341"> </a>
+<a name="ln342">typedef BOpenHashTable&lt;EntryHashDefinition&gt; EntryMap;</a>
+<a name="ln343"> </a>
+<a name="ln344"> </a>
+<a name="ln345">//	#pragma mark - Node</a>
+<a name="ln346"> </a>
+<a name="ln347"> </a>
+<a name="ln348">class Node {</a>
+<a name="ln349">public:</a>
+<a name="ln350">	Node(const node_ref&amp; nodeRef)</a>
+<a name="ln351">		:</a>
+<a name="ln352">		fNodeRef(nodeRef)</a>
+<a name="ln353">	{</a>
+<a name="ln354">	}</a>
+<a name="ln355"> </a>
+<a name="ln356">	virtual ~Node()</a>
+<a name="ln357">	{</a>
+<a name="ln358">	}</a>
+<a name="ln359"> </a>
+<a name="ln360">	virtual bool IsDirectory() const</a>
+<a name="ln361">	{</a>
+<a name="ln362">		return false;</a>
+<a name="ln363">	}</a>
+<a name="ln364"> </a>
+<a name="ln365">	virtual Directory* ToDirectory()</a>
+<a name="ln366">	{</a>
+<a name="ln367">		return NULL;</a>
+<a name="ln368">	}</a>
+<a name="ln369"> </a>
+<a name="ln370">	const node_ref&amp; NodeRef() const</a>
+<a name="ln371">	{</a>
+<a name="ln372">		return fNodeRef;</a>
+<a name="ln373">	}</a>
+<a name="ln374"> </a>
+<a name="ln375">	const EntryList&amp; Entries() const</a>
+<a name="ln376">	{</a>
+<a name="ln377">		return fEntries;</a>
+<a name="ln378">	}</a>
+<a name="ln379"> </a>
+<a name="ln380">	bool HasEntries() const</a>
+<a name="ln381">	{</a>
+<a name="ln382">		return !fEntries.IsEmpty();</a>
+<a name="ln383">	}</a>
+<a name="ln384"> </a>
+<a name="ln385">	Entry* FirstNodeEntry() const</a>
+<a name="ln386">	{</a>
+<a name="ln387">		return fEntries.Head();</a>
+<a name="ln388">	}</a>
+<a name="ln389"> </a>
+<a name="ln390">	bool IsOnlyNodeEntry(Entry* entry) const</a>
+<a name="ln391">	{</a>
+<a name="ln392">		return entry == fEntries.Head() &amp;&amp; fEntries.GetNext(entry) == NULL;</a>
+<a name="ln393">	}</a>
+<a name="ln394"> </a>
+<a name="ln395">	void AddNodeEntry(Entry* entry)</a>
+<a name="ln396">	{</a>
+<a name="ln397">		fEntries.Add(entry);</a>
+<a name="ln398">	}</a>
+<a name="ln399"> </a>
+<a name="ln400">	void RemoveNodeEntry(Entry* entry)</a>
+<a name="ln401">	{</a>
+<a name="ln402">		fEntries.Remove(entry);</a>
+<a name="ln403">	}</a>
+<a name="ln404"> </a>
+<a name="ln405">	Node*&amp; HashNext()</a>
+<a name="ln406">	{</a>
+<a name="ln407">		return fHashNext;</a>
+<a name="ln408">	}</a>
+<a name="ln409"> </a>
+<a name="ln410">private:</a>
+<a name="ln411">	node_ref			fNodeRef;</a>
+<a name="ln412">	EntryList			fEntries;</a>
+<a name="ln413">	Node*				fHashNext;</a>
+<a name="ln414">};</a>
+<a name="ln415"> </a>
+<a name="ln416"> </a>
+<a name="ln417">struct NodeHashDefinition {</a>
+<a name="ln418">	typedef	node_ref	KeyType;</a>
+<a name="ln419">	typedef	Node		ValueType;</a>
+<a name="ln420"> </a>
+<a name="ln421">	size_t HashKey(const node_ref&amp; key) const</a>
+<a name="ln422">	{</a>
+<a name="ln423">		return size_t(key.device ^ key.node);</a>
+<a name="ln424">	}</a>
+<a name="ln425"> </a>
+<a name="ln426">	size_t Hash(Node* value) const</a>
+<a name="ln427">	{</a>
+<a name="ln428">		return HashKey(value-&gt;NodeRef());</a>
+<a name="ln429">	}</a>
+<a name="ln430"> </a>
+<a name="ln431">	bool Compare(const node_ref&amp; key, Node* value) const</a>
+<a name="ln432">	{</a>
+<a name="ln433">		return key == value-&gt;NodeRef();</a>
+<a name="ln434">	}</a>
+<a name="ln435"> </a>
+<a name="ln436">	Node*&amp; GetLink(Node* value) const</a>
+<a name="ln437">	{</a>
+<a name="ln438">		return value-&gt;HashNext();</a>
+<a name="ln439">	}</a>
+<a name="ln440">};</a>
+<a name="ln441"> </a>
+<a name="ln442"> </a>
+<a name="ln443">typedef BOpenHashTable&lt;NodeHashDefinition&gt; NodeMap;</a>
+<a name="ln444"> </a>
+<a name="ln445"> </a>
+<a name="ln446">//	#pragma mark - Directory</a>
+<a name="ln447"> </a>
+<a name="ln448"> </a>
+<a name="ln449">class Directory : public Node {</a>
+<a name="ln450">public:</a>
+<a name="ln451">	static Directory* Create(const node_ref&amp; nodeRef)</a>
+<a name="ln452">	{</a>
+<a name="ln453">		Directory* directory = new(std::nothrow) Directory(nodeRef);</a>
+<a name="ln454">		if (directory == NULL || directory-&gt;fEntries.Init() != B_OK) {</a>
+<a name="ln455">			delete directory;</a>
+<a name="ln456">			return NULL;</a>
+<a name="ln457">		}</a>
+<a name="ln458"> </a>
+<a name="ln459">		return directory;</a>
+<a name="ln460">	}</a>
+<a name="ln461"> </a>
+<a name="ln462">	virtual bool IsDirectory() const</a>
+<a name="ln463">	{</a>
+<a name="ln464">		return true;</a>
+<a name="ln465">	}</a>
+<a name="ln466"> </a>
+<a name="ln467">	virtual Directory* ToDirectory()</a>
+<a name="ln468">	{</a>
+<a name="ln469">		return this;</a>
+<a name="ln470">	}</a>
+<a name="ln471"> </a>
+<a name="ln472">	Entry* FindEntry(const char* name) const</a>
+<a name="ln473">	{</a>
+<a name="ln474">		return fEntries.Lookup(name);</a>
+<a name="ln475">	}</a>
+<a name="ln476"> </a>
+<a name="ln477">	Entry* CreateEntry(const BString&amp; name, Node* node)</a>
+<a name="ln478">	{</a>
+<a name="ln479">		Entry* entry = new(std::nothrow) Entry(this, name, node);</a>
+<a name="ln480">		if (entry == NULL || entry-&gt;Name().IsEmpty()) {</a>
+<a name="ln481">			delete entry;</a>
+<a name="ln482">			return NULL;</a>
+<a name="ln483">		}</a>
+<a name="ln484"> </a>
+<a name="ln485">		AddEntry(entry);</a>
+<a name="ln486">		return entry;</a>
+<a name="ln487">	}</a>
+<a name="ln488"> </a>
+<a name="ln489">	void AddEntry(Entry* entry)</a>
+<a name="ln490">	{</a>
+<a name="ln491">		fEntries.Insert(entry);</a>
+<a name="ln492">	}</a>
+<a name="ln493"> </a>
+<a name="ln494">	void RemoveEntry(Entry* entry)</a>
+<a name="ln495">	{</a>
+<a name="ln496">		fEntries.Remove(entry);</a>
+<a name="ln497">	}</a>
+<a name="ln498"> </a>
+<a name="ln499">	EntryMap::Iterator GetEntryIterator() const</a>
+<a name="ln500">	{</a>
+<a name="ln501">		return fEntries.GetIterator();</a>
+<a name="ln502">	}</a>
+<a name="ln503"> </a>
+<a name="ln504">	Entry* RemoveAllEntries()</a>
+<a name="ln505">	{</a>
+<a name="ln506">		return fEntries.Clear(true);</a>
+<a name="ln507">	}</a>
+<a name="ln508"> </a>
+<a name="ln509">private:</a>
+<a name="ln510">	Directory(const node_ref&amp; nodeRef)</a>
+<a name="ln511">		:</a>
+<a name="ln512">		Node(nodeRef)</a>
+<a name="ln513">	{</a>
+<a name="ln514">	}</a>
+<a name="ln515"> </a>
+<a name="ln516">private:</a>
+<a name="ln517">	EntryMap	fEntries;</a>
+<a name="ln518">};</a>
+<a name="ln519"> </a>
+<a name="ln520"> </a>
+<a name="ln521">//	#pragma mark - Entry</a>
+<a name="ln522"> </a>
+<a name="ln523"> </a>
+<a name="ln524">inline NotOwningEntryRef</a>
+<a name="ln525">Entry::EntryRef() const</a>
+<a name="ln526">{</a>
+<a name="ln527">	return NotOwningEntryRef(fParent-&gt;NodeRef(), fName);</a>
+<a name="ln528">}</a>
+<a name="ln529"> </a>
+<a name="ln530"> </a>
+<a name="ln531">//	#pragma mark - PathHandler</a>
+<a name="ln532"> </a>
+<a name="ln533"> </a>
+<a name="ln534">class PathHandler : public BHandler {</a>
+<a name="ln535">public:</a>
+<a name="ln536">								PathHandler(const char* path, uint32 flags,</a>
+<a name="ln537">									const BMessenger&amp; target, BLooper* looper);</a>
+<a name="ln538">	virtual						~PathHandler();</a>
+<a name="ln539"> </a>
+<a name="ln540">			status_t			InitCheck() const;</a>
+<a name="ln541">			void				Quit();</a>
+<a name="ln542"> </a>
+<a name="ln543">			const BString&amp;		OriginalPath() const</a>
+<a name="ln544">									{ return fOriginalPath; }</a>
+<a name="ln545">			uint32				Flags() const	{ return fFlags; }</a>
+<a name="ln546"> </a>
+<a name="ln547">	virtual	void				MessageReceived(BMessage* message);</a>
+<a name="ln548"> </a>
+<a name="ln549">			PathHandler*&amp;		HashNext()	{ return fHashNext; }</a>
+<a name="ln550"> </a>
+<a name="ln551">private:</a>
+<a name="ln552">			status_t			_CreateAncestors();</a>
+<a name="ln553">			status_t			_StartWatchingAncestors(Ancestor* ancestor,</a>
+<a name="ln554">									bool notify);</a>
+<a name="ln555">			void				_StopWatchingAncestors(Ancestor* ancestor,</a>
+<a name="ln556">									bool notify);</a>
+<a name="ln557"> </a>
+<a name="ln558">			void				_EntryCreated(BMessage* message);</a>
+<a name="ln559">			void				_EntryRemoved(BMessage* message);</a>
+<a name="ln560">			void				_EntryMoved(BMessage* message);</a>
+<a name="ln561">			void				_NodeChanged(BMessage* message);</a>
+<a name="ln562"> </a>
+<a name="ln563">			bool				_EntryCreated(const NotOwningEntryRef&amp; entryRef,</a>
+<a name="ln564">									const node_ref&amp; nodeRef, bool isDirectory,</a>
+<a name="ln565">									bool dryRun, bool notify, Entry** _entry);</a>
+<a name="ln566">			bool				_EntryRemoved(const NotOwningEntryRef&amp; entryRef,</a>
+<a name="ln567">									const node_ref&amp; nodeRef, bool dryRun,</a>
+<a name="ln568">									bool notify, Entry** _keepEntry);</a>
+<a name="ln569"> </a>
+<a name="ln570">			bool				_CheckDuplicateEntryNotification(int32 opcode,</a>
+<a name="ln571">									const entry_ref&amp; toEntryRef,</a>
+<a name="ln572">									const node_ref&amp; nodeRef,</a>
+<a name="ln573">									const entry_ref* fromEntryRef = NULL);</a>
+<a name="ln574">			void				_UnsetDuplicateEntryNotification();</a>
+<a name="ln575"> </a>
+<a name="ln576">			Ancestor*			_GetAncestor(const node_ref&amp; nodeRef) const;</a>
+<a name="ln577"> </a>
+<a name="ln578">			status_t			_AddNode(const node_ref&amp; nodeRef,</a>
+<a name="ln579">									bool isDirectory, bool notify,</a>
+<a name="ln580">									Entry* entry = NULL, Node** _node = NULL);</a>
+<a name="ln581">			void				_DeleteNode(Node* node, bool notify);</a>
+<a name="ln582">			Node*				_GetNode(const node_ref&amp; nodeRef) const;</a>
+<a name="ln583"> </a>
+<a name="ln584">			status_t			_AddEntryIfNeeded(Directory* directory,</a>
+<a name="ln585">									const char* name, const node_ref&amp; nodeRef,</a>
+<a name="ln586">									bool isDirectory, bool notify,</a>
+<a name="ln587">									Entry** _entry = NULL);</a>
+<a name="ln588">			void				_DeleteEntry(Entry* entry, bool notify);</a>
+<a name="ln589">			void				_DeleteEntryAlreadyRemovedFromParent(</a>
+<a name="ln590">									Entry* entry, bool notify);</a>
+<a name="ln591"> </a>
+<a name="ln592">			void				_NotifyFilesCreatedOrRemoved(Entry* entry,</a>
+<a name="ln593">									int32 opcode) const;</a>
+<a name="ln594">			void				_NotifyEntryCreatedOrRemoved(Entry* entry,</a>
+<a name="ln595">									int32 opcode) const;</a>
+<a name="ln596">			void				_NotifyEntryCreatedOrRemoved(</a>
+<a name="ln597">									const entry_ref&amp; entryRef,</a>
+<a name="ln598">									const node_ref&amp; nodeRef, const char* path,</a>
+<a name="ln599">									bool isDirectory, int32 opcode) const;</a>
+<a name="ln600">			void				_NotifyEntryMoved(const entry_ref&amp; fromEntryRef,</a>
+<a name="ln601">									const entry_ref&amp; toEntryRef,</a>
+<a name="ln602">									const node_ref&amp; nodeRef,</a>
+<a name="ln603">									const char* fromPath, const char* path,</a>
+<a name="ln604">									bool isDirectory, bool wasAdded,</a>
+<a name="ln605">									bool wasRemoved) const;</a>
+<a name="ln606">			void				_NotifyTarget(BMessage&amp; message,</a>
+<a name="ln607">									const char* path) const;</a>
+<a name="ln608"> </a>
+<a name="ln609">			BString				_NodePath(const Node* node) const;</a>
+<a name="ln610">			BString				_EntryPath(const Entry* entry) const;</a>
+<a name="ln611"> </a>
+<a name="ln612"> </a>
+<a name="ln613">			bool				_WatchRecursively() const;</a>
+<a name="ln614">			bool				_WatchFilesOnly() const;</a>
+<a name="ln615">			bool				_WatchDirectoriesOnly() const;</a>
+<a name="ln616"> </a>
+<a name="ln617">private:</a>
+<a name="ln618">			BMessenger			fTarget;</a>
+<a name="ln619">			uint32				fFlags;</a>
+<a name="ln620">			status_t			fStatus;</a>
+<a name="ln621">			BString				fOriginalPath;</a>
+<a name="ln622">			BString				fPath;</a>
+<a name="ln623">			Ancestor*			fRoot;</a>
+<a name="ln624">			Ancestor*			fBaseAncestor;</a>
+<a name="ln625">			Node*				fBaseNode;</a>
+<a name="ln626">			AncestorMap			fAncestors;</a>
+<a name="ln627">			NodeMap				fNodes;</a>
+<a name="ln628">			PathHandler*		fHashNext;</a>
+<a name="ln629">			int32				fDuplicateEntryNotificationOpcode;</a>
+<a name="ln630">			node_ref			fDuplicateEntryNotificationNodeRef;</a>
+<a name="ln631">			entry_ref			fDuplicateEntryNotificationToEntryRef;</a>
+<a name="ln632">			entry_ref			fDuplicateEntryNotificationFromEntryRef;</a>
+<a name="ln633">};</a>
+<a name="ln634"> </a>
+<a name="ln635"> </a>
+<a name="ln636">struct PathHandlerHashDefinition {</a>
+<a name="ln637">	typedef	const char*	KeyType;</a>
+<a name="ln638">	typedef	PathHandler	ValueType;</a>
+<a name="ln639"> </a>
+<a name="ln640">	size_t HashKey(const char* key) const</a>
+<a name="ln641">	{</a>
+<a name="ln642">		return BString::HashValue(key);</a>
+<a name="ln643">	}</a>
+<a name="ln644"> </a>
+<a name="ln645">	size_t Hash(PathHandler* value) const</a>
+<a name="ln646">	{</a>
+<a name="ln647">		return value-&gt;OriginalPath().HashValue();</a>
+<a name="ln648">	}</a>
+<a name="ln649"> </a>
+<a name="ln650">	bool Compare(const char* key, PathHandler* value) const</a>
+<a name="ln651">	{</a>
+<a name="ln652">		return key == value-&gt;OriginalPath();</a>
+<a name="ln653">	}</a>
+<a name="ln654"> </a>
+<a name="ln655">	PathHandler*&amp; GetLink(PathHandler* value) const</a>
+<a name="ln656">	{</a>
+<a name="ln657">		return value-&gt;HashNext();</a>
+<a name="ln658">	}</a>
+<a name="ln659">};</a>
+<a name="ln660"> </a>
+<a name="ln661"> </a>
+<a name="ln662">typedef BOpenHashTable&lt;PathHandlerHashDefinition&gt; PathHandlerMap;</a>
+<a name="ln663"> </a>
+<a name="ln664"> </a>
+<a name="ln665">//	#pragma mark - Watcher</a>
+<a name="ln666"> </a>
+<a name="ln667"> </a>
+<a name="ln668">struct Watcher : public PathHandlerMap {</a>
+<a name="ln669">	static Watcher* Create(const BMessenger&amp; target)</a>
+<a name="ln670">	{</a>
+<a name="ln671">		Watcher* watcher = new(std::nothrow) Watcher(target);</a>
+<a name="ln672">		if (watcher == NULL || watcher-&gt;Init() != B_OK) {</a>
+<a name="ln673">			delete watcher;</a>
+<a name="ln674">			return NULL;</a>
+<a name="ln675">		}</a>
+<a name="ln676">		return watcher;</a>
+<a name="ln677">	}</a>
+<a name="ln678"> </a>
+<a name="ln679">	const BMessenger&amp; Target() const</a>
+<a name="ln680">	{</a>
+<a name="ln681">		return fTarget;</a>
+<a name="ln682">	}</a>
+<a name="ln683"> </a>
+<a name="ln684">	Watcher*&amp; HashNext()</a>
+<a name="ln685">	{</a>
+<a name="ln686">		return fHashNext;</a>
+<a name="ln687">	}</a>
+<a name="ln688"> </a>
+<a name="ln689">private:</a>
+<a name="ln690">	Watcher(const BMessenger&amp; target)</a>
+<a name="ln691">		:</a>
+<a name="ln692">		fTarget(target)</a>
+<a name="ln693">	{</a>
+<a name="ln694">	}</a>
+<a name="ln695"> </a>
+<a name="ln696">private:</a>
+<a name="ln697">	BMessenger		fTarget;</a>
+<a name="ln698">	Watcher*		fHashNext;</a>
+<a name="ln699">};</a>
+<a name="ln700"> </a>
+<a name="ln701"> </a>
+<a name="ln702">struct WatcherHashDefinition {</a>
+<a name="ln703">	typedef	BMessenger	KeyType;</a>
+<a name="ln704">	typedef	Watcher		ValueType;</a>
+<a name="ln705"> </a>
+<a name="ln706">	size_t HashKey(const BMessenger&amp; key) const</a>
+<a name="ln707">	{</a>
+<a name="ln708">		return key.HashValue();</a>
+<a name="ln709">	}</a>
+<a name="ln710"> </a>
+<a name="ln711">	size_t Hash(Watcher* value) const</a>
+<a name="ln712">	{</a>
+<a name="ln713">		return HashKey(value-&gt;Target());</a>
+<a name="ln714">	}</a>
+<a name="ln715"> </a>
+<a name="ln716">	bool Compare(const BMessenger&amp; key, Watcher* value) const</a>
+<a name="ln717">	{</a>
+<a name="ln718">		return key == value-&gt;Target();</a>
+<a name="ln719">	}</a>
+<a name="ln720"> </a>
+<a name="ln721">	Watcher*&amp; GetLink(Watcher* value) const</a>
+<a name="ln722">	{</a>
+<a name="ln723">		return value-&gt;HashNext();</a>
+<a name="ln724">	}</a>
+<a name="ln725">};</a>
+<a name="ln726"> </a>
+<a name="ln727"> </a>
+<a name="ln728">//	#pragma mark - PathHandler</a>
+<a name="ln729"> </a>
+<a name="ln730"> </a>
+<a name="ln731">PathHandler::PathHandler(const char* path, uint32 flags,</a>
+<a name="ln732">	const BMessenger&amp; target, BLooper* looper)</a>
+<a name="ln733">	:</a>
+<a name="ln734">	BHandler(path),</a>
+<a name="ln735">	fTarget(target),</a>
+<a name="ln736">	fFlags(flags),</a>
+<a name="ln737">	fStatus(B_OK),</a>
+<a name="ln738">	fOriginalPath(path),</a>
+<a name="ln739">	fPath(),</a>
+<a name="ln740">	fRoot(NULL),</a>
+<a name="ln741">	fBaseAncestor(NULL),</a>
+<a name="ln742">	fBaseNode(NULL),</a>
+<a name="ln743">	fAncestors(),</a>
+<a name="ln744">	fNodes()</a>
+<a name="ln745">{</a>
+<a name="ln746">	TRACE(&quot;%p-&gt;PathHandler::PathHandler(\&quot;%s\&quot;, %#&quot; B_PRIx32 &quot;)\n&quot;, this, path,</a>
+<a name="ln747">		flags);</a>
+<a name="ln748"> </a>
+<a name="ln749">	_UnsetDuplicateEntryNotification();</a>
+<a name="ln750"> </a>
+<a name="ln751">	fStatus = fAncestors.Init();</a>
+<a name="ln752">	if (fStatus != B_OK)</a>
+<a name="ln753">		return;</a>
+<a name="ln754"> </a>
+<a name="ln755">	fStatus = fNodes.Init();</a>
+<a name="ln756">	if (fStatus != B_OK)</a>
+<a name="ln757">		return;</a>
+<a name="ln758"> </a>
+<a name="ln759">	// normalize the flags</a>
+<a name="ln760">	if ((fFlags &amp; B_WATCH_RECURSIVELY) != 0) {</a>
+<a name="ln761">		// We add B_WATCH_NAME and B_WATCH_DIRECTORY as needed, so clear them</a>
+<a name="ln762">		// here.</a>
+<a name="ln763">		fFlags &amp;= ~uint32(B_WATCH_NAME | B_WATCH_DIRECTORY);</a>
+<a name="ln764">	} else {</a>
+<a name="ln765">		// The B_WATCH_*_ONLY flags are only valid for the recursive mode.</a>
+<a name="ln766">		// B_WATCH_NAME is implied (we watch the parent directory).</a>
+<a name="ln767">		fFlags &amp;= ~uint32(B_WATCH_FILES_ONLY | B_WATCH_DIRECTORIES_ONLY</a>
+<a name="ln768">			| B_WATCH_NAME);</a>
+<a name="ln769">	}</a>
+<a name="ln770"> </a>
+<a name="ln771">	// Normalize the path a bit. We can't use BPath, as it may really normalize</a>
+<a name="ln772">	// the path, i.e. resolve symlinks and such, which may cause us to monitor</a>
+<a name="ln773">	// the wrong path. We want some normalization, though:</a>
+<a name="ln774">	// * relative -&gt; absolute path</a>
+<a name="ln775">	// * fold duplicate '/'s</a>
+<a name="ln776">	// * omit &quot;.&quot; components</a>
+<a name="ln777">	// * fail when encountering &quot;..&quot; components</a>
+<a name="ln778"> </a>
+<a name="ln779">	// make absolute</a>
+<a name="ln780">	BString normalizedPath;</a>
+<a name="ln781">	if (path[0] == '/') {</a>
+<a name="ln782">		normalizedPath = &quot;/&quot;;</a>
+<a name="ln783">		path++;</a>
+<a name="ln784">	} else</a>
+<a name="ln785">		normalizedPath = BPath(&quot;.&quot;).Path();</a>
+<a name="ln786">	if (normalizedPath.IsEmpty()) {</a>
+<a name="ln787">		fStatus = B_NO_MEMORY;</a>
+<a name="ln788">		return;</a>
+<a name="ln789">	}</a>
+<a name="ln790"> </a>
+<a name="ln791">	// parse path components</a>
+<a name="ln792">	const char* pathEnd = path + strlen(path);</a>
+<a name="ln793">	for (;;) {</a>
+<a name="ln794">		// skip '/'s</a>
+<a name="ln795">		while (path[0] == '/')</a>
+<a name="ln796">			path++;</a>
+<a name="ln797">		if (path == pathEnd)</a>
+<a name="ln798">			break;</a>
+<a name="ln799"> </a>
+<a name="ln800">		const char* componentEnd = strchr(path, '/');</a>
+<a name="ln801">		if (componentEnd == NULL)</a>
+<a name="ln802">			componentEnd = pathEnd;</a>
+<a name="ln803">		size_t componentLength = componentEnd - path;</a>
+<a name="ln804"> </a>
+<a name="ln805">		// handle &quot;.' and &quot;..&quot;</a>
+<a name="ln806">		if (path[0] == '.') {</a>
+<a name="ln807">			if (componentLength == 1) {</a>
+<a name="ln808">				path = componentEnd;</a>
+<a name="ln809">				continue;</a>
+<a name="ln810">			}</a>
+<a name="ln811">			if (componentLength == 2 &amp;&amp; path[1] == '.') {</a>
+<a name="ln812">				fStatus = B_BAD_VALUE;</a>
+<a name="ln813">				return;</a>
+<a name="ln814">			}</a>
+<a name="ln815">		}</a>
+<a name="ln816"> </a>
+<a name="ln817">		int32 normalizedPathLength = normalizedPath.Length();</a>
+<a name="ln818">		if (normalizedPath.ByteAt(normalizedPathLength - 1) != '/') {</a>
+<a name="ln819">			normalizedPath &lt;&lt; '/';</a>
+<a name="ln820">			normalizedPathLength++;</a>
+<a name="ln821">		}</a>
+<a name="ln822">		normalizedPath.Append(path, componentEnd - path);</a>
+<a name="ln823">		normalizedPathLength += int32(componentEnd - path);</a>
+<a name="ln824"> </a>
+<a name="ln825">		if (normalizedPath.Length() != normalizedPathLength) {</a>
+<a name="ln826">			fStatus = B_NO_MEMORY;</a>
+<a name="ln827">			return;</a>
+<a name="ln828">		}</a>
+<a name="ln829"> </a>
+<a name="ln830">		path = componentEnd;</a>
+<a name="ln831">	}</a>
+<a name="ln832"> </a>
+<a name="ln833">	fPath = normalizedPath;</a>
+<a name="ln834"> </a>
+<a name="ln835">	// Create the Ancestor objects -- they correspond to the path components and</a>
+<a name="ln836">	// are used for watching changes that affect the entries on the path.</a>
+<a name="ln837">	fStatus = _CreateAncestors();</a>
+<a name="ln838">	if (fStatus != B_OK)</a>
+<a name="ln839">		return;</a>
+<a name="ln840"> </a>
+<a name="ln841">	// add ourselves to the looper</a>
+<a name="ln842">	looper-&gt;AddHandler(this);</a>
+<a name="ln843"> </a>
+<a name="ln844">	// start watching</a>
+<a name="ln845">	fStatus = _StartWatchingAncestors(fRoot, false);</a>
+<a name="ln846">	if (fStatus != B_OK)</a>
+<a name="ln847">		return;</a>
+<a name="ln848">}</a>
+<a name="ln849"> </a>
+<a name="ln850"> </a>
+<a name="ln851">PathHandler::~PathHandler()</a>
+<a name="ln852">{</a>
+<a name="ln853">	TRACE(&quot;%p-&gt;PathHandler::~PathHandler(\&quot;%s\&quot;, %#&quot; B_PRIx32 &quot;)\n&quot;, this,</a>
+<a name="ln854">		fPath.String(), fFlags);</a>
+<a name="ln855"> </a>
+<a name="ln856">	if (fBaseNode != NULL)</a>
+<a name="ln857">		_DeleteNode(fBaseNode, false);</a>
+<a name="ln858"> </a>
+<a name="ln859">	while (fRoot != NULL) {</a>
+<a name="ln860">		Ancestor* nextAncestor = fRoot-&gt;Child();</a>
+<a name="ln861">		delete fRoot;</a>
+<a name="ln862">		fRoot = nextAncestor;</a>
+<a name="ln863">	}</a>
+<a name="ln864">}</a>
+<a name="ln865"> </a>
+<a name="ln866"> </a>
+<a name="ln867">status_t</a>
+<a name="ln868">PathHandler::InitCheck() const</a>
+<a name="ln869">{</a>
+<a name="ln870">	return fStatus;</a>
+<a name="ln871">}</a>
+<a name="ln872"> </a>
+<a name="ln873"> </a>
+<a name="ln874">void</a>
+<a name="ln875">PathHandler::Quit()</a>
+<a name="ln876">{</a>
+<a name="ln877">	TRACE(&quot;%p-&gt;PathHandler::Quit()\n&quot;, this);</a>
+<a name="ln878">	sWatchingInterface-&gt;StopWatching(this);</a>
+<a name="ln879">	sLooper-&gt;RemoveHandler(this);</a>
+<a name="ln880">	delete this;</a>
+<a name="ln881">}</a>
+<a name="ln882"> </a>
+<a name="ln883"> </a>
+<a name="ln884">void</a>
+<a name="ln885">PathHandler::MessageReceived(BMessage* message)</a>
+<a name="ln886">{</a>
+<a name="ln887">	switch (message-&gt;what) {</a>
+<a name="ln888">		case B_NODE_MONITOR:</a>
+<a name="ln889">		{</a>
+<a name="ln890">			int32 opcode;</a>
+<a name="ln891">			if (message-&gt;FindInt32(&quot;opcode&quot;, &amp;opcode) != B_OK)</a>
+<a name="ln892">				return;</a>
+<a name="ln893"> </a>
+<a name="ln894">			switch (opcode) {</a>
+<a name="ln895">				case B_ENTRY_CREATED:</a>
+<a name="ln896">					_EntryCreated(message);</a>
+<a name="ln897">					break;</a>
+<a name="ln898"> </a>
+<a name="ln899">				case B_ENTRY_REMOVED:</a>
+<a name="ln900">					_EntryRemoved(message);</a>
+<a name="ln901">					break;</a>
+<a name="ln902"> </a>
+<a name="ln903">				case B_ENTRY_MOVED:</a>
+<a name="ln904">					_EntryMoved(message);</a>
+<a name="ln905">					break;</a>
+<a name="ln906"> </a>
+<a name="ln907">				default:</a>
+<a name="ln908">					_UnsetDuplicateEntryNotification();</a>
+<a name="ln909">					_NodeChanged(message);</a>
+<a name="ln910">					break;</a>
+<a name="ln911">			}</a>
+<a name="ln912"> </a>
+<a name="ln913">			break;</a>
+<a name="ln914">		}</a>
+<a name="ln915"> </a>
+<a name="ln916">		default:</a>
+<a name="ln917">			BHandler::MessageReceived(message);</a>
+<a name="ln918">			break;</a>
+<a name="ln919">	}</a>
+<a name="ln920">}</a>
+<a name="ln921"> </a>
+<a name="ln922"> </a>
+<a name="ln923">status_t</a>
+<a name="ln924">PathHandler::_CreateAncestors()</a>
+<a name="ln925">{</a>
+<a name="ln926">	TRACE(&quot;%p-&gt;PathHandler::_CreateAncestors()\n&quot;, this);</a>
+<a name="ln927"> </a>
+<a name="ln928">	// create the Ancestor objects</a>
+<a name="ln929">	const char* path = fPath.String();</a>
+<a name="ln930">	const char* pathEnd = path + fPath.Length();</a>
+<a name="ln931">	const char* component = path;</a>
+<a name="ln932"> </a>
+<a name="ln933">	Ancestor* ancestor = NULL;</a>
+<a name="ln934"> </a>
+<a name="ln935">	while (component &lt; pathEnd) {</a>
+<a name="ln936">		const char* componentEnd = component == path</a>
+<a name="ln937">			? component + 1 : strchr(component, '/');</a>
+<a name="ln938">		if (componentEnd == NULL)</a>
+<a name="ln939">			componentEnd = pathEnd;</a>
+<a name="ln940"> </a>
+<a name="ln941">		BString ancestorPath(path, componentEnd - path);</a>
+<a name="ln942">		if (ancestorPath.IsEmpty())</a>
+<a name="ln943">			return B_NO_MEMORY;</a>
+<a name="ln944"> </a>
+<a name="ln945">		ancestor = new(std::nothrow) Ancestor(ancestor, ancestorPath,</a>
+<a name="ln946">			component - path);</a>
+<a name="ln947">		TRACE(&quot;  created ancestor %p (\&quot;%s\&quot; / \&quot;%s\&quot;)\n&quot;, ancestor,</a>
+<a name="ln948">			ancestor-&gt;Path().String(), ancestor-&gt;Name());</a>
+<a name="ln949">		if (ancestor == NULL)</a>
+<a name="ln950">			return B_NO_MEMORY;</a>
+<a name="ln951"> </a>
+<a name="ln952">		if (fRoot == NULL)</a>
+<a name="ln953">			fRoot = ancestor;</a>
+<a name="ln954"> </a>
+<a name="ln955">		component = componentEnd[0] == '/' ? componentEnd + 1 : componentEnd;</a>
+<a name="ln956">	}</a>
+<a name="ln957"> </a>
+<a name="ln958">	fBaseAncestor = ancestor;</a>
+<a name="ln959"> </a>
+<a name="ln960">	return B_OK;</a>
+<a name="ln961">}</a>
+<a name="ln962"> </a>
+<a name="ln963"> </a>
+<a name="ln964">status_t</a>
+<a name="ln965">PathHandler::_StartWatchingAncestors(Ancestor* startAncestor, bool notify)</a>
+<a name="ln966">{</a>
+<a name="ln967">	TRACE(&quot;%p-&gt;PathHandler::_StartWatchingAncestors(%p, %d)\n&quot;, this,</a>
+<a name="ln968">		startAncestor, notify);</a>
+<a name="ln969"> </a>
+<a name="ln970">	// The watch flags for the path (if it exists). Recursively implies</a>
+<a name="ln971">	// directory, since we need to watch the entries.</a>
+<a name="ln972">	uint32 watchFlags = (fFlags &amp; WATCH_NODE_FLAG_MASK)</a>
+<a name="ln973">		| (_WatchRecursively() ? B_WATCH_DIRECTORY : 0);</a>
+<a name="ln974"> </a>
+<a name="ln975">	for (Ancestor* ancestor = startAncestor; ancestor != NULL;</a>
+<a name="ln976">		ancestor = ancestor-&gt;Child()) {</a>
+<a name="ln977">		status_t error = ancestor-&gt;StartWatching(watchFlags, this);</a>
+<a name="ln978">		if (error != B_OK)</a>
+<a name="ln979">			return error;</a>
+<a name="ln980"> </a>
+<a name="ln981">		if (!ancestor-&gt;Exists()) {</a>
+<a name="ln982">			TRACE(&quot;  -&gt; ancestor doesn't exist\n&quot;);</a>
+<a name="ln983">			break;</a>
+<a name="ln984">		}</a>
+<a name="ln985"> </a>
+<a name="ln986">		fAncestors.Insert(ancestor);</a>
+<a name="ln987">	}</a>
+<a name="ln988"> </a>
+<a name="ln989">	if (!fBaseAncestor-&gt;Exists())</a>
+<a name="ln990">		return B_OK;</a>
+<a name="ln991"> </a>
+<a name="ln992">	if (notify) {</a>
+<a name="ln993">		_NotifyEntryCreatedOrRemoved(fBaseAncestor-&gt;EntryRef(),</a>
+<a name="ln994">			fBaseAncestor-&gt;NodeRef(), fPath, fBaseAncestor-&gt;IsDirectory(),</a>
+<a name="ln995">			B_ENTRY_CREATED);</a>
+<a name="ln996">	}</a>
+<a name="ln997"> </a>
+<a name="ln998">	if (!_WatchRecursively())</a>
+<a name="ln999">		return B_OK;</a>
+<a name="ln1000"> </a>
+<a name="ln1001">	status_t error = _AddNode(fBaseAncestor-&gt;NodeRef(),</a>
+<a name="ln1002">		fBaseAncestor-&gt;IsDirectory(), notify &amp;&amp; _WatchFilesOnly(), NULL,</a>
+<a name="ln1003">		&amp;fBaseNode);</a>
+<a name="ln1004">	if (error != B_OK)</a>
+<a name="ln1005">		return error;</a>
+<a name="ln1006"> </a>
+<a name="ln1007">	return B_OK;</a>
+<a name="ln1008">}</a>
+<a name="ln1009"> </a>
+<a name="ln1010"> </a>
+<a name="ln1011">void</a>
+<a name="ln1012">PathHandler::_StopWatchingAncestors(Ancestor* ancestor, bool notify)</a>
+<a name="ln1013">{</a>
+<a name="ln1014">	// stop watching the tree below path</a>
+<a name="ln1015">	if (fBaseNode != NULL) {</a>
+<a name="ln1016">		_DeleteNode(fBaseNode, notify &amp;&amp; _WatchFilesOnly());</a>
+<a name="ln1017">		fBaseNode = NULL;</a>
+<a name="ln1018">	}</a>
+<a name="ln1019"> </a>
+<a name="ln1020">	if (notify &amp;&amp; fBaseAncestor-&gt;Exists()</a>
+<a name="ln1021">		&amp;&amp; (fBaseAncestor-&gt;IsDirectory()</a>
+<a name="ln1022">			? !_WatchFilesOnly() : !_WatchDirectoriesOnly())) {</a>
+<a name="ln1023">		_NotifyEntryCreatedOrRemoved(fBaseAncestor-&gt;EntryRef(),</a>
+<a name="ln1024">			fBaseAncestor-&gt;NodeRef(), fPath, fBaseAncestor-&gt;IsDirectory(),</a>
+<a name="ln1025">			B_ENTRY_REMOVED);</a>
+<a name="ln1026">	}</a>
+<a name="ln1027"> </a>
+<a name="ln1028">	// stop watching the ancestors and uninitialize their entries</a>
+<a name="ln1029">	for (; ancestor != NULL; ancestor = ancestor-&gt;Child()) {</a>
+<a name="ln1030">		if (ancestor-&gt;Exists())</a>
+<a name="ln1031">			fAncestors.Remove(ancestor);</a>
+<a name="ln1032">		ancestor-&gt;StopWatching(this);</a>
+<a name="ln1033">	}</a>
+<a name="ln1034">}</a>
+<a name="ln1035"> </a>
+<a name="ln1036"> </a>
+<a name="ln1037">void</a>
+<a name="ln1038">PathHandler::_EntryCreated(BMessage* message)</a>
+<a name="ln1039">{</a>
+<a name="ln1040">	// TODO: Unless we're watching files only, we might want to forward (some</a>
+<a name="ln1041">	// of) the messages that don't agree with our model, since our client</a>
+<a name="ln1042">	// maintains its model at a different time and the notification might be</a>
+<a name="ln1043">	// necessary to keep it up-to-date. E.g. consider the following case:</a>
+<a name="ln1044">	// 1. a directory is created</a>
+<a name="ln1045">	// 2. a file is created in the directory</a>
+<a name="ln1046">	// 3. the file is removed from the directory</a>
+<a name="ln1047">	// If we get the notification after 1. and before 2., we pass it on to the</a>
+<a name="ln1048">	// client, which may get it after 2. and before 3., thus seeing the file.</a>
+<a name="ln1049">	// If we then get the entry-created notification after 3., we don't see the</a>
+<a name="ln1050">	// file anymore and ignore the notification as well as the following</a>
+<a name="ln1051">	// entry-removed notification. That is the client will never know that the</a>
+<a name="ln1052">	// file has been removed. This can only happen in recursive mode. Otherwise</a>
+<a name="ln1053">	// (and with B_WATCH_DIRECTORY) we just pass on all notifications.</a>
+<a name="ln1054">	// A possible solution could be to just create a zombie entry and pass on</a>
+<a name="ln1055">	// the entry-created notification. We wouldn't be able to adhere to the</a>
+<a name="ln1056">	// B_WATCH_FILES_ONLY/B_WATCH_DIRECTORIES_ONLY flags, but that should be</a>
+<a name="ln1057">	// acceptable. Either the client hasn't seen the entry either -- then it</a>
+<a name="ln1058">	// doesn't matter -- or it likely has ignored a not matching entry anyway.</a>
+<a name="ln1059"> </a>
+<a name="ln1060">	NotOwningEntryRef entryRef;</a>
+<a name="ln1061">	node_ref nodeRef;</a>
+<a name="ln1062"> </a>
+<a name="ln1063">	if (message-&gt;FindInt32(&quot;device&quot;, &amp;nodeRef.device) != B_OK</a>
+<a name="ln1064">		|| message-&gt;FindInt64(&quot;node&quot;, &amp;nodeRef.node) != B_OK</a>
+<a name="ln1065">		|| message-&gt;FindInt64(&quot;directory&quot;, &amp;entryRef.directory) != B_OK</a>
+<a name="ln1066">		|| message-&gt;FindString(&quot;name&quot;, (const char**)&amp;entryRef.name) != B_OK) {</a>
+<a name="ln1067">		return;</a>
+<a name="ln1068">	}</a>
+<a name="ln1069">	entryRef.device = nodeRef.device;</a>
+<a name="ln1070"> </a>
+<a name="ln1071">	if (_CheckDuplicateEntryNotification(B_ENTRY_CREATED, entryRef, nodeRef))</a>
+<a name="ln1072">		return;</a>
+<a name="ln1073"> </a>
+<a name="ln1074">	TRACE(&quot;%p-&gt;PathHandler::_EntryCreated(): entry: %&quot; B_PRIdDEV &quot;:%&quot; B_PRIdINO</a>
+<a name="ln1075">		&quot;:\&quot;%s\&quot;, node: %&quot; B_PRIdDEV &quot;:%&quot; B_PRIdINO &quot;\n&quot;, this, entryRef.device,</a>
+<a name="ln1076">		entryRef.directory, entryRef.name, nodeRef.device, nodeRef.node);</a>
+<a name="ln1077"> </a>
+<a name="ln1078">	BEntry entry;</a>
+<a name="ln1079">	struct stat st;</a>
+<a name="ln1080">	if (entry.SetTo(&amp;entryRef) != B_OK || entry.GetStat(&amp;st) != B_OK</a>
+<a name="ln1081">		|| nodeRef != node_ref(st.st_dev, st.st_ino)) {</a>
+<a name="ln1082">		return;</a>
+<a name="ln1083">	}</a>
+<a name="ln1084"> </a>
+<a name="ln1085">	_EntryCreated(entryRef, nodeRef, S_ISDIR(st.st_mode), false, true, NULL);</a>
+<a name="ln1086">}</a>
+<a name="ln1087"> </a>
+<a name="ln1088"> </a>
+<a name="ln1089">void</a>
+<a name="ln1090">PathHandler::_EntryRemoved(BMessage* message)</a>
+<a name="ln1091">{</a>
+<a name="ln1092">	NotOwningEntryRef entryRef;</a>
+<a name="ln1093">	node_ref nodeRef;</a>
+<a name="ln1094"> </a>
+<a name="ln1095">	if (message-&gt;FindInt32(&quot;device&quot;, &amp;nodeRef.device) != B_OK</a>
+<a name="ln1096">		|| message-&gt;FindInt64(&quot;node&quot;, &amp;nodeRef.node) != B_OK</a>
+<a name="ln1097">		|| message-&gt;FindInt64(&quot;directory&quot;, &amp;entryRef.directory) != B_OK</a>
+<a name="ln1098">		|| message-&gt;FindString(&quot;name&quot;, (const char**)&amp;entryRef.name) != B_OK) {</a>
+<a name="ln1099">		return;</a>
+<a name="ln1100">	}</a>
+<a name="ln1101">	entryRef.device = nodeRef.device;</a>
+<a name="ln1102"> </a>
+<a name="ln1103">	if (_CheckDuplicateEntryNotification(B_ENTRY_REMOVED, entryRef, nodeRef))</a>
+<a name="ln1104">		return;</a>
+<a name="ln1105"> </a>
+<a name="ln1106">	TRACE(&quot;%p-&gt;PathHandler::_EntryRemoved(): entry: %&quot; B_PRIdDEV &quot;:%&quot; B_PRIdINO</a>
+<a name="ln1107">		&quot;:\&quot;%s\&quot;, node: %&quot; B_PRIdDEV &quot;:%&quot; B_PRIdINO &quot;\n&quot;, this, entryRef.device,</a>
+<a name="ln1108">		entryRef.directory, entryRef.name, nodeRef.device, nodeRef.node);</a>
+<a name="ln1109"> </a>
+<a name="ln1110">	_EntryRemoved(entryRef, nodeRef, false, true, NULL);</a>
+<a name="ln1111">}</a>
+<a name="ln1112"> </a>
+<a name="ln1113"> </a>
+<a name="ln1114">void</a>
+<a name="ln1115">PathHandler::_EntryMoved(BMessage* message)</a>
+<a name="ln1116">{</a>
+<a name="ln1117">	NotOwningEntryRef fromEntryRef;</a>
+<a name="ln1118">	NotOwningEntryRef toEntryRef;</a>
+<a name="ln1119">	node_ref nodeRef;</a>
+<a name="ln1120"> </a>
+<a name="ln1121">	if (message-&gt;FindInt32(&quot;node device&quot;, &amp;nodeRef.device) != B_OK</a>
+<a name="ln1122">		|| message-&gt;FindInt64(&quot;node&quot;, &amp;nodeRef.node) != B_OK</a>
+<a name="ln1123">		|| message-&gt;FindInt32(&quot;device&quot;, &amp;fromEntryRef.device) != B_OK</a>
+<a name="ln1124">		|| message-&gt;FindInt64(&quot;from directory&quot;, &amp;fromEntryRef.directory) != B_OK</a>
+<a name="ln1125">		|| message-&gt;FindInt64(&quot;to directory&quot;, &amp;toEntryRef.directory) != B_OK</a>
+<a name="ln1126">		|| message-&gt;FindString(&quot;from name&quot;, (const char**)&amp;fromEntryRef.name)</a>
+<a name="ln1127">			!= B_OK</a>
+<a name="ln1128">		|| message-&gt;FindString(&quot;name&quot;, (const char**)&amp;toEntryRef.name)</a>
+<a name="ln1129">			!= B_OK) {</a>
+<a name="ln1130">		return;</a>
+<a name="ln1131">	}</a>
+<a name="ln1132">	toEntryRef.device = fromEntryRef.device;</a>
+<a name="ln1133"> </a>
+<a name="ln1134">	if (_CheckDuplicateEntryNotification(B_ENTRY_MOVED, toEntryRef, nodeRef,</a>
+<a name="ln1135">			&amp;fromEntryRef)) {</a>
+<a name="ln1136">		return;</a>
+<a name="ln1137">	}</a>
+<a name="ln1138"> </a>
+<a name="ln1139">	TRACE(&quot;%p-&gt;PathHandler::_EntryMoved(): entry: %&quot; B_PRIdDEV &quot;:%&quot; B_PRIdINO</a>
+<a name="ln1140">		&quot;:\&quot;%s\&quot; -&gt; %&quot; B_PRIdDEV &quot;:%&quot; B_PRIdINO &quot;:\&quot;%s\&quot;, node: %&quot; B_PRIdDEV</a>
+<a name="ln1141">		&quot;:%&quot; B_PRIdINO &quot;\n&quot;, this, fromEntryRef.device, fromEntryRef.directory,</a>
+<a name="ln1142">		fromEntryRef.name, toEntryRef.device, toEntryRef.directory,</a>
+<a name="ln1143">		toEntryRef.name, nodeRef.device, nodeRef.node);</a>
+<a name="ln1144"> </a>
+<a name="ln1145">	BEntry entry;</a>
+<a name="ln1146">	struct stat st;</a>
+<a name="ln1147">	if (entry.SetTo(&amp;toEntryRef) != B_OK || entry.GetStat(&amp;st) != B_OK</a>
+<a name="ln1148">		|| nodeRef != node_ref(st.st_dev, st.st_ino)) {</a>
+<a name="ln1149">		_EntryRemoved(fromEntryRef, nodeRef, false, true, NULL);</a>
+<a name="ln1150">		return;</a>
+<a name="ln1151">	}</a>
+<a name="ln1152">	bool isDirectory = S_ISDIR(st.st_mode);</a>
+<a name="ln1153"> </a>
+<a name="ln1154">	Ancestor* fromAncestor = _GetAncestor(fromEntryRef.DirectoryNodeRef());</a>
+<a name="ln1155">	Ancestor* toAncestor = _GetAncestor(toEntryRef.DirectoryNodeRef());</a>
+<a name="ln1156"> </a>
+<a name="ln1157">	if (_WatchRecursively()) {</a>
+<a name="ln1158">		Node* fromDirectoryNode = _GetNode(fromEntryRef.DirectoryNodeRef());</a>
+<a name="ln1159">		Node* toDirectoryNode = _GetNode(toEntryRef.DirectoryNodeRef());</a>
+<a name="ln1160">		if (fromDirectoryNode != NULL || toDirectoryNode != NULL) {</a>
+<a name="ln1161">			// Check whether _EntryRemoved()/_EntryCreated() can handle the</a>
+<a name="ln1162">			// respective entry regularly (i.e. don't encounter an out-of-sync</a>
+<a name="ln1163">			// issue) or don't need to be called at all (entry outside the</a>
+<a name="ln1164">			// monitored tree).</a>
+<a name="ln1165">			if ((fromDirectoryNode == NULL</a>
+<a name="ln1166">					|| _EntryRemoved(fromEntryRef, nodeRef, true, false, NULL))</a>
+<a name="ln1167">				&amp;&amp; (toDirectoryNode == NULL</a>
+<a name="ln1168">					|| _EntryCreated(toEntryRef, nodeRef, isDirectory, true,</a>
+<a name="ln1169">						false, NULL))) {</a>
+<a name="ln1170">				// The entries can be handled regularly. We delegate the work to</a>
+<a name="ln1171">				// _EntryRemoved() and _EntryCreated() and only handle the</a>
+<a name="ln1172">				// notification ourselves.</a>
+<a name="ln1173"> </a>
+<a name="ln1174">				// handle removed</a>
+<a name="ln1175">				Entry* removedEntry = NULL;</a>
+<a name="ln1176">				if (fromDirectoryNode != NULL) {</a>
+<a name="ln1177">					_EntryRemoved(fromEntryRef, nodeRef, false, false,</a>
+<a name="ln1178">						&amp;removedEntry);</a>
+<a name="ln1179">				}</a>
+<a name="ln1180"> </a>
+<a name="ln1181">				// handle created</a>
+<a name="ln1182">				Entry* createdEntry = NULL;</a>
+<a name="ln1183">				if (toDirectoryNode != NULL) {</a>
+<a name="ln1184">					_EntryCreated(toEntryRef, nodeRef, isDirectory, false,</a>
+<a name="ln1185">						false, &amp;createdEntry);</a>
+<a name="ln1186">				}</a>
+<a name="ln1187"> </a>
+<a name="ln1188">				// notify</a>
+<a name="ln1189">				if (_WatchFilesOnly() &amp;&amp; isDirectory) {</a>
+<a name="ln1190">					// recursively iterate through the removed and created</a>
+<a name="ln1191">					// hierarchy and send notifications for the files</a>
+<a name="ln1192">					if (removedEntry != NULL) {</a>
+<a name="ln1193">						_NotifyFilesCreatedOrRemoved(removedEntry,</a>
+<a name="ln1194">							B_ENTRY_REMOVED);</a>
+<a name="ln1195">					}</a>
+<a name="ln1196"> </a>
+<a name="ln1197">					if (createdEntry != NULL) {</a>
+<a name="ln1198">						_NotifyFilesCreatedOrRemoved(createdEntry,</a>
+<a name="ln1199">							B_ENTRY_CREATED);</a>
+<a name="ln1200">					}</a>
+<a name="ln1201">				} else {</a>
+<a name="ln1202">					BString fromPath;</a>
+<a name="ln1203">					if (fromDirectoryNode != NULL) {</a>
+<a name="ln1204">						fromPath = make_path(_NodePath(fromDirectoryNode),</a>
+<a name="ln1205">							fromEntryRef.name);</a>
+<a name="ln1206">					}</a>
+<a name="ln1207"> </a>
+<a name="ln1208">					BString path;</a>
+<a name="ln1209">					if (toDirectoryNode != NULL) {</a>
+<a name="ln1210">						path = make_path(_NodePath(toDirectoryNode),</a>
+<a name="ln1211">							toEntryRef.name);</a>
+<a name="ln1212">					}</a>
+<a name="ln1213"> </a>
+<a name="ln1214">					_NotifyEntryMoved(fromEntryRef, toEntryRef, nodeRef,</a>
+<a name="ln1215">						fromPath, path, isDirectory, fromDirectoryNode == NULL,</a>
+<a name="ln1216">						toDirectoryNode == NULL);</a>
+<a name="ln1217">				}</a>
+<a name="ln1218"> </a>
+<a name="ln1219">				if (removedEntry != NULL)</a>
+<a name="ln1220">					_DeleteEntry(removedEntry, false);</a>
+<a name="ln1221">			} else {</a>
+<a name="ln1222">				// The entries can't be handled regularly. We delegate all the</a>
+<a name="ln1223">				// work to _EntryRemoved() and _EntryCreated(). This will</a>
+<a name="ln1224">				// generate separate entry-removed and entry-created</a>
+<a name="ln1225">				// notifications.</a>
+<a name="ln1226"> </a>
+<a name="ln1227">				// handle removed</a>
+<a name="ln1228">				if (fromDirectoryNode != NULL)</a>
+<a name="ln1229">					_EntryRemoved(fromEntryRef, nodeRef, false, true, NULL);</a>
+<a name="ln1230"> </a>
+<a name="ln1231">				// handle created</a>
+<a name="ln1232">				if (toDirectoryNode != NULL) {</a>
+<a name="ln1233">					_EntryCreated(toEntryRef, nodeRef, isDirectory, false, true,</a>
+<a name="ln1234">						NULL);</a>
+<a name="ln1235">				}</a>
+<a name="ln1236">			}</a>
+<a name="ln1237"> </a>
+<a name="ln1238">			return;</a>
+<a name="ln1239">		}</a>
+<a name="ln1240"> </a>
+<a name="ln1241">		if (fromAncestor == fBaseAncestor || toAncestor == fBaseAncestor) {</a>
+<a name="ln1242">			// That should never happen, as we should have found a matching</a>
+<a name="ln1243">			// directory node in this case.</a>
+<a name="ln1244">#ifdef DEBUG</a>
+<a name="ln1245">			debugger(&quot;path ancestor exists, but doesn't have a directory&quot;);</a>
+<a name="ln1246">			// Could actually be an out-of-memory situation, if we simply failed</a>
+<a name="ln1247">			// to create the directory earlier.</a>
+<a name="ln1248">#endif</a>
+<a name="ln1249">			_StopWatchingAncestors(fRoot, false);</a>
+<a name="ln1250">			_StartWatchingAncestors(fRoot, false);</a>
+<a name="ln1251">			return;</a>
+<a name="ln1252">		}</a>
+<a name="ln1253">	} else {</a>
+<a name="ln1254">		// Non-recursive mode: This notification is only of interest to us, if</a>
+<a name="ln1255">		// it is either a move into/within/out of the path and B_WATCH_DIRECTORY</a>
+<a name="ln1256">		// is set, or an ancestor might be affected.</a>
+<a name="ln1257">		if (fromAncestor == NULL &amp;&amp; toAncestor == NULL)</a>
+<a name="ln1258">			return;</a>
+<a name="ln1259"> </a>
+<a name="ln1260">		if (fromAncestor == fBaseAncestor || toAncestor == fBaseAncestor) {</a>
+<a name="ln1261">			if ((fFlags &amp; B_WATCH_DIRECTORY) != 0) {</a>
+<a name="ln1262">				BString fromPath;</a>
+<a name="ln1263">				if (fromAncestor == fBaseAncestor)</a>
+<a name="ln1264">					fromPath = make_path(fPath, fromEntryRef.name);</a>
+<a name="ln1265"> </a>
+<a name="ln1266">				BString path;</a>
+<a name="ln1267">				if (toAncestor == fBaseAncestor)</a>
+<a name="ln1268">					path = make_path(fPath, toEntryRef.name);</a>
+<a name="ln1269"> </a>
+<a name="ln1270">				_NotifyEntryMoved(fromEntryRef, toEntryRef, nodeRef,</a>
+<a name="ln1271">					fromPath, path, isDirectory, fromAncestor == NULL,</a>
+<a name="ln1272">					toAncestor == NULL);</a>
+<a name="ln1273">			}</a>
+<a name="ln1274">			return;</a>
+<a name="ln1275">		}</a>
+<a name="ln1276">	}</a>
+<a name="ln1277"> </a>
+<a name="ln1278">	if (fromAncestor == NULL &amp;&amp; toAncestor == NULL)</a>
+<a name="ln1279">		return;</a>
+<a name="ln1280"> </a>
+<a name="ln1281">	if (fromAncestor == NULL) {</a>
+<a name="ln1282">		_EntryCreated(toEntryRef, nodeRef, isDirectory, false, true, NULL);</a>
+<a name="ln1283">		return;</a>
+<a name="ln1284">	}</a>
+<a name="ln1285"> </a>
+<a name="ln1286">	if (toAncestor == NULL) {</a>
+<a name="ln1287">		_EntryRemoved(fromEntryRef, nodeRef, false, true, NULL);</a>
+<a name="ln1288">		return;</a>
+<a name="ln1289">	}</a>
+<a name="ln1290"> </a>
+<a name="ln1291">	// An entry was moved in a true ancestor directory or between true ancestor</a>
+<a name="ln1292">	// directories. Unless the moved entry was or becomes our base ancestor, we</a>
+<a name="ln1293">	// let _EntryRemoved() and _EntryCreated() handle it.</a>
+<a name="ln1294">	bool fromIsBase = fromAncestor == fBaseAncestor-&gt;Parent()</a>
+<a name="ln1295">		&amp;&amp; strcmp(fromEntryRef.name, fBaseAncestor-&gt;Name()) == 0;</a>
+<a name="ln1296">	bool toIsBase = toAncestor == fBaseAncestor-&gt;Parent()</a>
+<a name="ln1297">		&amp;&amp; strcmp(toEntryRef.name, fBaseAncestor-&gt;Name()) == 0;</a>
+<a name="ln1298">	if (fromIsBase || toIsBase) {</a>
+<a name="ln1299">		// This might be a duplicate notification. Check whether our model</a>
+<a name="ln1300">		// already reflects the change. Otherwise stop/start watching the base</a>
+<a name="ln1301">		// ancestor as required.</a>
+<a name="ln1302">		bool notifyFilesRecursively = _WatchFilesOnly() &amp;&amp; isDirectory;</a>
+<a name="ln1303">		if (fromIsBase) {</a>
+<a name="ln1304">			if (!fBaseAncestor-&gt;Exists())</a>
+<a name="ln1305">				return;</a>
+<a name="ln1306">			_StopWatchingAncestors(fBaseAncestor, notifyFilesRecursively);</a>
+<a name="ln1307">		} else {</a>
+<a name="ln1308">			if (fBaseAncestor-&gt;Exists()) {</a>
+<a name="ln1309">				if (fBaseAncestor-&gt;NodeRef() == nodeRef</a>
+<a name="ln1310">					&amp;&amp; isDirectory == fBaseAncestor-&gt;IsDirectory()) {</a>
+<a name="ln1311">					return;</a>
+<a name="ln1312">				}</a>
+<a name="ln1313"> </a>
+<a name="ln1314">				// We're out of sync with reality.</a>
+<a name="ln1315">				_StopWatchingAncestors(fBaseAncestor, true);</a>
+<a name="ln1316">				_StartWatchingAncestors(fBaseAncestor, true);</a>
+<a name="ln1317">				return;</a>
+<a name="ln1318">			}</a>
+<a name="ln1319"> </a>
+<a name="ln1320">			_StartWatchingAncestors(fBaseAncestor, notifyFilesRecursively);</a>
+<a name="ln1321">		}</a>
+<a name="ln1322"> </a>
+<a name="ln1323">		if (!notifyFilesRecursively) {</a>
+<a name="ln1324">			_NotifyEntryMoved(fromEntryRef, toEntryRef, nodeRef,</a>
+<a name="ln1325">				fromIsBase ? fPath.String() : NULL,</a>
+<a name="ln1326">				toIsBase ? fPath.String() : NULL,</a>
+<a name="ln1327">				isDirectory, toIsBase, fromIsBase);</a>
+<a name="ln1328">		}</a>
+<a name="ln1329">		return;</a>
+<a name="ln1330">	}</a>
+<a name="ln1331"> </a>
+<a name="ln1332">	_EntryRemoved(fromEntryRef, nodeRef, false, true, NULL);</a>
+<a name="ln1333">	_EntryCreated(toEntryRef, nodeRef, isDirectory, false, true, NULL);</a>
+<a name="ln1334">}</a>
+<a name="ln1335"> </a>
+<a name="ln1336"> </a>
+<a name="ln1337">void</a>
+<a name="ln1338">PathHandler::_NodeChanged(BMessage* message)</a>
+<a name="ln1339">{</a>
+<a name="ln1340">	node_ref nodeRef;</a>
+<a name="ln1341"> </a>
+<a name="ln1342">	if (message-&gt;FindInt32(&quot;device&quot;, &amp;nodeRef.device) != B_OK</a>
+<a name="ln1343">		|| message-&gt;FindInt64(&quot;node&quot;, &amp;nodeRef.node) != B_OK) {</a>
+<a name="ln1344">		return;</a>
+<a name="ln1345">	}</a>
+<a name="ln1346"> </a>
+<a name="ln1347">	TRACE(&quot;%p-&gt;PathHandler::_NodeChanged(): node: %&quot; B_PRIdDEV &quot;:%&quot; B_PRIdINO</a>
+<a name="ln1348">		&quot;, %s%s\n&quot;, this, nodeRef.device, nodeRef.node,</a>
+<a name="ln1349">			message-&gt;GetInt32(&quot;opcode&quot;, B_STAT_CHANGED) == B_ATTR_CHANGED</a>
+<a name="ln1350">				? &quot;attribute: &quot; : &quot;stat&quot;,</a>
+<a name="ln1351">			message-&gt;GetInt32(&quot;opcode&quot;, B_STAT_CHANGED) == B_ATTR_CHANGED</a>
+<a name="ln1352">				? message-&gt;GetString(&quot;attr&quot;, &quot;&quot;) : &quot;&quot;);</a>
+<a name="ln1353"> </a>
+<a name="ln1354">	bool isDirectory = false;</a>
+<a name="ln1355">	BString path;</a>
+<a name="ln1356">	if (Ancestor* ancestor = _GetAncestor(nodeRef)) {</a>
+<a name="ln1357">		if (ancestor != fBaseAncestor)</a>
+<a name="ln1358">			return;</a>
+<a name="ln1359">		isDirectory = ancestor-&gt;IsDirectory();</a>
+<a name="ln1360">		path = fPath;</a>
+<a name="ln1361">	} else if (Node* node = _GetNode(nodeRef)) {</a>
+<a name="ln1362">		isDirectory = node-&gt;IsDirectory();</a>
+<a name="ln1363">		path = _NodePath(node);</a>
+<a name="ln1364">	} else</a>
+<a name="ln1365">		return;</a>
+<a name="ln1366"> </a>
+<a name="ln1367">	if (isDirectory ? _WatchFilesOnly() : _WatchDirectoriesOnly())</a>
+<a name="ln1368">		return;</a>
+<a name="ln1369"> </a>
+<a name="ln1370">	_NotifyTarget(*message, path);</a>
+<a name="ln1371">}</a>
+<a name="ln1372"> </a>
+<a name="ln1373"> </a>
+<a name="ln1374">bool</a>
+<a name="ln1375">PathHandler::_EntryCreated(const NotOwningEntryRef&amp; entryRef,</a>
+<a name="ln1376">	const node_ref&amp; nodeRef, bool isDirectory, bool dryRun, bool notify,</a>
+<a name="ln1377">	Entry** _entry)</a>
+<a name="ln1378">{</a>
+<a name="ln1379">	if (_entry != NULL)</a>
+<a name="ln1380">		*_entry = NULL;</a>
+<a name="ln1381"> </a>
+<a name="ln1382">	Ancestor* ancestor = _GetAncestor(nodeRef);</a>
+<a name="ln1383">	if (ancestor != NULL) {</a>
+<a name="ln1384">		if (isDirectory == ancestor-&gt;IsDirectory()</a>
+<a name="ln1385">			&amp;&amp; entryRef == ancestor-&gt;EntryRef()) {</a>
+<a name="ln1386">			// just a duplicate notification</a>
+<a name="ln1387">			TRACE(&quot;  -&gt; we already know the ancestor\n&quot;);</a>
+<a name="ln1388">			return true;</a>
+<a name="ln1389">		}</a>
+<a name="ln1390"> </a>
+<a name="ln1391">		struct stat ancestorStat;</a>
+<a name="ln1392">		if (BEntry(&amp;ancestor-&gt;EntryRef()).GetStat(&amp;ancestorStat) == B_OK</a>
+<a name="ln1393">			&amp;&amp; node_ref(ancestorStat.st_dev, ancestorStat.st_ino)</a>
+<a name="ln1394">				== ancestor-&gt;NodeRef()</a>
+<a name="ln1395">			&amp;&amp; S_ISDIR(ancestorStat.st_mode) == ancestor-&gt;IsDirectory()) {</a>
+<a name="ln1396">			// Our information for the ancestor is up-to-date, so ignore the</a>
+<a name="ln1397">			// notification.</a>
+<a name="ln1398">			TRACE(&quot;  -&gt; we know a different ancestor, but our info is &quot;</a>
+<a name="ln1399">				&quot;up-to-date\n&quot;);</a>
+<a name="ln1400">			return true;</a>
+<a name="ln1401">		}</a>
+<a name="ln1402"> </a>
+<a name="ln1403">		// We're out of sync with reality.</a>
+<a name="ln1404">		TRACE(&quot;  -&gt; ancestor mismatch -&gt; resyncing\n&quot;);</a>
+<a name="ln1405">		if (!dryRun) {</a>
+<a name="ln1406">			_StopWatchingAncestors(ancestor, true);</a>
+<a name="ln1407">			_StartWatchingAncestors(ancestor, true);</a>
+<a name="ln1408">		}</a>
+<a name="ln1409">		return false;</a>
+<a name="ln1410">	}</a>
+<a name="ln1411"> </a>
+<a name="ln1412">	ancestor = _GetAncestor(entryRef.DirectoryNodeRef());</a>
+<a name="ln1413">	if (ancestor != NULL) {</a>
+<a name="ln1414">		if (ancestor != fBaseAncestor) {</a>
+<a name="ln1415">			// The directory is a true ancestor -- the notification is only of</a>
+<a name="ln1416">			// interest, if the entry matches the child ancestor.</a>
+<a name="ln1417">			Ancestor* childAncestor = ancestor-&gt;Child();</a>
+<a name="ln1418">			if (strcmp(entryRef.name, childAncestor-&gt;Name()) != 0) {</a>
+<a name="ln1419">				TRACE(&quot;  -&gt; not an ancestor entry we're interested in &quot;</a>
+<a name="ln1420">					&quot;(\&quot;%s\&quot;)\n&quot;, childAncestor-&gt;Name());</a>
+<a name="ln1421">				return true;</a>
+<a name="ln1422">			}</a>
+<a name="ln1423"> </a>
+<a name="ln1424">			if (!dryRun) {</a>
+<a name="ln1425">				if (childAncestor-&gt;Exists()) {</a>
+<a name="ln1426">					TRACE(&quot;  ancestor entry mismatch -&gt; resyncing\n&quot;);</a>
+<a name="ln1427">					// We're out of sync with reality -- the new entry refers to</a>
+<a name="ln1428">					// a different node.</a>
+<a name="ln1429">					_StopWatchingAncestors(childAncestor, true);</a>
+<a name="ln1430">				}</a>
+<a name="ln1431"> </a>
+<a name="ln1432">				TRACE(&quot;  -&gt; starting to watch newly appeared ancestor\n&quot;);</a>
+<a name="ln1433">				_StartWatchingAncestors(childAncestor, true);</a>
+<a name="ln1434">			}</a>
+<a name="ln1435">			return false;</a>
+<a name="ln1436">		}</a>
+<a name="ln1437"> </a>
+<a name="ln1438">		// The directory is our path. If watching recursively, just fall</a>
+<a name="ln1439">		// through. Otherwise, we want to pass on the notification, if directory</a>
+<a name="ln1440">		// watching is enabled.</a>
+<a name="ln1441">		if (!_WatchRecursively()) {</a>
+<a name="ln1442">			if ((fFlags &amp; B_WATCH_DIRECTORY) != 0) {</a>
+<a name="ln1443">				_NotifyEntryCreatedOrRemoved(entryRef, nodeRef,</a>
+<a name="ln1444">					make_path(fPath, entryRef.name), isDirectory,</a>
+<a name="ln1445">					B_ENTRY_CREATED);</a>
+<a name="ln1446">			}</a>
+<a name="ln1447">			return true;</a>
+<a name="ln1448">		}</a>
+<a name="ln1449">	}</a>
+<a name="ln1450"> </a>
+<a name="ln1451">	if (!_WatchRecursively()) {</a>
+<a name="ln1452">		// That shouldn't happen, since we only watch the ancestors in this</a>
+<a name="ln1453">		// case.</a>
+<a name="ln1454">		return true;</a>
+<a name="ln1455">	}</a>
+<a name="ln1456"> </a>
+<a name="ln1457">	Node* directoryNode = _GetNode(entryRef.DirectoryNodeRef());</a>
+<a name="ln1458">	if (directoryNode == NULL)</a>
+<a name="ln1459">		return true;</a>
+<a name="ln1460"> </a>
+<a name="ln1461">	Directory* directory = directoryNode-&gt;ToDirectory();</a>
+<a name="ln1462">	if (directory == NULL) {</a>
+<a name="ln1463">		// We're out of sync with reality.</a>
+<a name="ln1464">		if (!dryRun) {</a>
+<a name="ln1465">			if (Entry* nodeEntry = directory-&gt;FirstNodeEntry()) {</a>
+<a name="ln1466">				// remove the entry that is in the way and re-add the proper</a>
+<a name="ln1467">				// entry</a>
+<a name="ln1468">				NotOwningEntryRef directoryEntryRef = nodeEntry-&gt;EntryRef();</a>
+<a name="ln1469">				BString directoryName = nodeEntry-&gt;Name();</a>
+<a name="ln1470">				_DeleteEntry(nodeEntry, true);</a>
+<a name="ln1471">				_EntryCreated(directoryEntryRef, entryRef.DirectoryNodeRef(),</a>
+<a name="ln1472">					true, false, notify, NULL);</a>
+<a name="ln1473">			} else {</a>
+<a name="ln1474">				// It's either the base node or something's severely fishy.</a>
+<a name="ln1475">				// Resync the whole path.</a>
+<a name="ln1476">				_StopWatchingAncestors(fBaseAncestor, true);</a>
+<a name="ln1477">				_StartWatchingAncestors(fBaseAncestor, true);</a>
+<a name="ln1478">			}</a>
+<a name="ln1479">		}</a>
+<a name="ln1480"> </a>
+<a name="ln1481">		return false;</a>
+<a name="ln1482">	}</a>
+<a name="ln1483"> </a>
+<a name="ln1484">	// Check, if there's a colliding entry.</a>
+<a name="ln1485">	if (Entry* nodeEntry = directory-&gt;FindEntry(entryRef.name)) {</a>
+<a name="ln1486">		Node* entryNode = nodeEntry-&gt;Node();</a>
+<a name="ln1487">		if (entryNode != NULL &amp;&amp; entryNode-&gt;NodeRef() == nodeRef)</a>
+<a name="ln1488">			return true;</a>
+<a name="ln1489"> </a>
+<a name="ln1490">		// We're out of sync with reality -- the new entry refers to a different</a>
+<a name="ln1491">		// node.</a>
+<a name="ln1492">		_DeleteEntry(nodeEntry, true);</a>
+<a name="ln1493">	}</a>
+<a name="ln1494"> </a>
+<a name="ln1495">	if (dryRun)</a>
+<a name="ln1496">		return true;</a>
+<a name="ln1497"> </a>
+<a name="ln1498">	_AddEntryIfNeeded(directory, entryRef.name, nodeRef, isDirectory, notify,</a>
+<a name="ln1499">		_entry);</a>
+<a name="ln1500">	return true;</a>
+<a name="ln1501">}</a>
+<a name="ln1502"> </a>
+<a name="ln1503"> </a>
+<a name="ln1504">bool</a>
+<a name="ln1505">PathHandler::_EntryRemoved(const NotOwningEntryRef&amp; entryRef,</a>
+<a name="ln1506">	const node_ref&amp; nodeRef, bool dryRun, bool notify, Entry** _keepEntry)</a>
+<a name="ln1507">{</a>
+<a name="ln1508">	if (_keepEntry != NULL)</a>
+<a name="ln1509">		*_keepEntry = NULL;</a>
+<a name="ln1510"> </a>
+<a name="ln1511">	Ancestor* ancestor = _GetAncestor(nodeRef);</a>
+<a name="ln1512">	if (ancestor != NULL) {</a>
+<a name="ln1513">		// The node is an ancestor. If this is a true match, stop watching the</a>
+<a name="ln1514">		// ancestor.</a>
+<a name="ln1515">		if (!ancestor-&gt;Exists())</a>
+<a name="ln1516">			return true;</a>
+<a name="ln1517"> </a>
+<a name="ln1518">		if (entryRef != ancestor-&gt;EntryRef()) {</a>
+<a name="ln1519">			// We might be out of sync with reality -- the new entry refers to a</a>
+<a name="ln1520">			// different node.</a>
+<a name="ln1521">			struct stat ancestorStat;</a>
+<a name="ln1522">			if (BEntry(&amp;ancestor-&gt;EntryRef()).GetStat(&amp;ancestorStat) != B_OK) {</a>
+<a name="ln1523">				if (!dryRun)</a>
+<a name="ln1524">					_StopWatchingAncestors(ancestor, true);</a>
+<a name="ln1525">				return false;</a>
+<a name="ln1526">			}</a>
+<a name="ln1527"> </a>
+<a name="ln1528">			if (node_ref(ancestorStat.st_dev, ancestorStat.st_ino)</a>
+<a name="ln1529">					!= ancestor-&gt;NodeRef()</a>
+<a name="ln1530">				|| S_ISDIR(ancestorStat.st_mode) != ancestor-&gt;IsDirectory()) {</a>
+<a name="ln1531">				if (!dryRun) {</a>
+<a name="ln1532">					_StopWatchingAncestors(ancestor, true);</a>
+<a name="ln1533">					_StartWatchingAncestors(ancestor, true);</a>
+<a name="ln1534">				}</a>
+<a name="ln1535">				return false;</a>
+<a name="ln1536">			}</a>
+<a name="ln1537">			return true;</a>
+<a name="ln1538">		}</a>
+<a name="ln1539"> </a>
+<a name="ln1540">		if (!dryRun)</a>
+<a name="ln1541">			_StopWatchingAncestors(ancestor, true);</a>
+<a name="ln1542">		return false;</a>
+<a name="ln1543">	}</a>
+<a name="ln1544"> </a>
+<a name="ln1545">	ancestor = _GetAncestor(entryRef.DirectoryNodeRef());</a>
+<a name="ln1546">	if (ancestor != NULL) {</a>
+<a name="ln1547">		if (ancestor != fBaseAncestor) {</a>
+<a name="ln1548">			// The directory is a true ancestor -- the notification cannot be</a>
+<a name="ln1549">			// of interest, since the node didn't match a known ancestor.</a>
+<a name="ln1550">			return true;</a>
+<a name="ln1551">		}</a>
+<a name="ln1552"> </a>
+<a name="ln1553">		// The directory is our path. If watching recursively, just fall</a>
+<a name="ln1554">		// through. Otherwise, we want to pass on the notification, if directory</a>
+<a name="ln1555">		// watching is enabled.</a>
+<a name="ln1556">		if (!_WatchRecursively()) {</a>
+<a name="ln1557">			if (notify &amp;&amp; (fFlags &amp; B_WATCH_DIRECTORY) != 0) {</a>
+<a name="ln1558">				_NotifyEntryCreatedOrRemoved(entryRef, nodeRef,</a>
+<a name="ln1559">					make_path(fPath, entryRef.name), false, B_ENTRY_REMOVED);</a>
+<a name="ln1560">					// We don't know whether this was a directory, but it</a>
+<a name="ln1561">					// doesn't matter in this case.</a>
+<a name="ln1562">			}</a>
+<a name="ln1563">			return true;</a>
+<a name="ln1564">		}</a>
+<a name="ln1565">	}</a>
+<a name="ln1566"> </a>
+<a name="ln1567">	if (!_WatchRecursively()) {</a>
+<a name="ln1568">		// That shouldn't happen, since we only watch the ancestors in this</a>
+<a name="ln1569">		// case.</a>
+<a name="ln1570">		return true;</a>
+<a name="ln1571">	}</a>
+<a name="ln1572"> </a>
+<a name="ln1573">	Node* directoryNode = _GetNode(entryRef.DirectoryNodeRef());</a>
+<a name="ln1574">	if (directoryNode == NULL) {</a>
+<a name="ln1575">		// We shouldn't get a notification, if we don't known the directory.</a>
+<a name="ln1576">		return true;</a>
+<a name="ln1577">	}</a>
+<a name="ln1578"> </a>
+<a name="ln1579">	Directory* directory = directoryNode-&gt;ToDirectory();</a>
+<a name="ln1580">	if (directory == NULL) {</a>
+<a name="ln1581">		// We might be out of sync with reality or the notification is just</a>
+<a name="ln1582">		// late. The former case is extremely unlikely (we are watching the node</a>
+<a name="ln1583">		// and its parent directory after all) and rather hard to verify.</a>
+<a name="ln1584">		return true;</a>
+<a name="ln1585">	}</a>
+<a name="ln1586"> </a>
+<a name="ln1587">	Entry* nodeEntry = directory-&gt;FindEntry(entryRef.name);</a>
+<a name="ln1588">	if (nodeEntry == NULL) {</a>
+<a name="ln1589">		// might be a non-directory node while we're in directories-only mode</a>
+<a name="ln1590">		return true;</a>
+<a name="ln1591">	}</a>
+<a name="ln1592"> </a>
+<a name="ln1593">	if (!dryRun) {</a>
+<a name="ln1594">		if (_keepEntry != NULL)</a>
+<a name="ln1595">			*_keepEntry = nodeEntry;</a>
+<a name="ln1596">		else</a>
+<a name="ln1597">			_DeleteEntry(nodeEntry, notify);</a>
+<a name="ln1598">	}</a>
+<a name="ln1599">	return true;</a>
+<a name="ln1600">}</a>
+<a name="ln1601"> </a>
+<a name="ln1602"> </a>
+<a name="ln1603">bool</a>
+<a name="ln1604">PathHandler::_CheckDuplicateEntryNotification(int32 opcode,</a>
+<a name="ln1605">	const entry_ref&amp; toEntryRef, const node_ref&amp; nodeRef,</a>
+<a name="ln1606">	const entry_ref* fromEntryRef)</a>
+<a name="ln1607">{</a>
+<a name="ln1608">	if (opcode == fDuplicateEntryNotificationOpcode</a>
+<a name="ln1609">		&amp;&amp; nodeRef == fDuplicateEntryNotificationNodeRef</a>
+<a name="ln1610">		&amp;&amp; toEntryRef == fDuplicateEntryNotificationToEntryRef</a>
+<a name="ln1611">		&amp;&amp; (fromEntryRef == NULL</a>
+<a name="ln1612">			|| *fromEntryRef == fDuplicateEntryNotificationFromEntryRef)) {</a>
+<a name="ln1613">		return true;</a>
+<a name="ln1614">	}</a>
+<a name="ln1615"> </a>
+<a name="ln1616">	fDuplicateEntryNotificationOpcode = opcode;</a>
+<a name="ln1617">	fDuplicateEntryNotificationNodeRef = nodeRef;</a>
+<a name="ln1618">	fDuplicateEntryNotificationToEntryRef = toEntryRef;</a>
+<a name="ln1619">	fDuplicateEntryNotificationFromEntryRef = fromEntryRef != NULL</a>
+<a name="ln1620">		? *fromEntryRef : entry_ref();</a>
+<a name="ln1621">	return false;</a>
+<a name="ln1622">}</a>
+<a name="ln1623"> </a>
+<a name="ln1624"> </a>
+<a name="ln1625">void</a>
+<a name="ln1626">PathHandler::_UnsetDuplicateEntryNotification()</a>
+<a name="ln1627">{</a>
+<a name="ln1628">	fDuplicateEntryNotificationOpcode = B_STAT_CHANGED;</a>
+<a name="ln1629">	fDuplicateEntryNotificationNodeRef = node_ref();</a>
+<a name="ln1630">	fDuplicateEntryNotificationFromEntryRef = entry_ref();</a>
+<a name="ln1631">	fDuplicateEntryNotificationToEntryRef = entry_ref();</a>
+<a name="ln1632">}</a>
+<a name="ln1633"> </a>
+<a name="ln1634"> </a>
+<a name="ln1635">Ancestor*</a>
+<a name="ln1636">PathHandler::_GetAncestor(const node_ref&amp; nodeRef) const</a>
+<a name="ln1637">{</a>
+<a name="ln1638">	return fAncestors.Lookup(nodeRef);</a>
+<a name="ln1639">}</a>
+<a name="ln1640"> </a>
+<a name="ln1641"> </a>
+<a name="ln1642">status_t</a>
+<a name="ln1643">PathHandler::_AddNode(const node_ref&amp; nodeRef, bool isDirectory, bool notify,</a>
+<a name="ln1644">	Entry* entry, Node** _node)</a>
+<a name="ln1645">{</a>
+<a name="ln1646">	TRACE(&quot;%p-&gt;PathHandler::_AddNode(%&quot; B_PRIdDEV &quot;:%&quot; B_PRIdINO</a>
+<a name="ln1647">		&quot;, isDirectory: %d, notify: %d)\n&quot;, this, nodeRef.device, nodeRef.node,</a>
+<a name="ln1648">		isDirectory, notify);</a>
+<a name="ln1649"> </a>
+<a name="ln1650">	// If hard links are supported, we may already know the node.</a>
+<a name="ln1651">	Node* node = _GetNode(nodeRef);</a>
+<a name="ln1652">	if (node != NULL) {</a>
+<a name="ln1653">		if (entry != NULL) {</a>
+<a name="ln1654">			entry-&gt;SetNode(node);</a>
+<a name="ln1655">			node-&gt;AddNodeEntry(entry);</a>
+<a name="ln1656">		}</a>
+<a name="ln1657"> </a>
+<a name="ln1658">		if (_node != NULL)</a>
+<a name="ln1659">			*_node = node;</a>
+<a name="ln1660">		return B_OK;</a>
+<a name="ln1661">	}</a>
+<a name="ln1662"> </a>
+<a name="ln1663">	// create the node</a>
+<a name="ln1664">	Directory* directoryNode = NULL;</a>
+<a name="ln1665">	if (isDirectory)</a>
+<a name="ln1666">		node = directoryNode = Directory::Create(nodeRef);</a>
+<a name="ln1667">	else</a>
+<a name="ln1668">		node = new(std::nothrow) Node(nodeRef);</a>
+<a name="ln1669"> </a>
+<a name="ln1670">	if (node == NULL)</a>
+<a name="ln1671">		return B_NO_MEMORY;</a>
+<a name="ln1672"> </a>
+<a name="ln1673">	ObjectDeleter&lt;Node&gt; nodeDeleter(node);</a>
+<a name="ln1674"> </a>
+<a name="ln1675">	// start watching (don't do that for the base node, since we watch it</a>
+<a name="ln1676">	// already via fBaseAncestor)</a>
+<a name="ln1677">	if (nodeRef != fBaseAncestor-&gt;NodeRef()) {</a>
+<a name="ln1678">		uint32 flags = (fFlags &amp; WATCH_NODE_FLAG_MASK) | B_WATCH_DIRECTORY;</a>
+<a name="ln1679">		status_t error = sWatchingInterface-&gt;WatchNode(&amp;nodeRef, flags, this);</a>
+<a name="ln1680">		if (error != B_OK)</a>
+<a name="ln1681">			return error;</a>
+<a name="ln1682">	}</a>
+<a name="ln1683"> </a>
+<a name="ln1684">	fNodes.Insert(nodeDeleter.Detach());</a>
+<a name="ln1685"> </a>
+<a name="ln1686">	if (entry != NULL) {</a>
+<a name="ln1687">		entry-&gt;SetNode(node);</a>
+<a name="ln1688">		node-&gt;AddNodeEntry(entry);</a>
+<a name="ln1689">	}</a>
+<a name="ln1690"> </a>
+<a name="ln1691">	if (_node != NULL)</a>
+<a name="ln1692">		*_node = node;</a>
+<a name="ln1693"> </a>
+<a name="ln1694">	if (!isDirectory)</a>
+<a name="ln1695">		return B_OK;</a>
+<a name="ln1696"> </a>
+<a name="ln1697">	// recursively add the directory's descendents</a>
+<a name="ln1698">	BDirectory directory;</a>
+<a name="ln1699">	if (directory.SetTo(&amp;nodeRef) != B_OK) {</a>
+<a name="ln1700">		if (_node != NULL)</a>
+<a name="ln1701">			*_node = node;</a>
+<a name="ln1702">		return B_OK;</a>
+<a name="ln1703">	}</a>
+<a name="ln1704"> </a>
+<a name="ln1705">	entry_ref entryRef;</a>
+<a name="ln1706">	while (directory.GetNextRef(&amp;entryRef) == B_OK) {</a>
+<a name="ln1707">		struct stat st;</a>
+<a name="ln1708">		if (BEntry(&amp;entryRef).GetStat(&amp;st) != B_OK)</a>
+<a name="ln1709">			continue;</a>
+<a name="ln1710"> </a>
+<a name="ln1711">		bool isDirectory = S_ISDIR(st.st_mode);</a>
+<a name="ln1712">		status_t error = _AddEntryIfNeeded(directoryNode, entryRef.name,</a>
+<a name="ln1713">			node_ref(st.st_dev, st.st_ino), isDirectory, notify);</a>
+<a name="ln1714">		if (error != B_OK) {</a>
+<a name="ln1715">			TRACE(&quot;%p-&gt;PathHandler::_AddNode(%&quot; B_PRIdDEV &quot;:%&quot; B_PRIdINO</a>
+<a name="ln1716">				&quot;, isDirectory: %d, notify: %d): failed to add directory &quot;</a>
+<a name="ln1717">				&quot;entry: \&quot;%s\&quot;\n&quot;, this, nodeRef.device, nodeRef.node,</a>
+<a name="ln1718">				isDirectory, notify, entryRef.name);</a>
+<a name="ln1719">			continue;</a>
+<a name="ln1720">		}</a>
+<a name="ln1721">	}</a>
+<a name="ln1722"> </a>
+<a name="ln1723">	return B_OK;</a>
+<a name="ln1724">}</a>
+<a name="ln1725"> </a>
+<a name="ln1726"> </a>
+<a name="ln1727">void</a>
+<a name="ln1728">PathHandler::_DeleteNode(Node* node, bool notify)</a>
+<a name="ln1729">{</a>
+<a name="ln1730">	if (Directory* directory = node-&gt;ToDirectory()) {</a>
+<a name="ln1731">		Entry* entry = directory-&gt;RemoveAllEntries();</a>
+<a name="ln1732">		while (entry != NULL) {</a>
+<a name="ln1733">			Entry* nextEntry = entry-&gt;HashNext();</a>
+<a name="ln1734">			_DeleteEntryAlreadyRemovedFromParent(entry, notify);</a>
+<a name="ln1735">			entry = nextEntry;</a>
+<a name="ln1736">		}</a>
+<a name="ln1737">	}</a>
+<a name="ln1738"> </a>
+<a name="ln1739">	if (node-&gt;NodeRef() != fBaseAncestor-&gt;NodeRef())</a>
+<a name="ln1740">		sWatchingInterface-&gt;WatchNode(&amp;node-&gt;NodeRef(), B_STOP_WATCHING, this);</a>
+<a name="ln1741"> </a>
+<a name="ln1742">	fNodes.Remove(node);</a>
+<a name="ln1743">	delete node;</a>
+<a name="ln1744">}</a>
+<a name="ln1745"> </a>
+<a name="ln1746"> </a>
+<a name="ln1747">Node*</a>
+<a name="ln1748">PathHandler::_GetNode(const node_ref&amp; nodeRef) const</a>
+<a name="ln1749">{</a>
+<a name="ln1750">	return fNodes.Lookup(nodeRef);</a>
+<a name="ln1751">}</a>
+<a name="ln1752"> </a>
+<a name="ln1753"> </a>
+<a name="ln1754">status_t</a>
+<a name="ln1755">PathHandler::_AddEntryIfNeeded(Directory* directory, const char* name,</a>
+<a name="ln1756">	const node_ref&amp; nodeRef, bool isDirectory, bool notify,</a>
+<a name="ln1757">	Entry** _entry)</a>
+<a name="ln1758">{</a>
+<a name="ln1759">	TRACE(&quot;%p-&gt;PathHandler::_AddEntryIfNeeded(%&quot; B_PRIdDEV &quot;:%&quot; B_PRIdINO</a>
+<a name="ln1760">		&quot;:\&quot;%s\&quot;, %&quot; B_PRIdDEV &quot;:%&quot; B_PRIdINO</a>
+<a name="ln1761">		&quot;, isDirectory: %d, notify: %d)\n&quot;, this, directory-&gt;NodeRef().device,</a>
+<a name="ln1762">		directory-&gt;NodeRef().node, name, nodeRef.device, nodeRef.node,</a>
+<a name="ln1763">		isDirectory, notify);</a>
+<a name="ln1764"> </a>
+<a name="ln1765">	if (!isDirectory &amp;&amp; _WatchDirectoriesOnly()) {</a>
+<a name="ln1766">		if (_entry != NULL)</a>
+<a name="ln1767">			*_entry = NULL;</a>
+<a name="ln1768">		return B_OK;</a>
+<a name="ln1769">	}</a>
+<a name="ln1770"> </a>
+<a name="ln1771">	Entry* entry = directory-&gt;CreateEntry(name, NULL);</a>
+<a name="ln1772">	if (entry == NULL)</a>
+<a name="ln1773">		return B_NO_MEMORY;</a>
+<a name="ln1774"> </a>
+<a name="ln1775">	status_t error = _AddNode(nodeRef, isDirectory, notify &amp;&amp; _WatchFilesOnly(),</a>
+<a name="ln1776">		entry);</a>
+<a name="ln1777">	if (error != B_OK) {</a>
+<a name="ln1778">		directory-&gt;RemoveEntry(entry);</a>
+<a name="ln1779">		delete entry;</a>
+<a name="ln1780">		return error;</a>
+<a name="ln1781">	}</a>
+<a name="ln1782"> </a>
+<a name="ln1783">	if (notify)</a>
+<a name="ln1784">		_NotifyEntryCreatedOrRemoved(entry, B_ENTRY_CREATED);</a>
+<a name="ln1785"> </a>
+<a name="ln1786">	if (_entry != NULL)</a>
+<a name="ln1787">		*_entry = entry;</a>
+<a name="ln1788">	return B_OK;</a>
+<a name="ln1789">}</a>
+<a name="ln1790"> </a>
+<a name="ln1791"> </a>
+<a name="ln1792">void</a>
+<a name="ln1793">PathHandler::_DeleteEntry(Entry* entry, bool notify)</a>
+<a name="ln1794">{</a>
+<a name="ln1795">	entry-&gt;Parent()-&gt;RemoveEntry(entry);</a>
+<a name="ln1796">	_DeleteEntryAlreadyRemovedFromParent(entry, notify);</a>
+<a name="ln1797">}</a>
+<a name="ln1798"> </a>
+<a name="ln1799"> </a>
+<a name="ln1800">void</a>
+<a name="ln1801">PathHandler::_DeleteEntryAlreadyRemovedFromParent(Entry* entry, bool notify)</a>
+<a name="ln1802">{</a>
+<a name="ln1803">	if (notify)</a>
+<a name="ln1804">		_NotifyEntryCreatedOrRemoved(entry, B_ENTRY_REMOVED);</a>
+<a name="ln1805"> </a>
+<a name="ln1806">	Node* node = entry-&gt;Node();</a>
+<a name="ln1807">	if (node-&gt;IsOnlyNodeEntry(entry))</a>
+<a name="ln1808">		_DeleteNode(node, notify &amp;&amp; _WatchFilesOnly());</a>
+<a name="ln1809"> </a>
+<a name="ln1810">	delete entry;</a>
+<a name="ln1811">}</a>
+<a name="ln1812"> </a>
+<a name="ln1813"> </a>
+<a name="ln1814">void</a>
+<a name="ln1815">PathHandler::_NotifyFilesCreatedOrRemoved(Entry* entry, int32 opcode) const</a>
+<a name="ln1816">{</a>
+<a name="ln1817">	Directory* directory = entry-&gt;Node()-&gt;ToDirectory();</a>
+<a name="ln1818">	if (directory == NULL) {</a>
+<a name="ln1819">		_NotifyEntryCreatedOrRemoved(entry, opcode);</a>
+<a name="ln1820">		return;</a>
+<a name="ln1821">	}</a>
+<a name="ln1822"> </a>
+<a name="ln1823">	for (EntryMap::Iterator it = directory-&gt;GetEntryIterator(); it.HasNext();)</a>
+<a name="ln1824">		_NotifyFilesCreatedOrRemoved(it.Next(), opcode);</a>
+<a name="ln1825">}</a>
+<a name="ln1826"> </a>
+<a name="ln1827"> </a>
+<a name="ln1828">void</a>
+<a name="ln1829">PathHandler::_NotifyEntryCreatedOrRemoved(Entry* entry, int32 opcode) const</a>
+<a name="ln1830">{</a>
+<a name="ln1831">	Node* node = entry-&gt;Node();</a>
+<a name="ln1832">	_NotifyEntryCreatedOrRemoved(</a>
+<a name="ln1833">		NotOwningEntryRef(entry-&gt;Parent()-&gt;NodeRef(), entry-&gt;Name()),</a>
+<a name="ln1834">		node-&gt;NodeRef(), _EntryPath(entry), node-&gt;IsDirectory(), opcode);</a>
+<a name="ln1835">}</a>
+<a name="ln1836"> </a>
+<a name="ln1837"> </a>
+<a name="ln1838">void</a>
+<a name="ln1839">PathHandler::_NotifyEntryCreatedOrRemoved(const entry_ref&amp; entryRef,</a>
+<a name="ln1840">	const node_ref&amp; nodeRef, const char* path, bool isDirectory, int32 opcode)</a>
+<a name="ln1841">	const</a>
+<a name="ln1842">{</a>
+<a name="ln1843">	if (isDirectory ? _WatchFilesOnly() : _WatchDirectoriesOnly())</a>
+<a name="ln1844">		return;</a>
+<a name="ln1845"> </a>
+<a name="ln1846">	TRACE(&quot;%p-&gt;PathHandler::_NotifyEntryCreatedOrRemoved(): entry %s: %&quot;</a>
+<a name="ln1847">		B_PRIdDEV &quot;:%&quot; B_PRIdINO &quot;:\&quot;%s\&quot;, node: %&quot; B_PRIdDEV &quot;:%&quot; B_PRIdINO</a>
+<a name="ln1848">		&quot;\n&quot;, this, opcode == B_ENTRY_CREATED ? &quot;created&quot; : &quot;removed&quot;,</a>
+<a name="ln1849">		entryRef.device, entryRef.directory, entryRef.name, nodeRef.device,</a>
+<a name="ln1850">		nodeRef.node);</a>
+<a name="ln1851"> </a>
+<a name="ln1852">	BMessage message(B_PATH_MONITOR);</a>
+<a name="ln1853">	message.AddInt32(&quot;opcode&quot;, opcode);</a>
+<a name="ln1854">	message.AddInt32(&quot;device&quot;, entryRef.device);</a>
+<a name="ln1855">	message.AddInt64(&quot;directory&quot;, entryRef.directory);</a>
+<a name="ln1856">	message.AddInt32(&quot;node device&quot;, nodeRef.device);</a>
+<a name="ln1857">		// This field is not in a usual node monitoring message, since the node</a>
+<a name="ln1858">		// the created/removed entry refers to always belongs to the same FS as</a>
+<a name="ln1859">		// the directory, as another FS cannot yet/no longer be mounted there.</a>
+<a name="ln1860">		// In our case, however, this can very well be the case, e.g. when the</a>
+<a name="ln1861">		// the notification is triggered in response to a directory tree having</a>
+<a name="ln1862">		// been moved into/out of our path.</a>
+<a name="ln1863">	message.AddInt64(&quot;node&quot;, nodeRef.node);</a>
+<a name="ln1864">	message.AddString(&quot;name&quot;, entryRef.name);</a>
+<a name="ln1865"> </a>
+<a name="ln1866">	_NotifyTarget(message, path);</a>
+<a name="ln1867">}</a>
+<a name="ln1868"> </a>
+<a name="ln1869"> </a>
+<a name="ln1870">void</a>
+<a name="ln1871">PathHandler::_NotifyEntryMoved(const entry_ref&amp; fromEntryRef,</a>
+<a name="ln1872">	const entry_ref&amp; toEntryRef, const node_ref&amp; nodeRef, const char* fromPath,</a>
+<a name="ln1873">	const char* path, bool isDirectory, bool wasAdded, bool wasRemoved) const</a>
+<a name="ln1874">{</a>
+<a name="ln1875">	if ((isDirectory &amp;&amp; _WatchFilesOnly())</a>
+<a name="ln1876">		|| (!isDirectory &amp;&amp; _WatchDirectoriesOnly())) {</a>
+<a name="ln1877">		return;</a>
+<a name="ln1878">	}</a>
+<a name="ln1879"> </a>
+<a name="ln1880">	TRACE(&quot;%p-&gt;PathHandler::_NotifyEntryMoved(): entry: %&quot; B_PRIdDEV &quot;:%&quot;</a>
+<a name="ln1881">		B_PRIdINO &quot;:\&quot;%s\&quot; -&gt; %&quot; B_PRIdDEV &quot;:%&quot; B_PRIdINO &quot;:\&quot;%s\&quot;, node: %&quot;</a>
+<a name="ln1882">		B_PRIdDEV &quot;:%&quot; B_PRIdINO &quot;\n&quot;, this, fromEntryRef.device,</a>
+<a name="ln1883">		fromEntryRef.directory, fromEntryRef.name, toEntryRef.device,</a>
+<a name="ln1884">		toEntryRef.directory, toEntryRef.name, nodeRef.device, nodeRef.node);</a>
+<a name="ln1885"> </a>
+<a name="ln1886">	BMessage message(B_PATH_MONITOR);</a>
+<a name="ln1887">	message.AddInt32(&quot;opcode&quot;, B_ENTRY_MOVED);</a>
+<a name="ln1888">	message.AddInt32(&quot;device&quot;, fromEntryRef.device);</a>
+<a name="ln1889">	message.AddInt64(&quot;from directory&quot;, fromEntryRef.directory);</a>
+<a name="ln1890">	message.AddInt64(&quot;to directory&quot;, toEntryRef.directory);</a>
+<a name="ln1891">	message.AddInt32(&quot;node device&quot;, nodeRef.device);</a>
+<a name="ln1892">	message.AddInt64(&quot;node&quot;, nodeRef.node);</a>
+<a name="ln1893">	message.AddString(&quot;from name&quot;, fromEntryRef.name);</a>
+<a name="ln1894">	message.AddString(&quot;name&quot;, toEntryRef.name);</a>
+<a name="ln1895"> </a>
+<a name="ln1896">	if (wasAdded)</a>
+<a name="ln1897">		message.AddBool(&quot;added&quot;, true);</a>
+<a name="ln1898">	if (wasRemoved)</a>
+<a name="ln1899">		message.AddBool(&quot;removed&quot;, true);</a>
+<a name="ln1900"> </a>
+<a name="ln1901">	if (fromPath != NULL &amp;&amp; fromPath[0] != '\0')</a>
+<a name="ln1902">		message.AddString(&quot;from path&quot;, fromPath);</a>
+<a name="ln1903"> </a>
+<a name="ln1904">	_NotifyTarget(message, path);</a>
+<a name="ln1905">}</a>
+<a name="ln1906"> </a>
+<a name="ln1907"> </a>
+<a name="ln1908">void</a>
+<a name="ln1909">PathHandler::_NotifyTarget(BMessage&amp; message, const char* path) const</a>
+<a name="ln1910">{</a>
+<a name="ln1911">	message.what = B_PATH_MONITOR;</a>
+<a name="ln1912">	if (path != NULL &amp;&amp; path[0] != '\0')</a>
+<a name="ln1913">		message.AddString(&quot;path&quot;, path);</a>
+<a name="ln1914">	message.AddString(&quot;watched_path&quot;, fPath.String());</a>
+<a name="ln1915">	fTarget.SendMessage(&amp;message);</a>
+<a name="ln1916">}</a>
+<a name="ln1917"> </a>
+<a name="ln1918"> </a>
+<a name="ln1919"> </a>
+<a name="ln1920">BString</a>
+<a name="ln1921">PathHandler::_NodePath(const Node* node) const</a>
+<a name="ln1922">{</a>
+<a name="ln1923">	if (Entry* entry = node-&gt;FirstNodeEntry())</a>
+<a name="ln1924">		return _EntryPath(entry);</a>
+<a name="ln1925">	return node == fBaseNode ? fPath : BString();</a>
+<a name="ln1926">}</a>
+<a name="ln1927"> </a>
+<a name="ln1928"> </a>
+<a name="ln1929">BString</a>
+<a name="ln1930">PathHandler::_EntryPath(const Entry* entry) const</a>
+<a name="ln1931">{</a>
+<a name="ln1932">	return make_path(_NodePath(entry-&gt;Parent()), entry-&gt;Name());</a>
+<a name="ln1933">}</a>
+<a name="ln1934"> </a>
+<a name="ln1935"> </a>
+<a name="ln1936">bool</a>
+<a name="ln1937">PathHandler::_WatchRecursively() const</a>
+<a name="ln1938">{</a>
+<a name="ln1939">	return (fFlags &amp; B_WATCH_RECURSIVELY) != 0;</a>
+<a name="ln1940">}</a>
+<a name="ln1941"> </a>
+<a name="ln1942"> </a>
+<a name="ln1943">bool</a>
+<a name="ln1944">PathHandler::_WatchFilesOnly() const</a>
+<a name="ln1945">{</a>
+<a name="ln1946">	return (fFlags &amp; B_WATCH_FILES_ONLY) != 0;</a>
+<a name="ln1947">}</a>
+<a name="ln1948"> </a>
+<a name="ln1949"> </a>
+<a name="ln1950">bool</a>
+<a name="ln1951">PathHandler::_WatchDirectoriesOnly() const</a>
+<a name="ln1952">{</a>
+<a name="ln1953">	return (fFlags &amp; B_WATCH_DIRECTORIES_ONLY) != 0;</a>
+<a name="ln1954">}</a>
+<a name="ln1955"> </a>
+<a name="ln1956"> </a>
+<a name="ln1957">} // namespace</a>
+<a name="ln1958"> </a>
+<a name="ln1959"> </a>
+<a name="ln1960">//	#pragma mark - BPathMonitor</a>
+<a name="ln1961"> </a>
+<a name="ln1962"> </a>
+<a name="ln1963">namespace BPrivate {</a>
+<a name="ln1964"> </a>
+<a name="ln1965"> </a>
+<a name="ln1966">BPathMonitor::BPathMonitor()</a>
+<a name="ln1967">{</a>
+<a name="ln1968">}</a>
+<a name="ln1969"> </a>
+<a name="ln1970"> </a>
+<a name="ln1971">BPathMonitor::~BPathMonitor()</a>
+<a name="ln1972">{</a>
+<a name="ln1973">}</a>
+<a name="ln1974"> </a>
+<a name="ln1975"> </a>
+<a name="ln1976">/*static*/ status_t</a>
+<a name="ln1977">BPathMonitor::StartWatching(const char* path, uint32 flags,</a>
+<a name="ln1978">	const BMessenger&amp; target)</a>
+<a name="ln1979">{</a>
+<a name="ln1980">	TRACE(&quot;BPathMonitor::StartWatching(%s, %&quot; B_PRIx32 &quot;)\n&quot;, path, flags);</a>
+<a name="ln1981"> </a>
+<a name="ln1982">	if (path == NULL || path[0] == '\0')</a>
+<a name="ln1983">		return B_BAD_VALUE;</a>
+<a name="ln1984"> </a>
+<a name="ln1985">	// B_WATCH_FILES_ONLY and B_WATCH_DIRECTORIES_ONLY are mutual exclusive</a>
+<a name="ln1986">	if ((flags &amp; B_WATCH_FILES_ONLY) != 0</a>
+<a name="ln1987">		&amp;&amp; (flags &amp; B_WATCH_DIRECTORIES_ONLY) != 0) {</a>
+<a name="ln1988">		return B_BAD_VALUE;</a>
+<a name="ln1989">	}</a>
+<a name="ln1990"> </a>
+<a name="ln1991">	status_t status = _InitIfNeeded();</a>
+<a name="ln1992">	if (status != B_OK)</a>
+<a name="ln1993">		return status;</a>
+<a name="ln1994"> </a>
+<a name="ln1995">	BAutolock _(sLooper);</a>
+<a name="ln1996"> </a>
+<a name="ln1997">	Watcher* watcher = sWatchers-&gt;Lookup(target);</a>
+<a name="ln1998">	bool newWatcher = false;</a>
+<a name="ln1999">	if (watcher != NULL) {</a>
+<a name="ln2000">		// If there's already a handler for the path, we'll replace it, but</a>
+<a name="ln2001">		// add its flags.</a>
+<a name="ln2002">		if (PathHandler* handler = watcher-&gt;Lookup(path)) {</a>
+<a name="ln2003">			// keep old flags save for conflicting mutually exclusive ones</a>
+<a name="ln2004">			uint32 oldFlags = handler-&gt;Flags();</a>
+<a name="ln2005">			const uint32 kMutuallyExclusiveFlags</a>
+<a name="ln2006">				= B_WATCH_FILES_ONLY | B_WATCH_DIRECTORIES_ONLY;</a>
+<a name="ln2007">			if ((flags &amp; kMutuallyExclusiveFlags) != 0)</a>
+<a name="ln2008">				oldFlags &amp;= ~(uint32)kMutuallyExclusiveFlags;</a>
+<a name="ln2009">			flags |= oldFlags;</a>
+<a name="ln2010"> </a>
+<a name="ln2011">			watcher-&gt;Remove(handler);</a>
+<a name="ln2012">			handler-&gt;Quit();</a>
+<a name="ln2013">		}</a>
+<a name="ln2014">	} else {</a>
+<a name="ln2015">		watcher = Watcher::Create(target);</a>
+<a name="ln2016">		if (watcher == NULL)</a>
+<a name="ln2017">			return B_NO_MEMORY;</a>
+<a name="ln2018">		sWatchers-&gt;Insert(watcher);</a>
+<a name="ln2019">		newWatcher = true;</a>
+<a name="ln2020">	}</a>
+<a name="ln2021"> </a>
+<a name="ln2022">	PathHandler* handler = new (std::nothrow) PathHandler(path, flags, target,</a>
+<a name="ln2023">		sLooper);</a>
+<a name="ln2024">	status = handler != NULL ? handler-&gt;InitCheck() : B_NO_MEMORY;</a>
+<a name="ln2025"> </a>
+<a name="ln2026">	if (status != B_OK) {</a>
+<a name="ln2027">		if (handler != NULL)</a>
+<a name="ln2028">			handler-&gt;Quit();</a>
+<a name="ln2029"> </a>
+<a name="ln2030">		if (newWatcher) {</a>
+<a name="ln2031">			sWatchers-&gt;Remove(watcher);</a>
+<a name="ln2032">			delete watcher;</a>
+<a name="ln2033">		}</a>
+<a name="ln2034">		return status;</a>
+<a name="ln2035">	}</a>
+<a name="ln2036"> </a>
+<a name="ln2037">	watcher-&gt;Insert(handler);</a>
+<a name="ln2038">	return B_OK;</a>
+<a name="ln2039">}</a>
+<a name="ln2040"> </a>
+<a name="ln2041"> </a>
+<a name="ln2042">/*static*/ status_t</a>
+<a name="ln2043">BPathMonitor::StopWatching(const char* path, const BMessenger&amp; target)</a>
+<a name="ln2044">{</a>
+<a name="ln2045">	if (sLooper == NULL)</a>
+<a name="ln2046">		return B_BAD_VALUE;</a>
+<a name="ln2047"> </a>
+<a name="ln2048">	TRACE(&quot;BPathMonitor::StopWatching(%s)\n&quot;, path);</a>
+<a name="ln2049"> </a>
+<a name="ln2050">	BAutolock _(sLooper);</a>
+<a name="ln2051"> </a>
+<a name="ln2052">	Watcher* watcher = sWatchers-&gt;Lookup(target);</a>
+<a name="ln2053">	if (watcher == NULL)</a>
+<a name="ln2054">		return B_BAD_VALUE;</a>
+<a name="ln2055"> </a>
+<a name="ln2056">	PathHandler* handler = watcher-&gt;Lookup(path);</a>
+<a name="ln2057">	if (handler == NULL)</a>
+<a name="ln2058">		return B_BAD_VALUE;</a>
+<a name="ln2059"> </a>
+<a name="ln2060">	watcher-&gt;Remove(handler);</a>
+<a name="ln2061">	handler-&gt;Quit();</a>
+<a name="ln2062"> </a>
+<a name="ln2063">	if (watcher-&gt;IsEmpty()) {</a>
+<a name="ln2064">		sWatchers-&gt;Remove(watcher);</a>
+<a name="ln2065">		delete watcher;</a>
+<a name="ln2066">	}</a>
+<a name="ln2067"> </a>
+<a name="ln2068">	return B_OK;</a>
+<a name="ln2069">}</a>
+<a name="ln2070"> </a>
+<a name="ln2071"> </a>
+<a name="ln2072">/*static*/ status_t</a>
+<a name="ln2073">BPathMonitor::StopWatching(const BMessenger&amp; target)</a>
+<a name="ln2074">{</a>
+<a name="ln2075">	if (sLooper == NULL)</a>
+<a name="ln2076">		return B_BAD_VALUE;</a>
+<a name="ln2077"> </a>
+<a name="ln2078">	BAutolock _(sLooper);</a>
+<a name="ln2079"> </a>
+<a name="ln2080">	Watcher* watcher = sWatchers-&gt;Lookup(target);</a>
+<a name="ln2081">	if (watcher == NULL)</a>
+<a name="ln2082">		return B_BAD_VALUE;</a>
+<a name="ln2083"> </a>
+<a name="ln2084">	// delete handlers</a>
+<a name="ln2085">	PathHandler* handler = watcher-&gt;Clear(true);</a>
+<a name="ln2086">	while (handler != NULL) {</a>
+<a name="ln2087">		PathHandler* nextHandler = handler-&gt;HashNext();</a>
+<a name="ln2088">		handler-&gt;Quit();</a>
+<a name="ln2089">		handler = nextHandler;</a>
+<a name="ln2090">	}</a>
+<a name="ln2091"> </a>
+<a name="ln2092">	sWatchers-&gt;Remove(watcher);</a>
+<a name="ln2093">	delete watcher;</a>
+<a name="ln2094"> </a>
+<a name="ln2095">	return B_OK;</a>
+<a name="ln2096">}</a>
+<a name="ln2097"> </a>
+<a name="ln2098"> </a>
+<a name="ln2099">/*static*/ void</a>
+<a name="ln2100">BPathMonitor::SetWatchingInterface(BWatchingInterface* watchingInterface)</a>
+<a name="ln2101">{</a>
+<a name="ln2102">	sWatchingInterface = watchingInterface != NULL</a>
+<a name="ln2103">		? watchingInterface : sDefaultWatchingInterface;</a>
+<a name="ln2104">}</a>
+<a name="ln2105"> </a>
+<a name="ln2106"> </a>
+<a name="ln2107">/*static*/ status_t</a>
+<a name="ln2108">BPathMonitor::_InitIfNeeded()</a>
+<a name="ln2109">{</a>
+<a name="ln2110">	pthread_once(&amp;sInitOnce, &amp;BPathMonitor::_Init);</a>
+<a name="ln2111">	return sLooper != NULL ? B_OK : B_NO_MEMORY;</a>
+<a name="ln2112">}</a>
+<a name="ln2113"> </a>
+<a name="ln2114"> </a>
+<a name="ln2115">/*static*/ void</a>
+<a name="ln2116">BPathMonitor::_Init()</a>
+<a name="ln2117">{</a>
+<a name="ln2118">	sDefaultWatchingInterface = new(std::nothrow) BWatchingInterface;</a>
+<a name="ln2119">	if (sDefaultWatchingInterface == NULL)</a>
+<a name="ln2120">		return;</a>
+<a name="ln2121"> </a>
+<a name="ln2122">	sWatchers = new(std::nothrow) WatcherMap;</a>
+<a name="ln2123">	if (sWatchers == NULL || sWatchers-&gt;Init() != B_OK)</a>
+<a name="ln2124">		return;</a>
+<a name="ln2125"> </a>
+<a name="ln2126">	if (sWatchingInterface == NULL)</a>
+<a name="ln2127">		SetWatchingInterface(sDefaultWatchingInterface);</a>
+<a name="ln2128"> </a>
+<a name="ln2129">	BLooper* looper = new (std::nothrow) BLooper(&quot;PathMonitor looper&quot;);</a>
+<a name="ln2130">	TRACE(&quot;Start PathMonitor looper\n&quot;);</a>
+<a name="ln2131">	if (looper == NULL)</a>
+<a name="ln2132">		return;</a>
+<a name="ln2133">	thread_id thread = looper-&gt;Run();</a>
+<a name="ln2134">	if (thread &lt; 0) {</a>
+<a name="ln2135">		delete looper;</a>
+<a name="ln2136">		return;</a>
+<a name="ln2137">	}</a>
+<a name="ln2138"> </a>
+<a name="ln2139">	sLooper = looper;</a>
+<a name="ln2140">}</a>
+<a name="ln2141"> </a>
+<a name="ln2142"> </a>
+<a name="ln2143">// #pragma mark - BWatchingInterface</a>
+<a name="ln2144"> </a>
+<a name="ln2145"> </a>
+<a name="ln2146">BPathMonitor::BWatchingInterface::BWatchingInterface()</a>
+<a name="ln2147">{</a>
+<a name="ln2148">}</a>
+<a name="ln2149"> </a>
+<a name="ln2150"> </a>
+<a name="ln2151">BPathMonitor::BWatchingInterface::~BWatchingInterface()</a>
+<a name="ln2152">{</a>
+<a name="ln2153">}</a>
+<a name="ln2154"> </a>
+<a name="ln2155"> </a>
+<a name="ln2156">status_t</a>
+<a name="ln2157">BPathMonitor::BWatchingInterface::WatchNode(const node_ref* node, uint32 flags,</a>
+<a name="ln2158">	const BMessenger&amp; target)</a>
+<a name="ln2159">{</a>
+<a name="ln2160">	return watch_node(node, flags, target);</a>
+<a name="ln2161">}</a>
+<a name="ln2162"> </a>
+<a name="ln2163"> </a>
+<a name="ln2164">status_t</a>
+<a name="ln2165">BPathMonitor::BWatchingInterface::WatchNode(const node_ref* node, uint32 flags,</a>
+<a name="ln2166">	const BHandler* handler, const BLooper* looper)</a>
+<a name="ln2167">{</a>
+<a name="ln2168">	return watch_node(node, flags, handler, looper);</a>
+<a name="ln2169">}</a>
+<a name="ln2170"> </a>
+<a name="ln2171"> </a>
+<a name="ln2172">status_t</a>
+<a name="ln2173">BPathMonitor::BWatchingInterface::StopWatching(const BMessenger&amp; target)</a>
+<a name="ln2174">{</a>
+<a name="ln2175">	return stop_watching(target);</a>
+<a name="ln2176">}</a>
+<a name="ln2177"> </a>
+<a name="ln2178"> </a>
+<a name="ln2179">status_t</a>
+<a name="ln2180">BPathMonitor::BWatchingInterface::StopWatching(const BHandler* handler,</a>
+<a name="ln2181">	const BLooper* looper)</a>
+<a name="ln2182">{</a>
+<a name="ln2183">	return stop_watching(handler, looper);</a>
+<a name="ln2184">}</a>
+<a name="ln2185"> </a>
+<a name="ln2186"> </a>
+<a name="ln2187">}	// namespace BPrivate</a>
+
+</code></pre>
+<div class="balloon" rel="98"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fHashNext.</p></div>
+<div class="balloon" rel="690"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fHashNext.</p></div>
+<div class="balloon" rel="268"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fHashNext.</p></div>
+<div class="balloon" rel="1465"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v522/" target="_blank">V522</a> Dereferencing of the null pointer 'directory' might take place.</p></div>
+<div class="balloon" rel="350"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fHashNext.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

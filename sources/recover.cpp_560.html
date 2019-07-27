@@ -1,0 +1,928 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>recover.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright (c) 2001-2008 pinc Software. All Rights Reserved.</a>
+<a name="ln3"> * Released under the terms of the MIT license.</a>
+<a name="ln4"> */</a>
+<a name="ln5"> </a>
+<a name="ln6">//!	recovers corrupt BFS disks</a>
+<a name="ln7"> </a>
+<a name="ln8"> </a>
+<a name="ln9">#include &lt;set&gt;</a>
+<a name="ln10"> </a>
+<a name="ln11">#include &quot;Disk.h&quot;</a>
+<a name="ln12">#include &quot;Inode.h&quot;</a>
+<a name="ln13">#include &quot;Hashtable.h&quot;</a>
+<a name="ln14">#include &quot;BPlusTree.h&quot;</a>
+<a name="ln15">#include &quot;dump.h&quot;</a>
+<a name="ln16"> </a>
+<a name="ln17">#include &lt;String.h&gt;</a>
+<a name="ln18">#include &lt;fs_info.h&gt;</a>
+<a name="ln19"> </a>
+<a name="ln20">#include &lt;stdlib.h&gt;</a>
+<a name="ln21">#include &lt;stdio.h&gt;</a>
+<a name="ln22">#include &lt;string.h&gt;</a>
+<a name="ln23">#include &lt;unistd.h&gt;</a>
+<a name="ln24">#include &lt;ctype.h&gt;</a>
+<a name="ln25"> </a>
+<a name="ln26"> </a>
+<a name="ln27">extern const char *__progname;</a>
+<a name="ln28">static const char *kProgramName = __progname;</a>
+<a name="ln29"> </a>
+<a name="ln30">bool gCreateIndices = false;</a>
+<a name="ln31">bool gDumpMissingInodes = false;</a>
+<a name="ln32">bool gRawMode = false;</a>
+<a name="ln33">bool gVerbose = false;</a>
+<a name="ln34"> </a>
+<a name="ln35"> </a>
+<a name="ln36">// TODO: add a cache for all inodes</a>
+<a name="ln37">typedef std::set&lt;block_run&gt; RunSet;</a>
+<a name="ln38"> </a>
+<a name="ln39"> </a>
+<a name="ln40">class InodeHashtable {</a>
+<a name="ln41">	public:</a>
+<a name="ln42">		InodeHashtable(int capacity)</a>
+<a name="ln43">			:</a>
+<a name="ln44">			fHashtable(capacity),</a>
+<a name="ln45">			fLastChecked(0)</a>
+<a name="ln46">		{</a>
+<a name="ln47">			fHashtable.SetHashFunction((uint32 (*)(const void *))BlockRunHash);</a>
+<a name="ln48">			fHashtable.SetCompareFunction((bool (*)(const void *, const void *))</a>
+<a name="ln49">				BlockRunCompare);</a>
+<a name="ln50">		}</a>
+<a name="ln51"> </a>
+<a name="ln52">		Inode* Acquire(Inode* inode)</a>
+<a name="ln53">		{</a>
+<a name="ln54">			if (inode == NULL)</a>
+<a name="ln55">				return NULL;</a>
+<a name="ln56"> </a>
+<a name="ln57">			status_t status = inode-&gt;AcquireBuffer();</a>
+<a name="ln58">			if (status != B_OK) {</a>
+<a name="ln59">				fprintf(stderr, &quot;Could not retrieve buffer for inode %&quot;</a>
+<a name="ln60">					B_PRIdOFF &quot;: %s\n&quot;, inode-&gt;Offset(), strerror(status));</a>
+<a name="ln61">				return NULL;</a>
+<a name="ln62">			}</a>
+<a name="ln63">			return inode;</a>
+<a name="ln64">		}</a>
+<a name="ln65"> </a>
+<a name="ln66">		void Release(Inode* inode)</a>
+<a name="ln67">		{</a>
+<a name="ln68">			inode-&gt;ReleaseBuffer();</a>
+<a name="ln69">		}</a>
+<a name="ln70"> </a>
+<a name="ln71">		Inode* Get(block_run run)</a>
+<a name="ln72">		{</a>
+<a name="ln73">			return Acquire((Inode *)fHashtable.GetValue(&amp;run));</a>
+<a name="ln74">		}</a>
+<a name="ln75"> </a>
+<a name="ln76">		bool Insert(Inode* inode)</a>
+<a name="ln77">		{</a>
+<a name="ln78">			bool success = fHashtable.Put(&amp;inode-&gt;BlockRun(), inode);</a>
+<a name="ln79">			if (success)</a>
+<a name="ln80">				inode-&gt;ReleaseBuffer();</a>
+<a name="ln81"> </a>
+<a name="ln82">			return success;</a>
+<a name="ln83">		}</a>
+<a name="ln84"> </a>
+<a name="ln85">		bool Contains(block_run *key)</a>
+<a name="ln86">		{</a>
+<a name="ln87">			return fHashtable.ContainsKey(key);</a>
+<a name="ln88">		}</a>
+<a name="ln89"> </a>
+<a name="ln90">		Inode* Remove(block_run *key)</a>
+<a name="ln91">		{</a>
+<a name="ln92">			return Acquire((Inode*)fHashtable.Remove(key));</a>
+<a name="ln93">		}</a>
+<a name="ln94"> </a>
+<a name="ln95">		status_t GetNextEntry(Inode **_inode)</a>
+<a name="ln96">		{</a>
+<a name="ln97">			status_t status = fHashtable.GetNextEntry((void**)_inode);</a>
+<a name="ln98">			if (status == B_OK) {</a>
+<a name="ln99">				if (Acquire(*_inode) == NULL)</a>
+<a name="ln100">					return B_NO_MEMORY;</a>
+<a name="ln101">			}</a>
+<a name="ln102"> </a>
+<a name="ln103">			return status;</a>
+<a name="ln104">		}</a>
+<a name="ln105"> </a>
+<a name="ln106">		void Rewind()</a>
+<a name="ln107">		{</a>
+<a name="ln108">			fHashtable.Rewind();</a>
+<a name="ln109">		}</a>
+<a name="ln110"> </a>
+<a name="ln111">		bool IsEmpty() const</a>
+<a name="ln112">		{</a>
+<a name="ln113">			return fHashtable.IsEmpty();</a>
+<a name="ln114">		}</a>
+<a name="ln115"> </a>
+<a name="ln116">		void MakeEmpty()</a>
+<a name="ln117">		{</a>
+<a name="ln118">			fHashtable.MakeEmpty(HASH_EMPTY_NONE, HASH_EMPTY_DELETE);</a>
+<a name="ln119">		}</a>
+<a name="ln120"> </a>
+<a name="ln121">		static uint32 BlockRunHash(const block_run *run)</a>
+<a name="ln122">		{</a>
+<a name="ln123">			return (run-&gt;allocation_group &lt;&lt; 16) | run-&gt;start;</a>
+<a name="ln124">		}</a>
+<a name="ln125"> </a>
+<a name="ln126">		static bool BlockRunCompare(const block_run *runA, const block_run *runB)</a>
+<a name="ln127">		{</a>
+<a name="ln128">			return *runA == *runB;</a>
+<a name="ln129">		}</a>
+<a name="ln130"> </a>
+<a name="ln131">	private:</a>
+<a name="ln132">		Hashtable	fHashtable;</a>
+<a name="ln133">		bigtime_t	fLastChecked;</a>
+<a name="ln134">		uint32		fPercentUsed;</a>
+<a name="ln135">};</a>
+<a name="ln136"> </a>
+<a name="ln137"> </a>
+<a name="ln138">class InodeGetter {</a>
+<a name="ln139">	public:</a>
+<a name="ln140">		InodeGetter(Disk&amp; disk, block_run run)</a>
+<a name="ln141">		{</a>
+<a name="ln142">			fInode = Inode::Factory(&amp;disk, run);</a>
+<a name="ln143">			if (fInode != NULL)</a>
+<a name="ln144">				fInode-&gt;AcquireBuffer();</a>
+<a name="ln145">		}</a>
+<a name="ln146"> </a>
+<a name="ln147">		~InodeGetter()</a>
+<a name="ln148">		{</a>
+<a name="ln149">			if (fInode != NULL)</a>
+<a name="ln150">				fInode-&gt;ReleaseBuffer();</a>
+<a name="ln151">		}</a>
+<a name="ln152"> </a>
+<a name="ln153">		Inode* Node() const</a>
+<a name="ln154">		{</a>
+<a name="ln155">			return fInode;</a>
+<a name="ln156">		}</a>
+<a name="ln157"> </a>
+<a name="ln158">		void Detach()</a>
+<a name="ln159">		{</a>
+<a name="ln160">			fInode = NULL;</a>
+<a name="ln161">		}</a>
+<a name="ln162"> </a>
+<a name="ln163">	private:</a>
+<a name="ln164">		Inode*	fInode;</a>
+<a name="ln165">};</a>
+<a name="ln166"> </a>
+<a name="ln167"> </a>
+<a name="ln168">RunSet gMainInodes;</a>
+<a name="ln169">	// contains all inodes found on disk in the general data area</a>
+<a name="ln170">InodeHashtable gLogged(50);</a>
+<a name="ln171">	// contains all inodes found in the log area</a>
+<a name="ln172">InodeHashtable gMissing(50);</a>
+<a name="ln173">InodeHashtable gMissingEmpty(25);</a>
+<a name="ln174"> </a>
+<a name="ln175"> </a>
+<a name="ln176">class HashtableInodeSource : public Inode::Source {</a>
+<a name="ln177">public:</a>
+<a name="ln178">	HashtableInodeSource(Disk&amp; disk)</a>
+<a name="ln179">		:</a>
+<a name="ln180">		fDisk(disk)</a>
+<a name="ln181">	{</a>
+<a name="ln182">	}</a>
+<a name="ln183"> </a>
+<a name="ln184">	virtual Inode *InodeAt(block_run run)</a>
+<a name="ln185">	{</a>
+<a name="ln186">		Inode *inode;</a>
+<a name="ln187">		if ((inode = gLogged.Get(run)) != NULL)</a>
+<a name="ln188">			return Inode::Factory(&amp;fDisk, inode, false);</a>
+<a name="ln189"> </a>
+<a name="ln190">		if ((inode = gMissing.Get(run)) != NULL)</a>
+<a name="ln191">			return Inode::Factory(&amp;fDisk, inode, false);</a>
+<a name="ln192"> </a>
+<a name="ln193">		if (gMainInodes.find(run) == gMainInodes.end())</a>
+<a name="ln194">			return NULL;</a>
+<a name="ln195"> </a>
+<a name="ln196">		return Inode::Factory(&amp;fDisk, run);</a>
+<a name="ln197">	}</a>
+<a name="ln198"> </a>
+<a name="ln199">private:</a>
+<a name="ln200">	Disk&amp;	fDisk;</a>
+<a name="ln201">};</a>
+<a name="ln202"> </a>
+<a name="ln203"> </a>
+<a name="ln204">bool</a>
+<a name="ln205">operator&lt;(const block_run&amp; a, const block_run&amp; b)</a>
+<a name="ln206">{</a>
+<a name="ln207">	return a.allocation_group &lt; b.allocation_group</a>
+<a name="ln208">		|| (a.allocation_group == b.allocation_group &amp;&amp; a.start &lt; b.start);</a>
+<a name="ln209">}</a>
+<a name="ln210"> </a>
+<a name="ln211"> </a>
+<a name="ln212">void</a>
+<a name="ln213">collectInodes(Disk&amp; disk, RunSet* set, InodeHashtable* hashTable, off_t start,</a>
+<a name="ln214">	off_t end)</a>
+<a name="ln215">{</a>
+<a name="ln216">	char buffer[8192];</a>
+<a name="ln217">	Inode inode(&amp;disk, (bfs_inode *)buffer, false);</a>
+<a name="ln218"> </a>
+<a name="ln219">	off_t directories = 0LL;</a>
+<a name="ln220">	off_t directorySize = 0LL;</a>
+<a name="ln221">	off_t files = 0LL;</a>
+<a name="ln222">	off_t fileSize = 0LL;</a>
+<a name="ln223">	off_t symlinks = 0LL;</a>
+<a name="ln224">	off_t count = 0LL;</a>
+<a name="ln225"> </a>
+<a name="ln226">	off_t position = start;</a>
+<a name="ln227">	bigtime_t lastUpdate = system_time();</a>
+<a name="ln228"> </a>
+<a name="ln229">	for (off_t offset = start; offset &lt; end; offset += sizeof(buffer)) {</a>
+<a name="ln230">		if (disk.ReadAt(offset, buffer, sizeof(buffer)) &lt; B_OK) {</a>
+<a name="ln231">			fprintf(stderr, &quot;could not read from device!\n&quot;);</a>
+<a name="ln232">			break;</a>
+<a name="ln233">		}</a>
+<a name="ln234"> </a>
+<a name="ln235">		//if ((offset % (disk.BlockSize() &lt;&lt; disk.SuperBlock()-&gt;ag_shift)) == 0)</a>
+<a name="ln236">		//	printf(&quot;reading block %Ld, allocation group %Ld, %Ld inodes...\33[1A\n&quot;, offset / disk.BlockSize(),offset / (disk.BlockSize() &lt;&lt; disk.SuperBlock()-&gt;ag_shift), count);</a>
+<a name="ln237"> </a>
+<a name="ln238">		for (uint32 i = 0; i &lt; sizeof(buffer); i += disk.BlockSize()) {</a>
+<a name="ln239">			inode.SetTo((bfs_inode *)(buffer + i));</a>
+<a name="ln240">			if (inode.InitCheck() == B_OK) {</a>
+<a name="ln241">				if (inode.Flags() &amp; INODE_DELETED)</a>
+<a name="ln242">					continue;</a>
+<a name="ln243"> </a>
+<a name="ln244">				Inode *node = Inode::Factory(&amp;disk, &amp;inode);</a>
+<a name="ln245">				if (node != NULL) {</a>
+<a name="ln246">					if (gVerbose)</a>
+<a name="ln247">						printf(&quot;  node: %&quot; B_PRIdOFF &quot; \&quot;%s\&quot;\n&quot;, position,</a>
+<a name="ln248">							node-&gt;Name());</a>
+<a name="ln249"> </a>
+<a name="ln250">					if (set != NULL)</a>
+<a name="ln251">						set-&gt;insert(node-&gt;BlockRun());</a>
+<a name="ln252">					else</a>
+<a name="ln253">						hashTable-&gt;Insert(node);</a>
+<a name="ln254"> </a>
+<a name="ln255">					if (node-&gt;IsDirectory()) {</a>
+<a name="ln256">						directories++;</a>
+<a name="ln257">						directorySize += node-&gt;Size();</a>
+<a name="ln258">					} else if (node-&gt;IsFile()) {</a>
+<a name="ln259">						files++;</a>
+<a name="ln260">						fileSize += node-&gt;Size();</a>
+<a name="ln261">					} else if (node-&gt;IsSymlink()) {</a>
+<a name="ln262">						symlinks++;</a>
+<a name="ln263">					}</a>
+<a name="ln264">					count++;</a>
+<a name="ln265">				} else if (gVerbose) {</a>
+<a name="ln266">					printf(&quot;\nunrecognized inode:&quot;);</a>
+<a name="ln267">					dump_inode(&amp;inode, inode.InodeBuffer());</a>
+<a name="ln268">				}</a>
+<a name="ln269">			}</a>
+<a name="ln270">			position += disk.BlockSize();</a>
+<a name="ln271">		}</a>
+<a name="ln272">		if (system_time() - lastUpdate &gt; 500000) {</a>
+<a name="ln273">			printf(&quot;  block %&quot; B_PRIdOFF &quot; (%&quot; B_PRIdOFF &quot;%%), %&quot; B_PRIdOFF</a>
+<a name="ln274">				&quot; inodes\33[1A\n&quot;, offset,</a>
+<a name="ln275">				100 * (offset - start) / (end - start), count);</a>
+<a name="ln276">			lastUpdate = system_time();</a>
+<a name="ln277">		}</a>
+<a name="ln278">	}</a>
+<a name="ln279">	printf(&quot;\n%&quot; B_PRIdOFF &quot; inodes found.\n&quot;, count);</a>
+<a name="ln280"> </a>
+<a name="ln281">	printf(&quot;\n%20&quot; B_PRIdOFF &quot; directories found (total of %&quot; B_PRIdOFF</a>
+<a name="ln282">		&quot; bytes)\n%20&quot; B_PRIdOFF &quot; files found (total of %&quot; B_PRIdOFF</a>
+<a name="ln283">		&quot; bytes)\n%20&quot; B_PRIdOFF &quot; symlinks found\n&quot;</a>
+<a name="ln284">		&quot;--------------------\n&quot;</a>
+<a name="ln285">		&quot;%20&quot; B_PRIdOFF &quot; inodes total found.\n&quot;,</a>
+<a name="ln286">		directories, directorySize, files, fileSize, symlinks, count);</a>
+<a name="ln287">}</a>
+<a name="ln288"> </a>
+<a name="ln289"> </a>
+<a name="ln290">void</a>
+<a name="ln291">collectLogInodes(Disk &amp;disk)</a>
+<a name="ln292">{</a>
+<a name="ln293">	// scan log area</a>
+<a name="ln294">	off_t offset = disk.ToOffset(disk.Log());</a>
+<a name="ln295">	off_t end = offset + (disk.Log().length &lt;&lt; disk.BlockShift());</a>
+<a name="ln296"> </a>
+<a name="ln297">	printf(&quot;\nsearching from %&quot; B_PRIdOFF &quot; to %&quot; B_PRIdOFF &quot; (log area)\n&quot;,</a>
+<a name="ln298">		offset, end);</a>
+<a name="ln299"> </a>
+<a name="ln300">	collectInodes(disk, NULL, &amp;gLogged, offset, end);</a>
+<a name="ln301">}</a>
+<a name="ln302"> </a>
+<a name="ln303"> </a>
+<a name="ln304">void</a>
+<a name="ln305">collectRealInodes(Disk &amp;disk)</a>
+<a name="ln306">{</a>
+<a name="ln307">	// first block after bootblock, bitmap, and log</a>
+<a name="ln308">	off_t offset = disk.ToOffset(disk.Log()) + (disk.Log().length</a>
+<a name="ln309">		&lt;&lt; disk.BlockShift());</a>
+<a name="ln310">	off_t end = (off_t)disk.NumBlocks() &lt;&lt; disk.BlockShift();</a>
+<a name="ln311"> </a>
+<a name="ln312">	printf(&quot;\nsearching from %&quot; B_PRIdOFF &quot; to %&quot; B_PRIdOFF &quot; (main area)\n&quot;,</a>
+<a name="ln313">		offset, end);</a>
+<a name="ln314"> </a>
+<a name="ln315">	collectInodes(disk, &amp;gMainInodes, NULL, offset, end);</a>
+<a name="ln316">}</a>
+<a name="ln317"> </a>
+<a name="ln318"> </a>
+<a name="ln319">Directory *</a>
+<a name="ln320">getNameIndex(Disk &amp;disk)</a>
+<a name="ln321">{</a>
+<a name="ln322">	InodeGetter getter(disk, disk.Indices());</a>
+<a name="ln323">	Directory *indices = dynamic_cast&lt;Directory *&gt;(getter.Node());</a>
+<a name="ln324"> </a>
+<a name="ln325">	block_run run;</a>
+<a name="ln326">	if (indices != NULL &amp;&amp; indices-&gt;FindEntry(&quot;name&quot;, &amp;run) == B_OK) {</a>
+<a name="ln327">		InodeGetter getter(disk, run);</a>
+<a name="ln328">		Inode* node = getter.Node();</a>
+<a name="ln329">		getter.Detach();</a>
+<a name="ln330">		return dynamic_cast&lt;Directory *&gt;(node);</a>
+<a name="ln331">	}</a>
+<a name="ln332"> </a>
+<a name="ln333">	// search name index</a>
+<a name="ln334"> </a>
+<a name="ln335">	RunSet::iterator iterator = gMainInodes.begin();</a>
+<a name="ln336">	for (; iterator != gMainInodes.end(); iterator++) {</a>
+<a name="ln337">		InodeGetter getter(disk, *iterator);</a>
+<a name="ln338">		Inode* node = getter.Node();</a>
+<a name="ln339"> </a>
+<a name="ln340">		if (!node || !node-&gt;IsIndex() || node-&gt;Name() == NULL)</a>
+<a name="ln341">			continue;</a>
+<a name="ln342">		if (!strcmp(node-&gt;Name(), &quot;name&quot;) &amp;&amp; node-&gt;Mode() &amp; S_STR_INDEX)</a>
+<a name="ln343">			return dynamic_cast&lt;Directory *&gt;(node);</a>
+<a name="ln344">	}</a>
+<a name="ln345"> </a>
+<a name="ln346">	return NULL;</a>
+<a name="ln347">}</a>
+<a name="ln348"> </a>
+<a name="ln349"> </a>
+<a name="ln350">void</a>
+<a name="ln351">checkDirectoryContents(Disk&amp; disk, Directory *dir)</a>
+<a name="ln352">{</a>
+<a name="ln353">	dir-&gt;Rewind();</a>
+<a name="ln354"> </a>
+<a name="ln355">	char name[B_FILE_NAME_LENGTH];</a>
+<a name="ln356">	block_run run;</a>
+<a name="ln357"> </a>
+<a name="ln358">	while (dir-&gt;GetNextEntry(name, &amp;run) == B_OK) {</a>
+<a name="ln359">		if (run == dir-&gt;BlockRun() || run == dir-&gt;Parent()</a>
+<a name="ln360">			|| gMainInodes.find(run) != gMainInodes.end())</a>
+<a name="ln361">			continue;</a>
+<a name="ln362"> </a>
+<a name="ln363">		Inode *missing = gMissing.Get(run);</a>
+<a name="ln364">		if (missing != NULL) {</a>
+<a name="ln365">			if (missing-&gt;SetName(name) &lt; B_OK) {</a>
+<a name="ln366">				fprintf(stderr, &quot;setting name of missing node to &quot;</a>
+<a name="ln367">					&quot;\&quot;%s\&quot; failed!&quot;, name);</a>
+<a name="ln368">			}</a>
+<a name="ln369">			if (gVerbose) {</a>
+<a name="ln370">				printf(&quot;Set name of missing node (%&quot; B_PRId32</a>
+<a name="ln371">					&quot;, %d) to \&quot;%s\&quot; (%s)\n&quot;,</a>
+<a name="ln372">					run.allocation_group, run.start, missing-&gt;Name(), name);</a>
+<a name="ln373">			}</a>
+<a name="ln374"> </a>
+<a name="ln375">			missing-&gt;SetParent(dir-&gt;BlockRun());</a>
+<a name="ln376">		}</a>
+<a name="ln377">//		if (node-&gt;Mode() &amp; S_INDEX_DIR)</a>
+<a name="ln378">//		{</a>
+<a name="ln379">//			if (node-&gt;Mode() &amp; S_STR_INDEX)</a>
+<a name="ln380">//				printf(&quot;index directory (%ld, %d): \&quot;%s\&quot; is missing (%ld, %d, %d)\n&quot;,node-&gt;BlockRun().allocation_group,node-&gt;BlockRun().start,name,run.allocation_group,run.start,run.length);</a>
+<a name="ln381">//			else</a>
+<a name="ln382">//				printf(&quot;index directory (%ld, %d): key is missing (%ld, %d, %d)\n&quot;,node-&gt;BlockRun().allocation_group,node-&gt;BlockRun().start,run.allocation_group,run.start,run.length);</a>
+<a name="ln383">//		}</a>
+<a name="ln384">		else {</a>
+<a name="ln385">			// missing inode has not been found</a>
+<a name="ln386">			if (gVerbose) {</a>
+<a name="ln387">				printf(&quot;directory \&quot;%s\&quot; (%&quot; B_PRId32 &quot;, %d): node \&quot;%s\&quot; is &quot;</a>
+<a name="ln388">					&quot;missing (%&quot; B_PRId32 &quot;, %d, %d)\n&quot;, dir-&gt;Name(),</a>
+<a name="ln389">					dir-&gt;BlockRun().allocation_group,</a>
+<a name="ln390">					dir-&gt;BlockRun().start, name,</a>
+<a name="ln391">					run.allocation_group, run.start, run.length);</a>
+<a name="ln392">			}</a>
+<a name="ln393"> </a>
+<a name="ln394">			if ((missing = (Inode *)gLogged.Remove(&amp;run)) != NULL) {</a>
+<a name="ln395">				// missing inode is in the log</a>
+<a name="ln396">				if (gVerbose)</a>
+<a name="ln397">					printf(&quot;found missing entry in log!\n&quot;);</a>
+<a name="ln398">				if (missing-&gt;InodeBuffer()-&gt;parent != dir-&gt;BlockRun()) {</a>
+<a name="ln399">					if (gVerbose)</a>
+<a name="ln400">						puts(&quot;\tparent directories differ (may be an old &quot;</a>
+<a name="ln401">							&quot;version of it), reseting parent.&quot;);</a>
+<a name="ln402">					missing-&gt;SetParent(dir-&gt;BlockRun());</a>
+<a name="ln403">				}</a>
+<a name="ln404">				if (!gMissing.Insert(missing))</a>
+<a name="ln405">					delete missing;</a>
+<a name="ln406">			} else if (!gMissingEmpty.Contains(&amp;run)) {</a>
+<a name="ln407">				// not known at all yet</a>
+<a name="ln408">				Inode *empty = Inode::EmptyInode(&amp;disk, name, 0);</a>
+<a name="ln409">				if (empty) {</a>
+<a name="ln410">					empty-&gt;SetBlockRun(run);</a>
+<a name="ln411">					empty-&gt;SetParent(dir-&gt;BlockRun());</a>
+<a name="ln412">					if (gVerbose)</a>
+<a name="ln413">						printf(&quot;\tname = %s\n&quot;, empty-&gt;Name());</a>
+<a name="ln414"> </a>
+<a name="ln415">					if (!gMissingEmpty.Insert(empty))</a>
+<a name="ln416">						delete empty;</a>
+<a name="ln417">				}</a>
+<a name="ln418">			}</a>
+<a name="ln419">		}</a>
+<a name="ln420">	}</a>
+<a name="ln421">}</a>
+<a name="ln422"> </a>
+<a name="ln423"> </a>
+<a name="ln424">void</a>
+<a name="ln425">checkStructure(Disk &amp;disk)</a>
+<a name="ln426">{</a>
+<a name="ln427">	off_t count = 0;</a>
+<a name="ln428">	Inode* node;</a>
+<a name="ln429"> </a>
+<a name="ln430">	RunSet::iterator iterator = gMainInodes.begin();</a>
+<a name="ln431">	for (; iterator != gMainInodes.end(); iterator++) {</a>
+<a name="ln432">		InodeGetter getter(disk, *iterator);</a>
+<a name="ln433">		node = getter.Node();</a>
+<a name="ln434"> </a>
+<a name="ln435">		count++;</a>
+<a name="ln436">		if ((count % 50) == 0)</a>
+<a name="ln437">			fprintf(stderr, &quot;%&quot; B_PRIdOFF &quot; inodes processed...\33[1A\n&quot;, count);</a>
+<a name="ln438"> </a>
+<a name="ln439">		if (node == NULL)</a>
+<a name="ln440">			continue;</a>
+<a name="ln441"> </a>
+<a name="ln442">		if (node-&gt;IsDirectory() &amp;&amp; !node-&gt;IsIndex()) {</a>
+<a name="ln443">			// check if all entries are in the hashtable</a>
+<a name="ln444">			Directory* directory = dynamic_cast&lt;Directory*&gt;(node);</a>
+<a name="ln445">			if (directory != NULL)</a>
+<a name="ln446">				checkDirectoryContents(disk, directory);</a>
+<a name="ln447">			else {</a>
+<a name="ln448">				printf(&quot;Node \&quot;%s\&quot; at %&quot; B_PRId32</a>
+<a name="ln449">					&quot;,%d looks like a directory, but isn't.\n&quot;,</a>
+<a name="ln450">					node-&gt;Name(), node-&gt;BlockRun().allocation_group,</a>
+<a name="ln451">					node-&gt;BlockRun().start);</a>
+<a name="ln452">			}</a>
+<a name="ln453">		}</a>
+<a name="ln454"> </a>
+<a name="ln455">		// check for the parent directory</a>
+<a name="ln456"> </a>
+<a name="ln457">		block_run run = node-&gt;Parent();</a>
+<a name="ln458">		InodeGetter parentGetter(disk, run);</a>
+<a name="ln459">		Inode *parentNode = parentGetter.Node();</a>
+<a name="ln460"> </a>
+<a name="ln461">		Directory *dir = dynamic_cast&lt;Directory *&gt;(parentNode);</a>
+<a name="ln462">		if (dir || (parentNode &amp;&amp; (node-&gt;Mode() &amp; S_ATTR_DIR))) {</a>
+<a name="ln463">			// entry has a valid parent directory, so it's assumed to be a valid entry</a>
+<a name="ln464">			disk.BlockBitmap()-&gt;BackupSet(node, true);</a>
+<a name="ln465">		} else if (node-&gt;Mode() &amp; S_ATTR) {</a>
+<a name="ln466">			if (gVerbose) {</a>
+<a name="ln467">				printf(&quot;attribute \&quot;%s\&quot; at %&quot; B_PRId32 &quot;,%d misses its parent.\n&quot;,</a>
+<a name="ln468">					node-&gt;Name(), node-&gt;BlockRun().allocation_group,</a>
+<a name="ln469">					node-&gt;BlockRun().start);</a>
+<a name="ln470">				puts(&quot;\thandling not yet implemented...&quot;);</a>
+<a name="ln471">			}</a>
+<a name="ln472">		} else /*if ((node-&gt;Flags() &amp; INODE_DELETED) == 0)*/ {</a>
+<a name="ln473">			Inode* missing = gMissing.Get(run);</a>
+<a name="ln474">			dir = dynamic_cast&lt;Directory *&gt;(missing);</a>
+<a name="ln475"> </a>
+<a name="ln476">			if (missing == NULL) {</a>
+<a name="ln477">				if (gVerbose) {</a>
+<a name="ln478">					printf(&quot;%s \&quot;%s\&quot; (%&quot; B_PRId32 &quot;, %d, mode = %10&quot; B_PRIo32</a>
+<a name="ln479">						&quot;): parent directory is missing (%&quot; B_PRId32</a>
+<a name="ln480">						&quot;, %d, %d), may be deleted!\n&quot;,</a>
+<a name="ln481">						node-&gt;IsFile() ? &quot;file&quot; : &quot;node&quot;, node-&gt;Name(),</a>
+<a name="ln482">						node-&gt;BlockRun().allocation_group,</a>
+<a name="ln483">						node-&gt;BlockRun().start,</a>
+<a name="ln484">						node-&gt;Mode(), run.allocation_group, run.start,</a>
+<a name="ln485">						run.length);</a>
+<a name="ln486">				}</a>
+<a name="ln487"> </a>
+<a name="ln488">				if ((dir = dynamic_cast&lt;Directory *&gt;((Inode *)gLogged.Remove(</a>
+<a name="ln489">						&amp;run))) != NULL) {</a>
+<a name="ln490">					if (gVerbose) {</a>
+<a name="ln491">						printf(&quot;found directory \&quot;%s\&quot; in log:\n&quot;, dir-&gt;Name());</a>
+<a name="ln492">						if (dir-&gt;Size() &gt; 0)</a>
+<a name="ln493">							dump_inode(dir, dir-&gt;InodeBuffer());</a>
+<a name="ln494">						else</a>
+<a name="ln495">							puts(&quot;\tempty inode.&quot;);</a>
+<a name="ln496">					}</a>
+<a name="ln497">				} else {</a>
+<a name="ln498">					if (gVerbose)</a>
+<a name="ln499">						puts(&quot;\tcreate parent missing entry&quot;);</a>
+<a name="ln500"> </a>
+<a name="ln501">					Inode *nameNode = (Inode *)gMissingEmpty.Remove(&amp;run);</a>
+<a name="ln502">					if (nameNode != NULL) {</a>
+<a name="ln503">						nameNode-&gt;SetMode(S_IFDIR);</a>
+<a name="ln504">						if (gVerbose)</a>
+<a name="ln505">							printf(&quot;found missing name!\n&quot;);</a>
+<a name="ln506">					} else {</a>
+<a name="ln507">						BString parentName;</a>
+<a name="ln508">						parentName &lt;&lt; &quot;__directory &quot; &lt;&lt; run.allocation_group</a>
+<a name="ln509">							&lt;&lt; &quot;:&quot; &lt;&lt; (int32)run.start;</a>
+<a name="ln510"> </a>
+<a name="ln511">						nameNode = Inode::EmptyInode(&amp;disk, parentName.String(),</a>
+<a name="ln512">							S_IFDIR);</a>
+<a name="ln513">						if (nameNode) {</a>
+<a name="ln514">							nameNode-&gt;SetBlockRun(run);</a>
+<a name="ln515">							nameNode-&gt;SetParent(disk.Root());</a>
+<a name="ln516">						}</a>
+<a name="ln517">					}</a>
+<a name="ln518"> </a>
+<a name="ln519">					if (nameNode) {</a>
+<a name="ln520">						dir = new Directory(*nameNode);</a>
+<a name="ln521">						if (dir-&gt;CopyBuffer() &lt; B_OK)</a>
+<a name="ln522">							puts(&quot;could not copy buffer!&quot;);</a>
+<a name="ln523">						else</a>
+<a name="ln524">							delete nameNode;</a>
+<a name="ln525">					}</a>
+<a name="ln526">				}</a>
+<a name="ln527">				if (dir) {</a>
+<a name="ln528">					dir-&gt;AcquireBuffer();</a>
+<a name="ln529"> </a>
+<a name="ln530">					if (!gMissing.Insert(dir)) {</a>
+<a name="ln531">						printf(&quot;could not add dir!!\n&quot;);</a>
+<a name="ln532">						delete dir;</a>
+<a name="ln533">						dir = NULL;</a>
+<a name="ln534">					}</a>
+<a name="ln535">				}</a>
+<a name="ln536">			} else if (missing != NULL &amp;&amp; dir == NULL &amp;&amp; gVerbose) {</a>
+<a name="ln537">				printf(&quot;%s \&quot;%s\&quot; (%&quot; B_PRId32 &quot;, %d, mode = %10&quot; B_PRIo32</a>
+<a name="ln538">					&quot;): parent directory found in missing list (%&quot; B_PRId32</a>
+<a name="ln539">					&quot;, %d, %d), but it's not a dir!\n&quot;,</a>
+<a name="ln540">					node-&gt;IsFile() ? &quot;file&quot; : &quot;node&quot;, node-&gt;Name(),</a>
+<a name="ln541">					node-&gt;BlockRun().allocation_group, node-&gt;BlockRun().start,</a>
+<a name="ln542">					node-&gt;Mode(), run.allocation_group, run.start, run.length);</a>
+<a name="ln543">			} else if (gVerbose) {</a>
+<a name="ln544">				printf(&quot;%s \&quot;%s\&quot; (%&quot; B_PRId32 &quot;, %d, mode = %10&quot; B_PRIo32</a>
+<a name="ln545">					&quot;): parent directory found in missing list (%&quot; B_PRId32</a>
+<a name="ln546">					&quot;, %d, %d)!\n&quot;,</a>
+<a name="ln547">					node-&gt;IsFile() ? &quot;file&quot; : &quot;node&quot;, node-&gt;Name(),</a>
+<a name="ln548">					node-&gt;BlockRun().allocation_group, node-&gt;BlockRun().start,</a>
+<a name="ln549">					node-&gt;Mode(), run.allocation_group, run.start, run.length);</a>
+<a name="ln550">			}</a>
+<a name="ln551"> </a>
+<a name="ln552">			if (dir) {</a>
+<a name="ln553">				dir-&gt;AddEntry(node);</a>
+<a name="ln554">				dir-&gt;ReleaseBuffer();</a>
+<a name="ln555">			}</a>
+<a name="ln556">		}</a>
+<a name="ln557">//			else</a>
+<a name="ln558">//			{</a>
+<a name="ln559">//				printf(&quot;node %s\n&quot;, node-&gt;Name());</a>
+<a name="ln560">//				status_t status = dir-&gt;Contains(node);</a>
+<a name="ln561">//				if (status == B_ENTRY_NOT_FOUND)</a>
+<a name="ln562">//					printf(&quot;node \&quot;%s\&quot;: parent directory \&quot;%s\&quot; contains no link to this node!\n&quot;,node-&gt;Name(),dir-&gt;Name());</a>
+<a name="ln563">//				else if (status != B_OK)</a>
+<a name="ln564">//					printf(&quot;node \&quot;%s\&quot;: parent directory \&quot;%s\&quot; error: %s\n&quot;,node-&gt;Name(),dir-&gt;Name(),strerror(status));</a>
+<a name="ln565">//			}</a>
+<a name="ln566"> </a>
+<a name="ln567">		// check for attributes</a>
+<a name="ln568"> </a>
+<a name="ln569">		run = node-&gt;Attributes();</a>
+<a name="ln570">		if (!run.IsZero()) {</a>
+<a name="ln571">			//printf(&quot;node \&quot;%s\&quot; (%ld, %d, mode = %010lo): has attribute dir!\n&quot;,node-&gt;Name(),node-&gt;BlockRun().allocation_group,node-&gt;BlockRun().start,node-&gt;Mode());</a>
+<a name="ln572"> </a>
+<a name="ln573">			if (gMainInodes.find(run) == gMainInodes.end()) {</a>
+<a name="ln574">				if (gVerbose) {</a>
+<a name="ln575">					printf(&quot;node \&quot;%s\&quot;: attributes are missing (%&quot; B_PRId32</a>
+<a name="ln576">						&quot;, %d, %d)\n&quot;, node-&gt;Name(), run.allocation_group,</a>
+<a name="ln577">						run.start, run.length);</a>
+<a name="ln578">				}</a>
+<a name="ln579"> </a>
+<a name="ln580">				if ((dir = (Directory *)gMissing.Get(run)) != NULL) {</a>
+<a name="ln581">					if (gVerbose)</a>
+<a name="ln582">						puts(&quot;\tfound in missing&quot;);</a>
+<a name="ln583">					dir-&gt;SetMode(dir-&gt;Mode() | S_ATTR_DIR);</a>
+<a name="ln584">					dir-&gt;SetParent(node-&gt;BlockRun());</a>
+<a name="ln585">				} else {</a>
+<a name="ln586">					if (gVerbose)</a>
+<a name="ln587">						puts(&quot;\tcreate new!&quot;);</a>
+<a name="ln588"> </a>
+<a name="ln589">					Inode *empty = Inode::EmptyInode(&amp;disk, NULL,</a>
+<a name="ln590">						S_IFDIR | S_ATTR_DIR);</a>
+<a name="ln591">					if (empty) {</a>
+<a name="ln592">						empty-&gt;SetBlockRun(run);</a>
+<a name="ln593">						empty-&gt;SetParent(node-&gt;BlockRun());</a>
+<a name="ln594"> </a>
+<a name="ln595">						dir = new Directory(*empty);</a>
+<a name="ln596">						if (dir-&gt;CopyBuffer() &lt; B_OK)</a>
+<a name="ln597">							puts(&quot;could not copy buffer!&quot;);</a>
+<a name="ln598">						else</a>
+<a name="ln599">							delete empty;</a>
+<a name="ln600"> </a>
+<a name="ln601">						if (!gMissing.Insert(dir)) {</a>
+<a name="ln602">							puts(&quot;\tcould not add attribute dir&quot;);</a>
+<a name="ln603">							delete dir;</a>
+<a name="ln604">						}</a>
+<a name="ln605">					}</a>
+<a name="ln606">				}</a>
+<a name="ln607">			}</a>
+<a name="ln608">		}</a>
+<a name="ln609">	}</a>
+<a name="ln610">	printf(&quot;%&quot; B_PRIdOFF &quot; inodes processed.\n&quot;, count);</a>
+<a name="ln611"> </a>
+<a name="ln612">	Directory *directory = getNameIndex(disk);</a>
+<a name="ln613">	if (directory != NULL) {</a>
+<a name="ln614">		puts(&quot;\n*** Search names of missing inodes in the name index&quot;);</a>
+<a name="ln615"> </a>
+<a name="ln616">		BPlusTree *tree;</a>
+<a name="ln617">		if (directory-&gt;GetTree(&amp;tree) == B_OK &amp;&amp; tree-&gt;Validate(gVerbose) == B_OK) {</a>
+<a name="ln618">			char name[B_FILE_NAME_LENGTH];</a>
+<a name="ln619">			block_run run;</a>
+<a name="ln620">			directory-&gt;Rewind();</a>
+<a name="ln621">			while (directory-&gt;GetNextEntry(name, &amp;run) &gt;= B_OK) {</a>
+<a name="ln622">				if ((node = gMissing.Get(run)) == NULL)</a>
+<a name="ln623">					continue;</a>
+<a name="ln624"> </a>
+<a name="ln625">				if (gVerbose) {</a>
+<a name="ln626">					printf(&quot;  Node found: %&quot; B_PRId32 &quot;:%d\n&quot;,</a>
+<a name="ln627">						run.allocation_group, run.start);</a>
+<a name="ln628">				}</a>
+<a name="ln629">				if (node-&gt;Name() == NULL || strcmp(node-&gt;Name(), name)) {</a>
+<a name="ln630">					if (gVerbose) {</a>
+<a name="ln631">						printf(&quot;\tnames differ: %s -&gt; %s (indices)\n&quot;,</a>
+<a name="ln632">							node-&gt;Name(), name);</a>
+<a name="ln633">					}</a>
+<a name="ln634">					node-&gt;SetName(name);</a>
+<a name="ln635">				}</a>
+<a name="ln636">			}</a>
+<a name="ln637">		} else</a>
+<a name="ln638">			printf(&quot;\tname index is corrupt!\n&quot;);</a>
+<a name="ln639"> </a>
+<a name="ln640">		directory-&gt;ReleaseBuffer();</a>
+<a name="ln641">	} else</a>
+<a name="ln642">		printf(&quot;*** Name index corrupt or not existent!\n&quot;);</a>
+<a name="ln643"> </a>
+<a name="ln644">	if (!gVerbose)</a>
+<a name="ln645">		return;</a>
+<a name="ln646"> </a>
+<a name="ln647">	if (!gMissing.IsEmpty())</a>
+<a name="ln648">		puts(&quot;\n*** Missing inodes:&quot;);</a>
+<a name="ln649"> </a>
+<a name="ln650">	gMissing.Rewind();</a>
+<a name="ln651">	while (gMissing.GetNextEntry(&amp;node) == B_OK) {</a>
+<a name="ln652">		if (gDumpMissingInodes)</a>
+<a name="ln653">			dump_inode(node, node-&gt;InodeBuffer());</a>
+<a name="ln654"> </a>
+<a name="ln655">		Directory *dir = dynamic_cast&lt;Directory *&gt;(node);</a>
+<a name="ln656">		if (dir) {</a>
+<a name="ln657">			printf(&quot;\ndirectory \&quot;%s\&quot; (%&quot; B_PRId32 &quot;, %d) contents:\n&quot;,</a>
+<a name="ln658">				node-&gt;Name(), node-&gt;BlockRun().allocation_group,</a>
+<a name="ln659">				node-&gt;BlockRun().start);</a>
+<a name="ln660"> </a>
+<a name="ln661">			dir-&gt;Rewind();</a>
+<a name="ln662"> </a>
+<a name="ln663">			char name[B_FILE_NAME_LENGTH];</a>
+<a name="ln664">			block_run run;</a>
+<a name="ln665">			while (dir-&gt;GetNextEntry(name, &amp;run) == B_OK) {</a>
+<a name="ln666">				printf(&quot;\t\&quot;%s\&quot; (%&quot; B_PRId32 &quot;, %d, %d)\n&quot;, name,</a>
+<a name="ln667">					run.allocation_group, run.start, run.length);</a>
+<a name="ln668">			}</a>
+<a name="ln669"> </a>
+<a name="ln670">			BPlusTree *tree;</a>
+<a name="ln671">			if (dir-&gt;GetTree(&amp;tree) &lt; B_OK)</a>
+<a name="ln672">				continue;</a>
+<a name="ln673"> </a>
+<a name="ln674">			uint16 length;</a>
+<a name="ln675">			off_t offset;</a>
+<a name="ln676"> </a>
+<a name="ln677">			while (tree-&gt;GetNextEntry(name, &amp;length, B_FILE_NAME_LENGTH,</a>
+<a name="ln678">					&amp;offset) == B_OK) {</a>
+<a name="ln679">				name[length] = 0;</a>
+<a name="ln680"> </a>
+<a name="ln681">				run = disk.ToBlockRun(offset);</a>
+<a name="ln682">				printf(&quot;%s: block_run == (%5&quot; B_PRId32 &quot;,%5d,%5d), \&quot;%s\&quot;\n&quot;,</a>
+<a name="ln683">					dir-&gt;Name(), run.allocation_group, run.start, run.length,</a>
+<a name="ln684">					name);</a>
+<a name="ln685">			}</a>
+<a name="ln686"> </a>
+<a name="ln687">			//tree-&gt;WriteTo(dir);</a>
+<a name="ln688">			//disk.WriteAt(dir-&gt;Offset(),dir-&gt;InodeBuffer(),disk.BlockSize());</a>
+<a name="ln689">		}</a>
+<a name="ln690"> </a>
+<a name="ln691">		gMissing.Release(node);</a>
+<a name="ln692">	}</a>
+<a name="ln693">}</a>
+<a name="ln694"> </a>
+<a name="ln695"> </a>
+<a name="ln696">void</a>
+<a name="ln697">copyInodes(Disk&amp; disk, const char* copyTo)</a>
+<a name="ln698">{</a>
+<a name="ln699">	if (copyTo == NULL)</a>
+<a name="ln700">		return;</a>
+<a name="ln701"> </a>
+<a name="ln702">	HashtableInodeSource source(disk);</a>
+<a name="ln703">	Inode *node;</a>
+<a name="ln704"> </a>
+<a name="ln705">	int32 count = 0;</a>
+<a name="ln706"> </a>
+<a name="ln707">	RunSet::iterator iterator = gMainInodes.begin();</a>
+<a name="ln708">	for (; iterator != gMainInodes.end(); iterator++) {</a>
+<a name="ln709">		InodeGetter getter(disk, *iterator);</a>
+<a name="ln710">		Inode* node = getter.Node();</a>
+<a name="ln711"> </a>
+<a name="ln712">		if (node &amp;&amp; !node-&gt;IsIndex() &amp;&amp; !node-&gt;IsAttributeDirectory())</a>
+<a name="ln713">			node-&gt;CopyTo(copyTo, true, &amp;source);</a>
+<a name="ln714"> </a>
+<a name="ln715">		if ((++count % 500) == 0)</a>
+<a name="ln716">			fprintf(stderr, &quot;copied %&quot; B_PRId32 &quot; files...\n&quot;, count);</a>
+<a name="ln717">	}</a>
+<a name="ln718"> </a>
+<a name="ln719">	gMissing.Rewind();</a>
+<a name="ln720">	while (gMissing.GetNextEntry(&amp;node) == B_OK) {</a>
+<a name="ln721">		if (!node-&gt;IsIndex() &amp;&amp; !node-&gt;IsAttributeDirectory())</a>
+<a name="ln722">			node-&gt;CopyTo(copyTo, true, &amp;source);</a>
+<a name="ln723"> </a>
+<a name="ln724">		gMissing.Release(node);</a>
+<a name="ln725">	}</a>
+<a name="ln726">}</a>
+<a name="ln727"> </a>
+<a name="ln728"> </a>
+<a name="ln729">void</a>
+<a name="ln730">usage(char *name)</a>
+<a name="ln731">{</a>
+<a name="ln732">	fprintf(stderr,&quot;usage: %s [-idv] [-r [start-offset] [end-offset]] &lt;device&gt; [recover-to-path]\n&quot;</a>
+<a name="ln733">		&quot;\t-i\trecreate indices on target disk\n&quot;</a>
+<a name="ln734">		&quot;\t-d\tdump missing and recreated i-nodes\n&quot;</a>
+<a name="ln735">		&quot;\t-r\tdisk access in raw mode (use only if the partition table is invalid)\n&quot;</a>
+<a name="ln736">		&quot;\t-s\trecreate superblock and exit (for experts only, don't use this\n&quot;</a>
+<a name="ln737">		&quot;\t\tif you don't know what you're doing)\n&quot;</a>
+<a name="ln738">		&quot;\t-v\tverbose output\n&quot;, name);</a>
+<a name="ln739">	exit(-1);</a>
+<a name="ln740">}</a>
+<a name="ln741"> </a>
+<a name="ln742"> </a>
+<a name="ln743">int</a>
+<a name="ln744">main(int argc, char **argv)</a>
+<a name="ln745">{</a>
+<a name="ln746">	char *fileName = strrchr(argv[0], '/');</a>
+<a name="ln747">	fileName = fileName ? fileName + 1 : argv[0];</a>
+<a name="ln748">	bool recreateSuperBlockOnly = false;</a>
+<a name="ln749"> </a>
+<a name="ln750">	off_t startOffset = 0, endOffset = -1;</a>
+<a name="ln751"> </a>
+<a name="ln752">	puts(&quot;Copyright (c) 2001-2008 pinc Software.&quot;);</a>
+<a name="ln753"> </a>
+<a name="ln754">	if (argc &lt; 2 || !strcmp(argv[1], &quot;--help&quot;))</a>
+<a name="ln755">		usage(fileName);</a>
+<a name="ln756"> </a>
+<a name="ln757">	while (*++argv) {</a>
+<a name="ln758">		char *arg = *argv;</a>
+<a name="ln759">		if (*arg == '-') {</a>
+<a name="ln760">			while (*++arg &amp;&amp; isalpha(*arg)) {</a>
+<a name="ln761">				switch (arg[0]) {</a>
+<a name="ln762">					case 'r':</a>
+<a name="ln763">					{</a>
+<a name="ln764">						gRawMode = true;</a>
+<a name="ln765"> </a>
+<a name="ln766">						if (argv[1] &amp;&amp; isdigit((argv[1])[0])) {</a>
+<a name="ln767">							argv++;</a>
+<a name="ln768">							arg = *argv;</a>
+<a name="ln769"> </a>
+<a name="ln770">							startOffset = atoll(arg);</a>
+<a name="ln771">						}</a>
+<a name="ln772">						if (argv[1] &amp;&amp; isdigit((argv[1])[0])) {</a>
+<a name="ln773">							argv++;</a>
+<a name="ln774">							arg = *argv;</a>
+<a name="ln775"> </a>
+<a name="ln776">							endOffset = atoll(arg);</a>
+<a name="ln777">						}</a>
+<a name="ln778">						if (endOffset != -1 &amp;&amp; endOffset &lt; startOffset)</a>
+<a name="ln779">							usage(fileName);</a>
+<a name="ln780">						break;</a>
+<a name="ln781">					}</a>
+<a name="ln782">					case 'v':</a>
+<a name="ln783">						gVerbose = true;</a>
+<a name="ln784">						break;</a>
+<a name="ln785">					case 'i':</a>
+<a name="ln786">						gCreateIndices = true;</a>
+<a name="ln787">						break;</a>
+<a name="ln788">					case 'd':</a>
+<a name="ln789">						gDumpMissingInodes = true;</a>
+<a name="ln790">						break;</a>
+<a name="ln791">					case 's':</a>
+<a name="ln792">						recreateSuperBlockOnly = true;</a>
+<a name="ln793">						break;</a>
+<a name="ln794">				}</a>
+<a name="ln795">			}</a>
+<a name="ln796">		} else</a>
+<a name="ln797">			break;</a>
+<a name="ln798">	}</a>
+<a name="ln799"> </a>
+<a name="ln800">	Disk disk(argv[0], gRawMode, startOffset, endOffset);</a>
+<a name="ln801">	if (disk.InitCheck() &lt; B_OK) {</a>
+<a name="ln802">		fprintf(stderr,&quot;Could not open device or file: %s\n&quot;,</a>
+<a name="ln803">			strerror(disk.InitCheck()));</a>
+<a name="ln804">		return -1;</a>
+<a name="ln805">	}</a>
+<a name="ln806"> </a>
+<a name="ln807">	if (argv[1] != NULL) {</a>
+<a name="ln808">		dev_t device = dev_for_path(argv[1]);</a>
+<a name="ln809">		fs_info info;</a>
+<a name="ln810">		if (fs_stat_dev(device, &amp;info) == B_OK) {</a>
+<a name="ln811">			if (!strcmp(info.device_name, disk.Path().Path())) {</a>
+<a name="ln812">				fprintf(stderr,&quot;The source and target device are identical, &quot;</a>
+<a name="ln813">					&quot;you currently need\n&quot;</a>
+<a name="ln814">					&quot;to have another disk to recover to, sorry!\n&quot;);</a>
+<a name="ln815">				return -1;</a>
+<a name="ln816">			}</a>
+<a name="ln817">			if ((info.flags &amp; (B_FS_IS_PERSISTENT | B_FS_HAS_ATTR))</a>
+<a name="ln818">					!= (B_FS_IS_PERSISTENT | B_FS_HAS_ATTR)) {</a>
+<a name="ln819">				fprintf(stderr, &quot;%s: The target file system (%s) does not have &quot;</a>
+<a name="ln820">					&quot;the required\n&quot;</a>
+<a name="ln821">					&quot;\tfunctionality in order to restore all information.\n&quot;,</a>
+<a name="ln822">					kProgramName, info.fsh_name);</a>
+<a name="ln823">				return -1;</a>
+<a name="ln824">			}</a>
+<a name="ln825">		}</a>
+<a name="ln826">	}</a>
+<a name="ln827"> </a>
+<a name="ln828">	bool recreatedSuperBlock = false;</a>
+<a name="ln829"> </a>
+<a name="ln830">	if (disk.ValidateSuperBlock() &lt; B_OK) {</a>
+<a name="ln831">		fprintf(stderr, &quot;The disk's superblock is corrupt!\n&quot;);</a>
+<a name="ln832">		if (disk.RecreateSuperBlock() &lt; B_OK) {</a>
+<a name="ln833">			fprintf(stderr, &quot;Can't recreate the disk's superblock, sorry!\n&quot;);</a>
+<a name="ln834">			return -1;</a>
+<a name="ln835">		}</a>
+<a name="ln836">		recreatedSuperBlock = true;</a>
+<a name="ln837">	}</a>
+<a name="ln838">	if (gVerbose) {</a>
+<a name="ln839">		puts(&quot;\n*** The superblock:\n&quot;);</a>
+<a name="ln840">		dump_super_block(disk.SuperBlock());</a>
+<a name="ln841">	}</a>
+<a name="ln842"> </a>
+<a name="ln843">	if (recreateSuperBlockOnly) {</a>
+<a name="ln844">		if (!recreatedSuperBlock) {</a>
+<a name="ln845">			printf(&quot;Superblock was valid, no changes made.\n&quot;);</a>
+<a name="ln846">			return 0;</a>
+<a name="ln847">		}</a>
+<a name="ln848"> </a>
+<a name="ln849">		status_t status = disk.WriteAt(512, disk.SuperBlock(),</a>
+<a name="ln850">			sizeof(disk_super_block));</a>
+<a name="ln851">		if (status &lt; B_OK) {</a>
+<a name="ln852">			fprintf(stderr, &quot;Could not write superblock: %s!\n&quot;,</a>
+<a name="ln853">				strerror(status));</a>
+<a name="ln854">			return 1;</a>
+<a name="ln855">		}</a>
+<a name="ln856">		return 0;</a>
+<a name="ln857">	}</a>
+<a name="ln858"> </a>
+<a name="ln859">	puts(&quot;\n*** Collecting inodes...&quot;);</a>
+<a name="ln860"> </a>
+<a name="ln861">	collectLogInodes(disk);</a>
+<a name="ln862">	collectRealInodes(disk);</a>
+<a name="ln863"> </a>
+<a name="ln864">	puts(&quot;\n*** Checking Disk Structure Integrity...&quot;);</a>
+<a name="ln865"> </a>
+<a name="ln866">	checkStructure(disk);</a>
+<a name="ln867"> </a>
+<a name="ln868">	if (argv[1])</a>
+<a name="ln869">		copyInodes(disk, argv[1]);</a>
+<a name="ln870"> </a>
+<a name="ln871">	//disk.WriteBootBlock();</a>
+<a name="ln872">	//disk.BlockBitmap()-&gt;CompareWithBackup();</a>
+<a name="ln873"> </a>
+<a name="ln874">	gMissing.MakeEmpty();</a>
+<a name="ln875">	gLogged.MakeEmpty();</a>
+<a name="ln876"> </a>
+<a name="ln877">	return 0;</a>
+<a name="ln878">}</a>
+<a name="ln879"> </a>
+
+</code></pre>
+<div class="balloon" rel="295"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v629/" target="_blank">V629</a> Consider inspecting the 'disk.Log().length << disk.BlockShift()' expression. Bit shifting of the 32-bit value with a subsequent expansion to the 64-bit type.</p></div>
+<div class="balloon" rel="308"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v629/" target="_blank">V629</a> Consider inspecting the 'disk.Log().length << disk.BlockShift()' expression. Bit shifting of the 32-bit value with a subsequent expansion to the 64-bit type.</p></div>
+<div class="balloon" rel="42"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fPercentUsed.</p></div>
+<div class="balloon" rel="474"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v757/" target="_blank">V757</a> It is possible that an incorrect variable is compared with nullptr after type conversion using 'dynamic_cast'. Check lines: 474, 476.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

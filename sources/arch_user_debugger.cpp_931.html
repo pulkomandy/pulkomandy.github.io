@@ -1,0 +1,1208 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>arch_user_debugger.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2005-2016, Ingo Weinhold, ingo_weinhold@gmx.de.</a>
+<a name="ln3"> * Distributed under the terms of the MIT License.</a>
+<a name="ln4"> */</a>
+<a name="ln5"> </a>
+<a name="ln6"> </a>
+<a name="ln7">#include &lt;arch/user_debugger.h&gt;</a>
+<a name="ln8"> </a>
+<a name="ln9">#include &lt;string.h&gt;</a>
+<a name="ln10"> </a>
+<a name="ln11">#include &lt;debugger.h&gt;</a>
+<a name="ln12">#include &lt;driver_settings.h&gt;</a>
+<a name="ln13">#include &lt;int.h&gt;</a>
+<a name="ln14">#include &lt;team.h&gt;</a>
+<a name="ln15">#include &lt;thread.h&gt;</a>
+<a name="ln16">#include &lt;util/AutoLock.h&gt;</a>
+<a name="ln17"> </a>
+<a name="ln18"> </a>
+<a name="ln19">//#define TRACE_ARCH_USER_DEBUGGER</a>
+<a name="ln20">#ifdef TRACE_ARCH_USER_DEBUGGER</a>
+<a name="ln21">#	define TRACE(x) dprintf x</a>
+<a name="ln22">#else</a>
+<a name="ln23">#	define TRACE(x) ;</a>
+<a name="ln24">#endif</a>
+<a name="ln25"> </a>
+<a name="ln26">#define B_NO_MORE_BREAKPOINTS				B_BUSY</a>
+<a name="ln27">#define B_NO_MORE_WATCHPOINTS				B_BUSY</a>
+<a name="ln28">#define B_BAD_WATCHPOINT_ALIGNMENT			B_BAD_VALUE</a>
+<a name="ln29">#define B_WATCHPOINT_TYPE_NOT_SUPPORTED		B_NOT_SUPPORTED</a>
+<a name="ln30">#define B_WATCHPOINT_LENGTH_NOT_SUPPORTED	B_NOT_SUPPORTED</a>
+<a name="ln31">#define B_BREAKPOINT_NOT_FOUND				B_NAME_NOT_FOUND</a>
+<a name="ln32">#define B_WATCHPOINT_NOT_FOUND				B_NAME_NOT_FOUND</a>
+<a name="ln33">	// TODO: Make those real error codes.</a>
+<a name="ln34"> </a>
+<a name="ln35"> </a>
+<a name="ln36">#ifndef __x86_64__</a>
+<a name="ln37">extern bool gHasSSE;</a>
+<a name="ln38">#endif</a>
+<a name="ln39"> </a>
+<a name="ln40">// The software breakpoint instruction (int3).</a>
+<a name="ln41">const uint8 kX86SoftwareBreakpoint[1] = { 0xcc };</a>
+<a name="ln42"> </a>
+<a name="ln43">// maps breakpoint slot index to LEN_i LSB number</a>
+<a name="ln44">static const size_t sDR7Len[4] = {</a>
+<a name="ln45">	X86_DR7_LEN0_LSB, X86_DR7_LEN1_LSB, X86_DR7_LEN2_LSB, X86_DR7_LEN3_LSB</a>
+<a name="ln46">};</a>
+<a name="ln47"> </a>
+<a name="ln48">// maps breakpoint slot index to R/W_i LSB number</a>
+<a name="ln49">static const size_t sDR7RW[4] = {</a>
+<a name="ln50">	X86_DR7_RW0_LSB, X86_DR7_RW1_LSB, X86_DR7_RW2_LSB, X86_DR7_RW3_LSB</a>
+<a name="ln51">};</a>
+<a name="ln52"> </a>
+<a name="ln53">// maps breakpoint slot index to L_i bit number</a>
+<a name="ln54">static const size_t sDR7L[4] = {</a>
+<a name="ln55">	X86_DR7_L0, X86_DR7_L1, X86_DR7_L2, X86_DR7_L3</a>
+<a name="ln56">};</a>
+<a name="ln57"> </a>
+<a name="ln58">// maps breakpoint slot index to G_i bit number</a>
+<a name="ln59">static const size_t sDR7G[4] = {</a>
+<a name="ln60">	X86_DR7_G0, X86_DR7_G1, X86_DR7_G2, X86_DR7_G3</a>
+<a name="ln61">};</a>
+<a name="ln62"> </a>
+<a name="ln63">// maps breakpoint slot index to B_i bit number</a>
+<a name="ln64">static const size_t sDR6B[4] = {</a>
+<a name="ln65">	X86_DR6_B0, X86_DR6_B1, X86_DR6_B2, X86_DR6_B3</a>
+<a name="ln66">};</a>
+<a name="ln67"> </a>
+<a name="ln68">// Enables a hack to make single stepping work under qemu. Set via kernel</a>
+<a name="ln69">// driver settings.</a>
+<a name="ln70">static bool sQEmuSingleStepHack = false;</a>
+<a name="ln71"> </a>
+<a name="ln72"> </a>
+<a name="ln73">#ifdef __x86_64__</a>
+<a name="ln74"> </a>
+<a name="ln75"> </a>
+<a name="ln76">static void</a>
+<a name="ln77">get_iframe_registers(const iframe* frame, debug_cpu_state* cpuState)</a>
+<a name="ln78">{</a>
+<a name="ln79">	// Get general purpose registers.</a>
+<a name="ln80">	cpuState-&gt;r15 = frame-&gt;r15;</a>
+<a name="ln81">	cpuState-&gt;r14 = frame-&gt;r14;</a>
+<a name="ln82">	cpuState-&gt;r13 = frame-&gt;r13;</a>
+<a name="ln83">	cpuState-&gt;r12 = frame-&gt;r12;</a>
+<a name="ln84">	cpuState-&gt;r11 = frame-&gt;r11;</a>
+<a name="ln85">	cpuState-&gt;r10 = frame-&gt;r10;</a>
+<a name="ln86">	cpuState-&gt;r9 = frame-&gt;r9;</a>
+<a name="ln87">	cpuState-&gt;r8 = frame-&gt;r8;</a>
+<a name="ln88">	cpuState-&gt;rbp = frame-&gt;bp;</a>
+<a name="ln89">	cpuState-&gt;rsi = frame-&gt;si;</a>
+<a name="ln90">	cpuState-&gt;rdi = frame-&gt;di;</a>
+<a name="ln91">	cpuState-&gt;rdx = frame-&gt;dx;</a>
+<a name="ln92">	cpuState-&gt;rcx = frame-&gt;cx;</a>
+<a name="ln93">	cpuState-&gt;rbx = frame-&gt;bx;</a>
+<a name="ln94">	cpuState-&gt;rax = frame-&gt;ax;</a>
+<a name="ln95">	cpuState-&gt;vector = frame-&gt;vector;</a>
+<a name="ln96">	cpuState-&gt;error_code = frame-&gt;error_code;</a>
+<a name="ln97">	cpuState-&gt;rip = frame-&gt;ip;</a>
+<a name="ln98">	cpuState-&gt;cs = frame-&gt;cs;</a>
+<a name="ln99">	cpuState-&gt;rflags = frame-&gt;flags;</a>
+<a name="ln100">	cpuState-&gt;rsp = frame-&gt;sp;</a>
+<a name="ln101">	cpuState-&gt;ss = frame-&gt;ss;</a>
+<a name="ln102"> </a>
+<a name="ln103">	// Other segment registers are not saved or changed on interrupts, so</a>
+<a name="ln104">	// get their value here.</a>
+<a name="ln105">	uint16 seg;</a>
+<a name="ln106">	__asm__ volatile (&quot;movw %%ds, %0&quot; : &quot;=r&quot; (seg));</a>
+<a name="ln107">	cpuState-&gt;ds = seg;</a>
+<a name="ln108">	__asm__ volatile (&quot;movw %%es, %0&quot; : &quot;=r&quot; (seg));</a>
+<a name="ln109">	cpuState-&gt;es = seg;</a>
+<a name="ln110">	__asm__ volatile (&quot;movw %%fs, %0&quot; : &quot;=r&quot; (seg));</a>
+<a name="ln111">	cpuState-&gt;fs = seg;</a>
+<a name="ln112">	__asm__ volatile (&quot;movw %%gs, %0&quot; : &quot;=r&quot; (seg));</a>
+<a name="ln113">	cpuState-&gt;gs = seg;</a>
+<a name="ln114">}</a>
+<a name="ln115"> </a>
+<a name="ln116"> </a>
+<a name="ln117">static void</a>
+<a name="ln118">set_iframe_registers(iframe* frame, const debug_cpu_state* cpuState)</a>
+<a name="ln119">{</a>
+<a name="ln120">	frame-&gt;r15 = cpuState-&gt;r15;</a>
+<a name="ln121">	frame-&gt;r14 = cpuState-&gt;r14;</a>
+<a name="ln122">	frame-&gt;r13 = cpuState-&gt;r13;</a>
+<a name="ln123">	frame-&gt;r12 = cpuState-&gt;r12;</a>
+<a name="ln124">	frame-&gt;r11 = cpuState-&gt;r11;</a>
+<a name="ln125">	frame-&gt;r10 = cpuState-&gt;r10;</a>
+<a name="ln126">	frame-&gt;r9 = cpuState-&gt;r9;</a>
+<a name="ln127">	frame-&gt;r8 = cpuState-&gt;r8;</a>
+<a name="ln128">	frame-&gt;bp = cpuState-&gt;rbp;</a>
+<a name="ln129">	frame-&gt;si = cpuState-&gt;rsi;</a>
+<a name="ln130">	frame-&gt;di = cpuState-&gt;rdi;</a>
+<a name="ln131">	frame-&gt;dx = cpuState-&gt;rdx;</a>
+<a name="ln132">	frame-&gt;cx = cpuState-&gt;rcx;</a>
+<a name="ln133">	frame-&gt;bx = cpuState-&gt;rbx;</a>
+<a name="ln134">	frame-&gt;ax = cpuState-&gt;rax;</a>
+<a name="ln135">	frame-&gt;ip = cpuState-&gt;rip;</a>
+<a name="ln136">	frame-&gt;flags = (frame-&gt;flags &amp; ~X86_EFLAGS_USER_SETTABLE_FLAGS)</a>
+<a name="ln137">		| (cpuState-&gt;rflags &amp; X86_EFLAGS_USER_SETTABLE_FLAGS);</a>
+<a name="ln138">	frame-&gt;sp = cpuState-&gt;rsp;</a>
+<a name="ln139">}</a>
+<a name="ln140"> </a>
+<a name="ln141"> </a>
+<a name="ln142">#else	// __x86_64__</a>
+<a name="ln143"> </a>
+<a name="ln144"> </a>
+<a name="ln145">static void</a>
+<a name="ln146">get_iframe_registers(const iframe* frame, debug_cpu_state* cpuState)</a>
+<a name="ln147">{</a>
+<a name="ln148">	cpuState-&gt;gs = frame-&gt;gs;</a>
+<a name="ln149">	cpuState-&gt;fs = frame-&gt;fs;</a>
+<a name="ln150">	cpuState-&gt;es = frame-&gt;es;</a>
+<a name="ln151">	cpuState-&gt;ds = frame-&gt;ds;</a>
+<a name="ln152">	cpuState-&gt;edi = frame-&gt;di;</a>
+<a name="ln153">	cpuState-&gt;esi = frame-&gt;si;</a>
+<a name="ln154">	cpuState-&gt;ebp = frame-&gt;bp;</a>
+<a name="ln155">	cpuState-&gt;esp = frame-&gt;sp;</a>
+<a name="ln156">	cpuState-&gt;ebx = frame-&gt;bx;</a>
+<a name="ln157">	cpuState-&gt;edx = frame-&gt;orig_edx;</a>
+<a name="ln158">	cpuState-&gt;ecx = frame-&gt;cx;</a>
+<a name="ln159">	cpuState-&gt;eax = frame-&gt;orig_eax;</a>
+<a name="ln160">	cpuState-&gt;vector = frame-&gt;vector;</a>
+<a name="ln161">	cpuState-&gt;error_code = frame-&gt;error_code;</a>
+<a name="ln162">	cpuState-&gt;eip = frame-&gt;ip;</a>
+<a name="ln163">	cpuState-&gt;cs = frame-&gt;cs;</a>
+<a name="ln164">	cpuState-&gt;eflags = frame-&gt;flags;</a>
+<a name="ln165">	cpuState-&gt;user_esp = frame-&gt;user_sp;</a>
+<a name="ln166">	cpuState-&gt;user_ss = frame-&gt;user_ss;</a>
+<a name="ln167">}</a>
+<a name="ln168"> </a>
+<a name="ln169"> </a>
+<a name="ln170">static void</a>
+<a name="ln171">set_iframe_registers(iframe* frame, const debug_cpu_state* cpuState)</a>
+<a name="ln172">{</a>
+<a name="ln173">//	frame-&gt;gs = cpuState-&gt;gs;</a>
+<a name="ln174">//	frame-&gt;fs = cpuState-&gt;fs;</a>
+<a name="ln175">//	frame-&gt;es = cpuState-&gt;es;</a>
+<a name="ln176">//	frame-&gt;ds = cpuState-&gt;ds;</a>
+<a name="ln177">	frame-&gt;di = cpuState-&gt;edi;</a>
+<a name="ln178">	frame-&gt;si = cpuState-&gt;esi;</a>
+<a name="ln179">	frame-&gt;bp = cpuState-&gt;ebp;</a>
+<a name="ln180">//	frame-&gt;esp = cpuState-&gt;esp;</a>
+<a name="ln181">	frame-&gt;bx = cpuState-&gt;ebx;</a>
+<a name="ln182">	frame-&gt;dx = cpuState-&gt;edx;</a>
+<a name="ln183">	frame-&gt;cx = cpuState-&gt;ecx;</a>
+<a name="ln184">	frame-&gt;ax = cpuState-&gt;eax;</a>
+<a name="ln185">//	frame-&gt;vector = cpuState-&gt;vector;</a>
+<a name="ln186">//	frame-&gt;error_code = cpuState-&gt;error_code;</a>
+<a name="ln187">	frame-&gt;ip = cpuState-&gt;eip;</a>
+<a name="ln188">//	frame-&gt;cs = cpuState-&gt;cs;</a>
+<a name="ln189">	frame-&gt;flags = (frame-&gt;flags &amp; ~X86_EFLAGS_USER_SETTABLE_FLAGS)</a>
+<a name="ln190">		| (cpuState-&gt;eflags &amp; X86_EFLAGS_USER_SETTABLE_FLAGS);</a>
+<a name="ln191">	frame-&gt;user_sp = cpuState-&gt;user_esp;</a>
+<a name="ln192">//	frame-&gt;user_ss = cpuState-&gt;user_ss;</a>
+<a name="ln193">}</a>
+<a name="ln194"> </a>
+<a name="ln195"> </a>
+<a name="ln196">#endif	// __x86_64__</a>
+<a name="ln197"> </a>
+<a name="ln198"> </a>
+<a name="ln199">static void</a>
+<a name="ln200">get_cpu_state(Thread* thread, iframe* frame, debug_cpu_state* cpuState)</a>
+<a name="ln201">{</a>
+<a name="ln202">	// For the floating point state to be correct the calling function must</a>
+<a name="ln203">	// not use these registers (not even indirectly).</a>
+<a name="ln204">#ifdef __x86_64__</a>
+<a name="ln205">	if (frame-&gt;fpu != nullptr) {</a>
+<a name="ln206">		memcpy(&amp;cpuState-&gt;extended_registers, frame-&gt;fpu,</a>
+<a name="ln207">			sizeof(cpuState-&gt;extended_registers));</a>
+<a name="ln208">	} else {</a>
+<a name="ln209">		memset(&amp;cpuState-&gt;extended_registers, 0,</a>
+<a name="ln210">			sizeof(cpuState-&gt;extended_registers));</a>
+<a name="ln211">	}</a>
+<a name="ln212">#else</a>
+<a name="ln213">	Thread* thisThread = thread_get_current_thread();</a>
+<a name="ln214">	if (gHasSSE) {</a>
+<a name="ln215">		if (thread == thisThread) {</a>
+<a name="ln216">			// Since fxsave requires 16-byte alignment and this isn't guaranteed</a>
+<a name="ln217">			// for the passed buffer, we use our thread's fpu_state field as</a>
+<a name="ln218">			// temporary buffer. We need to disable interrupts to make use of</a>
+<a name="ln219">			// it.</a>
+<a name="ln220">			Thread* thread = thread_get_current_thread();</a>
+<a name="ln221">			InterruptsLocker locker;</a>
+<a name="ln222">			x86_fxsave(thread-&gt;arch_info.fpu_state);</a>
+<a name="ln223">				// unlike fnsave, fxsave doesn't reinit the FPU state</a>
+<a name="ln224">		}</a>
+<a name="ln225">		memcpy(&amp;cpuState-&gt;extended_registers, thread-&gt;arch_info.fpu_state,</a>
+<a name="ln226">			sizeof(cpuState-&gt;extended_registers));</a>
+<a name="ln227">	} else {</a>
+<a name="ln228">		if (thread == thisThread) {</a>
+<a name="ln229">			x86_fnsave(&amp;cpuState-&gt;extended_registers);</a>
+<a name="ln230">			// fnsave reinits the FPU state after saving, so we need to</a>
+<a name="ln231">			// load it again</a>
+<a name="ln232">			x86_frstor(&amp;cpuState-&gt;extended_registers);</a>
+<a name="ln233">		} else {</a>
+<a name="ln234">			memcpy(&amp;cpuState-&gt;extended_registers, thread-&gt;arch_info.fpu_state,</a>
+<a name="ln235">				sizeof(cpuState-&gt;extended_registers));</a>
+<a name="ln236">		}</a>
+<a name="ln237">		// TODO: Convert to fxsave format!</a>
+<a name="ln238">	}</a>
+<a name="ln239">#endif</a>
+<a name="ln240">	get_iframe_registers(frame, cpuState);</a>
+<a name="ln241">}</a>
+<a name="ln242"> </a>
+<a name="ln243"> </a>
+<a name="ln244">static inline void</a>
+<a name="ln245">install_breakpoints(const arch_team_debug_info&amp; teamInfo)</a>
+<a name="ln246">{</a>
+<a name="ln247">	// set breakpoints</a>
+<a name="ln248">	asm(&quot;mov %0, %%dr0&quot; : : &quot;r&quot;(teamInfo.breakpoints[0].address));</a>
+<a name="ln249">	asm(&quot;mov %0, %%dr1&quot; : : &quot;r&quot;(teamInfo.breakpoints[1].address));</a>
+<a name="ln250">	asm(&quot;mov %0, %%dr2&quot; : : &quot;r&quot;(teamInfo.breakpoints[2].address));</a>
+<a name="ln251">	asm(&quot;mov %0, %%dr3&quot; : : &quot;r&quot;(teamInfo.breakpoints[3].address));</a>
+<a name="ln252"> </a>
+<a name="ln253">	// enable breakpoints</a>
+<a name="ln254">	asm(&quot;mov %0, %%dr7&quot; : : &quot;r&quot;(teamInfo.dr7));</a>
+<a name="ln255">}</a>
+<a name="ln256"> </a>
+<a name="ln257"> </a>
+<a name="ln258">static inline void</a>
+<a name="ln259">disable_breakpoints()</a>
+<a name="ln260">{</a>
+<a name="ln261">	asm(&quot;mov %0, %%dr7&quot; : : &quot;r&quot;((size_t)X86_BREAKPOINTS_DISABLED_DR7));</a>
+<a name="ln262">}</a>
+<a name="ln263"> </a>
+<a name="ln264"> </a>
+<a name="ln265">/*! Sets a break-/watchpoint in the given team info.</a>
+<a name="ln266">	Interrupts must be disabled and the team debug info lock be held.</a>
+<a name="ln267">*/</a>
+<a name="ln268">static inline status_t</a>
+<a name="ln269">set_breakpoint(arch_team_debug_info&amp; info, void* address, size_t type,</a>
+<a name="ln270">	size_t length, bool setGlobalFlag)</a>
+<a name="ln271">{</a>
+<a name="ln272">	// check, if there is already a breakpoint at that address</a>
+<a name="ln273">	bool alreadySet = false;</a>
+<a name="ln274">	for (int32 i = 0; i &lt; X86_BREAKPOINT_COUNT; i++) {</a>
+<a name="ln275">		if (info.breakpoints[i].address == address</a>
+<a name="ln276">			&amp;&amp; info.breakpoints[i].type == type) {</a>
+<a name="ln277">			alreadySet = true;</a>
+<a name="ln278">			break;</a>
+<a name="ln279">		}</a>
+<a name="ln280">	}</a>
+<a name="ln281"> </a>
+<a name="ln282">	if (!alreadySet) {</a>
+<a name="ln283">		// find a free slot</a>
+<a name="ln284">		int32 slot = -1;</a>
+<a name="ln285">		for (int32 i = 0; i &lt; X86_BREAKPOINT_COUNT; i++) {</a>
+<a name="ln286">			if (!info.breakpoints[i].address) {</a>
+<a name="ln287">				slot = i;</a>
+<a name="ln288">				break;</a>
+<a name="ln289">			}</a>
+<a name="ln290">		}</a>
+<a name="ln291"> </a>
+<a name="ln292">		// init the breakpoint</a>
+<a name="ln293">		if (slot &gt;= 0) {</a>
+<a name="ln294">			info.breakpoints[slot].address = address;</a>
+<a name="ln295">			info.breakpoints[slot].type = type;</a>
+<a name="ln296">			info.breakpoints[slot].length = length;</a>
+<a name="ln297"> </a>
+<a name="ln298">			info.dr7 |= (length &lt;&lt; sDR7Len[slot])</a>
+<a name="ln299">				| (type &lt;&lt; sDR7RW[slot])</a>
+<a name="ln300">				| (1 &lt;&lt; sDR7L[slot]);</a>
+<a name="ln301">			if (setGlobalFlag)</a>
+<a name="ln302">				info.dr7 |= (1 &lt;&lt; sDR7G[slot]);</a>
+<a name="ln303">		} else {</a>
+<a name="ln304">			if (type == X86_INSTRUCTION_BREAKPOINT)</a>
+<a name="ln305">				return B_NO_MORE_BREAKPOINTS;</a>
+<a name="ln306">			else</a>
+<a name="ln307">				return B_NO_MORE_WATCHPOINTS;</a>
+<a name="ln308">		}</a>
+<a name="ln309">	}</a>
+<a name="ln310"> </a>
+<a name="ln311">	return B_OK;</a>
+<a name="ln312">}</a>
+<a name="ln313"> </a>
+<a name="ln314"> </a>
+<a name="ln315">/*! Clears a break-/watchpoint in the given team info.</a>
+<a name="ln316">	Interrupts must be disabled and the team debug info lock be held.</a>
+<a name="ln317">*/</a>
+<a name="ln318">static inline status_t</a>
+<a name="ln319">clear_breakpoint(arch_team_debug_info&amp; info, void* address, bool watchpoint)</a>
+<a name="ln320">{</a>
+<a name="ln321">	// find the breakpoint</a>
+<a name="ln322">	int32 slot = -1;</a>
+<a name="ln323">	for (int32 i = 0; i &lt; X86_BREAKPOINT_COUNT; i++) {</a>
+<a name="ln324">		if (info.breakpoints[i].address == address</a>
+<a name="ln325">			&amp;&amp; (watchpoint</a>
+<a name="ln326">				!= (info.breakpoints[i].type == X86_INSTRUCTION_BREAKPOINT))) {</a>
+<a name="ln327">			slot = i;</a>
+<a name="ln328">			break;</a>
+<a name="ln329">		}</a>
+<a name="ln330">	}</a>
+<a name="ln331"> </a>
+<a name="ln332">	// clear the breakpoint</a>
+<a name="ln333">	if (slot &gt;= 0) {</a>
+<a name="ln334">		info.breakpoints[slot].address = NULL;</a>
+<a name="ln335"> </a>
+<a name="ln336">		info.dr7 &amp;= ~((0x3 &lt;&lt; sDR7Len[slot])</a>
+<a name="ln337">			| (0x3 &lt;&lt; sDR7RW[slot])</a>
+<a name="ln338">			| (1 &lt;&lt; sDR7L[slot])</a>
+<a name="ln339">			| (1 &lt;&lt; sDR7G[slot]));</a>
+<a name="ln340">	} else {</a>
+<a name="ln341">		if (watchpoint)</a>
+<a name="ln342">			return B_WATCHPOINT_NOT_FOUND;</a>
+<a name="ln343">		else</a>
+<a name="ln344">			return B_BREAKPOINT_NOT_FOUND;</a>
+<a name="ln345">	}</a>
+<a name="ln346"> </a>
+<a name="ln347">	return B_OK;</a>
+<a name="ln348">}</a>
+<a name="ln349"> </a>
+<a name="ln350"> </a>
+<a name="ln351">static status_t</a>
+<a name="ln352">set_breakpoint(void* address, size_t type, size_t length)</a>
+<a name="ln353">{</a>
+<a name="ln354">	if (!address)</a>
+<a name="ln355">		return B_BAD_VALUE;</a>
+<a name="ln356"> </a>
+<a name="ln357">	Thread* thread = thread_get_current_thread();</a>
+<a name="ln358"> </a>
+<a name="ln359">	cpu_status state = disable_interrupts();</a>
+<a name="ln360">	GRAB_TEAM_DEBUG_INFO_LOCK(thread-&gt;team-&gt;debug_info);</a>
+<a name="ln361"> </a>
+<a name="ln362">	status_t error = set_breakpoint(thread-&gt;team-&gt;debug_info.arch_info, address,</a>
+<a name="ln363">		type, length, false);</a>
+<a name="ln364"> </a>
+<a name="ln365">	RELEASE_TEAM_DEBUG_INFO_LOCK(thread-&gt;team-&gt;debug_info);</a>
+<a name="ln366">	restore_interrupts(state);</a>
+<a name="ln367"> </a>
+<a name="ln368">	return error;</a>
+<a name="ln369">}</a>
+<a name="ln370"> </a>
+<a name="ln371"> </a>
+<a name="ln372">static status_t</a>
+<a name="ln373">clear_breakpoint(void* address, bool watchpoint)</a>
+<a name="ln374">{</a>
+<a name="ln375">	if (!address)</a>
+<a name="ln376">		return B_BAD_VALUE;</a>
+<a name="ln377"> </a>
+<a name="ln378">	Thread* thread = thread_get_current_thread();</a>
+<a name="ln379"> </a>
+<a name="ln380">	cpu_status state = disable_interrupts();</a>
+<a name="ln381">	GRAB_TEAM_DEBUG_INFO_LOCK(thread-&gt;team-&gt;debug_info);</a>
+<a name="ln382"> </a>
+<a name="ln383">	status_t error = clear_breakpoint(thread-&gt;team-&gt;debug_info.arch_info,</a>
+<a name="ln384">		address, watchpoint);</a>
+<a name="ln385"> </a>
+<a name="ln386">	RELEASE_TEAM_DEBUG_INFO_LOCK(thread-&gt;team-&gt;debug_info);</a>
+<a name="ln387">	restore_interrupts(state);</a>
+<a name="ln388"> </a>
+<a name="ln389">	return error;</a>
+<a name="ln390">}</a>
+<a name="ln391"> </a>
+<a name="ln392"> </a>
+<a name="ln393">#if KERNEL_BREAKPOINTS</a>
+<a name="ln394"> </a>
+<a name="ln395"> </a>
+<a name="ln396">static void</a>
+<a name="ln397">install_breakpoints_per_cpu(void* /*cookie*/, int cpu)</a>
+<a name="ln398">{</a>
+<a name="ln399">	Team* kernelTeam = team_get_kernel_team();</a>
+<a name="ln400"> </a>
+<a name="ln401">	GRAB_TEAM_DEBUG_INFO_LOCK(kernelTeam-&gt;debug_info);</a>
+<a name="ln402"> </a>
+<a name="ln403">	install_breakpoints(kernelTeam-&gt;debug_info.arch_info);</a>
+<a name="ln404"> </a>
+<a name="ln405">	RELEASE_TEAM_DEBUG_INFO_LOCK(kernelTeam-&gt;debug_info);</a>
+<a name="ln406">}</a>
+<a name="ln407"> </a>
+<a name="ln408"> </a>
+<a name="ln409">static status_t</a>
+<a name="ln410">set_kernel_breakpoint(void* address, size_t type, size_t length)</a>
+<a name="ln411">{</a>
+<a name="ln412">	if (!address)</a>
+<a name="ln413">		return B_BAD_VALUE;</a>
+<a name="ln414"> </a>
+<a name="ln415">	Team* kernelTeam = team_get_kernel_team();</a>
+<a name="ln416"> </a>
+<a name="ln417">	cpu_status state = disable_interrupts();</a>
+<a name="ln418">	GRAB_TEAM_DEBUG_INFO_LOCK(kernelTeam-&gt;debug_info);</a>
+<a name="ln419"> </a>
+<a name="ln420">	status_t error = set_breakpoint(kernelTeam-&gt;debug_info.arch_info, address,</a>
+<a name="ln421">		type, length, true);</a>
+<a name="ln422"> </a>
+<a name="ln423">	RELEASE_TEAM_DEBUG_INFO_LOCK(kernelTeam-&gt;debug_info);</a>
+<a name="ln424"> </a>
+<a name="ln425">	call_all_cpus(install_breakpoints_per_cpu, NULL);</a>
+<a name="ln426"> </a>
+<a name="ln427">	restore_interrupts(state);</a>
+<a name="ln428"> </a>
+<a name="ln429">	return error;</a>
+<a name="ln430">}</a>
+<a name="ln431"> </a>
+<a name="ln432"> </a>
+<a name="ln433">static status_t</a>
+<a name="ln434">clear_kernel_breakpoint(void* address, bool watchpoint)</a>
+<a name="ln435">{</a>
+<a name="ln436">	if (!address)</a>
+<a name="ln437">		return B_BAD_VALUE;</a>
+<a name="ln438"> </a>
+<a name="ln439">	Team* kernelTeam = team_get_kernel_team();</a>
+<a name="ln440"> </a>
+<a name="ln441">	cpu_status state = disable_interrupts();</a>
+<a name="ln442">	GRAB_TEAM_DEBUG_INFO_LOCK(kernelTeam-&gt;debug_info);</a>
+<a name="ln443"> </a>
+<a name="ln444">	status_t error = clear_breakpoint(kernelTeam-&gt;debug_info.arch_info,</a>
+<a name="ln445">		address, watchpoint);</a>
+<a name="ln446"> </a>
+<a name="ln447">	RELEASE_TEAM_DEBUG_INFO_LOCK(kernelTeam-&gt;debug_info);</a>
+<a name="ln448"> </a>
+<a name="ln449">	call_all_cpus(install_breakpoints_per_cpu, NULL);</a>
+<a name="ln450"> </a>
+<a name="ln451">	restore_interrupts(state);</a>
+<a name="ln452"> </a>
+<a name="ln453">	return error;</a>
+<a name="ln454">}</a>
+<a name="ln455"> </a>
+<a name="ln456">#endif	// KERNEL_BREAKPOINTS</a>
+<a name="ln457"> </a>
+<a name="ln458"> </a>
+<a name="ln459">static inline status_t</a>
+<a name="ln460">check_watch_point_parameters(void* address, uint32 type, int32 length,</a>
+<a name="ln461">	size_t&amp; archType, size_t&amp; archLength)</a>
+<a name="ln462">{</a>
+<a name="ln463">	// check type</a>
+<a name="ln464">	switch (type) {</a>
+<a name="ln465">		case B_DATA_WRITE_WATCHPOINT:</a>
+<a name="ln466">			archType = X86_DATA_WRITE_BREAKPOINT;</a>
+<a name="ln467">			break;</a>
+<a name="ln468">		case B_DATA_READ_WRITE_WATCHPOINT:</a>
+<a name="ln469">			archType = X86_DATA_READ_WRITE_BREAKPOINT;</a>
+<a name="ln470">			break;</a>
+<a name="ln471">		case B_DATA_READ_WATCHPOINT:</a>
+<a name="ln472">		default:</a>
+<a name="ln473">			return B_WATCHPOINT_TYPE_NOT_SUPPORTED;</a>
+<a name="ln474">			break;</a>
+<a name="ln475">	}</a>
+<a name="ln476"> </a>
+<a name="ln477">	// check length and alignment</a>
+<a name="ln478">	switch (length) {</a>
+<a name="ln479">		case 1:</a>
+<a name="ln480">			archLength = X86_BREAKPOINT_LENGTH_1;</a>
+<a name="ln481">			break;</a>
+<a name="ln482">		case 2:</a>
+<a name="ln483">			if ((addr_t)address &amp; 0x1)</a>
+<a name="ln484">				return B_BAD_WATCHPOINT_ALIGNMENT;</a>
+<a name="ln485">			archLength = X86_BREAKPOINT_LENGTH_2;</a>
+<a name="ln486">			break;</a>
+<a name="ln487">		case 4:</a>
+<a name="ln488">			if ((addr_t)address &amp; 0x3)</a>
+<a name="ln489">				return B_BAD_WATCHPOINT_ALIGNMENT;</a>
+<a name="ln490">			archLength = X86_BREAKPOINT_LENGTH_4;</a>
+<a name="ln491">			break;</a>
+<a name="ln492">		default:</a>
+<a name="ln493">			return B_WATCHPOINT_LENGTH_NOT_SUPPORTED;</a>
+<a name="ln494">	}</a>
+<a name="ln495"> </a>
+<a name="ln496">	return B_OK;</a>
+<a name="ln497">}</a>
+<a name="ln498"> </a>
+<a name="ln499"> </a>
+<a name="ln500">// #pragma mark - kernel debugger commands</a>
+<a name="ln501"> </a>
+<a name="ln502"> </a>
+<a name="ln503">#if KERNEL_BREAKPOINTS</a>
+<a name="ln504"> </a>
+<a name="ln505">static int</a>
+<a name="ln506">debugger_breakpoints(int argc, char** argv)</a>
+<a name="ln507">{</a>
+<a name="ln508">	Team* kernelTeam = team_get_kernel_team();</a>
+<a name="ln509">	arch_team_debug_info&amp; info = kernelTeam-&gt;debug_info.arch_info;</a>
+<a name="ln510"> </a>
+<a name="ln511">	for (int32 i = 0; i &lt; X86_BREAKPOINT_COUNT; i++) {</a>
+<a name="ln512">		kprintf(&quot;breakpoint[%&quot; B_PRId32 &quot;] &quot;, i);</a>
+<a name="ln513"> </a>
+<a name="ln514">		if (info.breakpoints[i].address != NULL) {</a>
+<a name="ln515">			kprintf(&quot;%p &quot;, info.breakpoints[i].address);</a>
+<a name="ln516">			switch (info.breakpoints[i].type) {</a>
+<a name="ln517">				case X86_INSTRUCTION_BREAKPOINT:</a>
+<a name="ln518">					kprintf(&quot;instruction&quot;);</a>
+<a name="ln519">					break;</a>
+<a name="ln520">				case X86_IO_READ_WRITE_BREAKPOINT:</a>
+<a name="ln521">					kprintf(&quot;io read/write&quot;);</a>
+<a name="ln522">					break;</a>
+<a name="ln523">				case X86_DATA_WRITE_BREAKPOINT:</a>
+<a name="ln524">					kprintf(&quot;data write&quot;);</a>
+<a name="ln525">					break;</a>
+<a name="ln526">				case X86_DATA_READ_WRITE_BREAKPOINT:</a>
+<a name="ln527">					kprintf(&quot;data read/write&quot;);</a>
+<a name="ln528">					break;</a>
+<a name="ln529">			}</a>
+<a name="ln530"> </a>
+<a name="ln531">			int length = 1;</a>
+<a name="ln532">			switch (info.breakpoints[i].length) {</a>
+<a name="ln533">				case X86_BREAKPOINT_LENGTH_1:</a>
+<a name="ln534">					length = 1;</a>
+<a name="ln535">					break;</a>
+<a name="ln536">				case X86_BREAKPOINT_LENGTH_2:</a>
+<a name="ln537">					length = 2;</a>
+<a name="ln538">					break;</a>
+<a name="ln539">				case X86_BREAKPOINT_LENGTH_4:</a>
+<a name="ln540">					length = 4;</a>
+<a name="ln541">					break;</a>
+<a name="ln542">			}</a>
+<a name="ln543"> </a>
+<a name="ln544">			if (info.breakpoints[i].type != X86_INSTRUCTION_BREAKPOINT)</a>
+<a name="ln545">				kprintf(&quot; %d byte%s&quot;, length, (length &gt; 1 ? &quot;s&quot; : &quot;&quot;));</a>
+<a name="ln546">		} else</a>
+<a name="ln547">			kprintf(&quot;unused&quot;);</a>
+<a name="ln548"> </a>
+<a name="ln549">		kprintf(&quot;\n&quot;);</a>
+<a name="ln550">	}</a>
+<a name="ln551"> </a>
+<a name="ln552">	return 0;</a>
+<a name="ln553">}</a>
+<a name="ln554"> </a>
+<a name="ln555"> </a>
+<a name="ln556">static int</a>
+<a name="ln557">debugger_breakpoint(int argc, char** argv)</a>
+<a name="ln558">{</a>
+<a name="ln559">	// get arguments</a>
+<a name="ln560"> </a>
+<a name="ln561">	if (argc &lt; 2 || argc &gt; 3)</a>
+<a name="ln562">		return print_debugger_command_usage(argv[0]);</a>
+<a name="ln563"> </a>
+<a name="ln564">	addr_t address = strtoul(argv[1], NULL, 0);</a>
+<a name="ln565">	if (address == 0)</a>
+<a name="ln566">		return print_debugger_command_usage(argv[0]);</a>
+<a name="ln567"> </a>
+<a name="ln568">	bool clear = false;</a>
+<a name="ln569">	if (argc == 3) {</a>
+<a name="ln570">		if (strcmp(argv[2], &quot;clear&quot;) == 0)</a>
+<a name="ln571">			clear = true;</a>
+<a name="ln572">		else</a>
+<a name="ln573">			return print_debugger_command_usage(argv[0]);</a>
+<a name="ln574">	}</a>
+<a name="ln575"> </a>
+<a name="ln576">	// set/clear breakpoint</a>
+<a name="ln577"> </a>
+<a name="ln578">	arch_team_debug_info&amp; info = team_get_kernel_team()-&gt;debug_info.arch_info;</a>
+<a name="ln579"> </a>
+<a name="ln580">	status_t error;</a>
+<a name="ln581"> </a>
+<a name="ln582">	if (clear) {</a>
+<a name="ln583">		error = clear_breakpoint(info, (void*)address, false);</a>
+<a name="ln584">	} else {</a>
+<a name="ln585">		error = set_breakpoint(info, (void*)address, X86_INSTRUCTION_BREAKPOINT,</a>
+<a name="ln586">			X86_BREAKPOINT_LENGTH_1, true);</a>
+<a name="ln587">	}</a>
+<a name="ln588"> </a>
+<a name="ln589">	if (error == B_OK)</a>
+<a name="ln590">		call_all_cpus_sync(install_breakpoints_per_cpu, NULL);</a>
+<a name="ln591">	else</a>
+<a name="ln592">		kprintf(&quot;Failed to install breakpoint: %s\n&quot;, strerror(error));</a>
+<a name="ln593"> </a>
+<a name="ln594">	return 0;</a>
+<a name="ln595">}</a>
+<a name="ln596"> </a>
+<a name="ln597"> </a>
+<a name="ln598">static int</a>
+<a name="ln599">debugger_watchpoint(int argc, char** argv)</a>
+<a name="ln600">{</a>
+<a name="ln601">	// get arguments</a>
+<a name="ln602"> </a>
+<a name="ln603">	if (argc &lt; 2 || argc &gt; 4)</a>
+<a name="ln604">		return print_debugger_command_usage(argv[0]);</a>
+<a name="ln605"> </a>
+<a name="ln606">	addr_t address = strtoul(argv[1], NULL, 0);</a>
+<a name="ln607">	if (address == 0)</a>
+<a name="ln608">		return print_debugger_command_usage(argv[0]);</a>
+<a name="ln609"> </a>
+<a name="ln610">	bool clear = false;</a>
+<a name="ln611">	bool readWrite = false;</a>
+<a name="ln612">	int argi = 2;</a>
+<a name="ln613">	int length = 1;</a>
+<a name="ln614">	if (argc &gt;= 3) {</a>
+<a name="ln615">		if (strcmp(argv[argi], &quot;clear&quot;) == 0) {</a>
+<a name="ln616">			clear = true;</a>
+<a name="ln617">			argi++;</a>
+<a name="ln618">		} else if (strcmp(argv[argi], &quot;rw&quot;) == 0) {</a>
+<a name="ln619">			readWrite = true;</a>
+<a name="ln620">			argi++;</a>
+<a name="ln621">		}</a>
+<a name="ln622"> </a>
+<a name="ln623">		if (!clear &amp;&amp; argi &lt; argc)</a>
+<a name="ln624">			length = strtoul(argv[argi++], NULL, 0);</a>
+<a name="ln625"> </a>
+<a name="ln626">		if (length == 0 || argi &lt; argc)</a>
+<a name="ln627">			return print_debugger_command_usage(argv[0]);</a>
+<a name="ln628">	}</a>
+<a name="ln629"> </a>
+<a name="ln630">	// set/clear breakpoint</a>
+<a name="ln631"> </a>
+<a name="ln632">	arch_team_debug_info&amp; info = team_get_kernel_team()-&gt;debug_info.arch_info;</a>
+<a name="ln633"> </a>
+<a name="ln634">	status_t error;</a>
+<a name="ln635"> </a>
+<a name="ln636">	if (clear) {</a>
+<a name="ln637">		error = clear_breakpoint(info, (void*)address, true);</a>
+<a name="ln638">	} else {</a>
+<a name="ln639">		uint32 type = readWrite ? B_DATA_READ_WRITE_WATCHPOINT</a>
+<a name="ln640">			: B_DATA_WRITE_WATCHPOINT;</a>
+<a name="ln641"> </a>
+<a name="ln642">		size_t archType, archLength;</a>
+<a name="ln643">		error = check_watch_point_parameters((void*)address, type, length,</a>
+<a name="ln644">			archType, archLength);</a>
+<a name="ln645"> </a>
+<a name="ln646">		if (error == B_OK) {</a>
+<a name="ln647">			error = set_breakpoint(info, (void*)address, archType, archLength,</a>
+<a name="ln648">				true);</a>
+<a name="ln649">		}</a>
+<a name="ln650">	}</a>
+<a name="ln651"> </a>
+<a name="ln652">	if (error == B_OK)</a>
+<a name="ln653">		call_all_cpus_sync(install_breakpoints_per_cpu, NULL);</a>
+<a name="ln654">	else</a>
+<a name="ln655">		kprintf(&quot;Failed to install breakpoint: %s\n&quot;, strerror(error));</a>
+<a name="ln656"> </a>
+<a name="ln657">	return 0;</a>
+<a name="ln658">}</a>
+<a name="ln659"> </a>
+<a name="ln660"> </a>
+<a name="ln661">static int</a>
+<a name="ln662">debugger_single_step(int argc, char** argv)</a>
+<a name="ln663">{</a>
+<a name="ln664">	// TODO: Since we need an iframe, this doesn't work when KDL wasn't entered</a>
+<a name="ln665">	// via an exception.</a>
+<a name="ln666"> </a>
+<a name="ln667">	iframe* frame = x86_get_current_iframe();</a>
+<a name="ln668">	if (frame == NULL) {</a>
+<a name="ln669">		kprintf(&quot;Failed to get the current iframe!\n&quot;);</a>
+<a name="ln670">		return 0;</a>
+<a name="ln671">	}</a>
+<a name="ln672"> </a>
+<a name="ln673">	frame-&gt;flags |= (1 &lt;&lt; X86_EFLAGS_TF);</a>
+<a name="ln674"> </a>
+<a name="ln675">	return B_KDEBUG_QUIT;</a>
+<a name="ln676">}</a>
+<a name="ln677"> </a>
+<a name="ln678"> </a>
+<a name="ln679">#endif	// KERNEL_BREAKPOINTS</a>
+<a name="ln680"> </a>
+<a name="ln681"> </a>
+<a name="ln682">// #pragma mark - in-kernel public interface</a>
+<a name="ln683"> </a>
+<a name="ln684"> </a>
+<a name="ln685">void</a>
+<a name="ln686">arch_clear_team_debug_info(arch_team_debug_info* info)</a>
+<a name="ln687">{</a>
+<a name="ln688">	for (int32 i = 0; i &lt; X86_BREAKPOINT_COUNT; i++)</a>
+<a name="ln689">		info-&gt;breakpoints[i].address = NULL;</a>
+<a name="ln690"> </a>
+<a name="ln691">	info-&gt;dr7 = X86_BREAKPOINTS_DISABLED_DR7;</a>
+<a name="ln692">}</a>
+<a name="ln693"> </a>
+<a name="ln694"> </a>
+<a name="ln695">void</a>
+<a name="ln696">arch_destroy_team_debug_info(arch_team_debug_info* info)</a>
+<a name="ln697">{</a>
+<a name="ln698">	arch_clear_team_debug_info(info);</a>
+<a name="ln699">}</a>
+<a name="ln700"> </a>
+<a name="ln701"> </a>
+<a name="ln702">void</a>
+<a name="ln703">arch_clear_thread_debug_info(arch_thread_debug_info* info)</a>
+<a name="ln704">{</a>
+<a name="ln705">	info-&gt;flags = 0;</a>
+<a name="ln706">}</a>
+<a name="ln707"> </a>
+<a name="ln708"> </a>
+<a name="ln709">void</a>
+<a name="ln710">arch_destroy_thread_debug_info(arch_thread_debug_info* info)</a>
+<a name="ln711">{</a>
+<a name="ln712">	arch_clear_thread_debug_info(info);</a>
+<a name="ln713">}</a>
+<a name="ln714"> </a>
+<a name="ln715"> </a>
+<a name="ln716">void</a>
+<a name="ln717">arch_update_thread_single_step()</a>
+<a name="ln718">{</a>
+<a name="ln719">	if (iframe* frame = x86_get_user_iframe()) {</a>
+<a name="ln720">		Thread* thread = thread_get_current_thread();</a>
+<a name="ln721"> </a>
+<a name="ln722">		// set/clear TF in EFLAGS depending on whether single stepping is</a>
+<a name="ln723">		// desired</a>
+<a name="ln724">		if (thread-&gt;debug_info.flags &amp; B_THREAD_DEBUG_SINGLE_STEP)</a>
+<a name="ln725">			frame-&gt;flags |= (1 &lt;&lt; X86_EFLAGS_TF);</a>
+<a name="ln726">		else</a>
+<a name="ln727">			frame-&gt;flags &amp;= ~(1 &lt;&lt; X86_EFLAGS_TF);</a>
+<a name="ln728">	}</a>
+<a name="ln729">}</a>
+<a name="ln730"> </a>
+<a name="ln731"> </a>
+<a name="ln732">void</a>
+<a name="ln733">arch_set_debug_cpu_state(const debug_cpu_state* cpuState)</a>
+<a name="ln734">{</a>
+<a name="ln735">	if (iframe* frame = x86_get_user_iframe()) {</a>
+<a name="ln736">		// For the floating point state to be correct the calling function must</a>
+<a name="ln737">		// not use these registers (not even indirectly).</a>
+<a name="ln738">#ifdef __x86_64__</a>
+<a name="ln739">		Thread* thread = thread_get_current_thread();</a>
+<a name="ln740">		memcpy(thread-&gt;arch_info.fpu_state, &amp;cpuState-&gt;extended_registers,</a>
+<a name="ln741">			sizeof(cpuState-&gt;extended_registers));</a>
+<a name="ln742">		frame-&gt;fpu = &amp;thread-&gt;arch_info.fpu_state;</a>
+<a name="ln743">#else</a>
+<a name="ln744">		if (gHasSSE) {</a>
+<a name="ln745">			// Since fxrstor requires 16-byte alignment and this isn't</a>
+<a name="ln746">			// guaranteed passed buffer, we use our thread's fpu_state field as</a>
+<a name="ln747">			// temporary buffer. We need to disable interrupts to make use of</a>
+<a name="ln748">			// it.</a>
+<a name="ln749">			Thread* thread = thread_get_current_thread();</a>
+<a name="ln750">			InterruptsLocker locker;</a>
+<a name="ln751">			memcpy(thread-&gt;arch_info.fpu_state, &amp;cpuState-&gt;extended_registers,</a>
+<a name="ln752">				sizeof(cpuState-&gt;extended_registers));</a>
+<a name="ln753">			x86_fxrstor(thread-&gt;arch_info.fpu_state);</a>
+<a name="ln754">		} else {</a>
+<a name="ln755">			// TODO: Implement! We need to convert the format first.</a>
+<a name="ln756">//			x86_frstor(&amp;cpuState-&gt;extended_registers);</a>
+<a name="ln757">		}</a>
+<a name="ln758">#endif</a>
+<a name="ln759">		set_iframe_registers(frame, cpuState);</a>
+<a name="ln760">	}</a>
+<a name="ln761">}</a>
+<a name="ln762"> </a>
+<a name="ln763"> </a>
+<a name="ln764">void</a>
+<a name="ln765">arch_get_debug_cpu_state(debug_cpu_state* cpuState)</a>
+<a name="ln766">{</a>
+<a name="ln767">	if (iframe* frame = x86_get_user_iframe())</a>
+<a name="ln768">		get_cpu_state(thread_get_current_thread(), frame, cpuState);</a>
+<a name="ln769">}</a>
+<a name="ln770"> </a>
+<a name="ln771"> </a>
+<a name="ln772">/*!	\brief Retrieves the CPU state for the given thread.</a>
+<a name="ln773">	The thread must not be running and the thread's scheduler spinlock must be</a>
+<a name="ln774">	held.</a>
+<a name="ln775">	\param thread The thread whose CPU state to retrieve.</a>
+<a name="ln776">	\param cpuState Pointer to pre-allocated storage for the CPU state.</a>
+<a name="ln777">	\return \c B_OK, if everything goes fine, another error code, if the CPU</a>
+<a name="ln778">		state could not be retrieved.</a>
+<a name="ln779">*/</a>
+<a name="ln780">status_t</a>
+<a name="ln781">arch_get_thread_debug_cpu_state(Thread* thread, debug_cpu_state* cpuState)</a>
+<a name="ln782">{</a>
+<a name="ln783">	iframe* frame = x86_get_thread_user_iframe(thread);</a>
+<a name="ln784">	if (frame == NULL)</a>
+<a name="ln785">		return B_BAD_VALUE;</a>
+<a name="ln786"> </a>
+<a name="ln787">	get_cpu_state(thread, frame, cpuState);</a>
+<a name="ln788">	return B_OK;</a>
+<a name="ln789">}</a>
+<a name="ln790"> </a>
+<a name="ln791"> </a>
+<a name="ln792">status_t</a>
+<a name="ln793">arch_set_breakpoint(void* address)</a>
+<a name="ln794">{</a>
+<a name="ln795">	return set_breakpoint(address, X86_INSTRUCTION_BREAKPOINT,</a>
+<a name="ln796">		X86_BREAKPOINT_LENGTH_1);</a>
+<a name="ln797">}</a>
+<a name="ln798"> </a>
+<a name="ln799"> </a>
+<a name="ln800">status_t</a>
+<a name="ln801">arch_clear_breakpoint(void* address)</a>
+<a name="ln802">{</a>
+<a name="ln803">	return clear_breakpoint(address, false);</a>
+<a name="ln804">}</a>
+<a name="ln805"> </a>
+<a name="ln806"> </a>
+<a name="ln807">status_t</a>
+<a name="ln808">arch_set_watchpoint(void* address, uint32 type, int32 length)</a>
+<a name="ln809">{</a>
+<a name="ln810">	size_t archType, archLength;</a>
+<a name="ln811">	status_t error = check_watch_point_parameters(address, type, length,</a>
+<a name="ln812">		archType, archLength);</a>
+<a name="ln813">	if (error != B_OK)</a>
+<a name="ln814">		return error;</a>
+<a name="ln815"> </a>
+<a name="ln816">	return set_breakpoint(address, archType, archLength);</a>
+<a name="ln817">}</a>
+<a name="ln818"> </a>
+<a name="ln819"> </a>
+<a name="ln820">status_t</a>
+<a name="ln821">arch_clear_watchpoint(void* address)</a>
+<a name="ln822">{</a>
+<a name="ln823">	return clear_breakpoint(address, true);</a>
+<a name="ln824">}</a>
+<a name="ln825"> </a>
+<a name="ln826"> </a>
+<a name="ln827">bool</a>
+<a name="ln828">arch_has_breakpoints(arch_team_debug_info* info)</a>
+<a name="ln829">{</a>
+<a name="ln830">	// Reading info-&gt;dr7 is atomically, so we don't need to lock. The caller</a>
+<a name="ln831">	// has to ensure, that the info doesn't go away.</a>
+<a name="ln832">	return (info-&gt;dr7 != X86_BREAKPOINTS_DISABLED_DR7);</a>
+<a name="ln833">}</a>
+<a name="ln834"> </a>
+<a name="ln835"> </a>
+<a name="ln836">#if KERNEL_BREAKPOINTS</a>
+<a name="ln837"> </a>
+<a name="ln838">status_t</a>
+<a name="ln839">arch_set_kernel_breakpoint(void* address)</a>
+<a name="ln840">{</a>
+<a name="ln841">	status_t error = set_kernel_breakpoint(address, X86_INSTRUCTION_BREAKPOINT,</a>
+<a name="ln842">		X86_BREAKPOINT_LENGTH_1);</a>
+<a name="ln843"> </a>
+<a name="ln844">	if (error != B_OK) {</a>
+<a name="ln845">		panic(&quot;arch_set_kernel_breakpoint() failed to set breakpoint: %s&quot;,</a>
+<a name="ln846">			strerror(error));</a>
+<a name="ln847">	}</a>
+<a name="ln848"> </a>
+<a name="ln849">	return error;</a>
+<a name="ln850">}</a>
+<a name="ln851"> </a>
+<a name="ln852"> </a>
+<a name="ln853">status_t</a>
+<a name="ln854">arch_clear_kernel_breakpoint(void* address)</a>
+<a name="ln855">{</a>
+<a name="ln856">	status_t error = clear_kernel_breakpoint(address, false);</a>
+<a name="ln857"> </a>
+<a name="ln858">	if (error != B_OK) {</a>
+<a name="ln859">		panic(&quot;arch_clear_kernel_breakpoint() failed to clear breakpoint: %s&quot;,</a>
+<a name="ln860">			strerror(error));</a>
+<a name="ln861">	}</a>
+<a name="ln862"> </a>
+<a name="ln863">	return error;</a>
+<a name="ln864">}</a>
+<a name="ln865"> </a>
+<a name="ln866"> </a>
+<a name="ln867">status_t</a>
+<a name="ln868">arch_set_kernel_watchpoint(void* address, uint32 type, int32 length)</a>
+<a name="ln869">{</a>
+<a name="ln870">	size_t archType, archLength;</a>
+<a name="ln871">	status_t error = check_watch_point_parameters(address, type, length,</a>
+<a name="ln872">		archType, archLength);</a>
+<a name="ln873"> </a>
+<a name="ln874">	if (error == B_OK)</a>
+<a name="ln875">		error = set_kernel_breakpoint(address, archType, archLength);</a>
+<a name="ln876"> </a>
+<a name="ln877">	if (error != B_OK) {</a>
+<a name="ln878">		panic(&quot;arch_set_kernel_watchpoint() failed to set watchpoint: %s&quot;,</a>
+<a name="ln879">			strerror(error));</a>
+<a name="ln880">	}</a>
+<a name="ln881"> </a>
+<a name="ln882">	return error;</a>
+<a name="ln883">}</a>
+<a name="ln884"> </a>
+<a name="ln885"> </a>
+<a name="ln886">status_t</a>
+<a name="ln887">arch_clear_kernel_watchpoint(void* address)</a>
+<a name="ln888">{</a>
+<a name="ln889">	status_t error = clear_kernel_breakpoint(address, true);</a>
+<a name="ln890"> </a>
+<a name="ln891">	if (error != B_OK) {</a>
+<a name="ln892">		panic(&quot;arch_clear_kernel_watchpoint() failed to clear watchpoint: %s&quot;,</a>
+<a name="ln893">			strerror(error));</a>
+<a name="ln894">	}</a>
+<a name="ln895"> </a>
+<a name="ln896">	return error;</a>
+<a name="ln897">}</a>
+<a name="ln898"> </a>
+<a name="ln899">#endif	// KERNEL_BREAKPOINTS</a>
+<a name="ln900"> </a>
+<a name="ln901"> </a>
+<a name="ln902">// #pragma mark - x86 implementation interface</a>
+<a name="ln903"> </a>
+<a name="ln904"> </a>
+<a name="ln905">/**</a>
+<a name="ln906"> *	Interrupts are disabled. \a frame is unused, i.e. can be \c NULL.</a>
+<a name="ln907"> */</a>
+<a name="ln908">void</a>
+<a name="ln909">x86_init_user_debug_at_kernel_exit(iframe* frame)</a>
+<a name="ln910">{</a>
+<a name="ln911">	Thread* thread = thread_get_current_thread();</a>
+<a name="ln912"> </a>
+<a name="ln913">	if (!(thread-&gt;flags &amp; THREAD_FLAGS_BREAKPOINTS_DEFINED))</a>
+<a name="ln914">		return;</a>
+<a name="ln915"> </a>
+<a name="ln916">	// disable kernel breakpoints</a>
+<a name="ln917">	disable_breakpoints();</a>
+<a name="ln918"> </a>
+<a name="ln919">	// install the user breakpoints</a>
+<a name="ln920">	GRAB_TEAM_DEBUG_INFO_LOCK(thread-&gt;team-&gt;debug_info);</a>
+<a name="ln921"> </a>
+<a name="ln922">	arch_team_debug_info &amp;teamInfo = thread-&gt;team-&gt;debug_info.arch_info;</a>
+<a name="ln923"> </a>
+<a name="ln924">	install_breakpoints(teamInfo);</a>
+<a name="ln925"> </a>
+<a name="ln926">	atomic_or(&amp;thread-&gt;flags, THREAD_FLAGS_BREAKPOINTS_INSTALLED);</a>
+<a name="ln927"> </a>
+<a name="ln928">	RELEASE_TEAM_DEBUG_INFO_LOCK(thread-&gt;team-&gt;debug_info);</a>
+<a name="ln929">}</a>
+<a name="ln930"> </a>
+<a name="ln931"> </a>
+<a name="ln932">/**</a>
+<a name="ln933"> *	Interrupts are disabled.</a>
+<a name="ln934"> */</a>
+<a name="ln935">void</a>
+<a name="ln936">x86_exit_user_debug_at_kernel_entry()</a>
+<a name="ln937">{</a>
+<a name="ln938">	Thread* thread = thread_get_current_thread();</a>
+<a name="ln939"> </a>
+<a name="ln940">	// We need to save the current values of dr6 and dr7 in the CPU structure,</a>
+<a name="ln941">	// since in case of a debug exception we might overwrite them before</a>
+<a name="ln942">	// x86_handle_debug_exception() is called. Debug exceptions occur when</a>
+<a name="ln943">	// hitting a hardware break/watchpoint or when single-stepping.</a>
+<a name="ln944">	asm(&quot;mov %%dr6, %0&quot; : &quot;=r&quot;(thread-&gt;cpu-&gt;arch.dr6));</a>
+<a name="ln945">	asm(&quot;mov %%dr7, %0&quot; : &quot;=r&quot;(thread-&gt;cpu-&gt;arch.dr7));</a>
+<a name="ln946"> </a>
+<a name="ln947">	// The remainder needs only be done, when user breakpoints are installed.</a>
+<a name="ln948">	if (!(thread-&gt;flags &amp; THREAD_FLAGS_BREAKPOINTS_INSTALLED))</a>
+<a name="ln949">		return;</a>
+<a name="ln950"> </a>
+<a name="ln951">	// disable user breakpoints</a>
+<a name="ln952">	disable_breakpoints();</a>
+<a name="ln953"> </a>
+<a name="ln954">	// install kernel breakpoints</a>
+<a name="ln955">	Team* kernelTeam = team_get_kernel_team();</a>
+<a name="ln956"> </a>
+<a name="ln957">	GRAB_TEAM_DEBUG_INFO_LOCK(kernelTeam-&gt;debug_info);</a>
+<a name="ln958"> </a>
+<a name="ln959">	install_breakpoints(kernelTeam-&gt;debug_info.arch_info);</a>
+<a name="ln960"> </a>
+<a name="ln961">	atomic_and(&amp;thread-&gt;flags, ~THREAD_FLAGS_BREAKPOINTS_INSTALLED);</a>
+<a name="ln962"> </a>
+<a name="ln963">	RELEASE_TEAM_DEBUG_INFO_LOCK(kernelTeam-&gt;debug_info);</a>
+<a name="ln964">}</a>
+<a name="ln965"> </a>
+<a name="ln966"> </a>
+<a name="ln967">/**</a>
+<a name="ln968"> *	Interrupts are disabled and will possibly be enabled by the function.</a>
+<a name="ln969"> */</a>
+<a name="ln970">void</a>
+<a name="ln971">x86_handle_debug_exception(iframe* frame)</a>
+<a name="ln972">{</a>
+<a name="ln973">	Thread* thread = thread_get_current_thread();</a>
+<a name="ln974"> </a>
+<a name="ln975">	// Get dr6 and dr7. If the given iframe is a userland frame, the exception</a>
+<a name="ln976">	// obviously occurred in userland. In that case</a>
+<a name="ln977">	// x86_exit_user_debug_at_kernel_entry() has already been invoked and dr6</a>
+<a name="ln978">	// and dr7 are stored in the cpu info. Otherwise we need to fetch the</a>
+<a name="ln979">	// current values from the registers.</a>
+<a name="ln980">	size_t dr6;</a>
+<a name="ln981">	size_t dr7;</a>
+<a name="ln982">	if (IFRAME_IS_USER(frame)) {</a>
+<a name="ln983">		dr6 = thread-&gt;cpu-&gt;arch.dr6;</a>
+<a name="ln984">		dr7 = thread-&gt;cpu-&gt;arch.dr7;</a>
+<a name="ln985">	} else {</a>
+<a name="ln986">		asm(&quot;mov %%dr6, %0&quot; : &quot;=r&quot;(dr6));</a>
+<a name="ln987">		asm(&quot;mov %%dr7, %0&quot; : &quot;=r&quot;(dr7));</a>
+<a name="ln988">	}</a>
+<a name="ln989"> </a>
+<a name="ln990">	TRACE((&quot;x86_handle_debug_exception(): DR6: %lx, DR7: %lx\n&quot;, dr6, dr7));</a>
+<a name="ln991"> </a>
+<a name="ln992">	// check, which exception condition applies</a>
+<a name="ln993">	if (dr6 &amp; X86_DR6_BREAKPOINT_MASK) {</a>
+<a name="ln994">		// breakpoint</a>
+<a name="ln995"> </a>
+<a name="ln996">		// check which breakpoint was taken</a>
+<a name="ln997">		bool watchpoint = true;</a>
+<a name="ln998">		for (int32 i = 0; i &lt; X86_BREAKPOINT_COUNT; i++) {</a>
+<a name="ln999">			if (dr6 &amp; (1 &lt;&lt; sDR6B[i])) {</a>
+<a name="ln1000">				size_t type = (dr7 &gt;&gt; sDR7RW[i]) &amp; 0x3;</a>
+<a name="ln1001">				if (type == X86_INSTRUCTION_BREAKPOINT)</a>
+<a name="ln1002">					watchpoint = false;</a>
+<a name="ln1003">			}</a>
+<a name="ln1004">		}</a>
+<a name="ln1005"> </a>
+<a name="ln1006">		if (IFRAME_IS_USER(frame)) {</a>
+<a name="ln1007">			// enable interrupts and notify the debugger</a>
+<a name="ln1008">			enable_interrupts();</a>
+<a name="ln1009"> </a>
+<a name="ln1010">			if (watchpoint)</a>
+<a name="ln1011">				user_debug_watchpoint_hit();</a>
+<a name="ln1012">			else</a>
+<a name="ln1013">				user_debug_breakpoint_hit(false);</a>
+<a name="ln1014">		} else {</a>
+<a name="ln1015">			panic(&quot;hit kernel %spoint: dr6: 0x%lx, dr7: 0x%lx&quot;,</a>
+<a name="ln1016">				watchpoint ? &quot;watch&quot; : &quot;break&quot;, dr6, dr7);</a>
+<a name="ln1017">		}</a>
+<a name="ln1018">	} else if (dr6 &amp; (1 &lt;&lt; X86_DR6_BD)) {</a>
+<a name="ln1019">		// general detect exception</a>
+<a name="ln1020">		// Occurs only, if GD in DR7 is set (which we don't do) and someone</a>
+<a name="ln1021">		// tries to write to the debug registers.</a>
+<a name="ln1022">		if (IFRAME_IS_USER(frame)) {</a>
+<a name="ln1023">			dprintf(&quot;x86_handle_debug_exception(): ignoring spurious general &quot;</a>
+<a name="ln1024">				&quot;detect exception\n&quot;);</a>
+<a name="ln1025"> </a>
+<a name="ln1026">			enable_interrupts();</a>
+<a name="ln1027">		} else</a>
+<a name="ln1028">			panic(&quot;spurious general detect exception in kernel mode&quot;);</a>
+<a name="ln1029">	} else if ((dr6 &amp; (1 &lt;&lt; X86_DR6_BS)) || sQEmuSingleStepHack) {</a>
+<a name="ln1030">		// single step</a>
+<a name="ln1031"> </a>
+<a name="ln1032">		if (IFRAME_IS_USER(frame)) {</a>
+<a name="ln1033">			// enable interrupts and notify the debugger</a>
+<a name="ln1034">			enable_interrupts();</a>
+<a name="ln1035"> </a>
+<a name="ln1036">			user_debug_single_stepped();</a>
+<a name="ln1037">		} else {</a>
+<a name="ln1038">			// Disable single-stepping -- the next &quot;step&quot; command will re-enable</a>
+<a name="ln1039">			// it, but we don't want it when continuing otherwise.</a>
+<a name="ln1040">			frame-&gt;flags &amp;= ~(1 &lt;&lt; X86_EFLAGS_TF);</a>
+<a name="ln1041"> </a>
+<a name="ln1042">			// Determine whether the exception occurred at a syscall/trap</a>
+<a name="ln1043">			// kernel entry or whether this is genuine kernel single-stepping.</a>
+<a name="ln1044">			bool inKernel = true;</a>
+<a name="ln1045">			if (thread-&gt;team != team_get_kernel_team()</a>
+<a name="ln1046">				&amp;&amp; x86_get_user_iframe() == NULL) {</a>
+<a name="ln1047">				// TODO: This is not yet fully correct, since a newly created</a>
+<a name="ln1048">				// thread that hasn't entered userland yet also has this</a>
+<a name="ln1049">				// property.</a>
+<a name="ln1050">				inKernel = false;</a>
+<a name="ln1051">			}</a>
+<a name="ln1052"> </a>
+<a name="ln1053">			if (inKernel) {</a>
+<a name="ln1054">				panic(&quot;kernel single step&quot;);</a>
+<a name="ln1055">			} else {</a>
+<a name="ln1056">				// The thread is a userland thread and it just entered the</a>
+<a name="ln1057">				// kernel when the single-step exception occurred. This happens</a>
+<a name="ln1058">				// e.g. when sysenter is called with single-stepping enabled.</a>
+<a name="ln1059">				// We need to ignore the exception now and send a single-step</a>
+<a name="ln1060">				// notification later, when the thread wants to return from the</a>
+<a name="ln1061">				// kernel.</a>
+<a name="ln1062">				InterruptsSpinLocker threadDebugInfoLocker(</a>
+<a name="ln1063">					thread-&gt;debug_info.lock);</a>
+<a name="ln1064"> </a>
+<a name="ln1065">				// Check whether the team is still being debugged and set</a>
+<a name="ln1066">				// the B_THREAD_DEBUG_NOTIFY_SINGLE_STEP and</a>
+<a name="ln1067">				// B_THREAD_DEBUG_STOP flags, so that the thread will be</a>
+<a name="ln1068">				// stopped when it is going to leave the kernel and notify the</a>
+<a name="ln1069">				// debugger about the single-step event.</a>
+<a name="ln1070">				int32 teamDebugFlags</a>
+<a name="ln1071">					= atomic_get(&amp;thread-&gt;team-&gt;debug_info.flags);</a>
+<a name="ln1072">				if (teamDebugFlags &amp; B_TEAM_DEBUG_DEBUGGER_INSTALLED) {</a>
+<a name="ln1073">					atomic_or(&amp;thread-&gt;debug_info.flags,</a>
+<a name="ln1074">						B_THREAD_DEBUG_NOTIFY_SINGLE_STEP</a>
+<a name="ln1075">							| B_THREAD_DEBUG_STOP);</a>
+<a name="ln1076"> </a>
+<a name="ln1077">					// also set the respective thread flag</a>
+<a name="ln1078">					atomic_or(&amp;thread-&gt;flags, THREAD_FLAGS_DEBUG_THREAD);</a>
+<a name="ln1079">				}</a>
+<a name="ln1080">			}</a>
+<a name="ln1081">		}</a>
+<a name="ln1082">	} else if (dr6 &amp; (1 &lt;&lt; X86_DR6_BT)) {</a>
+<a name="ln1083">		// task switch</a>
+<a name="ln1084">		// Occurs only, if T in EFLAGS is set (which we don't do).</a>
+<a name="ln1085">		if (IFRAME_IS_USER(frame)) {</a>
+<a name="ln1086">			dprintf(&quot;x86_handle_debug_exception(): ignoring spurious task switch &quot;</a>
+<a name="ln1087">				&quot;exception\n&quot;);</a>
+<a name="ln1088"> </a>
+<a name="ln1089">			enable_interrupts();</a>
+<a name="ln1090">		} else</a>
+<a name="ln1091">			panic(&quot;spurious task switch exception in kernel mode&quot;);</a>
+<a name="ln1092">	} else {</a>
+<a name="ln1093">		if (IFRAME_IS_USER(frame)) {</a>
+<a name="ln1094">			TRACE((&quot;x86_handle_debug_exception(): ignoring spurious debug &quot;</a>
+<a name="ln1095">				&quot;exception (no condition recognized)\n&quot;));</a>
+<a name="ln1096"> </a>
+<a name="ln1097">			enable_interrupts();</a>
+<a name="ln1098">		} else {</a>
+<a name="ln1099">			panic(&quot;spurious debug exception in kernel mode (no condition &quot;</a>
+<a name="ln1100">				&quot;recognized)&quot;);</a>
+<a name="ln1101">		}</a>
+<a name="ln1102">	}</a>
+<a name="ln1103">}</a>
+<a name="ln1104"> </a>
+<a name="ln1105"> </a>
+<a name="ln1106">/**</a>
+<a name="ln1107"> *	Interrupts are disabled and will possibly be enabled by the function.</a>
+<a name="ln1108"> */</a>
+<a name="ln1109">void</a>
+<a name="ln1110">x86_handle_breakpoint_exception(iframe* frame)</a>
+<a name="ln1111">{</a>
+<a name="ln1112">	TRACE((&quot;x86_handle_breakpoint_exception()\n&quot;));</a>
+<a name="ln1113"> </a>
+<a name="ln1114">	// reset eip to the int3 instruction</a>
+<a name="ln1115">	frame-&gt;ip--;</a>
+<a name="ln1116"> </a>
+<a name="ln1117">	if (!IFRAME_IS_USER(frame)) {</a>
+<a name="ln1118">		panic(&quot;breakpoint exception in kernel mode&quot;);</a>
+<a name="ln1119">		return;</a>
+<a name="ln1120">	}</a>
+<a name="ln1121"> </a>
+<a name="ln1122">	enable_interrupts();</a>
+<a name="ln1123"> </a>
+<a name="ln1124">	user_debug_breakpoint_hit(true);</a>
+<a name="ln1125">}</a>
+<a name="ln1126"> </a>
+<a name="ln1127"> </a>
+<a name="ln1128">void</a>
+<a name="ln1129">x86_init_user_debug()</a>
+<a name="ln1130">{</a>
+<a name="ln1131">	// get debug settings</a>
+<a name="ln1132">	if (void* handle = load_driver_settings(&quot;kernel&quot;)) {</a>
+<a name="ln1133">		sQEmuSingleStepHack = get_driver_boolean_parameter(handle,</a>
+<a name="ln1134">			&quot;qemu_single_step_hack&quot;, false, false);;</a>
+<a name="ln1135"> </a>
+<a name="ln1136">		unload_driver_settings(handle);</a>
+<a name="ln1137">	}</a>
+<a name="ln1138"> </a>
+<a name="ln1139">#if KERNEL_BREAKPOINTS</a>
+<a name="ln1140">	// install debugger commands</a>
+<a name="ln1141">	add_debugger_command_etc(&quot;breakpoints&quot;, &amp;debugger_breakpoints,</a>
+<a name="ln1142">		&quot;Lists current break-/watchpoints&quot;,</a>
+<a name="ln1143">		&quot;\n&quot;</a>
+<a name="ln1144">		&quot;Lists the current kernel break-/watchpoints.\n&quot;, 0);</a>
+<a name="ln1145">	add_debugger_command_alias(&quot;watchpoints&quot;, &quot;breakpoints&quot;, NULL);</a>
+<a name="ln1146">	add_debugger_command_etc(&quot;breakpoint&quot;, &amp;debugger_breakpoint,</a>
+<a name="ln1147">		&quot;Set/clears a breakpoint&quot;,</a>
+<a name="ln1148">		&quot;&lt;address&gt; [ clear ]\n&quot;</a>
+<a name="ln1149">		&quot;Sets respectively clears the breakpoint at address &lt;address&gt;.\n&quot;, 0);</a>
+<a name="ln1150">	add_debugger_command_etc(&quot;watchpoint&quot;, &amp;debugger_watchpoint,</a>
+<a name="ln1151">		&quot;Set/clears a watchpoint&quot;,</a>
+<a name="ln1152">		&quot;&lt;address&gt; &lt;address&gt; ( [ rw ] [ &lt;size&gt; ] | clear )\n&quot;</a>
+<a name="ln1153">		&quot;Sets respectively clears the watchpoint at address &lt;address&gt;.\n&quot;</a>
+<a name="ln1154">		&quot;If \&quot;rw\&quot; is given the new watchpoint is a read/write watchpoint\n&quot;</a>
+<a name="ln1155">		&quot;otherwise a write watchpoint only.\n&quot;, 0);</a>
+<a name="ln1156">	add_debugger_command_etc(&quot;step&quot;, &amp;debugger_single_step,</a>
+<a name="ln1157">		&quot;Single-steps to the next instruction&quot;,</a>
+<a name="ln1158">		&quot;\n&quot;</a>
+<a name="ln1159">		&quot;Single-steps to the next instruction.\n&quot;, 0);</a>
+<a name="ln1160">#endif</a>
+<a name="ln1161">}</a>
+<a name="ln1162"> </a>
+
+</code></pre>
+<div class="balloon" rel="336"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v784/" target="_blank">V784</a> The size of the bit mask is less than the size of the first operand. This will cause the loss of higher bits.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

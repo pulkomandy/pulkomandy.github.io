@@ -1,0 +1,866 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>scheduler_cpu.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2013, Paweł Dziepak, pdziepak@quarnos.org.</a>
+<a name="ln3"> * Distributed under the terms of the MIT License.</a>
+<a name="ln4"> */</a>
+<a name="ln5"> </a>
+<a name="ln6"> </a>
+<a name="ln7">#include &quot;scheduler_cpu.h&quot;</a>
+<a name="ln8"> </a>
+<a name="ln9">#include &lt;util/AutoLock.h&gt;</a>
+<a name="ln10"> </a>
+<a name="ln11">#include &lt;algorithm&gt;</a>
+<a name="ln12"> </a>
+<a name="ln13">#include &quot;scheduler_thread.h&quot;</a>
+<a name="ln14"> </a>
+<a name="ln15"> </a>
+<a name="ln16">namespace Scheduler {</a>
+<a name="ln17"> </a>
+<a name="ln18"> </a>
+<a name="ln19">CPUEntry* gCPUEntries;</a>
+<a name="ln20"> </a>
+<a name="ln21">CoreEntry* gCoreEntries;</a>
+<a name="ln22">CoreLoadHeap gCoreLoadHeap;</a>
+<a name="ln23">CoreLoadHeap gCoreHighLoadHeap;</a>
+<a name="ln24">rw_spinlock gCoreHeapsLock = B_RW_SPINLOCK_INITIALIZER;</a>
+<a name="ln25">int32 gCoreCount;</a>
+<a name="ln26"> </a>
+<a name="ln27">PackageEntry* gPackageEntries;</a>
+<a name="ln28">IdlePackageList gIdlePackageList;</a>
+<a name="ln29">rw_spinlock gIdlePackageLock = B_RW_SPINLOCK_INITIALIZER;</a>
+<a name="ln30">int32 gPackageCount;</a>
+<a name="ln31"> </a>
+<a name="ln32"> </a>
+<a name="ln33">}	// namespace Scheduler</a>
+<a name="ln34"> </a>
+<a name="ln35">using namespace Scheduler;</a>
+<a name="ln36"> </a>
+<a name="ln37"> </a>
+<a name="ln38">class Scheduler::DebugDumper {</a>
+<a name="ln39">public:</a>
+<a name="ln40">	static	void		DumpCPURunQueue(CPUEntry* cpu);</a>
+<a name="ln41">	static	void		DumpCoreRunQueue(CoreEntry* core);</a>
+<a name="ln42">	static	void		DumpCoreLoadHeapEntry(CoreEntry* core);</a>
+<a name="ln43">	static	void		DumpIdleCoresInPackage(PackageEntry* package);</a>
+<a name="ln44"> </a>
+<a name="ln45">private:</a>
+<a name="ln46">	struct CoreThreadsData {</a>
+<a name="ln47">			CoreEntry*	fCore;</a>
+<a name="ln48">			int32		fLoad;</a>
+<a name="ln49">	};</a>
+<a name="ln50"> </a>
+<a name="ln51">	static	void		_AnalyzeCoreThreads(Thread* thread, void* data);</a>
+<a name="ln52">};</a>
+<a name="ln53"> </a>
+<a name="ln54"> </a>
+<a name="ln55">static CPUPriorityHeap sDebugCPUHeap;</a>
+<a name="ln56">static CoreLoadHeap sDebugCoreHeap;</a>
+<a name="ln57"> </a>
+<a name="ln58"> </a>
+<a name="ln59">void</a>
+<a name="ln60">ThreadRunQueue::Dump() const</a>
+<a name="ln61">{</a>
+<a name="ln62">	ThreadRunQueue::ConstIterator iterator = GetConstIterator();</a>
+<a name="ln63">	if (!iterator.HasNext())</a>
+<a name="ln64">		kprintf(&quot;Run queue is empty.\n&quot;);</a>
+<a name="ln65">	else {</a>
+<a name="ln66">		kprintf(&quot;thread      id      priority penalty  name\n&quot;);</a>
+<a name="ln67">		while (iterator.HasNext()) {</a>
+<a name="ln68">			ThreadData* threadData = iterator.Next();</a>
+<a name="ln69">			Thread* thread = threadData-&gt;GetThread();</a>
+<a name="ln70"> </a>
+<a name="ln71">			kprintf(&quot;%p  %-7&quot; B_PRId32 &quot; %-8&quot; B_PRId32 &quot; %-8&quot; B_PRId32 &quot; %s\n&quot;,</a>
+<a name="ln72">				thread, thread-&gt;id, thread-&gt;priority,</a>
+<a name="ln73">				thread-&gt;priority - threadData-&gt;GetEffectivePriority(),</a>
+<a name="ln74">				thread-&gt;name);</a>
+<a name="ln75">		}</a>
+<a name="ln76">	}</a>
+<a name="ln77">}</a>
+<a name="ln78"> </a>
+<a name="ln79"> </a>
+<a name="ln80">CPUEntry::CPUEntry()</a>
+<a name="ln81">	:</a>
+<a name="ln82">	fLoad(0),</a>
+<a name="ln83">	fMeasureActiveTime(0),</a>
+<a name="ln84">	fMeasureTime(0),</a>
+<a name="ln85">	fUpdateLoadEvent(false)</a>
+<a name="ln86">{</a>
+<a name="ln87">	B_INITIALIZE_RW_SPINLOCK(&amp;fSchedulerModeLock);</a>
+<a name="ln88">	B_INITIALIZE_SPINLOCK(&amp;fQueueLock);</a>
+<a name="ln89">}</a>
+<a name="ln90"> </a>
+<a name="ln91"> </a>
+<a name="ln92">void</a>
+<a name="ln93">CPUEntry::Init(int32 id, CoreEntry* core)</a>
+<a name="ln94">{</a>
+<a name="ln95">	fCPUNumber = id;</a>
+<a name="ln96">	fCore = core;</a>
+<a name="ln97">}</a>
+<a name="ln98"> </a>
+<a name="ln99"> </a>
+<a name="ln100">void</a>
+<a name="ln101">CPUEntry::Start()</a>
+<a name="ln102">{</a>
+<a name="ln103">	fLoad = 0;</a>
+<a name="ln104">	fCore-&gt;AddCPU(this);</a>
+<a name="ln105">}</a>
+<a name="ln106"> </a>
+<a name="ln107"> </a>
+<a name="ln108">void</a>
+<a name="ln109">CPUEntry::Stop()</a>
+<a name="ln110">{</a>
+<a name="ln111">	cpu_ent* entry = &amp;gCPU[fCPUNumber];</a>
+<a name="ln112"> </a>
+<a name="ln113">	// get rid of irqs</a>
+<a name="ln114">	SpinLocker locker(entry-&gt;irqs_lock);</a>
+<a name="ln115">	irq_assignment* irq</a>
+<a name="ln116">		= (irq_assignment*)list_get_first_item(&amp;entry-&gt;irqs);</a>
+<a name="ln117">	while (irq != NULL) {</a>
+<a name="ln118">		locker.Unlock();</a>
+<a name="ln119"> </a>
+<a name="ln120">		assign_io_interrupt_to_cpu(irq-&gt;irq, -1);</a>
+<a name="ln121"> </a>
+<a name="ln122">		locker.Lock();</a>
+<a name="ln123">		irq = (irq_assignment*)list_get_first_item(&amp;entry-&gt;irqs);</a>
+<a name="ln124">	}</a>
+<a name="ln125">	locker.Unlock();</a>
+<a name="ln126">}</a>
+<a name="ln127"> </a>
+<a name="ln128"> </a>
+<a name="ln129">void</a>
+<a name="ln130">CPUEntry::PushFront(ThreadData* thread, int32 priority)</a>
+<a name="ln131">{</a>
+<a name="ln132">	SCHEDULER_ENTER_FUNCTION();</a>
+<a name="ln133">	fRunQueue.PushFront(thread, priority);</a>
+<a name="ln134">}</a>
+<a name="ln135"> </a>
+<a name="ln136"> </a>
+<a name="ln137">void</a>
+<a name="ln138">CPUEntry::PushBack(ThreadData* thread, int32 priority)</a>
+<a name="ln139">{</a>
+<a name="ln140">	SCHEDULER_ENTER_FUNCTION();</a>
+<a name="ln141">	fRunQueue.PushBack(thread, priority);</a>
+<a name="ln142">}</a>
+<a name="ln143"> </a>
+<a name="ln144"> </a>
+<a name="ln145">void</a>
+<a name="ln146">CPUEntry::Remove(ThreadData* thread)</a>
+<a name="ln147">{</a>
+<a name="ln148">	SCHEDULER_ENTER_FUNCTION();</a>
+<a name="ln149">	ASSERT(thread-&gt;IsEnqueued());</a>
+<a name="ln150">	thread-&gt;SetDequeued();</a>
+<a name="ln151">	fRunQueue.Remove(thread);</a>
+<a name="ln152">}</a>
+<a name="ln153"> </a>
+<a name="ln154"> </a>
+<a name="ln155">inline ThreadData*</a>
+<a name="ln156">CoreEntry::PeekThread() const</a>
+<a name="ln157">{</a>
+<a name="ln158">	SCHEDULER_ENTER_FUNCTION();</a>
+<a name="ln159">	return fRunQueue.PeekMaximum();</a>
+<a name="ln160">}</a>
+<a name="ln161"> </a>
+<a name="ln162"> </a>
+<a name="ln163">inline ThreadData*</a>
+<a name="ln164">CPUEntry::PeekThread() const</a>
+<a name="ln165">{</a>
+<a name="ln166">	SCHEDULER_ENTER_FUNCTION();</a>
+<a name="ln167">	return fRunQueue.PeekMaximum();</a>
+<a name="ln168">}</a>
+<a name="ln169"> </a>
+<a name="ln170"> </a>
+<a name="ln171">ThreadData*</a>
+<a name="ln172">CPUEntry::PeekIdleThread() const</a>
+<a name="ln173">{</a>
+<a name="ln174">	SCHEDULER_ENTER_FUNCTION();</a>
+<a name="ln175">	return fRunQueue.GetHead(B_IDLE_PRIORITY);</a>
+<a name="ln176">}</a>
+<a name="ln177"> </a>
+<a name="ln178"> </a>
+<a name="ln179">void</a>
+<a name="ln180">CPUEntry::UpdatePriority(int32 priority)</a>
+<a name="ln181">{</a>
+<a name="ln182">	SCHEDULER_ENTER_FUNCTION();</a>
+<a name="ln183"> </a>
+<a name="ln184">	ASSERT(!gCPU[fCPUNumber].disabled);</a>
+<a name="ln185"> </a>
+<a name="ln186">	int32 oldPriority = CPUPriorityHeap::GetKey(this);</a>
+<a name="ln187">	if (oldPriority == priority)</a>
+<a name="ln188">		return;</a>
+<a name="ln189">	fCore-&gt;CPUHeap()-&gt;ModifyKey(this, priority);</a>
+<a name="ln190"> </a>
+<a name="ln191">	if (oldPriority == B_IDLE_PRIORITY)</a>
+<a name="ln192">		fCore-&gt;CPUWakesUp(this);</a>
+<a name="ln193">	else if (priority == B_IDLE_PRIORITY)</a>
+<a name="ln194">		fCore-&gt;CPUGoesIdle(this);</a>
+<a name="ln195">}</a>
+<a name="ln196"> </a>
+<a name="ln197"> </a>
+<a name="ln198">void</a>
+<a name="ln199">CPUEntry::ComputeLoad()</a>
+<a name="ln200">{</a>
+<a name="ln201">	SCHEDULER_ENTER_FUNCTION();</a>
+<a name="ln202"> </a>
+<a name="ln203">	ASSERT(gTrackCPULoad);</a>
+<a name="ln204">	ASSERT(!gCPU[fCPUNumber].disabled);</a>
+<a name="ln205">	ASSERT(fCPUNumber == smp_get_current_cpu());</a>
+<a name="ln206"> </a>
+<a name="ln207">	int oldLoad = compute_load(fMeasureTime, fMeasureActiveTime, fLoad,</a>
+<a name="ln208">			system_time());</a>
+<a name="ln209">	if (oldLoad &lt; 0)</a>
+<a name="ln210">		return;</a>
+<a name="ln211"> </a>
+<a name="ln212">	if (fLoad &gt; kVeryHighLoad)</a>
+<a name="ln213">		gCurrentMode-&gt;rebalance_irqs(false);</a>
+<a name="ln214">}</a>
+<a name="ln215"> </a>
+<a name="ln216"> </a>
+<a name="ln217">ThreadData*</a>
+<a name="ln218">CPUEntry::ChooseNextThread(ThreadData* oldThread, bool putAtBack)</a>
+<a name="ln219">{</a>
+<a name="ln220">	SCHEDULER_ENTER_FUNCTION();</a>
+<a name="ln221"> </a>
+<a name="ln222">	int32 oldPriority = -1;</a>
+<a name="ln223">	if (oldThread != NULL)</a>
+<a name="ln224">		oldPriority = oldThread-&gt;GetEffectivePriority();</a>
+<a name="ln225"> </a>
+<a name="ln226">	CPURunQueueLocker cpuLocker(this);</a>
+<a name="ln227"> </a>
+<a name="ln228">	ThreadData* pinnedThread = fRunQueue.PeekMaximum();</a>
+<a name="ln229">	int32 pinnedPriority = -1;</a>
+<a name="ln230">	if (pinnedThread != NULL)</a>
+<a name="ln231">		pinnedPriority = pinnedThread-&gt;GetEffectivePriority();</a>
+<a name="ln232"> </a>
+<a name="ln233">	CoreRunQueueLocker coreLocker(fCore);</a>
+<a name="ln234"> </a>
+<a name="ln235">	ThreadData* sharedThread = fCore-&gt;PeekThread();</a>
+<a name="ln236">	ASSERT(sharedThread != NULL || pinnedThread != NULL || oldThread != NULL);</a>
+<a name="ln237"> </a>
+<a name="ln238">	int32 sharedPriority = -1;</a>
+<a name="ln239">	if (sharedThread != NULL)</a>
+<a name="ln240">		sharedPriority = sharedThread-&gt;GetEffectivePriority();</a>
+<a name="ln241"> </a>
+<a name="ln242">	int32 rest = std::max(pinnedPriority, sharedPriority);</a>
+<a name="ln243">	if (oldPriority &gt; rest || (!putAtBack &amp;&amp; oldPriority == rest))</a>
+<a name="ln244">		return oldThread;</a>
+<a name="ln245"> </a>
+<a name="ln246">	if (sharedPriority &gt; pinnedPriority) {</a>
+<a name="ln247">		fCore-&gt;Remove(sharedThread);</a>
+<a name="ln248">		return sharedThread;</a>
+<a name="ln249">	}</a>
+<a name="ln250"> </a>
+<a name="ln251">	coreLocker.Unlock();</a>
+<a name="ln252"> </a>
+<a name="ln253">	Remove(pinnedThread);</a>
+<a name="ln254">	return pinnedThread;</a>
+<a name="ln255">}</a>
+<a name="ln256"> </a>
+<a name="ln257"> </a>
+<a name="ln258">void</a>
+<a name="ln259">CPUEntry::TrackActivity(ThreadData* oldThreadData, ThreadData* nextThreadData)</a>
+<a name="ln260">{</a>
+<a name="ln261">	SCHEDULER_ENTER_FUNCTION();</a>
+<a name="ln262"> </a>
+<a name="ln263">	cpu_ent* cpuEntry = &amp;gCPU[fCPUNumber];</a>
+<a name="ln264"> </a>
+<a name="ln265">	Thread* oldThread = oldThreadData-&gt;GetThread();</a>
+<a name="ln266">	if (!thread_is_idle_thread(oldThread)) {</a>
+<a name="ln267">		bigtime_t active</a>
+<a name="ln268">			= (oldThread-&gt;kernel_time - cpuEntry-&gt;last_kernel_time)</a>
+<a name="ln269">				+ (oldThread-&gt;user_time - cpuEntry-&gt;last_user_time);</a>
+<a name="ln270"> </a>
+<a name="ln271">		WriteSequentialLocker locker(cpuEntry-&gt;active_time_lock);</a>
+<a name="ln272">		cpuEntry-&gt;active_time += active;</a>
+<a name="ln273">		locker.Unlock();</a>
+<a name="ln274"> </a>
+<a name="ln275">		fMeasureActiveTime += active;</a>
+<a name="ln276">		fCore-&gt;IncreaseActiveTime(active);</a>
+<a name="ln277"> </a>
+<a name="ln278">		oldThreadData-&gt;UpdateActivity(active);</a>
+<a name="ln279">	}</a>
+<a name="ln280"> </a>
+<a name="ln281">	if (gTrackCPULoad) {</a>
+<a name="ln282">		if (!cpuEntry-&gt;disabled)</a>
+<a name="ln283">			ComputeLoad();</a>
+<a name="ln284">		_RequestPerformanceLevel(nextThreadData);</a>
+<a name="ln285">	}</a>
+<a name="ln286"> </a>
+<a name="ln287">	Thread* nextThread = nextThreadData-&gt;GetThread();</a>
+<a name="ln288">	if (!thread_is_idle_thread(nextThread)) {</a>
+<a name="ln289">		cpuEntry-&gt;last_kernel_time = nextThread-&gt;kernel_time;</a>
+<a name="ln290">		cpuEntry-&gt;last_user_time = nextThread-&gt;user_time;</a>
+<a name="ln291"> </a>
+<a name="ln292">		nextThreadData-&gt;SetLastInterruptTime(cpuEntry-&gt;interrupt_time);</a>
+<a name="ln293">	}</a>
+<a name="ln294">}</a>
+<a name="ln295"> </a>
+<a name="ln296"> </a>
+<a name="ln297">void</a>
+<a name="ln298">CPUEntry::StartQuantumTimer(ThreadData* thread, bool wasPreempted)</a>
+<a name="ln299">{</a>
+<a name="ln300">	cpu_ent* cpu = &amp;gCPU[ID()];</a>
+<a name="ln301"> </a>
+<a name="ln302">	if (!wasPreempted || fUpdateLoadEvent)</a>
+<a name="ln303">		cancel_timer(&amp;cpu-&gt;quantum_timer);</a>
+<a name="ln304">	fUpdateLoadEvent = false;</a>
+<a name="ln305"> </a>
+<a name="ln306">	if (!thread-&gt;IsIdle()) {</a>
+<a name="ln307">		bigtime_t quantum = thread-&gt;GetQuantumLeft();</a>
+<a name="ln308">		add_timer(&amp;cpu-&gt;quantum_timer, &amp;CPUEntry::_RescheduleEvent, quantum,</a>
+<a name="ln309">			B_ONE_SHOT_RELATIVE_TIMER);</a>
+<a name="ln310">	} else if (gTrackCoreLoad) {</a>
+<a name="ln311">		add_timer(&amp;cpu-&gt;quantum_timer, &amp;CPUEntry::_UpdateLoadEvent,</a>
+<a name="ln312">			kLoadMeasureInterval * 2, B_ONE_SHOT_RELATIVE_TIMER);</a>
+<a name="ln313">		fUpdateLoadEvent = true;</a>
+<a name="ln314">	}</a>
+<a name="ln315">}</a>
+<a name="ln316"> </a>
+<a name="ln317"> </a>
+<a name="ln318">void</a>
+<a name="ln319">CPUEntry::_RequestPerformanceLevel(ThreadData* threadData)</a>
+<a name="ln320">{</a>
+<a name="ln321">	SCHEDULER_ENTER_FUNCTION();</a>
+<a name="ln322"> </a>
+<a name="ln323">	if (gCPU[fCPUNumber].disabled) {</a>
+<a name="ln324">		decrease_cpu_performance(kCPUPerformanceScaleMax);</a>
+<a name="ln325">		return;</a>
+<a name="ln326">	}</a>
+<a name="ln327"> </a>
+<a name="ln328">	int32 load = std::max(threadData-&gt;GetLoad(), fCore-&gt;GetLoad());</a>
+<a name="ln329">	ASSERT(load &gt;= 0 &amp;&amp; load &lt;= kMaxLoad);</a>
+<a name="ln330"> </a>
+<a name="ln331">	if (load &lt; kTargetLoad) {</a>
+<a name="ln332">		int32 delta = kTargetLoad - load;</a>
+<a name="ln333"> </a>
+<a name="ln334">		delta *= kTargetLoad;</a>
+<a name="ln335">		delta /= kCPUPerformanceScaleMax;</a>
+<a name="ln336"> </a>
+<a name="ln337">		decrease_cpu_performance(delta);</a>
+<a name="ln338">	} else {</a>
+<a name="ln339">		int32 delta = load - kTargetLoad;</a>
+<a name="ln340">		delta *= kMaxLoad - kTargetLoad;</a>
+<a name="ln341">		delta /= kCPUPerformanceScaleMax;</a>
+<a name="ln342"> </a>
+<a name="ln343">		increase_cpu_performance(delta);</a>
+<a name="ln344">	}</a>
+<a name="ln345">}</a>
+<a name="ln346"> </a>
+<a name="ln347"> </a>
+<a name="ln348">/* static */ int32</a>
+<a name="ln349">CPUEntry::_RescheduleEvent(timer* /* unused */)</a>
+<a name="ln350">{</a>
+<a name="ln351">	get_cpu_struct()-&gt;invoke_scheduler = true;</a>
+<a name="ln352">	get_cpu_struct()-&gt;preempted = true;</a>
+<a name="ln353">	return B_HANDLED_INTERRUPT;</a>
+<a name="ln354">}</a>
+<a name="ln355"> </a>
+<a name="ln356"> </a>
+<a name="ln357">/* static */ int32</a>
+<a name="ln358">CPUEntry::_UpdateLoadEvent(timer* /* unused */)</a>
+<a name="ln359">{</a>
+<a name="ln360">	CoreEntry::GetCore(smp_get_current_cpu())-&gt;ChangeLoad(0);</a>
+<a name="ln361">	CPUEntry::GetCPU(smp_get_current_cpu())-&gt;fUpdateLoadEvent = false;</a>
+<a name="ln362">	return B_HANDLED_INTERRUPT;</a>
+<a name="ln363">}</a>
+<a name="ln364"> </a>
+<a name="ln365"> </a>
+<a name="ln366">CPUPriorityHeap::CPUPriorityHeap(int32 cpuCount)</a>
+<a name="ln367">	:</a>
+<a name="ln368">	Heap&lt;CPUEntry, int32&gt;(cpuCount)</a>
+<a name="ln369">{</a>
+<a name="ln370">}</a>
+<a name="ln371"> </a>
+<a name="ln372"> </a>
+<a name="ln373">void</a>
+<a name="ln374">CPUPriorityHeap::Dump()</a>
+<a name="ln375">{</a>
+<a name="ln376">	kprintf(&quot;cpu priority load\n&quot;);</a>
+<a name="ln377">	CPUEntry* entry = PeekRoot();</a>
+<a name="ln378">	while (entry) {</a>
+<a name="ln379">		int32 cpu = entry-&gt;ID();</a>
+<a name="ln380">		int32 key = GetKey(entry);</a>
+<a name="ln381">		kprintf(&quot;%3&quot; B_PRId32 &quot; %8&quot; B_PRId32 &quot; %3&quot; B_PRId32 &quot;%%\n&quot;, cpu, key,</a>
+<a name="ln382">			entry-&gt;GetLoad() / 10);</a>
+<a name="ln383"> </a>
+<a name="ln384">		RemoveRoot();</a>
+<a name="ln385">		sDebugCPUHeap.Insert(entry, key);</a>
+<a name="ln386"> </a>
+<a name="ln387">		entry = PeekRoot();</a>
+<a name="ln388">	}</a>
+<a name="ln389"> </a>
+<a name="ln390">	entry = sDebugCPUHeap.PeekRoot();</a>
+<a name="ln391">	while (entry) {</a>
+<a name="ln392">		int32 key = GetKey(entry);</a>
+<a name="ln393">		sDebugCPUHeap.RemoveRoot();</a>
+<a name="ln394">		Insert(entry, key);</a>
+<a name="ln395">		entry = sDebugCPUHeap.PeekRoot();</a>
+<a name="ln396">	}</a>
+<a name="ln397">}</a>
+<a name="ln398"> </a>
+<a name="ln399"> </a>
+<a name="ln400">CoreEntry::CoreEntry()</a>
+<a name="ln401">	:</a>
+<a name="ln402">	fCPUCount(0),</a>
+<a name="ln403">	fIdleCPUCount(0),</a>
+<a name="ln404">	fThreadCount(0),</a>
+<a name="ln405">	fActiveTime(0),</a>
+<a name="ln406">	fLoad(0),</a>
+<a name="ln407">	fCurrentLoad(0),</a>
+<a name="ln408">	fLoadMeasurementEpoch(0),</a>
+<a name="ln409">	fHighLoad(false),</a>
+<a name="ln410">	fLastLoadUpdate(0)</a>
+<a name="ln411">{</a>
+<a name="ln412">	B_INITIALIZE_SPINLOCK(&amp;fCPULock);</a>
+<a name="ln413">	B_INITIALIZE_SPINLOCK(&amp;fQueueLock);</a>
+<a name="ln414">	B_INITIALIZE_SEQLOCK(&amp;fActiveTimeLock);</a>
+<a name="ln415">	B_INITIALIZE_RW_SPINLOCK(&amp;fLoadLock);</a>
+<a name="ln416">}</a>
+<a name="ln417"> </a>
+<a name="ln418"> </a>
+<a name="ln419">void</a>
+<a name="ln420">CoreEntry::Init(int32 id, PackageEntry* package)</a>
+<a name="ln421">{</a>
+<a name="ln422">	fCoreID = id;</a>
+<a name="ln423">	fPackage = package;</a>
+<a name="ln424">}</a>
+<a name="ln425"> </a>
+<a name="ln426"> </a>
+<a name="ln427">void</a>
+<a name="ln428">CoreEntry::PushFront(ThreadData* thread, int32 priority)</a>
+<a name="ln429">{</a>
+<a name="ln430">	SCHEDULER_ENTER_FUNCTION();</a>
+<a name="ln431"> </a>
+<a name="ln432">	fRunQueue.PushFront(thread, priority);</a>
+<a name="ln433">	atomic_add(&amp;fThreadCount, 1);</a>
+<a name="ln434">}</a>
+<a name="ln435"> </a>
+<a name="ln436"> </a>
+<a name="ln437">void</a>
+<a name="ln438">CoreEntry::PushBack(ThreadData* thread, int32 priority)</a>
+<a name="ln439">{</a>
+<a name="ln440">	SCHEDULER_ENTER_FUNCTION();</a>
+<a name="ln441"> </a>
+<a name="ln442">	fRunQueue.PushBack(thread, priority);</a>
+<a name="ln443">	atomic_add(&amp;fThreadCount, 1);</a>
+<a name="ln444">}</a>
+<a name="ln445"> </a>
+<a name="ln446"> </a>
+<a name="ln447">void</a>
+<a name="ln448">CoreEntry::Remove(ThreadData* thread)</a>
+<a name="ln449">{</a>
+<a name="ln450">	SCHEDULER_ENTER_FUNCTION();</a>
+<a name="ln451"> </a>
+<a name="ln452">	ASSERT(!thread-&gt;IsIdle());</a>
+<a name="ln453"> </a>
+<a name="ln454">	ASSERT(thread-&gt;IsEnqueued());</a>
+<a name="ln455">	thread-&gt;SetDequeued();</a>
+<a name="ln456"> </a>
+<a name="ln457">	fRunQueue.Remove(thread);</a>
+<a name="ln458">	atomic_add(&amp;fThreadCount, -1);</a>
+<a name="ln459">}</a>
+<a name="ln460"> </a>
+<a name="ln461"> </a>
+<a name="ln462">void</a>
+<a name="ln463">CoreEntry::AddCPU(CPUEntry* cpu)</a>
+<a name="ln464">{</a>
+<a name="ln465">	ASSERT(fCPUCount &gt;= 0);</a>
+<a name="ln466">	ASSERT(fIdleCPUCount &gt;= 0);</a>
+<a name="ln467"> </a>
+<a name="ln468">	fIdleCPUCount++;</a>
+<a name="ln469">	if (fCPUCount++ == 0) {</a>
+<a name="ln470">		// core has been reenabled</a>
+<a name="ln471">		fLoad = 0;</a>
+<a name="ln472">		fCurrentLoad = 0;</a>
+<a name="ln473">		fHighLoad = false;</a>
+<a name="ln474">		gCoreLoadHeap.Insert(this, 0);</a>
+<a name="ln475"> </a>
+<a name="ln476">		fPackage-&gt;AddIdleCore(this);</a>
+<a name="ln477">	}</a>
+<a name="ln478"> </a>
+<a name="ln479">	fCPUHeap.Insert(cpu, B_IDLE_PRIORITY);</a>
+<a name="ln480">}</a>
+<a name="ln481"> </a>
+<a name="ln482"> </a>
+<a name="ln483">void</a>
+<a name="ln484">CoreEntry::RemoveCPU(CPUEntry* cpu, ThreadProcessing&amp; threadPostProcessing)</a>
+<a name="ln485">{</a>
+<a name="ln486">	ASSERT(fCPUCount &gt; 0);</a>
+<a name="ln487">	ASSERT(fIdleCPUCount &gt; 0);</a>
+<a name="ln488"> </a>
+<a name="ln489">	fIdleCPUCount--;</a>
+<a name="ln490">	if (--fCPUCount == 0) {</a>
+<a name="ln491">		// unassign threads</a>
+<a name="ln492">		thread_map(CoreEntry::_UnassignThread, this);</a>
+<a name="ln493"> </a>
+<a name="ln494">		// core has been disabled</a>
+<a name="ln495">		if (fHighLoad) {</a>
+<a name="ln496">			gCoreHighLoadHeap.ModifyKey(this, -1);</a>
+<a name="ln497">			ASSERT(gCoreHighLoadHeap.PeekMinimum() == this);</a>
+<a name="ln498">			gCoreHighLoadHeap.RemoveMinimum();</a>
+<a name="ln499">		} else {</a>
+<a name="ln500">			gCoreLoadHeap.ModifyKey(this, -1);</a>
+<a name="ln501">			ASSERT(gCoreLoadHeap.PeekMinimum() == this);</a>
+<a name="ln502">			gCoreLoadHeap.RemoveMinimum();</a>
+<a name="ln503">		}</a>
+<a name="ln504"> </a>
+<a name="ln505">		fPackage-&gt;RemoveIdleCore(this);</a>
+<a name="ln506"> </a>
+<a name="ln507">		// get rid of threads</a>
+<a name="ln508">		while (fRunQueue.PeekMaximum() != NULL) {</a>
+<a name="ln509">			ThreadData* threadData = fRunQueue.PeekMaximum();</a>
+<a name="ln510"> </a>
+<a name="ln511">			Remove(threadData);</a>
+<a name="ln512"> </a>
+<a name="ln513">			ASSERT(threadData-&gt;Core() == NULL);</a>
+<a name="ln514">			threadPostProcessing(threadData);</a>
+<a name="ln515">		}</a>
+<a name="ln516"> </a>
+<a name="ln517">		fThreadCount = 0;</a>
+<a name="ln518">	}</a>
+<a name="ln519"> </a>
+<a name="ln520">	fCPUHeap.ModifyKey(cpu, -1);</a>
+<a name="ln521">	ASSERT(fCPUHeap.PeekRoot() == cpu);</a>
+<a name="ln522">	fCPUHeap.RemoveRoot();</a>
+<a name="ln523"> </a>
+<a name="ln524">	ASSERT(cpu-&gt;GetLoad() &gt;= 0 &amp;&amp; cpu-&gt;GetLoad() &lt;= kMaxLoad);</a>
+<a name="ln525">	ASSERT(fLoad &gt;= 0);</a>
+<a name="ln526">}</a>
+<a name="ln527"> </a>
+<a name="ln528"> </a>
+<a name="ln529">void</a>
+<a name="ln530">CoreEntry::_UpdateLoad(bool forceUpdate)</a>
+<a name="ln531">{</a>
+<a name="ln532">	SCHEDULER_ENTER_FUNCTION();</a>
+<a name="ln533"> </a>
+<a name="ln534">	if (fCPUCount &lt;= 0)</a>
+<a name="ln535">		return;</a>
+<a name="ln536"> </a>
+<a name="ln537">	bigtime_t now = system_time();</a>
+<a name="ln538">	bool intervalEnded = now &gt;= kLoadMeasureInterval + fLastLoadUpdate;</a>
+<a name="ln539">	bool intervalSkipped = now &gt;= kLoadMeasureInterval * 2 + fLastLoadUpdate;</a>
+<a name="ln540"> </a>
+<a name="ln541">	if (!intervalEnded &amp;&amp; !forceUpdate)</a>
+<a name="ln542">		return;</a>
+<a name="ln543"> </a>
+<a name="ln544">	WriteSpinLocker coreLocker(gCoreHeapsLock);</a>
+<a name="ln545"> </a>
+<a name="ln546">	int32 newKey;</a>
+<a name="ln547">	if (intervalEnded) {</a>
+<a name="ln548">		WriteSpinLocker locker(fLoadLock);</a>
+<a name="ln549"> </a>
+<a name="ln550">		newKey = intervalSkipped ? fCurrentLoad : GetLoad();</a>
+<a name="ln551"> </a>
+<a name="ln552">		ASSERT(fCurrentLoad &gt;= 0);</a>
+<a name="ln553">		ASSERT(fLoad &gt;= fCurrentLoad);</a>
+<a name="ln554"> </a>
+<a name="ln555">		fLoad = fCurrentLoad;</a>
+<a name="ln556">		fLoadMeasurementEpoch++;</a>
+<a name="ln557">		fLastLoadUpdate = now;</a>
+<a name="ln558">	} else</a>
+<a name="ln559">		newKey = GetLoad();</a>
+<a name="ln560"> </a>
+<a name="ln561">	int32 oldKey = CoreLoadHeap::GetKey(this);</a>
+<a name="ln562"> </a>
+<a name="ln563">	ASSERT(oldKey &gt;= 0);</a>
+<a name="ln564">	ASSERT(newKey &gt;= 0);</a>
+<a name="ln565"> </a>
+<a name="ln566">	if (oldKey == newKey)</a>
+<a name="ln567">		return;</a>
+<a name="ln568"> </a>
+<a name="ln569">	if (newKey &gt; kHighLoad) {</a>
+<a name="ln570">		if (!fHighLoad) {</a>
+<a name="ln571">			gCoreLoadHeap.ModifyKey(this, -1);</a>
+<a name="ln572">			ASSERT(gCoreLoadHeap.PeekMinimum() == this);</a>
+<a name="ln573">			gCoreLoadHeap.RemoveMinimum();</a>
+<a name="ln574"> </a>
+<a name="ln575">			gCoreHighLoadHeap.Insert(this, newKey);</a>
+<a name="ln576"> </a>
+<a name="ln577">			fHighLoad = true;</a>
+<a name="ln578">		} else</a>
+<a name="ln579">			gCoreHighLoadHeap.ModifyKey(this, newKey);</a>
+<a name="ln580">	} else if (newKey &lt; kMediumLoad) {</a>
+<a name="ln581">		if (fHighLoad) {</a>
+<a name="ln582">			gCoreHighLoadHeap.ModifyKey(this, -1);</a>
+<a name="ln583">			ASSERT(gCoreHighLoadHeap.PeekMinimum() == this);</a>
+<a name="ln584">			gCoreHighLoadHeap.RemoveMinimum();</a>
+<a name="ln585"> </a>
+<a name="ln586">			gCoreLoadHeap.Insert(this, newKey);</a>
+<a name="ln587"> </a>
+<a name="ln588">			fHighLoad = false;</a>
+<a name="ln589">		} else</a>
+<a name="ln590">			gCoreLoadHeap.ModifyKey(this, newKey);</a>
+<a name="ln591">	} else {</a>
+<a name="ln592">		if (fHighLoad)</a>
+<a name="ln593">			gCoreHighLoadHeap.ModifyKey(this, newKey);</a>
+<a name="ln594">		else</a>
+<a name="ln595">			gCoreLoadHeap.ModifyKey(this, newKey);</a>
+<a name="ln596">	}</a>
+<a name="ln597">}</a>
+<a name="ln598"> </a>
+<a name="ln599"> </a>
+<a name="ln600">/* static */ void</a>
+<a name="ln601">CoreEntry::_UnassignThread(Thread* thread, void* data)</a>
+<a name="ln602">{</a>
+<a name="ln603">	CoreEntry* core = static_cast&lt;CoreEntry*&gt;(data);</a>
+<a name="ln604">	ThreadData* threadData = thread-&gt;scheduler_data;</a>
+<a name="ln605"> </a>
+<a name="ln606">	if (threadData-&gt;Core() == core &amp;&amp; thread-&gt;pinned_to_cpu == 0)</a>
+<a name="ln607">		threadData-&gt;UnassignCore();</a>
+<a name="ln608">}</a>
+<a name="ln609"> </a>
+<a name="ln610"> </a>
+<a name="ln611">CoreLoadHeap::CoreLoadHeap(int32 coreCount)</a>
+<a name="ln612">	:</a>
+<a name="ln613">	MinMaxHeap&lt;CoreEntry, int32&gt;(coreCount)</a>
+<a name="ln614">{</a>
+<a name="ln615">}</a>
+<a name="ln616"> </a>
+<a name="ln617"> </a>
+<a name="ln618">void</a>
+<a name="ln619">CoreLoadHeap::Dump()</a>
+<a name="ln620">{</a>
+<a name="ln621">	CoreEntry* entry = PeekMinimum();</a>
+<a name="ln622">	while (entry) {</a>
+<a name="ln623">		int32 key = GetKey(entry);</a>
+<a name="ln624"> </a>
+<a name="ln625">		DebugDumper::DumpCoreLoadHeapEntry(entry);</a>
+<a name="ln626"> </a>
+<a name="ln627">		RemoveMinimum();</a>
+<a name="ln628">		sDebugCoreHeap.Insert(entry, key);</a>
+<a name="ln629"> </a>
+<a name="ln630">		entry = PeekMinimum();</a>
+<a name="ln631">	}</a>
+<a name="ln632"> </a>
+<a name="ln633">	entry = sDebugCoreHeap.PeekMinimum();</a>
+<a name="ln634">	while (entry) {</a>
+<a name="ln635">		int32 key = GetKey(entry);</a>
+<a name="ln636">		sDebugCoreHeap.RemoveMinimum();</a>
+<a name="ln637">		Insert(entry, key);</a>
+<a name="ln638">		entry = sDebugCoreHeap.PeekMinimum();</a>
+<a name="ln639">	}</a>
+<a name="ln640">}</a>
+<a name="ln641"> </a>
+<a name="ln642"> </a>
+<a name="ln643">PackageEntry::PackageEntry()</a>
+<a name="ln644">	:</a>
+<a name="ln645">	fIdleCoreCount(0),</a>
+<a name="ln646">	fCoreCount(0)</a>
+<a name="ln647">{</a>
+<a name="ln648">	B_INITIALIZE_RW_SPINLOCK(&amp;fCoreLock);</a>
+<a name="ln649">}</a>
+<a name="ln650"> </a>
+<a name="ln651"> </a>
+<a name="ln652">void</a>
+<a name="ln653">PackageEntry::Init(int32 id)</a>
+<a name="ln654">{</a>
+<a name="ln655">	fPackageID = id;</a>
+<a name="ln656">}</a>
+<a name="ln657"> </a>
+<a name="ln658"> </a>
+<a name="ln659">void</a>
+<a name="ln660">PackageEntry::AddIdleCore(CoreEntry* core)</a>
+<a name="ln661">{</a>
+<a name="ln662">	fCoreCount++;</a>
+<a name="ln663">	fIdleCoreCount++;</a>
+<a name="ln664">	fIdleCores.Add(core);</a>
+<a name="ln665"> </a>
+<a name="ln666">	if (fCoreCount == 1)</a>
+<a name="ln667">		gIdlePackageList.Add(this);</a>
+<a name="ln668">}</a>
+<a name="ln669"> </a>
+<a name="ln670"> </a>
+<a name="ln671">void</a>
+<a name="ln672">PackageEntry::RemoveIdleCore(CoreEntry* core)</a>
+<a name="ln673">{</a>
+<a name="ln674">	fIdleCores.Remove(core);</a>
+<a name="ln675">	fIdleCoreCount--;</a>
+<a name="ln676">	fCoreCount--;</a>
+<a name="ln677"> </a>
+<a name="ln678">	if (fCoreCount == 0)</a>
+<a name="ln679">		gIdlePackageList.Remove(this);</a>
+<a name="ln680">}</a>
+<a name="ln681"> </a>
+<a name="ln682"> </a>
+<a name="ln683">/* static */ void</a>
+<a name="ln684">DebugDumper::DumpCPURunQueue(CPUEntry* cpu)</a>
+<a name="ln685">{</a>
+<a name="ln686">	ThreadRunQueue::ConstIterator iterator = cpu-&gt;fRunQueue.GetConstIterator();</a>
+<a name="ln687"> </a>
+<a name="ln688">	if (iterator.HasNext()</a>
+<a name="ln689">		&amp;&amp; !thread_is_idle_thread(iterator.Next()-&gt;GetThread())) {</a>
+<a name="ln690">		kprintf(&quot;\nCPU %&quot; B_PRId32 &quot; run queue:\n&quot;, cpu-&gt;ID());</a>
+<a name="ln691">		cpu-&gt;fRunQueue.Dump();</a>
+<a name="ln692">	}</a>
+<a name="ln693">}</a>
+<a name="ln694"> </a>
+<a name="ln695"> </a>
+<a name="ln696">/* static */ void</a>
+<a name="ln697">DebugDumper::DumpCoreRunQueue(CoreEntry* core)</a>
+<a name="ln698">{</a>
+<a name="ln699">	core-&gt;fRunQueue.Dump();</a>
+<a name="ln700">}</a>
+<a name="ln701"> </a>
+<a name="ln702"> </a>
+<a name="ln703">/* static */ void</a>
+<a name="ln704">DebugDumper::DumpCoreLoadHeapEntry(CoreEntry* entry)</a>
+<a name="ln705">{</a>
+<a name="ln706">	CoreThreadsData threadsData;</a>
+<a name="ln707">	threadsData.fCore = entry;</a>
+<a name="ln708">	threadsData.fLoad = 0;</a>
+<a name="ln709">	thread_map(DebugDumper::_AnalyzeCoreThreads, &amp;threadsData);</a>
+<a name="ln710"> </a>
+<a name="ln711">	kprintf(&quot;%4&quot; B_PRId32 &quot; %11&quot; B_PRId32 &quot;%% %11&quot; B_PRId32 &quot;%% %11&quot; B_PRId32</a>
+<a name="ln712">		&quot;%% %7&quot; B_PRId32 &quot; %5&quot; B_PRIu32 &quot;\n&quot;, entry-&gt;ID(), entry-&gt;fLoad / 10,</a>
+<a name="ln713">		entry-&gt;fCurrentLoad / 10, threadsData.fLoad, entry-&gt;ThreadCount(),</a>
+<a name="ln714">		entry-&gt;fLoadMeasurementEpoch);</a>
+<a name="ln715">}</a>
+<a name="ln716"> </a>
+<a name="ln717"> </a>
+<a name="ln718">/* static */ void</a>
+<a name="ln719">DebugDumper::DumpIdleCoresInPackage(PackageEntry* package)</a>
+<a name="ln720">{</a>
+<a name="ln721">	kprintf(&quot;%-7&quot; B_PRId32 &quot; &quot;, package-&gt;fPackageID);</a>
+<a name="ln722"> </a>
+<a name="ln723">	DoublyLinkedList&lt;CoreEntry&gt;::ReverseIterator iterator</a>
+<a name="ln724">		= package-&gt;fIdleCores.GetReverseIterator();</a>
+<a name="ln725">	if (iterator.HasNext()) {</a>
+<a name="ln726">		while (iterator.HasNext()) {</a>
+<a name="ln727">			CoreEntry* coreEntry = iterator.Next();</a>
+<a name="ln728">			kprintf(&quot;%&quot; B_PRId32 &quot;%s&quot;, coreEntry-&gt;ID(),</a>
+<a name="ln729">				iterator.HasNext() ? &quot;, &quot; : &quot;&quot;);</a>
+<a name="ln730">		}</a>
+<a name="ln731">	} else</a>
+<a name="ln732">		kprintf(&quot;-&quot;);</a>
+<a name="ln733">	kprintf(&quot;\n&quot;);</a>
+<a name="ln734">}</a>
+<a name="ln735"> </a>
+<a name="ln736"> </a>
+<a name="ln737">/* static */ void</a>
+<a name="ln738">DebugDumper::_AnalyzeCoreThreads(Thread* thread, void* data)</a>
+<a name="ln739">{</a>
+<a name="ln740">	CoreThreadsData* threadsData = static_cast&lt;CoreThreadsData*&gt;(data);</a>
+<a name="ln741">	if (thread-&gt;scheduler_data-&gt;Core() == threadsData-&gt;fCore)</a>
+<a name="ln742">		threadsData-&gt;fLoad += thread-&gt;scheduler_data-&gt;GetLoad();</a>
+<a name="ln743">}</a>
+<a name="ln744"> </a>
+<a name="ln745"> </a>
+<a name="ln746">static int</a>
+<a name="ln747">dump_run_queue(int /* argc */, char** /* argv */)</a>
+<a name="ln748">{</a>
+<a name="ln749">	int32 cpuCount = smp_get_num_cpus();</a>
+<a name="ln750">	int32 coreCount = gCoreCount;</a>
+<a name="ln751"> </a>
+<a name="ln752">	for (int32 i = 0; i &lt; coreCount; i++) {</a>
+<a name="ln753">		kprintf(&quot;%sCore %&quot; B_PRId32 &quot; run queue:\n&quot;, i &gt; 0 ? &quot;\n&quot; : &quot;&quot;, i);</a>
+<a name="ln754">		DebugDumper::DumpCoreRunQueue(&amp;gCoreEntries[i]);</a>
+<a name="ln755">	}</a>
+<a name="ln756"> </a>
+<a name="ln757">	for (int32 i = 0; i &lt; cpuCount; i++)</a>
+<a name="ln758">		DebugDumper::DumpCPURunQueue(&amp;gCPUEntries[i]);</a>
+<a name="ln759"> </a>
+<a name="ln760">	return 0;</a>
+<a name="ln761">}</a>
+<a name="ln762"> </a>
+<a name="ln763"> </a>
+<a name="ln764">static int</a>
+<a name="ln765">dump_cpu_heap(int /* argc */, char** /* argv */)</a>
+<a name="ln766">{</a>
+<a name="ln767">	kprintf(&quot;core average_load current_load threads_load threads epoch\n&quot;);</a>
+<a name="ln768">	gCoreLoadHeap.Dump();</a>
+<a name="ln769">	kprintf(&quot;\n&quot;);</a>
+<a name="ln770">	gCoreHighLoadHeap.Dump();</a>
+<a name="ln771"> </a>
+<a name="ln772">	for (int32 i = 0; i &lt; gCoreCount; i++) {</a>
+<a name="ln773">		if (gCoreEntries[i].CPUCount() &lt; 2)</a>
+<a name="ln774">			continue;</a>
+<a name="ln775"> </a>
+<a name="ln776">		kprintf(&quot;\nCore %&quot; B_PRId32 &quot; heap:\n&quot;, i);</a>
+<a name="ln777">		gCoreEntries[i].CPUHeap()-&gt;Dump();</a>
+<a name="ln778">	}</a>
+<a name="ln779"> </a>
+<a name="ln780">	return 0;</a>
+<a name="ln781">}</a>
+<a name="ln782"> </a>
+<a name="ln783"> </a>
+<a name="ln784">static int</a>
+<a name="ln785">dump_idle_cores(int /* argc */, char** /* argv */)</a>
+<a name="ln786">{</a>
+<a name="ln787">	kprintf(&quot;Idle packages:\n&quot;);</a>
+<a name="ln788">	IdlePackageList::ReverseIterator idleIterator</a>
+<a name="ln789">		= gIdlePackageList.GetReverseIterator();</a>
+<a name="ln790"> </a>
+<a name="ln791">	if (idleIterator.HasNext()) {</a>
+<a name="ln792">		kprintf(&quot;package cores\n&quot;);</a>
+<a name="ln793"> </a>
+<a name="ln794">		while (idleIterator.HasNext())</a>
+<a name="ln795">			DebugDumper::DumpIdleCoresInPackage(idleIterator.Next());</a>
+<a name="ln796">	} else</a>
+<a name="ln797">		kprintf(&quot;No idle packages.\n&quot;);</a>
+<a name="ln798"> </a>
+<a name="ln799">	return 0;</a>
+<a name="ln800">}</a>
+<a name="ln801"> </a>
+<a name="ln802"> </a>
+<a name="ln803">void Scheduler::init_debug_commands()</a>
+<a name="ln804">{</a>
+<a name="ln805">	new(&amp;sDebugCPUHeap) CPUPriorityHeap(smp_get_num_cpus());</a>
+<a name="ln806">	new(&amp;sDebugCoreHeap) CoreLoadHeap(smp_get_num_cpus());</a>
+<a name="ln807"> </a>
+<a name="ln808">	add_debugger_command_etc(&quot;run_queue&quot;, &amp;dump_run_queue,</a>
+<a name="ln809">		&quot;List threads in run queue&quot;, &quot;\nLists threads in run queue&quot;, 0);</a>
+<a name="ln810">	if (!gSingleCore) {</a>
+<a name="ln811">		add_debugger_command_etc(&quot;cpu_heap&quot;, &amp;dump_cpu_heap,</a>
+<a name="ln812">			&quot;List CPUs in CPU priority heap&quot;,</a>
+<a name="ln813">			&quot;\nList CPUs in CPU priority heap&quot;, 0);</a>
+<a name="ln814">		add_debugger_command_etc(&quot;idle_cores&quot;, &amp;dump_idle_cores,</a>
+<a name="ln815">			&quot;List idle cores&quot;, &quot;\nList idle cores&quot;, 0);</a>
+<a name="ln816">	}</a>
+<a name="ln817">}</a>
+<a name="ln818"> </a>
+
+</code></pre>
+<div class="balloon" rel="80"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fCPUNumber, fCore, fSchedulerModeLock, fQueueLock.</p></div>
+<div class="balloon" rel="643"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fPackageID, fCoreLock.</p></div>
+<div class="balloon" rel="400"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fCoreID, fPackage, fCPULock, fQueueLock, fActiveTimeLock, fLoadLock.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

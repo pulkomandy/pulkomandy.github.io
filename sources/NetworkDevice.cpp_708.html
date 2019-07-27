@@ -1,0 +1,1043 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>NetworkDevice.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2010-2015, Axel Dörfler, axeld@pinc-software.de.</a>
+<a name="ln3"> * Distributed under the terms of the MIT License.</a>
+<a name="ln4"> */</a>
+<a name="ln5"> </a>
+<a name="ln6"> </a>
+<a name="ln7">#include &lt;NetworkDevice.h&gt;</a>
+<a name="ln8"> </a>
+<a name="ln9">#include &lt;errno.h&gt;</a>
+<a name="ln10">#include &lt;net/if.h&gt;</a>
+<a name="ln11">#include &lt;net/if_media.h&gt;</a>
+<a name="ln12">#include &lt;stdio.h&gt;</a>
+<a name="ln13">#include &lt;sys/sockio.h&gt;</a>
+<a name="ln14"> </a>
+<a name="ln15">#include &lt;Looper.h&gt;</a>
+<a name="ln16">#include &lt;Messenger.h&gt;</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &lt;AutoDeleter.h&gt;</a>
+<a name="ln19">#include &lt;NetServer.h&gt;</a>
+<a name="ln20">#include &lt;NetworkNotifications.h&gt;</a>
+<a name="ln21"> </a>
+<a name="ln22">extern &quot;C&quot; {</a>
+<a name="ln23">#	include &lt;compat/sys/cdefs.h&gt;</a>
+<a name="ln24">#	include &lt;compat/sys/ioccom.h&gt;</a>
+<a name="ln25">#	include &lt;net80211/ieee80211_ioctl.h&gt;</a>
+<a name="ln26">}</a>
+<a name="ln27"> </a>
+<a name="ln28"> </a>
+<a name="ln29">//#define TRACE_DEVICE</a>
+<a name="ln30">#ifdef TRACE_DEVICE</a>
+<a name="ln31">#	define TRACE(x, ...) printf(x, __VA_ARGS__);</a>
+<a name="ln32">#else</a>
+<a name="ln33">#	define TRACE(x, ...) ;</a>
+<a name="ln34">#endif</a>
+<a name="ln35"> </a>
+<a name="ln36"> </a>
+<a name="ln37">namespace {</a>
+<a name="ln38"> </a>
+<a name="ln39"> </a>
+<a name="ln40">struct ie_data {</a>
+<a name="ln41">	uint8	type;</a>
+<a name="ln42">	uint8	length;</a>
+<a name="ln43">	uint8	data[1];</a>
+<a name="ln44">};</a>
+<a name="ln45"> </a>
+<a name="ln46"> </a>
+<a name="ln47">// #pragma mark - private functions (code shared with net_server)</a>
+<a name="ln48"> </a>
+<a name="ln49"> </a>
+<a name="ln50">static status_t</a>
+<a name="ln51">get_80211(const char* name, int32 type, void* data, int32&amp; length)</a>
+<a name="ln52">{</a>
+<a name="ln53">	int socket = ::socket(AF_INET, SOCK_DGRAM, 0);</a>
+<a name="ln54">	if (socket &lt; 0)</a>
+<a name="ln55">		return errno;</a>
+<a name="ln56"> </a>
+<a name="ln57">	FileDescriptorCloser closer(socket);</a>
+<a name="ln58"> </a>
+<a name="ln59">	struct ieee80211req ireq;</a>
+<a name="ln60">	strlcpy(ireq.i_name, name, IF_NAMESIZE);</a>
+<a name="ln61">	ireq.i_type = type;</a>
+<a name="ln62">	ireq.i_val = 0;</a>
+<a name="ln63">	ireq.i_len = length;</a>
+<a name="ln64">	ireq.i_data = data;</a>
+<a name="ln65"> </a>
+<a name="ln66">	if (ioctl(socket, SIOCG80211, &amp;ireq, sizeof(struct ieee80211req)) &lt; 0)</a>
+<a name="ln67">		return errno;</a>
+<a name="ln68"> </a>
+<a name="ln69">	length = ireq.i_len;</a>
+<a name="ln70">	return B_OK;</a>
+<a name="ln71">}</a>
+<a name="ln72"> </a>
+<a name="ln73"> </a>
+<a name="ln74">static status_t</a>
+<a name="ln75">set_80211(const char* name, int32 type, void* data,</a>
+<a name="ln76">	int32 length = 0, int32 value = 0)</a>
+<a name="ln77">{</a>
+<a name="ln78">	int socket = ::socket(AF_INET, SOCK_DGRAM, 0);</a>
+<a name="ln79">	if (socket &lt; 0)</a>
+<a name="ln80">		return errno;</a>
+<a name="ln81"> </a>
+<a name="ln82">	FileDescriptorCloser closer(socket);</a>
+<a name="ln83"> </a>
+<a name="ln84">	struct ieee80211req ireq;</a>
+<a name="ln85">	strlcpy(ireq.i_name, name, IF_NAMESIZE);</a>
+<a name="ln86">	ireq.i_type = type;</a>
+<a name="ln87">	ireq.i_val = value;</a>
+<a name="ln88">	ireq.i_len = length;</a>
+<a name="ln89">	ireq.i_data = data;</a>
+<a name="ln90"> </a>
+<a name="ln91">	if (ioctl(socket, SIOCS80211, &amp;ireq, sizeof(struct ieee80211req)) &lt; 0)</a>
+<a name="ln92">		return errno;</a>
+<a name="ln93"> </a>
+<a name="ln94">	return B_OK;</a>
+<a name="ln95">}</a>
+<a name="ln96"> </a>
+<a name="ln97"> </a>
+<a name="ln98">template&lt;typename T&gt; status_t</a>
+<a name="ln99">do_request(T&amp; request, const char* name, int option)</a>
+<a name="ln100">{</a>
+<a name="ln101">	int socket = ::socket(AF_LINK, SOCK_DGRAM, 0);</a>
+<a name="ln102">	if (socket &lt; 0)</a>
+<a name="ln103">		return errno;</a>
+<a name="ln104"> </a>
+<a name="ln105">	FileDescriptorCloser closer(socket);</a>
+<a name="ln106"> </a>
+<a name="ln107">	strlcpy(((struct ifreq&amp;)request).ifr_name, name, IF_NAMESIZE);</a>
+<a name="ln108"> </a>
+<a name="ln109">	if (ioctl(socket, option, &amp;request, sizeof(T)) &lt; 0)</a>
+<a name="ln110">		return errno;</a>
+<a name="ln111"> </a>
+<a name="ln112">	return B_OK;</a>
+<a name="ln113">}</a>
+<a name="ln114"> </a>
+<a name="ln115"> </a>
+<a name="ln116">template&lt;&gt; status_t</a>
+<a name="ln117">do_request&lt;ieee80211req&gt;(ieee80211req&amp; request, const char* name, int option)</a>
+<a name="ln118">{</a>
+<a name="ln119">	int socket = ::socket(AF_INET, SOCK_DGRAM, 0);</a>
+<a name="ln120">	if (socket &lt; 0)</a>
+<a name="ln121">		return errno;</a>
+<a name="ln122"> </a>
+<a name="ln123">	FileDescriptorCloser closer(socket);</a>
+<a name="ln124"> </a>
+<a name="ln125">	strlcpy(((struct ieee80211req&amp;)request).i_name, name, IFNAMSIZ);</a>
+<a name="ln126"> </a>
+<a name="ln127">	if (ioctl(socket, option, &amp;request, sizeof(request)) &lt; 0)</a>
+<a name="ln128">		return errno;</a>
+<a name="ln129"> </a>
+<a name="ln130">	return B_OK;</a>
+<a name="ln131">}</a>
+<a name="ln132"> </a>
+<a name="ln133"> </a>
+<a name="ln134">//! Read a 16 bit little endian value</a>
+<a name="ln135">static uint16</a>
+<a name="ln136">read_le16(uint8*&amp; data, int32&amp; length)</a>
+<a name="ln137">{</a>
+<a name="ln138">	uint16 value = B_LENDIAN_TO_HOST_INT16(*(uint16*)data);</a>
+<a name="ln139">	data += 2;</a>
+<a name="ln140">	length -= 2;</a>
+<a name="ln141">	return value;</a>
+<a name="ln142">}</a>
+<a name="ln143"> </a>
+<a name="ln144"> </a>
+<a name="ln145">//! Read a 32 bit little endian value</a>
+<a name="ln146">static uint32</a>
+<a name="ln147">read_le32(uint8*&amp; data, int32&amp; length)</a>
+<a name="ln148">{</a>
+<a name="ln149">	uint32 value = B_LENDIAN_TO_HOST_INT32(*(uint32*)data);</a>
+<a name="ln150">	data += 4;</a>
+<a name="ln151">	length -= 4;</a>
+<a name="ln152">	return value;</a>
+<a name="ln153">}</a>
+<a name="ln154"> </a>
+<a name="ln155"> </a>
+<a name="ln156">static uint32</a>
+<a name="ln157">from_rsn_cipher(uint32 cipher)</a>
+<a name="ln158">{</a>
+<a name="ln159">	if ((cipher &amp; 0xffffff) != RSN_OUI)</a>
+<a name="ln160">		return B_NETWORK_CIPHER_CCMP;</a>
+<a name="ln161"> </a>
+<a name="ln162">	switch (cipher &gt;&gt; 24) {</a>
+<a name="ln163">		case RSN_CSE_NULL:</a>
+<a name="ln164">			return B_NETWORK_CIPHER_NONE;</a>
+<a name="ln165">		case RSN_CSE_WEP40:</a>
+<a name="ln166">			return B_NETWORK_CIPHER_WEP_40;</a>
+<a name="ln167">		case RSN_CSE_WEP104:</a>
+<a name="ln168">			return B_NETWORK_CIPHER_WEP_104;</a>
+<a name="ln169">		case RSN_CSE_TKIP:</a>
+<a name="ln170">			return B_NETWORK_CIPHER_TKIP;</a>
+<a name="ln171">		default:</a>
+<a name="ln172">		case RSN_CSE_CCMP:</a>
+<a name="ln173">			return B_NETWORK_CIPHER_CCMP;</a>
+<a name="ln174">		case RSN_CSE_WRAP:</a>
+<a name="ln175">			return B_NETWORK_CIPHER_AES_128_CMAC;</a>
+<a name="ln176">	}</a>
+<a name="ln177">}</a>
+<a name="ln178"> </a>
+<a name="ln179"> </a>
+<a name="ln180">static uint32</a>
+<a name="ln181">from_rsn_key_mode(uint32 mode)</a>
+<a name="ln182">{</a>
+<a name="ln183">	if ((mode &amp; 0xffffff) != RSN_OUI)</a>
+<a name="ln184">		return B_KEY_MODE_IEEE802_1X;</a>
+<a name="ln185"> </a>
+<a name="ln186">	switch (mode &gt;&gt; 24) {</a>
+<a name="ln187">		default:</a>
+<a name="ln188">		case RSN_ASE_8021X_UNSPEC:</a>
+<a name="ln189">			return B_KEY_MODE_IEEE802_1X;</a>
+<a name="ln190">		case RSN_ASE_8021X_PSK:</a>
+<a name="ln191">			return B_KEY_MODE_PSK;</a>
+<a name="ln192">		// the following are currently not defined in net80211</a>
+<a name="ln193">		case 3:</a>
+<a name="ln194">			return B_KEY_MODE_FT_IEEE802_1X;</a>
+<a name="ln195">		case 4:</a>
+<a name="ln196">			return B_KEY_MODE_FT_PSK;</a>
+<a name="ln197">		case 5:</a>
+<a name="ln198">			return B_KEY_MODE_IEEE802_1X_SHA256;</a>
+<a name="ln199">		case 6:</a>
+<a name="ln200">			return B_KEY_MODE_PSK_SHA256;</a>
+<a name="ln201">	}</a>
+<a name="ln202">}</a>
+<a name="ln203"> </a>
+<a name="ln204"> </a>
+<a name="ln205">//! Parse RSN/WPA information elements common data</a>
+<a name="ln206">static void</a>
+<a name="ln207">parse_ie_rsn_wpa(wireless_network&amp; network, uint8*&amp; data, int32&amp; length)</a>
+<a name="ln208">{</a>
+<a name="ln209">	if (length &gt;= 4) {</a>
+<a name="ln210">		// parse group cipher</a>
+<a name="ln211">		network.group_cipher = from_rsn_cipher(read_le32(data, length));</a>
+<a name="ln212">	} else if (length &gt; 0)</a>
+<a name="ln213">		return;</a>
+<a name="ln214"> </a>
+<a name="ln215">	if (length &gt;= 2) {</a>
+<a name="ln216">		// parse unicast cipher</a>
+<a name="ln217">		uint16 count = read_le16(data, length);</a>
+<a name="ln218">		network.cipher = 0;</a>
+<a name="ln219"> </a>
+<a name="ln220">		for (uint16 i = 0; i &lt; count; i++) {</a>
+<a name="ln221">			if (length &lt; 4)</a>
+<a name="ln222">				return;</a>
+<a name="ln223">			network.cipher |= from_rsn_cipher(read_le32(data, length));</a>
+<a name="ln224">		}</a>
+<a name="ln225">	} else if (length &gt; 0)</a>
+<a name="ln226">		return;</a>
+<a name="ln227"> </a>
+<a name="ln228">	if (length &gt;= 2) {</a>
+<a name="ln229">		// parse key management mode</a>
+<a name="ln230">		uint16 count = read_le16(data, length);</a>
+<a name="ln231">		network.key_mode = 0;</a>
+<a name="ln232"> </a>
+<a name="ln233">		for (uint16 i = 0; i &lt; count; i++) {</a>
+<a name="ln234">			if (length &lt; 4)</a>
+<a name="ln235">				return;</a>
+<a name="ln236">			network.key_mode |= from_rsn_key_mode(read_le32(data, length));</a>
+<a name="ln237">		}</a>
+<a name="ln238">	} else if (length &gt; 0)</a>
+<a name="ln239">		return;</a>
+<a name="ln240"> </a>
+<a name="ln241">	// TODO: capabilities, and PMKID following in case of RSN</a>
+<a name="ln242">}</a>
+<a name="ln243"> </a>
+<a name="ln244"> </a>
+<a name="ln245">//! Parse RSN (Robust Security Network) information element.</a>
+<a name="ln246">static void</a>
+<a name="ln247">parse_ie_rsn(wireless_network&amp; network, ie_data* ie)</a>
+<a name="ln248">{</a>
+<a name="ln249">	network.authentication_mode = B_NETWORK_AUTHENTICATION_WPA2;</a>
+<a name="ln250">	network.cipher = B_NETWORK_CIPHER_CCMP;</a>
+<a name="ln251">	network.group_cipher = B_NETWORK_CIPHER_CCMP;</a>
+<a name="ln252">	network.key_mode = B_KEY_MODE_IEEE802_1X;</a>
+<a name="ln253"> </a>
+<a name="ln254">	int32 length = ie-&gt;length;</a>
+<a name="ln255">	if (length &lt; 2)</a>
+<a name="ln256">		return;</a>
+<a name="ln257"> </a>
+<a name="ln258">	uint8* data = ie-&gt;data;</a>
+<a name="ln259"> </a>
+<a name="ln260">	uint16 version = read_le16(data, length);</a>
+<a name="ln261">	if (version != RSN_VERSION)</a>
+<a name="ln262">		return;</a>
+<a name="ln263"> </a>
+<a name="ln264">	parse_ie_rsn_wpa(network, data, length);</a>
+<a name="ln265">}</a>
+<a name="ln266"> </a>
+<a name="ln267"> </a>
+<a name="ln268">//! Parse WPA information element.</a>
+<a name="ln269">static bool</a>
+<a name="ln270">parse_ie_wpa(wireless_network&amp; network, ie_data* ie)</a>
+<a name="ln271">{</a>
+<a name="ln272">	int32 length = ie-&gt;length;</a>
+<a name="ln273">	if (length &lt; 6)</a>
+<a name="ln274">		return false;</a>
+<a name="ln275"> </a>
+<a name="ln276">	uint8* data = ie-&gt;data;</a>
+<a name="ln277"> </a>
+<a name="ln278">	uint32 oui = read_le32(data, length);</a>
+<a name="ln279">	TRACE(&quot;  oui: %&quot; B_PRIx32 &quot;\n&quot;, oui);</a>
+<a name="ln280">	if (oui != ((WPA_OUI_TYPE &lt;&lt; 24) | WPA_OUI))</a>
+<a name="ln281">		return false;</a>
+<a name="ln282"> </a>
+<a name="ln283">	uint16 version = read_le16(data, length);</a>
+<a name="ln284">	if (version != WPA_VERSION)</a>
+<a name="ln285">		return false;</a>
+<a name="ln286"> </a>
+<a name="ln287">	network.authentication_mode = B_NETWORK_AUTHENTICATION_WPA;</a>
+<a name="ln288">	network.cipher = B_NETWORK_CIPHER_TKIP;</a>
+<a name="ln289">	network.group_cipher = B_NETWORK_CIPHER_TKIP;</a>
+<a name="ln290">	network.key_mode = B_KEY_MODE_IEEE802_1X;</a>
+<a name="ln291"> </a>
+<a name="ln292">	parse_ie_rsn_wpa(network, data, length);</a>
+<a name="ln293">	return true;</a>
+<a name="ln294">}</a>
+<a name="ln295"> </a>
+<a name="ln296"> </a>
+<a name="ln297">//! Parse information elements.</a>
+<a name="ln298">static void</a>
+<a name="ln299">parse_ie(wireless_network&amp; network, uint8* _ie, int32 ieLength)</a>
+<a name="ln300">{</a>
+<a name="ln301">	struct ie_data* ie = (ie_data*)_ie;</a>
+<a name="ln302">	bool hadRSN = false;</a>
+<a name="ln303">	bool hadWPA = false;</a>
+<a name="ln304"> </a>
+<a name="ln305">	while (ieLength &gt; 1) {</a>
+<a name="ln306">		TRACE(&quot;ie type %u\n&quot;, ie-&gt;type);</a>
+<a name="ln307">		switch (ie-&gt;type) {</a>
+<a name="ln308">			case IEEE80211_ELEMID_SSID:</a>
+<a name="ln309">				strlcpy(network.name, (char*)ie-&gt;data,</a>
+<a name="ln310">					min_c(ie-&gt;length + 1, (int)sizeof(network.name)));</a>
+<a name="ln311">				break;</a>
+<a name="ln312">			case IEEE80211_ELEMID_RSN:</a>
+<a name="ln313">				parse_ie_rsn(network, ie);</a>
+<a name="ln314">				hadRSN = true;</a>
+<a name="ln315">				break;</a>
+<a name="ln316">			case IEEE80211_ELEMID_VENDOR:</a>
+<a name="ln317">				if (!hadRSN &amp;&amp; parse_ie_wpa(network, ie))</a>
+<a name="ln318">					hadWPA = true;</a>
+<a name="ln319">				break;</a>
+<a name="ln320">		}</a>
+<a name="ln321"> </a>
+<a name="ln322">		ieLength -= 2 + ie-&gt;length;</a>
+<a name="ln323">		ie = (ie_data*)((uint8*)ie + 2 + ie-&gt;length);</a>
+<a name="ln324">	}</a>
+<a name="ln325"> </a>
+<a name="ln326">	if (hadRSN || hadWPA) {</a>
+<a name="ln327">		// Determine authentication mode</a>
+<a name="ln328"> </a>
+<a name="ln329">		if ((network.key_mode &amp; (B_KEY_MODE_IEEE802_1X_SHA256</a>
+<a name="ln330">				| B_KEY_MODE_PSK_SHA256)) != 0) {</a>
+<a name="ln331">			network.authentication_mode = B_NETWORK_AUTHENTICATION_WPA2;</a>
+<a name="ln332">		} else if ((network.key_mode &amp; (B_KEY_MODE_IEEE802_1X</a>
+<a name="ln333">				| B_KEY_MODE_PSK | B_KEY_MODE_FT_IEEE802_1X</a>
+<a name="ln334">				| B_KEY_MODE_FT_PSK)) != 0) {</a>
+<a name="ln335">			if (!hadRSN)</a>
+<a name="ln336">				network.authentication_mode = B_NETWORK_AUTHENTICATION_WPA;</a>
+<a name="ln337">		} else if ((network.key_mode &amp; B_KEY_MODE_NONE) != 0) {</a>
+<a name="ln338">			if ((network.cipher &amp; (B_NETWORK_CIPHER_WEP_40</a>
+<a name="ln339">					| B_NETWORK_CIPHER_WEP_104)) != 0)</a>
+<a name="ln340">				network.authentication_mode = B_NETWORK_AUTHENTICATION_WEP;</a>
+<a name="ln341">			else</a>
+<a name="ln342">				network.authentication_mode = B_NETWORK_AUTHENTICATION_NONE;</a>
+<a name="ln343">		}</a>
+<a name="ln344">	}</a>
+<a name="ln345">}</a>
+<a name="ln346"> </a>
+<a name="ln347"> </a>
+<a name="ln348">static void</a>
+<a name="ln349">parse_ie(wireless_network&amp; network, struct ieee80211req_sta_info&amp; info)</a>
+<a name="ln350">{</a>
+<a name="ln351">	parse_ie(network, (uint8*)&amp;info + info.isi_ie_off, info.isi_ie_len);</a>
+<a name="ln352">}</a>
+<a name="ln353"> </a>
+<a name="ln354"> </a>
+<a name="ln355">static void</a>
+<a name="ln356">parse_ie(wireless_network&amp; network, struct ieee80211req_scan_result&amp; result)</a>
+<a name="ln357">{</a>
+<a name="ln358">	parse_ie(network, (uint8*)&amp;result + result.isr_ie_off + result.isr_ssid_len</a>
+<a name="ln359">			+ result.isr_meshid_len, result.isr_ie_len);</a>
+<a name="ln360">}</a>
+<a name="ln361"> </a>
+<a name="ln362"> </a>
+<a name="ln363">static bool</a>
+<a name="ln364">get_ssid_from_ie(char* name, uint8* _ie, int32 ieLength)</a>
+<a name="ln365">{</a>
+<a name="ln366">	struct ie_data* ie = (ie_data*)_ie;</a>
+<a name="ln367"> </a>
+<a name="ln368">	while (ieLength &gt; 1) {</a>
+<a name="ln369">		switch (ie-&gt;type) {</a>
+<a name="ln370">			case IEEE80211_ELEMID_SSID:</a>
+<a name="ln371">				strlcpy(name, (char*)ie-&gt;data, min_c(ie-&gt;length + 1, 32));</a>
+<a name="ln372">				return true;</a>
+<a name="ln373">		}</a>
+<a name="ln374"> </a>
+<a name="ln375">		ieLength -= 2 + ie-&gt;length;</a>
+<a name="ln376">		ie = (ie_data*)((uint8*)ie + 2 + ie-&gt;length);</a>
+<a name="ln377">	}</a>
+<a name="ln378">	return false;</a>
+<a name="ln379">}</a>
+<a name="ln380"> </a>
+<a name="ln381"> </a>
+<a name="ln382">static bool</a>
+<a name="ln383">get_ssid_from_ie(char* name, struct ieee80211req_sta_info&amp; info)</a>
+<a name="ln384">{</a>
+<a name="ln385">	return get_ssid_from_ie(name, (uint8*)&amp;info + info.isi_ie_off,</a>
+<a name="ln386">		info.isi_ie_len);</a>
+<a name="ln387">}</a>
+<a name="ln388"> </a>
+<a name="ln389"> </a>
+<a name="ln390">static void</a>
+<a name="ln391">fill_wireless_network(wireless_network&amp; network,</a>
+<a name="ln392">	struct ieee80211req_sta_info&amp; info)</a>
+<a name="ln393">{</a>
+<a name="ln394">	network.name[0] = '\0';</a>
+<a name="ln395">	network.address.SetToLinkLevel(info.isi_macaddr,</a>
+<a name="ln396">		IEEE80211_ADDR_LEN);</a>
+<a name="ln397">	network.signal_strength = info.isi_rssi;</a>
+<a name="ln398">	network.noise_level = info.isi_noise;</a>
+<a name="ln399">	network.flags |= (info.isi_capinfo &amp; IEEE80211_CAPINFO_PRIVACY) != 0</a>
+<a name="ln400">		? B_NETWORK_IS_ENCRYPTED : 0;</a>
+<a name="ln401"> </a>
+<a name="ln402">	network.authentication_mode = 0;</a>
+<a name="ln403">	network.cipher = 0;</a>
+<a name="ln404">	network.group_cipher = 0;</a>
+<a name="ln405">	network.key_mode = 0;</a>
+<a name="ln406"> </a>
+<a name="ln407">	parse_ie(network, info);</a>
+<a name="ln408">}</a>
+<a name="ln409"> </a>
+<a name="ln410"> </a>
+<a name="ln411">static void</a>
+<a name="ln412">fill_wireless_network(wireless_network&amp; network, const char* networkName,</a>
+<a name="ln413">	struct ieee80211req_scan_result&amp; result)</a>
+<a name="ln414">{</a>
+<a name="ln415">	strlcpy(network.name, networkName, sizeof(network.name));</a>
+<a name="ln416">	network.address.SetToLinkLevel(result.isr_bssid,</a>
+<a name="ln417">		IEEE80211_ADDR_LEN);</a>
+<a name="ln418">	network.signal_strength = result.isr_rssi;</a>
+<a name="ln419">	network.noise_level = result.isr_noise;</a>
+<a name="ln420">	network.flags = (result.isr_capinfo &amp; IEEE80211_CAPINFO_PRIVACY)</a>
+<a name="ln421">		!= 0 ? B_NETWORK_IS_ENCRYPTED : 0;</a>
+<a name="ln422"> </a>
+<a name="ln423">	network.authentication_mode = 0;</a>
+<a name="ln424">	network.cipher = 0;</a>
+<a name="ln425">	network.group_cipher = 0;</a>
+<a name="ln426">	network.key_mode = 0;</a>
+<a name="ln427"> </a>
+<a name="ln428">	parse_ie(network, result);</a>
+<a name="ln429">}</a>
+<a name="ln430"> </a>
+<a name="ln431"> </a>
+<a name="ln432">static status_t</a>
+<a name="ln433">get_scan_result(const char* device, wireless_network&amp; network, uint32 index,</a>
+<a name="ln434">	const BNetworkAddress* address, const char* name)</a>
+<a name="ln435">{</a>
+<a name="ln436">	if (address != NULL &amp;&amp; address-&gt;Family() != AF_LINK)</a>
+<a name="ln437">		return B_BAD_VALUE;</a>
+<a name="ln438"> </a>
+<a name="ln439">	const size_t kBufferSize = 65535;</a>
+<a name="ln440">	uint8* buffer = (uint8*)malloc(kBufferSize);</a>
+<a name="ln441">	if (buffer == NULL)</a>
+<a name="ln442">		return B_NO_MEMORY;</a>
+<a name="ln443"> </a>
+<a name="ln444">	MemoryDeleter deleter(buffer);</a>
+<a name="ln445"> </a>
+<a name="ln446">	int32 length = kBufferSize;</a>
+<a name="ln447">	status_t status = get_80211(device, IEEE80211_IOC_SCAN_RESULTS, buffer,</a>
+<a name="ln448">		length);</a>
+<a name="ln449">	if (status != B_OK)</a>
+<a name="ln450">		return status;</a>
+<a name="ln451"> </a>
+<a name="ln452">	int32 bytesLeft = length;</a>
+<a name="ln453">	uint8* entry = buffer;</a>
+<a name="ln454">	uint32 count = 0;</a>
+<a name="ln455"> </a>
+<a name="ln456">	while (bytesLeft &gt; (int32)sizeof(struct ieee80211req_scan_result)) {</a>
+<a name="ln457">		ieee80211req_scan_result* result</a>
+<a name="ln458">			= (ieee80211req_scan_result*)entry;</a>
+<a name="ln459"> </a>
+<a name="ln460">		char networkName[32];</a>
+<a name="ln461">		strlcpy(networkName, (char*)(result + 1),</a>
+<a name="ln462">			min_c((int)sizeof(networkName), result-&gt;isr_ssid_len + 1));</a>
+<a name="ln463"> </a>
+<a name="ln464">		if (index == count || (address != NULL &amp;&amp; !memcmp(</a>
+<a name="ln465">				address-&gt;LinkLevelAddress(), result-&gt;isr_bssid,</a>
+<a name="ln466">				IEEE80211_ADDR_LEN))</a>
+<a name="ln467">			|| (name != NULL &amp;&amp; !strcmp(networkName, name))) {</a>
+<a name="ln468">			// Fill wireless_network with scan result data</a>
+<a name="ln469">			fill_wireless_network(network, networkName, *result);</a>
+<a name="ln470">			return B_OK;</a>
+<a name="ln471">		}</a>
+<a name="ln472"> </a>
+<a name="ln473">		entry += result-&gt;isr_len;</a>
+<a name="ln474">		bytesLeft -= result-&gt;isr_len;</a>
+<a name="ln475">		count++;</a>
+<a name="ln476">	}</a>
+<a name="ln477"> </a>
+<a name="ln478">	return B_ENTRY_NOT_FOUND;</a>
+<a name="ln479">}</a>
+<a name="ln480"> </a>
+<a name="ln481"> </a>
+<a name="ln482">static status_t</a>
+<a name="ln483">get_station(const char* device, wireless_network&amp; network, uint32 index,</a>
+<a name="ln484">	const BNetworkAddress* address, const char* name)</a>
+<a name="ln485">{</a>
+<a name="ln486">	if (address != NULL &amp;&amp; address-&gt;Family() != AF_LINK)</a>
+<a name="ln487">		return B_BAD_VALUE;</a>
+<a name="ln488"> </a>
+<a name="ln489">	const size_t kBufferSize = 65535;</a>
+<a name="ln490">	uint8* buffer = (uint8*)malloc(kBufferSize);</a>
+<a name="ln491">	if (buffer == NULL)</a>
+<a name="ln492">		return B_NO_MEMORY;</a>
+<a name="ln493"> </a>
+<a name="ln494">	MemoryDeleter deleter(buffer);</a>
+<a name="ln495"> </a>
+<a name="ln496">	struct ieee80211req_sta_req&amp; request = *(ieee80211req_sta_req*)buffer;</a>
+<a name="ln497">	if (address != NULL) {</a>
+<a name="ln498">		memcpy(request.is_u.macaddr, address-&gt;LinkLevelAddress(),</a>
+<a name="ln499">			IEEE80211_ADDR_LEN);</a>
+<a name="ln500">	} else</a>
+<a name="ln501">		memset(request.is_u.macaddr, 0xff, IEEE80211_ADDR_LEN);</a>
+<a name="ln502"> </a>
+<a name="ln503">	int32 length = kBufferSize;</a>
+<a name="ln504">	status_t status = get_80211(device, IEEE80211_IOC_STA_INFO, &amp;request,</a>
+<a name="ln505">		length);</a>
+<a name="ln506">	if (status != B_OK)</a>
+<a name="ln507">		return status;</a>
+<a name="ln508"> </a>
+<a name="ln509">	int32 bytesLeft = length;</a>
+<a name="ln510">	uint8* entry = (uint8*)&amp;request.info[0];</a>
+<a name="ln511">	uint32 count = 0;</a>
+<a name="ln512"> </a>
+<a name="ln513">	while (bytesLeft &gt; (int32)sizeof(struct ieee80211req_sta_info)) {</a>
+<a name="ln514">		ieee80211req_sta_info* info = (ieee80211req_sta_info*)entry;</a>
+<a name="ln515"> </a>
+<a name="ln516">		char networkName[32];</a>
+<a name="ln517">		get_ssid_from_ie(networkName, *info);</a>
+<a name="ln518">		if (index == count || address != NULL</a>
+<a name="ln519">			|| (name != NULL &amp;&amp; !strcmp(networkName, name))) {</a>
+<a name="ln520">			fill_wireless_network(network, *info);</a>
+<a name="ln521">			return B_OK;</a>
+<a name="ln522">		}</a>
+<a name="ln523"> </a>
+<a name="ln524">		entry += info-&gt;isi_len;</a>
+<a name="ln525">		bytesLeft -= info-&gt;isi_len;</a>
+<a name="ln526">		count++;</a>
+<a name="ln527">	}</a>
+<a name="ln528"> </a>
+<a name="ln529">	return B_ENTRY_NOT_FOUND;</a>
+<a name="ln530">}</a>
+<a name="ln531"> </a>
+<a name="ln532"> </a>
+<a name="ln533">static status_t</a>
+<a name="ln534">get_network(const char* device, wireless_network&amp; network, uint32 index,</a>
+<a name="ln535">	const BNetworkAddress* address, const char* name)</a>
+<a name="ln536">{</a>
+<a name="ln537">	status_t status = get_station(device, network, index, address, name);</a>
+<a name="ln538">	if (status != B_OK)</a>
+<a name="ln539">		return get_scan_result(device, network, index, address, name);</a>
+<a name="ln540"> </a>
+<a name="ln541">	return B_OK;</a>
+<a name="ln542">}</a>
+<a name="ln543"> </a>
+<a name="ln544"> </a>
+<a name="ln545">}	// namespace</a>
+<a name="ln546"> </a>
+<a name="ln547"> </a>
+<a name="ln548">// #pragma mark -</a>
+<a name="ln549"> </a>
+<a name="ln550"> </a>
+<a name="ln551">BNetworkDevice::BNetworkDevice()</a>
+<a name="ln552">{</a>
+<a name="ln553">	Unset();</a>
+<a name="ln554">}</a>
+<a name="ln555"> </a>
+<a name="ln556"> </a>
+<a name="ln557">BNetworkDevice::BNetworkDevice(const char* name)</a>
+<a name="ln558">{</a>
+<a name="ln559">	SetTo(name);</a>
+<a name="ln560">}</a>
+<a name="ln561"> </a>
+<a name="ln562"> </a>
+<a name="ln563">BNetworkDevice::~BNetworkDevice()</a>
+<a name="ln564">{</a>
+<a name="ln565">}</a>
+<a name="ln566"> </a>
+<a name="ln567"> </a>
+<a name="ln568">void</a>
+<a name="ln569">BNetworkDevice::Unset()</a>
+<a name="ln570">{</a>
+<a name="ln571">	fName[0] = '\0';</a>
+<a name="ln572">}</a>
+<a name="ln573"> </a>
+<a name="ln574"> </a>
+<a name="ln575">void</a>
+<a name="ln576">BNetworkDevice::SetTo(const char* name)</a>
+<a name="ln577">{</a>
+<a name="ln578">	strlcpy(fName, name, IF_NAMESIZE);</a>
+<a name="ln579">}</a>
+<a name="ln580"> </a>
+<a name="ln581"> </a>
+<a name="ln582">const char*</a>
+<a name="ln583">BNetworkDevice::Name() const</a>
+<a name="ln584">{</a>
+<a name="ln585">	return fName;</a>
+<a name="ln586">}</a>
+<a name="ln587"> </a>
+<a name="ln588"> </a>
+<a name="ln589">bool</a>
+<a name="ln590">BNetworkDevice::Exists() const</a>
+<a name="ln591">{</a>
+<a name="ln592">	ifreq request;</a>
+<a name="ln593">	return do_request(request, Name(), SIOCGIFINDEX) == B_OK;</a>
+<a name="ln594">}</a>
+<a name="ln595"> </a>
+<a name="ln596"> </a>
+<a name="ln597">uint32</a>
+<a name="ln598">BNetworkDevice::Index() const</a>
+<a name="ln599">{</a>
+<a name="ln600">	ifreq request;</a>
+<a name="ln601">	if (do_request(request, Name(), SIOCGIFINDEX) != B_OK)</a>
+<a name="ln602">		return 0;</a>
+<a name="ln603"> </a>
+<a name="ln604">	return request.ifr_index;</a>
+<a name="ln605">}</a>
+<a name="ln606"> </a>
+<a name="ln607"> </a>
+<a name="ln608">uint32</a>
+<a name="ln609">BNetworkDevice::Flags() const</a>
+<a name="ln610">{</a>
+<a name="ln611">	ifreq request;</a>
+<a name="ln612">	if (do_request(request, Name(), SIOCGIFFLAGS) != B_OK)</a>
+<a name="ln613">		return 0;</a>
+<a name="ln614"> </a>
+<a name="ln615">	return request.ifr_flags;</a>
+<a name="ln616">}</a>
+<a name="ln617"> </a>
+<a name="ln618"> </a>
+<a name="ln619">bool</a>
+<a name="ln620">BNetworkDevice::HasLink() const</a>
+<a name="ln621">{</a>
+<a name="ln622">	return (Flags() &amp; IFF_LINK) != 0;</a>
+<a name="ln623">}</a>
+<a name="ln624"> </a>
+<a name="ln625"> </a>
+<a name="ln626">int32</a>
+<a name="ln627">BNetworkDevice::CountMedia() const</a>
+<a name="ln628">{</a>
+<a name="ln629">	ifmediareq request;</a>
+<a name="ln630">	request.ifm_count = 0;</a>
+<a name="ln631">	request.ifm_ulist = NULL;</a>
+<a name="ln632"> </a>
+<a name="ln633">	if (do_request(request, Name(), SIOCGIFMEDIA) != B_OK)</a>
+<a name="ln634">		return -1;</a>
+<a name="ln635"> </a>
+<a name="ln636">	return request.ifm_count;</a>
+<a name="ln637">}</a>
+<a name="ln638"> </a>
+<a name="ln639"> </a>
+<a name="ln640">int32</a>
+<a name="ln641">BNetworkDevice::Media() const</a>
+<a name="ln642">{</a>
+<a name="ln643">	ifmediareq request;</a>
+<a name="ln644">	request.ifm_count = 0;</a>
+<a name="ln645">	request.ifm_ulist = NULL;</a>
+<a name="ln646"> </a>
+<a name="ln647">	if (do_request(request, Name(), SIOCGIFMEDIA) != B_OK)</a>
+<a name="ln648">		return -1;</a>
+<a name="ln649"> </a>
+<a name="ln650">	return request.ifm_current;</a>
+<a name="ln651">}</a>
+<a name="ln652"> </a>
+<a name="ln653"> </a>
+<a name="ln654">int32</a>
+<a name="ln655">BNetworkDevice::GetMediaAt(int32 index) const</a>
+<a name="ln656">{</a>
+<a name="ln657">	// TODO: this could do some caching</a>
+<a name="ln658">	return 0;</a>
+<a name="ln659">}</a>
+<a name="ln660"> </a>
+<a name="ln661"> </a>
+<a name="ln662">status_t</a>
+<a name="ln663">BNetworkDevice::SetMedia(int32 media)</a>
+<a name="ln664">{</a>
+<a name="ln665">	ifreq request;</a>
+<a name="ln666">	request.ifr_media = media;</a>
+<a name="ln667">	return do_request(request, Name(), SIOCSIFMEDIA);</a>
+<a name="ln668">}</a>
+<a name="ln669"> </a>
+<a name="ln670"> </a>
+<a name="ln671">status_t</a>
+<a name="ln672">BNetworkDevice::GetHardwareAddress(BNetworkAddress&amp; address)</a>
+<a name="ln673">{</a>
+<a name="ln674">	ifreq request;</a>
+<a name="ln675">	status_t status = do_request(request, Name(), SIOCGIFADDR);</a>
+<a name="ln676">	if (status != B_OK)</a>
+<a name="ln677">		return status;</a>
+<a name="ln678"> </a>
+<a name="ln679">	address.SetTo(request.ifr_addr);</a>
+<a name="ln680">	return B_OK;</a>
+<a name="ln681">}</a>
+<a name="ln682"> </a>
+<a name="ln683"> </a>
+<a name="ln684">bool</a>
+<a name="ln685">BNetworkDevice::IsEthernet()</a>
+<a name="ln686">{</a>
+<a name="ln687">	return IFM_TYPE(Media()) == IFM_ETHER;</a>
+<a name="ln688">}</a>
+<a name="ln689"> </a>
+<a name="ln690"> </a>
+<a name="ln691">bool</a>
+<a name="ln692">BNetworkDevice::IsWireless()</a>
+<a name="ln693">{</a>
+<a name="ln694">	return IFM_TYPE(Media()) == IFM_IEEE80211;</a>
+<a name="ln695">}</a>
+<a name="ln696"> </a>
+<a name="ln697"> </a>
+<a name="ln698">status_t</a>
+<a name="ln699">BNetworkDevice::Control(int option, void* request)</a>
+<a name="ln700">{</a>
+<a name="ln701">	switch (IFM_TYPE(Media())) {</a>
+<a name="ln702">		case IFM_ETHER:</a>
+<a name="ln703">			return do_request(*reinterpret_cast&lt;ifreq*&gt;(request),</a>
+<a name="ln704">				&amp;fName[0], option);</a>
+<a name="ln705"> </a>
+<a name="ln706">		case IFM_IEEE80211:</a>
+<a name="ln707">			return do_request(*reinterpret_cast&lt;ieee80211req*&gt;(request),</a>
+<a name="ln708">				&amp;fName[0], option);</a>
+<a name="ln709"> </a>
+<a name="ln710">		default:</a>
+<a name="ln711">			return B_ERROR;</a>
+<a name="ln712">	}</a>
+<a name="ln713">}</a>
+<a name="ln714"> </a>
+<a name="ln715"> </a>
+<a name="ln716">status_t</a>
+<a name="ln717">BNetworkDevice::Scan(bool wait, bool forceRescan)</a>
+<a name="ln718">{</a>
+<a name="ln719">	// Network status listener for change notifications</a>
+<a name="ln720">	class ScanListener : public BLooper {</a>
+<a name="ln721">	public:</a>
+<a name="ln722">		ScanListener(BString iface)</a>
+<a name="ln723">			:</a>
+<a name="ln724">			fInterface(iface)</a>
+<a name="ln725">		{</a>
+<a name="ln726">			start_watching_network(B_WATCH_NETWORK_WLAN_CHANGES, this);</a>
+<a name="ln727">		}</a>
+<a name="ln728">		virtual ~ScanListener()</a>
+<a name="ln729">		{</a>
+<a name="ln730">			stop_watching_network(this);</a>
+<a name="ln731">		}</a>
+<a name="ln732"> </a>
+<a name="ln733">	protected:</a>
+<a name="ln734">		virtual void MessageReceived(BMessage *message)</a>
+<a name="ln735">		{</a>
+<a name="ln736">			if (message-&gt;what != B_NETWORK_MONITOR) {</a>
+<a name="ln737">				BLooper::MessageReceived(message);</a>
+<a name="ln738">				return;</a>
+<a name="ln739">			}</a>
+<a name="ln740"> </a>
+<a name="ln741">			BString interfaceName;</a>
+<a name="ln742">			if (message-&gt;FindString(&quot;interface&quot;, &amp;interfaceName) != B_OK)</a>
+<a name="ln743">				return;</a>
+<a name="ln744">			// See comment in AutoconfigLooper::_NetworkMonitorNotification</a>
+<a name="ln745">			// for the reason as to why we use FindFirst instead of ==.</a>
+<a name="ln746">			if (fInterface.FindFirst(interfaceName) &lt; 0)</a>
+<a name="ln747">				return;</a>
+<a name="ln748">			if (message-&gt;FindInt32(&quot;opcode&quot;) != B_NETWORK_WLAN_SCANNED)</a>
+<a name="ln749">				return;</a>
+<a name="ln750"> </a>
+<a name="ln751">			Lock();</a>
+<a name="ln752">			Quit();</a>
+<a name="ln753">		}</a>
+<a name="ln754"> </a>
+<a name="ln755">	private:</a>
+<a name="ln756">		BString fInterface;</a>
+<a name="ln757">	};</a>
+<a name="ln758"> </a>
+<a name="ln759">	ScanListener* listener = NULL;</a>
+<a name="ln760">	if (wait)</a>
+<a name="ln761">		listener = new ScanListener(Name());</a>
+<a name="ln762"> </a>
+<a name="ln763">	// Trigger the scan</a>
+<a name="ln764">	struct ieee80211_scan_req request;</a>
+<a name="ln765">	memset(&amp;request, 0, sizeof(request));</a>
+<a name="ln766">	request.sr_flags = IEEE80211_IOC_SCAN_ACTIVE</a>
+<a name="ln767">		| IEEE80211_IOC_SCAN_BGSCAN</a>
+<a name="ln768">		| IEEE80211_IOC_SCAN_NOPICK</a>
+<a name="ln769">		| IEEE80211_IOC_SCAN_ONCE</a>
+<a name="ln770">		| (forceRescan ? IEEE80211_IOC_SCAN_FLUSH : 0);</a>
+<a name="ln771">	request.sr_duration = IEEE80211_IOC_SCAN_FOREVER;</a>
+<a name="ln772">	request.sr_nssid = 0;</a>
+<a name="ln773"> </a>
+<a name="ln774">	status_t status = set_80211(Name(), IEEE80211_IOC_SCAN_REQ, &amp;request,</a>
+<a name="ln775">		sizeof(request));</a>
+<a name="ln776"> </a>
+<a name="ln777">	// If there are no VAPs running, the net80211 layer will return ENXIO.</a>
+<a name="ln778">	// Try to bring up the interface (which should start a VAP) and try again.</a>
+<a name="ln779">	if (status == ENXIO) {</a>
+<a name="ln780">		struct ieee80211req dummy;</a>
+<a name="ln781">		status = set_80211(Name(), IEEE80211_IOC_HAIKU_COMPAT_WLAN_UP, &amp;dummy,</a>
+<a name="ln782">			sizeof(dummy));</a>
+<a name="ln783">		if (status != B_OK)</a>
+<a name="ln784">			return status;</a>
+<a name="ln785"> </a>
+<a name="ln786">		status = set_80211(Name(), IEEE80211_IOC_SCAN_REQ, &amp;request,</a>
+<a name="ln787">			sizeof(request));</a>
+<a name="ln788">	}</a>
+<a name="ln789"> </a>
+<a name="ln790">	// If there is already a scan currently running, it's probably an &quot;infinite&quot;</a>
+<a name="ln791">	// one, which we of course don't want to wait for. So just return immediately</a>
+<a name="ln792">	// if that's the case.</a>
+<a name="ln793">	if (status == EINPROGRESS) {</a>
+<a name="ln794">		delete listener;</a>
+<a name="ln795">		return B_OK;</a>
+<a name="ln796">	}</a>
+<a name="ln797"> </a>
+<a name="ln798">	if (!wait || status != B_OK) {</a>
+<a name="ln799">		delete listener;</a>
+<a name="ln800">		return status;</a>
+<a name="ln801">	}</a>
+<a name="ln802"> </a>
+<a name="ln803">	while (wait_for_thread(listener-&gt;Run(), NULL) == B_INTERRUPTED)</a>
+<a name="ln804">		;</a>
+<a name="ln805">	return B_OK;</a>
+<a name="ln806">}</a>
+<a name="ln807"> </a>
+<a name="ln808"> </a>
+<a name="ln809">status_t</a>
+<a name="ln810">BNetworkDevice::GetNextNetwork(uint32&amp; cookie, wireless_network&amp; network)</a>
+<a name="ln811">{</a>
+<a name="ln812">	status_t status = get_scan_result(Name(), network, cookie, NULL, NULL);</a>
+<a name="ln813">	if (status != B_OK)</a>
+<a name="ln814">		return status;</a>
+<a name="ln815"> </a>
+<a name="ln816">	cookie++;</a>
+<a name="ln817">	return B_OK;</a>
+<a name="ln818">}</a>
+<a name="ln819"> </a>
+<a name="ln820"> </a>
+<a name="ln821">status_t</a>
+<a name="ln822">BNetworkDevice::GetNetwork(const char* name, wireless_network&amp; network)</a>
+<a name="ln823">{</a>
+<a name="ln824">	if (name == NULL || name[0] == '\0')</a>
+<a name="ln825">		return B_BAD_VALUE;</a>
+<a name="ln826"> </a>
+<a name="ln827">	return get_network(Name(), network, UINT32_MAX, NULL, name);</a>
+<a name="ln828">}</a>
+<a name="ln829"> </a>
+<a name="ln830"> </a>
+<a name="ln831">status_t</a>
+<a name="ln832">BNetworkDevice::GetNetwork(const BNetworkAddress&amp; address,</a>
+<a name="ln833">	wireless_network&amp; network)</a>
+<a name="ln834">{</a>
+<a name="ln835">	if (address.Family() != AF_LINK)</a>
+<a name="ln836">		return B_BAD_VALUE;</a>
+<a name="ln837"> </a>
+<a name="ln838">	return get_network(Name(), network, UINT32_MAX, &amp;address, NULL);</a>
+<a name="ln839">}</a>
+<a name="ln840"> </a>
+<a name="ln841"> </a>
+<a name="ln842">status_t</a>
+<a name="ln843">BNetworkDevice::JoinNetwork(const char* name, const char* password)</a>
+<a name="ln844">{</a>
+<a name="ln845">	if (name == NULL || name[0] == '\0')</a>
+<a name="ln846">		return B_BAD_VALUE;</a>
+<a name="ln847"> </a>
+<a name="ln848">	BMessage message(kMsgJoinNetwork);</a>
+<a name="ln849">	status_t status = message.AddString(&quot;device&quot;, Name());</a>
+<a name="ln850"> </a>
+<a name="ln851">	if (status == B_OK)</a>
+<a name="ln852">		status = message.AddString(&quot;name&quot;, name);</a>
+<a name="ln853">	if (status == B_OK &amp;&amp; password != NULL)</a>
+<a name="ln854">		status = message.AddString(&quot;password&quot;, password);</a>
+<a name="ln855">	if (status != B_OK)</a>
+<a name="ln856">		return status;</a>
+<a name="ln857"> </a>
+<a name="ln858">	// Send message to the net_server</a>
+<a name="ln859"> </a>
+<a name="ln860">	BMessenger networkServer(kNetServerSignature);</a>
+<a name="ln861">	BMessage reply;</a>
+<a name="ln862">	status = networkServer.SendMessage(&amp;message, &amp;reply);</a>
+<a name="ln863">	if (status == B_OK)</a>
+<a name="ln864">		reply.FindInt32(&quot;status&quot;, &amp;status);</a>
+<a name="ln865"> </a>
+<a name="ln866">	return status;</a>
+<a name="ln867">}</a>
+<a name="ln868"> </a>
+<a name="ln869"> </a>
+<a name="ln870">status_t</a>
+<a name="ln871">BNetworkDevice::JoinNetwork(const wireless_network&amp; network,</a>
+<a name="ln872">	const char* password)</a>
+<a name="ln873">{</a>
+<a name="ln874">	return JoinNetwork(network.address, password);</a>
+<a name="ln875">}</a>
+<a name="ln876"> </a>
+<a name="ln877"> </a>
+<a name="ln878">status_t</a>
+<a name="ln879">BNetworkDevice::JoinNetwork(const BNetworkAddress&amp; address,</a>
+<a name="ln880">	const char* password)</a>
+<a name="ln881">{</a>
+<a name="ln882">	if (address.InitCheck() != B_OK)</a>
+<a name="ln883">		return B_BAD_VALUE;</a>
+<a name="ln884"> </a>
+<a name="ln885">	BMessage message(kMsgJoinNetwork);</a>
+<a name="ln886">	status_t status = message.AddString(&quot;device&quot;, Name());</a>
+<a name="ln887"> </a>
+<a name="ln888">	if (status == B_OK) {</a>
+<a name="ln889">		status = message.AddFlat(&quot;address&quot;,</a>
+<a name="ln890">			const_cast&lt;BNetworkAddress*&gt;(&amp;address));</a>
+<a name="ln891">	}</a>
+<a name="ln892">	if (status == B_OK &amp;&amp; password != NULL)</a>
+<a name="ln893">		status = message.AddString(&quot;password&quot;, password);</a>
+<a name="ln894">	if (status != B_OK)</a>
+<a name="ln895">		return status;</a>
+<a name="ln896"> </a>
+<a name="ln897">	// Send message to the net_server</a>
+<a name="ln898"> </a>
+<a name="ln899">	BMessenger networkServer(kNetServerSignature);</a>
+<a name="ln900">	BMessage reply;</a>
+<a name="ln901">	status = networkServer.SendMessage(&amp;message, &amp;reply);</a>
+<a name="ln902">	if (status == B_OK)</a>
+<a name="ln903">		reply.FindInt32(&quot;status&quot;, &amp;status);</a>
+<a name="ln904"> </a>
+<a name="ln905">	return status;</a>
+<a name="ln906">}</a>
+<a name="ln907"> </a>
+<a name="ln908"> </a>
+<a name="ln909">status_t</a>
+<a name="ln910">BNetworkDevice::LeaveNetwork(const char* name)</a>
+<a name="ln911">{</a>
+<a name="ln912">	BMessage message(kMsgLeaveNetwork);</a>
+<a name="ln913">	status_t status = message.AddString(&quot;device&quot;, Name());</a>
+<a name="ln914">	if (status == B_OK)</a>
+<a name="ln915">		status = message.AddString(&quot;name&quot;, name);</a>
+<a name="ln916">	if (status == B_OK)</a>
+<a name="ln917">		status = message.AddInt32(&quot;reason&quot;, IEEE80211_REASON_UNSPECIFIED);</a>
+<a name="ln918">	if (status != B_OK)</a>
+<a name="ln919">		return status;</a>
+<a name="ln920"> </a>
+<a name="ln921">	BMessenger networkServer(kNetServerSignature);</a>
+<a name="ln922">	BMessage reply;</a>
+<a name="ln923">	status = networkServer.SendMessage(&amp;message, &amp;reply);</a>
+<a name="ln924">	if (status == B_OK)</a>
+<a name="ln925">		reply.FindInt32(&quot;status&quot;, &amp;status);</a>
+<a name="ln926"> </a>
+<a name="ln927">	return status;</a>
+<a name="ln928">}</a>
+<a name="ln929"> </a>
+<a name="ln930"> </a>
+<a name="ln931">status_t</a>
+<a name="ln932">BNetworkDevice::LeaveNetwork(const wireless_network&amp; network)</a>
+<a name="ln933">{</a>
+<a name="ln934">	return LeaveNetwork(network.address);</a>
+<a name="ln935">}</a>
+<a name="ln936"> </a>
+<a name="ln937"> </a>
+<a name="ln938">status_t</a>
+<a name="ln939">BNetworkDevice::LeaveNetwork(const BNetworkAddress&amp; address)</a>
+<a name="ln940">{</a>
+<a name="ln941">	BMessage message(kMsgLeaveNetwork);</a>
+<a name="ln942">	status_t status = message.AddString(&quot;device&quot;, Name());</a>
+<a name="ln943">	if (status == B_OK) {</a>
+<a name="ln944">		status = message.AddFlat(&quot;address&quot;,</a>
+<a name="ln945">			const_cast&lt;BNetworkAddress*&gt;(&amp;address));</a>
+<a name="ln946">	}</a>
+<a name="ln947">	if (status == B_OK)</a>
+<a name="ln948">		status = message.AddInt32(&quot;reason&quot;, IEEE80211_REASON_UNSPECIFIED);</a>
+<a name="ln949">	if (status != B_OK)</a>
+<a name="ln950">		return status;</a>
+<a name="ln951"> </a>
+<a name="ln952">	BMessenger networkServer(kNetServerSignature);</a>
+<a name="ln953">	BMessage reply;</a>
+<a name="ln954">	status = networkServer.SendMessage(&amp;message, &amp;reply);</a>
+<a name="ln955">	if (status == B_OK)</a>
+<a name="ln956">		reply.FindInt32(&quot;status&quot;, &amp;status);</a>
+<a name="ln957"> </a>
+<a name="ln958">	return status;</a>
+<a name="ln959">}</a>
+<a name="ln960"> </a>
+<a name="ln961"> </a>
+<a name="ln962">status_t</a>
+<a name="ln963">BNetworkDevice::GetNextAssociatedNetwork(uint32&amp; cookie,</a>
+<a name="ln964">	wireless_network&amp; network)</a>
+<a name="ln965">{</a>
+<a name="ln966">	BNetworkAddress address;</a>
+<a name="ln967">	status_t status = GetNextAssociatedNetwork(cookie, address);</a>
+<a name="ln968">	if (status != B_OK)</a>
+<a name="ln969">		return status;</a>
+<a name="ln970"> </a>
+<a name="ln971">	return GetNetwork(address, network);</a>
+<a name="ln972">}</a>
+<a name="ln973"> </a>
+<a name="ln974"> </a>
+<a name="ln975">status_t</a>
+<a name="ln976">BNetworkDevice::GetNextAssociatedNetwork(uint32&amp; cookie,</a>
+<a name="ln977">	BNetworkAddress&amp; address)</a>
+<a name="ln978">{</a>
+<a name="ln979">	// We currently support only a single associated network</a>
+<a name="ln980">	if (cookie != 0)</a>
+<a name="ln981">		return B_ENTRY_NOT_FOUND;</a>
+<a name="ln982"> </a>
+<a name="ln983">	uint8 mac[IEEE80211_ADDR_LEN];</a>
+<a name="ln984">	int32 length = IEEE80211_ADDR_LEN;</a>
+<a name="ln985">	status_t status = get_80211(Name(), IEEE80211_IOC_BSSID, mac, length);</a>
+<a name="ln986">	if (status != B_OK)</a>
+<a name="ln987">		return status;</a>
+<a name="ln988"> </a>
+<a name="ln989">	if (mac[0] == 0 &amp;&amp; mac[1] == 0 &amp;&amp; mac[2] == 0 &amp;&amp; mac[3] == 0 &amp;&amp; mac[4] == 0</a>
+<a name="ln990">			&amp;&amp; mac[5] == 0) {</a>
+<a name="ln991">		return B_ENTRY_NOT_FOUND;</a>
+<a name="ln992">	}</a>
+<a name="ln993"> </a>
+<a name="ln994">	address.SetToLinkLevel(mac, IEEE80211_ADDR_LEN);</a>
+<a name="ln995">	cookie++;</a>
+<a name="ln996">	return B_OK;</a>
+<a name="ln997">}</a>
+
+</code></pre>
+<div class="balloon" rel="784"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v773/" target="_blank">V773</a> The function was exited without releasing the 'listener' pointer. A memory leak is possible.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

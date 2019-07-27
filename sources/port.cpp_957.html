@@ -1,0 +1,2017 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>port.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2011, Ingo Weinhold, ingo_weinhold@gmx.de.</a>
+<a name="ln3"> * Copyright 2002-2015, Axel Dörfler, axeld@pinc-software.de.</a>
+<a name="ln4"> * Distributed under the terms of the MIT License.</a>
+<a name="ln5"> *</a>
+<a name="ln6"> * Copyright 2001, Mark-Jan Bastian. All rights reserved.</a>
+<a name="ln7"> * Distributed under the terms of the NewOS License.</a>
+<a name="ln8"> */</a>
+<a name="ln9"> </a>
+<a name="ln10"> </a>
+<a name="ln11">/*!	Ports for IPC */</a>
+<a name="ln12"> </a>
+<a name="ln13"> </a>
+<a name="ln14">#include &lt;port.h&gt;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &lt;algorithm&gt;</a>
+<a name="ln17">#include &lt;ctype.h&gt;</a>
+<a name="ln18">#include &lt;iovec.h&gt;</a>
+<a name="ln19">#include &lt;stdlib.h&gt;</a>
+<a name="ln20">#include &lt;string.h&gt;</a>
+<a name="ln21"> </a>
+<a name="ln22">#include &lt;OS.h&gt;</a>
+<a name="ln23"> </a>
+<a name="ln24">#include &lt;AutoDeleter.h&gt;</a>
+<a name="ln25"> </a>
+<a name="ln26">#include &lt;arch/int.h&gt;</a>
+<a name="ln27">#include &lt;heap.h&gt;</a>
+<a name="ln28">#include &lt;kernel.h&gt;</a>
+<a name="ln29">#include &lt;Notifications.h&gt;</a>
+<a name="ln30">#include &lt;sem.h&gt;</a>
+<a name="ln31">#include &lt;syscall_restart.h&gt;</a>
+<a name="ln32">#include &lt;team.h&gt;</a>
+<a name="ln33">#include &lt;tracing.h&gt;</a>
+<a name="ln34">#include &lt;util/AutoLock.h&gt;</a>
+<a name="ln35">#include &lt;util/list.h&gt;</a>
+<a name="ln36">#include &lt;vm/vm.h&gt;</a>
+<a name="ln37">#include &lt;wait_for_objects.h&gt;</a>
+<a name="ln38"> </a>
+<a name="ln39"> </a>
+<a name="ln40">//#define TRACE_PORTS</a>
+<a name="ln41">#ifdef TRACE_PORTS</a>
+<a name="ln42">#	define TRACE(x) dprintf x</a>
+<a name="ln43">#else</a>
+<a name="ln44">#	define TRACE(x)</a>
+<a name="ln45">#endif</a>
+<a name="ln46"> </a>
+<a name="ln47"> </a>
+<a name="ln48">#if __GNUC__ &gt;= 3</a>
+<a name="ln49">#	define GCC_2_NRV(x)</a>
+<a name="ln50">	// GCC &gt;= 3.1 doesn't need it anymore</a>
+<a name="ln51">#else</a>
+<a name="ln52">#	define GCC_2_NRV(x) return x;</a>
+<a name="ln53">	// GCC 2 named return value syntax</a>
+<a name="ln54">	// see http://gcc.gnu.org/onlinedocs/gcc-2.95.2/gcc_5.html#SEC106</a>
+<a name="ln55">#endif</a>
+<a name="ln56"> </a>
+<a name="ln57"> </a>
+<a name="ln58">// Locking:</a>
+<a name="ln59">// * sPortsLock: Protects the sPorts and sPortsByName hash tables.</a>
+<a name="ln60">// * sTeamListLock[]: Protects Team::port_list. Lock index for given team is</a>
+<a name="ln61">//   (Team::id % kTeamListLockCount).</a>
+<a name="ln62">// * Port::lock: Protects all Port members save team_link, hash_link, lock and</a>
+<a name="ln63">//   state. id is immutable.</a>
+<a name="ln64">//</a>
+<a name="ln65">// Port::state ensures atomicity by providing a linearization point for adding</a>
+<a name="ln66">// and removing ports to the hash tables and the team port list.</a>
+<a name="ln67">// * sPortsLock and sTeamListLock[] are locked separately and not in a nested</a>
+<a name="ln68">//   fashion, so a port can be in the hash table but not in the team port list</a>
+<a name="ln69">//   or vice versa. =&gt; Without further provisions, insertion and removal are</a>
+<a name="ln70">//   not linearizable and thus not concurrency-safe.</a>
+<a name="ln71">// * To make insertion and removal linearizable, Port::state was added. It is</a>
+<a name="ln72">//   always only accessed atomically and updates are done using</a>
+<a name="ln73">//   atomic_test_and_set(). A port is only seen as existent when its state is</a>
+<a name="ln74">//   Port::kActive.</a>
+<a name="ln75">// * Deletion of ports is done in two steps: logical and physical deletion.</a>
+<a name="ln76">//   First, logical deletion happens and sets Port::state to Port::kDeleted.</a>
+<a name="ln77">//   This is an atomic operation and from then on, functions like</a>
+<a name="ln78">//   get_locked_port() consider this port as deleted and ignore it. Secondly,</a>
+<a name="ln79">//   physical deletion removes the port from hash tables and team port list.</a>
+<a name="ln80">//   In a similar way, port creation first inserts into hashes and team list</a>
+<a name="ln81">//   and only then sets port to Port::kActive.</a>
+<a name="ln82">//   This creates a linearization point at the atomic update of Port::state,</a>
+<a name="ln83">//   operations become linearizable and thus concurrency-safe. To help</a>
+<a name="ln84">//   understanding, the linearization points are annotated with comments.</a>
+<a name="ln85">// * Ports are reference-counted so it's not a problem when someone still</a>
+<a name="ln86">//   has a reference to a deleted port.</a>
+<a name="ln87"> </a>
+<a name="ln88"> </a>
+<a name="ln89">namespace {</a>
+<a name="ln90"> </a>
+<a name="ln91">struct port_message : DoublyLinkedListLinkImpl&lt;port_message&gt; {</a>
+<a name="ln92">	int32				code;</a>
+<a name="ln93">	size_t				size;</a>
+<a name="ln94">	uid_t				sender;</a>
+<a name="ln95">	gid_t				sender_group;</a>
+<a name="ln96">	team_id				sender_team;</a>
+<a name="ln97">	char				buffer[0];</a>
+<a name="ln98">};</a>
+<a name="ln99"> </a>
+<a name="ln100">typedef DoublyLinkedList&lt;port_message&gt; MessageList;</a>
+<a name="ln101"> </a>
+<a name="ln102">} // namespace</a>
+<a name="ln103"> </a>
+<a name="ln104"> </a>
+<a name="ln105">static void put_port_message(port_message* message);</a>
+<a name="ln106"> </a>
+<a name="ln107"> </a>
+<a name="ln108">namespace {</a>
+<a name="ln109"> </a>
+<a name="ln110">struct Port : public KernelReferenceable {</a>
+<a name="ln111">	enum State {</a>
+<a name="ln112">		kUnused = 0,</a>
+<a name="ln113">		kActive,</a>
+<a name="ln114">		kDeleted</a>
+<a name="ln115">	};</a>
+<a name="ln116"> </a>
+<a name="ln117">	struct list_link	team_link;</a>
+<a name="ln118">	Port*				hash_link;</a>
+<a name="ln119">	port_id				id;</a>
+<a name="ln120">	team_id				owner;</a>
+<a name="ln121">	Port*				name_hash_link;</a>
+<a name="ln122">	size_t				name_hash;</a>
+<a name="ln123">	int32				capacity;</a>
+<a name="ln124">	mutex				lock;</a>
+<a name="ln125">	int32				state;</a>
+<a name="ln126">	uint32				read_count;</a>
+<a name="ln127">	int32				write_count;</a>
+<a name="ln128">	ConditionVariable	read_condition;</a>
+<a name="ln129">	ConditionVariable	write_condition;</a>
+<a name="ln130">	int32				total_count;</a>
+<a name="ln131">		// messages read from port since creation</a>
+<a name="ln132">	select_info*		select_infos;</a>
+<a name="ln133">	MessageList			messages;</a>
+<a name="ln134"> </a>
+<a name="ln135">	Port(team_id owner, int32 queueLength, char* name)</a>
+<a name="ln136">		:</a>
+<a name="ln137">		owner(owner),</a>
+<a name="ln138">		name_hash(0),</a>
+<a name="ln139">		capacity(queueLength),</a>
+<a name="ln140">		state(kUnused),</a>
+<a name="ln141">		read_count(0),</a>
+<a name="ln142">		write_count(queueLength),</a>
+<a name="ln143">		total_count(0),</a>
+<a name="ln144">		select_infos(NULL)</a>
+<a name="ln145">	{</a>
+<a name="ln146">		// id is initialized when the caller adds the port to the hash table</a>
+<a name="ln147"> </a>
+<a name="ln148">		mutex_init(&amp;lock, name);</a>
+<a name="ln149">		read_condition.Init(this, &quot;port read&quot;);</a>
+<a name="ln150">		write_condition.Init(this, &quot;port write&quot;);</a>
+<a name="ln151">	}</a>
+<a name="ln152"> </a>
+<a name="ln153">	virtual ~Port()</a>
+<a name="ln154">	{</a>
+<a name="ln155">		while (port_message* message = messages.RemoveHead())</a>
+<a name="ln156">			put_port_message(message);</a>
+<a name="ln157"> </a>
+<a name="ln158">		free((char*)lock.name);</a>
+<a name="ln159">		lock.name = NULL;</a>
+<a name="ln160">	}</a>
+<a name="ln161">};</a>
+<a name="ln162"> </a>
+<a name="ln163"> </a>
+<a name="ln164">struct PortHashDefinition {</a>
+<a name="ln165">	typedef port_id		KeyType;</a>
+<a name="ln166">	typedef	Port		ValueType;</a>
+<a name="ln167"> </a>
+<a name="ln168">	size_t HashKey(port_id key) const</a>
+<a name="ln169">	{</a>
+<a name="ln170">		return key;</a>
+<a name="ln171">	}</a>
+<a name="ln172"> </a>
+<a name="ln173">	size_t Hash(Port* value) const</a>
+<a name="ln174">	{</a>
+<a name="ln175">		return HashKey(value-&gt;id);</a>
+<a name="ln176">	}</a>
+<a name="ln177"> </a>
+<a name="ln178">	bool Compare(port_id key, Port* value) const</a>
+<a name="ln179">	{</a>
+<a name="ln180">		return value-&gt;id == key;</a>
+<a name="ln181">	}</a>
+<a name="ln182"> </a>
+<a name="ln183">	Port*&amp; GetLink(Port* value) const</a>
+<a name="ln184">	{</a>
+<a name="ln185">		return value-&gt;hash_link;</a>
+<a name="ln186">	}</a>
+<a name="ln187">};</a>
+<a name="ln188"> </a>
+<a name="ln189">typedef BOpenHashTable&lt;PortHashDefinition&gt; PortHashTable;</a>
+<a name="ln190"> </a>
+<a name="ln191"> </a>
+<a name="ln192">struct PortNameHashDefinition {</a>
+<a name="ln193">	typedef const char*	KeyType;</a>
+<a name="ln194">	typedef	Port		ValueType;</a>
+<a name="ln195"> </a>
+<a name="ln196">	size_t HashKey(const char* key) const</a>
+<a name="ln197">	{</a>
+<a name="ln198">		// Hash function: hash(key) =  key[0] * 31^(length - 1)</a>
+<a name="ln199">		//   + key[1] * 31^(length - 2) + ... + key[length - 1]</a>
+<a name="ln200"> </a>
+<a name="ln201">		const size_t length = strlen(key);</a>
+<a name="ln202"> </a>
+<a name="ln203">		size_t hash = 0;</a>
+<a name="ln204">		for (size_t index = 0; index &lt; length; index++)</a>
+<a name="ln205">			hash = 31 * hash + key[index];</a>
+<a name="ln206"> </a>
+<a name="ln207">		return hash;</a>
+<a name="ln208">	}</a>
+<a name="ln209"> </a>
+<a name="ln210">	size_t Hash(Port* value) const</a>
+<a name="ln211">	{</a>
+<a name="ln212">		size_t&amp; hash = value-&gt;name_hash;</a>
+<a name="ln213">		if (hash == 0)</a>
+<a name="ln214">			hash = HashKey(value-&gt;lock.name);</a>
+<a name="ln215">		return hash;</a>
+<a name="ln216">	}</a>
+<a name="ln217"> </a>
+<a name="ln218">	bool Compare(const char* key, Port* value) const</a>
+<a name="ln219">	{</a>
+<a name="ln220">		return (strcmp(key, value-&gt;lock.name) == 0);</a>
+<a name="ln221">	}</a>
+<a name="ln222"> </a>
+<a name="ln223">	Port*&amp; GetLink(Port* value) const</a>
+<a name="ln224">	{</a>
+<a name="ln225">		return value-&gt;name_hash_link;</a>
+<a name="ln226">	}</a>
+<a name="ln227">};</a>
+<a name="ln228"> </a>
+<a name="ln229">typedef BOpenHashTable&lt;PortNameHashDefinition&gt; PortNameHashTable;</a>
+<a name="ln230"> </a>
+<a name="ln231"> </a>
+<a name="ln232">class PortNotificationService : public DefaultNotificationService {</a>
+<a name="ln233">public:</a>
+<a name="ln234">							PortNotificationService();</a>
+<a name="ln235"> </a>
+<a name="ln236">			void			Notify(uint32 opcode, port_id team);</a>
+<a name="ln237">};</a>
+<a name="ln238"> </a>
+<a name="ln239">} // namespace</a>
+<a name="ln240"> </a>
+<a name="ln241"> </a>
+<a name="ln242">// #pragma mark - tracing</a>
+<a name="ln243"> </a>
+<a name="ln244"> </a>
+<a name="ln245">#if PORT_TRACING</a>
+<a name="ln246">namespace PortTracing {</a>
+<a name="ln247"> </a>
+<a name="ln248">class Create : public AbstractTraceEntry {</a>
+<a name="ln249">public:</a>
+<a name="ln250">	Create(Port* port)</a>
+<a name="ln251">		:</a>
+<a name="ln252">		fID(port-&gt;id),</a>
+<a name="ln253">		fOwner(port-&gt;owner),</a>
+<a name="ln254">		fCapacity(port-&gt;capacity)</a>
+<a name="ln255">	{</a>
+<a name="ln256">		fName = alloc_tracing_buffer_strcpy(port-&gt;lock.name, B_OS_NAME_LENGTH,</a>
+<a name="ln257">			false);</a>
+<a name="ln258"> </a>
+<a name="ln259">		Initialized();</a>
+<a name="ln260">	}</a>
+<a name="ln261"> </a>
+<a name="ln262">	virtual void AddDump(TraceOutput&amp; out)</a>
+<a name="ln263">	{</a>
+<a name="ln264">		out.Print(&quot;port %ld created, name \&quot;%s\&quot;, owner %ld, capacity %ld&quot;,</a>
+<a name="ln265">			fID, fName, fOwner, fCapacity);</a>
+<a name="ln266">	}</a>
+<a name="ln267"> </a>
+<a name="ln268">private:</a>
+<a name="ln269">	port_id				fID;</a>
+<a name="ln270">	char*				fName;</a>
+<a name="ln271">	team_id				fOwner;</a>
+<a name="ln272">	int32		 		fCapacity;</a>
+<a name="ln273">};</a>
+<a name="ln274"> </a>
+<a name="ln275"> </a>
+<a name="ln276">class Delete : public AbstractTraceEntry {</a>
+<a name="ln277">public:</a>
+<a name="ln278">	Delete(Port* port)</a>
+<a name="ln279">		:</a>
+<a name="ln280">		fID(port-&gt;id)</a>
+<a name="ln281">	{</a>
+<a name="ln282">		Initialized();</a>
+<a name="ln283">	}</a>
+<a name="ln284"> </a>
+<a name="ln285">	virtual void AddDump(TraceOutput&amp; out)</a>
+<a name="ln286">	{</a>
+<a name="ln287">		out.Print(&quot;port %ld deleted&quot;, fID);</a>
+<a name="ln288">	}</a>
+<a name="ln289"> </a>
+<a name="ln290">private:</a>
+<a name="ln291">	port_id				fID;</a>
+<a name="ln292">};</a>
+<a name="ln293"> </a>
+<a name="ln294"> </a>
+<a name="ln295">class Read : public AbstractTraceEntry {</a>
+<a name="ln296">public:</a>
+<a name="ln297">	Read(const BReference&lt;Port&gt;&amp; portRef, int32 code, ssize_t result)</a>
+<a name="ln298">		:</a>
+<a name="ln299">		fID(portRef-&gt;id),</a>
+<a name="ln300">		fReadCount(portRef-&gt;read_count),</a>
+<a name="ln301">		fWriteCount(portRef-&gt;write_count),</a>
+<a name="ln302">		fCode(code),</a>
+<a name="ln303">		fResult(result)</a>
+<a name="ln304">	{</a>
+<a name="ln305">		Initialized();</a>
+<a name="ln306">	}</a>
+<a name="ln307"> </a>
+<a name="ln308">	Read(port_id id, int32 readCount, int32 writeCount, int32 code,</a>
+<a name="ln309">		ssize_t result)</a>
+<a name="ln310">		:</a>
+<a name="ln311">		fID(id),</a>
+<a name="ln312">		fReadCount(readCount),</a>
+<a name="ln313">		fWriteCount(writeCount),</a>
+<a name="ln314">		fCode(code),</a>
+<a name="ln315">		fResult(result)</a>
+<a name="ln316">	{</a>
+<a name="ln317">		Initialized();</a>
+<a name="ln318">	}</a>
+<a name="ln319"> </a>
+<a name="ln320">	virtual void AddDump(TraceOutput&amp; out)</a>
+<a name="ln321">	{</a>
+<a name="ln322">		out.Print(&quot;port %ld read, read %ld, write %ld, code %lx: %ld&quot;,</a>
+<a name="ln323">			fID, fReadCount, fWriteCount, fCode, fResult);</a>
+<a name="ln324">	}</a>
+<a name="ln325"> </a>
+<a name="ln326">private:</a>
+<a name="ln327">	port_id				fID;</a>
+<a name="ln328">	int32				fReadCount;</a>
+<a name="ln329">	int32				fWriteCount;</a>
+<a name="ln330">	int32				fCode;</a>
+<a name="ln331">	ssize_t				fResult;</a>
+<a name="ln332">};</a>
+<a name="ln333"> </a>
+<a name="ln334"> </a>
+<a name="ln335">class Write : public AbstractTraceEntry {</a>
+<a name="ln336">public:</a>
+<a name="ln337">	Write(port_id id, int32 readCount, int32 writeCount, int32 code,</a>
+<a name="ln338">		size_t bufferSize, ssize_t result)</a>
+<a name="ln339">		:</a>
+<a name="ln340">		fID(id),</a>
+<a name="ln341">		fReadCount(readCount),</a>
+<a name="ln342">		fWriteCount(writeCount),</a>
+<a name="ln343">		fCode(code),</a>
+<a name="ln344">		fBufferSize(bufferSize),</a>
+<a name="ln345">		fResult(result)</a>
+<a name="ln346">	{</a>
+<a name="ln347">		Initialized();</a>
+<a name="ln348">	}</a>
+<a name="ln349"> </a>
+<a name="ln350">	virtual void AddDump(TraceOutput&amp; out)</a>
+<a name="ln351">	{</a>
+<a name="ln352">		out.Print(&quot;port %ld write, read %ld, write %ld, code %lx, size %ld: %ld&quot;,</a>
+<a name="ln353">			fID, fReadCount, fWriteCount, fCode, fBufferSize, fResult);</a>
+<a name="ln354">	}</a>
+<a name="ln355"> </a>
+<a name="ln356">private:</a>
+<a name="ln357">	port_id				fID;</a>
+<a name="ln358">	int32				fReadCount;</a>
+<a name="ln359">	int32				fWriteCount;</a>
+<a name="ln360">	int32				fCode;</a>
+<a name="ln361">	size_t				fBufferSize;</a>
+<a name="ln362">	ssize_t				fResult;</a>
+<a name="ln363">};</a>
+<a name="ln364"> </a>
+<a name="ln365"> </a>
+<a name="ln366">class Info : public AbstractTraceEntry {</a>
+<a name="ln367">public:</a>
+<a name="ln368">	Info(const BReference&lt;Port&gt;&amp; portRef, int32 code, ssize_t result)</a>
+<a name="ln369">		:</a>
+<a name="ln370">		fID(portRef-&gt;id),</a>
+<a name="ln371">		fReadCount(portRef-&gt;read_count),</a>
+<a name="ln372">		fWriteCount(portRef-&gt;write_count),</a>
+<a name="ln373">		fCode(code),</a>
+<a name="ln374">		fResult(result)</a>
+<a name="ln375">	{</a>
+<a name="ln376">		Initialized();</a>
+<a name="ln377">	}</a>
+<a name="ln378"> </a>
+<a name="ln379">	Info(port_id id, int32 readCount, int32 writeCount, int32 code,</a>
+<a name="ln380">		ssize_t result)</a>
+<a name="ln381">		:</a>
+<a name="ln382">		fID(id),</a>
+<a name="ln383">		fReadCount(readCount),</a>
+<a name="ln384">		fWriteCount(writeCount),</a>
+<a name="ln385">		fCode(code),</a>
+<a name="ln386">		fResult(result)</a>
+<a name="ln387">	{</a>
+<a name="ln388">		Initialized();</a>
+<a name="ln389">	}</a>
+<a name="ln390"> </a>
+<a name="ln391">	virtual void AddDump(TraceOutput&amp; out)</a>
+<a name="ln392">	{</a>
+<a name="ln393">		out.Print(&quot;port %ld info, read %ld, write %ld, code %lx: %ld&quot;,</a>
+<a name="ln394">			fID, fReadCount, fWriteCount, fCode, fResult);</a>
+<a name="ln395">	}</a>
+<a name="ln396"> </a>
+<a name="ln397">private:</a>
+<a name="ln398">	port_id				fID;</a>
+<a name="ln399">	int32				fReadCount;</a>
+<a name="ln400">	int32				fWriteCount;</a>
+<a name="ln401">	int32				fCode;</a>
+<a name="ln402">	ssize_t				fResult;</a>
+<a name="ln403">};</a>
+<a name="ln404"> </a>
+<a name="ln405"> </a>
+<a name="ln406">class OwnerChange : public AbstractTraceEntry {</a>
+<a name="ln407">public:</a>
+<a name="ln408">	OwnerChange(Port* port, team_id newOwner, status_t status)</a>
+<a name="ln409">		:</a>
+<a name="ln410">		fID(port-&gt;id),</a>
+<a name="ln411">		fOldOwner(port-&gt;owner),</a>
+<a name="ln412">		fNewOwner(newOwner),</a>
+<a name="ln413">		fStatus(status)</a>
+<a name="ln414">	{</a>
+<a name="ln415">		Initialized();</a>
+<a name="ln416">	}</a>
+<a name="ln417"> </a>
+<a name="ln418">	virtual void AddDump(TraceOutput&amp; out)</a>
+<a name="ln419">	{</a>
+<a name="ln420">		out.Print(&quot;port %ld owner change from %ld to %ld: %s&quot;, fID, fOldOwner,</a>
+<a name="ln421">			fNewOwner, strerror(fStatus));</a>
+<a name="ln422">	}</a>
+<a name="ln423"> </a>
+<a name="ln424">private:</a>
+<a name="ln425">	port_id				fID;</a>
+<a name="ln426">	team_id				fOldOwner;</a>
+<a name="ln427">	team_id				fNewOwner;</a>
+<a name="ln428">	status_t	 		fStatus;</a>
+<a name="ln429">};</a>
+<a name="ln430"> </a>
+<a name="ln431">}	// namespace PortTracing</a>
+<a name="ln432"> </a>
+<a name="ln433">#	define T(x) new(std::nothrow) PortTracing::x;</a>
+<a name="ln434">#else</a>
+<a name="ln435">#	define T(x) ;</a>
+<a name="ln436">#endif</a>
+<a name="ln437"> </a>
+<a name="ln438"> </a>
+<a name="ln439">static const size_t kInitialPortBufferSize = 4 * 1024 * 1024;</a>
+<a name="ln440">static const size_t kTotalSpaceLimit = 64 * 1024 * 1024;</a>
+<a name="ln441">static const size_t kTeamSpaceLimit = 8 * 1024 * 1024;</a>
+<a name="ln442">static const size_t kBufferGrowRate = kInitialPortBufferSize;</a>
+<a name="ln443"> </a>
+<a name="ln444">#define MAX_QUEUE_LENGTH 4096</a>
+<a name="ln445">#define PORT_MAX_MESSAGE_SIZE (256 * 1024)</a>
+<a name="ln446"> </a>
+<a name="ln447">static int32 sMaxPorts = 4096;</a>
+<a name="ln448">static int32 sUsedPorts;</a>
+<a name="ln449"> </a>
+<a name="ln450">static PortHashTable sPorts;</a>
+<a name="ln451">static PortNameHashTable sPortsByName;</a>
+<a name="ln452">static ConditionVariable sNoSpaceCondition;</a>
+<a name="ln453">static int32 sTotalSpaceCommited;</a>
+<a name="ln454">static int32 sWaitingForSpace;</a>
+<a name="ln455">static port_id sNextPortID = 1;</a>
+<a name="ln456">static bool sPortsActive = false;</a>
+<a name="ln457">static rw_lock sPortsLock = RW_LOCK_INITIALIZER(&quot;ports list&quot;);</a>
+<a name="ln458"> </a>
+<a name="ln459">enum {</a>
+<a name="ln460">	kTeamListLockCount = 8</a>
+<a name="ln461">};</a>
+<a name="ln462"> </a>
+<a name="ln463">static mutex sTeamListLock[kTeamListLockCount] = {</a>
+<a name="ln464">	MUTEX_INITIALIZER(&quot;team ports list 1&quot;),</a>
+<a name="ln465">	MUTEX_INITIALIZER(&quot;team ports list 2&quot;),</a>
+<a name="ln466">	MUTEX_INITIALIZER(&quot;team ports list 3&quot;),</a>
+<a name="ln467">	MUTEX_INITIALIZER(&quot;team ports list 4&quot;),</a>
+<a name="ln468">	MUTEX_INITIALIZER(&quot;team ports list 5&quot;),</a>
+<a name="ln469">	MUTEX_INITIALIZER(&quot;team ports list 6&quot;),</a>
+<a name="ln470">	MUTEX_INITIALIZER(&quot;team ports list 7&quot;),</a>
+<a name="ln471">	MUTEX_INITIALIZER(&quot;team ports list 8&quot;)</a>
+<a name="ln472">};</a>
+<a name="ln473"> </a>
+<a name="ln474">static PortNotificationService sNotificationService;</a>
+<a name="ln475"> </a>
+<a name="ln476"> </a>
+<a name="ln477">//	#pragma mark - TeamNotificationService</a>
+<a name="ln478"> </a>
+<a name="ln479"> </a>
+<a name="ln480">PortNotificationService::PortNotificationService()</a>
+<a name="ln481">	:</a>
+<a name="ln482">	DefaultNotificationService(&quot;ports&quot;)</a>
+<a name="ln483">{</a>
+<a name="ln484">}</a>
+<a name="ln485"> </a>
+<a name="ln486"> </a>
+<a name="ln487">void</a>
+<a name="ln488">PortNotificationService::Notify(uint32 opcode, port_id port)</a>
+<a name="ln489">{</a>
+<a name="ln490">	char eventBuffer[128];</a>
+<a name="ln491">	KMessage event;</a>
+<a name="ln492">	event.SetTo(eventBuffer, sizeof(eventBuffer), PORT_MONITOR);</a>
+<a name="ln493">	event.AddInt32(&quot;event&quot;, opcode);</a>
+<a name="ln494">	event.AddInt32(&quot;port&quot;, port);</a>
+<a name="ln495"> </a>
+<a name="ln496">	DefaultNotificationService::Notify(event, opcode);</a>
+<a name="ln497">}</a>
+<a name="ln498"> </a>
+<a name="ln499"> </a>
+<a name="ln500">//	#pragma mark - debugger commands</a>
+<a name="ln501"> </a>
+<a name="ln502"> </a>
+<a name="ln503">static int</a>
+<a name="ln504">dump_port_list(int argc, char** argv)</a>
+<a name="ln505">{</a>
+<a name="ln506">	const char* name = NULL;</a>
+<a name="ln507">	team_id owner = -1;</a>
+<a name="ln508"> </a>
+<a name="ln509">	if (argc &gt; 2) {</a>
+<a name="ln510">		if (!strcmp(argv[1], &quot;team&quot;) || !strcmp(argv[1], &quot;owner&quot;))</a>
+<a name="ln511">			owner = strtoul(argv[2], NULL, 0);</a>
+<a name="ln512">		else if (!strcmp(argv[1], &quot;name&quot;))</a>
+<a name="ln513">			name = argv[2];</a>
+<a name="ln514">	} else if (argc &gt; 1)</a>
+<a name="ln515">		owner = strtoul(argv[1], NULL, 0);</a>
+<a name="ln516"> </a>
+<a name="ln517">	kprintf(&quot;port             id  cap  read-cnt  write-cnt   total   team  &quot;</a>
+<a name="ln518">		&quot;name\n&quot;);</a>
+<a name="ln519"> </a>
+<a name="ln520">	for (PortHashTable::Iterator it = sPorts.GetIterator();</a>
+<a name="ln521">		Port* port = it.Next();) {</a>
+<a name="ln522">		if ((owner != -1 &amp;&amp; port-&gt;owner != owner)</a>
+<a name="ln523">			|| (name != NULL &amp;&amp; strstr(port-&gt;lock.name, name) == NULL))</a>
+<a name="ln524">			continue;</a>
+<a name="ln525"> </a>
+<a name="ln526">		kprintf(&quot;%p %8&quot; B_PRId32 &quot; %4&quot; B_PRId32 &quot; %9&quot; B_PRIu32 &quot; %9&quot; B_PRId32</a>
+<a name="ln527">			&quot; %8&quot; B_PRId32 &quot; %6&quot; B_PRId32 &quot;  %s\n&quot;, port, port-&gt;id,</a>
+<a name="ln528">			port-&gt;capacity, port-&gt;read_count, port-&gt;write_count,</a>
+<a name="ln529">			port-&gt;total_count, port-&gt;owner, port-&gt;lock.name);</a>
+<a name="ln530">	}</a>
+<a name="ln531"> </a>
+<a name="ln532">	return 0;</a>
+<a name="ln533">}</a>
+<a name="ln534"> </a>
+<a name="ln535"> </a>
+<a name="ln536">static void</a>
+<a name="ln537">_dump_port_info(Port* port)</a>
+<a name="ln538">{</a>
+<a name="ln539">	kprintf(&quot;PORT: %p\n&quot;, port);</a>
+<a name="ln540">	kprintf(&quot; id:              %&quot; B_PRId32 &quot;\n&quot;, port-&gt;id);</a>
+<a name="ln541">	kprintf(&quot; name:            \&quot;%s\&quot;\n&quot;, port-&gt;lock.name);</a>
+<a name="ln542">	kprintf(&quot; owner:           %&quot; B_PRId32 &quot;\n&quot;, port-&gt;owner);</a>
+<a name="ln543">	kprintf(&quot; capacity:        %&quot; B_PRId32 &quot;\n&quot;, port-&gt;capacity);</a>
+<a name="ln544">	kprintf(&quot; read_count:      %&quot; B_PRIu32 &quot;\n&quot;, port-&gt;read_count);</a>
+<a name="ln545">	kprintf(&quot; write_count:     %&quot; B_PRId32 &quot;\n&quot;, port-&gt;write_count);</a>
+<a name="ln546">	kprintf(&quot; total count:     %&quot; B_PRId32 &quot;\n&quot;, port-&gt;total_count);</a>
+<a name="ln547"> </a>
+<a name="ln548">	if (!port-&gt;messages.IsEmpty()) {</a>
+<a name="ln549">		kprintf(&quot;messages:\n&quot;);</a>
+<a name="ln550"> </a>
+<a name="ln551">		MessageList::Iterator iterator = port-&gt;messages.GetIterator();</a>
+<a name="ln552">		while (port_message* message = iterator.Next()) {</a>
+<a name="ln553">			kprintf(&quot; %p  %08&quot; B_PRIx32 &quot;  %ld\n&quot;, message, message-&gt;code, message-&gt;size);</a>
+<a name="ln554">		}</a>
+<a name="ln555">	}</a>
+<a name="ln556"> </a>
+<a name="ln557">	set_debug_variable(&quot;_port&quot;, (addr_t)port);</a>
+<a name="ln558">	set_debug_variable(&quot;_portID&quot;, port-&gt;id);</a>
+<a name="ln559">	set_debug_variable(&quot;_owner&quot;, port-&gt;owner);</a>
+<a name="ln560">}</a>
+<a name="ln561"> </a>
+<a name="ln562"> </a>
+<a name="ln563">static int</a>
+<a name="ln564">dump_port_info(int argc, char** argv)</a>
+<a name="ln565">{</a>
+<a name="ln566">	ConditionVariable* condition = NULL;</a>
+<a name="ln567">	const char* name = NULL;</a>
+<a name="ln568"> </a>
+<a name="ln569">	if (argc &lt; 2) {</a>
+<a name="ln570">		print_debugger_command_usage(argv[0]);</a>
+<a name="ln571">		return 0;</a>
+<a name="ln572">	}</a>
+<a name="ln573"> </a>
+<a name="ln574">	if (argc &gt; 2) {</a>
+<a name="ln575">		if (!strcmp(argv[1], &quot;address&quot;)) {</a>
+<a name="ln576">			_dump_port_info((Port*)parse_expression(argv[2]));</a>
+<a name="ln577">			return 0;</a>
+<a name="ln578">		} else if (!strcmp(argv[1], &quot;condition&quot;))</a>
+<a name="ln579">			condition = (ConditionVariable*)parse_expression(argv[2]);</a>
+<a name="ln580">		else if (!strcmp(argv[1], &quot;name&quot;))</a>
+<a name="ln581">			name = argv[2];</a>
+<a name="ln582">	} else if (parse_expression(argv[1]) &gt; 0) {</a>
+<a name="ln583">		// if the argument looks like a number, treat it as such</a>
+<a name="ln584">		int32 num = parse_expression(argv[1]);</a>
+<a name="ln585">		Port* port = sPorts.Lookup(num);</a>
+<a name="ln586">		if (port == NULL || port-&gt;state != Port::kActive) {</a>
+<a name="ln587">			kprintf(&quot;port %&quot; B_PRId32 &quot; (%#&quot; B_PRIx32 &quot;) doesn't exist!\n&quot;,</a>
+<a name="ln588">				num, num);</a>
+<a name="ln589">			return 0;</a>
+<a name="ln590">		}</a>
+<a name="ln591">		_dump_port_info(port);</a>
+<a name="ln592">		return 0;</a>
+<a name="ln593">	} else</a>
+<a name="ln594">		name = argv[1];</a>
+<a name="ln595"> </a>
+<a name="ln596">	// walk through the ports list, trying to match name</a>
+<a name="ln597">	for (PortHashTable::Iterator it = sPorts.GetIterator();</a>
+<a name="ln598">		Port* port = it.Next();) {</a>
+<a name="ln599">		if ((name != NULL &amp;&amp; port-&gt;lock.name != NULL</a>
+<a name="ln600">				&amp;&amp; !strcmp(name, port-&gt;lock.name))</a>
+<a name="ln601">			|| (condition != NULL &amp;&amp; (&amp;port-&gt;read_condition == condition</a>
+<a name="ln602">				|| &amp;port-&gt;write_condition == condition))) {</a>
+<a name="ln603">			_dump_port_info(port);</a>
+<a name="ln604">			return 0;</a>
+<a name="ln605">		}</a>
+<a name="ln606">	}</a>
+<a name="ln607"> </a>
+<a name="ln608">	return 0;</a>
+<a name="ln609">}</a>
+<a name="ln610"> </a>
+<a name="ln611"> </a>
+<a name="ln612">// #pragma mark - internal helper functions</a>
+<a name="ln613"> </a>
+<a name="ln614"> </a>
+<a name="ln615">/*!	Notifies the port's select events.</a>
+<a name="ln616">	The port must be locked.</a>
+<a name="ln617">*/</a>
+<a name="ln618">static void</a>
+<a name="ln619">notify_port_select_events(Port* port, uint16 events)</a>
+<a name="ln620">{</a>
+<a name="ln621">	if (port-&gt;select_infos)</a>
+<a name="ln622">		notify_select_events_list(port-&gt;select_infos, events);</a>
+<a name="ln623">}</a>
+<a name="ln624"> </a>
+<a name="ln625"> </a>
+<a name="ln626">static BReference&lt;Port&gt;</a>
+<a name="ln627">get_locked_port(port_id id) GCC_2_NRV(portRef)</a>
+<a name="ln628">{</a>
+<a name="ln629">#if __GNUC__ &gt;= 3</a>
+<a name="ln630">	BReference&lt;Port&gt; portRef;</a>
+<a name="ln631">#endif</a>
+<a name="ln632">	{</a>
+<a name="ln633">		ReadLocker portsLocker(sPortsLock);</a>
+<a name="ln634">		portRef.SetTo(sPorts.Lookup(id));</a>
+<a name="ln635">	}</a>
+<a name="ln636"> </a>
+<a name="ln637">	if (portRef != NULL &amp;&amp; portRef-&gt;state == Port::kActive)</a>
+<a name="ln638">		mutex_lock(&amp;portRef-&gt;lock);</a>
+<a name="ln639">	else</a>
+<a name="ln640">		portRef.Unset();</a>
+<a name="ln641"> </a>
+<a name="ln642">	return portRef;</a>
+<a name="ln643">}</a>
+<a name="ln644"> </a>
+<a name="ln645"> </a>
+<a name="ln646">static BReference&lt;Port&gt;</a>
+<a name="ln647">get_port(port_id id) GCC_2_NRV(portRef)</a>
+<a name="ln648">{</a>
+<a name="ln649">#if __GNUC__ &gt;= 3</a>
+<a name="ln650">	BReference&lt;Port&gt; portRef;</a>
+<a name="ln651">#endif</a>
+<a name="ln652">	ReadLocker portsLocker(sPortsLock);</a>
+<a name="ln653">	portRef.SetTo(sPorts.Lookup(id));</a>
+<a name="ln654"> </a>
+<a name="ln655">	return portRef;</a>
+<a name="ln656">}</a>
+<a name="ln657"> </a>
+<a name="ln658"> </a>
+<a name="ln659">/*!	You need to own the port's lock when calling this function */</a>
+<a name="ln660">static inline bool</a>
+<a name="ln661">is_port_closed(Port* port)</a>
+<a name="ln662">{</a>
+<a name="ln663">	return port-&gt;capacity == 0;</a>
+<a name="ln664">}</a>
+<a name="ln665"> </a>
+<a name="ln666"> </a>
+<a name="ln667">static void</a>
+<a name="ln668">put_port_message(port_message* message)</a>
+<a name="ln669">{</a>
+<a name="ln670">	const size_t size = sizeof(port_message) + message-&gt;size;</a>
+<a name="ln671">	free(message);</a>
+<a name="ln672"> </a>
+<a name="ln673">	atomic_add(&amp;sTotalSpaceCommited, -size);</a>
+<a name="ln674">	if (sWaitingForSpace &gt; 0)</a>
+<a name="ln675">		sNoSpaceCondition.NotifyAll();</a>
+<a name="ln676">}</a>
+<a name="ln677"> </a>
+<a name="ln678"> </a>
+<a name="ln679">/*! Port must be locked. */</a>
+<a name="ln680">static status_t</a>
+<a name="ln681">get_port_message(int32 code, size_t bufferSize, uint32 flags, bigtime_t timeout,</a>
+<a name="ln682">	port_message** _message, Port&amp; port)</a>
+<a name="ln683">{</a>
+<a name="ln684">	const size_t size = sizeof(port_message) + bufferSize;</a>
+<a name="ln685"> </a>
+<a name="ln686">	while (true) {</a>
+<a name="ln687">		int32 previouslyCommited = atomic_add(&amp;sTotalSpaceCommited, size);</a>
+<a name="ln688"> </a>
+<a name="ln689">		while (previouslyCommited + size &gt; kTotalSpaceLimit) {</a>
+<a name="ln690">			// TODO: add per team limit</a>
+<a name="ln691"> </a>
+<a name="ln692">			// We are not allowed to allocate more memory, as our</a>
+<a name="ln693">			// space limit has been reached - just wait until we get</a>
+<a name="ln694">			// some free space again.</a>
+<a name="ln695"> </a>
+<a name="ln696">			atomic_add(&amp;sTotalSpaceCommited, -size);</a>
+<a name="ln697"> </a>
+<a name="ln698">			// TODO: we don't want to wait - but does that also mean we</a>
+<a name="ln699">			// shouldn't wait for free memory?</a>
+<a name="ln700">			if ((flags &amp; B_RELATIVE_TIMEOUT) != 0 &amp;&amp; timeout &lt;= 0)</a>
+<a name="ln701">				return B_WOULD_BLOCK;</a>
+<a name="ln702"> </a>
+<a name="ln703">			ConditionVariableEntry entry;</a>
+<a name="ln704">			sNoSpaceCondition.Add(&amp;entry);</a>
+<a name="ln705"> </a>
+<a name="ln706">			port_id portID = port.id;</a>
+<a name="ln707">			mutex_unlock(&amp;port.lock);</a>
+<a name="ln708"> </a>
+<a name="ln709">			atomic_add(&amp;sWaitingForSpace, 1);</a>
+<a name="ln710"> </a>
+<a name="ln711">			// TODO: right here the condition could be notified and we'd</a>
+<a name="ln712">			//       miss it.</a>
+<a name="ln713"> </a>
+<a name="ln714">			status_t status = entry.Wait(flags, timeout);</a>
+<a name="ln715"> </a>
+<a name="ln716">			atomic_add(&amp;sWaitingForSpace, -1);</a>
+<a name="ln717"> </a>
+<a name="ln718">			// re-lock the port</a>
+<a name="ln719">			BReference&lt;Port&gt; newPortRef = get_locked_port(portID);</a>
+<a name="ln720"> </a>
+<a name="ln721">			if (newPortRef.Get() != &amp;port || is_port_closed(&amp;port)) {</a>
+<a name="ln722">				// the port is no longer usable</a>
+<a name="ln723">				return B_BAD_PORT_ID;</a>
+<a name="ln724">			}</a>
+<a name="ln725"> </a>
+<a name="ln726">			if (status == B_TIMED_OUT)</a>
+<a name="ln727">				return B_TIMED_OUT;</a>
+<a name="ln728"> </a>
+<a name="ln729">			previouslyCommited = atomic_add(&amp;sTotalSpaceCommited, size);</a>
+<a name="ln730">			continue;</a>
+<a name="ln731">		}</a>
+<a name="ln732"> </a>
+<a name="ln733">		// Quota is fulfilled, try to allocate the buffer</a>
+<a name="ln734">		port_message* message = (port_message*)malloc(size);</a>
+<a name="ln735">		if (message != NULL) {</a>
+<a name="ln736">			message-&gt;code = code;</a>
+<a name="ln737">			message-&gt;size = bufferSize;</a>
+<a name="ln738"> </a>
+<a name="ln739">			*_message = message;</a>
+<a name="ln740">			return B_OK;</a>
+<a name="ln741">		}</a>
+<a name="ln742"> </a>
+<a name="ln743">		// We weren't able to allocate and we'll start over,so we remove our</a>
+<a name="ln744">		// size from the commited-counter again.</a>
+<a name="ln745">		atomic_add(&amp;sTotalSpaceCommited, -size);</a>
+<a name="ln746">		continue;</a>
+<a name="ln747">	}</a>
+<a name="ln748">}</a>
+<a name="ln749"> </a>
+<a name="ln750"> </a>
+<a name="ln751">/*!	Fills the port_info structure with information from the specified</a>
+<a name="ln752">	port.</a>
+<a name="ln753">	The port's lock must be held when called.</a>
+<a name="ln754">*/</a>
+<a name="ln755">static void</a>
+<a name="ln756">fill_port_info(Port* port, port_info* info, size_t size)</a>
+<a name="ln757">{</a>
+<a name="ln758">	info-&gt;port = port-&gt;id;</a>
+<a name="ln759">	info-&gt;team = port-&gt;owner;</a>
+<a name="ln760">	info-&gt;capacity = port-&gt;capacity;</a>
+<a name="ln761"> </a>
+<a name="ln762">	info-&gt;queue_count = port-&gt;read_count;</a>
+<a name="ln763">	info-&gt;total_count = port-&gt;total_count;</a>
+<a name="ln764"> </a>
+<a name="ln765">	strlcpy(info-&gt;name, port-&gt;lock.name, B_OS_NAME_LENGTH);</a>
+<a name="ln766">}</a>
+<a name="ln767"> </a>
+<a name="ln768"> </a>
+<a name="ln769">static ssize_t</a>
+<a name="ln770">copy_port_message(port_message* message, int32* _code, void* buffer,</a>
+<a name="ln771">	size_t bufferSize, bool userCopy)</a>
+<a name="ln772">{</a>
+<a name="ln773">	// check output buffer size</a>
+<a name="ln774">	size_t size = std::min(bufferSize, message-&gt;size);</a>
+<a name="ln775"> </a>
+<a name="ln776">	// copy message</a>
+<a name="ln777">	if (_code != NULL)</a>
+<a name="ln778">		*_code = message-&gt;code;</a>
+<a name="ln779"> </a>
+<a name="ln780">	if (size &gt; 0) {</a>
+<a name="ln781">		if (userCopy) {</a>
+<a name="ln782">			status_t status = user_memcpy(buffer, message-&gt;buffer, size);</a>
+<a name="ln783">			if (status != B_OK)</a>
+<a name="ln784">				return status;</a>
+<a name="ln785">		} else</a>
+<a name="ln786">			memcpy(buffer, message-&gt;buffer, size);</a>
+<a name="ln787">	}</a>
+<a name="ln788"> </a>
+<a name="ln789">	return size;</a>
+<a name="ln790">}</a>
+<a name="ln791"> </a>
+<a name="ln792"> </a>
+<a name="ln793">static void</a>
+<a name="ln794">uninit_port(Port* port)</a>
+<a name="ln795">{</a>
+<a name="ln796">	MutexLocker locker(port-&gt;lock);</a>
+<a name="ln797"> </a>
+<a name="ln798">	notify_port_select_events(port, B_EVENT_INVALID);</a>
+<a name="ln799">	port-&gt;select_infos = NULL;</a>
+<a name="ln800"> </a>
+<a name="ln801">	// Release the threads that were blocking on this port.</a>
+<a name="ln802">	// read_port() will see the B_BAD_PORT_ID return value, and act accordingly</a>
+<a name="ln803">	port-&gt;read_condition.NotifyAll(B_BAD_PORT_ID);</a>
+<a name="ln804">	port-&gt;write_condition.NotifyAll(B_BAD_PORT_ID);</a>
+<a name="ln805">	sNotificationService.Notify(PORT_REMOVED, port-&gt;id);</a>
+<a name="ln806">}</a>
+<a name="ln807"> </a>
+<a name="ln808"> </a>
+<a name="ln809">/*! Caller must ensure there is still a reference to the port. (Either by</a>
+<a name="ln810"> *  holding a reference itself or by holding a lock on one of the data</a>
+<a name="ln811"> *  structures in which it is referenced.)</a>
+<a name="ln812"> */</a>
+<a name="ln813">static status_t</a>
+<a name="ln814">delete_port_logical(Port* port)</a>
+<a name="ln815">{</a>
+<a name="ln816">	for (;;) {</a>
+<a name="ln817">		// Try to logically delete</a>
+<a name="ln818">		const int32 oldState = atomic_test_and_set(&amp;port-&gt;state,</a>
+<a name="ln819">			Port::kDeleted, Port::kActive);</a>
+<a name="ln820">			// Linearization point for port deletion</a>
+<a name="ln821"> </a>
+<a name="ln822">		switch (oldState) {</a>
+<a name="ln823">			case Port::kActive:</a>
+<a name="ln824">				// Logical deletion succesful</a>
+<a name="ln825">				return B_OK;</a>
+<a name="ln826"> </a>
+<a name="ln827">			case Port::kDeleted:</a>
+<a name="ln828">				// Someone else already deleted it in the meantime</a>
+<a name="ln829">				TRACE((&quot;delete_port_logical: already deleted port_id %ld\n&quot;,</a>
+<a name="ln830">						port-&gt;id));</a>
+<a name="ln831">				return B_BAD_PORT_ID;</a>
+<a name="ln832"> </a>
+<a name="ln833">			case Port::kUnused:</a>
+<a name="ln834">				// Port is still being created, retry</a>
+<a name="ln835">				continue;</a>
+<a name="ln836"> </a>
+<a name="ln837">			default:</a>
+<a name="ln838">				// Port state got corrupted somehow</a>
+<a name="ln839">				panic(&quot;Invalid port state!\n&quot;);</a>
+<a name="ln840">		}</a>
+<a name="ln841">	}</a>
+<a name="ln842">}</a>
+<a name="ln843"> </a>
+<a name="ln844"> </a>
+<a name="ln845">//	#pragma mark - private kernel API</a>
+<a name="ln846"> </a>
+<a name="ln847"> </a>
+<a name="ln848">/*! This function deletes all the ports that are owned by the passed team.</a>
+<a name="ln849">*/</a>
+<a name="ln850">void</a>
+<a name="ln851">delete_owned_ports(Team* team)</a>
+<a name="ln852">{</a>
+<a name="ln853">	TRACE((&quot;delete_owned_ports(owner = %ld)\n&quot;, team-&gt;id));</a>
+<a name="ln854"> </a>
+<a name="ln855">	list deletionList;</a>
+<a name="ln856">	list_init_etc(&amp;deletionList, port_team_link_offset());</a>
+<a name="ln857"> </a>
+<a name="ln858">	const uint8 lockIndex = team-&gt;id % kTeamListLockCount;</a>
+<a name="ln859">	MutexLocker teamPortsListLocker(sTeamListLock[lockIndex]);</a>
+<a name="ln860"> </a>
+<a name="ln861">	// Try to logically delete all ports from the team's port list.</a>
+<a name="ln862">	// On success, move the port to deletionList.</a>
+<a name="ln863">	Port* port = (Port*)list_get_first_item(&amp;team-&gt;port_list);</a>
+<a name="ln864">	while (port != NULL) {</a>
+<a name="ln865">		status_t status = delete_port_logical(port);</a>
+<a name="ln866">			// Contains linearization point</a>
+<a name="ln867"> </a>
+<a name="ln868">		Port* nextPort = (Port*)list_get_next_item(&amp;team-&gt;port_list, port);</a>
+<a name="ln869"> </a>
+<a name="ln870">		if (status == B_OK) {</a>
+<a name="ln871">			list_remove_link(&amp;port-&gt;team_link);</a>
+<a name="ln872">			list_add_item(&amp;deletionList, port);</a>
+<a name="ln873">		}</a>
+<a name="ln874"> </a>
+<a name="ln875">		port = nextPort;</a>
+<a name="ln876">	}</a>
+<a name="ln877"> </a>
+<a name="ln878">	teamPortsListLocker.Unlock();</a>
+<a name="ln879"> </a>
+<a name="ln880">	// Remove all ports in deletionList from hashes</a>
+<a name="ln881">	{</a>
+<a name="ln882">		WriteLocker portsLocker(sPortsLock);</a>
+<a name="ln883"> </a>
+<a name="ln884">		for (Port* port = (Port*)list_get_first_item(&amp;deletionList);</a>
+<a name="ln885">			 port != NULL;</a>
+<a name="ln886">			 port = (Port*)list_get_next_item(&amp;deletionList, port)) {</a>
+<a name="ln887"> </a>
+<a name="ln888">			sPorts.Remove(port);</a>
+<a name="ln889">			sPortsByName.Remove(port);</a>
+<a name="ln890">			port-&gt;ReleaseReference();</a>
+<a name="ln891">				// joint reference for sPorts and sPortsByName</a>
+<a name="ln892">		}</a>
+<a name="ln893">	}</a>
+<a name="ln894"> </a>
+<a name="ln895">	// Uninitialize ports and release team port list references</a>
+<a name="ln896">	while (Port* port = (Port*)list_remove_head_item(&amp;deletionList)) {</a>
+<a name="ln897">		atomic_add(&amp;sUsedPorts, -1);</a>
+<a name="ln898">		uninit_port(port);</a>
+<a name="ln899">		port-&gt;ReleaseReference();</a>
+<a name="ln900">			// Reference for team port list</a>
+<a name="ln901">	}</a>
+<a name="ln902">}</a>
+<a name="ln903"> </a>
+<a name="ln904"> </a>
+<a name="ln905">int32</a>
+<a name="ln906">port_max_ports(void)</a>
+<a name="ln907">{</a>
+<a name="ln908">	return sMaxPorts;</a>
+<a name="ln909">}</a>
+<a name="ln910"> </a>
+<a name="ln911"> </a>
+<a name="ln912">int32</a>
+<a name="ln913">port_used_ports(void)</a>
+<a name="ln914">{</a>
+<a name="ln915">	return sUsedPorts;</a>
+<a name="ln916">}</a>
+<a name="ln917"> </a>
+<a name="ln918"> </a>
+<a name="ln919">size_t</a>
+<a name="ln920">port_team_link_offset()</a>
+<a name="ln921">{</a>
+<a name="ln922">	// Somewhat ugly workaround since we cannot use offsetof() for a class</a>
+<a name="ln923">	// with vtable (GCC4 throws a warning then).</a>
+<a name="ln924">	Port* port = (Port*)0;</a>
+<a name="ln925">	return (size_t)&amp;port-&gt;team_link;</a>
+<a name="ln926">}</a>
+<a name="ln927"> </a>
+<a name="ln928"> </a>
+<a name="ln929">status_t</a>
+<a name="ln930">port_init(kernel_args *args)</a>
+<a name="ln931">{</a>
+<a name="ln932">	// initialize ports table and by-name hash</a>
+<a name="ln933">	new(&amp;sPorts) PortHashTable;</a>
+<a name="ln934">	if (sPorts.Init() != B_OK) {</a>
+<a name="ln935">		panic(&quot;Failed to init port hash table!&quot;);</a>
+<a name="ln936">		return B_NO_MEMORY;</a>
+<a name="ln937">	}</a>
+<a name="ln938"> </a>
+<a name="ln939">	new(&amp;sPortsByName) PortNameHashTable;</a>
+<a name="ln940">	if (sPortsByName.Init() != B_OK) {</a>
+<a name="ln941">		panic(&quot;Failed to init port by name hash table!&quot;);</a>
+<a name="ln942">		return B_NO_MEMORY;</a>
+<a name="ln943">	}</a>
+<a name="ln944"> </a>
+<a name="ln945">	sNoSpaceCondition.Init(&amp;sPorts, &quot;port space&quot;);</a>
+<a name="ln946"> </a>
+<a name="ln947">	// add debugger commands</a>
+<a name="ln948">	add_debugger_command_etc(&quot;ports&quot;, &amp;dump_port_list,</a>
+<a name="ln949">		&quot;Dump a list of all active ports (for team, with name, etc.)&quot;,</a>
+<a name="ln950">		&quot;[ ([ \&quot;team\&quot; | \&quot;owner\&quot; ] &lt;team&gt;) | (\&quot;name\&quot; &lt;name&gt;) ]\n&quot;</a>
+<a name="ln951">		&quot;Prints a list of all active ports meeting the given\n&quot;</a>
+<a name="ln952">		&quot;requirement. If no argument is given, all ports are listed.\n&quot;</a>
+<a name="ln953">		&quot;  &lt;team&gt;             - The team owning the ports.\n&quot;</a>
+<a name="ln954">		&quot;  &lt;name&gt;             - Part of the name of the ports.\n&quot;, 0);</a>
+<a name="ln955">	add_debugger_command_etc(&quot;port&quot;, &amp;dump_port_info,</a>
+<a name="ln956">		&quot;Dump info about a particular port&quot;,</a>
+<a name="ln957">		&quot;(&lt;id&gt; | [ \&quot;address\&quot; ] &lt;address&gt;) | ([ \&quot;name\&quot; ] &lt;name&gt;) &quot;</a>
+<a name="ln958">			&quot;| (\&quot;condition\&quot; &lt;address&gt;)\n&quot;</a>
+<a name="ln959">		&quot;Prints info about the specified port.\n&quot;</a>
+<a name="ln960">		&quot;  &lt;address&gt;   - Pointer to the port structure.\n&quot;</a>
+<a name="ln961">		&quot;  &lt;name&gt;      - Name of the port.\n&quot;</a>
+<a name="ln962">		&quot;  &lt;condition&gt; - address of the port's read or write condition.\n&quot;, 0);</a>
+<a name="ln963"> </a>
+<a name="ln964">	new(&amp;sNotificationService) PortNotificationService();</a>
+<a name="ln965">	sNotificationService.Register();</a>
+<a name="ln966">	sPortsActive = true;</a>
+<a name="ln967">	return B_OK;</a>
+<a name="ln968">}</a>
+<a name="ln969"> </a>
+<a name="ln970"> </a>
+<a name="ln971">//	#pragma mark - public kernel API</a>
+<a name="ln972"> </a>
+<a name="ln973"> </a>
+<a name="ln974">port_id</a>
+<a name="ln975">create_port(int32 queueLength, const char* name)</a>
+<a name="ln976">{</a>
+<a name="ln977">	TRACE((&quot;create_port(queueLength = %ld, name = \&quot;%s\&quot;)\n&quot;, queueLength,</a>
+<a name="ln978">		name));</a>
+<a name="ln979"> </a>
+<a name="ln980">	if (!sPortsActive) {</a>
+<a name="ln981">		panic(&quot;ports used too early!\n&quot;);</a>
+<a name="ln982">		return B_BAD_PORT_ID;</a>
+<a name="ln983">	}</a>
+<a name="ln984">	if (queueLength &lt; 1 || queueLength &gt; MAX_QUEUE_LENGTH)</a>
+<a name="ln985">		return B_BAD_VALUE;</a>
+<a name="ln986"> </a>
+<a name="ln987">	Team* team = thread_get_current_thread()-&gt;team;</a>
+<a name="ln988">	if (team == NULL)</a>
+<a name="ln989">		return B_BAD_TEAM_ID;</a>
+<a name="ln990"> </a>
+<a name="ln991">	// check &amp; dup name</a>
+<a name="ln992">	char* nameBuffer = strdup(name != NULL ? name : &quot;unnamed port&quot;);</a>
+<a name="ln993">	if (nameBuffer == NULL)</a>
+<a name="ln994">		return B_NO_MEMORY;</a>
+<a name="ln995"> </a>
+<a name="ln996">	// create a port</a>
+<a name="ln997">	Port* port = new(std::nothrow) Port(team_get_current_team_id(), queueLength,</a>
+<a name="ln998">		nameBuffer);</a>
+<a name="ln999">	if (port == NULL) {</a>
+<a name="ln1000">		free(nameBuffer);</a>
+<a name="ln1001">		return B_NO_MEMORY;</a>
+<a name="ln1002">	}</a>
+<a name="ln1003"> </a>
+<a name="ln1004">	// check the ports limit</a>
+<a name="ln1005">	const int32 previouslyUsed = atomic_add(&amp;sUsedPorts, 1);</a>
+<a name="ln1006">	if (previouslyUsed + 1 &gt;= sMaxPorts) {</a>
+<a name="ln1007">		atomic_add(&amp;sUsedPorts, -1);</a>
+<a name="ln1008">		delete port;</a>
+<a name="ln1009">		return B_NO_MORE_PORTS;</a>
+<a name="ln1010">	}</a>
+<a name="ln1011"> </a>
+<a name="ln1012">	{</a>
+<a name="ln1013">		WriteLocker locker(sPortsLock);</a>
+<a name="ln1014"> </a>
+<a name="ln1015">		// allocate a port ID</a>
+<a name="ln1016">		do {</a>
+<a name="ln1017">			port-&gt;id = sNextPortID++;</a>
+<a name="ln1018"> </a>
+<a name="ln1019">			// handle integer overflow</a>
+<a name="ln1020">			if (sNextPortID &lt; 0)</a>
+<a name="ln1021">				sNextPortID = 1;</a>
+<a name="ln1022">		} while (sPorts.Lookup(port-&gt;id) != NULL);</a>
+<a name="ln1023"> </a>
+<a name="ln1024">		// Insert port physically:</a>
+<a name="ln1025">		// (1/2) Insert into hash tables</a>
+<a name="ln1026">		port-&gt;AcquireReference();</a>
+<a name="ln1027">			// joint reference for sPorts and sPortsByName</a>
+<a name="ln1028"> </a>
+<a name="ln1029">		sPorts.Insert(port);</a>
+<a name="ln1030">		sPortsByName.Insert(port);</a>
+<a name="ln1031">	}</a>
+<a name="ln1032"> </a>
+<a name="ln1033">	// (2/2) Insert into team list</a>
+<a name="ln1034">	{</a>
+<a name="ln1035">		const uint8 lockIndex = port-&gt;owner % kTeamListLockCount;</a>
+<a name="ln1036">		MutexLocker teamPortsListLocker(sTeamListLock[lockIndex]);</a>
+<a name="ln1037">		port-&gt;AcquireReference();</a>
+<a name="ln1038">		list_add_item(&amp;team-&gt;port_list, port);</a>
+<a name="ln1039">	}</a>
+<a name="ln1040"> </a>
+<a name="ln1041">	// tracing, notifications, etc.</a>
+<a name="ln1042">	T(Create(port));</a>
+<a name="ln1043"> </a>
+<a name="ln1044">	const port_id id = port-&gt;id;</a>
+<a name="ln1045"> </a>
+<a name="ln1046">	// Insert port logically by marking it active</a>
+<a name="ln1047">	const int32 oldState = atomic_test_and_set(&amp;port-&gt;state,</a>
+<a name="ln1048">		Port::kActive, Port::kUnused);</a>
+<a name="ln1049">		// Linearization point for port creation</a>
+<a name="ln1050"> </a>
+<a name="ln1051">	if (oldState != Port::kUnused) {</a>
+<a name="ln1052">		// Nobody is allowed to tamper with the port before it's active.</a>
+<a name="ln1053">		panic(&quot;Port state was modified during creation!\n&quot;);</a>
+<a name="ln1054">	}</a>
+<a name="ln1055"> </a>
+<a name="ln1056">	TRACE((&quot;create_port() done: port created %ld\n&quot;, id));</a>
+<a name="ln1057"> </a>
+<a name="ln1058">	sNotificationService.Notify(PORT_ADDED, id);</a>
+<a name="ln1059">	return id;</a>
+<a name="ln1060">}</a>
+<a name="ln1061"> </a>
+<a name="ln1062"> </a>
+<a name="ln1063">status_t</a>
+<a name="ln1064">close_port(port_id id)</a>
+<a name="ln1065">{</a>
+<a name="ln1066">	TRACE((&quot;close_port(id = %ld)\n&quot;, id));</a>
+<a name="ln1067"> </a>
+<a name="ln1068">	if (!sPortsActive || id &lt; 0)</a>
+<a name="ln1069">		return B_BAD_PORT_ID;</a>
+<a name="ln1070"> </a>
+<a name="ln1071">	// get the port</a>
+<a name="ln1072">	BReference&lt;Port&gt; portRef = get_locked_port(id);</a>
+<a name="ln1073">	if (portRef == NULL) {</a>
+<a name="ln1074">		TRACE((&quot;close_port: invalid port_id %ld\n&quot;, id));</a>
+<a name="ln1075">		return B_BAD_PORT_ID;</a>
+<a name="ln1076">	}</a>
+<a name="ln1077">	MutexLocker lock(&amp;portRef-&gt;lock, true);</a>
+<a name="ln1078"> </a>
+<a name="ln1079">	// mark port to disable writing - deleting the semaphores will</a>
+<a name="ln1080">	// wake up waiting read/writes</a>
+<a name="ln1081">	portRef-&gt;capacity = 0;</a>
+<a name="ln1082"> </a>
+<a name="ln1083">	notify_port_select_events(portRef, B_EVENT_INVALID);</a>
+<a name="ln1084">	portRef-&gt;select_infos = NULL;</a>
+<a name="ln1085"> </a>
+<a name="ln1086">	portRef-&gt;read_condition.NotifyAll(B_BAD_PORT_ID);</a>
+<a name="ln1087">	portRef-&gt;write_condition.NotifyAll(B_BAD_PORT_ID);</a>
+<a name="ln1088"> </a>
+<a name="ln1089">	return B_OK;</a>
+<a name="ln1090">}</a>
+<a name="ln1091"> </a>
+<a name="ln1092"> </a>
+<a name="ln1093">status_t</a>
+<a name="ln1094">delete_port(port_id id)</a>
+<a name="ln1095">{</a>
+<a name="ln1096">	TRACE((&quot;delete_port(id = %ld)\n&quot;, id));</a>
+<a name="ln1097"> </a>
+<a name="ln1098">	if (!sPortsActive || id &lt; 0)</a>
+<a name="ln1099">		return B_BAD_PORT_ID;</a>
+<a name="ln1100"> </a>
+<a name="ln1101">	BReference&lt;Port&gt; portRef = get_port(id);</a>
+<a name="ln1102"> </a>
+<a name="ln1103">	if (portRef == NULL) {</a>
+<a name="ln1104">		TRACE((&quot;delete_port: invalid port_id %ld\n&quot;, id));</a>
+<a name="ln1105">		return B_BAD_PORT_ID;</a>
+<a name="ln1106">	}</a>
+<a name="ln1107"> </a>
+<a name="ln1108">	status_t status = delete_port_logical(portRef);</a>
+<a name="ln1109">		// Contains linearization point</a>
+<a name="ln1110">	if (status != B_OK)</a>
+<a name="ln1111">		return status;</a>
+<a name="ln1112"> </a>
+<a name="ln1113">	// Now remove port physically:</a>
+<a name="ln1114">	// (1/2) Remove from hash tables</a>
+<a name="ln1115">	{</a>
+<a name="ln1116">		WriteLocker portsLocker(sPortsLock);</a>
+<a name="ln1117"> </a>
+<a name="ln1118">		sPorts.Remove(portRef);</a>
+<a name="ln1119">		sPortsByName.Remove(portRef);</a>
+<a name="ln1120"> </a>
+<a name="ln1121">		portRef-&gt;ReleaseReference();</a>
+<a name="ln1122">			// joint reference for sPorts and sPortsByName</a>
+<a name="ln1123">	}</a>
+<a name="ln1124"> </a>
+<a name="ln1125">	// (2/2) Remove from team port list</a>
+<a name="ln1126">	{</a>
+<a name="ln1127">		const uint8 lockIndex = portRef-&gt;owner % kTeamListLockCount;</a>
+<a name="ln1128">		MutexLocker teamPortsListLocker(sTeamListLock[lockIndex]);</a>
+<a name="ln1129"> </a>
+<a name="ln1130">		list_remove_link(&amp;portRef-&gt;team_link);</a>
+<a name="ln1131">		portRef-&gt;ReleaseReference();</a>
+<a name="ln1132">	}</a>
+<a name="ln1133"> </a>
+<a name="ln1134">	uninit_port(portRef);</a>
+<a name="ln1135"> </a>
+<a name="ln1136">	T(Delete(portRef));</a>
+<a name="ln1137"> </a>
+<a name="ln1138">	atomic_add(&amp;sUsedPorts, -1);</a>
+<a name="ln1139"> </a>
+<a name="ln1140">	return B_OK;</a>
+<a name="ln1141">}</a>
+<a name="ln1142"> </a>
+<a name="ln1143"> </a>
+<a name="ln1144">status_t</a>
+<a name="ln1145">select_port(int32 id, struct select_info* info, bool kernel)</a>
+<a name="ln1146">{</a>
+<a name="ln1147">	if (id &lt; 0)</a>
+<a name="ln1148">		return B_BAD_PORT_ID;</a>
+<a name="ln1149"> </a>
+<a name="ln1150">	// get the port</a>
+<a name="ln1151">	BReference&lt;Port&gt; portRef = get_locked_port(id);</a>
+<a name="ln1152">	if (portRef == NULL)</a>
+<a name="ln1153">		return B_BAD_PORT_ID;</a>
+<a name="ln1154">	MutexLocker locker(portRef-&gt;lock, true);</a>
+<a name="ln1155"> </a>
+<a name="ln1156">	// port must not yet be closed</a>
+<a name="ln1157">	if (is_port_closed(portRef))</a>
+<a name="ln1158">		return B_BAD_PORT_ID;</a>
+<a name="ln1159"> </a>
+<a name="ln1160">	if (!kernel &amp;&amp; portRef-&gt;owner == team_get_kernel_team_id()) {</a>
+<a name="ln1161">		// kernel port, but call from userland</a>
+<a name="ln1162">		return B_NOT_ALLOWED;</a>
+<a name="ln1163">	}</a>
+<a name="ln1164"> </a>
+<a name="ln1165">	info-&gt;selected_events &amp;= B_EVENT_READ | B_EVENT_WRITE | B_EVENT_INVALID;</a>
+<a name="ln1166"> </a>
+<a name="ln1167">	if (info-&gt;selected_events != 0) {</a>
+<a name="ln1168">		uint16 events = 0;</a>
+<a name="ln1169"> </a>
+<a name="ln1170">		info-&gt;next = portRef-&gt;select_infos;</a>
+<a name="ln1171">		portRef-&gt;select_infos = info;</a>
+<a name="ln1172"> </a>
+<a name="ln1173">		// check for events</a>
+<a name="ln1174">		if ((info-&gt;selected_events &amp; B_EVENT_READ) != 0</a>
+<a name="ln1175">			&amp;&amp; !portRef-&gt;messages.IsEmpty()) {</a>
+<a name="ln1176">			events |= B_EVENT_READ;</a>
+<a name="ln1177">		}</a>
+<a name="ln1178"> </a>
+<a name="ln1179">		if (portRef-&gt;write_count &gt; 0)</a>
+<a name="ln1180">			events |= B_EVENT_WRITE;</a>
+<a name="ln1181"> </a>
+<a name="ln1182">		if (events != 0)</a>
+<a name="ln1183">			notify_select_events(info, events);</a>
+<a name="ln1184">	}</a>
+<a name="ln1185"> </a>
+<a name="ln1186">	return B_OK;</a>
+<a name="ln1187">}</a>
+<a name="ln1188"> </a>
+<a name="ln1189"> </a>
+<a name="ln1190">status_t</a>
+<a name="ln1191">deselect_port(int32 id, struct select_info* info, bool kernel)</a>
+<a name="ln1192">{</a>
+<a name="ln1193">	if (id &lt; 0)</a>
+<a name="ln1194">		return B_BAD_PORT_ID;</a>
+<a name="ln1195">	if (info-&gt;selected_events == 0)</a>
+<a name="ln1196">		return B_OK;</a>
+<a name="ln1197"> </a>
+<a name="ln1198">	// get the port</a>
+<a name="ln1199">	BReference&lt;Port&gt; portRef = get_locked_port(id);</a>
+<a name="ln1200">	if (portRef == NULL)</a>
+<a name="ln1201">		return B_BAD_PORT_ID;</a>
+<a name="ln1202">	MutexLocker locker(portRef-&gt;lock, true);</a>
+<a name="ln1203"> </a>
+<a name="ln1204">	// find and remove the infos</a>
+<a name="ln1205">	select_info** infoLocation = &amp;portRef-&gt;select_infos;</a>
+<a name="ln1206">	while (*infoLocation != NULL &amp;&amp; *infoLocation != info)</a>
+<a name="ln1207">		infoLocation = &amp;(*infoLocation)-&gt;next;</a>
+<a name="ln1208"> </a>
+<a name="ln1209">	if (*infoLocation == info)</a>
+<a name="ln1210">		*infoLocation = info-&gt;next;</a>
+<a name="ln1211"> </a>
+<a name="ln1212">	return B_OK;</a>
+<a name="ln1213">}</a>
+<a name="ln1214"> </a>
+<a name="ln1215"> </a>
+<a name="ln1216">port_id</a>
+<a name="ln1217">find_port(const char* name)</a>
+<a name="ln1218">{</a>
+<a name="ln1219">	TRACE((&quot;find_port(name = \&quot;%s\&quot;)\n&quot;, name));</a>
+<a name="ln1220"> </a>
+<a name="ln1221">	if (!sPortsActive) {</a>
+<a name="ln1222">		panic(&quot;ports used too early!\n&quot;);</a>
+<a name="ln1223">		return B_NAME_NOT_FOUND;</a>
+<a name="ln1224">	}</a>
+<a name="ln1225">	if (name == NULL)</a>
+<a name="ln1226">		return B_BAD_VALUE;</a>
+<a name="ln1227"> </a>
+<a name="ln1228">	ReadLocker locker(sPortsLock);</a>
+<a name="ln1229">	Port* port = sPortsByName.Lookup(name);</a>
+<a name="ln1230">		// Since we have sPortsLock and don't return the port itself,</a>
+<a name="ln1231">		// no BReference necessary</a>
+<a name="ln1232"> </a>
+<a name="ln1233">	if (port != NULL &amp;&amp; port-&gt;state == Port::kActive)</a>
+<a name="ln1234">		return port-&gt;id;</a>
+<a name="ln1235"> </a>
+<a name="ln1236">	return B_NAME_NOT_FOUND;</a>
+<a name="ln1237">}</a>
+<a name="ln1238"> </a>
+<a name="ln1239"> </a>
+<a name="ln1240">status_t</a>
+<a name="ln1241">_get_port_info(port_id id, port_info* info, size_t size)</a>
+<a name="ln1242">{</a>
+<a name="ln1243">	TRACE((&quot;get_port_info(id = %ld)\n&quot;, id));</a>
+<a name="ln1244"> </a>
+<a name="ln1245">	if (info == NULL || size != sizeof(port_info))</a>
+<a name="ln1246">		return B_BAD_VALUE;</a>
+<a name="ln1247">	if (!sPortsActive || id &lt; 0)</a>
+<a name="ln1248">		return B_BAD_PORT_ID;</a>
+<a name="ln1249"> </a>
+<a name="ln1250">	// get the port</a>
+<a name="ln1251">	BReference&lt;Port&gt; portRef = get_locked_port(id);</a>
+<a name="ln1252">	if (portRef == NULL) {</a>
+<a name="ln1253">		TRACE((&quot;get_port_info: invalid port_id %ld\n&quot;, id));</a>
+<a name="ln1254">		return B_BAD_PORT_ID;</a>
+<a name="ln1255">	}</a>
+<a name="ln1256">	MutexLocker locker(portRef-&gt;lock, true);</a>
+<a name="ln1257"> </a>
+<a name="ln1258">	// fill a port_info struct with info</a>
+<a name="ln1259">	fill_port_info(portRef, info, size);</a>
+<a name="ln1260">	return B_OK;</a>
+<a name="ln1261">}</a>
+<a name="ln1262"> </a>
+<a name="ln1263"> </a>
+<a name="ln1264">status_t</a>
+<a name="ln1265">_get_next_port_info(team_id teamID, int32* _cookie, struct port_info* info,</a>
+<a name="ln1266">	size_t size)</a>
+<a name="ln1267">{</a>
+<a name="ln1268">	TRACE((&quot;get_next_port_info(team = %ld)\n&quot;, teamID));</a>
+<a name="ln1269"> </a>
+<a name="ln1270">	if (info == NULL || size != sizeof(port_info) || _cookie == NULL</a>
+<a name="ln1271">		|| teamID &lt; 0) {</a>
+<a name="ln1272">		return B_BAD_VALUE;</a>
+<a name="ln1273">	}</a>
+<a name="ln1274">	if (!sPortsActive)</a>
+<a name="ln1275">		return B_BAD_PORT_ID;</a>
+<a name="ln1276"> </a>
+<a name="ln1277">	Team* team = Team::Get(teamID);</a>
+<a name="ln1278">	if (team == NULL)</a>
+<a name="ln1279">		return B_BAD_TEAM_ID;</a>
+<a name="ln1280">	BReference&lt;Team&gt; teamReference(team, true);</a>
+<a name="ln1281"> </a>
+<a name="ln1282">	// iterate through the team's port list</a>
+<a name="ln1283">	const uint8 lockIndex = teamID % kTeamListLockCount;</a>
+<a name="ln1284">	MutexLocker teamPortsListLocker(sTeamListLock[lockIndex]);</a>
+<a name="ln1285"> </a>
+<a name="ln1286">	int32 stopIndex = *_cookie;</a>
+<a name="ln1287">	int32 index = 0;</a>
+<a name="ln1288"> </a>
+<a name="ln1289">	Port* port = (Port*)list_get_first_item(&amp;team-&gt;port_list);</a>
+<a name="ln1290">	while (port != NULL) {</a>
+<a name="ln1291">		if (!is_port_closed(port)) {</a>
+<a name="ln1292">			if (index == stopIndex)</a>
+<a name="ln1293">				break;</a>
+<a name="ln1294">			index++;</a>
+<a name="ln1295">		}</a>
+<a name="ln1296"> </a>
+<a name="ln1297">		port = (Port*)list_get_next_item(&amp;team-&gt;port_list, port);</a>
+<a name="ln1298">	}</a>
+<a name="ln1299"> </a>
+<a name="ln1300">	if (port == NULL)</a>
+<a name="ln1301">		return B_BAD_PORT_ID;</a>
+<a name="ln1302"> </a>
+<a name="ln1303">	// fill in the port info</a>
+<a name="ln1304">	BReference&lt;Port&gt; portRef = port;</a>
+<a name="ln1305">	teamPortsListLocker.Unlock();</a>
+<a name="ln1306">		// Only use portRef below this line...</a>
+<a name="ln1307"> </a>
+<a name="ln1308">	MutexLocker locker(portRef-&gt;lock);</a>
+<a name="ln1309">	fill_port_info(portRef, info, size);</a>
+<a name="ln1310"> </a>
+<a name="ln1311">	*_cookie = stopIndex + 1;</a>
+<a name="ln1312">	return B_OK;</a>
+<a name="ln1313">}</a>
+<a name="ln1314"> </a>
+<a name="ln1315"> </a>
+<a name="ln1316">ssize_t</a>
+<a name="ln1317">port_buffer_size(port_id id)</a>
+<a name="ln1318">{</a>
+<a name="ln1319">	return port_buffer_size_etc(id, 0, 0);</a>
+<a name="ln1320">}</a>
+<a name="ln1321"> </a>
+<a name="ln1322"> </a>
+<a name="ln1323">ssize_t</a>
+<a name="ln1324">port_buffer_size_etc(port_id id, uint32 flags, bigtime_t timeout)</a>
+<a name="ln1325">{</a>
+<a name="ln1326">	port_message_info info;</a>
+<a name="ln1327">	status_t error = get_port_message_info_etc(id, &amp;info, flags, timeout);</a>
+<a name="ln1328">	return error != B_OK ? error : info.size;</a>
+<a name="ln1329">}</a>
+<a name="ln1330"> </a>
+<a name="ln1331"> </a>
+<a name="ln1332">status_t</a>
+<a name="ln1333">_get_port_message_info_etc(port_id id, port_message_info* info,</a>
+<a name="ln1334">	size_t infoSize, uint32 flags, bigtime_t timeout)</a>
+<a name="ln1335">{</a>
+<a name="ln1336">	if (info == NULL || infoSize != sizeof(port_message_info))</a>
+<a name="ln1337">		return B_BAD_VALUE;</a>
+<a name="ln1338">	if (!sPortsActive || id &lt; 0)</a>
+<a name="ln1339">		return B_BAD_PORT_ID;</a>
+<a name="ln1340"> </a>
+<a name="ln1341">	flags &amp;= B_CAN_INTERRUPT | B_KILL_CAN_INTERRUPT | B_RELATIVE_TIMEOUT</a>
+<a name="ln1342">		| B_ABSOLUTE_TIMEOUT;</a>
+<a name="ln1343"> </a>
+<a name="ln1344">	// get the port</a>
+<a name="ln1345">	BReference&lt;Port&gt; portRef = get_locked_port(id);</a>
+<a name="ln1346">	if (portRef == NULL)</a>
+<a name="ln1347">		return B_BAD_PORT_ID;</a>
+<a name="ln1348">	MutexLocker locker(portRef-&gt;lock, true);</a>
+<a name="ln1349"> </a>
+<a name="ln1350">	if (is_port_closed(portRef) &amp;&amp; portRef-&gt;messages.IsEmpty()) {</a>
+<a name="ln1351">		T(Info(portRef, 0, B_BAD_PORT_ID));</a>
+<a name="ln1352">		TRACE((&quot;_get_port_message_info_etc(): closed port %ld\n&quot;, id));</a>
+<a name="ln1353">		return B_BAD_PORT_ID;</a>
+<a name="ln1354">	}</a>
+<a name="ln1355"> </a>
+<a name="ln1356">	while (portRef-&gt;read_count == 0) {</a>
+<a name="ln1357">		// We need to wait for a message to appear</a>
+<a name="ln1358">		if ((flags &amp; B_RELATIVE_TIMEOUT) != 0 &amp;&amp; timeout &lt;= 0)</a>
+<a name="ln1359">			return B_WOULD_BLOCK;</a>
+<a name="ln1360"> </a>
+<a name="ln1361">		ConditionVariableEntry entry;</a>
+<a name="ln1362">		portRef-&gt;read_condition.Add(&amp;entry);</a>
+<a name="ln1363"> </a>
+<a name="ln1364">		locker.Unlock();</a>
+<a name="ln1365"> </a>
+<a name="ln1366">		// block if no message, or, if B_TIMEOUT flag set, block with timeout</a>
+<a name="ln1367">		status_t status = entry.Wait(flags, timeout);</a>
+<a name="ln1368"> </a>
+<a name="ln1369">		if (status != B_OK) {</a>
+<a name="ln1370">			T(Info(portRef, 0, status));</a>
+<a name="ln1371">			return status;</a>
+<a name="ln1372">		}</a>
+<a name="ln1373"> </a>
+<a name="ln1374">		// re-lock</a>
+<a name="ln1375">		BReference&lt;Port&gt; newPortRef = get_locked_port(id);</a>
+<a name="ln1376">		if (newPortRef == NULL) {</a>
+<a name="ln1377">			T(Info(id, 0, 0, 0, B_BAD_PORT_ID));</a>
+<a name="ln1378">			return B_BAD_PORT_ID;</a>
+<a name="ln1379">		}</a>
+<a name="ln1380">		locker.SetTo(newPortRef-&gt;lock, true);</a>
+<a name="ln1381"> </a>
+<a name="ln1382">		if (newPortRef != portRef</a>
+<a name="ln1383">			|| (is_port_closed(portRef) &amp;&amp; portRef-&gt;messages.IsEmpty())) {</a>
+<a name="ln1384">			// the port is no longer there</a>
+<a name="ln1385">			T(Info(id, 0, 0, 0, B_BAD_PORT_ID));</a>
+<a name="ln1386">			return B_BAD_PORT_ID;</a>
+<a name="ln1387">		}</a>
+<a name="ln1388">	}</a>
+<a name="ln1389"> </a>
+<a name="ln1390">	// determine tail &amp; get the length of the message</a>
+<a name="ln1391">	port_message* message = portRef-&gt;messages.Head();</a>
+<a name="ln1392">	if (message == NULL) {</a>
+<a name="ln1393">		panic(&quot;port %&quot; B_PRId32 &quot;: no messages found\n&quot;, portRef-&gt;id);</a>
+<a name="ln1394">		return B_ERROR;</a>
+<a name="ln1395">	}</a>
+<a name="ln1396"> </a>
+<a name="ln1397">	info-&gt;size = message-&gt;size;</a>
+<a name="ln1398">	info-&gt;sender = message-&gt;sender;</a>
+<a name="ln1399">	info-&gt;sender_group = message-&gt;sender_group;</a>
+<a name="ln1400">	info-&gt;sender_team = message-&gt;sender_team;</a>
+<a name="ln1401"> </a>
+<a name="ln1402">	T(Info(portRef, message-&gt;code, B_OK));</a>
+<a name="ln1403"> </a>
+<a name="ln1404">	// notify next one, as we haven't read from the port</a>
+<a name="ln1405">	portRef-&gt;read_condition.NotifyOne();</a>
+<a name="ln1406"> </a>
+<a name="ln1407">	return B_OK;</a>
+<a name="ln1408">}</a>
+<a name="ln1409"> </a>
+<a name="ln1410"> </a>
+<a name="ln1411">ssize_t</a>
+<a name="ln1412">port_count(port_id id)</a>
+<a name="ln1413">{</a>
+<a name="ln1414">	if (!sPortsActive || id &lt; 0)</a>
+<a name="ln1415">		return B_BAD_PORT_ID;</a>
+<a name="ln1416"> </a>
+<a name="ln1417">	// get the port</a>
+<a name="ln1418">	BReference&lt;Port&gt; portRef = get_locked_port(id);</a>
+<a name="ln1419">	if (portRef == NULL) {</a>
+<a name="ln1420">		TRACE((&quot;port_count: invalid port_id %ld\n&quot;, id));</a>
+<a name="ln1421">		return B_BAD_PORT_ID;</a>
+<a name="ln1422">	}</a>
+<a name="ln1423">	MutexLocker locker(portRef-&gt;lock, true);</a>
+<a name="ln1424"> </a>
+<a name="ln1425">	// return count of messages</a>
+<a name="ln1426">	return portRef-&gt;read_count;</a>
+<a name="ln1427">}</a>
+<a name="ln1428"> </a>
+<a name="ln1429"> </a>
+<a name="ln1430">ssize_t</a>
+<a name="ln1431">read_port(port_id port, int32* msgCode, void* buffer, size_t bufferSize)</a>
+<a name="ln1432">{</a>
+<a name="ln1433">	return read_port_etc(port, msgCode, buffer, bufferSize, 0, 0);</a>
+<a name="ln1434">}</a>
+<a name="ln1435"> </a>
+<a name="ln1436"> </a>
+<a name="ln1437">ssize_t</a>
+<a name="ln1438">read_port_etc(port_id id, int32* _code, void* buffer, size_t bufferSize,</a>
+<a name="ln1439">	uint32 flags, bigtime_t timeout)</a>
+<a name="ln1440">{</a>
+<a name="ln1441">	if (!sPortsActive || id &lt; 0)</a>
+<a name="ln1442">		return B_BAD_PORT_ID;</a>
+<a name="ln1443">	if ((buffer == NULL &amp;&amp; bufferSize &gt; 0) || timeout &lt; 0)</a>
+<a name="ln1444">		return B_BAD_VALUE;</a>
+<a name="ln1445"> </a>
+<a name="ln1446">	bool userCopy = (flags &amp; PORT_FLAG_USE_USER_MEMCPY) != 0;</a>
+<a name="ln1447">	bool peekOnly = !userCopy &amp;&amp; (flags &amp; B_PEEK_PORT_MESSAGE) != 0;</a>
+<a name="ln1448">		// TODO: we could allow peeking for user apps now</a>
+<a name="ln1449"> </a>
+<a name="ln1450">	flags &amp;= B_CAN_INTERRUPT | B_KILL_CAN_INTERRUPT | B_RELATIVE_TIMEOUT</a>
+<a name="ln1451">		| B_ABSOLUTE_TIMEOUT;</a>
+<a name="ln1452"> </a>
+<a name="ln1453">	// get the port</a>
+<a name="ln1454">	BReference&lt;Port&gt; portRef = get_locked_port(id);</a>
+<a name="ln1455">	if (portRef == NULL)</a>
+<a name="ln1456">		return B_BAD_PORT_ID;</a>
+<a name="ln1457">	MutexLocker locker(portRef-&gt;lock, true);</a>
+<a name="ln1458"> </a>
+<a name="ln1459">	if (is_port_closed(portRef) &amp;&amp; portRef-&gt;messages.IsEmpty()) {</a>
+<a name="ln1460">		T(Read(portRef, 0, B_BAD_PORT_ID));</a>
+<a name="ln1461">		TRACE((&quot;read_port_etc(): closed port %ld\n&quot;, id));</a>
+<a name="ln1462">		return B_BAD_PORT_ID;</a>
+<a name="ln1463">	}</a>
+<a name="ln1464"> </a>
+<a name="ln1465">	while (portRef-&gt;read_count == 0) {</a>
+<a name="ln1466">		if ((flags &amp; B_RELATIVE_TIMEOUT) != 0 &amp;&amp; timeout &lt;= 0)</a>
+<a name="ln1467">			return B_WOULD_BLOCK;</a>
+<a name="ln1468"> </a>
+<a name="ln1469">		// We need to wait for a message to appear</a>
+<a name="ln1470">		ConditionVariableEntry entry;</a>
+<a name="ln1471">		portRef-&gt;read_condition.Add(&amp;entry);</a>
+<a name="ln1472"> </a>
+<a name="ln1473">		locker.Unlock();</a>
+<a name="ln1474"> </a>
+<a name="ln1475">		// block if no message, or, if B_TIMEOUT flag set, block with timeout</a>
+<a name="ln1476">		status_t status = entry.Wait(flags, timeout);</a>
+<a name="ln1477"> </a>
+<a name="ln1478">		// re-lock</a>
+<a name="ln1479">		BReference&lt;Port&gt; newPortRef = get_locked_port(id);</a>
+<a name="ln1480">		if (newPortRef == NULL) {</a>
+<a name="ln1481">			T(Read(id, 0, 0, 0, B_BAD_PORT_ID));</a>
+<a name="ln1482">			return B_BAD_PORT_ID;</a>
+<a name="ln1483">		}</a>
+<a name="ln1484">		locker.SetTo(newPortRef-&gt;lock, true);</a>
+<a name="ln1485"> </a>
+<a name="ln1486">		if (newPortRef != portRef</a>
+<a name="ln1487">			|| (is_port_closed(portRef) &amp;&amp; portRef-&gt;messages.IsEmpty())) {</a>
+<a name="ln1488">			// the port is no longer there</a>
+<a name="ln1489">			T(Read(id, 0, 0, 0, B_BAD_PORT_ID));</a>
+<a name="ln1490">			return B_BAD_PORT_ID;</a>
+<a name="ln1491">		}</a>
+<a name="ln1492"> </a>
+<a name="ln1493">		if (status != B_OK) {</a>
+<a name="ln1494">			T(Read(portRef, 0, status));</a>
+<a name="ln1495">			return status;</a>
+<a name="ln1496">		}</a>
+<a name="ln1497">	}</a>
+<a name="ln1498"> </a>
+<a name="ln1499">	// determine tail &amp; get the length of the message</a>
+<a name="ln1500">	port_message* message = portRef-&gt;messages.Head();</a>
+<a name="ln1501">	if (message == NULL) {</a>
+<a name="ln1502">		panic(&quot;port %&quot; B_PRId32 &quot;: no messages found\n&quot;, portRef-&gt;id);</a>
+<a name="ln1503">		return B_ERROR;</a>
+<a name="ln1504">	}</a>
+<a name="ln1505"> </a>
+<a name="ln1506">	if (peekOnly) {</a>
+<a name="ln1507">		size_t size = copy_port_message(message, _code, buffer, bufferSize,</a>
+<a name="ln1508">			userCopy);</a>
+<a name="ln1509"> </a>
+<a name="ln1510">		T(Read(portRef, message-&gt;code, size));</a>
+<a name="ln1511"> </a>
+<a name="ln1512">		portRef-&gt;read_condition.NotifyOne();</a>
+<a name="ln1513">			// we only peeked, but didn't grab the message</a>
+<a name="ln1514">		return size;</a>
+<a name="ln1515">	}</a>
+<a name="ln1516"> </a>
+<a name="ln1517">	portRef-&gt;messages.RemoveHead();</a>
+<a name="ln1518">	portRef-&gt;total_count++;</a>
+<a name="ln1519">	portRef-&gt;write_count++;</a>
+<a name="ln1520">	portRef-&gt;read_count--;</a>
+<a name="ln1521"> </a>
+<a name="ln1522">	notify_port_select_events(portRef, B_EVENT_WRITE);</a>
+<a name="ln1523">	portRef-&gt;write_condition.NotifyOne();</a>
+<a name="ln1524">		// make one spot in queue available again for write</a>
+<a name="ln1525"> </a>
+<a name="ln1526">	T(Read(portRef, message-&gt;code, std::min(bufferSize, message-&gt;size)));</a>
+<a name="ln1527"> </a>
+<a name="ln1528">	locker.Unlock();</a>
+<a name="ln1529"> </a>
+<a name="ln1530">	size_t size = copy_port_message(message, _code, buffer, bufferSize,</a>
+<a name="ln1531">		userCopy);</a>
+<a name="ln1532"> </a>
+<a name="ln1533">	put_port_message(message);</a>
+<a name="ln1534">	return size;</a>
+<a name="ln1535">}</a>
+<a name="ln1536"> </a>
+<a name="ln1537"> </a>
+<a name="ln1538">status_t</a>
+<a name="ln1539">write_port(port_id id, int32 msgCode, const void* buffer, size_t bufferSize)</a>
+<a name="ln1540">{</a>
+<a name="ln1541">	iovec vec = { (void*)buffer, bufferSize };</a>
+<a name="ln1542"> </a>
+<a name="ln1543">	return writev_port_etc(id, msgCode, &amp;vec, 1, bufferSize, 0, 0);</a>
+<a name="ln1544">}</a>
+<a name="ln1545"> </a>
+<a name="ln1546"> </a>
+<a name="ln1547">status_t</a>
+<a name="ln1548">write_port_etc(port_id id, int32 msgCode, const void* buffer,</a>
+<a name="ln1549">	size_t bufferSize, uint32 flags, bigtime_t timeout)</a>
+<a name="ln1550">{</a>
+<a name="ln1551">	iovec vec = { (void*)buffer, bufferSize };</a>
+<a name="ln1552"> </a>
+<a name="ln1553">	return writev_port_etc(id, msgCode, &amp;vec, 1, bufferSize, flags, timeout);</a>
+<a name="ln1554">}</a>
+<a name="ln1555"> </a>
+<a name="ln1556"> </a>
+<a name="ln1557">status_t</a>
+<a name="ln1558">writev_port_etc(port_id id, int32 msgCode, const iovec* msgVecs,</a>
+<a name="ln1559">	size_t vecCount, size_t bufferSize, uint32 flags, bigtime_t timeout)</a>
+<a name="ln1560">{</a>
+<a name="ln1561">	if (!sPortsActive || id &lt; 0)</a>
+<a name="ln1562">		return B_BAD_PORT_ID;</a>
+<a name="ln1563">	if (bufferSize &gt; PORT_MAX_MESSAGE_SIZE)</a>
+<a name="ln1564">		return B_BAD_VALUE;</a>
+<a name="ln1565"> </a>
+<a name="ln1566">	bool userCopy = (flags &amp; PORT_FLAG_USE_USER_MEMCPY) != 0;</a>
+<a name="ln1567"> </a>
+<a name="ln1568">	// mask irrelevant flags (for acquire_sem() usage)</a>
+<a name="ln1569">	flags &amp;= B_CAN_INTERRUPT | B_KILL_CAN_INTERRUPT | B_RELATIVE_TIMEOUT</a>
+<a name="ln1570">		| B_ABSOLUTE_TIMEOUT;</a>
+<a name="ln1571">	if ((flags &amp; B_RELATIVE_TIMEOUT) != 0</a>
+<a name="ln1572">		&amp;&amp; timeout != B_INFINITE_TIMEOUT &amp;&amp; timeout &gt; 0) {</a>
+<a name="ln1573">		// Make the timeout absolute, since we have more than one step where</a>
+<a name="ln1574">		// we might have to wait</a>
+<a name="ln1575">		flags = (flags &amp; ~B_RELATIVE_TIMEOUT) | B_ABSOLUTE_TIMEOUT;</a>
+<a name="ln1576">		timeout += system_time();</a>
+<a name="ln1577">	}</a>
+<a name="ln1578"> </a>
+<a name="ln1579">	status_t status;</a>
+<a name="ln1580">	port_message* message = NULL;</a>
+<a name="ln1581"> </a>
+<a name="ln1582">	// get the port</a>
+<a name="ln1583">	BReference&lt;Port&gt; portRef = get_locked_port(id);</a>
+<a name="ln1584">	if (portRef == NULL) {</a>
+<a name="ln1585">		TRACE((&quot;write_port_etc: invalid port_id %ld\n&quot;, id));</a>
+<a name="ln1586">		return B_BAD_PORT_ID;</a>
+<a name="ln1587">	}</a>
+<a name="ln1588">	MutexLocker locker(portRef-&gt;lock, true);</a>
+<a name="ln1589"> </a>
+<a name="ln1590">	if (is_port_closed(portRef)) {</a>
+<a name="ln1591">		TRACE((&quot;write_port_etc: port %ld closed\n&quot;, id));</a>
+<a name="ln1592">		return B_BAD_PORT_ID;</a>
+<a name="ln1593">	}</a>
+<a name="ln1594"> </a>
+<a name="ln1595">	if (portRef-&gt;write_count &lt;= 0) {</a>
+<a name="ln1596">		if ((flags &amp; B_RELATIVE_TIMEOUT) != 0 &amp;&amp; timeout &lt;= 0)</a>
+<a name="ln1597">			return B_WOULD_BLOCK;</a>
+<a name="ln1598"> </a>
+<a name="ln1599">		portRef-&gt;write_count--;</a>
+<a name="ln1600"> </a>
+<a name="ln1601">		// We need to block in order to wait for a free message slot</a>
+<a name="ln1602">		ConditionVariableEntry entry;</a>
+<a name="ln1603">		portRef-&gt;write_condition.Add(&amp;entry);</a>
+<a name="ln1604"> </a>
+<a name="ln1605">		locker.Unlock();</a>
+<a name="ln1606"> </a>
+<a name="ln1607">		status = entry.Wait(flags, timeout);</a>
+<a name="ln1608"> </a>
+<a name="ln1609">		// re-lock</a>
+<a name="ln1610">		BReference&lt;Port&gt; newPortRef = get_locked_port(id);</a>
+<a name="ln1611">		if (newPortRef == NULL) {</a>
+<a name="ln1612">			T(Write(id, 0, 0, 0, 0, B_BAD_PORT_ID));</a>
+<a name="ln1613">			return B_BAD_PORT_ID;</a>
+<a name="ln1614">		}</a>
+<a name="ln1615">		locker.SetTo(newPortRef-&gt;lock, true);</a>
+<a name="ln1616"> </a>
+<a name="ln1617">		if (newPortRef != portRef || is_port_closed(portRef)) {</a>
+<a name="ln1618">			// the port is no longer there</a>
+<a name="ln1619">			T(Write(id, 0, 0, 0, 0, B_BAD_PORT_ID));</a>
+<a name="ln1620">			return B_BAD_PORT_ID;</a>
+<a name="ln1621">		}</a>
+<a name="ln1622"> </a>
+<a name="ln1623">		if (status != B_OK)</a>
+<a name="ln1624">			goto error;</a>
+<a name="ln1625">	} else</a>
+<a name="ln1626">		portRef-&gt;write_count--;</a>
+<a name="ln1627"> </a>
+<a name="ln1628">	status = get_port_message(msgCode, bufferSize, flags, timeout,</a>
+<a name="ln1629">		&amp;message, *portRef);</a>
+<a name="ln1630">	if (status != B_OK) {</a>
+<a name="ln1631">		if (status == B_BAD_PORT_ID) {</a>
+<a name="ln1632">			// the port had to be unlocked and is now no longer there</a>
+<a name="ln1633">			T(Write(id, 0, 0, 0, 0, B_BAD_PORT_ID));</a>
+<a name="ln1634">			return B_BAD_PORT_ID;</a>
+<a name="ln1635">		}</a>
+<a name="ln1636"> </a>
+<a name="ln1637">		goto error;</a>
+<a name="ln1638">	}</a>
+<a name="ln1639"> </a>
+<a name="ln1640">	// sender credentials</a>
+<a name="ln1641">	message-&gt;sender = geteuid();</a>
+<a name="ln1642">	message-&gt;sender_group = getegid();</a>
+<a name="ln1643">	message-&gt;sender_team = team_get_current_team_id();</a>
+<a name="ln1644"> </a>
+<a name="ln1645">	if (bufferSize &gt; 0) {</a>
+<a name="ln1646">		size_t offset = 0;</a>
+<a name="ln1647">		for (uint32 i = 0; i &lt; vecCount; i++) {</a>
+<a name="ln1648">			size_t bytes = msgVecs[i].iov_len;</a>
+<a name="ln1649">			if (bytes &gt; bufferSize)</a>
+<a name="ln1650">				bytes = bufferSize;</a>
+<a name="ln1651"> </a>
+<a name="ln1652">			if (userCopy) {</a>
+<a name="ln1653">				status_t status = user_memcpy(message-&gt;buffer + offset,</a>
+<a name="ln1654">					msgVecs[i].iov_base, bytes);</a>
+<a name="ln1655">				if (status != B_OK) {</a>
+<a name="ln1656">					put_port_message(message);</a>
+<a name="ln1657">					goto error;</a>
+<a name="ln1658">				}</a>
+<a name="ln1659">			} else</a>
+<a name="ln1660">				memcpy(message-&gt;buffer + offset, msgVecs[i].iov_base, bytes);</a>
+<a name="ln1661"> </a>
+<a name="ln1662">			bufferSize -= bytes;</a>
+<a name="ln1663">			if (bufferSize == 0)</a>
+<a name="ln1664">				break;</a>
+<a name="ln1665"> </a>
+<a name="ln1666">			offset += bytes;</a>
+<a name="ln1667">		}</a>
+<a name="ln1668">	}</a>
+<a name="ln1669"> </a>
+<a name="ln1670">	portRef-&gt;messages.Add(message);</a>
+<a name="ln1671">	portRef-&gt;read_count++;</a>
+<a name="ln1672"> </a>
+<a name="ln1673">	T(Write(id, portRef-&gt;read_count, portRef-&gt;write_count, message-&gt;code,</a>
+<a name="ln1674">		message-&gt;size, B_OK));</a>
+<a name="ln1675"> </a>
+<a name="ln1676">	notify_port_select_events(portRef, B_EVENT_READ);</a>
+<a name="ln1677">	portRef-&gt;read_condition.NotifyOne();</a>
+<a name="ln1678">	return B_OK;</a>
+<a name="ln1679"> </a>
+<a name="ln1680">error:</a>
+<a name="ln1681">	// Give up our slot in the queue again, and let someone else</a>
+<a name="ln1682">	// try and fail</a>
+<a name="ln1683">	T(Write(id, portRef-&gt;read_count, portRef-&gt;write_count, 0, 0, status));</a>
+<a name="ln1684">	portRef-&gt;write_count++;</a>
+<a name="ln1685">	notify_port_select_events(portRef, B_EVENT_WRITE);</a>
+<a name="ln1686">	portRef-&gt;write_condition.NotifyOne();</a>
+<a name="ln1687"> </a>
+<a name="ln1688">	return status;</a>
+<a name="ln1689">}</a>
+<a name="ln1690"> </a>
+<a name="ln1691"> </a>
+<a name="ln1692">status_t</a>
+<a name="ln1693">set_port_owner(port_id id, team_id newTeamID)</a>
+<a name="ln1694">{</a>
+<a name="ln1695">	TRACE((&quot;set_port_owner(id = %ld, team = %ld)\n&quot;, id, newTeamID));</a>
+<a name="ln1696"> </a>
+<a name="ln1697">	if (id &lt; 0)</a>
+<a name="ln1698">		return B_BAD_PORT_ID;</a>
+<a name="ln1699"> </a>
+<a name="ln1700">	// get the new team</a>
+<a name="ln1701">	Team* team = Team::Get(newTeamID);</a>
+<a name="ln1702">	if (team == NULL)</a>
+<a name="ln1703">		return B_BAD_TEAM_ID;</a>
+<a name="ln1704">	BReference&lt;Team&gt; teamReference(team, true);</a>
+<a name="ln1705"> </a>
+<a name="ln1706">	// get the port</a>
+<a name="ln1707">	BReference&lt;Port&gt; portRef = get_locked_port(id);</a>
+<a name="ln1708">	if (portRef == NULL) {</a>
+<a name="ln1709">		TRACE((&quot;set_port_owner: invalid port_id %ld\n&quot;, id));</a>
+<a name="ln1710">		return B_BAD_PORT_ID;</a>
+<a name="ln1711">	}</a>
+<a name="ln1712">	MutexLocker locker(portRef-&gt;lock, true);</a>
+<a name="ln1713"> </a>
+<a name="ln1714">	// transfer ownership to other team</a>
+<a name="ln1715">	if (team-&gt;id != portRef-&gt;owner) {</a>
+<a name="ln1716">		uint8 firstLockIndex  = portRef-&gt;owner % kTeamListLockCount;</a>
+<a name="ln1717">		uint8 secondLockIndex = team-&gt;id % kTeamListLockCount;</a>
+<a name="ln1718"> </a>
+<a name="ln1719">		// Avoid deadlocks: always lock lower index first</a>
+<a name="ln1720">		if (secondLockIndex &lt; firstLockIndex) {</a>
+<a name="ln1721">			uint8 temp = secondLockIndex;</a>
+<a name="ln1722">			secondLockIndex = firstLockIndex;</a>
+<a name="ln1723">			firstLockIndex = temp;</a>
+<a name="ln1724">		}</a>
+<a name="ln1725"> </a>
+<a name="ln1726">		MutexLocker oldTeamPortsListLocker(sTeamListLock[firstLockIndex]);</a>
+<a name="ln1727">		MutexLocker newTeamPortsListLocker;</a>
+<a name="ln1728">		if (firstLockIndex != secondLockIndex) {</a>
+<a name="ln1729">			newTeamPortsListLocker.SetTo(sTeamListLock[secondLockIndex],</a>
+<a name="ln1730">					false);</a>
+<a name="ln1731">		}</a>
+<a name="ln1732"> </a>
+<a name="ln1733">		// Now that we have locked the team port lists, check the state again</a>
+<a name="ln1734">		if (portRef-&gt;state == Port::kActive) {</a>
+<a name="ln1735">			list_remove_link(&amp;portRef-&gt;team_link);</a>
+<a name="ln1736">			list_add_item(&amp;team-&gt;port_list, portRef.Get());</a>
+<a name="ln1737">			portRef-&gt;owner = team-&gt;id;</a>
+<a name="ln1738">		} else {</a>
+<a name="ln1739">			// Port was already deleted. We haven't changed anything yet so</a>
+<a name="ln1740">			// we can cancel the operation.</a>
+<a name="ln1741">			return B_BAD_PORT_ID;</a>
+<a name="ln1742">		}</a>
+<a name="ln1743">	}</a>
+<a name="ln1744"> </a>
+<a name="ln1745">	T(OwnerChange(portRef, team-&gt;id, B_OK));</a>
+<a name="ln1746">	return B_OK;</a>
+<a name="ln1747">}</a>
+<a name="ln1748"> </a>
+<a name="ln1749"> </a>
+<a name="ln1750">//	#pragma mark - syscalls</a>
+<a name="ln1751"> </a>
+<a name="ln1752"> </a>
+<a name="ln1753">port_id</a>
+<a name="ln1754">_user_create_port(int32 queueLength, const char *userName)</a>
+<a name="ln1755">{</a>
+<a name="ln1756">	char name[B_OS_NAME_LENGTH];</a>
+<a name="ln1757"> </a>
+<a name="ln1758">	if (userName == NULL)</a>
+<a name="ln1759">		return create_port(queueLength, NULL);</a>
+<a name="ln1760"> </a>
+<a name="ln1761">	if (!IS_USER_ADDRESS(userName)</a>
+<a name="ln1762">		|| user_strlcpy(name, userName, B_OS_NAME_LENGTH) &lt; B_OK)</a>
+<a name="ln1763">		return B_BAD_ADDRESS;</a>
+<a name="ln1764"> </a>
+<a name="ln1765">	return create_port(queueLength, name);</a>
+<a name="ln1766">}</a>
+<a name="ln1767"> </a>
+<a name="ln1768"> </a>
+<a name="ln1769">status_t</a>
+<a name="ln1770">_user_close_port(port_id id)</a>
+<a name="ln1771">{</a>
+<a name="ln1772">	return close_port(id);</a>
+<a name="ln1773">}</a>
+<a name="ln1774"> </a>
+<a name="ln1775"> </a>
+<a name="ln1776">status_t</a>
+<a name="ln1777">_user_delete_port(port_id id)</a>
+<a name="ln1778">{</a>
+<a name="ln1779">	return delete_port(id);</a>
+<a name="ln1780">}</a>
+<a name="ln1781"> </a>
+<a name="ln1782"> </a>
+<a name="ln1783">port_id</a>
+<a name="ln1784">_user_find_port(const char *userName)</a>
+<a name="ln1785">{</a>
+<a name="ln1786">	char name[B_OS_NAME_LENGTH];</a>
+<a name="ln1787"> </a>
+<a name="ln1788">	if (userName == NULL)</a>
+<a name="ln1789">		return B_BAD_VALUE;</a>
+<a name="ln1790">	if (!IS_USER_ADDRESS(userName)</a>
+<a name="ln1791">		|| user_strlcpy(name, userName, B_OS_NAME_LENGTH) &lt; B_OK)</a>
+<a name="ln1792">		return B_BAD_ADDRESS;</a>
+<a name="ln1793"> </a>
+<a name="ln1794">	return find_port(name);</a>
+<a name="ln1795">}</a>
+<a name="ln1796"> </a>
+<a name="ln1797"> </a>
+<a name="ln1798">status_t</a>
+<a name="ln1799">_user_get_port_info(port_id id, struct port_info *userInfo)</a>
+<a name="ln1800">{</a>
+<a name="ln1801">	struct port_info info;</a>
+<a name="ln1802">	status_t status;</a>
+<a name="ln1803"> </a>
+<a name="ln1804">	if (userInfo == NULL)</a>
+<a name="ln1805">		return B_BAD_VALUE;</a>
+<a name="ln1806">	if (!IS_USER_ADDRESS(userInfo))</a>
+<a name="ln1807">		return B_BAD_ADDRESS;</a>
+<a name="ln1808"> </a>
+<a name="ln1809">	status = get_port_info(id, &amp;info);</a>
+<a name="ln1810"> </a>
+<a name="ln1811">	// copy back to user space</a>
+<a name="ln1812">	if (status == B_OK</a>
+<a name="ln1813">		&amp;&amp; user_memcpy(userInfo, &amp;info, sizeof(struct port_info)) &lt; B_OK)</a>
+<a name="ln1814">		return B_BAD_ADDRESS;</a>
+<a name="ln1815"> </a>
+<a name="ln1816">	return status;</a>
+<a name="ln1817">}</a>
+<a name="ln1818"> </a>
+<a name="ln1819"> </a>
+<a name="ln1820">status_t</a>
+<a name="ln1821">_user_get_next_port_info(team_id team, int32 *userCookie,</a>
+<a name="ln1822">	struct port_info *userInfo)</a>
+<a name="ln1823">{</a>
+<a name="ln1824">	struct port_info info;</a>
+<a name="ln1825">	status_t status;</a>
+<a name="ln1826">	int32 cookie;</a>
+<a name="ln1827"> </a>
+<a name="ln1828">	if (userCookie == NULL || userInfo == NULL)</a>
+<a name="ln1829">		return B_BAD_VALUE;</a>
+<a name="ln1830">	if (!IS_USER_ADDRESS(userCookie) || !IS_USER_ADDRESS(userInfo)</a>
+<a name="ln1831">		|| user_memcpy(&amp;cookie, userCookie, sizeof(int32)) &lt; B_OK)</a>
+<a name="ln1832">		return B_BAD_ADDRESS;</a>
+<a name="ln1833"> </a>
+<a name="ln1834">	status = get_next_port_info(team, &amp;cookie, &amp;info);</a>
+<a name="ln1835"> </a>
+<a name="ln1836">	// copy back to user space</a>
+<a name="ln1837">	if (user_memcpy(userCookie, &amp;cookie, sizeof(int32)) &lt; B_OK</a>
+<a name="ln1838">		|| (status == B_OK &amp;&amp; user_memcpy(userInfo, &amp;info,</a>
+<a name="ln1839">				sizeof(struct port_info)) &lt; B_OK))</a>
+<a name="ln1840">		return B_BAD_ADDRESS;</a>
+<a name="ln1841"> </a>
+<a name="ln1842">	return status;</a>
+<a name="ln1843">}</a>
+<a name="ln1844"> </a>
+<a name="ln1845"> </a>
+<a name="ln1846">ssize_t</a>
+<a name="ln1847">_user_port_buffer_size_etc(port_id port, uint32 flags, bigtime_t timeout)</a>
+<a name="ln1848">{</a>
+<a name="ln1849">	syscall_restart_handle_timeout_pre(flags, timeout);</a>
+<a name="ln1850"> </a>
+<a name="ln1851">	status_t status = port_buffer_size_etc(port, flags | B_CAN_INTERRUPT,</a>
+<a name="ln1852">		timeout);</a>
+<a name="ln1853"> </a>
+<a name="ln1854">	return syscall_restart_handle_timeout_post(status, timeout);</a>
+<a name="ln1855">}</a>
+<a name="ln1856"> </a>
+<a name="ln1857"> </a>
+<a name="ln1858">ssize_t</a>
+<a name="ln1859">_user_port_count(port_id port)</a>
+<a name="ln1860">{</a>
+<a name="ln1861">	return port_count(port);</a>
+<a name="ln1862">}</a>
+<a name="ln1863"> </a>
+<a name="ln1864"> </a>
+<a name="ln1865">status_t</a>
+<a name="ln1866">_user_set_port_owner(port_id port, team_id team)</a>
+<a name="ln1867">{</a>
+<a name="ln1868">	return set_port_owner(port, team);</a>
+<a name="ln1869">}</a>
+<a name="ln1870"> </a>
+<a name="ln1871"> </a>
+<a name="ln1872">ssize_t</a>
+<a name="ln1873">_user_read_port_etc(port_id port, int32 *userCode, void *userBuffer,</a>
+<a name="ln1874">	size_t bufferSize, uint32 flags, bigtime_t timeout)</a>
+<a name="ln1875">{</a>
+<a name="ln1876">	int32 messageCode;</a>
+<a name="ln1877">	ssize_t	bytesRead;</a>
+<a name="ln1878"> </a>
+<a name="ln1879">	syscall_restart_handle_timeout_pre(flags, timeout);</a>
+<a name="ln1880"> </a>
+<a name="ln1881">	if (userBuffer == NULL &amp;&amp; bufferSize != 0)</a>
+<a name="ln1882">		return B_BAD_VALUE;</a>
+<a name="ln1883">	if ((userCode != NULL &amp;&amp; !IS_USER_ADDRESS(userCode))</a>
+<a name="ln1884">		|| (userBuffer != NULL &amp;&amp; !IS_USER_ADDRESS(userBuffer)))</a>
+<a name="ln1885">		return B_BAD_ADDRESS;</a>
+<a name="ln1886"> </a>
+<a name="ln1887">	bytesRead = read_port_etc(port, &amp;messageCode, userBuffer, bufferSize,</a>
+<a name="ln1888">		flags | PORT_FLAG_USE_USER_MEMCPY | B_CAN_INTERRUPT, timeout);</a>
+<a name="ln1889"> </a>
+<a name="ln1890">	if (bytesRead &gt;= 0 &amp;&amp; userCode != NULL</a>
+<a name="ln1891">		&amp;&amp; user_memcpy(userCode, &amp;messageCode, sizeof(int32)) &lt; B_OK)</a>
+<a name="ln1892">		return B_BAD_ADDRESS;</a>
+<a name="ln1893"> </a>
+<a name="ln1894">	return syscall_restart_handle_timeout_post(bytesRead, timeout);</a>
+<a name="ln1895">}</a>
+<a name="ln1896"> </a>
+<a name="ln1897"> </a>
+<a name="ln1898">status_t</a>
+<a name="ln1899">_user_write_port_etc(port_id port, int32 messageCode, const void *userBuffer,</a>
+<a name="ln1900">	size_t bufferSize, uint32 flags, bigtime_t timeout)</a>
+<a name="ln1901">{</a>
+<a name="ln1902">	iovec vec = { (void *)userBuffer, bufferSize };</a>
+<a name="ln1903"> </a>
+<a name="ln1904">	syscall_restart_handle_timeout_pre(flags, timeout);</a>
+<a name="ln1905"> </a>
+<a name="ln1906">	if (userBuffer == NULL &amp;&amp; bufferSize != 0)</a>
+<a name="ln1907">		return B_BAD_VALUE;</a>
+<a name="ln1908">	if (userBuffer != NULL &amp;&amp; !IS_USER_ADDRESS(userBuffer))</a>
+<a name="ln1909">		return B_BAD_ADDRESS;</a>
+<a name="ln1910"> </a>
+<a name="ln1911">	status_t status = writev_port_etc(port, messageCode, &amp;vec, 1, bufferSize,</a>
+<a name="ln1912">		flags | PORT_FLAG_USE_USER_MEMCPY | B_CAN_INTERRUPT, timeout);</a>
+<a name="ln1913"> </a>
+<a name="ln1914">	return syscall_restart_handle_timeout_post(status, timeout);</a>
+<a name="ln1915">}</a>
+<a name="ln1916"> </a>
+<a name="ln1917"> </a>
+<a name="ln1918">status_t</a>
+<a name="ln1919">_user_writev_port_etc(port_id port, int32 messageCode, const iovec *userVecs,</a>
+<a name="ln1920">	size_t vecCount, size_t bufferSize, uint32 flags, bigtime_t timeout)</a>
+<a name="ln1921">{</a>
+<a name="ln1922">	syscall_restart_handle_timeout_pre(flags, timeout);</a>
+<a name="ln1923"> </a>
+<a name="ln1924">	if (userVecs == NULL &amp;&amp; bufferSize != 0)</a>
+<a name="ln1925">		return B_BAD_VALUE;</a>
+<a name="ln1926">	if (userVecs != NULL &amp;&amp; !IS_USER_ADDRESS(userVecs))</a>
+<a name="ln1927">		return B_BAD_ADDRESS;</a>
+<a name="ln1928"> </a>
+<a name="ln1929">	iovec *vecs = NULL;</a>
+<a name="ln1930">	if (userVecs &amp;&amp; vecCount != 0) {</a>
+<a name="ln1931">		vecs = (iovec*)malloc(sizeof(iovec) * vecCount);</a>
+<a name="ln1932">		if (vecs == NULL)</a>
+<a name="ln1933">			return B_NO_MEMORY;</a>
+<a name="ln1934"> </a>
+<a name="ln1935">		if (user_memcpy(vecs, userVecs, sizeof(iovec) * vecCount) &lt; B_OK) {</a>
+<a name="ln1936">			free(vecs);</a>
+<a name="ln1937">			return B_BAD_ADDRESS;</a>
+<a name="ln1938">		}</a>
+<a name="ln1939">	}</a>
+<a name="ln1940"> </a>
+<a name="ln1941">	status_t status = writev_port_etc(port, messageCode, vecs, vecCount,</a>
+<a name="ln1942">		bufferSize, flags | PORT_FLAG_USE_USER_MEMCPY | B_CAN_INTERRUPT,</a>
+<a name="ln1943">		timeout);</a>
+<a name="ln1944"> </a>
+<a name="ln1945">	free(vecs);</a>
+<a name="ln1946">	return syscall_restart_handle_timeout_post(status, timeout);</a>
+<a name="ln1947">}</a>
+<a name="ln1948"> </a>
+<a name="ln1949"> </a>
+<a name="ln1950">status_t</a>
+<a name="ln1951">_user_get_port_message_info_etc(port_id port, port_message_info *userInfo,</a>
+<a name="ln1952">	size_t infoSize, uint32 flags, bigtime_t timeout)</a>
+<a name="ln1953">{</a>
+<a name="ln1954">	if (userInfo == NULL || infoSize != sizeof(port_message_info))</a>
+<a name="ln1955">		return B_BAD_VALUE;</a>
+<a name="ln1956"> </a>
+<a name="ln1957">	syscall_restart_handle_timeout_pre(flags, timeout);</a>
+<a name="ln1958"> </a>
+<a name="ln1959">	port_message_info info;</a>
+<a name="ln1960">	status_t error = _get_port_message_info_etc(port, &amp;info, sizeof(info),</a>
+<a name="ln1961">		flags | B_CAN_INTERRUPT, timeout);</a>
+<a name="ln1962"> </a>
+<a name="ln1963">	// copy info to userland</a>
+<a name="ln1964">	if (error == B_OK &amp;&amp; (!IS_USER_ADDRESS(userInfo)</a>
+<a name="ln1965">			|| user_memcpy(userInfo, &amp;info, sizeof(info)) != B_OK)) {</a>
+<a name="ln1966">		error = B_BAD_ADDRESS;</a>
+<a name="ln1967">	}</a>
+<a name="ln1968"> </a>
+<a name="ln1969">	return syscall_restart_handle_timeout_post(error, timeout);</a>
+<a name="ln1970">}</a>
+
+</code></pre>
+<div class="balloon" rel="925"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v522/" target="_blank">V522</a> Dereferencing of the null pointer 'port' might take place.</p></div>
+<div class="balloon" rel="135"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: team_link, hash_link, id, name_hash_link.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

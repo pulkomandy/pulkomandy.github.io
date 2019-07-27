@@ -1,0 +1,2025 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>ipv4.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2006-2010, Haiku, Inc. All Rights Reserved.</a>
+<a name="ln3"> * Distributed under the terms of the MIT License.</a>
+<a name="ln4"> *</a>
+<a name="ln5"> * Authors:</a>
+<a name="ln6"> *		Axel Dörfler, axeld@pinc-software.de</a>
+<a name="ln7"> */</a>
+<a name="ln8"> </a>
+<a name="ln9"> </a>
+<a name="ln10">#include &quot;ipv4.h&quot;</a>
+<a name="ln11">#include &quot;ipv4_address.h&quot;</a>
+<a name="ln12">#include &quot;multicast.h&quot;</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &lt;net_datalink.h&gt;</a>
+<a name="ln15">#include &lt;net_datalink_protocol.h&gt;</a>
+<a name="ln16">#include &lt;net_device.h&gt;</a>
+<a name="ln17">#include &lt;net_protocol.h&gt;</a>
+<a name="ln18">#include &lt;net_stack.h&gt;</a>
+<a name="ln19">#include &lt;NetBufferUtilities.h&gt;</a>
+<a name="ln20">#include &lt;ProtocolUtilities.h&gt;</a>
+<a name="ln21"> </a>
+<a name="ln22">#include &lt;KernelExport.h&gt;</a>
+<a name="ln23">#include &lt;util/AutoLock.h&gt;</a>
+<a name="ln24">#include &lt;util/list.h&gt;</a>
+<a name="ln25">#include &lt;util/DoublyLinkedList.h&gt;</a>
+<a name="ln26">#include &lt;util/MultiHashTable.h&gt;</a>
+<a name="ln27"> </a>
+<a name="ln28">#include &lt;netinet/in.h&gt;</a>
+<a name="ln29">#include &lt;netinet/ip.h&gt;</a>
+<a name="ln30">#include &lt;new&gt;</a>
+<a name="ln31">#include &lt;stdlib.h&gt;</a>
+<a name="ln32">#include &lt;stdio.h&gt;</a>
+<a name="ln33">#include &lt;string.h&gt;</a>
+<a name="ln34">#include &lt;utility&gt;</a>
+<a name="ln35"> </a>
+<a name="ln36"> </a>
+<a name="ln37">//#define TRACE_IPV4</a>
+<a name="ln38">#ifdef TRACE_IPV4</a>
+<a name="ln39">#	define TRACE(format, args...) \</a>
+<a name="ln40">		dprintf(&quot;IPv4 [%llu] &quot; format &quot;\n&quot;, system_time() , ##args)</a>
+<a name="ln41">#	define TRACE_SK(protocol, format, args...) \</a>
+<a name="ln42">		dprintf(&quot;IPv4 [%llu] %p &quot; format &quot;\n&quot;, system_time(), \</a>
+<a name="ln43">			protocol , ##args)</a>
+<a name="ln44">#	define TRACE_ONLY(x) x</a>
+<a name="ln45">#else</a>
+<a name="ln46">#	define TRACE(args...) ;</a>
+<a name="ln47">#	define TRACE_SK(args...) ;</a>
+<a name="ln48">#	define TRACE_ONLY(x)</a>
+<a name="ln49">#endif</a>
+<a name="ln50"> </a>
+<a name="ln51"> </a>
+<a name="ln52">#define MAX_HASH_FRAGMENTS 		64</a>
+<a name="ln53">	// slots in the fragment packet's hash</a>
+<a name="ln54">#define FRAGMENT_TIMEOUT		60000000LL</a>
+<a name="ln55">	// discard fragment after 60 seconds</a>
+<a name="ln56"> </a>
+<a name="ln57"> </a>
+<a name="ln58">typedef DoublyLinkedList&lt;struct net_buffer,</a>
+<a name="ln59">	DoublyLinkedListCLink&lt;struct net_buffer&gt; &gt; FragmentList;</a>
+<a name="ln60"> </a>
+<a name="ln61">typedef NetBufferField&lt;uint16, offsetof(ipv4_header, checksum)&gt; IPChecksumField;</a>
+<a name="ln62"> </a>
+<a name="ln63">struct ipv4_packet_key {</a>
+<a name="ln64">	in_addr_t	source;</a>
+<a name="ln65">	in_addr_t	destination;</a>
+<a name="ln66">	uint16		id;</a>
+<a name="ln67">	uint8		protocol;</a>
+<a name="ln68">};</a>
+<a name="ln69"> </a>
+<a name="ln70"> </a>
+<a name="ln71">class FragmentPacket {</a>
+<a name="ln72">public:</a>
+<a name="ln73">								FragmentPacket(const ipv4_packet_key&amp; key);</a>
+<a name="ln74">								~FragmentPacket();</a>
+<a name="ln75"> </a>
+<a name="ln76">			status_t			AddFragment(uint16 start, uint16 end,</a>
+<a name="ln77">									net_buffer* buffer, bool lastFragment);</a>
+<a name="ln78">			status_t			Reassemble(net_buffer* to);</a>
+<a name="ln79"> </a>
+<a name="ln80">			bool				IsComplete() const</a>
+<a name="ln81">									{ return fReceivedLastFragment</a>
+<a name="ln82">										&amp;&amp; fBytesLeft == 0; }</a>
+<a name="ln83"> </a>
+<a name="ln84">			const ipv4_packet_key&amp; Key() const { return fKey; }</a>
+<a name="ln85">			FragmentPacket*&amp;	HashTableLink() { return fNext; }</a>
+<a name="ln86"> </a>
+<a name="ln87">	static	void				StaleTimer(struct net_timer* timer, void* data);</a>
+<a name="ln88"> </a>
+<a name="ln89">private:</a>
+<a name="ln90">			FragmentPacket*		fNext;</a>
+<a name="ln91">			struct ipv4_packet_key fKey;</a>
+<a name="ln92">			uint32				fIndex;</a>
+<a name="ln93">			bool				fReceivedLastFragment;</a>
+<a name="ln94">			int32				fBytesLeft;</a>
+<a name="ln95">			FragmentList		fFragments;</a>
+<a name="ln96">			net_timer			fTimer;</a>
+<a name="ln97">};</a>
+<a name="ln98"> </a>
+<a name="ln99"> </a>
+<a name="ln100">struct FragmentHashDefinition {</a>
+<a name="ln101">	typedef ipv4_packet_key KeyType;</a>
+<a name="ln102">	typedef FragmentPacket ValueType;</a>
+<a name="ln103"> </a>
+<a name="ln104">	size_t HashKey(const KeyType&amp; key) const</a>
+<a name="ln105">	{</a>
+<a name="ln106">		return (key.source ^ key.destination ^ key.protocol ^ key.id);</a>
+<a name="ln107">	}</a>
+<a name="ln108"> </a>
+<a name="ln109">	size_t Hash(ValueType* value) const</a>
+<a name="ln110">	{</a>
+<a name="ln111">		return HashKey(value-&gt;Key());</a>
+<a name="ln112">	}</a>
+<a name="ln113"> </a>
+<a name="ln114">	bool Compare(const KeyType&amp; key, ValueType* value) const</a>
+<a name="ln115">	{</a>
+<a name="ln116">		const ipv4_packet_key&amp; packetKey = value-&gt;Key();</a>
+<a name="ln117"> </a>
+<a name="ln118">		return packetKey.id == key.id</a>
+<a name="ln119">			&amp;&amp; packetKey.source == key.source</a>
+<a name="ln120">			&amp;&amp; packetKey.destination == key.destination</a>
+<a name="ln121">			&amp;&amp; packetKey.protocol == key.protocol;</a>
+<a name="ln122">	}</a>
+<a name="ln123"> </a>
+<a name="ln124">	ValueType*&amp; GetLink(ValueType* value) const</a>
+<a name="ln125">	{</a>
+<a name="ln126">		return value-&gt;HashTableLink();</a>
+<a name="ln127">	}</a>
+<a name="ln128">};</a>
+<a name="ln129"> </a>
+<a name="ln130">typedef BOpenHashTable&lt;FragmentHashDefinition, false, true&gt; FragmentTable;</a>
+<a name="ln131"> </a>
+<a name="ln132"> </a>
+<a name="ln133">class RawSocket</a>
+<a name="ln134">	: public DoublyLinkedListLinkImpl&lt;RawSocket&gt;, public DatagramSocket&lt;&gt; {</a>
+<a name="ln135">public:</a>
+<a name="ln136">								RawSocket(net_socket* socket);</a>
+<a name="ln137">};</a>
+<a name="ln138"> </a>
+<a name="ln139">typedef DoublyLinkedList&lt;RawSocket&gt; RawSocketList;</a>
+<a name="ln140"> </a>
+<a name="ln141">typedef MulticastGroupInterface&lt;IPv4Multicast&gt; IPv4GroupInterface;</a>
+<a name="ln142">typedef MulticastFilter&lt;IPv4Multicast&gt; IPv4MulticastFilter;</a>
+<a name="ln143"> </a>
+<a name="ln144">struct MulticastStateHash {</a>
+<a name="ln145">	typedef std::pair&lt;const in_addr* , uint32&gt; KeyType;</a>
+<a name="ln146">	typedef IPv4GroupInterface ValueType;</a>
+<a name="ln147"> </a>
+<a name="ln148">	size_t HashKey(const KeyType &amp;key) const</a>
+<a name="ln149">		{ return key.first-&gt;s_addr ^ key.second; }</a>
+<a name="ln150">	size_t Hash(ValueType* value) const</a>
+<a name="ln151">		{ return HashKey(std::make_pair(&amp;value-&gt;Address(),</a>
+<a name="ln152">			value-&gt;Interface()-&gt;index)); }</a>
+<a name="ln153">	bool Compare(const KeyType &amp;key, ValueType* value) const</a>
+<a name="ln154">		{ return value-&gt;Interface()-&gt;index == key.second</a>
+<a name="ln155">			&amp;&amp; value-&gt;Address().s_addr == key.first-&gt;s_addr; }</a>
+<a name="ln156">	bool CompareValues(ValueType* value1, ValueType* value2) const</a>
+<a name="ln157">		{ return value1-&gt;Interface()-&gt;index == value2-&gt;Interface()-&gt;index</a>
+<a name="ln158">			&amp;&amp; value1-&gt;Address().s_addr == value2-&gt;Address().s_addr; }</a>
+<a name="ln159">	ValueType*&amp; GetLink(ValueType* value) const { return value-&gt;MulticastGroupsHashLink(); }</a>
+<a name="ln160">};</a>
+<a name="ln161"> </a>
+<a name="ln162"> </a>
+<a name="ln163">struct ipv4_protocol : net_protocol {</a>
+<a name="ln164">	ipv4_protocol()</a>
+<a name="ln165">		:</a>
+<a name="ln166">		raw(NULL),</a>
+<a name="ln167">		multicast_filter(this)</a>
+<a name="ln168">	{</a>
+<a name="ln169">	}</a>
+<a name="ln170"> </a>
+<a name="ln171">	~ipv4_protocol()</a>
+<a name="ln172">	{</a>
+<a name="ln173">		delete raw;</a>
+<a name="ln174">	}</a>
+<a name="ln175"> </a>
+<a name="ln176">	RawSocket*			raw;</a>
+<a name="ln177">	uint8				service_type;</a>
+<a name="ln178">	uint8				time_to_live;</a>
+<a name="ln179">	uint8				multicast_time_to_live;</a>
+<a name="ln180">	uint32				flags;</a>
+<a name="ln181">	struct sockaddr*	multicast_address; // for IP_MULTICAST_IF</a>
+<a name="ln182"> </a>
+<a name="ln183">	IPv4MulticastFilter	multicast_filter;</a>
+<a name="ln184">};</a>
+<a name="ln185"> </a>
+<a name="ln186">// protocol flags</a>
+<a name="ln187">#define IP_FLAG_HEADER_INCLUDED		0x01</a>
+<a name="ln188">#define IP_FLAG_RECEIVE_DEST_ADDR	0x02</a>
+<a name="ln189"> </a>
+<a name="ln190"> </a>
+<a name="ln191">static const int kDefaultTTL = 254;</a>
+<a name="ln192">static const int kDefaultMulticastTTL = 1;</a>
+<a name="ln193"> </a>
+<a name="ln194"> </a>
+<a name="ln195">extern net_protocol_module_info gIPv4Module;</a>
+<a name="ln196">	// we need this in ipv4_std_ops() for registering the AF_INET domain</a>
+<a name="ln197"> </a>
+<a name="ln198">net_stack_module_info* gStackModule;</a>
+<a name="ln199">net_buffer_module_info* gBufferModule;</a>
+<a name="ln200"> </a>
+<a name="ln201">static struct net_domain* sDomain;</a>
+<a name="ln202">static net_datalink_module_info* sDatalinkModule;</a>
+<a name="ln203">static net_socket_module_info* sSocketModule;</a>
+<a name="ln204">static int32 sPacketID;</a>
+<a name="ln205">static RawSocketList sRawSockets;</a>
+<a name="ln206">static mutex sRawSocketsLock;</a>
+<a name="ln207">static mutex sFragmentLock;</a>
+<a name="ln208">static FragmentTable sFragmentHash;</a>
+<a name="ln209">static mutex sMulticastGroupsLock;</a>
+<a name="ln210"> </a>
+<a name="ln211">typedef MultiHashTable&lt;MulticastStateHash&gt; MulticastState;</a>
+<a name="ln212">static MulticastState* sMulticastState;</a>
+<a name="ln213"> </a>
+<a name="ln214">static net_protocol_module_info* sReceivingProtocol[256];</a>
+<a name="ln215">static mutex sReceivingProtocolLock;</a>
+<a name="ln216"> </a>
+<a name="ln217"> </a>
+<a name="ln218">static const char*</a>
+<a name="ln219">print_address(const in_addr* address, char* buf, size_t bufLen)</a>
+<a name="ln220">{</a>
+<a name="ln221">	unsigned int addr = ntohl(address-&gt;s_addr);</a>
+<a name="ln222"> </a>
+<a name="ln223">	snprintf(buf, bufLen, &quot;%u.%u.%u.%u&quot;, (addr &gt;&gt; 24) &amp; 0xff,</a>
+<a name="ln224">		(addr &gt;&gt; 16) &amp; 0xff, (addr &gt;&gt; 8) &amp; 0xff, addr &amp; 0xff);</a>
+<a name="ln225"> </a>
+<a name="ln226">	return buf;</a>
+<a name="ln227">}</a>
+<a name="ln228"> </a>
+<a name="ln229"> </a>
+<a name="ln230">RawSocket::RawSocket(net_socket* socket)</a>
+<a name="ln231">	:</a>
+<a name="ln232">	DatagramSocket&lt;&gt;(&quot;ipv4 raw socket&quot;, socket)</a>
+<a name="ln233">{</a>
+<a name="ln234">}</a>
+<a name="ln235"> </a>
+<a name="ln236"> </a>
+<a name="ln237">//	#pragma mark -</a>
+<a name="ln238"> </a>
+<a name="ln239"> </a>
+<a name="ln240">FragmentPacket::FragmentPacket(const ipv4_packet_key&amp; key)</a>
+<a name="ln241">	:</a>
+<a name="ln242">	fKey(key),</a>
+<a name="ln243">	fIndex(0),</a>
+<a name="ln244">	fReceivedLastFragment(false),</a>
+<a name="ln245">	fBytesLeft(IP_MAXPACKET)</a>
+<a name="ln246">{</a>
+<a name="ln247">	gStackModule-&gt;init_timer(&amp;fTimer, FragmentPacket::StaleTimer, this);</a>
+<a name="ln248">}</a>
+<a name="ln249"> </a>
+<a name="ln250"> </a>
+<a name="ln251">FragmentPacket::~FragmentPacket()</a>
+<a name="ln252">{</a>
+<a name="ln253">	// cancel the kill timer</a>
+<a name="ln254">	gStackModule-&gt;set_timer(&amp;fTimer, -1);</a>
+<a name="ln255"> </a>
+<a name="ln256">	// delete all fragments</a>
+<a name="ln257">	net_buffer* buffer;</a>
+<a name="ln258">	while ((buffer = fFragments.RemoveHead()) != NULL) {</a>
+<a name="ln259">		gBufferModule-&gt;free(buffer);</a>
+<a name="ln260">	}</a>
+<a name="ln261">}</a>
+<a name="ln262"> </a>
+<a name="ln263"> </a>
+<a name="ln264">status_t</a>
+<a name="ln265">FragmentPacket::AddFragment(uint16 start, uint16 end, net_buffer* buffer,</a>
+<a name="ln266">	bool lastFragment)</a>
+<a name="ln267">{</a>
+<a name="ln268">	// restart the timer</a>
+<a name="ln269">	gStackModule-&gt;set_timer(&amp;fTimer, FRAGMENT_TIMEOUT);</a>
+<a name="ln270"> </a>
+<a name="ln271">	if (start &gt;= end) {</a>
+<a name="ln272">		// invalid fragment</a>
+<a name="ln273">		return B_BAD_DATA;</a>
+<a name="ln274">	}</a>
+<a name="ln275"> </a>
+<a name="ln276">	// Search for a position in the list to insert the fragment</a>
+<a name="ln277"> </a>
+<a name="ln278">	FragmentList::ReverseIterator iterator = fFragments.GetReverseIterator();</a>
+<a name="ln279">	net_buffer* previous = NULL;</a>
+<a name="ln280">	net_buffer* next = NULL;</a>
+<a name="ln281">	while ((previous = iterator.Next()) != NULL) {</a>
+<a name="ln282">		if (previous-&gt;fragment.start &lt;= start) {</a>
+<a name="ln283">			// The new fragment can be inserted after this one</a>
+<a name="ln284">			break;</a>
+<a name="ln285">		}</a>
+<a name="ln286"> </a>
+<a name="ln287">		next = previous;</a>
+<a name="ln288">	}</a>
+<a name="ln289"> </a>
+<a name="ln290">	// See if we already have the fragment's data</a>
+<a name="ln291"> </a>
+<a name="ln292">	if (previous != NULL &amp;&amp; previous-&gt;fragment.start &lt;= start</a>
+<a name="ln293">		&amp;&amp; previous-&gt;fragment.end &gt;= end) {</a>
+<a name="ln294">		// we do, so we can just drop this fragment</a>
+<a name="ln295">		gBufferModule-&gt;free(buffer);</a>
+<a name="ln296">		return B_OK;</a>
+<a name="ln297">	}</a>
+<a name="ln298"> </a>
+<a name="ln299">	fIndex = buffer-&gt;index;</a>
+<a name="ln300">		// adopt the buffer's device index</a>
+<a name="ln301"> </a>
+<a name="ln302">	TRACE(&quot;    previous: %p, next: %p&quot;, previous, next);</a>
+<a name="ln303"> </a>
+<a name="ln304">	// If we have parts of the data already, truncate as needed</a>
+<a name="ln305"> </a>
+<a name="ln306">	if (previous != NULL &amp;&amp; previous-&gt;fragment.end &gt; start) {</a>
+<a name="ln307">		TRACE(&quot;    remove header %d bytes&quot;, previous-&gt;fragment.end - start);</a>
+<a name="ln308">		gBufferModule-&gt;remove_header(buffer, previous-&gt;fragment.end - start);</a>
+<a name="ln309">		start = previous-&gt;fragment.end;</a>
+<a name="ln310">	}</a>
+<a name="ln311">	if (next != NULL &amp;&amp; next-&gt;fragment.start &lt; end) {</a>
+<a name="ln312">		TRACE(&quot;    remove trailer %d bytes&quot;, next-&gt;fragment.start - end);</a>
+<a name="ln313">		gBufferModule-&gt;remove_trailer(buffer, next-&gt;fragment.start - end);</a>
+<a name="ln314">		end = next-&gt;fragment.start;</a>
+<a name="ln315">	}</a>
+<a name="ln316"> </a>
+<a name="ln317">	// Now try if we can already merge the fragments together</a>
+<a name="ln318"> </a>
+<a name="ln319">	// We will always keep the last buffer received, so that we can still</a>
+<a name="ln320">	// report an error (in which case we're not responsible for freeing it)</a>
+<a name="ln321"> </a>
+<a name="ln322">	if (previous != NULL &amp;&amp; previous-&gt;fragment.end == start) {</a>
+<a name="ln323">		fFragments.Remove(previous);</a>
+<a name="ln324"> </a>
+<a name="ln325">		buffer-&gt;fragment.start = previous-&gt;fragment.start;</a>
+<a name="ln326">		buffer-&gt;fragment.end = end;</a>
+<a name="ln327"> </a>
+<a name="ln328">		status_t status = gBufferModule-&gt;merge(buffer, previous, false);</a>
+<a name="ln329">		TRACE(&quot;    merge previous: %s&quot;, strerror(status));</a>
+<a name="ln330">		if (status != B_OK) {</a>
+<a name="ln331">			fFragments.Insert(next, previous);</a>
+<a name="ln332">			return status;</a>
+<a name="ln333">		}</a>
+<a name="ln334"> </a>
+<a name="ln335">		fFragments.Insert(next, buffer);</a>
+<a name="ln336"> </a>
+<a name="ln337">		// cut down existing hole</a>
+<a name="ln338">		fBytesLeft -= end - start;</a>
+<a name="ln339"> </a>
+<a name="ln340">		if (lastFragment &amp;&amp; !fReceivedLastFragment) {</a>
+<a name="ln341">			fReceivedLastFragment = true;</a>
+<a name="ln342">			fBytesLeft -= IP_MAXPACKET - end;</a>
+<a name="ln343">		}</a>
+<a name="ln344"> </a>
+<a name="ln345">		TRACE(&quot;    hole length: %d&quot;, (int)fBytesLeft);</a>
+<a name="ln346"> </a>
+<a name="ln347">		return B_OK;</a>
+<a name="ln348">	} else if (next != NULL &amp;&amp; next-&gt;fragment.start == end) {</a>
+<a name="ln349">		net_buffer* afterNext = (net_buffer*)next-&gt;link.next;</a>
+<a name="ln350">		fFragments.Remove(next);</a>
+<a name="ln351"> </a>
+<a name="ln352">		buffer-&gt;fragment.start = start;</a>
+<a name="ln353">		buffer-&gt;fragment.end = next-&gt;fragment.end;</a>
+<a name="ln354"> </a>
+<a name="ln355">		status_t status = gBufferModule-&gt;merge(buffer, next, true);</a>
+<a name="ln356">		TRACE(&quot;    merge next: %s&quot;, strerror(status));</a>
+<a name="ln357">		if (status != B_OK) {</a>
+<a name="ln358">			// Insert &quot;next&quot; at its previous position</a>
+<a name="ln359">			fFragments.Insert(afterNext, next);</a>
+<a name="ln360">			return status;</a>
+<a name="ln361">		}</a>
+<a name="ln362"> </a>
+<a name="ln363">		fFragments.Insert(afterNext, buffer);</a>
+<a name="ln364"> </a>
+<a name="ln365">		// cut down existing hole</a>
+<a name="ln366">		fBytesLeft -= end - start;</a>
+<a name="ln367"> </a>
+<a name="ln368">		if (lastFragment &amp;&amp; !fReceivedLastFragment) {</a>
+<a name="ln369">			fReceivedLastFragment = true;</a>
+<a name="ln370">			fBytesLeft -= IP_MAXPACKET - end;</a>
+<a name="ln371">		}</a>
+<a name="ln372"> </a>
+<a name="ln373">		TRACE(&quot;    hole length: %d&quot;, (int)fBytesLeft);</a>
+<a name="ln374"> </a>
+<a name="ln375">		return B_OK;</a>
+<a name="ln376">	}</a>
+<a name="ln377"> </a>
+<a name="ln378">	// We couldn't merge the fragments, so we need to add it as is</a>
+<a name="ln379"> </a>
+<a name="ln380">	TRACE(&quot;    new fragment: %p, bytes %d-%d&quot;, buffer, start, end);</a>
+<a name="ln381"> </a>
+<a name="ln382">	buffer-&gt;fragment.start = start;</a>
+<a name="ln383">	buffer-&gt;fragment.end = end;</a>
+<a name="ln384">	fFragments.Insert(next, buffer);</a>
+<a name="ln385"> </a>
+<a name="ln386">	// update length of the hole, if any</a>
+<a name="ln387">	fBytesLeft -= end - start;</a>
+<a name="ln388"> </a>
+<a name="ln389">	if (lastFragment &amp;&amp; !fReceivedLastFragment) {</a>
+<a name="ln390">		fReceivedLastFragment = true;</a>
+<a name="ln391">		fBytesLeft -= IP_MAXPACKET - end;</a>
+<a name="ln392">	}</a>
+<a name="ln393"> </a>
+<a name="ln394">	TRACE(&quot;    hole length: %d&quot;, (int)fBytesLeft);</a>
+<a name="ln395"> </a>
+<a name="ln396">	return B_OK;</a>
+<a name="ln397">}</a>
+<a name="ln398"> </a>
+<a name="ln399"> </a>
+<a name="ln400">/*!	Reassembles the fragments to the specified buffer \a to.</a>
+<a name="ln401">	This buffer must have been added via AddFragment() before.</a>
+<a name="ln402">*/</a>
+<a name="ln403">status_t</a>
+<a name="ln404">FragmentPacket::Reassemble(net_buffer* to)</a>
+<a name="ln405">{</a>
+<a name="ln406">	if (!IsComplete())</a>
+<a name="ln407">		return B_ERROR;</a>
+<a name="ln408"> </a>
+<a name="ln409">	net_buffer* buffer = NULL;</a>
+<a name="ln410"> </a>
+<a name="ln411">	net_buffer* fragment;</a>
+<a name="ln412">	while ((fragment = fFragments.RemoveHead()) != NULL) {</a>
+<a name="ln413">		if (buffer != NULL) {</a>
+<a name="ln414">			status_t status;</a>
+<a name="ln415">			if (to == fragment) {</a>
+<a name="ln416">				status = gBufferModule-&gt;merge(fragment, buffer, false);</a>
+<a name="ln417">				buffer = fragment;</a>
+<a name="ln418">			} else</a>
+<a name="ln419">				status = gBufferModule-&gt;merge(buffer, fragment, true);</a>
+<a name="ln420">			if (status != B_OK)</a>
+<a name="ln421">				return status;</a>
+<a name="ln422">		} else</a>
+<a name="ln423">			buffer = fragment;</a>
+<a name="ln424">	}</a>
+<a name="ln425"> </a>
+<a name="ln426">	if (buffer != to)</a>
+<a name="ln427">		panic(&quot;ipv4 packet reassembly did not work correctly.&quot;);</a>
+<a name="ln428"> </a>
+<a name="ln429">	to-&gt;index = fIndex;</a>
+<a name="ln430">		// reset the buffer's device index</a>
+<a name="ln431"> </a>
+<a name="ln432">	return B_OK;</a>
+<a name="ln433">}</a>
+<a name="ln434"> </a>
+<a name="ln435"> </a>
+<a name="ln436">/*static*/ void</a>
+<a name="ln437">FragmentPacket::StaleTimer(struct net_timer* timer, void* data)</a>
+<a name="ln438">{</a>
+<a name="ln439">	FragmentPacket* packet = (FragmentPacket*)data;</a>
+<a name="ln440">	TRACE(&quot;Assembling FragmentPacket %p timed out!&quot;, packet);</a>
+<a name="ln441"> </a>
+<a name="ln442">	MutexLocker locker(&amp;sFragmentLock);</a>
+<a name="ln443">	sFragmentHash.Remove(packet);</a>
+<a name="ln444">	locker.Unlock();</a>
+<a name="ln445"> </a>
+<a name="ln446">	if (!packet-&gt;fFragments.IsEmpty()) {</a>
+<a name="ln447">		// Send error: fragment reassembly time exceeded</a>
+<a name="ln448">		sDomain-&gt;module-&gt;error_reply(NULL, packet-&gt;fFragments.First(),</a>
+<a name="ln449">			B_NET_ERROR_REASSEMBLY_TIME_EXCEEDED, NULL);</a>
+<a name="ln450">	}</a>
+<a name="ln451"> </a>
+<a name="ln452">	delete packet;</a>
+<a name="ln453">}</a>
+<a name="ln454"> </a>
+<a name="ln455"> </a>
+<a name="ln456">//	#pragma mark -</a>
+<a name="ln457"> </a>
+<a name="ln458"> </a>
+<a name="ln459">#ifdef TRACE_IPV4</a>
+<a name="ln460">static void</a>
+<a name="ln461">dump_ipv4_header(ipv4_header &amp;header)</a>
+<a name="ln462">{</a>
+<a name="ln463">	struct pretty_ipv4 {</a>
+<a name="ln464">	#if B_HOST_IS_LENDIAN == 1</a>
+<a name="ln465">		uint8 a;</a>
+<a name="ln466">		uint8 b;</a>
+<a name="ln467">		uint8 c;</a>
+<a name="ln468">		uint8 d;</a>
+<a name="ln469">	#else</a>
+<a name="ln470">		uint8 d;</a>
+<a name="ln471">		uint8 c;</a>
+<a name="ln472">		uint8 b;</a>
+<a name="ln473">		uint8 a;</a>
+<a name="ln474">	#endif</a>
+<a name="ln475">	};</a>
+<a name="ln476">	struct pretty_ipv4* src = (struct pretty_ipv4*)&amp;header.source;</a>
+<a name="ln477">	struct pretty_ipv4* dst = (struct pretty_ipv4*)&amp;header.destination;</a>
+<a name="ln478">	dprintf(&quot;  version: %d\n&quot;, header.version);</a>
+<a name="ln479">	dprintf(&quot;  header_length: 4 * %d\n&quot;, header.header_length);</a>
+<a name="ln480">	dprintf(&quot;  service_type: %d\n&quot;, header.service_type);</a>
+<a name="ln481">	dprintf(&quot;  total_length: %d\n&quot;, header.TotalLength());</a>
+<a name="ln482">	dprintf(&quot;  id: %d\n&quot;, ntohs(header.id));</a>
+<a name="ln483">	dprintf(&quot;  fragment_offset: %d (flags: %c%c%c)\n&quot;,</a>
+<a name="ln484">		header.FragmentOffset() &amp; IP_FRAGMENT_OFFSET_MASK,</a>
+<a name="ln485">		(header.FragmentOffset() &amp; IP_RESERVED_FLAG) ? 'r' : '-',</a>
+<a name="ln486">		(header.FragmentOffset() &amp; IP_DONT_FRAGMENT) ? 'd' : '-',</a>
+<a name="ln487">		(header.FragmentOffset() &amp; IP_MORE_FRAGMENTS) ? 'm' : '-');</a>
+<a name="ln488">	dprintf(&quot;  time_to_live: %d\n&quot;, header.time_to_live);</a>
+<a name="ln489">	dprintf(&quot;  protocol: %d\n&quot;, header.protocol);</a>
+<a name="ln490">	dprintf(&quot;  checksum: %d\n&quot;, ntohs(header.checksum));</a>
+<a name="ln491">	dprintf(&quot;  source: %d.%d.%d.%d\n&quot;, src-&gt;a, src-&gt;b, src-&gt;c, src-&gt;d);</a>
+<a name="ln492">	dprintf(&quot;  destination: %d.%d.%d.%d\n&quot;, dst-&gt;a, dst-&gt;b, dst-&gt;c, dst-&gt;d);</a>
+<a name="ln493">}</a>
+<a name="ln494">#endif	// TRACE_IPV4</a>
+<a name="ln495"> </a>
+<a name="ln496"> </a>
+<a name="ln497">static int</a>
+<a name="ln498">dump_ipv4_multicast(int argc, char** argv)</a>
+<a name="ln499">{</a>
+<a name="ln500">	MulticastState::Iterator groupIterator = sMulticastState-&gt;GetIterator();</a>
+<a name="ln501"> </a>
+<a name="ln502">	while (groupIterator.HasNext()) {</a>
+<a name="ln503">		IPv4GroupInterface* state = groupIterator.Next();</a>
+<a name="ln504"> </a>
+<a name="ln505">		char addressBuffer[64];</a>
+<a name="ln506"> </a>
+<a name="ln507">		kprintf(&quot;%p: group &lt;%s, %s, %s {&quot;, state, state-&gt;Interface()-&gt;name,</a>
+<a name="ln508">			print_address(&amp;state-&gt;Address(), addressBuffer,</a>
+<a name="ln509">			sizeof(addressBuffer)),</a>
+<a name="ln510">			state-&gt;Mode() == IPv4GroupInterface::kExclude</a>
+<a name="ln511">				? &quot;Exclude&quot; : &quot;Include&quot;);</a>
+<a name="ln512"> </a>
+<a name="ln513">		int count = 0;</a>
+<a name="ln514">		IPv4GroupInterface::AddressSet::Iterator addressIterator</a>
+<a name="ln515">			= state-&gt;Sources().GetIterator();</a>
+<a name="ln516">		while (addressIterator.HasNext()) {</a>
+<a name="ln517">			kprintf(&quot;%s%s&quot;, count &gt; 0 ? &quot;, &quot; : &quot;&quot;,</a>
+<a name="ln518">				print_address(&amp;addressIterator.Next(),</a>
+<a name="ln519">				addressBuffer, sizeof(addressBuffer)));</a>
+<a name="ln520">			count++;</a>
+<a name="ln521">		}</a>
+<a name="ln522"> </a>
+<a name="ln523">		kprintf(&quot;}&gt; sock %p\n&quot;, state-&gt;Parent()-&gt;Socket());</a>
+<a name="ln524">	}</a>
+<a name="ln525"> </a>
+<a name="ln526">	return 0;</a>
+<a name="ln527">}</a>
+<a name="ln528"> </a>
+<a name="ln529"> </a>
+<a name="ln530">/*!	Attempts to re-assemble fragmented packets.</a>
+<a name="ln531">	\return B_OK if everything went well; if it could reassemble the packet, \a _buffer</a>
+<a name="ln532">		will point to its buffer, otherwise, it will be \c NULL.</a>
+<a name="ln533">	\return various error codes if something went wrong (mostly B_NO_MEMORY)</a>
+<a name="ln534">*/</a>
+<a name="ln535">static status_t</a>
+<a name="ln536">reassemble_fragments(const ipv4_header &amp;header, net_buffer** _buffer)</a>
+<a name="ln537">{</a>
+<a name="ln538">	net_buffer* buffer = *_buffer;</a>
+<a name="ln539">	status_t status;</a>
+<a name="ln540"> </a>
+<a name="ln541">	struct ipv4_packet_key key;</a>
+<a name="ln542">	key.source = (in_addr_t)header.source;</a>
+<a name="ln543">	key.destination = (in_addr_t)header.destination;</a>
+<a name="ln544">	key.id = header.id;</a>
+<a name="ln545">	key.protocol = header.protocol;</a>
+<a name="ln546"> </a>
+<a name="ln547">	// TODO: Make locking finer grained.</a>
+<a name="ln548">	MutexLocker locker(&amp;sFragmentLock);</a>
+<a name="ln549"> </a>
+<a name="ln550">	FragmentPacket* packet = sFragmentHash.Lookup(key);</a>
+<a name="ln551">	if (packet == NULL) {</a>
+<a name="ln552">		// New fragment packet</a>
+<a name="ln553">		packet = new (std::nothrow) FragmentPacket(key);</a>
+<a name="ln554">		if (packet == NULL)</a>
+<a name="ln555">			return B_NO_MEMORY;</a>
+<a name="ln556"> </a>
+<a name="ln557">		// add packet to hash</a>
+<a name="ln558">		status = sFragmentHash.Insert(packet);</a>
+<a name="ln559">		if (status != B_OK) {</a>
+<a name="ln560">			delete packet;</a>
+<a name="ln561">			return status;</a>
+<a name="ln562">		}</a>
+<a name="ln563">	}</a>
+<a name="ln564"> </a>
+<a name="ln565">	uint16 fragmentOffset = header.FragmentOffset();</a>
+<a name="ln566">	uint16 start = (fragmentOffset &amp; IP_FRAGMENT_OFFSET_MASK) &lt;&lt; 3;</a>
+<a name="ln567">	uint16 end = start + header.TotalLength() - header.HeaderLength();</a>
+<a name="ln568">	bool lastFragment = (fragmentOffset &amp; IP_MORE_FRAGMENTS) == 0;</a>
+<a name="ln569"> </a>
+<a name="ln570">	TRACE(&quot;   Received IPv4 %sfragment of size %d, offset %d.&quot;,</a>
+<a name="ln571">		lastFragment ? &quot;last &quot;: &quot;&quot;, end - start, start);</a>
+<a name="ln572"> </a>
+<a name="ln573">	// Remove header unless this is the first fragment</a>
+<a name="ln574">	if (start != 0)</a>
+<a name="ln575">		gBufferModule-&gt;remove_header(buffer, header.HeaderLength());</a>
+<a name="ln576"> </a>
+<a name="ln577">	status = packet-&gt;AddFragment(start, end, buffer, lastFragment);</a>
+<a name="ln578">	if (status != B_OK)</a>
+<a name="ln579">		return status;</a>
+<a name="ln580"> </a>
+<a name="ln581">	if (packet-&gt;IsComplete()) {</a>
+<a name="ln582">		sFragmentHash.Remove(packet);</a>
+<a name="ln583">			// no matter if reassembling succeeds, we won't need this packet</a>
+<a name="ln584">			// anymore</a>
+<a name="ln585"> </a>
+<a name="ln586">		status = packet-&gt;Reassemble(buffer);</a>
+<a name="ln587">		delete packet;</a>
+<a name="ln588"> </a>
+<a name="ln589">		// _buffer does not change</a>
+<a name="ln590">		return status;</a>
+<a name="ln591">	}</a>
+<a name="ln592"> </a>
+<a name="ln593">	// This indicates that the packet is not yet complete</a>
+<a name="ln594">	*_buffer = NULL;</a>
+<a name="ln595">	return B_OK;</a>
+<a name="ln596">}</a>
+<a name="ln597"> </a>
+<a name="ln598"> </a>
+<a name="ln599">/*!	Fragments the incoming buffer and send all fragments via the specified</a>
+<a name="ln600">	\a route.</a>
+<a name="ln601">*/</a>
+<a name="ln602">static status_t</a>
+<a name="ln603">send_fragments(ipv4_protocol* protocol, struct net_route* route,</a>
+<a name="ln604">	net_buffer* buffer, uint32 mtu)</a>
+<a name="ln605">{</a>
+<a name="ln606">	TRACE_SK(protocol, &quot;SendFragments(%lu bytes, mtu %lu)&quot;, buffer-&gt;size, mtu);</a>
+<a name="ln607"> </a>
+<a name="ln608">	NetBufferHeaderReader&lt;ipv4_header&gt; originalHeader(buffer);</a>
+<a name="ln609">	if (originalHeader.Status() != B_OK)</a>
+<a name="ln610">		return originalHeader.Status();</a>
+<a name="ln611"> </a>
+<a name="ln612">	uint16 headerLength = originalHeader-&gt;HeaderLength();</a>
+<a name="ln613">	uint32 bytesLeft = buffer-&gt;size - headerLength;</a>
+<a name="ln614">	uint32 fragmentOffset = 0;</a>
+<a name="ln615">	status_t status = B_OK;</a>
+<a name="ln616"> </a>
+<a name="ln617">	net_buffer* headerBuffer = gBufferModule-&gt;split(buffer, headerLength);</a>
+<a name="ln618">	if (headerBuffer == NULL)</a>
+<a name="ln619">		return B_NO_MEMORY;</a>
+<a name="ln620"> </a>
+<a name="ln621">	// TODO: we need to make sure ipv4_header is contiguous or</a>
+<a name="ln622">	// use another construct.</a>
+<a name="ln623">	NetBufferHeaderReader&lt;ipv4_header&gt; bufferHeader(headerBuffer);</a>
+<a name="ln624">	ipv4_header* header = &amp;bufferHeader.Data();</a>
+<a name="ln625"> </a>
+<a name="ln626">	// Adapt MTU to be a multiple of 8 (fragment offsets can only be specified</a>
+<a name="ln627">	// this way)</a>
+<a name="ln628">	mtu -= headerLength;</a>
+<a name="ln629">	mtu &amp;= ~7;</a>
+<a name="ln630">	TRACE(&quot;  adjusted MTU to %ld, bytesLeft %ld&quot;, mtu, bytesLeft);</a>
+<a name="ln631"> </a>
+<a name="ln632">	while (bytesLeft &gt; 0) {</a>
+<a name="ln633">		uint32 fragmentLength = min_c(bytesLeft, mtu);</a>
+<a name="ln634">		bytesLeft -= fragmentLength;</a>
+<a name="ln635">		bool lastFragment = bytesLeft == 0;</a>
+<a name="ln636"> </a>
+<a name="ln637">		header-&gt;total_length = htons(fragmentLength + headerLength);</a>
+<a name="ln638">		header-&gt;fragment_offset = htons((lastFragment ? 0 : IP_MORE_FRAGMENTS)</a>
+<a name="ln639">			| (fragmentOffset &gt;&gt; 3));</a>
+<a name="ln640">		header-&gt;checksum = 0;</a>
+<a name="ln641">		header-&gt;checksum = gStackModule-&gt;checksum((uint8*)header,</a>
+<a name="ln642">			headerLength);</a>
+<a name="ln643">			// TODO: compute the checksum only for those parts that changed?</a>
+<a name="ln644"> </a>
+<a name="ln645">		TRACE(&quot;  send fragment of %ld bytes (%ld bytes left)&quot;, fragmentLength,</a>
+<a name="ln646">			bytesLeft);</a>
+<a name="ln647"> </a>
+<a name="ln648">		net_buffer* fragmentBuffer;</a>
+<a name="ln649">		if (!lastFragment) {</a>
+<a name="ln650">			fragmentBuffer = gBufferModule-&gt;split(buffer, fragmentLength);</a>
+<a name="ln651">			fragmentOffset += fragmentLength;</a>
+<a name="ln652">		} else</a>
+<a name="ln653">			fragmentBuffer = buffer;</a>
+<a name="ln654"> </a>
+<a name="ln655">		if (fragmentBuffer == NULL) {</a>
+<a name="ln656">			status = B_NO_MEMORY;</a>
+<a name="ln657">			break;</a>
+<a name="ln658">		}</a>
+<a name="ln659"> </a>
+<a name="ln660">		// copy header to fragment</a>
+<a name="ln661">		status = gBufferModule-&gt;prepend(fragmentBuffer, header, headerLength);</a>
+<a name="ln662"> </a>
+<a name="ln663">		// send fragment</a>
+<a name="ln664">		if (status == B_OK)</a>
+<a name="ln665">			status = sDatalinkModule-&gt;send_routed_data(route, fragmentBuffer);</a>
+<a name="ln666"> </a>
+<a name="ln667">		if (lastFragment) {</a>
+<a name="ln668">			// we don't own the last buffer, so we don't have to free it</a>
+<a name="ln669">			break;</a>
+<a name="ln670">		}</a>
+<a name="ln671"> </a>
+<a name="ln672">		if (status != B_OK) {</a>
+<a name="ln673">			gBufferModule-&gt;free(fragmentBuffer);</a>
+<a name="ln674">			break;</a>
+<a name="ln675">		}</a>
+<a name="ln676">	}</a>
+<a name="ln677"> </a>
+<a name="ln678">	gBufferModule-&gt;free(headerBuffer);</a>
+<a name="ln679">	return status;</a>
+<a name="ln680">}</a>
+<a name="ln681"> </a>
+<a name="ln682"> </a>
+<a name="ln683">/*!	Delivers the provided \a buffer to all listeners of this multicast group.</a>
+<a name="ln684">	Does not take over ownership of the buffer.</a>
+<a name="ln685">*/</a>
+<a name="ln686">static bool</a>
+<a name="ln687">deliver_multicast(net_protocol_module_info* module, net_buffer* buffer,</a>
+<a name="ln688">	bool deliverToRaw)</a>
+<a name="ln689">{</a>
+<a name="ln690">	if (module-&gt;deliver_data == NULL)</a>
+<a name="ln691">		return false;</a>
+<a name="ln692"> </a>
+<a name="ln693">	// TODO: fix multicast!</a>
+<a name="ln694">	return false;</a>
+<a name="ln695">	MutexLocker _(sMulticastGroupsLock);</a>
+<a name="ln696"> </a>
+<a name="ln697">	sockaddr_in* multicastAddr = (sockaddr_in*)buffer-&gt;destination;</a>
+<a name="ln698"> </a>
+<a name="ln699">	MulticastState::ValueIterator it = sMulticastState-&gt;Lookup(std::make_pair(</a>
+<a name="ln700">		&amp;multicastAddr-&gt;sin_addr, buffer-&gt;interface_address-&gt;interface-&gt;index));</a>
+<a name="ln701"> </a>
+<a name="ln702">	size_t count = 0;</a>
+<a name="ln703"> </a>
+<a name="ln704">	while (it.HasNext()) {</a>
+<a name="ln705">		IPv4GroupInterface* state = it.Next();</a>
+<a name="ln706"> </a>
+<a name="ln707">		ipv4_protocol* ipProtocol = state-&gt;Parent()-&gt;Socket();</a>
+<a name="ln708">		if (deliverToRaw &amp;&amp; (ipProtocol-&gt;raw == NULL</a>
+<a name="ln709">				|| ipProtocol-&gt;socket-&gt;protocol != buffer-&gt;protocol))</a>
+<a name="ln710">			continue;</a>
+<a name="ln711"> </a>
+<a name="ln712">		if (state-&gt;FilterAccepts(buffer)) {</a>
+<a name="ln713">			net_protocol* protocol = ipProtocol;</a>
+<a name="ln714">			if (protocol-&gt;module != module) {</a>
+<a name="ln715">				// as multicast filters are installed with an IPv4 protocol</a>
+<a name="ln716">				// reference, we need to go and find the appropriate instance</a>
+<a name="ln717">				// related to the 'receiving protocol' with module 'module'.</a>
+<a name="ln718">				net_protocol* protocol = ipProtocol-&gt;socket-&gt;first_protocol;</a>
+<a name="ln719"> </a>
+<a name="ln720">				while (protocol != NULL &amp;&amp; protocol-&gt;module != module)</a>
+<a name="ln721">					protocol = protocol-&gt;next;</a>
+<a name="ln722">			}</a>
+<a name="ln723"> </a>
+<a name="ln724">			if (protocol != NULL) {</a>
+<a name="ln725">				module-&gt;deliver_data(protocol, buffer);</a>
+<a name="ln726">				count++;</a>
+<a name="ln727">			}</a>
+<a name="ln728">		}</a>
+<a name="ln729">	}</a>
+<a name="ln730"> </a>
+<a name="ln731">	return count &gt; 0;</a>
+<a name="ln732">}</a>
+<a name="ln733"> </a>
+<a name="ln734"> </a>
+<a name="ln735">/*!	Delivers the buffer to all listening raw sockets without taking ownership of</a>
+<a name="ln736">	the provided \a buffer.</a>
+<a name="ln737">	Returns \c true if there was any receiver, \c false if not.</a>
+<a name="ln738">*/</a>
+<a name="ln739">static bool</a>
+<a name="ln740">raw_receive_data(net_buffer* buffer)</a>
+<a name="ln741">{</a>
+<a name="ln742">	MutexLocker locker(sRawSocketsLock);</a>
+<a name="ln743"> </a>
+<a name="ln744">	if (sRawSockets.IsEmpty())</a>
+<a name="ln745">		return false;</a>
+<a name="ln746"> </a>
+<a name="ln747">	TRACE(&quot;RawReceiveData(%i)&quot;, buffer-&gt;protocol);</a>
+<a name="ln748"> </a>
+<a name="ln749">	if ((buffer-&gt;flags &amp; MSG_MCAST) != 0) {</a>
+<a name="ln750">		// we need to call deliver_multicast here separately as</a>
+<a name="ln751">		// buffer still has the IP header, and it won't in the</a>
+<a name="ln752">		// next call. This isn't very optimized but works for now.</a>
+<a name="ln753">		// A better solution would be to hold separate hash tables</a>
+<a name="ln754">		// and lists for RAW and non-RAW sockets.</a>
+<a name="ln755">		return deliver_multicast(&amp;gIPv4Module, buffer, true);</a>
+<a name="ln756">	}</a>
+<a name="ln757"> </a>
+<a name="ln758">	RawSocketList::Iterator iterator = sRawSockets.GetIterator();</a>
+<a name="ln759">	size_t count = 0;</a>
+<a name="ln760"> </a>
+<a name="ln761">	while (iterator.HasNext()) {</a>
+<a name="ln762">		RawSocket* raw = iterator.Next();</a>
+<a name="ln763"> </a>
+<a name="ln764">		if (raw-&gt;Socket()-&gt;protocol == buffer-&gt;protocol) {</a>
+<a name="ln765">			raw-&gt;EnqueueClone(buffer);</a>
+<a name="ln766">			count++;</a>
+<a name="ln767">		}</a>
+<a name="ln768">	}</a>
+<a name="ln769"> </a>
+<a name="ln770">	return count &gt; 0;</a>
+<a name="ln771">}</a>
+<a name="ln772"> </a>
+<a name="ln773"> </a>
+<a name="ln774">static inline sockaddr*</a>
+<a name="ln775">fill_sockaddr_in(sockaddr_in* target, in_addr_t address)</a>
+<a name="ln776">{</a>
+<a name="ln777">	target-&gt;sin_family = AF_INET;</a>
+<a name="ln778">	target-&gt;sin_len = sizeof(sockaddr_in);</a>
+<a name="ln779">	target-&gt;sin_port = 0;</a>
+<a name="ln780">	target-&gt;sin_addr.s_addr = address;</a>
+<a name="ln781">	return (sockaddr*)target;</a>
+<a name="ln782">}</a>
+<a name="ln783"> </a>
+<a name="ln784"> </a>
+<a name="ln785">static status_t</a>
+<a name="ln786">get_int_option(void* target, size_t length, int value)</a>
+<a name="ln787">{</a>
+<a name="ln788">	if (length != sizeof(int))</a>
+<a name="ln789">		return B_BAD_VALUE;</a>
+<a name="ln790"> </a>
+<a name="ln791">	return user_memcpy(target, &amp;value, sizeof(int));</a>
+<a name="ln792">}</a>
+<a name="ln793"> </a>
+<a name="ln794"> </a>
+<a name="ln795">template&lt;typename Type&gt; static status_t</a>
+<a name="ln796">set_int_option(Type &amp;target, const void* _value, size_t length)</a>
+<a name="ln797">{</a>
+<a name="ln798">	int value;</a>
+<a name="ln799"> </a>
+<a name="ln800">	if (length != sizeof(int))</a>
+<a name="ln801">		return B_BAD_VALUE;</a>
+<a name="ln802"> </a>
+<a name="ln803">	if (user_memcpy(&amp;value, _value, sizeof(int)) != B_OK)</a>
+<a name="ln804">		return B_BAD_ADDRESS;</a>
+<a name="ln805"> </a>
+<a name="ln806">	target = value;</a>
+<a name="ln807">	return B_OK;</a>
+<a name="ln808">}</a>
+<a name="ln809"> </a>
+<a name="ln810"> </a>
+<a name="ln811">static net_protocol_module_info*</a>
+<a name="ln812">receiving_protocol(uint8 protocol)</a>
+<a name="ln813">{</a>
+<a name="ln814">	net_protocol_module_info* module = sReceivingProtocol[protocol];</a>
+<a name="ln815">	if (module != NULL)</a>
+<a name="ln816">		return module;</a>
+<a name="ln817"> </a>
+<a name="ln818">	MutexLocker locker(sReceivingProtocolLock);</a>
+<a name="ln819"> </a>
+<a name="ln820">	module = sReceivingProtocol[protocol];</a>
+<a name="ln821">	if (module != NULL)</a>
+<a name="ln822">		return module;</a>
+<a name="ln823"> </a>
+<a name="ln824">	if (gStackModule-&gt;get_domain_receiving_protocol(sDomain, protocol,</a>
+<a name="ln825">			&amp;module) == B_OK)</a>
+<a name="ln826">		sReceivingProtocol[protocol] = module;</a>
+<a name="ln827"> </a>
+<a name="ln828">	return module;</a>
+<a name="ln829">}</a>
+<a name="ln830"> </a>
+<a name="ln831"> </a>
+<a name="ln832">// #pragma mark - multicast</a>
+<a name="ln833"> </a>
+<a name="ln834"> </a>
+<a name="ln835">status_t</a>
+<a name="ln836">IPv4Multicast::JoinGroup(IPv4GroupInterface* state)</a>
+<a name="ln837">{</a>
+<a name="ln838">	MutexLocker _(sMulticastGroupsLock);</a>
+<a name="ln839"> </a>
+<a name="ln840">	sockaddr_in groupAddr;</a>
+<a name="ln841">	status_t status = sDatalinkModule-&gt;join_multicast(state-&gt;Interface(),</a>
+<a name="ln842">		sDomain, fill_sockaddr_in(&amp;groupAddr, state-&gt;Address().s_addr));</a>
+<a name="ln843">	if (status != B_OK)</a>
+<a name="ln844">		return status;</a>
+<a name="ln845"> </a>
+<a name="ln846">	sMulticastState-&gt;Insert(state);</a>
+<a name="ln847">	return B_OK;</a>
+<a name="ln848">}</a>
+<a name="ln849"> </a>
+<a name="ln850"> </a>
+<a name="ln851">status_t</a>
+<a name="ln852">IPv4Multicast::LeaveGroup(IPv4GroupInterface* state)</a>
+<a name="ln853">{</a>
+<a name="ln854">	MutexLocker _(sMulticastGroupsLock);</a>
+<a name="ln855"> </a>
+<a name="ln856">	sMulticastState-&gt;Remove(state);</a>
+<a name="ln857"> </a>
+<a name="ln858">	sockaddr_in groupAddr;</a>
+<a name="ln859">	return sDatalinkModule-&gt;leave_multicast(state-&gt;Interface(), sDomain,</a>
+<a name="ln860">		fill_sockaddr_in(&amp;groupAddr, state-&gt;Address().s_addr));</a>
+<a name="ln861">}</a>
+<a name="ln862"> </a>
+<a name="ln863"> </a>
+<a name="ln864">static status_t</a>
+<a name="ln865">ipv4_delta_group(IPv4GroupInterface* group, int option,</a>
+<a name="ln866">	net_interface* interface, const in_addr* sourceAddr)</a>
+<a name="ln867">{</a>
+<a name="ln868">	switch (option) {</a>
+<a name="ln869">		case IP_ADD_MEMBERSHIP:</a>
+<a name="ln870">			return group-&gt;Add();</a>
+<a name="ln871">		case IP_DROP_MEMBERSHIP:</a>
+<a name="ln872">			return group-&gt;Drop();</a>
+<a name="ln873">		case IP_BLOCK_SOURCE:</a>
+<a name="ln874">			return group-&gt;BlockSource(*sourceAddr);</a>
+<a name="ln875">		case IP_UNBLOCK_SOURCE:</a>
+<a name="ln876">			return group-&gt;UnblockSource(*sourceAddr);</a>
+<a name="ln877">		case IP_ADD_SOURCE_MEMBERSHIP:</a>
+<a name="ln878">			return group-&gt;AddSSM(*sourceAddr);</a>
+<a name="ln879">		case IP_DROP_SOURCE_MEMBERSHIP:</a>
+<a name="ln880">			return group-&gt;DropSSM(*sourceAddr);</a>
+<a name="ln881">	}</a>
+<a name="ln882"> </a>
+<a name="ln883">	return B_ERROR;</a>
+<a name="ln884">}</a>
+<a name="ln885"> </a>
+<a name="ln886"> </a>
+<a name="ln887">static status_t</a>
+<a name="ln888">ipv4_delta_membership(ipv4_protocol* protocol, int option,</a>
+<a name="ln889">	net_interface* interface, const in_addr* groupAddr,</a>
+<a name="ln890">	const in_addr* sourceAddr)</a>
+<a name="ln891">{</a>
+<a name="ln892">	IPv4MulticastFilter&amp; filter = protocol-&gt;multicast_filter;</a>
+<a name="ln893">	IPv4GroupInterface* state = NULL;</a>
+<a name="ln894">	status_t status = B_OK;</a>
+<a name="ln895"> </a>
+<a name="ln896">	switch (option) {</a>
+<a name="ln897">		case IP_ADD_MEMBERSHIP:</a>
+<a name="ln898">		case IP_ADD_SOURCE_MEMBERSHIP:</a>
+<a name="ln899">			status = filter.GetState(*groupAddr, interface, state, true);</a>
+<a name="ln900">			break;</a>
+<a name="ln901"> </a>
+<a name="ln902">		case IP_DROP_MEMBERSHIP:</a>
+<a name="ln903">		case IP_BLOCK_SOURCE:</a>
+<a name="ln904">		case IP_UNBLOCK_SOURCE:</a>
+<a name="ln905">		case IP_DROP_SOURCE_MEMBERSHIP:</a>
+<a name="ln906">			filter.GetState(*groupAddr, interface, state, false);</a>
+<a name="ln907">			if (state == NULL) {</a>
+<a name="ln908">				if (option == IP_DROP_MEMBERSHIP</a>
+<a name="ln909">					|| option == IP_DROP_SOURCE_MEMBERSHIP)</a>
+<a name="ln910">					return EADDRNOTAVAIL;</a>
+<a name="ln911"> </a>
+<a name="ln912">				return B_BAD_VALUE;</a>
+<a name="ln913">			}</a>
+<a name="ln914">			break;</a>
+<a name="ln915">	}</a>
+<a name="ln916"> </a>
+<a name="ln917">	if (status != B_OK)</a>
+<a name="ln918">		return status;</a>
+<a name="ln919"> </a>
+<a name="ln920">	status = ipv4_delta_group(state, option, interface, sourceAddr);</a>
+<a name="ln921">	filter.ReturnState(state);</a>
+<a name="ln922">	return status;</a>
+<a name="ln923">}</a>
+<a name="ln924"> </a>
+<a name="ln925"> </a>
+<a name="ln926">static int</a>
+<a name="ln927">generic_to_ipv4(int option)</a>
+<a name="ln928">{</a>
+<a name="ln929">	switch (option) {</a>
+<a name="ln930">		case MCAST_JOIN_GROUP:</a>
+<a name="ln931">			return IP_ADD_MEMBERSHIP;</a>
+<a name="ln932">		case MCAST_JOIN_SOURCE_GROUP:</a>
+<a name="ln933">			return IP_ADD_SOURCE_MEMBERSHIP;</a>
+<a name="ln934">		case MCAST_LEAVE_GROUP:</a>
+<a name="ln935">			return IP_DROP_MEMBERSHIP;</a>
+<a name="ln936">		case MCAST_BLOCK_SOURCE:</a>
+<a name="ln937">			return IP_BLOCK_SOURCE;</a>
+<a name="ln938">		case MCAST_UNBLOCK_SOURCE:</a>
+<a name="ln939">			return IP_UNBLOCK_SOURCE;</a>
+<a name="ln940">		case MCAST_LEAVE_SOURCE_GROUP:</a>
+<a name="ln941">			return IP_DROP_SOURCE_MEMBERSHIP;</a>
+<a name="ln942">	}</a>
+<a name="ln943"> </a>
+<a name="ln944">	return -1;</a>
+<a name="ln945">}</a>
+<a name="ln946"> </a>
+<a name="ln947"> </a>
+<a name="ln948">static net_interface*</a>
+<a name="ln949">get_multicast_interface(ipv4_protocol* protocol, const in_addr* address)</a>
+<a name="ln950">{</a>
+<a name="ln951">	// TODO: this is broken and leaks references</a>
+<a name="ln952">	sockaddr_in groupAddr;</a>
+<a name="ln953">	net_route* route = sDatalinkModule-&gt;get_route(sDomain,</a>
+<a name="ln954">		fill_sockaddr_in(&amp;groupAddr, address ? address-&gt;s_addr : INADDR_ANY));</a>
+<a name="ln955">	if (route == NULL)</a>
+<a name="ln956">		return NULL;</a>
+<a name="ln957"> </a>
+<a name="ln958">	return route-&gt;interface_address-&gt;interface;</a>
+<a name="ln959">}</a>
+<a name="ln960"> </a>
+<a name="ln961"> </a>
+<a name="ln962">static status_t</a>
+<a name="ln963">ipv4_delta_membership(ipv4_protocol* protocol, int option,</a>
+<a name="ln964">	in_addr* interfaceAddr, in_addr* groupAddr, in_addr* sourceAddr)</a>
+<a name="ln965">{</a>
+<a name="ln966">	net_interface* interface = NULL;</a>
+<a name="ln967"> </a>
+<a name="ln968">	if (interfaceAddr-&gt;s_addr == INADDR_ANY) {</a>
+<a name="ln969">		interface = get_multicast_interface(protocol, groupAddr);</a>
+<a name="ln970">	} else {</a>
+<a name="ln971">		sockaddr_in address;</a>
+<a name="ln972">		interface = sDatalinkModule-&gt;get_interface_with_address(</a>
+<a name="ln973">			fill_sockaddr_in(&amp;address, interfaceAddr-&gt;s_addr));</a>
+<a name="ln974">	}</a>
+<a name="ln975"> </a>
+<a name="ln976">	if (interface == NULL)</a>
+<a name="ln977">		return B_DEVICE_NOT_FOUND;</a>
+<a name="ln978"> </a>
+<a name="ln979">	return ipv4_delta_membership(protocol, option, interface,</a>
+<a name="ln980">		groupAddr, sourceAddr);</a>
+<a name="ln981">}</a>
+<a name="ln982"> </a>
+<a name="ln983"> </a>
+<a name="ln984">static status_t</a>
+<a name="ln985">ipv4_generic_delta_membership(ipv4_protocol* protocol, int option,</a>
+<a name="ln986">	uint32 index, const sockaddr_storage* _groupAddr,</a>
+<a name="ln987">	const sockaddr_storage* _sourceAddr)</a>
+<a name="ln988">{</a>
+<a name="ln989">	if (_groupAddr-&gt;ss_family != AF_INET</a>
+<a name="ln990">		|| (_sourceAddr != NULL &amp;&amp; _sourceAddr-&gt;ss_family != AF_INET))</a>
+<a name="ln991">		return B_BAD_VALUE;</a>
+<a name="ln992"> </a>
+<a name="ln993">	const in_addr* groupAddr = &amp;((const sockaddr_in*)_groupAddr)-&gt;sin_addr;</a>
+<a name="ln994"> </a>
+<a name="ln995">	// TODO: this is broken and leaks references</a>
+<a name="ln996">	net_interface* interface;</a>
+<a name="ln997">	if (index == 0)</a>
+<a name="ln998">		interface = get_multicast_interface(protocol, groupAddr);</a>
+<a name="ln999">	else</a>
+<a name="ln1000">		interface = sDatalinkModule-&gt;get_interface(sDomain, index);</a>
+<a name="ln1001"> </a>
+<a name="ln1002">	if (interface == NULL)</a>
+<a name="ln1003">		return B_DEVICE_NOT_FOUND;</a>
+<a name="ln1004"> </a>
+<a name="ln1005">	const in_addr* sourceAddr = NULL;</a>
+<a name="ln1006">	if (_sourceAddr != NULL)</a>
+<a name="ln1007">		sourceAddr = &amp;((const sockaddr_in*)_sourceAddr)-&gt;sin_addr;</a>
+<a name="ln1008"> </a>
+<a name="ln1009">	return ipv4_delta_membership(protocol, generic_to_ipv4(option), interface,</a>
+<a name="ln1010">		groupAddr, sourceAddr);</a>
+<a name="ln1011">}</a>
+<a name="ln1012"> </a>
+<a name="ln1013"> </a>
+<a name="ln1014">//	#pragma mark - module interface</a>
+<a name="ln1015"> </a>
+<a name="ln1016"> </a>
+<a name="ln1017">net_protocol*</a>
+<a name="ln1018">ipv4_init_protocol(net_socket* socket)</a>
+<a name="ln1019">{</a>
+<a name="ln1020">	ipv4_protocol* protocol = new (std::nothrow) ipv4_protocol();</a>
+<a name="ln1021">	if (protocol == NULL)</a>
+<a name="ln1022">		return NULL;</a>
+<a name="ln1023"> </a>
+<a name="ln1024">	protocol-&gt;raw = NULL;</a>
+<a name="ln1025">	protocol-&gt;service_type = 0;</a>
+<a name="ln1026">	protocol-&gt;time_to_live = kDefaultTTL;</a>
+<a name="ln1027">	protocol-&gt;multicast_time_to_live = kDefaultMulticastTTL;</a>
+<a name="ln1028">	protocol-&gt;flags = 0;</a>
+<a name="ln1029">	protocol-&gt;multicast_address = NULL;</a>
+<a name="ln1030">	return protocol;</a>
+<a name="ln1031">}</a>
+<a name="ln1032"> </a>
+<a name="ln1033"> </a>
+<a name="ln1034">status_t</a>
+<a name="ln1035">ipv4_uninit_protocol(net_protocol* _protocol)</a>
+<a name="ln1036">{</a>
+<a name="ln1037">	ipv4_protocol* protocol = (ipv4_protocol*)_protocol;</a>
+<a name="ln1038"> </a>
+<a name="ln1039">	delete protocol;</a>
+<a name="ln1040"> </a>
+<a name="ln1041">	return B_OK;</a>
+<a name="ln1042">}</a>
+<a name="ln1043"> </a>
+<a name="ln1044"> </a>
+<a name="ln1045">/*!	Since open() is only called on the top level protocol, when we get here</a>
+<a name="ln1046">	it means we are on a SOCK_RAW socket.</a>
+<a name="ln1047">*/</a>
+<a name="ln1048">status_t</a>
+<a name="ln1049">ipv4_open(net_protocol* _protocol)</a>
+<a name="ln1050">{</a>
+<a name="ln1051">	ipv4_protocol* protocol = (ipv4_protocol*)_protocol;</a>
+<a name="ln1052"> </a>
+<a name="ln1053">	// Only root may open raw sockets</a>
+<a name="ln1054">	if (geteuid() != 0)</a>
+<a name="ln1055">		return B_NOT_ALLOWED;</a>
+<a name="ln1056"> </a>
+<a name="ln1057">	RawSocket* raw = new (std::nothrow) RawSocket(protocol-&gt;socket);</a>
+<a name="ln1058">	if (raw == NULL)</a>
+<a name="ln1059">		return B_NO_MEMORY;</a>
+<a name="ln1060"> </a>
+<a name="ln1061">	status_t status = raw-&gt;InitCheck();</a>
+<a name="ln1062">	if (status != B_OK) {</a>
+<a name="ln1063">		delete raw;</a>
+<a name="ln1064">		return status;</a>
+<a name="ln1065">	}</a>
+<a name="ln1066"> </a>
+<a name="ln1067">	TRACE_SK(protocol, &quot;Open()&quot;);</a>
+<a name="ln1068"> </a>
+<a name="ln1069">	protocol-&gt;raw = raw;</a>
+<a name="ln1070"> </a>
+<a name="ln1071">	MutexLocker locker(sRawSocketsLock);</a>
+<a name="ln1072">	sRawSockets.Add(raw);</a>
+<a name="ln1073">	return B_OK;</a>
+<a name="ln1074">}</a>
+<a name="ln1075"> </a>
+<a name="ln1076"> </a>
+<a name="ln1077">status_t</a>
+<a name="ln1078">ipv4_close(net_protocol* _protocol)</a>
+<a name="ln1079">{</a>
+<a name="ln1080">	ipv4_protocol* protocol = (ipv4_protocol*)_protocol;</a>
+<a name="ln1081">	RawSocket* raw = protocol-&gt;raw;</a>
+<a name="ln1082">	if (raw == NULL)</a>
+<a name="ln1083">		return B_ERROR;</a>
+<a name="ln1084"> </a>
+<a name="ln1085">	TRACE_SK(protocol, &quot;Close()&quot;);</a>
+<a name="ln1086"> </a>
+<a name="ln1087">	MutexLocker locker(sRawSocketsLock);</a>
+<a name="ln1088">	sRawSockets.Remove(raw);</a>
+<a name="ln1089">	delete raw;</a>
+<a name="ln1090">	protocol-&gt;raw = NULL;</a>
+<a name="ln1091"> </a>
+<a name="ln1092">	return B_OK;</a>
+<a name="ln1093">}</a>
+<a name="ln1094"> </a>
+<a name="ln1095"> </a>
+<a name="ln1096">status_t</a>
+<a name="ln1097">ipv4_free(net_protocol* protocol)</a>
+<a name="ln1098">{</a>
+<a name="ln1099">	return B_OK;</a>
+<a name="ln1100">}</a>
+<a name="ln1101"> </a>
+<a name="ln1102"> </a>
+<a name="ln1103">status_t</a>
+<a name="ln1104">ipv4_connect(net_protocol* protocol, const struct sockaddr* address)</a>
+<a name="ln1105">{</a>
+<a name="ln1106">	return B_ERROR;</a>
+<a name="ln1107">}</a>
+<a name="ln1108"> </a>
+<a name="ln1109"> </a>
+<a name="ln1110">status_t</a>
+<a name="ln1111">ipv4_accept(net_protocol* protocol, struct net_socket** _acceptedSocket)</a>
+<a name="ln1112">{</a>
+<a name="ln1113">	return B_NOT_SUPPORTED;</a>
+<a name="ln1114">}</a>
+<a name="ln1115"> </a>
+<a name="ln1116"> </a>
+<a name="ln1117">status_t</a>
+<a name="ln1118">ipv4_control(net_protocol* _protocol, int level, int option, void* value,</a>
+<a name="ln1119">	size_t* _length)</a>
+<a name="ln1120">{</a>
+<a name="ln1121">	if ((level &amp; LEVEL_MASK) != IPPROTO_IP)</a>
+<a name="ln1122">		return sDatalinkModule-&gt;control(sDomain, option, value, _length);</a>
+<a name="ln1123"> </a>
+<a name="ln1124">	return B_BAD_VALUE;</a>
+<a name="ln1125">}</a>
+<a name="ln1126"> </a>
+<a name="ln1127"> </a>
+<a name="ln1128">status_t</a>
+<a name="ln1129">ipv4_getsockopt(net_protocol* _protocol, int level, int option, void* value,</a>
+<a name="ln1130">	int* _length)</a>
+<a name="ln1131">{</a>
+<a name="ln1132">	ipv4_protocol* protocol = (ipv4_protocol*)_protocol;</a>
+<a name="ln1133"> </a>
+<a name="ln1134">	if (level == IPPROTO_IP) {</a>
+<a name="ln1135">		if (option == IP_HDRINCL) {</a>
+<a name="ln1136">			return get_int_option(value, *_length,</a>
+<a name="ln1137">				(protocol-&gt;flags &amp; IP_FLAG_HEADER_INCLUDED) != 0);</a>
+<a name="ln1138">		}</a>
+<a name="ln1139">		if (option == IP_RECVDSTADDR) {</a>
+<a name="ln1140">			return get_int_option(value, *_length,</a>
+<a name="ln1141">				(protocol-&gt;flags &amp; IP_FLAG_RECEIVE_DEST_ADDR) != 0);</a>
+<a name="ln1142">		}</a>
+<a name="ln1143">		if (option == IP_TTL)</a>
+<a name="ln1144">			return get_int_option(value, *_length, protocol-&gt;time_to_live);</a>
+<a name="ln1145">		if (option == IP_TOS)</a>
+<a name="ln1146">			return get_int_option(value, *_length, protocol-&gt;service_type);</a>
+<a name="ln1147">		if (option == IP_MULTICAST_TTL) {</a>
+<a name="ln1148">			return get_int_option(value, *_length,</a>
+<a name="ln1149">				protocol-&gt;multicast_time_to_live);</a>
+<a name="ln1150">		}</a>
+<a name="ln1151">		if (option == IP_ADD_MEMBERSHIP</a>
+<a name="ln1152">			|| option == IP_DROP_MEMBERSHIP</a>
+<a name="ln1153">			|| option == IP_BLOCK_SOURCE</a>
+<a name="ln1154">			|| option == IP_UNBLOCK_SOURCE</a>
+<a name="ln1155">			|| option == IP_ADD_SOURCE_MEMBERSHIP</a>
+<a name="ln1156">			|| option == IP_DROP_SOURCE_MEMBERSHIP</a>
+<a name="ln1157">			|| option == MCAST_JOIN_GROUP</a>
+<a name="ln1158">			|| option == MCAST_LEAVE_GROUP</a>
+<a name="ln1159">			|| option == MCAST_BLOCK_SOURCE</a>
+<a name="ln1160">			|| option == MCAST_UNBLOCK_SOURCE</a>
+<a name="ln1161">			|| option == MCAST_JOIN_SOURCE_GROUP</a>
+<a name="ln1162">			|| option == MCAST_LEAVE_SOURCE_GROUP) {</a>
+<a name="ln1163">			// RFC 3678, Section 4.1:</a>
+<a name="ln1164">			// ``An error of EOPNOTSUPP is returned if these options are</a>
+<a name="ln1165">			// used with getsockopt().''</a>
+<a name="ln1166">			return B_NOT_SUPPORTED;</a>
+<a name="ln1167">		}</a>
+<a name="ln1168"> </a>
+<a name="ln1169">		dprintf(&quot;IPv4::getsockopt(): get unknown option: %d\n&quot;, option);</a>
+<a name="ln1170">		return ENOPROTOOPT;</a>
+<a name="ln1171">	}</a>
+<a name="ln1172"> </a>
+<a name="ln1173">	return sSocketModule-&gt;get_option(protocol-&gt;socket, level, option, value,</a>
+<a name="ln1174">		_length);</a>
+<a name="ln1175">}</a>
+<a name="ln1176"> </a>
+<a name="ln1177"> </a>
+<a name="ln1178">status_t</a>
+<a name="ln1179">ipv4_setsockopt(net_protocol* _protocol, int level, int option,</a>
+<a name="ln1180">	const void* value, int length)</a>
+<a name="ln1181">{</a>
+<a name="ln1182">	ipv4_protocol* protocol = (ipv4_protocol*)_protocol;</a>
+<a name="ln1183"> </a>
+<a name="ln1184">	if (level == IPPROTO_IP) {</a>
+<a name="ln1185">		if (option == IP_HDRINCL) {</a>
+<a name="ln1186">			int headerIncluded;</a>
+<a name="ln1187">			if (length != sizeof(int))</a>
+<a name="ln1188">				return B_BAD_VALUE;</a>
+<a name="ln1189">			if (user_memcpy(&amp;headerIncluded, value, sizeof(headerIncluded))</a>
+<a name="ln1190">					!= B_OK)</a>
+<a name="ln1191">				return B_BAD_ADDRESS;</a>
+<a name="ln1192"> </a>
+<a name="ln1193">			if (headerIncluded)</a>
+<a name="ln1194">				protocol-&gt;flags |= IP_FLAG_HEADER_INCLUDED;</a>
+<a name="ln1195">			else</a>
+<a name="ln1196">				protocol-&gt;flags &amp;= ~IP_FLAG_HEADER_INCLUDED;</a>
+<a name="ln1197"> </a>
+<a name="ln1198">			return B_OK;</a>
+<a name="ln1199">		}</a>
+<a name="ln1200">		if (option == IP_RECVDSTADDR) {</a>
+<a name="ln1201">			int getAddress;</a>
+<a name="ln1202">			if (length != sizeof(int))</a>
+<a name="ln1203">				return B_BAD_VALUE;</a>
+<a name="ln1204">			if (user_memcpy(&amp;getAddress, value, sizeof(int)) != B_OK)</a>
+<a name="ln1205">				return B_BAD_ADDRESS;</a>
+<a name="ln1206"> </a>
+<a name="ln1207">			if (getAddress &amp;&amp; (protocol-&gt;socket-&gt;type == SOCK_DGRAM</a>
+<a name="ln1208">					|| protocol-&gt;socket-&gt;type == SOCK_RAW))</a>
+<a name="ln1209">				protocol-&gt;flags |= IP_FLAG_RECEIVE_DEST_ADDR;</a>
+<a name="ln1210">			else</a>
+<a name="ln1211">				protocol-&gt;flags &amp;= ~IP_FLAG_RECEIVE_DEST_ADDR;</a>
+<a name="ln1212"> </a>
+<a name="ln1213">			return B_OK;</a>
+<a name="ln1214">		}</a>
+<a name="ln1215">		if (option == IP_TTL)</a>
+<a name="ln1216">			return set_int_option(protocol-&gt;time_to_live, value, length);</a>
+<a name="ln1217">		if (option == IP_TOS)</a>
+<a name="ln1218">			return set_int_option(protocol-&gt;service_type, value, length);</a>
+<a name="ln1219">		if (option == IP_MULTICAST_IF) {</a>
+<a name="ln1220">			if (length != sizeof(struct in_addr))</a>
+<a name="ln1221">				return B_BAD_VALUE;</a>
+<a name="ln1222"> </a>
+<a name="ln1223">			struct sockaddr_in* address = new (std::nothrow) sockaddr_in;</a>
+<a name="ln1224">			if (address == NULL)</a>
+<a name="ln1225">				return B_NO_MEMORY;</a>
+<a name="ln1226"> </a>
+<a name="ln1227">			if (user_memcpy(&amp;address-&gt;sin_addr, value, sizeof(struct in_addr))</a>
+<a name="ln1228">					!= B_OK) {</a>
+<a name="ln1229">				delete address;</a>
+<a name="ln1230">				return B_BAD_ADDRESS;</a>
+<a name="ln1231">			}</a>
+<a name="ln1232"> </a>
+<a name="ln1233">			// Using INADDR_ANY to remove the previous setting.</a>
+<a name="ln1234">			if (address-&gt;sin_addr.s_addr == htonl(INADDR_ANY)) {</a>
+<a name="ln1235">				delete address;</a>
+<a name="ln1236">				delete protocol-&gt;multicast_address;</a>
+<a name="ln1237">				protocol-&gt;multicast_address = NULL;</a>
+<a name="ln1238">				return B_OK;</a>
+<a name="ln1239">			}</a>
+<a name="ln1240"> </a>
+<a name="ln1241">			struct net_interface* interface</a>
+<a name="ln1242">				= sDatalinkModule-&gt;get_interface_with_address(</a>
+<a name="ln1243">					(sockaddr*)address);</a>
+<a name="ln1244">			if (interface == NULL) {</a>
+<a name="ln1245">				delete address;</a>
+<a name="ln1246">				return EADDRNOTAVAIL;</a>
+<a name="ln1247">			}</a>
+<a name="ln1248"> </a>
+<a name="ln1249">			delete protocol-&gt;multicast_address;</a>
+<a name="ln1250">			protocol-&gt;multicast_address = (struct sockaddr*)address;</a>
+<a name="ln1251"> </a>
+<a name="ln1252">			sDatalinkModule-&gt;put_interface(interface);</a>
+<a name="ln1253">			return B_OK;</a>
+<a name="ln1254">		}</a>
+<a name="ln1255">		if (option == IP_MULTICAST_TTL) {</a>
+<a name="ln1256">			return set_int_option(protocol-&gt;multicast_time_to_live, value,</a>
+<a name="ln1257">				length);</a>
+<a name="ln1258">		}</a>
+<a name="ln1259">		if (option == IP_ADD_MEMBERSHIP || option == IP_DROP_MEMBERSHIP) {</a>
+<a name="ln1260">			ip_mreq mreq;</a>
+<a name="ln1261">			if (length != sizeof(ip_mreq))</a>
+<a name="ln1262">				return B_BAD_VALUE;</a>
+<a name="ln1263">			if (user_memcpy(&amp;mreq, value, sizeof(ip_mreq)) != B_OK)</a>
+<a name="ln1264">				return B_BAD_ADDRESS;</a>
+<a name="ln1265"> </a>
+<a name="ln1266">			return ipv4_delta_membership(protocol, option, &amp;mreq.imr_interface,</a>
+<a name="ln1267">				&amp;mreq.imr_multiaddr, NULL);</a>
+<a name="ln1268">		}</a>
+<a name="ln1269">		if (option == IP_BLOCK_SOURCE</a>
+<a name="ln1270">			|| option == IP_UNBLOCK_SOURCE</a>
+<a name="ln1271">			|| option == IP_ADD_SOURCE_MEMBERSHIP</a>
+<a name="ln1272">			|| option == IP_DROP_SOURCE_MEMBERSHIP) {</a>
+<a name="ln1273">			ip_mreq_source mreq;</a>
+<a name="ln1274">			if (length != sizeof(ip_mreq_source))</a>
+<a name="ln1275">				return B_BAD_VALUE;</a>
+<a name="ln1276">			if (user_memcpy(&amp;mreq, value, sizeof(ip_mreq_source)) != B_OK)</a>
+<a name="ln1277">				return B_BAD_ADDRESS;</a>
+<a name="ln1278"> </a>
+<a name="ln1279">			return ipv4_delta_membership(protocol, option, &amp;mreq.imr_interface,</a>
+<a name="ln1280">				&amp;mreq.imr_multiaddr, &amp;mreq.imr_sourceaddr);</a>
+<a name="ln1281">		}</a>
+<a name="ln1282">		if (option == MCAST_LEAVE_GROUP || option == MCAST_JOIN_GROUP) {</a>
+<a name="ln1283">			group_req greq;</a>
+<a name="ln1284">			if (length != sizeof(group_req))</a>
+<a name="ln1285">				return B_BAD_VALUE;</a>
+<a name="ln1286">			if (user_memcpy(&amp;greq, value, sizeof(group_req)) != B_OK)</a>
+<a name="ln1287">				return B_BAD_ADDRESS;</a>
+<a name="ln1288"> </a>
+<a name="ln1289">			return ipv4_generic_delta_membership(protocol, option,</a>
+<a name="ln1290">				greq.gr_interface, &amp;greq.gr_group, NULL);</a>
+<a name="ln1291">		}</a>
+<a name="ln1292">		if (option == MCAST_BLOCK_SOURCE</a>
+<a name="ln1293">			|| option == MCAST_UNBLOCK_SOURCE</a>
+<a name="ln1294">			|| option == MCAST_JOIN_SOURCE_GROUP</a>
+<a name="ln1295">			|| option == MCAST_LEAVE_SOURCE_GROUP) {</a>
+<a name="ln1296">			group_source_req greq;</a>
+<a name="ln1297">			if (length != sizeof(group_source_req))</a>
+<a name="ln1298">				return B_BAD_VALUE;</a>
+<a name="ln1299">			if (user_memcpy(&amp;greq, value, sizeof(group_source_req)) != B_OK)</a>
+<a name="ln1300">				return B_BAD_ADDRESS;</a>
+<a name="ln1301"> </a>
+<a name="ln1302">			return ipv4_generic_delta_membership(protocol, option,</a>
+<a name="ln1303">				greq.gsr_interface, &amp;greq.gsr_group, &amp;greq.gsr_source);</a>
+<a name="ln1304">		}</a>
+<a name="ln1305"> </a>
+<a name="ln1306">		dprintf(&quot;IPv4::setsockopt(): set unknown option: %d\n&quot;, option);</a>
+<a name="ln1307">		return ENOPROTOOPT;</a>
+<a name="ln1308">	}</a>
+<a name="ln1309"> </a>
+<a name="ln1310">	return sSocketModule-&gt;set_option(protocol-&gt;socket, level, option,</a>
+<a name="ln1311">		value, length);</a>
+<a name="ln1312">}</a>
+<a name="ln1313"> </a>
+<a name="ln1314"> </a>
+<a name="ln1315">status_t</a>
+<a name="ln1316">ipv4_bind(net_protocol* protocol, const struct sockaddr* address)</a>
+<a name="ln1317">{</a>
+<a name="ln1318">	if (address-&gt;sa_family != AF_INET)</a>
+<a name="ln1319">		return EAFNOSUPPORT;</a>
+<a name="ln1320"> </a>
+<a name="ln1321">	// only INADDR_ANY and addresses of local interfaces are accepted:</a>
+<a name="ln1322">	if (((sockaddr_in*)address)-&gt;sin_addr.s_addr == INADDR_ANY</a>
+<a name="ln1323">		|| IN_MULTICAST(ntohl(((sockaddr_in*)address)-&gt;sin_addr.s_addr))</a>
+<a name="ln1324">		|| sDatalinkModule-&gt;is_local_address(sDomain, address, NULL, NULL)) {</a>
+<a name="ln1325">		memcpy(&amp;protocol-&gt;socket-&gt;address, address, sizeof(struct sockaddr_in));</a>
+<a name="ln1326">		protocol-&gt;socket-&gt;address.ss_len = sizeof(struct sockaddr_in);</a>
+<a name="ln1327">			// explicitly set length, as our callers can't be trusted to</a>
+<a name="ln1328">			// always provide the correct length!</a>
+<a name="ln1329">		return B_OK;</a>
+<a name="ln1330">	}</a>
+<a name="ln1331"> </a>
+<a name="ln1332">	return B_ERROR;</a>
+<a name="ln1333">		// address is unknown on this host</a>
+<a name="ln1334">}</a>
+<a name="ln1335"> </a>
+<a name="ln1336"> </a>
+<a name="ln1337">status_t</a>
+<a name="ln1338">ipv4_unbind(net_protocol* protocol, struct sockaddr* address)</a>
+<a name="ln1339">{</a>
+<a name="ln1340">	// nothing to do here</a>
+<a name="ln1341">	return B_OK;</a>
+<a name="ln1342">}</a>
+<a name="ln1343"> </a>
+<a name="ln1344"> </a>
+<a name="ln1345">status_t</a>
+<a name="ln1346">ipv4_listen(net_protocol* protocol, int count)</a>
+<a name="ln1347">{</a>
+<a name="ln1348">	return B_NOT_SUPPORTED;</a>
+<a name="ln1349">}</a>
+<a name="ln1350"> </a>
+<a name="ln1351"> </a>
+<a name="ln1352">status_t</a>
+<a name="ln1353">ipv4_shutdown(net_protocol* protocol, int direction)</a>
+<a name="ln1354">{</a>
+<a name="ln1355">	return B_NOT_SUPPORTED;</a>
+<a name="ln1356">}</a>
+<a name="ln1357"> </a>
+<a name="ln1358"> </a>
+<a name="ln1359">status_t</a>
+<a name="ln1360">ipv4_send_routed_data(net_protocol* _protocol, struct net_route* route,</a>
+<a name="ln1361">	net_buffer* buffer)</a>
+<a name="ln1362">{</a>
+<a name="ln1363">	if (route == NULL)</a>
+<a name="ln1364">		return B_BAD_VALUE;</a>
+<a name="ln1365"> </a>
+<a name="ln1366">	ipv4_protocol* protocol = (ipv4_protocol*)_protocol;</a>
+<a name="ln1367">	net_interface_address* interfaceAddress = route-&gt;interface_address;</a>
+<a name="ln1368">	net_interface* interface = interfaceAddress-&gt;interface;</a>
+<a name="ln1369"> </a>
+<a name="ln1370">	TRACE_SK(protocol, &quot;SendRoutedData(%p, %p [%ld bytes])&quot;, route, buffer,</a>
+<a name="ln1371">		buffer-&gt;size);</a>
+<a name="ln1372"> </a>
+<a name="ln1373">	sockaddr_in&amp; source = *(sockaddr_in*)buffer-&gt;source;</a>
+<a name="ln1374">	sockaddr_in&amp; destination = *(sockaddr_in*)buffer-&gt;destination;</a>
+<a name="ln1375">	sockaddr_in* broadcastAddress = (sockaddr_in*)interfaceAddress-&gt;destination;</a>
+<a name="ln1376"> </a>
+<a name="ln1377">	bool checksumNeeded = true;</a>
+<a name="ln1378">	bool headerIncluded = false;</a>
+<a name="ln1379">	if (protocol != NULL)</a>
+<a name="ln1380">		headerIncluded = (protocol-&gt;flags &amp; IP_FLAG_HEADER_INCLUDED) != 0;</a>
+<a name="ln1381"> </a>
+<a name="ln1382">	buffer-&gt;flags &amp;= ~(MSG_BCAST | MSG_MCAST);</a>
+<a name="ln1383"> </a>
+<a name="ln1384">	if (destination.sin_addr.s_addr == INADDR_ANY)</a>
+<a name="ln1385">		return EDESTADDRREQ;</a>
+<a name="ln1386"> </a>
+<a name="ln1387">	if ((interface-&gt;device-&gt;flags &amp; IFF_BROADCAST) != 0</a>
+<a name="ln1388">		&amp;&amp; (destination.sin_addr.s_addr == INADDR_BROADCAST</a>
+<a name="ln1389">			|| (broadcastAddress != NULL &amp;&amp; destination.sin_addr.s_addr</a>
+<a name="ln1390">					== broadcastAddress-&gt;sin_addr.s_addr))) {</a>
+<a name="ln1391">		if (protocol &amp;&amp; !(protocol-&gt;socket-&gt;options &amp; SO_BROADCAST))</a>
+<a name="ln1392">			return B_BAD_VALUE;</a>
+<a name="ln1393">		buffer-&gt;flags |= MSG_BCAST;</a>
+<a name="ln1394">	} else if (IN_MULTICAST(ntohl(destination.sin_addr.s_addr)))</a>
+<a name="ln1395">		buffer-&gt;flags |= MSG_MCAST;</a>
+<a name="ln1396"> </a>
+<a name="ln1397">	// Add IP header (if needed)</a>
+<a name="ln1398"> </a>
+<a name="ln1399">	if (!headerIncluded) {</a>
+<a name="ln1400">		NetBufferPrepend&lt;ipv4_header&gt; header(buffer);</a>
+<a name="ln1401">		if (header.Status() != B_OK)</a>
+<a name="ln1402">			return header.Status();</a>
+<a name="ln1403"> </a>
+<a name="ln1404">		header-&gt;version = IPV4_VERSION;</a>
+<a name="ln1405">		header-&gt;header_length = sizeof(ipv4_header) / 4;</a>
+<a name="ln1406">		header-&gt;service_type = protocol ? protocol-&gt;service_type : 0;</a>
+<a name="ln1407">		header-&gt;total_length = htons(buffer-&gt;size);</a>
+<a name="ln1408">		header-&gt;id = htons(atomic_add(&amp;sPacketID, 1));</a>
+<a name="ln1409">		header-&gt;fragment_offset = 0;</a>
+<a name="ln1410">		if (protocol) {</a>
+<a name="ln1411">			header-&gt;time_to_live = (buffer-&gt;flags &amp; MSG_MCAST) != 0</a>
+<a name="ln1412">				? protocol-&gt;multicast_time_to_live : protocol-&gt;time_to_live;</a>
+<a name="ln1413">		} else {</a>
+<a name="ln1414">			header-&gt;time_to_live = (buffer-&gt;flags &amp; MSG_MCAST) != 0</a>
+<a name="ln1415">				? kDefaultMulticastTTL : kDefaultTTL;</a>
+<a name="ln1416">		}</a>
+<a name="ln1417">		header-&gt;protocol = protocol</a>
+<a name="ln1418">			? protocol-&gt;socket-&gt;protocol : buffer-&gt;protocol;</a>
+<a name="ln1419">		header-&gt;checksum = 0;</a>
+<a name="ln1420"> </a>
+<a name="ln1421">		header-&gt;source = source.sin_addr.s_addr;</a>
+<a name="ln1422">		header-&gt;destination = destination.sin_addr.s_addr;</a>
+<a name="ln1423"> </a>
+<a name="ln1424">		TRACE_ONLY(dump_ipv4_header(*header));</a>
+<a name="ln1425">	} else {</a>
+<a name="ln1426">		// if IP_HDRINCL, check if the source address is set</a>
+<a name="ln1427">		NetBufferHeaderReader&lt;ipv4_header&gt; header(buffer);</a>
+<a name="ln1428">		if (header.Status() != B_OK)</a>
+<a name="ln1429">			return header.Status();</a>
+<a name="ln1430"> </a>
+<a name="ln1431">		if (header-&gt;source == 0) {</a>
+<a name="ln1432">			header-&gt;source = source.sin_addr.s_addr;</a>
+<a name="ln1433">			header-&gt;checksum = 0;</a>
+<a name="ln1434">			header.Sync();</a>
+<a name="ln1435">		} else</a>
+<a name="ln1436">			checksumNeeded = false;</a>
+<a name="ln1437"> </a>
+<a name="ln1438">		TRACE(&quot;  Header was already supplied:&quot;);</a>
+<a name="ln1439">		TRACE_ONLY(dump_ipv4_header(*header));</a>
+<a name="ln1440">	}</a>
+<a name="ln1441"> </a>
+<a name="ln1442">	if (buffer-&gt;size &gt; 0xffff)</a>
+<a name="ln1443">		return EMSGSIZE;</a>
+<a name="ln1444"> </a>
+<a name="ln1445">	if (checksumNeeded) {</a>
+<a name="ln1446">		*IPChecksumField(buffer) = gBufferModule-&gt;checksum(buffer, 0,</a>
+<a name="ln1447">			sizeof(ipv4_header), true);</a>
+<a name="ln1448">	}</a>
+<a name="ln1449"> </a>
+<a name="ln1450">	TRACE_SK(protocol, &quot;  SendRoutedData(): header chksum: %ld, buffer &quot;</a>
+<a name="ln1451">		&quot;checksum: %ld&quot;,</a>
+<a name="ln1452">		gBufferModule-&gt;checksum(buffer, 0, sizeof(ipv4_header), true),</a>
+<a name="ln1453">		gBufferModule-&gt;checksum(buffer, 0, buffer-&gt;size, true));</a>
+<a name="ln1454"> </a>
+<a name="ln1455">	TRACE_SK(protocol, &quot;  SendRoutedData(): destination: %08x&quot;,</a>
+<a name="ln1456">		ntohl(destination.sin_addr.s_addr));</a>
+<a name="ln1457"> </a>
+<a name="ln1458">	uint32 mtu = route-&gt;mtu ? route-&gt;mtu : interface-&gt;mtu;</a>
+<a name="ln1459">	if (buffer-&gt;size &gt; mtu) {</a>
+<a name="ln1460">		// we need to fragment the packet</a>
+<a name="ln1461">		return send_fragments(protocol, route, buffer, mtu);</a>
+<a name="ln1462">	}</a>
+<a name="ln1463"> </a>
+<a name="ln1464">	return sDatalinkModule-&gt;send_routed_data(route, buffer);</a>
+<a name="ln1465">}</a>
+<a name="ln1466"> </a>
+<a name="ln1467"> </a>
+<a name="ln1468">status_t</a>
+<a name="ln1469">ipv4_send_data(net_protocol* _protocol, net_buffer* buffer)</a>
+<a name="ln1470">{</a>
+<a name="ln1471">	ipv4_protocol* protocol = (ipv4_protocol*)_protocol;</a>
+<a name="ln1472"> </a>
+<a name="ln1473">	TRACE_SK(protocol, &quot;SendData(%p [%ld bytes])&quot;, buffer, buffer-&gt;size);</a>
+<a name="ln1474"> </a>
+<a name="ln1475">	if (protocol != NULL &amp;&amp; (protocol-&gt;flags &amp; IP_FLAG_HEADER_INCLUDED)) {</a>
+<a name="ln1476">		if (buffer-&gt;size &lt; sizeof(ipv4_header))</a>
+<a name="ln1477">			return B_BAD_VALUE;</a>
+<a name="ln1478"> </a>
+<a name="ln1479">		sockaddr_in* source = (sockaddr_in*)buffer-&gt;source;</a>
+<a name="ln1480">		sockaddr_in* destination = (sockaddr_in*)buffer-&gt;destination;</a>
+<a name="ln1481"> </a>
+<a name="ln1482">		fill_sockaddr_in(source, *NetBufferField&lt;in_addr_t,</a>
+<a name="ln1483">			offsetof(ipv4_header, source)&gt;(buffer));</a>
+<a name="ln1484">		fill_sockaddr_in(destination, *NetBufferField&lt;in_addr_t,</a>
+<a name="ln1485">			offsetof(ipv4_header, destination)&gt;(buffer));</a>
+<a name="ln1486">	}</a>
+<a name="ln1487"> </a>
+<a name="ln1488">	// handle IP_MULTICAST_IF</a>
+<a name="ln1489">	if (IN_MULTICAST(ntohl(</a>
+<a name="ln1490">			((sockaddr_in*)buffer-&gt;destination)-&gt;sin_addr.s_addr))</a>
+<a name="ln1491">		&amp;&amp; protocol != NULL &amp;&amp; protocol-&gt;multicast_address != NULL) {</a>
+<a name="ln1492">		net_interface_address* address = sDatalinkModule-&gt;get_interface_address(</a>
+<a name="ln1493">			protocol-&gt;multicast_address);</a>
+<a name="ln1494">		if (address == NULL || (address-&gt;interface-&gt;flags &amp; IFF_UP) == 0) {</a>
+<a name="ln1495">			sDatalinkModule-&gt;put_interface_address(address);</a>
+<a name="ln1496">			return EADDRNOTAVAIL;</a>
+<a name="ln1497">		}</a>
+<a name="ln1498"> </a>
+<a name="ln1499">		sDatalinkModule-&gt;put_interface_address(buffer-&gt;interface_address);</a>
+<a name="ln1500">		buffer-&gt;interface_address = address;</a>
+<a name="ln1501">			// the buffer takes over ownership of the address</a>
+<a name="ln1502"> </a>
+<a name="ln1503">		net_route* route = sDatalinkModule-&gt;get_route(sDomain, address-&gt;local);</a>
+<a name="ln1504">		if (route == NULL)</a>
+<a name="ln1505">			return ENETUNREACH;</a>
+<a name="ln1506"> </a>
+<a name="ln1507">		return sDatalinkModule-&gt;send_routed_data(route, buffer);</a>
+<a name="ln1508">	}</a>
+<a name="ln1509"> </a>
+<a name="ln1510">	return sDatalinkModule-&gt;send_data(protocol, sDomain, buffer);</a>
+<a name="ln1511">}</a>
+<a name="ln1512"> </a>
+<a name="ln1513"> </a>
+<a name="ln1514">ssize_t</a>
+<a name="ln1515">ipv4_send_avail(net_protocol* protocol)</a>
+<a name="ln1516">{</a>
+<a name="ln1517">	return B_ERROR;</a>
+<a name="ln1518">}</a>
+<a name="ln1519"> </a>
+<a name="ln1520"> </a>
+<a name="ln1521">status_t</a>
+<a name="ln1522">ipv4_read_data(net_protocol* _protocol, size_t numBytes, uint32 flags,</a>
+<a name="ln1523">	net_buffer** _buffer)</a>
+<a name="ln1524">{</a>
+<a name="ln1525">	ipv4_protocol* protocol = (ipv4_protocol*)_protocol;</a>
+<a name="ln1526">	RawSocket* raw = protocol-&gt;raw;</a>
+<a name="ln1527">	if (raw == NULL)</a>
+<a name="ln1528">		return B_ERROR;</a>
+<a name="ln1529"> </a>
+<a name="ln1530">	TRACE_SK(protocol, &quot;ReadData(%lu, 0x%lx)&quot;, numBytes, flags);</a>
+<a name="ln1531"> </a>
+<a name="ln1532">	return raw-&gt;Dequeue(flags, _buffer);</a>
+<a name="ln1533">}</a>
+<a name="ln1534"> </a>
+<a name="ln1535"> </a>
+<a name="ln1536">ssize_t</a>
+<a name="ln1537">ipv4_read_avail(net_protocol* _protocol)</a>
+<a name="ln1538">{</a>
+<a name="ln1539">	ipv4_protocol* protocol = (ipv4_protocol*)_protocol;</a>
+<a name="ln1540">	RawSocket* raw = protocol-&gt;raw;</a>
+<a name="ln1541">	if (raw == NULL)</a>
+<a name="ln1542">		return B_ERROR;</a>
+<a name="ln1543"> </a>
+<a name="ln1544">	return raw-&gt;AvailableData();</a>
+<a name="ln1545">}</a>
+<a name="ln1546"> </a>
+<a name="ln1547"> </a>
+<a name="ln1548">struct net_domain*</a>
+<a name="ln1549">ipv4_get_domain(net_protocol* protocol)</a>
+<a name="ln1550">{</a>
+<a name="ln1551">	return sDomain;</a>
+<a name="ln1552">}</a>
+<a name="ln1553"> </a>
+<a name="ln1554"> </a>
+<a name="ln1555">size_t</a>
+<a name="ln1556">ipv4_get_mtu(net_protocol* protocol, const struct sockaddr* address)</a>
+<a name="ln1557">{</a>
+<a name="ln1558">	net_route* route = sDatalinkModule-&gt;get_route(sDomain, address);</a>
+<a name="ln1559">	if (route == NULL)</a>
+<a name="ln1560">		return 0;</a>
+<a name="ln1561"> </a>
+<a name="ln1562">	size_t mtu;</a>
+<a name="ln1563">	if (route-&gt;mtu != 0)</a>
+<a name="ln1564">		mtu = route-&gt;mtu;</a>
+<a name="ln1565">	else</a>
+<a name="ln1566">		mtu = route-&gt;interface_address-&gt;interface-&gt;mtu;</a>
+<a name="ln1567"> </a>
+<a name="ln1568">	sDatalinkModule-&gt;put_route(sDomain, route);</a>
+<a name="ln1569">	return mtu - sizeof(ipv4_header);</a>
+<a name="ln1570">}</a>
+<a name="ln1571"> </a>
+<a name="ln1572"> </a>
+<a name="ln1573">status_t</a>
+<a name="ln1574">ipv4_receive_data(net_buffer* buffer)</a>
+<a name="ln1575">{</a>
+<a name="ln1576">	TRACE(&quot;ipv4_receive_data(%p [%ld bytes])&quot;, buffer, buffer-&gt;size);</a>
+<a name="ln1577"> </a>
+<a name="ln1578">	NetBufferHeaderReader&lt;ipv4_header&gt; bufferHeader(buffer);</a>
+<a name="ln1579">	if (bufferHeader.Status() != B_OK)</a>
+<a name="ln1580">		return bufferHeader.Status();</a>
+<a name="ln1581"> </a>
+<a name="ln1582">	ipv4_header&amp; header = bufferHeader.Data();</a>
+<a name="ln1583">	TRACE_ONLY(dump_ipv4_header(header));</a>
+<a name="ln1584"> </a>
+<a name="ln1585">	if (header.version != IPV4_VERSION)</a>
+<a name="ln1586">		return B_BAD_TYPE;</a>
+<a name="ln1587"> </a>
+<a name="ln1588">	uint16 packetLength = header.TotalLength();</a>
+<a name="ln1589">	uint16 headerLength = header.HeaderLength();</a>
+<a name="ln1590">	if (packetLength &gt; buffer-&gt;size</a>
+<a name="ln1591">		|| headerLength &lt; sizeof(ipv4_header))</a>
+<a name="ln1592">		return B_BAD_DATA;</a>
+<a name="ln1593"> </a>
+<a name="ln1594">	// TODO: would be nice to have a direct checksum function somewhere</a>
+<a name="ln1595">	if (gBufferModule-&gt;checksum(buffer, 0, headerLength, true) != 0)</a>
+<a name="ln1596">		return B_BAD_DATA;</a>
+<a name="ln1597"> </a>
+<a name="ln1598">	// lower layers notion of broadcast or multicast have no relevance to us</a>
+<a name="ln1599">	// other than deciding whether to send an ICMP error</a>
+<a name="ln1600">	bool wasMulticast = (buffer-&gt;flags &amp; (MSG_BCAST | MSG_MCAST)) != 0;</a>
+<a name="ln1601">	bool notForUs = false;</a>
+<a name="ln1602">	buffer-&gt;flags &amp;= ~(MSG_BCAST | MSG_MCAST);</a>
+<a name="ln1603"> </a>
+<a name="ln1604">	sockaddr_in destination;</a>
+<a name="ln1605">	fill_sockaddr_in(&amp;destination, header.destination);</a>
+<a name="ln1606"> </a>
+<a name="ln1607">	if (header.destination == INADDR_BROADCAST) {</a>
+<a name="ln1608">		buffer-&gt;flags |= MSG_BCAST;</a>
+<a name="ln1609"> </a>
+<a name="ln1610">		// Find first interface with a matching family</a>
+<a name="ln1611">		if (!sDatalinkModule-&gt;is_local_link_address(sDomain, true,</a>
+<a name="ln1612">				buffer-&gt;destination, &amp;buffer-&gt;interface_address))</a>
+<a name="ln1613">			notForUs = !wasMulticast;</a>
+<a name="ln1614">	} else if (IN_MULTICAST(ntohl(header.destination))) {</a>
+<a name="ln1615">		buffer-&gt;flags |= MSG_MCAST;</a>
+<a name="ln1616">	} else {</a>
+<a name="ln1617">		uint32 matchedAddressType = 0;</a>
+<a name="ln1618"> </a>
+<a name="ln1619">		// test if the packet is really for us</a>
+<a name="ln1620">		if (!sDatalinkModule-&gt;is_local_address(sDomain, (sockaddr*)&amp;destination,</a>
+<a name="ln1621">				&amp;buffer-&gt;interface_address, &amp;matchedAddressType)</a>
+<a name="ln1622">			&amp;&amp; !sDatalinkModule-&gt;is_local_link_address(sDomain, true,</a>
+<a name="ln1623">				buffer-&gt;destination, &amp;buffer-&gt;interface_address)) {</a>
+<a name="ln1624">			// if the buffer was a link layer multicast, regard it as a</a>
+<a name="ln1625">			// broadcast, and let the upper levels decide what to do with it</a>
+<a name="ln1626">			if (wasMulticast)</a>
+<a name="ln1627">				buffer-&gt;flags |= MSG_BCAST;</a>
+<a name="ln1628">			else</a>
+<a name="ln1629">				notForUs = true;</a>
+<a name="ln1630">		} else {</a>
+<a name="ln1631">			// copy over special address types (MSG_BCAST or MSG_MCAST):</a>
+<a name="ln1632">			buffer-&gt;flags |= matchedAddressType;</a>
+<a name="ln1633">		}</a>
+<a name="ln1634">	}</a>
+<a name="ln1635"> </a>
+<a name="ln1636">	// set net_buffer's source/destination address</a>
+<a name="ln1637">	fill_sockaddr_in((struct sockaddr_in*)buffer-&gt;source, header.source);</a>
+<a name="ln1638">	memcpy(buffer-&gt;destination, &amp;destination, sizeof(sockaddr_in));</a>
+<a name="ln1639"> </a>
+<a name="ln1640">	buffer-&gt;protocol = header.protocol;</a>
+<a name="ln1641"> </a>
+<a name="ln1642">	if (notForUs) {</a>
+<a name="ln1643">		TRACE(&quot;  ipv4_receive_data(): packet was not for us %x -&gt; %x&quot;,</a>
+<a name="ln1644">			ntohl(header.source), ntohl(header.destination));</a>
+<a name="ln1645"> </a>
+<a name="ln1646">		if (!wasMulticast) {</a>
+<a name="ln1647">			// Send ICMP error: Host unreachable</a>
+<a name="ln1648">			sDomain-&gt;module-&gt;error_reply(NULL, buffer, B_NET_ERROR_UNREACH_HOST,</a>
+<a name="ln1649">				NULL);</a>
+<a name="ln1650">		}</a>
+<a name="ln1651"> </a>
+<a name="ln1652">		return B_ERROR;</a>
+<a name="ln1653">	}</a>
+<a name="ln1654"> </a>
+<a name="ln1655">	// remove any trailing/padding data</a>
+<a name="ln1656">	status_t status = gBufferModule-&gt;trim(buffer, packetLength);</a>
+<a name="ln1657">	if (status != B_OK)</a>
+<a name="ln1658">		return status;</a>
+<a name="ln1659"> </a>
+<a name="ln1660">	// check for fragmentation</a>
+<a name="ln1661">	uint16 fragmentOffset = header.FragmentOffset();</a>
+<a name="ln1662">	if ((fragmentOffset &amp; IP_MORE_FRAGMENTS) != 0</a>
+<a name="ln1663">		|| (fragmentOffset &amp; IP_FRAGMENT_OFFSET_MASK) != 0) {</a>
+<a name="ln1664">		// this is a fragment</a>
+<a name="ln1665">		TRACE(&quot;  ipv4_receive_data(): Found a Fragment!&quot;);</a>
+<a name="ln1666">		status = reassemble_fragments(header, &amp;buffer);</a>
+<a name="ln1667">		TRACE(&quot;  ipv4_receive_data():  -&gt; %s&quot;, strerror(status));</a>
+<a name="ln1668">		if (status != B_OK)</a>
+<a name="ln1669">			return status;</a>
+<a name="ln1670"> </a>
+<a name="ln1671">		if (buffer == NULL) {</a>
+<a name="ln1672">			// buffer was put into fragment packet</a>
+<a name="ln1673">			TRACE(&quot;  ipv4_receive_data(): Not yet assembled.&quot;);</a>
+<a name="ln1674">			return B_OK;</a>
+<a name="ln1675">		}</a>
+<a name="ln1676">	}</a>
+<a name="ln1677"> </a>
+<a name="ln1678">	// Since the buffer might have been changed (reassembled fragment)</a>
+<a name="ln1679">	// we must no longer access bufferHeader or header anymore after</a>
+<a name="ln1680">	// this point</a>
+<a name="ln1681"> </a>
+<a name="ln1682">	bool rawDelivered = raw_receive_data(buffer);</a>
+<a name="ln1683"> </a>
+<a name="ln1684">	// Preserve the ipv4 header for ICMP processing</a>
+<a name="ln1685">	gBufferModule-&gt;store_header(buffer);</a>
+<a name="ln1686"> </a>
+<a name="ln1687">	bufferHeader.Remove(headerLength);</a>
+<a name="ln1688">		// the header is of variable size and may include IP options</a>
+<a name="ln1689">		// (TODO: that we ignore for now)</a>
+<a name="ln1690"> </a>
+<a name="ln1691">	net_protocol_module_info* module = receiving_protocol(buffer-&gt;protocol);</a>
+<a name="ln1692">	if (module == NULL) {</a>
+<a name="ln1693">		// no handler for this packet</a>
+<a name="ln1694">		if (!rawDelivered) {</a>
+<a name="ln1695">			sDomain-&gt;module-&gt;error_reply(NULL, buffer,</a>
+<a name="ln1696">				B_NET_ERROR_UNREACH_PROTOCOL, NULL);</a>
+<a name="ln1697">		}</a>
+<a name="ln1698">		return EAFNOSUPPORT;</a>
+<a name="ln1699">	}</a>
+<a name="ln1700"> </a>
+<a name="ln1701">	if ((buffer-&gt;flags &amp; MSG_MCAST) != 0) {</a>
+<a name="ln1702">		// Unfortunately historical reasons dictate that the IP multicast</a>
+<a name="ln1703">		// model be a little different from the unicast one. We deliver</a>
+<a name="ln1704">		// this frame directly to all sockets registered with interest</a>
+<a name="ln1705">		// for this multicast group.</a>
+<a name="ln1706">		deliver_multicast(module, buffer, false);</a>
+<a name="ln1707">		gBufferModule-&gt;free(buffer);</a>
+<a name="ln1708">		return B_OK;</a>
+<a name="ln1709">	}</a>
+<a name="ln1710"> </a>
+<a name="ln1711">	return module-&gt;receive_data(buffer);</a>
+<a name="ln1712">}</a>
+<a name="ln1713"> </a>
+<a name="ln1714"> </a>
+<a name="ln1715">status_t</a>
+<a name="ln1716">ipv4_deliver_data(net_protocol* _protocol, net_buffer* buffer)</a>
+<a name="ln1717">{</a>
+<a name="ln1718">	ipv4_protocol* protocol = (ipv4_protocol*)_protocol;</a>
+<a name="ln1719"> </a>
+<a name="ln1720">	if (protocol-&gt;raw == NULL)</a>
+<a name="ln1721">		return B_ERROR;</a>
+<a name="ln1722"> </a>
+<a name="ln1723">	return protocol-&gt;raw-&gt;EnqueueClone(buffer);</a>
+<a name="ln1724">}</a>
+<a name="ln1725"> </a>
+<a name="ln1726"> </a>
+<a name="ln1727">status_t</a>
+<a name="ln1728">ipv4_error_received(net_error error, net_buffer* buffer)</a>
+<a name="ln1729">{</a>
+<a name="ln1730">	TRACE(&quot;  ipv4_error_received(error %d, buffer %p [%zu bytes])&quot;, (int)error,</a>
+<a name="ln1731">		buffer, buffer-&gt;size);</a>
+<a name="ln1732"> </a>
+<a name="ln1733">	NetBufferHeaderReader&lt;ipv4_header&gt; bufferHeader(buffer);</a>
+<a name="ln1734">	if (bufferHeader.Status() != B_OK)</a>
+<a name="ln1735">		return bufferHeader.Status();</a>
+<a name="ln1736"> </a>
+<a name="ln1737">	ipv4_header&amp; header = bufferHeader.Data();</a>
+<a name="ln1738">	TRACE_ONLY(dump_ipv4_header(header));</a>
+<a name="ln1739"> </a>
+<a name="ln1740">	// We do not check the packet length, as we usually only get a part of it</a>
+<a name="ln1741">	uint16 headerLength = header.HeaderLength();</a>
+<a name="ln1742">	if (header.version != IPV4_VERSION</a>
+<a name="ln1743">		|| headerLength &lt; sizeof(ipv4_header)</a>
+<a name="ln1744">		|| gBufferModule-&gt;checksum(buffer, 0, headerLength, true) != 0)</a>
+<a name="ln1745">		return B_BAD_DATA;</a>
+<a name="ln1746"> </a>
+<a name="ln1747">	// Restore addresses of the original buffer</a>
+<a name="ln1748"> </a>
+<a name="ln1749">	// lower layers notion of broadcast or multicast have no relevance to us</a>
+<a name="ln1750">	// TODO: they actually have when deciding whether to send an ICMP error</a>
+<a name="ln1751">	buffer-&gt;flags &amp;= ~(MSG_BCAST | MSG_MCAST);</a>
+<a name="ln1752"> </a>
+<a name="ln1753">	fill_sockaddr_in((struct sockaddr_in*)buffer-&gt;source, header.source);</a>
+<a name="ln1754">	fill_sockaddr_in((struct sockaddr_in*)buffer-&gt;destination,</a>
+<a name="ln1755">		header.destination);</a>
+<a name="ln1756"> </a>
+<a name="ln1757">	if (header.destination == INADDR_BROADCAST)</a>
+<a name="ln1758">		buffer-&gt;flags |= MSG_BCAST;</a>
+<a name="ln1759">	else if (IN_MULTICAST(ntohl(header.destination)))</a>
+<a name="ln1760">		buffer-&gt;flags |= MSG_MCAST;</a>
+<a name="ln1761"> </a>
+<a name="ln1762">	// test if the packet is really from us</a>
+<a name="ln1763">	if (!sDatalinkModule-&gt;is_local_address(sDomain, buffer-&gt;source, NULL,</a>
+<a name="ln1764">			NULL)) {</a>
+<a name="ln1765">		TRACE(&quot;  ipv4_error_received(): packet was not for us %x -&gt; %x&quot;,</a>
+<a name="ln1766">			ntohl(header.source), ntohl(header.destination));</a>
+<a name="ln1767">		return B_ERROR;</a>
+<a name="ln1768">	}</a>
+<a name="ln1769"> </a>
+<a name="ln1770">	buffer-&gt;protocol = header.protocol;</a>
+<a name="ln1771"> </a>
+<a name="ln1772">	bufferHeader.Remove(headerLength);</a>
+<a name="ln1773"> </a>
+<a name="ln1774">	net_protocol_module_info* protocol = receiving_protocol(buffer-&gt;protocol);</a>
+<a name="ln1775">	if (protocol == NULL)</a>
+<a name="ln1776">		return B_ERROR;</a>
+<a name="ln1777"> </a>
+<a name="ln1778">	// propagate error</a>
+<a name="ln1779">	return protocol-&gt;error_received(error, buffer);</a>
+<a name="ln1780">}</a>
+<a name="ln1781"> </a>
+<a name="ln1782"> </a>
+<a name="ln1783">status_t</a>
+<a name="ln1784">ipv4_error_reply(net_protocol* protocol, net_buffer* cause, net_error error,</a>
+<a name="ln1785">	net_error_data* errorData)</a>
+<a name="ln1786">{</a>
+<a name="ln1787">	// Directly obtain the ICMP protocol module</a>
+<a name="ln1788">	net_protocol_module_info* icmp = receiving_protocol(IPPROTO_ICMP);</a>
+<a name="ln1789">	if (icmp == NULL)</a>
+<a name="ln1790">		return B_ERROR;</a>
+<a name="ln1791"> </a>
+<a name="ln1792">	return icmp-&gt;error_reply(protocol, cause, error, errorData);</a>
+<a name="ln1793">}</a>
+<a name="ln1794"> </a>
+<a name="ln1795"> </a>
+<a name="ln1796">ssize_t</a>
+<a name="ln1797">ipv4_process_ancillary_data_no_container(net_protocol* protocol,</a>
+<a name="ln1798">	net_buffer* buffer, void* msgControl, size_t msgControlLen)</a>
+<a name="ln1799">{</a>
+<a name="ln1800">	ssize_t bytesWritten = 0;</a>
+<a name="ln1801"> </a>
+<a name="ln1802">	if ((((ipv4_protocol*)protocol)-&gt;flags &amp; IP_FLAG_RECEIVE_DEST_ADDR) != 0) {</a>
+<a name="ln1803">		if (msgControlLen &lt; CMSG_SPACE(sizeof(struct in_addr)))</a>
+<a name="ln1804">			return B_NO_MEMORY;</a>
+<a name="ln1805"> </a>
+<a name="ln1806">		cmsghdr* messageHeader = (cmsghdr*)msgControl;</a>
+<a name="ln1807">		messageHeader-&gt;cmsg_len = CMSG_LEN(sizeof(struct in_addr));</a>
+<a name="ln1808">		messageHeader-&gt;cmsg_level = IPPROTO_IP;</a>
+<a name="ln1809">		messageHeader-&gt;cmsg_type = IP_RECVDSTADDR;</a>
+<a name="ln1810"> </a>
+<a name="ln1811">		memcpy(CMSG_DATA(messageHeader),</a>
+<a name="ln1812">		 	&amp;((struct sockaddr_in*)buffer-&gt;destination)-&gt;sin_addr,</a>
+<a name="ln1813">		 	sizeof(struct in_addr));</a>
+<a name="ln1814"> </a>
+<a name="ln1815">		bytesWritten += CMSG_SPACE(sizeof(struct in_addr));</a>
+<a name="ln1816">	}</a>
+<a name="ln1817"> </a>
+<a name="ln1818">	return bytesWritten;</a>
+<a name="ln1819">}</a>
+<a name="ln1820"> </a>
+<a name="ln1821"> </a>
+<a name="ln1822">//	#pragma mark -</a>
+<a name="ln1823"> </a>
+<a name="ln1824"> </a>
+<a name="ln1825">status_t</a>
+<a name="ln1826">init_ipv4()</a>
+<a name="ln1827">{</a>
+<a name="ln1828">	sPacketID = (int32)system_time();</a>
+<a name="ln1829"> </a>
+<a name="ln1830">	mutex_init(&amp;sRawSocketsLock, &quot;raw sockets&quot;);</a>
+<a name="ln1831">	mutex_init(&amp;sFragmentLock, &quot;IPv4 Fragments&quot;);</a>
+<a name="ln1832">	mutex_init(&amp;sMulticastGroupsLock, &quot;IPv4 multicast groups&quot;);</a>
+<a name="ln1833">	mutex_init(&amp;sReceivingProtocolLock, &quot;IPv4 receiving protocols&quot;);</a>
+<a name="ln1834"> </a>
+<a name="ln1835">	status_t status;</a>
+<a name="ln1836"> </a>
+<a name="ln1837">	sMulticastState = new MulticastState();</a>
+<a name="ln1838">	if (sMulticastState == NULL) {</a>
+<a name="ln1839">		status = B_NO_MEMORY;</a>
+<a name="ln1840">		goto err4;</a>
+<a name="ln1841">	}</a>
+<a name="ln1842"> </a>
+<a name="ln1843">	status = sMulticastState-&gt;Init();</a>
+<a name="ln1844">	if (status != B_OK)</a>
+<a name="ln1845">		goto err5;</a>
+<a name="ln1846"> </a>
+<a name="ln1847">	new (&amp;sFragmentHash) FragmentTable();</a>
+<a name="ln1848">	status = sFragmentHash.Init(256);</a>
+<a name="ln1849">	if (status != B_OK)</a>
+<a name="ln1850">		goto err5;</a>
+<a name="ln1851"> </a>
+<a name="ln1852">	new (&amp;sRawSockets) RawSocketList;</a>
+<a name="ln1853">		// static initializers do not work in the kernel,</a>
+<a name="ln1854">		// so we have to do it here, manually</a>
+<a name="ln1855">		// TODO: for modules, this shouldn't be required</a>
+<a name="ln1856"> </a>
+<a name="ln1857">	status = gStackModule-&gt;register_domain_protocols(AF_INET, SOCK_RAW, 0,</a>
+<a name="ln1858">		&quot;network/protocols/ipv4/v1&quot;, NULL);</a>
+<a name="ln1859">	if (status != B_OK)</a>
+<a name="ln1860">		goto err6;</a>
+<a name="ln1861"> </a>
+<a name="ln1862">	status = gStackModule-&gt;register_domain(AF_INET, &quot;internet&quot;, &amp;gIPv4Module,</a>
+<a name="ln1863">		&amp;gIPv4AddressModule, &amp;sDomain);</a>
+<a name="ln1864">	if (status != B_OK)</a>
+<a name="ln1865">		goto err6;</a>
+<a name="ln1866"> </a>
+<a name="ln1867">	add_debugger_command(&quot;ipv4_multicast&quot;, dump_ipv4_multicast,</a>
+<a name="ln1868">		&quot;list all current IPv4 multicast states&quot;);</a>
+<a name="ln1869"> </a>
+<a name="ln1870">	return B_OK;</a>
+<a name="ln1871"> </a>
+<a name="ln1872">err6:</a>
+<a name="ln1873">	sFragmentHash.~FragmentTable();</a>
+<a name="ln1874">err5:</a>
+<a name="ln1875">	delete sMulticastState;</a>
+<a name="ln1876">err4:</a>
+<a name="ln1877">	mutex_destroy(&amp;sReceivingProtocolLock);</a>
+<a name="ln1878">	mutex_destroy(&amp;sMulticastGroupsLock);</a>
+<a name="ln1879">	mutex_destroy(&amp;sFragmentLock);</a>
+<a name="ln1880">	mutex_destroy(&amp;sRawSocketsLock);</a>
+<a name="ln1881">	return status;</a>
+<a name="ln1882">}</a>
+<a name="ln1883"> </a>
+<a name="ln1884"> </a>
+<a name="ln1885">status_t</a>
+<a name="ln1886">uninit_ipv4()</a>
+<a name="ln1887">{</a>
+<a name="ln1888">	mutex_lock(&amp;sReceivingProtocolLock);</a>
+<a name="ln1889"> </a>
+<a name="ln1890">	remove_debugger_command(&quot;ipv4_multicast&quot;, dump_ipv4_multicast);</a>
+<a name="ln1891"> </a>
+<a name="ln1892">	// put all the domain receiving protocols we gathered so far</a>
+<a name="ln1893">	for (uint32 i = 0; i &lt; 256; i++) {</a>
+<a name="ln1894">		if (sReceivingProtocol[i] != NULL)</a>
+<a name="ln1895">			gStackModule-&gt;put_domain_receiving_protocol(sDomain, i);</a>
+<a name="ln1896">	}</a>
+<a name="ln1897"> </a>
+<a name="ln1898">	gStackModule-&gt;unregister_domain(sDomain);</a>
+<a name="ln1899">	mutex_unlock(&amp;sReceivingProtocolLock);</a>
+<a name="ln1900"> </a>
+<a name="ln1901">	delete sMulticastState;</a>
+<a name="ln1902">	sFragmentHash.~FragmentTable();</a>
+<a name="ln1903"> </a>
+<a name="ln1904">	mutex_destroy(&amp;sMulticastGroupsLock);</a>
+<a name="ln1905">	mutex_destroy(&amp;sFragmentLock);</a>
+<a name="ln1906">	mutex_destroy(&amp;sRawSocketsLock);</a>
+<a name="ln1907">	mutex_destroy(&amp;sReceivingProtocolLock);</a>
+<a name="ln1908"> </a>
+<a name="ln1909">	return B_OK;</a>
+<a name="ln1910">}</a>
+<a name="ln1911"> </a>
+<a name="ln1912"> </a>
+<a name="ln1913">static status_t</a>
+<a name="ln1914">ipv4_std_ops(int32 op, ...)</a>
+<a name="ln1915">{</a>
+<a name="ln1916">	switch (op) {</a>
+<a name="ln1917">		case B_MODULE_INIT:</a>
+<a name="ln1918">			return init_ipv4();</a>
+<a name="ln1919">		case B_MODULE_UNINIT:</a>
+<a name="ln1920">			return uninit_ipv4();</a>
+<a name="ln1921"> </a>
+<a name="ln1922">		default:</a>
+<a name="ln1923">			return B_ERROR;</a>
+<a name="ln1924">	}</a>
+<a name="ln1925">}</a>
+<a name="ln1926"> </a>
+<a name="ln1927"> </a>
+<a name="ln1928">net_protocol_module_info gIPv4Module = {</a>
+<a name="ln1929">	{</a>
+<a name="ln1930">		&quot;network/protocols/ipv4/v1&quot;,</a>
+<a name="ln1931">		0,</a>
+<a name="ln1932">		ipv4_std_ops</a>
+<a name="ln1933">	},</a>
+<a name="ln1934">	NET_PROTOCOL_ATOMIC_MESSAGES,</a>
+<a name="ln1935"> </a>
+<a name="ln1936">	ipv4_init_protocol,</a>
+<a name="ln1937">	ipv4_uninit_protocol,</a>
+<a name="ln1938">	ipv4_open,</a>
+<a name="ln1939">	ipv4_close,</a>
+<a name="ln1940">	ipv4_free,</a>
+<a name="ln1941">	ipv4_connect,</a>
+<a name="ln1942">	ipv4_accept,</a>
+<a name="ln1943">	ipv4_control,</a>
+<a name="ln1944">	ipv4_getsockopt,</a>
+<a name="ln1945">	ipv4_setsockopt,</a>
+<a name="ln1946">	ipv4_bind,</a>
+<a name="ln1947">	ipv4_unbind,</a>
+<a name="ln1948">	ipv4_listen,</a>
+<a name="ln1949">	ipv4_shutdown,</a>
+<a name="ln1950">	ipv4_send_data,</a>
+<a name="ln1951">	ipv4_send_routed_data,</a>
+<a name="ln1952">	ipv4_send_avail,</a>
+<a name="ln1953">	ipv4_read_data,</a>
+<a name="ln1954">	ipv4_read_avail,</a>
+<a name="ln1955">	ipv4_get_domain,</a>
+<a name="ln1956">	ipv4_get_mtu,</a>
+<a name="ln1957">	ipv4_receive_data,</a>
+<a name="ln1958">	ipv4_deliver_data,</a>
+<a name="ln1959">	ipv4_error_received,</a>
+<a name="ln1960">	ipv4_error_reply,</a>
+<a name="ln1961">	NULL,		// add_ancillary_data()</a>
+<a name="ln1962">	NULL,		// process_ancillary_data()</a>
+<a name="ln1963">	ipv4_process_ancillary_data_no_container,</a>
+<a name="ln1964">	NULL,		// send_data_no_buffer()</a>
+<a name="ln1965">	NULL		// read_data_no_buffer()</a>
+<a name="ln1966">};</a>
+<a name="ln1967"> </a>
+<a name="ln1968">module_dependency module_dependencies[] = {</a>
+<a name="ln1969">	{NET_STACK_MODULE_NAME, (module_info**)&amp;gStackModule},</a>
+<a name="ln1970">	{NET_BUFFER_MODULE_NAME, (module_info**)&amp;gBufferModule},</a>
+<a name="ln1971">	{NET_DATALINK_MODULE_NAME, (module_info**)&amp;sDatalinkModule},</a>
+<a name="ln1972">	{NET_SOCKET_MODULE_NAME, (module_info**)&amp;sSocketModule},</a>
+<a name="ln1973">	{}</a>
+<a name="ln1974">};</a>
+<a name="ln1975"> </a>
+<a name="ln1976">module_info* modules[] = {</a>
+<a name="ln1977">	(module_info*)&amp;gIPv4Module,</a>
+<a name="ln1978">	NULL</a>
+<a name="ln1979">};</a>
+
+</code></pre>
+<div class="balloon" rel="1811"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v512/" target="_blank">V512</a> A call of the 'memcpy' function will lead to a buffer overflow.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

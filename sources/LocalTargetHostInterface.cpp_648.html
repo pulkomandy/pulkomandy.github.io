@@ -1,0 +1,409 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>LocalTargetHostInterface.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2016, Rene Gollent, rene@gollent.com.</a>
+<a name="ln3"> * Copyright 2016, Ingo Weinhold, ingo_weinhold@gmx.de.</a>
+<a name="ln4"> * Distributed under the terms of the MIT License.</a>
+<a name="ln5"> */</a>
+<a name="ln6"> </a>
+<a name="ln7">#include &quot;LocalTargetHostInterface.h&quot;</a>
+<a name="ln8"> </a>
+<a name="ln9">#include &lt;set&gt;</a>
+<a name="ln10"> </a>
+<a name="ln11">#include &lt;stdio.h&gt;</a>
+<a name="ln12">#include &lt;unistd.h&gt;</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &lt;image.h&gt;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &lt;AutoDeleter.h&gt;</a>
+<a name="ln17">#include &lt;AutoLocker.h&gt;</a>
+<a name="ln18">#include &lt;system_info.h&gt;</a>
+<a name="ln19">#include &lt;util/KMessage.h&gt;</a>
+<a name="ln20"> </a>
+<a name="ln21">#include &quot;debug_utils.h&quot;</a>
+<a name="ln22"> </a>
+<a name="ln23">#include &quot;CoreFile.h&quot;</a>
+<a name="ln24">#include &quot;CoreFileDebuggerInterface.h&quot;</a>
+<a name="ln25">#include &quot;LocalDebuggerInterface.h&quot;</a>
+<a name="ln26">#include &quot;TargetHost.h&quot;</a>
+<a name="ln27"> </a>
+<a name="ln28">using std::set;</a>
+<a name="ln29"> </a>
+<a name="ln30">LocalTargetHostInterface::LocalTargetHostInterface()</a>
+<a name="ln31">	:</a>
+<a name="ln32">	TargetHostInterface(),</a>
+<a name="ln33">	fTargetHost(NULL),</a>
+<a name="ln34">	fDataPort(-1)</a>
+<a name="ln35">{</a>
+<a name="ln36">	SetName(&quot;Local&quot;);</a>
+<a name="ln37">}</a>
+<a name="ln38"> </a>
+<a name="ln39"> </a>
+<a name="ln40">LocalTargetHostInterface::~LocalTargetHostInterface()</a>
+<a name="ln41">{</a>
+<a name="ln42">	Close();</a>
+<a name="ln43"> </a>
+<a name="ln44">	if (fTargetHost != NULL)</a>
+<a name="ln45">		fTargetHost-&gt;ReleaseReference();</a>
+<a name="ln46">}</a>
+<a name="ln47"> </a>
+<a name="ln48"> </a>
+<a name="ln49">status_t</a>
+<a name="ln50">LocalTargetHostInterface::Init(Settings* settings)</a>
+<a name="ln51">{</a>
+<a name="ln52">	char hostname[HOST_NAME_MAX + 1];</a>
+<a name="ln53">	status_t error = gethostname(hostname, sizeof(hostname));</a>
+<a name="ln54">	if (error != B_OK) {</a>
+<a name="ln55">		fprintf(stderr, &quot;gethostname() failed, defaults to localhost\n&quot;);</a>
+<a name="ln56">		strlcpy(hostname, &quot;localhost&quot;, sizeof(hostname));</a>
+<a name="ln57">	}</a>
+<a name="ln58"> </a>
+<a name="ln59">	fTargetHost = new(std::nothrow) TargetHost(hostname);</a>
+<a name="ln60">	if (fTargetHost == NULL)</a>
+<a name="ln61">		return B_NO_MEMORY;</a>
+<a name="ln62"> </a>
+<a name="ln63">	team_info info;</a>
+<a name="ln64">	error = get_team_info(B_CURRENT_TEAM, &amp;info);</a>
+<a name="ln65">	if (error != B_OK)</a>
+<a name="ln66">		return error;</a>
+<a name="ln67"> </a>
+<a name="ln68">	char buffer[128];</a>
+<a name="ln69">	snprintf(buffer, sizeof(buffer), &quot;LocalTargetHostInterface %&quot; B_PRId32,</a>
+<a name="ln70">		info.team);</a>
+<a name="ln71"> </a>
+<a name="ln72">	fDataPort = create_port(100, buffer);</a>
+<a name="ln73">	if (fDataPort &lt; 0)</a>
+<a name="ln74">		return fDataPort;</a>
+<a name="ln75"> </a>
+<a name="ln76">	fPortWorker = spawn_thread(_PortLoop, &quot;Local Target Host Loop&quot;,</a>
+<a name="ln77">		B_NORMAL_PRIORITY, this);</a>
+<a name="ln78">	if (fPortWorker &lt; 0)</a>
+<a name="ln79">		return fPortWorker;</a>
+<a name="ln80"> </a>
+<a name="ln81">	resume_thread(fPortWorker);</a>
+<a name="ln82"> </a>
+<a name="ln83">	AutoLocker&lt;TargetHost&gt; hostLocker(fTargetHost);</a>
+<a name="ln84"> </a>
+<a name="ln85">	error = __start_watching_system(-1,</a>
+<a name="ln86">		B_WATCH_SYSTEM_TEAM_CREATION | B_WATCH_SYSTEM_TEAM_DELETION,</a>
+<a name="ln87">		fDataPort, 0);</a>
+<a name="ln88">	if (error != B_OK)</a>
+<a name="ln89">		return error;</a>
+<a name="ln90"> </a>
+<a name="ln91">	int32 cookie = 0;</a>
+<a name="ln92">	while (get_next_team_info(&amp;cookie, &amp;info) == B_OK) {</a>
+<a name="ln93">		error = fTargetHost-&gt;AddTeam(info);</a>
+<a name="ln94">		if (error != B_OK)</a>
+<a name="ln95">			return error;</a>
+<a name="ln96">	}</a>
+<a name="ln97"> </a>
+<a name="ln98">	snprintf(buffer, sizeof(buffer), &quot;Local (%s)&quot;, hostname);</a>
+<a name="ln99">	SetName(buffer);</a>
+<a name="ln100"> </a>
+<a name="ln101">	return B_OK;</a>
+<a name="ln102">}</a>
+<a name="ln103"> </a>
+<a name="ln104"> </a>
+<a name="ln105">void</a>
+<a name="ln106">LocalTargetHostInterface::Close()</a>
+<a name="ln107">{</a>
+<a name="ln108">	if (fDataPort &gt; 0) {</a>
+<a name="ln109">		__stop_watching_system(-1,</a>
+<a name="ln110">			B_WATCH_SYSTEM_TEAM_CREATION | B_WATCH_SYSTEM_TEAM_DELETION,</a>
+<a name="ln111">			fDataPort, 0);</a>
+<a name="ln112"> </a>
+<a name="ln113">		delete_port(fDataPort);</a>
+<a name="ln114">		fDataPort = -1;</a>
+<a name="ln115">	}</a>
+<a name="ln116"> </a>
+<a name="ln117">	if (fPortWorker &gt; 0) {</a>
+<a name="ln118">		wait_for_thread(fPortWorker, NULL);</a>
+<a name="ln119">		fPortWorker = -1;</a>
+<a name="ln120">	}</a>
+<a name="ln121">}</a>
+<a name="ln122"> </a>
+<a name="ln123"> </a>
+<a name="ln124">bool</a>
+<a name="ln125">LocalTargetHostInterface::IsLocal() const</a>
+<a name="ln126">{</a>
+<a name="ln127">	return true;</a>
+<a name="ln128">}</a>
+<a name="ln129"> </a>
+<a name="ln130"> </a>
+<a name="ln131">bool</a>
+<a name="ln132">LocalTargetHostInterface::Connected() const</a>
+<a name="ln133">{</a>
+<a name="ln134">	return true;</a>
+<a name="ln135">}</a>
+<a name="ln136"> </a>
+<a name="ln137"> </a>
+<a name="ln138">TargetHost*</a>
+<a name="ln139">LocalTargetHostInterface::GetTargetHost()</a>
+<a name="ln140">{</a>
+<a name="ln141">	return fTargetHost;</a>
+<a name="ln142">}</a>
+<a name="ln143"> </a>
+<a name="ln144"> </a>
+<a name="ln145">status_t</a>
+<a name="ln146">LocalTargetHostInterface::Attach(team_id teamID, thread_id threadID,</a>
+<a name="ln147">	DebuggerInterface*&amp; _interface) const</a>
+<a name="ln148">{</a>
+<a name="ln149">	if (teamID &lt; 0 &amp;&amp; threadID &lt; 0)</a>
+<a name="ln150">		return B_BAD_VALUE;</a>
+<a name="ln151"> </a>
+<a name="ln152">	status_t error;</a>
+<a name="ln153">	if (teamID &lt; 0) {</a>
+<a name="ln154">		thread_info threadInfo;</a>
+<a name="ln155">		error = get_thread_info(threadID, &amp;threadInfo);</a>
+<a name="ln156">		if (error != B_OK)</a>
+<a name="ln157">			return error;</a>
+<a name="ln158"> </a>
+<a name="ln159">		teamID = threadInfo.team;</a>
+<a name="ln160">	}</a>
+<a name="ln161"> </a>
+<a name="ln162">	LocalDebuggerInterface* interface</a>
+<a name="ln163">		= new(std::nothrow) LocalDebuggerInterface(teamID);</a>
+<a name="ln164">	if (interface == NULL)</a>
+<a name="ln165">		return B_NO_MEMORY;</a>
+<a name="ln166"> </a>
+<a name="ln167">	BReference&lt;DebuggerInterface&gt; interfaceReference(interface, true);</a>
+<a name="ln168">	error = interface-&gt;Init();</a>
+<a name="ln169">	if (error != B_OK)</a>
+<a name="ln170">		return error;</a>
+<a name="ln171"> </a>
+<a name="ln172">	_interface = interface;</a>
+<a name="ln173">	interfaceReference.Detach();</a>
+<a name="ln174">	return B_OK;</a>
+<a name="ln175">}</a>
+<a name="ln176"> </a>
+<a name="ln177"> </a>
+<a name="ln178">status_t</a>
+<a name="ln179">LocalTargetHostInterface::CreateTeam(int commandLineArgc,</a>
+<a name="ln180">	const char* const* arguments, team_id&amp; _teamID) const</a>
+<a name="ln181">{</a>
+<a name="ln182">	thread_id thread = load_program(arguments, commandLineArgc, false);</a>
+<a name="ln183">	if (thread &lt; 0)</a>
+<a name="ln184">		return thread;</a>
+<a name="ln185"> </a>
+<a name="ln186">	// main thread ID == team ID.</a>
+<a name="ln187">	_teamID = thread;</a>
+<a name="ln188">	return B_OK;</a>
+<a name="ln189">}</a>
+<a name="ln190"> </a>
+<a name="ln191"> </a>
+<a name="ln192">status_t</a>
+<a name="ln193">LocalTargetHostInterface::LoadCore(const char* coreFilePath,</a>
+<a name="ln194">	DebuggerInterface*&amp; _interface, thread_id&amp; _thread) const</a>
+<a name="ln195">{</a>
+<a name="ln196">	// load the core file</a>
+<a name="ln197">	CoreFile* coreFile = new(std::nothrow) CoreFile;</a>
+<a name="ln198">	if (coreFile == NULL)</a>
+<a name="ln199">		return B_NO_MEMORY;</a>
+<a name="ln200">	ObjectDeleter&lt;CoreFile&gt; coreFileDeleter(coreFile);</a>
+<a name="ln201"> </a>
+<a name="ln202">	status_t error = coreFile-&gt;Init(coreFilePath);</a>
+<a name="ln203">	if (error != B_OK)</a>
+<a name="ln204">		return error;</a>
+<a name="ln205"> </a>
+<a name="ln206">	// create the debugger interface</a>
+<a name="ln207">	CoreFileDebuggerInterface* interface</a>
+<a name="ln208">		= new(std::nothrow) CoreFileDebuggerInterface(coreFile);</a>
+<a name="ln209">	if (interface == NULL)</a>
+<a name="ln210">		return B_NO_MEMORY;</a>
+<a name="ln211">	coreFileDeleter.Detach();</a>
+<a name="ln212"> </a>
+<a name="ln213">	BReference&lt;DebuggerInterface&gt; interfaceReference(interface, true);</a>
+<a name="ln214">	error = interface-&gt;Init();</a>
+<a name="ln215">	if (error != B_OK)</a>
+<a name="ln216">		return error;</a>
+<a name="ln217"> </a>
+<a name="ln218">	const CoreFileTeamInfo&amp; teamInfo = coreFile-&gt;GetTeamInfo();</a>
+<a name="ln219">	_thread = teamInfo.Id();</a>
+<a name="ln220">	_interface = interface;</a>
+<a name="ln221">	interfaceReference.Detach();</a>
+<a name="ln222"> </a>
+<a name="ln223">	return B_OK;</a>
+<a name="ln224">}</a>
+<a name="ln225"> </a>
+<a name="ln226"> </a>
+<a name="ln227">status_t</a>
+<a name="ln228">LocalTargetHostInterface::FindTeamByThread(thread_id thread,</a>
+<a name="ln229">	team_id&amp; _teamID) const</a>
+<a name="ln230">{</a>
+<a name="ln231">	thread_info info;</a>
+<a name="ln232">	status_t error = get_thread_info(thread, &amp;info);</a>
+<a name="ln233">	if (error != B_OK)</a>
+<a name="ln234">		return error;</a>
+<a name="ln235"> </a>
+<a name="ln236">	_teamID = info.team;</a>
+<a name="ln237">	return B_OK;</a>
+<a name="ln238">}</a>
+<a name="ln239"> </a>
+<a name="ln240"> </a>
+<a name="ln241">status_t</a>
+<a name="ln242">LocalTargetHostInterface::_PortLoop(void* arg)</a>
+<a name="ln243">{</a>
+<a name="ln244">	LocalTargetHostInterface* interface = (LocalTargetHostInterface*)arg;</a>
+<a name="ln245">	set&lt;team_id&gt; waitingTeams;</a>
+<a name="ln246"> </a>
+<a name="ln247">	for (;;) {</a>
+<a name="ln248">		status_t error;</a>
+<a name="ln249">		bool addToWaiters;</a>
+<a name="ln250">		char buffer[2048];</a>
+<a name="ln251">		int32 messageCode;</a>
+<a name="ln252">		team_id team;</a>
+<a name="ln253"> </a>
+<a name="ln254">		ssize_t size = read_port_etc(interface-&gt;fDataPort, &amp;messageCode,</a>
+<a name="ln255">			buffer, sizeof(buffer), B_TIMEOUT, waitingTeams.empty()</a>
+<a name="ln256">				? B_INFINITE_TIMEOUT : 20000);</a>
+<a name="ln257">		if (size == B_INTERRUPTED)</a>
+<a name="ln258">			continue;</a>
+<a name="ln259">		else if (size == B_TIMED_OUT &amp;&amp; !waitingTeams.empty()) {</a>
+<a name="ln260">			for (set&lt;team_id&gt;::iterator it = waitingTeams.begin();</a>
+<a name="ln261">				it != waitingTeams.end(); ++it) {</a>
+<a name="ln262">				team = *it;</a>
+<a name="ln263">				error = interface-&gt;_HandleTeamEvent(team,</a>
+<a name="ln264">					B_TEAM_CREATED, addToWaiters);</a>
+<a name="ln265">				if (error != B_OK)</a>
+<a name="ln266">					continue;</a>
+<a name="ln267">				else if (!addToWaiters) {</a>
+<a name="ln268">					waitingTeams.erase(it);</a>
+<a name="ln269">					if (waitingTeams.empty())</a>
+<a name="ln270">						break;</a>
+<a name="ln271">					it = waitingTeams.begin();</a>
+<a name="ln272">				}</a>
+<a name="ln273">			}</a>
+<a name="ln274">			continue;</a>
+<a name="ln275">		} else if (size &lt; 0)</a>
+<a name="ln276">			return size;</a>
+<a name="ln277"> </a>
+<a name="ln278">		KMessage message;</a>
+<a name="ln279">		size = message.SetTo(buffer);</a>
+<a name="ln280">		if (size != B_OK)</a>
+<a name="ln281">			continue;</a>
+<a name="ln282"> </a>
+<a name="ln283">		if (message.What() != B_SYSTEM_OBJECT_UPDATE)</a>
+<a name="ln284">			continue;</a>
+<a name="ln285"> </a>
+<a name="ln286">		int32 opcode = 0;</a>
+<a name="ln287">		if (message.FindInt32(&quot;opcode&quot;, &amp;opcode) != B_OK)</a>
+<a name="ln288">			continue;</a>
+<a name="ln289"> </a>
+<a name="ln290">		team = -1;</a>
+<a name="ln291">		if (message.FindInt32(&quot;team&quot;, &amp;team) != B_OK)</a>
+<a name="ln292">			continue;</a>
+<a name="ln293"> </a>
+<a name="ln294">		error = interface-&gt;_HandleTeamEvent(team, opcode,</a>
+<a name="ln295">			addToWaiters);</a>
+<a name="ln296">		if (error != B_OK)</a>
+<a name="ln297">			continue;</a>
+<a name="ln298">		if (opcode == B_TEAM_CREATED &amp;&amp; addToWaiters) {</a>
+<a name="ln299">			try {</a>
+<a name="ln300">				waitingTeams.insert(team);</a>
+<a name="ln301">			} catch (...) {</a>
+<a name="ln302">				continue;</a>
+<a name="ln303">			}</a>
+<a name="ln304">		}</a>
+<a name="ln305">	}</a>
+<a name="ln306"> </a>
+<a name="ln307">	return B_OK;</a>
+<a name="ln308">}</a>
+<a name="ln309"> </a>
+<a name="ln310"> </a>
+<a name="ln311">status_t</a>
+<a name="ln312">LocalTargetHostInterface::_HandleTeamEvent(team_id team, int32 opcode,</a>
+<a name="ln313">	bool&amp; addToWaiters)</a>
+<a name="ln314">{</a>
+<a name="ln315">	addToWaiters = false;</a>
+<a name="ln316">	AutoLocker&lt;TargetHost&gt; locker(fTargetHost);</a>
+<a name="ln317">	switch (opcode) {</a>
+<a name="ln318">		case B_TEAM_CREATED:</a>
+<a name="ln319">		case B_TEAM_EXEC:</a>
+<a name="ln320">		{</a>
+<a name="ln321">			team_info info;</a>
+<a name="ln322">			status_t error = get_team_info(team, &amp;info);</a>
+<a name="ln323">			// this team is already gone, no point in sending a notification</a>
+<a name="ln324">			if (error == B_BAD_TEAM_ID)</a>
+<a name="ln325">				return B_OK;</a>
+<a name="ln326">			else if (error != B_OK)</a>
+<a name="ln327">				return error;</a>
+<a name="ln328">			else {</a>
+<a name="ln329">				int32 cookie = 0;</a>
+<a name="ln330">				image_info imageInfo;</a>
+<a name="ln331">				addToWaiters = true;</a>
+<a name="ln332">				while (get_next_image_info(team, &amp;cookie, &amp;imageInfo)</a>
+<a name="ln333">					== B_OK) {</a>
+<a name="ln334">					if (imageInfo.type == B_APP_IMAGE) {</a>
+<a name="ln335">						addToWaiters = false;</a>
+<a name="ln336">						break;</a>
+<a name="ln337">					}</a>
+<a name="ln338">				}</a>
+<a name="ln339">				if (addToWaiters)</a>
+<a name="ln340">					return B_OK;</a>
+<a name="ln341">			}</a>
+<a name="ln342"> </a>
+<a name="ln343">			if (opcode == B_TEAM_CREATED)</a>
+<a name="ln344">				fTargetHost-&gt;AddTeam(info);</a>
+<a name="ln345">			else</a>
+<a name="ln346">				fTargetHost-&gt;UpdateTeam(info);</a>
+<a name="ln347">			break;</a>
+<a name="ln348">		}</a>
+<a name="ln349"> </a>
+<a name="ln350">		case B_TEAM_DELETED:</a>
+<a name="ln351">		{</a>
+<a name="ln352">			fTargetHost-&gt;RemoveTeam(team);</a>
+<a name="ln353">			break;</a>
+<a name="ln354">		}</a>
+<a name="ln355"> </a>
+<a name="ln356">		default:</a>
+<a name="ln357">		{</a>
+<a name="ln358">			break;</a>
+<a name="ln359">		}</a>
+<a name="ln360">	}</a>
+<a name="ln361"> </a>
+<a name="ln362">	return B_OK;</a>
+<a name="ln363">}</a>
+
+</code></pre>
+<div class="balloon" rel="30"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fPortWorker.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

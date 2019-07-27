@@ -1,0 +1,475 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>NFS4Server.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2012 Haiku, Inc. All rights reserved.</a>
+<a name="ln3"> * Distributed under the terms of the MIT License.</a>
+<a name="ln4"> *</a>
+<a name="ln5"> * Authors:</a>
+<a name="ln6"> *		Paweł Dziepak, pdziepak@quarnos.org</a>
+<a name="ln7"> */</a>
+<a name="ln8"> </a>
+<a name="ln9"> </a>
+<a name="ln10">#include &quot;NFS4Server.h&quot;</a>
+<a name="ln11"> </a>
+<a name="ln12">#include &lt;AutoDeleter.h&gt;</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &quot;FileSystem.h&quot;</a>
+<a name="ln15">#include &quot;Inode.h&quot;</a>
+<a name="ln16">#include &quot;Request.h&quot;</a>
+<a name="ln17">#include &quot;WorkQueue.h&quot;</a>
+<a name="ln18"> </a>
+<a name="ln19"> </a>
+<a name="ln20">NFS4Server::NFS4Server(RPC::Server* serv)</a>
+<a name="ln21">	:</a>
+<a name="ln22">	fThreadCancel(true),</a>
+<a name="ln23">	fWaitCancel(create_sem(0, NULL)),</a>
+<a name="ln24">	fLeaseTime(0),</a>
+<a name="ln25">	fClientIdLastUse(0),</a>
+<a name="ln26">	fUseCount(0),</a>
+<a name="ln27">	fServer(serv)</a>
+<a name="ln28">{</a>
+<a name="ln29">	ASSERT(serv != NULL);</a>
+<a name="ln30"> </a>
+<a name="ln31">	mutex_init(&amp;fClientIdLock, NULL);</a>
+<a name="ln32">	mutex_init(&amp;fFSLock, NULL);</a>
+<a name="ln33">	mutex_init(&amp;fThreadStartLock, NULL);</a>
+<a name="ln34"> </a>
+<a name="ln35">}</a>
+<a name="ln36"> </a>
+<a name="ln37"> </a>
+<a name="ln38">NFS4Server::~NFS4Server()</a>
+<a name="ln39">{</a>
+<a name="ln40">	fThreadCancel = true;</a>
+<a name="ln41">	fUseCount = 0;</a>
+<a name="ln42">	release_sem(fWaitCancel);</a>
+<a name="ln43">	status_t result;</a>
+<a name="ln44">	wait_for_thread(fThread, &amp;result);</a>
+<a name="ln45"> </a>
+<a name="ln46">	delete_sem(fWaitCancel);</a>
+<a name="ln47">	mutex_destroy(&amp;fClientIdLock);</a>
+<a name="ln48">	mutex_destroy(&amp;fFSLock);</a>
+<a name="ln49">	mutex_destroy(&amp;fThreadStartLock);</a>
+<a name="ln50">}</a>
+<a name="ln51"> </a>
+<a name="ln52"> </a>
+<a name="ln53">uint64</a>
+<a name="ln54">NFS4Server::ServerRebooted(uint64 clientId)</a>
+<a name="ln55">{</a>
+<a name="ln56">	if (clientId != fClientId)</a>
+<a name="ln57">		return fClientId;</a>
+<a name="ln58"> </a>
+<a name="ln59">	fClientId = ClientId(clientId, true);</a>
+<a name="ln60"> </a>
+<a name="ln61">	// reclaim all opened files and held locks from all filesystems</a>
+<a name="ln62">	MutexLocker _(fFSLock);</a>
+<a name="ln63">	FileSystem* fs = fFileSystems.Head();</a>
+<a name="ln64">	while (fs != NULL) {</a>
+<a name="ln65">		DoublyLinkedList&lt;OpenState&gt;::Iterator iterator</a>
+<a name="ln66">			= fs-&gt;OpenFilesLock().GetIterator();</a>
+<a name="ln67">		OpenState* current = iterator.Next();</a>
+<a name="ln68">		while (current != NULL) {</a>
+<a name="ln69">			current-&gt;Reclaim(fClientId);</a>
+<a name="ln70"> </a>
+<a name="ln71">			current = iterator.Next();</a>
+<a name="ln72">		}</a>
+<a name="ln73">		fs-&gt;OpenFilesUnlock();</a>
+<a name="ln74"> </a>
+<a name="ln75">		fs = fFileSystems.GetNext(fs);</a>
+<a name="ln76">	}</a>
+<a name="ln77"> </a>
+<a name="ln78">	return fClientId;</a>
+<a name="ln79">}</a>
+<a name="ln80"> </a>
+<a name="ln81"> </a>
+<a name="ln82">void</a>
+<a name="ln83">NFS4Server::AddFileSystem(FileSystem* fs)</a>
+<a name="ln84">{</a>
+<a name="ln85">	ASSERT(fs != NULL);</a>
+<a name="ln86"> </a>
+<a name="ln87">	MutexLocker _(fFSLock);</a>
+<a name="ln88">	fFileSystems.Add(fs);</a>
+<a name="ln89"> </a>
+<a name="ln90">	fUseCount += fs-&gt;OpenFilesCount();</a>
+<a name="ln91">	if (fs-&gt;OpenFilesCount() &gt; 0)</a>
+<a name="ln92">		_StartRenewing();</a>
+<a name="ln93">}</a>
+<a name="ln94"> </a>
+<a name="ln95"> </a>
+<a name="ln96">void</a>
+<a name="ln97">NFS4Server::RemoveFileSystem(FileSystem* fs)</a>
+<a name="ln98">{</a>
+<a name="ln99">	ASSERT(fs != NULL);</a>
+<a name="ln100"> </a>
+<a name="ln101">	MutexLocker _(fFSLock);</a>
+<a name="ln102">	fFileSystems.Remove(fs);</a>
+<a name="ln103">	fUseCount -= fs-&gt;OpenFilesCount();</a>
+<a name="ln104">}</a>
+<a name="ln105"> </a>
+<a name="ln106"> </a>
+<a name="ln107">uint64</a>
+<a name="ln108">NFS4Server::ClientId(uint64 prevId, bool forceNew)</a>
+<a name="ln109">{</a>
+<a name="ln110">	MutexLocker _(fClientIdLock);</a>
+<a name="ln111">	if ((fUseCount == 0 &amp;&amp; fClientIdLastUse + (time_t)LeaseTime() &lt; time(NULL))</a>
+<a name="ln112">		|| (forceNew &amp;&amp; fClientId == prevId)) {</a>
+<a name="ln113"> </a>
+<a name="ln114">		Request request(fServer, NULL);</a>
+<a name="ln115">		request.Builder().SetClientID(fServer);</a>
+<a name="ln116"> </a>
+<a name="ln117">		status_t result = request.Send();</a>
+<a name="ln118">		if (result != B_OK)</a>
+<a name="ln119">			return fClientId;</a>
+<a name="ln120"> </a>
+<a name="ln121">		uint64 ver;</a>
+<a name="ln122">		result = request.Reply().SetClientID(&amp;fClientId, &amp;ver);</a>
+<a name="ln123">		if (result != B_OK)</a>
+<a name="ln124">			return fClientId;</a>
+<a name="ln125"> </a>
+<a name="ln126">		request.Reset();</a>
+<a name="ln127">		request.Builder().SetClientIDConfirm(fClientId, ver);</a>
+<a name="ln128"> </a>
+<a name="ln129">		result = request.Send();</a>
+<a name="ln130">		if (result != B_OK)</a>
+<a name="ln131">			return fClientId;</a>
+<a name="ln132"> </a>
+<a name="ln133">		result = request.Reply().SetClientIDConfirm();</a>
+<a name="ln134">		if (result != B_OK)</a>
+<a name="ln135">			return fClientId;</a>
+<a name="ln136">	}</a>
+<a name="ln137"> </a>
+<a name="ln138">	fClientIdLastUse = time(NULL);</a>
+<a name="ln139">	return fClientId;</a>
+<a name="ln140">}</a>
+<a name="ln141"> </a>
+<a name="ln142"> </a>
+<a name="ln143">status_t</a>
+<a name="ln144">NFS4Server::FileSystemMigrated()</a>
+<a name="ln145">{</a>
+<a name="ln146">	// reclaim all opened files and held locks from all filesystems</a>
+<a name="ln147">	MutexLocker _(fFSLock);</a>
+<a name="ln148">	FileSystem* fs = fFileSystems.Head();</a>
+<a name="ln149">	while (fs != NULL) {</a>
+<a name="ln150">		fs-&gt;Migrate(fServer);</a>
+<a name="ln151">		fs = fFileSystems.GetNext(fs);</a>
+<a name="ln152">	}</a>
+<a name="ln153"> </a>
+<a name="ln154">	return B_OK;</a>
+<a name="ln155">}</a>
+<a name="ln156"> </a>
+<a name="ln157"> </a>
+<a name="ln158">status_t</a>
+<a name="ln159">NFS4Server::_GetLeaseTime()</a>
+<a name="ln160">{</a>
+<a name="ln161">	Request request(fServer, NULL);</a>
+<a name="ln162">	request.Builder().PutRootFH();</a>
+<a name="ln163">	Attribute attr[] = { FATTR4_LEASE_TIME };</a>
+<a name="ln164">	request.Builder().GetAttr(attr, sizeof(attr) / sizeof(Attribute));</a>
+<a name="ln165"> </a>
+<a name="ln166">	status_t result = request.Send();</a>
+<a name="ln167">	if (result != B_OK)</a>
+<a name="ln168">		return result;</a>
+<a name="ln169"> </a>
+<a name="ln170">	ReplyInterpreter&amp; reply = request.Reply();</a>
+<a name="ln171"> </a>
+<a name="ln172">	reply.PutRootFH();</a>
+<a name="ln173"> </a>
+<a name="ln174">	AttrValue* values;</a>
+<a name="ln175">	uint32 count;</a>
+<a name="ln176">	result = reply.GetAttr(&amp;values, &amp;count);</a>
+<a name="ln177">	if (result != B_OK)</a>
+<a name="ln178">		return result;</a>
+<a name="ln179">	ArrayDeleter&lt;AttrValue&gt; valuesDeleter(values);</a>
+<a name="ln180"> </a>
+<a name="ln181">	// FATTR4_LEASE_TIME is mandatory</a>
+<a name="ln182">	if (count &lt; 1 || values[0].fAttribute != FATTR4_LEASE_TIME)</a>
+<a name="ln183">		return B_BAD_VALUE;</a>
+<a name="ln184"> </a>
+<a name="ln185">	fLeaseTime = values[0].fData.fValue32;</a>
+<a name="ln186"> </a>
+<a name="ln187">	return B_OK;</a>
+<a name="ln188">}</a>
+<a name="ln189"> </a>
+<a name="ln190"> </a>
+<a name="ln191">status_t</a>
+<a name="ln192">NFS4Server::_StartRenewing()</a>
+<a name="ln193">{</a>
+<a name="ln194">	if (!fThreadCancel)</a>
+<a name="ln195">		return B_OK;</a>
+<a name="ln196"> </a>
+<a name="ln197">	MutexLocker _(fThreadStartLock);</a>
+<a name="ln198"> </a>
+<a name="ln199">	if (!fThreadCancel)</a>
+<a name="ln200">		return B_OK;</a>
+<a name="ln201"> </a>
+<a name="ln202">	if (fLeaseTime == 0) {</a>
+<a name="ln203">		status_t result = _GetLeaseTime();</a>
+<a name="ln204">		if (result != B_OK)</a>
+<a name="ln205">			return result;</a>
+<a name="ln206">	}</a>
+<a name="ln207"> </a>
+<a name="ln208">	fThreadCancel = false;</a>
+<a name="ln209">	fThread = spawn_kernel_thread(&amp;NFS4Server::_RenewalThreadStart,</a>
+<a name="ln210">		&quot;NFSv4 Renewal&quot;, B_NORMAL_PRIORITY, this);</a>
+<a name="ln211">	if (fThread &lt; B_OK)</a>
+<a name="ln212">		return fThread;</a>
+<a name="ln213"> </a>
+<a name="ln214">	status_t result = resume_thread(fThread);</a>
+<a name="ln215">	if (result != B_OK) {</a>
+<a name="ln216">		kill_thread(fThread);</a>
+<a name="ln217">		return result;</a>
+<a name="ln218">	}</a>
+<a name="ln219"> </a>
+<a name="ln220">	return B_OK;</a>
+<a name="ln221">}</a>
+<a name="ln222"> </a>
+<a name="ln223"> </a>
+<a name="ln224">status_t</a>
+<a name="ln225">NFS4Server::_Renewal()</a>
+<a name="ln226">{</a>
+<a name="ln227">	while (!fThreadCancel) {</a>
+<a name="ln228">		// TODO: operations like OPEN, READ, CLOSE, etc also renew leases</a>
+<a name="ln229">		status_t result = acquire_sem_etc(fWaitCancel, 1,</a>
+<a name="ln230">			B_RELATIVE_TIMEOUT, sSecToBigTime(fLeaseTime - 2));</a>
+<a name="ln231">		if (result != B_TIMED_OUT) {</a>
+<a name="ln232">			if (result == B_OK)</a>
+<a name="ln233">				release_sem(fWaitCancel);</a>
+<a name="ln234">			return result;</a>
+<a name="ln235">		}</a>
+<a name="ln236"> </a>
+<a name="ln237">		uint64 clientId = fClientId;</a>
+<a name="ln238"> </a>
+<a name="ln239">		if (fUseCount == 0) {</a>
+<a name="ln240">			MutexLocker _(fFSLock);</a>
+<a name="ln241">			if (fUseCount == 0) {</a>
+<a name="ln242">				fThreadCancel = true;</a>
+<a name="ln243">				return B_OK;</a>
+<a name="ln244">			}</a>
+<a name="ln245">		}</a>
+<a name="ln246"> </a>
+<a name="ln247">		Request request(fServer, NULL);</a>
+<a name="ln248">		request.Builder().Renew(clientId);</a>
+<a name="ln249">		result = request.Send();</a>
+<a name="ln250">		if (result != B_OK)</a>
+<a name="ln251">			continue;</a>
+<a name="ln252"> </a>
+<a name="ln253">		switch (request.Reply().NFS4Error()) {</a>
+<a name="ln254">			case NFS4ERR_CB_PATH_DOWN:</a>
+<a name="ln255">				RecallAll();</a>
+<a name="ln256">				break;</a>
+<a name="ln257">			case NFS4ERR_STALE_CLIENTID:</a>
+<a name="ln258">				ServerRebooted(clientId);</a>
+<a name="ln259">				break;</a>
+<a name="ln260">			case NFS4ERR_LEASE_MOVED:</a>
+<a name="ln261">				FileSystemMigrated();</a>
+<a name="ln262">				break;</a>
+<a name="ln263">		}</a>
+<a name="ln264">	}</a>
+<a name="ln265"> </a>
+<a name="ln266">	return B_OK;</a>
+<a name="ln267">}</a>
+<a name="ln268"> </a>
+<a name="ln269"> </a>
+<a name="ln270">status_t</a>
+<a name="ln271">NFS4Server::_RenewalThreadStart(void* ptr)</a>
+<a name="ln272">{</a>
+<a name="ln273">	ASSERT(ptr != NULL);</a>
+<a name="ln274">	NFS4Server* server = reinterpret_cast&lt;NFS4Server*&gt;(ptr);</a>
+<a name="ln275">	return server-&gt;_Renewal();</a>
+<a name="ln276">}</a>
+<a name="ln277"> </a>
+<a name="ln278"> </a>
+<a name="ln279">status_t</a>
+<a name="ln280">NFS4Server::ProcessCallback(RPC::CallbackRequest* request,</a>
+<a name="ln281">	Connection* connection)</a>
+<a name="ln282">{</a>
+<a name="ln283">	ASSERT(request != NULL);</a>
+<a name="ln284">	ASSERT(connection != NULL);</a>
+<a name="ln285"> </a>
+<a name="ln286">	RequestInterpreter req(request);</a>
+<a name="ln287">	ReplyBuilder reply(request-&gt;XID());</a>
+<a name="ln288"> </a>
+<a name="ln289">	status_t result;</a>
+<a name="ln290">	uint32 count = req.OperationCount();</a>
+<a name="ln291"> </a>
+<a name="ln292">	for (uint32 i = 0; i &lt; count; i++) {</a>
+<a name="ln293">		switch (req.Operation()) {</a>
+<a name="ln294">			case OpCallbackGetAttr:</a>
+<a name="ln295">				result = CallbackGetAttr(&amp;req, &amp;reply);</a>
+<a name="ln296">				break;</a>
+<a name="ln297">			case OpCallbackRecall:</a>
+<a name="ln298">				result = CallbackRecall(&amp;req, &amp;reply);</a>
+<a name="ln299">				break;</a>
+<a name="ln300">			default:</a>
+<a name="ln301">				result = B_NOT_SUPPORTED;</a>
+<a name="ln302">		}</a>
+<a name="ln303"> </a>
+<a name="ln304">		if (result != B_OK)</a>
+<a name="ln305">			break;</a>
+<a name="ln306">	}</a>
+<a name="ln307"> </a>
+<a name="ln308">	XDR::WriteStream&amp; stream = reply.Reply()-&gt;Stream();</a>
+<a name="ln309">	connection-&gt;Send(stream.Buffer(), stream.Size());</a>
+<a name="ln310"> </a>
+<a name="ln311">	return B_OK;</a>
+<a name="ln312">}</a>
+<a name="ln313"> </a>
+<a name="ln314"> </a>
+<a name="ln315">status_t</a>
+<a name="ln316">NFS4Server::CallbackRecall(RequestInterpreter* request, ReplyBuilder* reply)</a>
+<a name="ln317">{</a>
+<a name="ln318">	ASSERT(request != NULL);</a>
+<a name="ln319">	ASSERT(reply != NULL);</a>
+<a name="ln320"> </a>
+<a name="ln321">	uint32 stateID[3];</a>
+<a name="ln322">	uint32 stateSeq;</a>
+<a name="ln323">	bool truncate;</a>
+<a name="ln324">	FileHandle handle;</a>
+<a name="ln325"> </a>
+<a name="ln326">	status_t result = request-&gt;Recall(&amp;handle, truncate, &amp;stateSeq, stateID);</a>
+<a name="ln327">	if (result != B_OK)</a>
+<a name="ln328">		return result;</a>
+<a name="ln329"> </a>
+<a name="ln330">	MutexLocker locker(fFSLock);</a>
+<a name="ln331"> </a>
+<a name="ln332">	Delegation* delegation = NULL;</a>
+<a name="ln333">	FileSystem* current = fFileSystems.Head();</a>
+<a name="ln334">	while (current != NULL) {</a>
+<a name="ln335">		delegation = current-&gt;GetDelegation(handle);</a>
+<a name="ln336">		if (delegation != NULL)</a>
+<a name="ln337">			break;</a>
+<a name="ln338"> </a>
+<a name="ln339">		current = fFileSystems.GetNext(current);</a>
+<a name="ln340">	}</a>
+<a name="ln341">	locker.Unlock();</a>
+<a name="ln342"> </a>
+<a name="ln343">	if (delegation == NULL) {</a>
+<a name="ln344">		reply-&gt;Recall(B_FILE_NOT_FOUND);</a>
+<a name="ln345">		return B_FILE_NOT_FOUND;</a>
+<a name="ln346">	}</a>
+<a name="ln347"> </a>
+<a name="ln348">	DelegationRecallArgs* args = new(std::nothrow) DelegationRecallArgs;</a>
+<a name="ln349">	args-&gt;fDelegation = delegation;</a>
+<a name="ln350">	args-&gt;fTruncate = truncate;</a>
+<a name="ln351">	gWorkQueue-&gt;EnqueueJob(DelegationRecall, args);</a>
+<a name="ln352"> </a>
+<a name="ln353">	reply-&gt;Recall(B_OK);</a>
+<a name="ln354"> </a>
+<a name="ln355">	return B_OK;</a>
+<a name="ln356">}</a>
+<a name="ln357"> </a>
+<a name="ln358"> </a>
+<a name="ln359">status_t</a>
+<a name="ln360">NFS4Server::CallbackGetAttr(RequestInterpreter* request, ReplyBuilder* reply)</a>
+<a name="ln361">{</a>
+<a name="ln362">	ASSERT(request != NULL);</a>
+<a name="ln363">	ASSERT(reply != NULL);</a>
+<a name="ln364"> </a>
+<a name="ln365">	FileHandle handle;</a>
+<a name="ln366">	int mask;</a>
+<a name="ln367"> </a>
+<a name="ln368">	status_t result = request-&gt;GetAttr(&amp;handle, &amp;mask);</a>
+<a name="ln369">	if (result != B_OK)</a>
+<a name="ln370">		return result;</a>
+<a name="ln371"> </a>
+<a name="ln372">	MutexLocker locker(fFSLock);</a>
+<a name="ln373"> </a>
+<a name="ln374">	Delegation* delegation = NULL;</a>
+<a name="ln375">	FileSystem* current = fFileSystems.Head();</a>
+<a name="ln376">	while (current != NULL) {</a>
+<a name="ln377">		delegation = current-&gt;GetDelegation(handle);</a>
+<a name="ln378">		if (delegation != NULL)</a>
+<a name="ln379">			break;</a>
+<a name="ln380"> </a>
+<a name="ln381">		current = fFileSystems.GetNext(current);</a>
+<a name="ln382">	}</a>
+<a name="ln383">	locker.Unlock();</a>
+<a name="ln384"> </a>
+<a name="ln385">	if (delegation == NULL) {</a>
+<a name="ln386">		reply-&gt;GetAttr(B_FILE_NOT_FOUND, 0, 0, 0);</a>
+<a name="ln387">		return B_FILE_NOT_FOUND;</a>
+<a name="ln388">	}</a>
+<a name="ln389"> </a>
+<a name="ln390">	struct stat st;</a>
+<a name="ln391">	delegation-&gt;GetInode()-&gt;Stat(&amp;st);</a>
+<a name="ln392"> </a>
+<a name="ln393">	uint64 change;</a>
+<a name="ln394">	change = delegation-&gt;GetInode()-&gt;Change();</a>
+<a name="ln395">	if (delegation-&gt;GetInode()-&gt;Dirty())</a>
+<a name="ln396">		change++;</a>
+<a name="ln397">	reply-&gt;GetAttr(B_OK, mask, st.st_size, change);</a>
+<a name="ln398"> </a>
+<a name="ln399">	return B_OK;</a>
+<a name="ln400">}</a>
+<a name="ln401"> </a>
+<a name="ln402"> </a>
+<a name="ln403">status_t</a>
+<a name="ln404">NFS4Server::RecallAll()</a>
+<a name="ln405">{</a>
+<a name="ln406">	MutexLocker _(fFSLock);</a>
+<a name="ln407">	FileSystem* fs = fFileSystems.Head();</a>
+<a name="ln408">	while (fs != NULL) {</a>
+<a name="ln409">		DoublyLinkedList&lt;Delegation&gt;&amp; list = fs-&gt;DelegationsLock();</a>
+<a name="ln410">		DoublyLinkedList&lt;Delegation&gt;::Iterator iterator = list.GetIterator();</a>
+<a name="ln411"> </a>
+<a name="ln412">		Delegation* current = iterator.Next();</a>
+<a name="ln413">		while (current != NULL) {</a>
+<a name="ln414">			DelegationRecallArgs* args = new(std::nothrow) DelegationRecallArgs;</a>
+<a name="ln415">			args-&gt;fDelegation = current;</a>
+<a name="ln416">			args-&gt;fTruncate = false;</a>
+<a name="ln417">			gWorkQueue-&gt;EnqueueJob(DelegationRecall, args);</a>
+<a name="ln418"> </a>
+<a name="ln419">			current = iterator.Next();</a>
+<a name="ln420">		}	</a>
+<a name="ln421">		fs-&gt;DelegationsUnlock();</a>
+<a name="ln422"> </a>
+<a name="ln423">		fs = fFileSystems.GetNext(fs);</a>
+<a name="ln424">	}</a>
+<a name="ln425"> </a>
+<a name="ln426">	return B_OK;</a>
+<a name="ln427">}</a>
+<a name="ln428"> </a>
+
+</code></pre>
+<div class="balloon" rel="241"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v547/" target="_blank">V547</a> Expression 'fUseCount == 0' is always true.</p></div>
+<div class="balloon" rel="20"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fThread, fClientId.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

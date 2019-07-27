@@ -1,0 +1,2660 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>kernel_interface.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2001-2017, Axel Dörfler, axeld@pinc-software.de.</a>
+<a name="ln3"> * This file may be used under the terms of the MIT License.</a>
+<a name="ln4"> */</a>
+<a name="ln5"> </a>
+<a name="ln6"> </a>
+<a name="ln7">//!	file system interface to Haiku's vnode layer</a>
+<a name="ln8"> </a>
+<a name="ln9"> </a>
+<a name="ln10">#include &quot;CheckVisitor.h&quot;</a>
+<a name="ln11">#include &quot;Debug.h&quot;</a>
+<a name="ln12">#include &quot;Volume.h&quot;</a>
+<a name="ln13">#include &quot;Inode.h&quot;</a>
+<a name="ln14">#include &quot;Index.h&quot;</a>
+<a name="ln15">#include &quot;BPlusTree.h&quot;</a>
+<a name="ln16">#include &quot;Query.h&quot;</a>
+<a name="ln17">#include &quot;Attribute.h&quot;</a>
+<a name="ln18">#include &quot;bfs_control.h&quot;</a>
+<a name="ln19">#include &quot;bfs_disk_system.h&quot;</a>
+<a name="ln20"> </a>
+<a name="ln21">// TODO: temporary solution as long as there is no public I/O requests API</a>
+<a name="ln22">#ifndef FS_SHELL</a>
+<a name="ln23">#	include &lt;io_requests.h&gt;</a>
+<a name="ln24">#	include &lt;util/fs_trim_support.h&gt;</a>
+<a name="ln25">#endif</a>
+<a name="ln26"> </a>
+<a name="ln27"> </a>
+<a name="ln28">#define BFS_IO_SIZE	65536</a>
+<a name="ln29"> </a>
+<a name="ln30">#if defined(BFS_LITTLE_ENDIAN_ONLY)</a>
+<a name="ln31">#define BFS_ENDIAN_SUFFIX &quot;&quot;</a>
+<a name="ln32">#define BFS_ENDIAN_PRETTY_SUFFIX &quot;&quot;</a>
+<a name="ln33">#else</a>
+<a name="ln34">#define BFS_ENDIAN_SUFFIX &quot;_big&quot;</a>
+<a name="ln35">#define BFS_ENDIAN_PRETTY_SUFFIX &quot; (Big Endian)&quot;</a>
+<a name="ln36">#endif</a>
+<a name="ln37"> </a>
+<a name="ln38"> </a>
+<a name="ln39">struct identify_cookie {</a>
+<a name="ln40">	disk_super_block super_block;</a>
+<a name="ln41">};</a>
+<a name="ln42"> </a>
+<a name="ln43">extern void fill_stat_buffer(Inode* inode, struct stat&amp; stat);</a>
+<a name="ln44"> </a>
+<a name="ln45"> </a>
+<a name="ln46">static void</a>
+<a name="ln47">fill_stat_time(const bfs_inode&amp; node, struct stat&amp; stat)</a>
+<a name="ln48">{</a>
+<a name="ln49">	bigtime_t now = real_time_clock_usecs();</a>
+<a name="ln50">	stat.st_atim.tv_sec = now / 1000000LL;</a>
+<a name="ln51">	stat.st_atim.tv_nsec = (now % 1000000LL) * 1000;</a>
+<a name="ln52"> </a>
+<a name="ln53">	stat.st_mtim.tv_sec = bfs_inode::ToSecs(node.LastModifiedTime());</a>
+<a name="ln54">	stat.st_mtim.tv_nsec = bfs_inode::ToNsecs(node.LastModifiedTime());</a>
+<a name="ln55">	stat.st_crtim.tv_sec = bfs_inode::ToSecs(node.CreateTime());</a>
+<a name="ln56">	stat.st_crtim.tv_nsec = bfs_inode::ToNsecs(node.CreateTime());</a>
+<a name="ln57"> </a>
+<a name="ln58">	// For BeOS compatibility, if on-disk ctime is invalid, fall back to mtime:</a>
+<a name="ln59">	bigtime_t changeTime = node.StatusChangeTime();</a>
+<a name="ln60">	if (changeTime &lt; node.LastModifiedTime())</a>
+<a name="ln61">		stat.st_ctim = stat.st_mtim;</a>
+<a name="ln62">	else {</a>
+<a name="ln63">		stat.st_ctim.tv_sec = bfs_inode::ToSecs(changeTime);</a>
+<a name="ln64">		stat.st_ctim.tv_nsec = bfs_inode::ToNsecs(changeTime);</a>
+<a name="ln65">	}</a>
+<a name="ln66">}</a>
+<a name="ln67"> </a>
+<a name="ln68"> </a>
+<a name="ln69">void</a>
+<a name="ln70">fill_stat_buffer(Inode* inode, struct stat&amp; stat)</a>
+<a name="ln71">{</a>
+<a name="ln72">	const bfs_inode&amp; node = inode-&gt;Node();</a>
+<a name="ln73"> </a>
+<a name="ln74">	stat.st_dev = inode-&gt;GetVolume()-&gt;ID();</a>
+<a name="ln75">	stat.st_ino = inode-&gt;ID();</a>
+<a name="ln76">	stat.st_nlink = 1;</a>
+<a name="ln77">	stat.st_blksize = BFS_IO_SIZE;</a>
+<a name="ln78"> </a>
+<a name="ln79">	stat.st_uid = node.UserID();</a>
+<a name="ln80">	stat.st_gid = node.GroupID();</a>
+<a name="ln81">	stat.st_mode = node.Mode();</a>
+<a name="ln82">	stat.st_type = node.Type();</a>
+<a name="ln83"> </a>
+<a name="ln84">	fill_stat_time(node, stat);</a>
+<a name="ln85"> </a>
+<a name="ln86">	if (inode-&gt;IsSymLink() &amp;&amp; (inode-&gt;Flags() &amp; INODE_LONG_SYMLINK) == 0) {</a>
+<a name="ln87">		// symlinks report the size of the link here</a>
+<a name="ln88">		stat.st_size = strlen(node.short_symlink);</a>
+<a name="ln89">	} else</a>
+<a name="ln90">		stat.st_size = inode-&gt;Size();</a>
+<a name="ln91"> </a>
+<a name="ln92">	stat.st_blocks = inode-&gt;AllocatedSize() / 512;</a>
+<a name="ln93">}</a>
+<a name="ln94"> </a>
+<a name="ln95"> </a>
+<a name="ln96">//!	bfs_io() callback hook</a>
+<a name="ln97">static status_t</a>
+<a name="ln98">iterative_io_get_vecs_hook(void* cookie, io_request* request, off_t offset,</a>
+<a name="ln99">	size_t size, struct file_io_vec* vecs, size_t* _count)</a>
+<a name="ln100">{</a>
+<a name="ln101">	Inode* inode = (Inode*)cookie;</a>
+<a name="ln102"> </a>
+<a name="ln103">	return file_map_translate(inode-&gt;Map(), offset, size, vecs, _count,</a>
+<a name="ln104">		inode-&gt;GetVolume()-&gt;BlockSize());</a>
+<a name="ln105">}</a>
+<a name="ln106"> </a>
+<a name="ln107"> </a>
+<a name="ln108">//!	bfs_io() callback hook</a>
+<a name="ln109">static status_t</a>
+<a name="ln110">iterative_io_finished_hook(void* cookie, io_request* request, status_t status,</a>
+<a name="ln111">	bool partialTransfer, size_t bytesTransferred)</a>
+<a name="ln112">{</a>
+<a name="ln113">	Inode* inode = (Inode*)cookie;</a>
+<a name="ln114">	rw_lock_read_unlock(&amp;inode-&gt;Lock());</a>
+<a name="ln115">	return B_OK;</a>
+<a name="ln116">}</a>
+<a name="ln117"> </a>
+<a name="ln118"> </a>
+<a name="ln119">//	#pragma mark - Scanning</a>
+<a name="ln120"> </a>
+<a name="ln121"> </a>
+<a name="ln122">static float</a>
+<a name="ln123">bfs_identify_partition(int fd, partition_data* partition, void** _cookie)</a>
+<a name="ln124">{</a>
+<a name="ln125">	disk_super_block superBlock;</a>
+<a name="ln126">	status_t status = Volume::Identify(fd, &amp;superBlock);</a>
+<a name="ln127">	if (status != B_OK)</a>
+<a name="ln128">		return -1;</a>
+<a name="ln129"> </a>
+<a name="ln130">	identify_cookie* cookie = new(std::nothrow) identify_cookie;</a>
+<a name="ln131">	if (cookie == NULL)</a>
+<a name="ln132">		return -1;</a>
+<a name="ln133"> </a>
+<a name="ln134">	memcpy(&amp;cookie-&gt;super_block, &amp;superBlock, sizeof(disk_super_block));</a>
+<a name="ln135"> </a>
+<a name="ln136">	*_cookie = cookie;</a>
+<a name="ln137">	return 0.8f;</a>
+<a name="ln138">}</a>
+<a name="ln139"> </a>
+<a name="ln140"> </a>
+<a name="ln141">static status_t</a>
+<a name="ln142">bfs_scan_partition(int fd, partition_data* partition, void* _cookie)</a>
+<a name="ln143">{</a>
+<a name="ln144">	identify_cookie* cookie = (identify_cookie*)_cookie;</a>
+<a name="ln145"> </a>
+<a name="ln146">	partition-&gt;status = B_PARTITION_VALID;</a>
+<a name="ln147">	partition-&gt;flags |= B_PARTITION_FILE_SYSTEM;</a>
+<a name="ln148">	partition-&gt;content_size = cookie-&gt;super_block.NumBlocks()</a>
+<a name="ln149">		* cookie-&gt;super_block.BlockSize();</a>
+<a name="ln150">	partition-&gt;block_size = cookie-&gt;super_block.BlockSize();</a>
+<a name="ln151">	partition-&gt;content_name = strdup(cookie-&gt;super_block.name);</a>
+<a name="ln152">	if (partition-&gt;content_name == NULL)</a>
+<a name="ln153">		return B_NO_MEMORY;</a>
+<a name="ln154"> </a>
+<a name="ln155">	return B_OK;</a>
+<a name="ln156">}</a>
+<a name="ln157"> </a>
+<a name="ln158"> </a>
+<a name="ln159">static void</a>
+<a name="ln160">bfs_free_identify_partition_cookie(partition_data* partition, void* _cookie)</a>
+<a name="ln161">{</a>
+<a name="ln162">	identify_cookie* cookie = (identify_cookie*)_cookie;</a>
+<a name="ln163">	delete cookie;</a>
+<a name="ln164">}</a>
+<a name="ln165"> </a>
+<a name="ln166"> </a>
+<a name="ln167">//	#pragma mark -</a>
+<a name="ln168"> </a>
+<a name="ln169"> </a>
+<a name="ln170">static status_t</a>
+<a name="ln171">bfs_mount(fs_volume* _volume, const char* device, uint32 flags,</a>
+<a name="ln172">	const char* args, ino_t* _rootID)</a>
+<a name="ln173">{</a>
+<a name="ln174">	FUNCTION();</a>
+<a name="ln175"> </a>
+<a name="ln176">	Volume* volume = new(std::nothrow) Volume(_volume);</a>
+<a name="ln177">	if (volume == NULL)</a>
+<a name="ln178">		return B_NO_MEMORY;</a>
+<a name="ln179"> </a>
+<a name="ln180">	status_t status = volume-&gt;Mount(device, flags);</a>
+<a name="ln181">	if (status != B_OK) {</a>
+<a name="ln182">		delete volume;</a>
+<a name="ln183">		RETURN_ERROR(status);</a>
+<a name="ln184">	}</a>
+<a name="ln185"> </a>
+<a name="ln186">	_volume-&gt;private_volume = volume;</a>
+<a name="ln187">	_volume-&gt;ops = &amp;gBFSVolumeOps;</a>
+<a name="ln188">	*_rootID = volume-&gt;ToVnode(volume-&gt;Root());</a>
+<a name="ln189"> </a>
+<a name="ln190">	INFORM((&quot;mounted \&quot;%s\&quot; (root node at %&quot; B_PRIdINO &quot;, device = %s)\n&quot;,</a>
+<a name="ln191">		volume-&gt;Name(), *_rootID, device));</a>
+<a name="ln192">	return B_OK;</a>
+<a name="ln193">}</a>
+<a name="ln194"> </a>
+<a name="ln195"> </a>
+<a name="ln196">static status_t</a>
+<a name="ln197">bfs_unmount(fs_volume* _volume)</a>
+<a name="ln198">{</a>
+<a name="ln199">	FUNCTION();</a>
+<a name="ln200">	Volume* volume = (Volume*)_volume-&gt;private_volume;</a>
+<a name="ln201"> </a>
+<a name="ln202">	status_t status = volume-&gt;Unmount();</a>
+<a name="ln203">	delete volume;</a>
+<a name="ln204"> </a>
+<a name="ln205">	RETURN_ERROR(status);</a>
+<a name="ln206">}</a>
+<a name="ln207"> </a>
+<a name="ln208"> </a>
+<a name="ln209">static status_t</a>
+<a name="ln210">bfs_read_fs_stat(fs_volume* _volume, struct fs_info* info)</a>
+<a name="ln211">{</a>
+<a name="ln212">	FUNCTION();</a>
+<a name="ln213"> </a>
+<a name="ln214">	Volume* volume = (Volume*)_volume-&gt;private_volume;</a>
+<a name="ln215">	MutexLocker locker(volume-&gt;Lock());</a>
+<a name="ln216"> </a>
+<a name="ln217">	// File system flags.</a>
+<a name="ln218">	info-&gt;flags = B_FS_IS_PERSISTENT | B_FS_HAS_ATTR | B_FS_HAS_MIME</a>
+<a name="ln219">		| (volume-&gt;IndicesNode() != NULL ? B_FS_HAS_QUERY : 0)</a>
+<a name="ln220">		| (volume-&gt;IsReadOnly() ? B_FS_IS_READONLY : 0)</a>
+<a name="ln221">		| B_FS_SUPPORTS_MONITOR_CHILDREN;</a>
+<a name="ln222"> </a>
+<a name="ln223">	info-&gt;io_size = BFS_IO_SIZE;</a>
+<a name="ln224">		// whatever is appropriate here?</a>
+<a name="ln225"> </a>
+<a name="ln226">	info-&gt;block_size = volume-&gt;BlockSize();</a>
+<a name="ln227">	info-&gt;total_blocks = volume-&gt;NumBlocks();</a>
+<a name="ln228">	info-&gt;free_blocks = volume-&gt;FreeBlocks();</a>
+<a name="ln229"> </a>
+<a name="ln230">	// Volume name</a>
+<a name="ln231">	strlcpy(info-&gt;volume_name, volume-&gt;Name(), sizeof(info-&gt;volume_name));</a>
+<a name="ln232"> </a>
+<a name="ln233">	// File system name</a>
+<a name="ln234">	strlcpy(info-&gt;fsh_name, &quot;bfs&quot;, sizeof(info-&gt;fsh_name));</a>
+<a name="ln235"> </a>
+<a name="ln236">	return B_OK;</a>
+<a name="ln237">}</a>
+<a name="ln238"> </a>
+<a name="ln239"> </a>
+<a name="ln240">static status_t</a>
+<a name="ln241">bfs_write_fs_stat(fs_volume* _volume, const struct fs_info* info, uint32 mask)</a>
+<a name="ln242">{</a>
+<a name="ln243">	FUNCTION_START((&quot;mask = %ld\n&quot;, mask));</a>
+<a name="ln244"> </a>
+<a name="ln245">	Volume* volume = (Volume*)_volume-&gt;private_volume;</a>
+<a name="ln246">	if (volume-&gt;IsReadOnly())</a>
+<a name="ln247">		return B_READ_ONLY_DEVICE;</a>
+<a name="ln248"> </a>
+<a name="ln249">	MutexLocker locker(volume-&gt;Lock());</a>
+<a name="ln250"> </a>
+<a name="ln251">	status_t status = B_BAD_VALUE;</a>
+<a name="ln252"> </a>
+<a name="ln253">	if (mask &amp; FS_WRITE_FSINFO_NAME) {</a>
+<a name="ln254">		disk_super_block&amp; superBlock = volume-&gt;SuperBlock();</a>
+<a name="ln255"> </a>
+<a name="ln256">		strncpy(superBlock.name, info-&gt;volume_name,</a>
+<a name="ln257">			sizeof(superBlock.name) - 1);</a>
+<a name="ln258">		superBlock.name[sizeof(superBlock.name) - 1] = '\0';</a>
+<a name="ln259"> </a>
+<a name="ln260">		status = volume-&gt;WriteSuperBlock();</a>
+<a name="ln261">	}</a>
+<a name="ln262">	return status;</a>
+<a name="ln263">}</a>
+<a name="ln264"> </a>
+<a name="ln265"> </a>
+<a name="ln266">static status_t</a>
+<a name="ln267">bfs_sync(fs_volume* _volume)</a>
+<a name="ln268">{</a>
+<a name="ln269">	FUNCTION();</a>
+<a name="ln270"> </a>
+<a name="ln271">	Volume* volume = (Volume*)_volume-&gt;private_volume;</a>
+<a name="ln272">	return volume-&gt;Sync();</a>
+<a name="ln273">}</a>
+<a name="ln274"> </a>
+<a name="ln275"> </a>
+<a name="ln276">//	#pragma mark -</a>
+<a name="ln277"> </a>
+<a name="ln278"> </a>
+<a name="ln279">/*!	Reads in the node from disk and creates an inode object from it.</a>
+<a name="ln280">*/</a>
+<a name="ln281">static status_t</a>
+<a name="ln282">bfs_get_vnode(fs_volume* _volume, ino_t id, fs_vnode* _node, int* _type,</a>
+<a name="ln283">	uint32* _flags, bool reenter)</a>
+<a name="ln284">{</a>
+<a name="ln285">	//FUNCTION_START((&quot;ino_t = %Ld\n&quot;, id));</a>
+<a name="ln286">	Volume* volume = (Volume*)_volume-&gt;private_volume;</a>
+<a name="ln287"> </a>
+<a name="ln288">	// first inode may be after the log area, we don't go through</a>
+<a name="ln289">	// the hassle and try to load an earlier block from disk</a>
+<a name="ln290">	if (id &lt; volume-&gt;ToBlock(volume-&gt;Log()) + volume-&gt;Log().Length()</a>
+<a name="ln291">		|| id &gt; volume-&gt;NumBlocks()) {</a>
+<a name="ln292">		INFORM((&quot;inode at %&quot; B_PRIdINO &quot; requested!\n&quot;, id));</a>
+<a name="ln293">		return B_ERROR;</a>
+<a name="ln294">	}</a>
+<a name="ln295"> </a>
+<a name="ln296">	CachedBlock cached(volume, id);</a>
+<a name="ln297">	bfs_inode* node = (bfs_inode*)cached.Block();</a>
+<a name="ln298">	if (node == NULL) {</a>
+<a name="ln299">		FATAL((&quot;could not read inode: %&quot; B_PRIdINO &quot;\n&quot;, id));</a>
+<a name="ln300">		return B_IO_ERROR;</a>
+<a name="ln301">	}</a>
+<a name="ln302"> </a>
+<a name="ln303">	status_t status = node-&gt;InitCheck(volume);</a>
+<a name="ln304">	if (status != B_OK) {</a>
+<a name="ln305">		if ((node-&gt;Flags() &amp; INODE_DELETED) != 0) {</a>
+<a name="ln306">			INFORM((&quot;inode at %&quot; B_PRIdINO &quot; is already deleted!\n&quot;, id));</a>
+<a name="ln307">		} else {</a>
+<a name="ln308">			FATAL((&quot;inode at %&quot; B_PRIdINO &quot; could not be read: %s!\n&quot;, id,</a>
+<a name="ln309">				strerror(status)));</a>
+<a name="ln310">		}</a>
+<a name="ln311">		return status;</a>
+<a name="ln312">	}</a>
+<a name="ln313"> </a>
+<a name="ln314">	Inode* inode = new(std::nothrow) Inode(volume, id);</a>
+<a name="ln315">	if (inode == NULL)</a>
+<a name="ln316">		return B_NO_MEMORY;</a>
+<a name="ln317"> </a>
+<a name="ln318">	status = inode-&gt;InitCheck(false);</a>
+<a name="ln319">	if (status != B_OK)</a>
+<a name="ln320">		delete inode;</a>
+<a name="ln321"> </a>
+<a name="ln322">	if (status == B_OK) {</a>
+<a name="ln323">		_node-&gt;private_node = inode;</a>
+<a name="ln324">		_node-&gt;ops = &amp;gBFSVnodeOps;</a>
+<a name="ln325">		*_type = inode-&gt;Mode();</a>
+<a name="ln326">		*_flags = 0;</a>
+<a name="ln327">	}</a>
+<a name="ln328"> </a>
+<a name="ln329">	return status;</a>
+<a name="ln330">}</a>
+<a name="ln331"> </a>
+<a name="ln332"> </a>
+<a name="ln333">static status_t</a>
+<a name="ln334">bfs_put_vnode(fs_volume* _volume, fs_vnode* _node, bool reenter)</a>
+<a name="ln335">{</a>
+<a name="ln336">	Volume* volume = (Volume*)_volume-&gt;private_volume;</a>
+<a name="ln337">	Inode* inode = (Inode*)_node-&gt;private_node;</a>
+<a name="ln338"> </a>
+<a name="ln339">	// since a directory's size can be changed without having it opened,</a>
+<a name="ln340">	// we need to take care about their preallocated blocks here</a>
+<a name="ln341">	if (!volume-&gt;IsReadOnly() &amp;&amp; !volume-&gt;IsCheckingThread()</a>
+<a name="ln342">		&amp;&amp; inode-&gt;NeedsTrimming()) {</a>
+<a name="ln343">		Transaction transaction(volume, inode-&gt;BlockNumber());</a>
+<a name="ln344"> </a>
+<a name="ln345">		if (inode-&gt;TrimPreallocation(transaction) == B_OK)</a>
+<a name="ln346">			transaction.Done();</a>
+<a name="ln347">		else if (transaction.HasParent()) {</a>
+<a name="ln348">			// TODO: for now, we don't let sub-transactions fail</a>
+<a name="ln349">			transaction.Done();</a>
+<a name="ln350">		}</a>
+<a name="ln351">	}</a>
+<a name="ln352"> </a>
+<a name="ln353">	delete inode;</a>
+<a name="ln354">	return B_OK;</a>
+<a name="ln355">}</a>
+<a name="ln356"> </a>
+<a name="ln357"> </a>
+<a name="ln358">static status_t</a>
+<a name="ln359">bfs_remove_vnode(fs_volume* _volume, fs_vnode* _node, bool reenter)</a>
+<a name="ln360">{</a>
+<a name="ln361">	FUNCTION();</a>
+<a name="ln362"> </a>
+<a name="ln363">	Volume* volume = (Volume*)_volume-&gt;private_volume;</a>
+<a name="ln364">	Inode* inode = (Inode*)_node-&gt;private_node;</a>
+<a name="ln365"> </a>
+<a name="ln366">	// If the inode isn't in use anymore, we were called before</a>
+<a name="ln367">	// bfs_unlink() returns - in this case, we can just use the</a>
+<a name="ln368">	// transaction which has already deleted the inode.</a>
+<a name="ln369">	Transaction transaction(volume, volume-&gt;ToBlock(inode-&gt;Parent()));</a>
+<a name="ln370"> </a>
+<a name="ln371">	// The file system check functionality uses this flag to prevent the space</a>
+<a name="ln372">	// used up by the inode from being freed - this flag is set only in</a>
+<a name="ln373">	// situations where this does not cause any harm as the block bitmap will</a>
+<a name="ln374">	// get fixed anyway in this case).</a>
+<a name="ln375">	if ((inode-&gt;Flags() &amp; INODE_DONT_FREE_SPACE) != 0) {</a>
+<a name="ln376">		delete inode;</a>
+<a name="ln377">		return B_OK;</a>
+<a name="ln378">	}</a>
+<a name="ln379"> </a>
+<a name="ln380">	ASSERT((inode-&gt;Flags() &amp; INODE_DELETED) != 0);</a>
+<a name="ln381"> </a>
+<a name="ln382">	status_t status = inode-&gt;Free(transaction);</a>
+<a name="ln383">	if (status == B_OK) {</a>
+<a name="ln384">		status = transaction.Done();</a>
+<a name="ln385">	} else if (transaction.HasParent()) {</a>
+<a name="ln386">		// TODO: for now, we don't let sub-transactions fail</a>
+<a name="ln387">		status = transaction.Done();</a>
+<a name="ln388">	}</a>
+<a name="ln389"> </a>
+<a name="ln390">	volume-&gt;RemovedInodes().Remove(inode);</a>
+<a name="ln391"> </a>
+<a name="ln392">	// TODO: the VFS currently does not allow this to fail</a>
+<a name="ln393">	delete inode;</a>
+<a name="ln394"> </a>
+<a name="ln395">	return status;</a>
+<a name="ln396">}</a>
+<a name="ln397"> </a>
+<a name="ln398"> </a>
+<a name="ln399">static bool</a>
+<a name="ln400">bfs_can_page(fs_volume* _volume, fs_vnode* _v, void* _cookie)</a>
+<a name="ln401">{</a>
+<a name="ln402">	// TODO: we're obviously not even asked...</a>
+<a name="ln403">	return false;</a>
+<a name="ln404">}</a>
+<a name="ln405"> </a>
+<a name="ln406"> </a>
+<a name="ln407">static status_t</a>
+<a name="ln408">bfs_read_pages(fs_volume* _volume, fs_vnode* _node, void* _cookie,</a>
+<a name="ln409">	off_t pos, const iovec* vecs, size_t count, size_t* _numBytes)</a>
+<a name="ln410">{</a>
+<a name="ln411">	Volume* volume = (Volume*)_volume-&gt;private_volume;</a>
+<a name="ln412">	Inode* inode = (Inode*)_node-&gt;private_node;</a>
+<a name="ln413"> </a>
+<a name="ln414">	if (inode-&gt;FileCache() == NULL)</a>
+<a name="ln415">		RETURN_ERROR(B_BAD_VALUE);</a>
+<a name="ln416"> </a>
+<a name="ln417">	InodeReadLocker _(inode);</a>
+<a name="ln418"> </a>
+<a name="ln419">	uint32 vecIndex = 0;</a>
+<a name="ln420">	size_t vecOffset = 0;</a>
+<a name="ln421">	size_t bytesLeft = *_numBytes;</a>
+<a name="ln422">	status_t status;</a>
+<a name="ln423"> </a>
+<a name="ln424">	while (true) {</a>
+<a name="ln425">		file_io_vec fileVecs[8];</a>
+<a name="ln426">		size_t fileVecCount = 8;</a>
+<a name="ln427"> </a>
+<a name="ln428">		status = file_map_translate(inode-&gt;Map(), pos, bytesLeft, fileVecs,</a>
+<a name="ln429">			&amp;fileVecCount, 0);</a>
+<a name="ln430">		if (status != B_OK &amp;&amp; status != B_BUFFER_OVERFLOW)</a>
+<a name="ln431">			break;</a>
+<a name="ln432"> </a>
+<a name="ln433">		bool bufferOverflow = status == B_BUFFER_OVERFLOW;</a>
+<a name="ln434"> </a>
+<a name="ln435">		size_t bytes = bytesLeft;</a>
+<a name="ln436">		status = read_file_io_vec_pages(volume-&gt;Device(), fileVecs,</a>
+<a name="ln437">			fileVecCount, vecs, count, &amp;vecIndex, &amp;vecOffset, &amp;bytes);</a>
+<a name="ln438">		if (status != B_OK || !bufferOverflow)</a>
+<a name="ln439">			break;</a>
+<a name="ln440"> </a>
+<a name="ln441">		pos += bytes;</a>
+<a name="ln442">		bytesLeft -= bytes;</a>
+<a name="ln443">	}</a>
+<a name="ln444"> </a>
+<a name="ln445">	return status;</a>
+<a name="ln446">}</a>
+<a name="ln447"> </a>
+<a name="ln448"> </a>
+<a name="ln449">static status_t</a>
+<a name="ln450">bfs_write_pages(fs_volume* _volume, fs_vnode* _node, void* _cookie,</a>
+<a name="ln451">	off_t pos, const iovec* vecs, size_t count, size_t* _numBytes)</a>
+<a name="ln452">{</a>
+<a name="ln453">	Volume* volume = (Volume*)_volume-&gt;private_volume;</a>
+<a name="ln454">	Inode* inode = (Inode*)_node-&gt;private_node;</a>
+<a name="ln455"> </a>
+<a name="ln456">	if (volume-&gt;IsReadOnly())</a>
+<a name="ln457">		return B_READ_ONLY_DEVICE;</a>
+<a name="ln458"> </a>
+<a name="ln459">	if (inode-&gt;FileCache() == NULL)</a>
+<a name="ln460">		RETURN_ERROR(B_BAD_VALUE);</a>
+<a name="ln461"> </a>
+<a name="ln462">	InodeReadLocker _(inode);</a>
+<a name="ln463"> </a>
+<a name="ln464">	uint32 vecIndex = 0;</a>
+<a name="ln465">	size_t vecOffset = 0;</a>
+<a name="ln466">	size_t bytesLeft = *_numBytes;</a>
+<a name="ln467">	status_t status;</a>
+<a name="ln468"> </a>
+<a name="ln469">	while (true) {</a>
+<a name="ln470">		file_io_vec fileVecs[8];</a>
+<a name="ln471">		size_t fileVecCount = 8;</a>
+<a name="ln472"> </a>
+<a name="ln473">		status = file_map_translate(inode-&gt;Map(), pos, bytesLeft, fileVecs,</a>
+<a name="ln474">			&amp;fileVecCount, 0);</a>
+<a name="ln475">		if (status != B_OK &amp;&amp; status != B_BUFFER_OVERFLOW)</a>
+<a name="ln476">			break;</a>
+<a name="ln477"> </a>
+<a name="ln478">		bool bufferOverflow = status == B_BUFFER_OVERFLOW;</a>
+<a name="ln479"> </a>
+<a name="ln480">		size_t bytes = bytesLeft;</a>
+<a name="ln481">		status = write_file_io_vec_pages(volume-&gt;Device(), fileVecs,</a>
+<a name="ln482">			fileVecCount, vecs, count, &amp;vecIndex, &amp;vecOffset, &amp;bytes);</a>
+<a name="ln483">		if (status != B_OK || !bufferOverflow)</a>
+<a name="ln484">			break;</a>
+<a name="ln485"> </a>
+<a name="ln486">		pos += bytes;</a>
+<a name="ln487">		bytesLeft -= bytes;</a>
+<a name="ln488">	}</a>
+<a name="ln489"> </a>
+<a name="ln490">	return status;</a>
+<a name="ln491">}</a>
+<a name="ln492"> </a>
+<a name="ln493"> </a>
+<a name="ln494">static status_t</a>
+<a name="ln495">bfs_io(fs_volume* _volume, fs_vnode* _node, void* _cookie, io_request* request)</a>
+<a name="ln496">{</a>
+<a name="ln497">	Volume* volume = (Volume*)_volume-&gt;private_volume;</a>
+<a name="ln498">	Inode* inode = (Inode*)_node-&gt;private_node;</a>
+<a name="ln499"> </a>
+<a name="ln500">#ifndef FS_SHELL</a>
+<a name="ln501">	if (io_request_is_write(request) &amp;&amp; volume-&gt;IsReadOnly()) {</a>
+<a name="ln502">		notify_io_request(request, B_READ_ONLY_DEVICE);</a>
+<a name="ln503">		return B_READ_ONLY_DEVICE;</a>
+<a name="ln504">	}</a>
+<a name="ln505">#endif</a>
+<a name="ln506"> </a>
+<a name="ln507">	if (inode-&gt;FileCache() == NULL) {</a>
+<a name="ln508">#ifndef FS_SHELL</a>
+<a name="ln509">		notify_io_request(request, B_BAD_VALUE);</a>
+<a name="ln510">#endif</a>
+<a name="ln511">		RETURN_ERROR(B_BAD_VALUE);</a>
+<a name="ln512">	}</a>
+<a name="ln513"> </a>
+<a name="ln514">	// We lock the node here and will unlock it in the &quot;finished&quot; hook.</a>
+<a name="ln515">	rw_lock_read_lock(&amp;inode-&gt;Lock());</a>
+<a name="ln516"> </a>
+<a name="ln517">	return do_iterative_fd_io(volume-&gt;Device(), request,</a>
+<a name="ln518">		iterative_io_get_vecs_hook, iterative_io_finished_hook, inode);</a>
+<a name="ln519">}</a>
+<a name="ln520"> </a>
+<a name="ln521"> </a>
+<a name="ln522">static status_t</a>
+<a name="ln523">bfs_get_file_map(fs_volume* _volume, fs_vnode* _node, off_t offset, size_t size,</a>
+<a name="ln524">	struct file_io_vec* vecs, size_t* _count)</a>
+<a name="ln525">{</a>
+<a name="ln526">	Volume* volume = (Volume*)_volume-&gt;private_volume;</a>
+<a name="ln527">	Inode* inode = (Inode*)_node-&gt;private_node;</a>
+<a name="ln528"> </a>
+<a name="ln529">	int32 blockShift = volume-&gt;BlockShift();</a>
+<a name="ln530">	uint32 index = 0, max = *_count;</a>
+<a name="ln531">	block_run run;</a>
+<a name="ln532">	off_t fileOffset;</a>
+<a name="ln533"> </a>
+<a name="ln534">	//FUNCTION_START((&quot;offset = %Ld, size = %lu\n&quot;, offset, size));</a>
+<a name="ln535"> </a>
+<a name="ln536">	while (true) {</a>
+<a name="ln537">		status_t status = inode-&gt;FindBlockRun(offset, run, fileOffset);</a>
+<a name="ln538">		if (status != B_OK)</a>
+<a name="ln539">			return status;</a>
+<a name="ln540"> </a>
+<a name="ln541">		vecs[index].offset = volume-&gt;ToOffset(run) + offset - fileOffset;</a>
+<a name="ln542">		vecs[index].length = ((uint32)run.Length() &lt;&lt; blockShift)</a>
+<a name="ln543">			- offset + fileOffset;</a>
+<a name="ln544"> </a>
+<a name="ln545">		// are we already done?</a>
+<a name="ln546">		if ((uint64)size &lt;= (uint64)vecs[index].length</a>
+<a name="ln547">			|| (uint64)offset + (uint64)vecs[index].length</a>
+<a name="ln548">				&gt;= (uint64)inode-&gt;Size()) {</a>
+<a name="ln549">			if ((uint64)offset + (uint64)vecs[index].length</a>
+<a name="ln550">					&gt; (uint64)inode-&gt;Size()) {</a>
+<a name="ln551">				// make sure the extent ends with the last official file</a>
+<a name="ln552">				// block (without taking any preallocations into account)</a>
+<a name="ln553">				vecs[index].length = round_up(inode-&gt;Size() - offset,</a>
+<a name="ln554">					volume-&gt;BlockSize());</a>
+<a name="ln555">			}</a>
+<a name="ln556">			*_count = index + 1;</a>
+<a name="ln557">			return B_OK;</a>
+<a name="ln558">		}</a>
+<a name="ln559"> </a>
+<a name="ln560">		offset += vecs[index].length;</a>
+<a name="ln561">		size -= vecs[index].length;</a>
+<a name="ln562">		index++;</a>
+<a name="ln563"> </a>
+<a name="ln564">		if (index &gt;= max) {</a>
+<a name="ln565">			// we're out of file_io_vecs; let's bail out</a>
+<a name="ln566">			*_count = index;</a>
+<a name="ln567">			return B_BUFFER_OVERFLOW;</a>
+<a name="ln568">		}</a>
+<a name="ln569">	}</a>
+<a name="ln570"> </a>
+<a name="ln571">	// can never get here</a>
+<a name="ln572">	return B_ERROR;</a>
+<a name="ln573">}</a>
+<a name="ln574"> </a>
+<a name="ln575"> </a>
+<a name="ln576">//	#pragma mark -</a>
+<a name="ln577"> </a>
+<a name="ln578"> </a>
+<a name="ln579">static status_t</a>
+<a name="ln580">bfs_lookup(fs_volume* _volume, fs_vnode* _directory, const char* file,</a>
+<a name="ln581">	ino_t* _vnodeID)</a>
+<a name="ln582">{</a>
+<a name="ln583">	Volume* volume = (Volume*)_volume-&gt;private_volume;</a>
+<a name="ln584">	Inode* directory = (Inode*)_directory-&gt;private_node;</a>
+<a name="ln585"> </a>
+<a name="ln586">	InodeReadLocker locker(directory);</a>
+<a name="ln587"> </a>
+<a name="ln588">	// check access permissions</a>
+<a name="ln589">	status_t status = directory-&gt;CheckPermissions(X_OK);</a>
+<a name="ln590">	if (status != B_OK)</a>
+<a name="ln591">		RETURN_ERROR(status);</a>
+<a name="ln592"> </a>
+<a name="ln593">	BPlusTree* tree = directory-&gt;Tree();</a>
+<a name="ln594">	if (tree == NULL)</a>
+<a name="ln595">		RETURN_ERROR(B_BAD_VALUE);</a>
+<a name="ln596"> </a>
+<a name="ln597">	status = tree-&gt;Find((uint8*)file, (uint16)strlen(file), _vnodeID);</a>
+<a name="ln598">	if (status != B_OK) {</a>
+<a name="ln599">		//PRINT((&quot;bfs_walk() could not find %Ld:\&quot;%s\&quot;: %s\n&quot;, directory-&gt;BlockNumber(), file, strerror(status)));</a>
+<a name="ln600">		if (status == B_ENTRY_NOT_FOUND)</a>
+<a name="ln601">			entry_cache_add_missing(volume-&gt;ID(), directory-&gt;ID(), file);</a>
+<a name="ln602"> </a>
+<a name="ln603">		return status;</a>
+<a name="ln604">	}</a>
+<a name="ln605"> </a>
+<a name="ln606">	entry_cache_add(volume-&gt;ID(), directory-&gt;ID(), file, *_vnodeID);</a>
+<a name="ln607"> </a>
+<a name="ln608">	locker.Unlock();</a>
+<a name="ln609"> </a>
+<a name="ln610">	Inode* inode;</a>
+<a name="ln611">	status = get_vnode(volume-&gt;FSVolume(), *_vnodeID, (void**)&amp;inode);</a>
+<a name="ln612">	if (status != B_OK) {</a>
+<a name="ln613">		REPORT_ERROR(status);</a>
+<a name="ln614">		return B_ENTRY_NOT_FOUND;</a>
+<a name="ln615">	}</a>
+<a name="ln616"> </a>
+<a name="ln617">	return B_OK;</a>
+<a name="ln618">}</a>
+<a name="ln619"> </a>
+<a name="ln620"> </a>
+<a name="ln621">static status_t</a>
+<a name="ln622">bfs_get_vnode_name(fs_volume* _volume, fs_vnode* _node, char* buffer,</a>
+<a name="ln623">	size_t bufferSize)</a>
+<a name="ln624">{</a>
+<a name="ln625">	Inode* inode = (Inode*)_node-&gt;private_node;</a>
+<a name="ln626"> </a>
+<a name="ln627">	return inode-&gt;GetName(buffer, bufferSize);</a>
+<a name="ln628">}</a>
+<a name="ln629"> </a>
+<a name="ln630"> </a>
+<a name="ln631">static status_t</a>
+<a name="ln632">bfs_ioctl(fs_volume* _volume, fs_vnode* _node, void* _cookie, uint32 cmd,</a>
+<a name="ln633">	void* buffer, size_t bufferLength)</a>
+<a name="ln634">{</a>
+<a name="ln635">	FUNCTION_START((&quot;node = %p, cmd = %lu, buf = %p, len = %ld\n&quot;, _node, cmd,</a>
+<a name="ln636">		buffer, bufferLength));</a>
+<a name="ln637"> </a>
+<a name="ln638">	Volume* volume = (Volume*)_volume-&gt;private_volume;</a>
+<a name="ln639"> </a>
+<a name="ln640">	switch (cmd) {</a>
+<a name="ln641">#ifndef FS_SHELL</a>
+<a name="ln642">		case B_TRIM_DEVICE:</a>
+<a name="ln643">		{</a>
+<a name="ln644">			fs_trim_data* trimData;</a>
+<a name="ln645">			MemoryDeleter deleter;</a>
+<a name="ln646">			status_t status = get_trim_data_from_user(buffer, bufferLength,</a>
+<a name="ln647">				deleter, trimData);</a>
+<a name="ln648">			if (status != B_OK)</a>
+<a name="ln649">				return status;</a>
+<a name="ln650"> </a>
+<a name="ln651">			trimData-&gt;trimmed_size = 0;</a>
+<a name="ln652"> </a>
+<a name="ln653">			for (uint32 i = 0; i &lt; trimData-&gt;range_count; i++) {</a>
+<a name="ln654">				uint64 trimmedSize = 0;</a>
+<a name="ln655">				status_t status = volume-&gt;Allocator().Trim(</a>
+<a name="ln656">					trimData-&gt;ranges[i].offset, trimData-&gt;ranges[i].size,</a>
+<a name="ln657">					trimmedSize);</a>
+<a name="ln658">				if (status != B_OK)</a>
+<a name="ln659">					return status;</a>
+<a name="ln660"> </a>
+<a name="ln661">				trimData-&gt;trimmed_size += trimmedSize;</a>
+<a name="ln662">			}</a>
+<a name="ln663"> </a>
+<a name="ln664">			return copy_trim_data_to_user(buffer, trimData);</a>
+<a name="ln665">		}</a>
+<a name="ln666">#endif</a>
+<a name="ln667"> </a>
+<a name="ln668">		case BFS_IOCTL_VERSION:</a>
+<a name="ln669">		{</a>
+<a name="ln670">			uint32 version = 0x10000;</a>
+<a name="ln671">			return user_memcpy(buffer, &amp;version, sizeof(uint32));</a>
+<a name="ln672">		}</a>
+<a name="ln673">		case BFS_IOCTL_START_CHECKING:</a>
+<a name="ln674">		{</a>
+<a name="ln675">			// start checking</a>
+<a name="ln676">			status_t status = volume-&gt;CreateCheckVisitor();</a>
+<a name="ln677">			if (status != B_OK)</a>
+<a name="ln678">				return status;</a>
+<a name="ln679"> </a>
+<a name="ln680">			CheckVisitor* checker = volume-&gt;CheckVisitor();</a>
+<a name="ln681"> </a>
+<a name="ln682">			if (user_memcpy(&amp;checker-&gt;Control(), buffer,</a>
+<a name="ln683">					sizeof(check_control)) != B_OK) {</a>
+<a name="ln684">				return B_BAD_ADDRESS;</a>
+<a name="ln685">			}</a>
+<a name="ln686"> </a>
+<a name="ln687">			status = checker-&gt;StartBitmapPass();</a>
+<a name="ln688">			if (status == B_OK) {</a>
+<a name="ln689">				file_cookie* cookie = (file_cookie*)_cookie;</a>
+<a name="ln690">				cookie-&gt;open_mode |= BFS_OPEN_MODE_CHECKING;</a>
+<a name="ln691">			}</a>
+<a name="ln692"> </a>
+<a name="ln693">			return status;</a>
+<a name="ln694">		}</a>
+<a name="ln695">		case BFS_IOCTL_STOP_CHECKING:</a>
+<a name="ln696">		{</a>
+<a name="ln697">			// stop checking</a>
+<a name="ln698">			CheckVisitor* checker = volume-&gt;CheckVisitor();</a>
+<a name="ln699">			if (checker == NULL)</a>
+<a name="ln700">				return B_NO_INIT;</a>
+<a name="ln701"> </a>
+<a name="ln702">			status_t status = checker-&gt;StopChecking();</a>
+<a name="ln703"> </a>
+<a name="ln704">			if (status == B_OK) {</a>
+<a name="ln705">				file_cookie* cookie = (file_cookie*)_cookie;</a>
+<a name="ln706">				cookie-&gt;open_mode &amp;= ~BFS_OPEN_MODE_CHECKING;</a>
+<a name="ln707"> </a>
+<a name="ln708">				status = user_memcpy(buffer, &amp;checker-&gt;Control(),</a>
+<a name="ln709">					sizeof(check_control));</a>
+<a name="ln710">			}</a>
+<a name="ln711"> </a>
+<a name="ln712">			volume-&gt;DeleteCheckVisitor();</a>
+<a name="ln713">			volume-&gt;SetCheckingThread(-1);</a>
+<a name="ln714"> </a>
+<a name="ln715">			return status;</a>
+<a name="ln716">		}</a>
+<a name="ln717">		case BFS_IOCTL_CHECK_NEXT_NODE:</a>
+<a name="ln718">		{</a>
+<a name="ln719">			// check next</a>
+<a name="ln720">			CheckVisitor* checker = volume-&gt;CheckVisitor();</a>
+<a name="ln721">			if (checker == NULL)</a>
+<a name="ln722">				return B_NO_INIT;</a>
+<a name="ln723"> </a>
+<a name="ln724">			volume-&gt;SetCheckingThread(find_thread(NULL));</a>
+<a name="ln725"> </a>
+<a name="ln726">			checker-&gt;Control().errors = 0;</a>
+<a name="ln727"> </a>
+<a name="ln728">			status_t status = checker-&gt;Next();</a>
+<a name="ln729">			if (status == B_ENTRY_NOT_FOUND) {</a>
+<a name="ln730">				checker-&gt;Control().status = B_ENTRY_NOT_FOUND;</a>
+<a name="ln731">					// tells StopChecking() that we finished the pass</a>
+<a name="ln732"> </a>
+<a name="ln733">				if (checker-&gt;Pass() == BFS_CHECK_PASS_BITMAP) {</a>
+<a name="ln734">					if (checker-&gt;WriteBackCheckBitmap() == B_OK)</a>
+<a name="ln735">						status = checker-&gt;StartIndexPass();</a>
+<a name="ln736">				}</a>
+<a name="ln737">			}</a>
+<a name="ln738">			</a>
+<a name="ln739">			if (status == B_OK) {</a>
+<a name="ln740">				status = user_memcpy(buffer, &amp;checker-&gt;Control(),</a>
+<a name="ln741">					sizeof(check_control));</a>
+<a name="ln742">			}</a>
+<a name="ln743"> </a>
+<a name="ln744">			return status;</a>
+<a name="ln745">		}</a>
+<a name="ln746">		case BFS_IOCTL_UPDATE_BOOT_BLOCK:</a>
+<a name="ln747">		{</a>
+<a name="ln748">			// let's makebootable (or anyone else) update the boot block</a>
+<a name="ln749">			// while BFS is mounted</a>
+<a name="ln750">			update_boot_block update;</a>
+<a name="ln751">			if (bufferLength != sizeof(update_boot_block))</a>
+<a name="ln752">				return B_BAD_VALUE;</a>
+<a name="ln753">			if (user_memcpy(&amp;update, buffer, sizeof(update_boot_block)) != B_OK)</a>
+<a name="ln754">				return B_BAD_ADDRESS;</a>
+<a name="ln755"> </a>
+<a name="ln756">			uint32 minOffset = offsetof(disk_super_block, pad_to_block);</a>
+<a name="ln757">			if (update.offset &lt; minOffset</a>
+<a name="ln758">				|| update.offset &gt;= 512 || update.length &gt; 512 - minOffset</a>
+<a name="ln759">				|| update.length + update.offset &gt; 512) {</a>
+<a name="ln760">				return B_BAD_VALUE;</a>
+<a name="ln761">			}</a>
+<a name="ln762">			if (user_memcpy((uint8*)&amp;volume-&gt;SuperBlock() + update.offset,</a>
+<a name="ln763">					update.data, update.length) != B_OK) {</a>
+<a name="ln764">				return B_BAD_ADDRESS;</a>
+<a name="ln765">			}</a>
+<a name="ln766"> </a>
+<a name="ln767">			return volume-&gt;WriteSuperBlock();</a>
+<a name="ln768">		}</a>
+<a name="ln769"> </a>
+<a name="ln770">#ifdef DEBUG_FRAGMENTER</a>
+<a name="ln771">		case 56741:</a>
+<a name="ln772">		{</a>
+<a name="ln773">			BlockAllocator&amp; allocator = volume-&gt;Allocator();</a>
+<a name="ln774">			allocator.Fragment();</a>
+<a name="ln775">			return B_OK;</a>
+<a name="ln776">		}</a>
+<a name="ln777">#endif</a>
+<a name="ln778"> </a>
+<a name="ln779">#ifdef DEBUG</a>
+<a name="ln780">		case 56742:</a>
+<a name="ln781">		{</a>
+<a name="ln782">			// allocate all free blocks and zero them out</a>
+<a name="ln783">			// (a test for the BlockAllocator)!</a>
+<a name="ln784">			BlockAllocator&amp; allocator = volume-&gt;Allocator();</a>
+<a name="ln785">			Transaction transaction(volume, 0);</a>
+<a name="ln786">			CachedBlock cached(volume);</a>
+<a name="ln787">			block_run run;</a>
+<a name="ln788">			while (allocator.AllocateBlocks(transaction, 8, 0, 64, 1, run)</a>
+<a name="ln789">					== B_OK) {</a>
+<a name="ln790">				PRINT((&quot;write block_run(%ld, %d, %d)\n&quot;, run.allocation_group,</a>
+<a name="ln791">					run.start, run.length));</a>
+<a name="ln792">				for (int32 i = 0;i &lt; run.length;i++) {</a>
+<a name="ln793">					uint8* block = cached.SetToWritable(transaction, run);</a>
+<a name="ln794">					if (block != NULL)</a>
+<a name="ln795">						memset(block, 0, volume-&gt;BlockSize());</a>
+<a name="ln796">				}</a>
+<a name="ln797">			}</a>
+<a name="ln798">			return B_OK;</a>
+<a name="ln799">		}</a>
+<a name="ln800">#endif</a>
+<a name="ln801">	}</a>
+<a name="ln802">	return B_DEV_INVALID_IOCTL;</a>
+<a name="ln803">}</a>
+<a name="ln804"> </a>
+<a name="ln805"> </a>
+<a name="ln806">/*!	Sets the open-mode flags for the open file cookie - only</a>
+<a name="ln807">	supports O_APPEND currently, but that should be sufficient</a>
+<a name="ln808">	for a file system.</a>
+<a name="ln809">*/</a>
+<a name="ln810">static status_t</a>
+<a name="ln811">bfs_set_flags(fs_volume* _volume, fs_vnode* _node, void* _cookie, int flags)</a>
+<a name="ln812">{</a>
+<a name="ln813">	FUNCTION_START((&quot;node = %p, flags = %d&quot;, _node, flags));</a>
+<a name="ln814"> </a>
+<a name="ln815">	file_cookie* cookie = (file_cookie*)_cookie;</a>
+<a name="ln816">	cookie-&gt;open_mode = (cookie-&gt;open_mode &amp; ~O_APPEND) | (flags &amp; O_APPEND);</a>
+<a name="ln817"> </a>
+<a name="ln818">	return B_OK;</a>
+<a name="ln819">}</a>
+<a name="ln820"> </a>
+<a name="ln821"> </a>
+<a name="ln822">static status_t</a>
+<a name="ln823">bfs_fsync(fs_volume* _volume, fs_vnode* _node)</a>
+<a name="ln824">{</a>
+<a name="ln825">	FUNCTION();</a>
+<a name="ln826"> </a>
+<a name="ln827">	Inode* inode = (Inode*)_node-&gt;private_node;</a>
+<a name="ln828">	return inode-&gt;Sync();</a>
+<a name="ln829">}</a>
+<a name="ln830"> </a>
+<a name="ln831"> </a>
+<a name="ln832">static status_t</a>
+<a name="ln833">bfs_read_stat(fs_volume* _volume, fs_vnode* _node, struct stat* stat)</a>
+<a name="ln834">{</a>
+<a name="ln835">	FUNCTION();</a>
+<a name="ln836"> </a>
+<a name="ln837">	Inode* inode = (Inode*)_node-&gt;private_node;</a>
+<a name="ln838">	fill_stat_buffer(inode, *stat);</a>
+<a name="ln839">	return B_OK;</a>
+<a name="ln840">}</a>
+<a name="ln841"> </a>
+<a name="ln842"> </a>
+<a name="ln843">static status_t</a>
+<a name="ln844">bfs_write_stat(fs_volume* _volume, fs_vnode* _node, const struct stat* stat,</a>
+<a name="ln845">	uint32 mask)</a>
+<a name="ln846">{</a>
+<a name="ln847">	FUNCTION();</a>
+<a name="ln848"> </a>
+<a name="ln849">	Volume* volume = (Volume*)_volume-&gt;private_volume;</a>
+<a name="ln850">	Inode* inode = (Inode*)_node-&gt;private_node;</a>
+<a name="ln851"> </a>
+<a name="ln852">	if (volume-&gt;IsReadOnly())</a>
+<a name="ln853">		return B_READ_ONLY_DEVICE;</a>
+<a name="ln854"> </a>
+<a name="ln855">	// TODO: we should definitely check a bit more if the new stats are</a>
+<a name="ln856">	//	valid - or even better, the VFS should check this before calling us</a>
+<a name="ln857"> </a>
+<a name="ln858">	bfs_inode&amp; node = inode-&gt;Node();</a>
+<a name="ln859">	bool updateTime = false;</a>
+<a name="ln860">	uid_t uid = geteuid();</a>
+<a name="ln861"> </a>
+<a name="ln862">	bool isOwnerOrRoot = uid == 0 || uid == (uid_t)node.UserID();</a>
+<a name="ln863">	bool hasWriteAccess = inode-&gt;CheckPermissions(W_OK) == B_OK;</a>
+<a name="ln864"> </a>
+<a name="ln865">	Transaction transaction(volume, inode-&gt;BlockNumber());</a>
+<a name="ln866">	inode-&gt;WriteLockInTransaction(transaction);</a>
+<a name="ln867"> </a>
+<a name="ln868">	if ((mask &amp; B_STAT_SIZE) != 0 &amp;&amp; inode-&gt;Size() != stat-&gt;st_size) {</a>
+<a name="ln869">		// Since B_STAT_SIZE is the only thing that can fail directly, we</a>
+<a name="ln870">		// do it first, so that the inode state will still be consistent</a>
+<a name="ln871">		// with the on-disk version</a>
+<a name="ln872">		if (inode-&gt;IsDirectory())</a>
+<a name="ln873">			return B_IS_A_DIRECTORY;</a>
+<a name="ln874">		if (!inode-&gt;IsFile())</a>
+<a name="ln875">			return B_BAD_VALUE;</a>
+<a name="ln876">		if (!hasWriteAccess)</a>
+<a name="ln877">			RETURN_ERROR(B_NOT_ALLOWED);</a>
+<a name="ln878"> </a>
+<a name="ln879">		off_t oldSize = inode-&gt;Size();</a>
+<a name="ln880"> </a>
+<a name="ln881">		status_t status = inode-&gt;SetFileSize(transaction, stat-&gt;st_size);</a>
+<a name="ln882">		if (status != B_OK)</a>
+<a name="ln883">			return status;</a>
+<a name="ln884"> </a>
+<a name="ln885">		// fill the new blocks (if any) with zeros</a>
+<a name="ln886">		if ((mask &amp; B_STAT_SIZE_INSECURE) == 0) {</a>
+<a name="ln887">			// We must not keep the inode locked during a write operation,</a>
+<a name="ln888">			// or else we might deadlock.</a>
+<a name="ln889">			rw_lock_write_unlock(&amp;inode-&gt;Lock());</a>
+<a name="ln890">			inode-&gt;FillGapWithZeros(oldSize, inode-&gt;Size());</a>
+<a name="ln891">			rw_lock_write_lock(&amp;inode-&gt;Lock());</a>
+<a name="ln892">		}</a>
+<a name="ln893"> </a>
+<a name="ln894">		if (!inode-&gt;IsDeleted()) {</a>
+<a name="ln895">			Index index(volume);</a>
+<a name="ln896">			index.UpdateSize(transaction, inode);</a>
+<a name="ln897"> </a>
+<a name="ln898">			updateTime = true;</a>
+<a name="ln899">		}</a>
+<a name="ln900">	}</a>
+<a name="ln901"> </a>
+<a name="ln902">	if ((mask &amp; B_STAT_UID) != 0) {</a>
+<a name="ln903">		// only root should be allowed</a>
+<a name="ln904">		if (uid != 0)</a>
+<a name="ln905">			RETURN_ERROR(B_NOT_ALLOWED);</a>
+<a name="ln906">		node.uid = HOST_ENDIAN_TO_BFS_INT32(stat-&gt;st_uid);</a>
+<a name="ln907">		updateTime = true;</a>
+<a name="ln908">	}</a>
+<a name="ln909"> </a>
+<a name="ln910">	if ((mask &amp; B_STAT_GID) != 0) {</a>
+<a name="ln911">		// only the user or root can do that</a>
+<a name="ln912">		if (!isOwnerOrRoot)</a>
+<a name="ln913">			RETURN_ERROR(B_NOT_ALLOWED);</a>
+<a name="ln914">		node.gid = HOST_ENDIAN_TO_BFS_INT32(stat-&gt;st_gid);</a>
+<a name="ln915">		updateTime = true;</a>
+<a name="ln916">	}</a>
+<a name="ln917"> </a>
+<a name="ln918">	if ((mask &amp; B_STAT_MODE) != 0) {</a>
+<a name="ln919">		// only the user or root can do that</a>
+<a name="ln920">		if (!isOwnerOrRoot)</a>
+<a name="ln921">			RETURN_ERROR(B_NOT_ALLOWED);</a>
+<a name="ln922">		PRINT((&quot;original mode = %ld, stat-&gt;st_mode = %d\n&quot;, node.Mode(),</a>
+<a name="ln923">			stat-&gt;st_mode));</a>
+<a name="ln924">		node.mode = HOST_ENDIAN_TO_BFS_INT32((node.Mode() &amp; ~S_IUMSK)</a>
+<a name="ln925">			| (stat-&gt;st_mode &amp; S_IUMSK));</a>
+<a name="ln926">		updateTime = true;</a>
+<a name="ln927">	}</a>
+<a name="ln928"> </a>
+<a name="ln929">	if ((mask &amp; B_STAT_CREATION_TIME) != 0) {</a>
+<a name="ln930">		// the user or root can do that or any user with write access</a>
+<a name="ln931">		if (!isOwnerOrRoot &amp;&amp; !hasWriteAccess)</a>
+<a name="ln932">			RETURN_ERROR(B_NOT_ALLOWED);</a>
+<a name="ln933">		node.create_time</a>
+<a name="ln934">			= HOST_ENDIAN_TO_BFS_INT64(bfs_inode::ToInode(stat-&gt;st_crtim));</a>
+<a name="ln935">	}</a>
+<a name="ln936"> </a>
+<a name="ln937">	if ((mask &amp; B_STAT_MODIFICATION_TIME) != 0) {</a>
+<a name="ln938">		// the user or root can do that or any user with write access</a>
+<a name="ln939">		if (!isOwnerOrRoot &amp;&amp; !hasWriteAccess)</a>
+<a name="ln940">			RETURN_ERROR(B_NOT_ALLOWED);</a>
+<a name="ln941">		if (!inode-&gt;InLastModifiedIndex()) {</a>
+<a name="ln942">			// directory modification times are not part of the index</a>
+<a name="ln943">			node.last_modified_time</a>
+<a name="ln944">				= HOST_ENDIAN_TO_BFS_INT64(bfs_inode::ToInode(stat-&gt;st_mtim));</a>
+<a name="ln945">		} else if (!inode-&gt;IsDeleted()) {</a>
+<a name="ln946">			// Index::UpdateLastModified() will set the new time in the inode</a>
+<a name="ln947">			Index index(volume);</a>
+<a name="ln948">			index.UpdateLastModified(transaction, inode,</a>
+<a name="ln949">				bfs_inode::ToInode(stat-&gt;st_mtim));</a>
+<a name="ln950">		}</a>
+<a name="ln951">	}</a>
+<a name="ln952"> </a>
+<a name="ln953">	if ((mask &amp; B_STAT_CHANGE_TIME) != 0 || updateTime) {</a>
+<a name="ln954">		// the user or root can do that or any user with write access</a>
+<a name="ln955">		if (!isOwnerOrRoot &amp;&amp; !hasWriteAccess)</a>
+<a name="ln956">			RETURN_ERROR(B_NOT_ALLOWED);</a>
+<a name="ln957">		bigtime_t newTime;</a>
+<a name="ln958">		if ((mask &amp; B_STAT_CHANGE_TIME) == 0)</a>
+<a name="ln959">			newTime = bfs_inode::ToInode(real_time_clock_usecs());</a>
+<a name="ln960">		else</a>
+<a name="ln961">			newTime = bfs_inode::ToInode(stat-&gt;st_ctim);</a>
+<a name="ln962"> </a>
+<a name="ln963">		node.status_change_time = HOST_ENDIAN_TO_BFS_INT64(newTime);</a>
+<a name="ln964">	}</a>
+<a name="ln965"> </a>
+<a name="ln966">	status_t status = inode-&gt;WriteBack(transaction);</a>
+<a name="ln967">	if (status == B_OK)</a>
+<a name="ln968">		status = transaction.Done();</a>
+<a name="ln969">	if (status == B_OK)</a>
+<a name="ln970">		notify_stat_changed(volume-&gt;ID(), inode-&gt;ParentID(), inode-&gt;ID(), mask);</a>
+<a name="ln971"> </a>
+<a name="ln972">	return status;</a>
+<a name="ln973">}</a>
+<a name="ln974"> </a>
+<a name="ln975"> </a>
+<a name="ln976">status_t</a>
+<a name="ln977">bfs_create(fs_volume* _volume, fs_vnode* _directory, const char* name,</a>
+<a name="ln978">	int openMode, int mode, void** _cookie, ino_t* _vnodeID)</a>
+<a name="ln979">{</a>
+<a name="ln980">	FUNCTION_START((&quot;name = \&quot;%s\&quot;, perms = %d, openMode = %d\n&quot;, name, mode,</a>
+<a name="ln981">		openMode));</a>
+<a name="ln982"> </a>
+<a name="ln983">	Volume* volume = (Volume*)_volume-&gt;private_volume;</a>
+<a name="ln984">	Inode* directory = (Inode*)_directory-&gt;private_node;</a>
+<a name="ln985"> </a>
+<a name="ln986">	if (volume-&gt;IsReadOnly())</a>
+<a name="ln987">		return B_READ_ONLY_DEVICE;</a>
+<a name="ln988"> </a>
+<a name="ln989">	if (!directory-&gt;IsDirectory())</a>
+<a name="ln990">		RETURN_ERROR(B_BAD_TYPE);</a>
+<a name="ln991"> </a>
+<a name="ln992">	// We are creating the cookie at this point, so that we don't have</a>
+<a name="ln993">	// to remove the inode if we don't have enough free memory later...</a>
+<a name="ln994">	file_cookie* cookie = new(std::nothrow) file_cookie;</a>
+<a name="ln995">	if (cookie == NULL)</a>
+<a name="ln996">		RETURN_ERROR(B_NO_MEMORY);</a>
+<a name="ln997"> </a>
+<a name="ln998">	// initialize the cookie</a>
+<a name="ln999">	cookie-&gt;open_mode = openMode;</a>
+<a name="ln1000">	cookie-&gt;last_size = 0;</a>
+<a name="ln1001">	cookie-&gt;last_notification = system_time();</a>
+<a name="ln1002"> </a>
+<a name="ln1003">	Transaction transaction(volume, directory-&gt;BlockNumber());</a>
+<a name="ln1004"> </a>
+<a name="ln1005">	Inode* inode;</a>
+<a name="ln1006">	bool created;</a>
+<a name="ln1007">	status_t status = Inode::Create(transaction, directory, name,</a>
+<a name="ln1008">		S_FILE | (mode &amp; S_IUMSK), openMode, 0, &amp;created, _vnodeID, &amp;inode);</a>
+<a name="ln1009"> </a>
+<a name="ln1010">	// Disable the file cache, if requested?</a>
+<a name="ln1011">	if (status == B_OK &amp;&amp; (openMode &amp; O_NOCACHE) != 0</a>
+<a name="ln1012">		&amp;&amp; inode-&gt;FileCache() != NULL) {</a>
+<a name="ln1013">		status = file_cache_disable(inode-&gt;FileCache());</a>
+<a name="ln1014">	}</a>
+<a name="ln1015"> </a>
+<a name="ln1016">	entry_cache_add(volume-&gt;ID(), directory-&gt;ID(), name, *_vnodeID);</a>
+<a name="ln1017"> </a>
+<a name="ln1018">	if (status == B_OK)</a>
+<a name="ln1019">		status = transaction.Done();</a>
+<a name="ln1020"> </a>
+<a name="ln1021">	if (status == B_OK) {</a>
+<a name="ln1022">		// register the cookie</a>
+<a name="ln1023">		*_cookie = cookie;</a>
+<a name="ln1024"> </a>
+<a name="ln1025">		if (created) {</a>
+<a name="ln1026">			notify_entry_created(volume-&gt;ID(), directory-&gt;ID(), name,</a>
+<a name="ln1027">				*_vnodeID);</a>
+<a name="ln1028">		}</a>
+<a name="ln1029">	} else {</a>
+<a name="ln1030">		entry_cache_remove(volume-&gt;ID(), directory-&gt;ID(), name);</a>
+<a name="ln1031">		delete cookie;</a>
+<a name="ln1032">	}</a>
+<a name="ln1033"> </a>
+<a name="ln1034">	return status;</a>
+<a name="ln1035">}</a>
+<a name="ln1036"> </a>
+<a name="ln1037"> </a>
+<a name="ln1038">static status_t</a>
+<a name="ln1039">bfs_create_symlink(fs_volume* _volume, fs_vnode* _directory, const char* name,</a>
+<a name="ln1040">	const char* path, int mode)</a>
+<a name="ln1041">{</a>
+<a name="ln1042">	FUNCTION_START((&quot;name = \&quot;%s\&quot;, path = \&quot;%s\&quot;\n&quot;, name, path));</a>
+<a name="ln1043"> </a>
+<a name="ln1044">	Volume* volume = (Volume*)_volume-&gt;private_volume;</a>
+<a name="ln1045">	Inode* directory = (Inode*)_directory-&gt;private_node;</a>
+<a name="ln1046"> </a>
+<a name="ln1047">	if (volume-&gt;IsReadOnly())</a>
+<a name="ln1048">		return B_READ_ONLY_DEVICE;</a>
+<a name="ln1049"> </a>
+<a name="ln1050">	if (!directory-&gt;IsDirectory())</a>
+<a name="ln1051">		RETURN_ERROR(B_BAD_TYPE);</a>
+<a name="ln1052"> </a>
+<a name="ln1053">	status_t status = directory-&gt;CheckPermissions(W_OK);</a>
+<a name="ln1054">	if (status &lt; B_OK)</a>
+<a name="ln1055">		RETURN_ERROR(status);</a>
+<a name="ln1056"> </a>
+<a name="ln1057">	Transaction transaction(volume, directory-&gt;BlockNumber());</a>
+<a name="ln1058"> </a>
+<a name="ln1059">	Inode* link;</a>
+<a name="ln1060">	off_t id;</a>
+<a name="ln1061">	status = Inode::Create(transaction, directory, name, S_SYMLINK | 0777,</a>
+<a name="ln1062">		0, 0, NULL, &amp;id, &amp;link);</a>
+<a name="ln1063">	if (status &lt; B_OK)</a>
+<a name="ln1064">		RETURN_ERROR(status);</a>
+<a name="ln1065"> </a>
+<a name="ln1066">	size_t length = strlen(path);</a>
+<a name="ln1067">	if (length &lt; SHORT_SYMLINK_NAME_LENGTH) {</a>
+<a name="ln1068">		strcpy(link-&gt;Node().short_symlink, path);</a>
+<a name="ln1069">	} else {</a>
+<a name="ln1070">		link-&gt;Node().flags |= HOST_ENDIAN_TO_BFS_INT32(INODE_LONG_SYMLINK</a>
+<a name="ln1071">			| INODE_LOGGED);</a>
+<a name="ln1072"> </a>
+<a name="ln1073">		// links usually don't have a file cache attached - but we now need one</a>
+<a name="ln1074">		link-&gt;SetFileCache(file_cache_create(volume-&gt;ID(), link-&gt;ID(), 0));</a>
+<a name="ln1075">		link-&gt;SetMap(file_map_create(volume-&gt;ID(), link-&gt;ID(), 0));</a>
+<a name="ln1076"> </a>
+<a name="ln1077">		// The following call will have to write the inode back, so</a>
+<a name="ln1078">		// we don't have to do that here...</a>
+<a name="ln1079">		status = link-&gt;WriteAt(transaction, 0, (const uint8*)path, &amp;length);</a>
+<a name="ln1080">	}</a>
+<a name="ln1081"> </a>
+<a name="ln1082">	if (status == B_OK)</a>
+<a name="ln1083">		status = link-&gt;WriteBack(transaction);</a>
+<a name="ln1084"> </a>
+<a name="ln1085">	// Inode::Create() left the inode locked in memory, and also doesn't</a>
+<a name="ln1086">	// publish links</a>
+<a name="ln1087">	publish_vnode(volume-&gt;FSVolume(), id, link, &amp;gBFSVnodeOps, link-&gt;Mode(), 0);</a>
+<a name="ln1088">	put_vnode(volume-&gt;FSVolume(), id);</a>
+<a name="ln1089"> </a>
+<a name="ln1090">	if (status == B_OK) {</a>
+<a name="ln1091">		entry_cache_add(volume-&gt;ID(), directory-&gt;ID(), name, id);</a>
+<a name="ln1092"> </a>
+<a name="ln1093">		status = transaction.Done();</a>
+<a name="ln1094">		if (status == B_OK)</a>
+<a name="ln1095">			notify_entry_created(volume-&gt;ID(), directory-&gt;ID(), name, id);</a>
+<a name="ln1096">		else</a>
+<a name="ln1097">			entry_cache_remove(volume-&gt;ID(), directory-&gt;ID(), name);</a>
+<a name="ln1098">	}</a>
+<a name="ln1099"> </a>
+<a name="ln1100">	return status;</a>
+<a name="ln1101">}</a>
+<a name="ln1102"> </a>
+<a name="ln1103"> </a>
+<a name="ln1104">status_t</a>
+<a name="ln1105">bfs_link(fs_volume* _volume, fs_vnode* dir, const char* name, fs_vnode* node)</a>
+<a name="ln1106">{</a>
+<a name="ln1107">	FUNCTION_START((&quot;name = \&quot;%s\&quot;\n&quot;, name));</a>
+<a name="ln1108"> </a>
+<a name="ln1109">	// This one won't be implemented in a binary compatible BFS</a>
+<a name="ln1110">	return B_UNSUPPORTED;</a>
+<a name="ln1111">}</a>
+<a name="ln1112"> </a>
+<a name="ln1113"> </a>
+<a name="ln1114">status_t</a>
+<a name="ln1115">bfs_unlink(fs_volume* _volume, fs_vnode* _directory, const char* name)</a>
+<a name="ln1116">{</a>
+<a name="ln1117">	FUNCTION_START((&quot;name = \&quot;%s\&quot;\n&quot;, name));</a>
+<a name="ln1118"> </a>
+<a name="ln1119">	if (!strcmp(name, &quot;..&quot;) || !strcmp(name, &quot;.&quot;))</a>
+<a name="ln1120">		return B_NOT_ALLOWED;</a>
+<a name="ln1121"> </a>
+<a name="ln1122">	Volume* volume = (Volume*)_volume-&gt;private_volume;</a>
+<a name="ln1123">	Inode* directory = (Inode*)_directory-&gt;private_node;</a>
+<a name="ln1124"> </a>
+<a name="ln1125">	status_t status = directory-&gt;CheckPermissions(W_OK);</a>
+<a name="ln1126">	if (status &lt; B_OK)</a>
+<a name="ln1127">		return status;</a>
+<a name="ln1128"> </a>
+<a name="ln1129">	Transaction transaction(volume, directory-&gt;BlockNumber());</a>
+<a name="ln1130"> </a>
+<a name="ln1131">	off_t id;</a>
+<a name="ln1132">	status = directory-&gt;Remove(transaction, name, &amp;id);</a>
+<a name="ln1133">	if (status == B_OK) {</a>
+<a name="ln1134">		entry_cache_remove(volume-&gt;ID(), directory-&gt;ID(), name);</a>
+<a name="ln1135"> </a>
+<a name="ln1136">		status = transaction.Done();</a>
+<a name="ln1137">		if (status == B_OK)</a>
+<a name="ln1138">			notify_entry_removed(volume-&gt;ID(), directory-&gt;ID(), name, id);</a>
+<a name="ln1139">		else</a>
+<a name="ln1140">			entry_cache_add(volume-&gt;ID(), directory-&gt;ID(), name, id);</a>
+<a name="ln1141">	}</a>
+<a name="ln1142">	return status;</a>
+<a name="ln1143">}</a>
+<a name="ln1144"> </a>
+<a name="ln1145"> </a>
+<a name="ln1146">status_t</a>
+<a name="ln1147">bfs_rename(fs_volume* _volume, fs_vnode* _oldDir, const char* oldName,</a>
+<a name="ln1148">	fs_vnode* _newDir, const char* newName)</a>
+<a name="ln1149">{</a>
+<a name="ln1150">	FUNCTION_START((&quot;oldDir = %p, oldName = \&quot;%s\&quot;, newDir = %p, newName = &quot;</a>
+<a name="ln1151">		&quot;\&quot;%s\&quot;\n&quot;, _oldDir, oldName, _newDir, newName));</a>
+<a name="ln1152"> </a>
+<a name="ln1153">	Volume* volume = (Volume*)_volume-&gt;private_volume;</a>
+<a name="ln1154">	Inode* oldDirectory = (Inode*)_oldDir-&gt;private_node;</a>
+<a name="ln1155">	Inode* newDirectory = (Inode*)_newDir-&gt;private_node;</a>
+<a name="ln1156"> </a>
+<a name="ln1157">	// are we already done?</a>
+<a name="ln1158">	if (oldDirectory == newDirectory &amp;&amp; !strcmp(oldName, newName))</a>
+<a name="ln1159">		return B_OK;</a>
+<a name="ln1160"> </a>
+<a name="ln1161">	Transaction transaction(volume, oldDirectory-&gt;BlockNumber());</a>
+<a name="ln1162"> </a>
+<a name="ln1163">	oldDirectory-&gt;WriteLockInTransaction(transaction);</a>
+<a name="ln1164">	if (oldDirectory != newDirectory)</a>
+<a name="ln1165">		newDirectory-&gt;WriteLockInTransaction(transaction);</a>
+<a name="ln1166"> </a>
+<a name="ln1167">	// are we allowed to do what we've been told?</a>
+<a name="ln1168">	status_t status = oldDirectory-&gt;CheckPermissions(W_OK);</a>
+<a name="ln1169">	if (status == B_OK)</a>
+<a name="ln1170">		status = newDirectory-&gt;CheckPermissions(W_OK);</a>
+<a name="ln1171">	if (status != B_OK)</a>
+<a name="ln1172">		return status;</a>
+<a name="ln1173"> </a>
+<a name="ln1174">	// Get the directory's tree, and a pointer to the inode which should be</a>
+<a name="ln1175">	// changed</a>
+<a name="ln1176">	BPlusTree* tree = oldDirectory-&gt;Tree();</a>
+<a name="ln1177">	if (tree == NULL)</a>
+<a name="ln1178">		RETURN_ERROR(B_BAD_VALUE);</a>
+<a name="ln1179"> </a>
+<a name="ln1180">	off_t id;</a>
+<a name="ln1181">	status = tree-&gt;Find((const uint8*)oldName, strlen(oldName), &amp;id);</a>
+<a name="ln1182">	if (status != B_OK)</a>
+<a name="ln1183">		RETURN_ERROR(status);</a>
+<a name="ln1184"> </a>
+<a name="ln1185">	Vnode vnode(volume, id);</a>
+<a name="ln1186">	Inode* inode;</a>
+<a name="ln1187">	if (vnode.Get(&amp;inode) != B_OK)</a>
+<a name="ln1188">		return B_IO_ERROR;</a>
+<a name="ln1189"> </a>
+<a name="ln1190">	// Don't move a directory into one of its children - we soar up</a>
+<a name="ln1191">	// from the newDirectory to either the root node or the old</a>
+<a name="ln1192">	// directory, whichever comes first.</a>
+<a name="ln1193">	// If we meet our inode on that way, we have to bail out.</a>
+<a name="ln1194"> </a>
+<a name="ln1195">	if (oldDirectory != newDirectory) {</a>
+<a name="ln1196">		ino_t parent = newDirectory-&gt;ID();</a>
+<a name="ln1197">		ino_t root = volume-&gt;RootNode()-&gt;ID();</a>
+<a name="ln1198"> </a>
+<a name="ln1199">		while (true) {</a>
+<a name="ln1200">			if (parent == id)</a>
+<a name="ln1201">				return B_BAD_VALUE;</a>
+<a name="ln1202">			else if (parent == root || parent == oldDirectory-&gt;ID())</a>
+<a name="ln1203">				break;</a>
+<a name="ln1204"> </a>
+<a name="ln1205">			Vnode vnode(volume, parent);</a>
+<a name="ln1206">			Inode* parentNode;</a>
+<a name="ln1207">			if (vnode.Get(&amp;parentNode) != B_OK)</a>
+<a name="ln1208">				return B_ERROR;</a>
+<a name="ln1209"> </a>
+<a name="ln1210">			parent = volume-&gt;ToVnode(parentNode-&gt;Parent());</a>
+<a name="ln1211">		}</a>
+<a name="ln1212">	}</a>
+<a name="ln1213"> </a>
+<a name="ln1214">	// Everything okay? Then lets get to work...</a>
+<a name="ln1215"> </a>
+<a name="ln1216">	// First, try to make sure there is nothing that will stop us in</a>
+<a name="ln1217">	// the target directory - since this is the only non-critical</a>
+<a name="ln1218">	// failure, we will test this case first</a>
+<a name="ln1219">	BPlusTree* newTree = tree;</a>
+<a name="ln1220">	if (newDirectory != oldDirectory) {</a>
+<a name="ln1221">		newTree = newDirectory-&gt;Tree();</a>
+<a name="ln1222">		if (newTree == NULL)</a>
+<a name="ln1223">			RETURN_ERROR(B_BAD_VALUE);</a>
+<a name="ln1224">	}</a>
+<a name="ln1225"> </a>
+<a name="ln1226">	status = newTree-&gt;Insert(transaction, (const uint8*)newName,</a>
+<a name="ln1227">		strlen(newName), id);</a>
+<a name="ln1228">	if (status == B_NAME_IN_USE) {</a>
+<a name="ln1229">		// If there is already a file with that name, we have to remove</a>
+<a name="ln1230">		// it, as long it's not a directory with files in it</a>
+<a name="ln1231">		off_t clobber;</a>
+<a name="ln1232">		if (newTree-&gt;Find((const uint8*)newName, strlen(newName), &amp;clobber)</a>
+<a name="ln1233">				&lt; B_OK)</a>
+<a name="ln1234">			return B_NAME_IN_USE;</a>
+<a name="ln1235">		if (clobber == id)</a>
+<a name="ln1236">			return B_BAD_VALUE;</a>
+<a name="ln1237"> </a>
+<a name="ln1238">		Vnode vnode(volume, clobber);</a>
+<a name="ln1239">		Inode* other;</a>
+<a name="ln1240">		if (vnode.Get(&amp;other) &lt; B_OK)</a>
+<a name="ln1241">			return B_NAME_IN_USE;</a>
+<a name="ln1242"> </a>
+<a name="ln1243">		// only allowed, if either both nodes are directories or neither is</a>
+<a name="ln1244">		if (inode-&gt;IsDirectory() != other-&gt;IsDirectory())</a>
+<a name="ln1245">			return other-&gt;IsDirectory() ? B_IS_A_DIRECTORY : B_NOT_A_DIRECTORY;</a>
+<a name="ln1246"> </a>
+<a name="ln1247">		status = newDirectory-&gt;Remove(transaction, newName, NULL,</a>
+<a name="ln1248">			other-&gt;IsDirectory());</a>
+<a name="ln1249">		if (status &lt; B_OK)</a>
+<a name="ln1250">			return status;</a>
+<a name="ln1251"> </a>
+<a name="ln1252">		entry_cache_remove(volume-&gt;ID(), newDirectory-&gt;ID(), newName);</a>
+<a name="ln1253"> </a>
+<a name="ln1254">		notify_entry_removed(volume-&gt;ID(), newDirectory-&gt;ID(), newName,</a>
+<a name="ln1255">			clobber);</a>
+<a name="ln1256"> </a>
+<a name="ln1257">		status = newTree-&gt;Insert(transaction, (const uint8*)newName,</a>
+<a name="ln1258">			strlen(newName), id);</a>
+<a name="ln1259">	}</a>
+<a name="ln1260">	if (status != B_OK)</a>
+<a name="ln1261">		return status;</a>
+<a name="ln1262"> </a>
+<a name="ln1263">	inode-&gt;WriteLockInTransaction(transaction);</a>
+<a name="ln1264"> </a>
+<a name="ln1265">	volume-&gt;UpdateLiveQueriesRenameMove(inode, oldDirectory-&gt;ID(), oldName,</a>
+<a name="ln1266">		newDirectory-&gt;ID(), newName);</a>
+<a name="ln1267"> </a>
+<a name="ln1268">	// update the name only when they differ</a>
+<a name="ln1269">	if (strcmp(oldName, newName)) {</a>
+<a name="ln1270">		status = inode-&gt;SetName(transaction, newName);</a>
+<a name="ln1271">		if (status == B_OK) {</a>
+<a name="ln1272">			Index index(volume);</a>
+<a name="ln1273">			index.UpdateName(transaction, oldName, newName, inode);</a>
+<a name="ln1274">		}</a>
+<a name="ln1275">	}</a>
+<a name="ln1276"> </a>
+<a name="ln1277">	if (status == B_OK) {</a>
+<a name="ln1278">		status = tree-&gt;Remove(transaction, (const uint8*)oldName,</a>
+<a name="ln1279">			strlen(oldName), id);</a>
+<a name="ln1280">		if (status == B_OK) {</a>
+<a name="ln1281">			inode-&gt;Parent() = newDirectory-&gt;BlockRun();</a>
+<a name="ln1282"> </a>
+<a name="ln1283">			// if it's a directory, update the parent directory pointer</a>
+<a name="ln1284">			// in its tree if necessary</a>
+<a name="ln1285">			BPlusTree* movedTree = inode-&gt;Tree();</a>
+<a name="ln1286">			if (oldDirectory != newDirectory</a>
+<a name="ln1287">				&amp;&amp; inode-&gt;IsDirectory()</a>
+<a name="ln1288">				&amp;&amp; movedTree != NULL) {</a>
+<a name="ln1289">				status = movedTree-&gt;Replace(transaction, (const uint8*)&quot;..&quot;,</a>
+<a name="ln1290">					2, newDirectory-&gt;ID());</a>
+<a name="ln1291"> </a>
+<a name="ln1292">				if (status == B_OK) {</a>
+<a name="ln1293">					// update/add the cache entry for the parent</a>
+<a name="ln1294">					entry_cache_add(volume-&gt;ID(), id, &quot;..&quot;, newDirectory-&gt;ID());</a>
+<a name="ln1295">				}</a>
+<a name="ln1296">			}</a>
+<a name="ln1297"> </a>
+<a name="ln1298">			if (status == B_OK &amp;&amp; newDirectory != oldDirectory)</a>
+<a name="ln1299">				status = oldDirectory-&gt;ContainerContentsChanged(transaction);</a>
+<a name="ln1300">			if (status == B_OK)</a>
+<a name="ln1301">				status = newDirectory-&gt;ContainerContentsChanged(transaction);</a>
+<a name="ln1302"> </a>
+<a name="ln1303">			if (status == B_OK)</a>
+<a name="ln1304">				status = inode-&gt;WriteBack(transaction);</a>
+<a name="ln1305"> </a>
+<a name="ln1306">			if (status == B_OK) {</a>
+<a name="ln1307">				entry_cache_remove(volume-&gt;ID(), oldDirectory-&gt;ID(), oldName);</a>
+<a name="ln1308">				entry_cache_add(volume-&gt;ID(), newDirectory-&gt;ID(), newName, id);</a>
+<a name="ln1309"> </a>
+<a name="ln1310">				status = transaction.Done();</a>
+<a name="ln1311">				if (status == B_OK) {</a>
+<a name="ln1312">					notify_entry_moved(volume-&gt;ID(), oldDirectory-&gt;ID(),</a>
+<a name="ln1313">						oldName, newDirectory-&gt;ID(), newName, id);</a>
+<a name="ln1314">					return B_OK;</a>
+<a name="ln1315">				}</a>
+<a name="ln1316"> </a>
+<a name="ln1317">				entry_cache_remove(volume-&gt;ID(), newDirectory-&gt;ID(), newName);</a>
+<a name="ln1318">				entry_cache_add(volume-&gt;ID(), oldDirectory-&gt;ID(), oldName, id);</a>
+<a name="ln1319">			}</a>
+<a name="ln1320">		}</a>
+<a name="ln1321">	}</a>
+<a name="ln1322"> </a>
+<a name="ln1323">	return status;</a>
+<a name="ln1324">}</a>
+<a name="ln1325"> </a>
+<a name="ln1326"> </a>
+<a name="ln1327">static status_t</a>
+<a name="ln1328">bfs_open(fs_volume* _volume, fs_vnode* _node, int openMode, void** _cookie)</a>
+<a name="ln1329">{</a>
+<a name="ln1330">	FUNCTION();</a>
+<a name="ln1331"> </a>
+<a name="ln1332">	Volume* volume = (Volume*)_volume-&gt;private_volume;</a>
+<a name="ln1333">	Inode* inode = (Inode*)_node-&gt;private_node;</a>
+<a name="ln1334"> </a>
+<a name="ln1335">	// Opening a directory read-only is allowed, although you can't read</a>
+<a name="ln1336">	// any data from it.</a>
+<a name="ln1337">	if (inode-&gt;IsDirectory() &amp;&amp; (openMode &amp; O_RWMASK) != O_RDONLY)</a>
+<a name="ln1338">		return B_IS_A_DIRECTORY;</a>
+<a name="ln1339">	if ((openMode &amp; O_DIRECTORY) != 0 &amp;&amp; !inode-&gt;IsDirectory())</a>
+<a name="ln1340">		return B_NOT_A_DIRECTORY;</a>
+<a name="ln1341"> </a>
+<a name="ln1342">	status_t status = inode-&gt;CheckPermissions(open_mode_to_access(openMode)</a>
+<a name="ln1343">		| ((openMode &amp; O_TRUNC) != 0 ? W_OK : 0));</a>
+<a name="ln1344">	if (status != B_OK)</a>
+<a name="ln1345">		RETURN_ERROR(status);</a>
+<a name="ln1346"> </a>
+<a name="ln1347">	file_cookie* cookie = new(std::nothrow) file_cookie;</a>
+<a name="ln1348">	if (cookie == NULL)</a>
+<a name="ln1349">		RETURN_ERROR(B_NO_MEMORY);</a>
+<a name="ln1350">	ObjectDeleter&lt;file_cookie&gt; cookieDeleter(cookie);</a>
+<a name="ln1351"> </a>
+<a name="ln1352">	// initialize the cookie</a>
+<a name="ln1353">	cookie-&gt;open_mode = openMode &amp; BFS_OPEN_MODE_USER_MASK;</a>
+<a name="ln1354">	cookie-&gt;last_size = inode-&gt;Size();</a>
+<a name="ln1355">	cookie-&gt;last_notification = system_time();</a>
+<a name="ln1356"> </a>
+<a name="ln1357">	// Disable the file cache, if requested?</a>
+<a name="ln1358">	CObjectDeleter&lt;void&gt; fileCacheEnabler(file_cache_enable);</a>
+<a name="ln1359">	if ((openMode &amp; O_NOCACHE) != 0 &amp;&amp; inode-&gt;FileCache() != NULL) {</a>
+<a name="ln1360">		status = file_cache_disable(inode-&gt;FileCache());</a>
+<a name="ln1361">		if (status != B_OK)</a>
+<a name="ln1362">			return status;</a>
+<a name="ln1363">		fileCacheEnabler.SetTo(inode-&gt;FileCache());</a>
+<a name="ln1364">	}</a>
+<a name="ln1365"> </a>
+<a name="ln1366">	// Should we truncate the file?</a>
+<a name="ln1367">	if ((openMode &amp; O_TRUNC) != 0) {</a>
+<a name="ln1368">		if ((openMode &amp; O_RWMASK) == O_RDONLY)</a>
+<a name="ln1369">			return B_NOT_ALLOWED;</a>
+<a name="ln1370"> </a>
+<a name="ln1371">		Transaction transaction(volume, inode-&gt;BlockNumber());</a>
+<a name="ln1372">		inode-&gt;WriteLockInTransaction(transaction);</a>
+<a name="ln1373"> </a>
+<a name="ln1374">		status_t status = inode-&gt;SetFileSize(transaction, 0);</a>
+<a name="ln1375">		if (status == B_OK)</a>
+<a name="ln1376">			status = inode-&gt;WriteBack(transaction);</a>
+<a name="ln1377">		if (status == B_OK)</a>
+<a name="ln1378">			status = transaction.Done();</a>
+<a name="ln1379">		if (status != B_OK)</a>
+<a name="ln1380">			return status;</a>
+<a name="ln1381">	}</a>
+<a name="ln1382"> </a>
+<a name="ln1383">	fileCacheEnabler.Detach();</a>
+<a name="ln1384">	cookieDeleter.Detach();</a>
+<a name="ln1385">	*_cookie = cookie;</a>
+<a name="ln1386">	return B_OK;</a>
+<a name="ln1387">}</a>
+<a name="ln1388"> </a>
+<a name="ln1389"> </a>
+<a name="ln1390">static status_t</a>
+<a name="ln1391">bfs_read(fs_volume* _volume, fs_vnode* _node, void* _cookie, off_t pos,</a>
+<a name="ln1392">	void* buffer, size_t* _length)</a>
+<a name="ln1393">{</a>
+<a name="ln1394">	//FUNCTION();</a>
+<a name="ln1395">	Inode* inode = (Inode*)_node-&gt;private_node;</a>
+<a name="ln1396"> </a>
+<a name="ln1397">	if (!inode-&gt;HasUserAccessableStream()) {</a>
+<a name="ln1398">		*_length = 0;</a>
+<a name="ln1399">		return inode-&gt;IsDirectory() ? B_IS_A_DIRECTORY : B_BAD_VALUE;</a>
+<a name="ln1400">	}</a>
+<a name="ln1401"> </a>
+<a name="ln1402">	return inode-&gt;ReadAt(pos, (uint8*)buffer, _length);</a>
+<a name="ln1403">}</a>
+<a name="ln1404"> </a>
+<a name="ln1405"> </a>
+<a name="ln1406">static status_t</a>
+<a name="ln1407">bfs_write(fs_volume* _volume, fs_vnode* _node, void* _cookie, off_t pos,</a>
+<a name="ln1408">	const void* buffer, size_t* _length)</a>
+<a name="ln1409">{</a>
+<a name="ln1410">	//FUNCTION();</a>
+<a name="ln1411">	Volume* volume = (Volume*)_volume-&gt;private_volume;</a>
+<a name="ln1412">	Inode* inode = (Inode*)_node-&gt;private_node;</a>
+<a name="ln1413"> </a>
+<a name="ln1414">	if (volume-&gt;IsReadOnly())</a>
+<a name="ln1415">		return B_READ_ONLY_DEVICE;</a>
+<a name="ln1416"> </a>
+<a name="ln1417">	if (!inode-&gt;HasUserAccessableStream()) {</a>
+<a name="ln1418">		*_length = 0;</a>
+<a name="ln1419">		return inode-&gt;IsDirectory() ? B_IS_A_DIRECTORY : B_BAD_VALUE;</a>
+<a name="ln1420">	}</a>
+<a name="ln1421"> </a>
+<a name="ln1422">	file_cookie* cookie = (file_cookie*)_cookie;</a>
+<a name="ln1423"> </a>
+<a name="ln1424">	if (cookie-&gt;open_mode &amp; O_APPEND)</a>
+<a name="ln1425">		pos = inode-&gt;Size();</a>
+<a name="ln1426"> </a>
+<a name="ln1427">	Transaction transaction;</a>
+<a name="ln1428">		// We are not starting the transaction here, since</a>
+<a name="ln1429">		// it might not be needed at all (the contents of</a>
+<a name="ln1430">		// regular files aren't logged)</a>
+<a name="ln1431"> </a>
+<a name="ln1432">	status_t status = inode-&gt;WriteAt(transaction, pos, (const uint8*)buffer,</a>
+<a name="ln1433">		_length);</a>
+<a name="ln1434">	if (status == B_OK)</a>
+<a name="ln1435">		status = transaction.Done();</a>
+<a name="ln1436">	if (status == B_OK) {</a>
+<a name="ln1437">		InodeReadLocker locker(inode);</a>
+<a name="ln1438"> </a>
+<a name="ln1439">		// periodically notify if the file size has changed</a>
+<a name="ln1440">		// TODO: should we better test for a change in the last_modified time only?</a>
+<a name="ln1441">		if (!inode-&gt;IsDeleted() &amp;&amp; cookie-&gt;last_size != inode-&gt;Size()</a>
+<a name="ln1442">			&amp;&amp; system_time() &gt; cookie-&gt;last_notification</a>
+<a name="ln1443">					+ INODE_NOTIFICATION_INTERVAL) {</a>
+<a name="ln1444">			notify_stat_changed(volume-&gt;ID(), inode-&gt;ParentID(), inode-&gt;ID(),</a>
+<a name="ln1445">				B_STAT_MODIFICATION_TIME | B_STAT_SIZE | B_STAT_INTERIM_UPDATE);</a>
+<a name="ln1446">			cookie-&gt;last_size = inode-&gt;Size();</a>
+<a name="ln1447">			cookie-&gt;last_notification = system_time();</a>
+<a name="ln1448">		}</a>
+<a name="ln1449">	}</a>
+<a name="ln1450"> </a>
+<a name="ln1451">	return status;</a>
+<a name="ln1452">}</a>
+<a name="ln1453"> </a>
+<a name="ln1454"> </a>
+<a name="ln1455">static status_t</a>
+<a name="ln1456">bfs_close(fs_volume* _volume, fs_vnode* _node, void* _cookie)</a>
+<a name="ln1457">{</a>
+<a name="ln1458">	FUNCTION();</a>
+<a name="ln1459">	return B_OK;</a>
+<a name="ln1460">}</a>
+<a name="ln1461"> </a>
+<a name="ln1462"> </a>
+<a name="ln1463">static status_t</a>
+<a name="ln1464">bfs_free_cookie(fs_volume* _volume, fs_vnode* _node, void* _cookie)</a>
+<a name="ln1465">{</a>
+<a name="ln1466">	FUNCTION();</a>
+<a name="ln1467"> </a>
+<a name="ln1468">	file_cookie* cookie = (file_cookie*)_cookie;</a>
+<a name="ln1469">	Volume* volume = (Volume*)_volume-&gt;private_volume;</a>
+<a name="ln1470">	Inode* inode = (Inode*)_node-&gt;private_node;</a>
+<a name="ln1471"> </a>
+<a name="ln1472">	Transaction transaction;</a>
+<a name="ln1473">	bool needsTrimming = false;</a>
+<a name="ln1474"> </a>
+<a name="ln1475">	if (!volume-&gt;IsReadOnly() &amp;&amp; !volume-&gt;IsCheckingThread()) {</a>
+<a name="ln1476">		InodeReadLocker locker(inode);</a>
+<a name="ln1477">		needsTrimming = inode-&gt;NeedsTrimming();</a>
+<a name="ln1478"> </a>
+<a name="ln1479">		if ((cookie-&gt;open_mode &amp; O_RWMASK) != 0</a>
+<a name="ln1480">			&amp;&amp; !inode-&gt;IsDeleted()</a>
+<a name="ln1481">			&amp;&amp; (needsTrimming</a>
+<a name="ln1482">				|| inode-&gt;OldLastModified() != inode-&gt;LastModified()</a>
+<a name="ln1483">				|| (inode-&gt;InSizeIndex()</a>
+<a name="ln1484">					// TODO: this can prevent the size update notification</a>
+<a name="ln1485">					// for nodes not in the index!</a>
+<a name="ln1486">					&amp;&amp; inode-&gt;OldSize() != inode-&gt;Size()))) {</a>
+<a name="ln1487">			locker.Unlock();</a>
+<a name="ln1488">			transaction.Start(volume, inode-&gt;BlockNumber());</a>
+<a name="ln1489">		}</a>
+<a name="ln1490">	}</a>
+<a name="ln1491"> </a>
+<a name="ln1492">	status_t status = transaction.IsStarted() ? B_OK : B_ERROR;</a>
+<a name="ln1493"> </a>
+<a name="ln1494">	if (status == B_OK) {</a>
+<a name="ln1495">		inode-&gt;WriteLockInTransaction(transaction);</a>
+<a name="ln1496"> </a>
+<a name="ln1497">		// trim the preallocated blocks and update the size,</a>
+<a name="ln1498">		// and last_modified indices if needed</a>
+<a name="ln1499">		bool changedSize = false, changedTime = false;</a>
+<a name="ln1500">		Index index(volume);</a>
+<a name="ln1501"> </a>
+<a name="ln1502">		if (needsTrimming) {</a>
+<a name="ln1503">			status = inode-&gt;TrimPreallocation(transaction);</a>
+<a name="ln1504">			if (status &lt; B_OK) {</a>
+<a name="ln1505">				FATAL((&quot;Could not trim preallocated blocks: inode %&quot; B_PRIdINO</a>
+<a name="ln1506">					&quot;, transaction %d: %s!\n&quot;, inode-&gt;ID(),</a>
+<a name="ln1507">					(int)transaction.ID(), strerror(status)));</a>
+<a name="ln1508"> </a>
+<a name="ln1509">				// we still want this transaction to succeed</a>
+<a name="ln1510">				status = B_OK;</a>
+<a name="ln1511">			}</a>
+<a name="ln1512">		}</a>
+<a name="ln1513">		if (inode-&gt;OldSize() != inode-&gt;Size()) {</a>
+<a name="ln1514">			if (inode-&gt;InSizeIndex())</a>
+<a name="ln1515">				index.UpdateSize(transaction, inode);</a>
+<a name="ln1516">			changedSize = true;</a>
+<a name="ln1517">		}</a>
+<a name="ln1518">		if (inode-&gt;OldLastModified() != inode-&gt;LastModified()) {</a>
+<a name="ln1519">			if (inode-&gt;InLastModifiedIndex()) {</a>
+<a name="ln1520">				index.UpdateLastModified(transaction, inode,</a>
+<a name="ln1521">					inode-&gt;LastModified());</a>
+<a name="ln1522">			}</a>
+<a name="ln1523">			changedTime = true;</a>
+<a name="ln1524"> </a>
+<a name="ln1525">			// updating the index doesn't write back the inode</a>
+<a name="ln1526">			inode-&gt;WriteBack(transaction);</a>
+<a name="ln1527">		}</a>
+<a name="ln1528"> </a>
+<a name="ln1529">		if (changedSize || changedTime) {</a>
+<a name="ln1530">			notify_stat_changed(volume-&gt;ID(), inode-&gt;ParentID(), inode-&gt;ID(),</a>
+<a name="ln1531">				(changedTime ? B_STAT_MODIFICATION_TIME : 0)</a>
+<a name="ln1532">				| (changedSize ? B_STAT_SIZE : 0));</a>
+<a name="ln1533">		}</a>
+<a name="ln1534">	}</a>
+<a name="ln1535">	if (status == B_OK)</a>
+<a name="ln1536">		transaction.Done();</a>
+<a name="ln1537"> </a>
+<a name="ln1538">	if ((cookie-&gt;open_mode &amp; BFS_OPEN_MODE_CHECKING) != 0) {</a>
+<a name="ln1539">		// &quot;chkbfs&quot; exited abnormally, so we have to stop it here...</a>
+<a name="ln1540">		FATAL((&quot;check process was aborted!\n&quot;));</a>
+<a name="ln1541">		volume-&gt;CheckVisitor()-&gt;StopChecking();</a>
+<a name="ln1542">		volume-&gt;DeleteCheckVisitor();</a>
+<a name="ln1543">	}</a>
+<a name="ln1544"> </a>
+<a name="ln1545">	if ((cookie-&gt;open_mode &amp; O_NOCACHE) != 0 &amp;&amp; inode-&gt;FileCache() != NULL)</a>
+<a name="ln1546">		file_cache_enable(inode-&gt;FileCache());</a>
+<a name="ln1547"> </a>
+<a name="ln1548">	delete cookie;</a>
+<a name="ln1549">	return B_OK;</a>
+<a name="ln1550">}</a>
+<a name="ln1551"> </a>
+<a name="ln1552"> </a>
+<a name="ln1553">/*!	Checks access permissions, return B_NOT_ALLOWED if the action</a>
+<a name="ln1554">	is not allowed.</a>
+<a name="ln1555">*/</a>
+<a name="ln1556">static status_t</a>
+<a name="ln1557">bfs_access(fs_volume* _volume, fs_vnode* _node, int accessMode)</a>
+<a name="ln1558">{</a>
+<a name="ln1559">	//FUNCTION();</a>
+<a name="ln1560"> </a>
+<a name="ln1561">	Inode* inode = (Inode*)_node-&gt;private_node;</a>
+<a name="ln1562">	status_t status = inode-&gt;CheckPermissions(accessMode);</a>
+<a name="ln1563">	if (status &lt; B_OK)</a>
+<a name="ln1564">		RETURN_ERROR(status);</a>
+<a name="ln1565"> </a>
+<a name="ln1566">	return B_OK;</a>
+<a name="ln1567">}</a>
+<a name="ln1568"> </a>
+<a name="ln1569"> </a>
+<a name="ln1570">static status_t</a>
+<a name="ln1571">bfs_read_link(fs_volume* _volume, fs_vnode* _node, char* buffer,</a>
+<a name="ln1572">	size_t* _bufferSize)</a>
+<a name="ln1573">{</a>
+<a name="ln1574">	FUNCTION();</a>
+<a name="ln1575"> </a>
+<a name="ln1576">	Inode* inode = (Inode*)_node-&gt;private_node;</a>
+<a name="ln1577"> </a>
+<a name="ln1578">	if (!inode-&gt;IsSymLink())</a>
+<a name="ln1579">		RETURN_ERROR(B_BAD_VALUE);</a>
+<a name="ln1580"> </a>
+<a name="ln1581">	if ((inode-&gt;Flags() &amp; INODE_LONG_SYMLINK) != 0) {</a>
+<a name="ln1582">		if ((uint64)inode-&gt;Size() &lt; (uint64)*_bufferSize)</a>
+<a name="ln1583">			*_bufferSize = inode-&gt;Size();</a>
+<a name="ln1584"> </a>
+<a name="ln1585">		status_t status = inode-&gt;ReadAt(0, (uint8*)buffer, _bufferSize);</a>
+<a name="ln1586">		if (status &lt; B_OK)</a>
+<a name="ln1587">			RETURN_ERROR(status);</a>
+<a name="ln1588"> </a>
+<a name="ln1589">		return B_OK;</a>
+<a name="ln1590">	}</a>
+<a name="ln1591"> </a>
+<a name="ln1592">	size_t linkLen = strlen(inode-&gt;Node().short_symlink);</a>
+<a name="ln1593">	if (linkLen &lt; *_bufferSize)</a>
+<a name="ln1594">		*_bufferSize = linkLen;</a>
+<a name="ln1595"> </a>
+<a name="ln1596">	return user_memcpy(buffer, inode-&gt;Node().short_symlink, *_bufferSize);</a>
+<a name="ln1597">}</a>
+<a name="ln1598"> </a>
+<a name="ln1599"> </a>
+<a name="ln1600">//	#pragma mark - Directory functions</a>
+<a name="ln1601"> </a>
+<a name="ln1602"> </a>
+<a name="ln1603">static status_t</a>
+<a name="ln1604">bfs_create_dir(fs_volume* _volume, fs_vnode* _directory, const char* name,</a>
+<a name="ln1605">	int mode)</a>
+<a name="ln1606">{</a>
+<a name="ln1607">	FUNCTION_START((&quot;name = \&quot;%s\&quot;, perms = %d\n&quot;, name, mode));</a>
+<a name="ln1608"> </a>
+<a name="ln1609">	Volume* volume = (Volume*)_volume-&gt;private_volume;</a>
+<a name="ln1610">	Inode* directory = (Inode*)_directory-&gt;private_node;</a>
+<a name="ln1611"> </a>
+<a name="ln1612">	if (volume-&gt;IsReadOnly())</a>
+<a name="ln1613">		return B_READ_ONLY_DEVICE;</a>
+<a name="ln1614"> </a>
+<a name="ln1615">	if (!directory-&gt;IsDirectory())</a>
+<a name="ln1616">		RETURN_ERROR(B_BAD_TYPE);</a>
+<a name="ln1617"> </a>
+<a name="ln1618">	status_t status = directory-&gt;CheckPermissions(W_OK);</a>
+<a name="ln1619">	if (status &lt; B_OK)</a>
+<a name="ln1620">		RETURN_ERROR(status);</a>
+<a name="ln1621"> </a>
+<a name="ln1622">	Transaction transaction(volume, directory-&gt;BlockNumber());</a>
+<a name="ln1623"> </a>
+<a name="ln1624">	// Inode::Create() locks the inode if we pass the &quot;id&quot; parameter, but we</a>
+<a name="ln1625">	// need it anyway</a>
+<a name="ln1626">	off_t id;</a>
+<a name="ln1627">	status = Inode::Create(transaction, directory, name,</a>
+<a name="ln1628">		S_DIRECTORY | (mode &amp; S_IUMSK), 0, 0, NULL, &amp;id);</a>
+<a name="ln1629">	if (status == B_OK) {</a>
+<a name="ln1630">		put_vnode(volume-&gt;FSVolume(), id);</a>
+<a name="ln1631"> </a>
+<a name="ln1632">		entry_cache_add(volume-&gt;ID(), directory-&gt;ID(), name, id);</a>
+<a name="ln1633"> </a>
+<a name="ln1634">		status = transaction.Done();</a>
+<a name="ln1635">		if (status == B_OK)</a>
+<a name="ln1636">			notify_entry_created(volume-&gt;ID(), directory-&gt;ID(), name, id);</a>
+<a name="ln1637">		else</a>
+<a name="ln1638">			entry_cache_remove(volume-&gt;ID(), directory-&gt;ID(), name);</a>
+<a name="ln1639">	}</a>
+<a name="ln1640"> </a>
+<a name="ln1641">	return status;</a>
+<a name="ln1642">}</a>
+<a name="ln1643"> </a>
+<a name="ln1644"> </a>
+<a name="ln1645">static status_t</a>
+<a name="ln1646">bfs_remove_dir(fs_volume* _volume, fs_vnode* _directory, const char* name)</a>
+<a name="ln1647">{</a>
+<a name="ln1648">	FUNCTION_START((&quot;name = \&quot;%s\&quot;\n&quot;, name));</a>
+<a name="ln1649"> </a>
+<a name="ln1650">	Volume* volume = (Volume*)_volume-&gt;private_volume;</a>
+<a name="ln1651">	Inode* directory = (Inode*)_directory-&gt;private_node;</a>
+<a name="ln1652"> </a>
+<a name="ln1653">	Transaction transaction(volume, directory-&gt;BlockNumber());</a>
+<a name="ln1654"> </a>
+<a name="ln1655">	off_t id;</a>
+<a name="ln1656">	status_t status = directory-&gt;Remove(transaction, name, &amp;id, true);</a>
+<a name="ln1657">	if (status == B_OK) {</a>
+<a name="ln1658">		// Remove the cache entry for the directory and potentially also</a>
+<a name="ln1659">		// the parent entry still belonging to the directory</a>
+<a name="ln1660">		entry_cache_remove(volume-&gt;ID(), directory-&gt;ID(), name);</a>
+<a name="ln1661">		entry_cache_remove(volume-&gt;ID(), id, &quot;..&quot;);</a>
+<a name="ln1662"> </a>
+<a name="ln1663">		status = transaction.Done();</a>
+<a name="ln1664">		if (status == B_OK)</a>
+<a name="ln1665">			notify_entry_removed(volume-&gt;ID(), directory-&gt;ID(), name, id);</a>
+<a name="ln1666">		else {</a>
+<a name="ln1667">			entry_cache_add(volume-&gt;ID(), directory-&gt;ID(), name, id);</a>
+<a name="ln1668">			entry_cache_add(volume-&gt;ID(), id, &quot;..&quot;, id);</a>
+<a name="ln1669">		}</a>
+<a name="ln1670">	}</a>
+<a name="ln1671"> </a>
+<a name="ln1672">	return status;</a>
+<a name="ln1673">}</a>
+<a name="ln1674"> </a>
+<a name="ln1675"> </a>
+<a name="ln1676">/*!	Opens a directory ready to be traversed.</a>
+<a name="ln1677">	bfs_open_dir() is also used by bfs_open_index_dir().</a>
+<a name="ln1678">*/</a>
+<a name="ln1679">static status_t</a>
+<a name="ln1680">bfs_open_dir(fs_volume* _volume, fs_vnode* _node, void** _cookie)</a>
+<a name="ln1681">{</a>
+<a name="ln1682">	FUNCTION();</a>
+<a name="ln1683"> </a>
+<a name="ln1684">	Inode* inode = (Inode*)_node-&gt;private_node;</a>
+<a name="ln1685">	status_t status = inode-&gt;CheckPermissions(R_OK);</a>
+<a name="ln1686">	if (status &lt; B_OK)</a>
+<a name="ln1687">		RETURN_ERROR(status);</a>
+<a name="ln1688"> </a>
+<a name="ln1689">	// we don't ask here for directories only, because the bfs_open_index_dir()</a>
+<a name="ln1690">	// function utilizes us (so we must be able to open indices as well)</a>
+<a name="ln1691">	if (!inode-&gt;IsContainer())</a>
+<a name="ln1692">		RETURN_ERROR(B_NOT_A_DIRECTORY);</a>
+<a name="ln1693"> </a>
+<a name="ln1694">	BPlusTree* tree = inode-&gt;Tree();</a>
+<a name="ln1695">	if (tree == NULL)</a>
+<a name="ln1696">		RETURN_ERROR(B_BAD_VALUE);</a>
+<a name="ln1697"> </a>
+<a name="ln1698">	TreeIterator* iterator = new(std::nothrow) TreeIterator(tree);</a>
+<a name="ln1699">	if (iterator == NULL)</a>
+<a name="ln1700">		RETURN_ERROR(B_NO_MEMORY);</a>
+<a name="ln1701"> </a>
+<a name="ln1702">	*_cookie = iterator;</a>
+<a name="ln1703">	return B_OK;</a>
+<a name="ln1704">}</a>
+<a name="ln1705"> </a>
+<a name="ln1706"> </a>
+<a name="ln1707">static status_t</a>
+<a name="ln1708">bfs_read_dir(fs_volume* _volume, fs_vnode* _node, void* _cookie,</a>
+<a name="ln1709">	struct dirent* dirent, size_t bufferSize, uint32* _num)</a>
+<a name="ln1710">{</a>
+<a name="ln1711">	FUNCTION();</a>
+<a name="ln1712"> </a>
+<a name="ln1713">	TreeIterator* iterator = (TreeIterator*)_cookie;</a>
+<a name="ln1714">	Volume* volume = (Volume*)_volume-&gt;private_volume;</a>
+<a name="ln1715"> </a>
+<a name="ln1716">	uint32 maxCount = *_num;</a>
+<a name="ln1717">	uint32 count = 0;</a>
+<a name="ln1718"> </a>
+<a name="ln1719">	while (count &lt; maxCount &amp;&amp; bufferSize &gt; sizeof(struct dirent)) {</a>
+<a name="ln1720">		ino_t id;</a>
+<a name="ln1721">		uint16 length;</a>
+<a name="ln1722">		size_t nameBufferSize = bufferSize - sizeof(struct dirent) + 1;</a>
+<a name="ln1723"> </a>
+<a name="ln1724">		status_t status = iterator-&gt;GetNextEntry(dirent-&gt;d_name, &amp;length,</a>
+<a name="ln1725">			nameBufferSize, &amp;id);</a>
+<a name="ln1726"> </a>
+<a name="ln1727">		if (status == B_ENTRY_NOT_FOUND)</a>
+<a name="ln1728">			break;</a>
+<a name="ln1729"> </a>
+<a name="ln1730">		if (status == B_BUFFER_OVERFLOW) {</a>
+<a name="ln1731">			// the remaining name buffer length was too small</a>
+<a name="ln1732">			if (count == 0)</a>
+<a name="ln1733">				RETURN_ERROR(B_BUFFER_OVERFLOW);</a>
+<a name="ln1734">			break;</a>
+<a name="ln1735">		}</a>
+<a name="ln1736"> </a>
+<a name="ln1737">		if (status != B_OK)</a>
+<a name="ln1738">			RETURN_ERROR(status);</a>
+<a name="ln1739"> </a>
+<a name="ln1740">		ASSERT(length &lt; nameBufferSize);</a>
+<a name="ln1741"> </a>
+<a name="ln1742">		dirent-&gt;d_dev = volume-&gt;ID();</a>
+<a name="ln1743">		dirent-&gt;d_ino = id;</a>
+<a name="ln1744">		dirent-&gt;d_reclen = sizeof(struct dirent) + length;</a>
+<a name="ln1745"> </a>
+<a name="ln1746">		bufferSize -= dirent-&gt;d_reclen;</a>
+<a name="ln1747">		dirent = (struct dirent*)((uint8*)dirent + dirent-&gt;d_reclen);</a>
+<a name="ln1748">		count++;</a>
+<a name="ln1749">	}</a>
+<a name="ln1750"> </a>
+<a name="ln1751">	*_num = count;</a>
+<a name="ln1752">	return B_OK;</a>
+<a name="ln1753">}</a>
+<a name="ln1754"> </a>
+<a name="ln1755"> </a>
+<a name="ln1756">/*!	Sets the TreeIterator back to the beginning of the directory. */</a>
+<a name="ln1757">static status_t</a>
+<a name="ln1758">bfs_rewind_dir(fs_volume* /*_volume*/, fs_vnode* /*node*/, void* _cookie)</a>
+<a name="ln1759">{</a>
+<a name="ln1760">	FUNCTION();</a>
+<a name="ln1761">	TreeIterator* iterator = (TreeIterator*)_cookie;</a>
+<a name="ln1762"> </a>
+<a name="ln1763">	return iterator-&gt;Rewind();</a>
+<a name="ln1764">}</a>
+<a name="ln1765"> </a>
+<a name="ln1766"> </a>
+<a name="ln1767">static status_t</a>
+<a name="ln1768">bfs_close_dir(fs_volume* /*_volume*/, fs_vnode* /*node*/, void* /*_cookie*/)</a>
+<a name="ln1769">{</a>
+<a name="ln1770">	FUNCTION();</a>
+<a name="ln1771">	return B_OK;</a>
+<a name="ln1772">}</a>
+<a name="ln1773"> </a>
+<a name="ln1774"> </a>
+<a name="ln1775">static status_t</a>
+<a name="ln1776">bfs_free_dir_cookie(fs_volume* _volume, fs_vnode* node, void* _cookie)</a>
+<a name="ln1777">{</a>
+<a name="ln1778">	delete (TreeIterator*)_cookie;</a>
+<a name="ln1779">	return B_OK;</a>
+<a name="ln1780">}</a>
+<a name="ln1781"> </a>
+<a name="ln1782"> </a>
+<a name="ln1783">//	#pragma mark - Attribute functions</a>
+<a name="ln1784"> </a>
+<a name="ln1785"> </a>
+<a name="ln1786">static status_t</a>
+<a name="ln1787">bfs_open_attr_dir(fs_volume* _volume, fs_vnode* _node, void** _cookie)</a>
+<a name="ln1788">{</a>
+<a name="ln1789">	Inode* inode = (Inode*)_node-&gt;private_node;</a>
+<a name="ln1790"> </a>
+<a name="ln1791">	FUNCTION();</a>
+<a name="ln1792"> </a>
+<a name="ln1793">	AttributeIterator* iterator = new(std::nothrow) AttributeIterator(inode);</a>
+<a name="ln1794">	if (iterator == NULL)</a>
+<a name="ln1795">		RETURN_ERROR(B_NO_MEMORY);</a>
+<a name="ln1796"> </a>
+<a name="ln1797">	*_cookie = iterator;</a>
+<a name="ln1798">	return B_OK;</a>
+<a name="ln1799">}</a>
+<a name="ln1800"> </a>
+<a name="ln1801"> </a>
+<a name="ln1802">static status_t</a>
+<a name="ln1803">bfs_close_attr_dir(fs_volume* _volume, fs_vnode* node, void* cookie)</a>
+<a name="ln1804">{</a>
+<a name="ln1805">	FUNCTION();</a>
+<a name="ln1806">	return B_OK;</a>
+<a name="ln1807">}</a>
+<a name="ln1808"> </a>
+<a name="ln1809"> </a>
+<a name="ln1810">static status_t</a>
+<a name="ln1811">bfs_free_attr_dir_cookie(fs_volume* _volume, fs_vnode* node, void* _cookie)</a>
+<a name="ln1812">{</a>
+<a name="ln1813">	FUNCTION();</a>
+<a name="ln1814">	AttributeIterator* iterator = (AttributeIterator*)_cookie;</a>
+<a name="ln1815"> </a>
+<a name="ln1816">	delete iterator;</a>
+<a name="ln1817">	return B_OK;</a>
+<a name="ln1818">}</a>
+<a name="ln1819"> </a>
+<a name="ln1820"> </a>
+<a name="ln1821">static status_t</a>
+<a name="ln1822">bfs_rewind_attr_dir(fs_volume* _volume, fs_vnode* _node, void* _cookie)</a>
+<a name="ln1823">{</a>
+<a name="ln1824">	FUNCTION();</a>
+<a name="ln1825"> </a>
+<a name="ln1826">	AttributeIterator* iterator = (AttributeIterator*)_cookie;</a>
+<a name="ln1827">	RETURN_ERROR(iterator-&gt;Rewind());</a>
+<a name="ln1828">}</a>
+<a name="ln1829"> </a>
+<a name="ln1830"> </a>
+<a name="ln1831">static status_t</a>
+<a name="ln1832">bfs_read_attr_dir(fs_volume* _volume, fs_vnode* node, void* _cookie,</a>
+<a name="ln1833">	struct dirent* dirent, size_t bufferSize, uint32* _num)</a>
+<a name="ln1834">{</a>
+<a name="ln1835">	FUNCTION();</a>
+<a name="ln1836">	AttributeIterator* iterator = (AttributeIterator*)_cookie;</a>
+<a name="ln1837"> </a>
+<a name="ln1838">	uint32 type;</a>
+<a name="ln1839">	size_t length;</a>
+<a name="ln1840">	status_t status = iterator-&gt;GetNext(dirent-&gt;d_name, &amp;length, &amp;type,</a>
+<a name="ln1841">		&amp;dirent-&gt;d_ino);</a>
+<a name="ln1842">	if (status == B_ENTRY_NOT_FOUND) {</a>
+<a name="ln1843">		*_num = 0;</a>
+<a name="ln1844">		return B_OK;</a>
+<a name="ln1845">	} else if (status != B_OK) {</a>
+<a name="ln1846">		RETURN_ERROR(status);</a>
+<a name="ln1847">	}</a>
+<a name="ln1848"> </a>
+<a name="ln1849">	Volume* volume = (Volume*)_volume-&gt;private_volume;</a>
+<a name="ln1850"> </a>
+<a name="ln1851">	dirent-&gt;d_dev = volume-&gt;ID();</a>
+<a name="ln1852">	dirent-&gt;d_reclen = sizeof(struct dirent) + length;</a>
+<a name="ln1853"> </a>
+<a name="ln1854">	*_num = 1;</a>
+<a name="ln1855">	return B_OK;</a>
+<a name="ln1856">}</a>
+<a name="ln1857"> </a>
+<a name="ln1858"> </a>
+<a name="ln1859">static status_t</a>
+<a name="ln1860">bfs_create_attr(fs_volume* _volume, fs_vnode* _node, const char* name,</a>
+<a name="ln1861">	uint32 type, int openMode, void** _cookie)</a>
+<a name="ln1862">{</a>
+<a name="ln1863">	FUNCTION();</a>
+<a name="ln1864"> </a>
+<a name="ln1865">	Volume* volume = (Volume*)_volume-&gt;private_volume;</a>
+<a name="ln1866">	if (volume-&gt;IsReadOnly())</a>
+<a name="ln1867">		return B_READ_ONLY_DEVICE;</a>
+<a name="ln1868"> </a>
+<a name="ln1869">	Inode* inode = (Inode*)_node-&gt;private_node;</a>
+<a name="ln1870">	Attribute attribute(inode);</a>
+<a name="ln1871"> </a>
+<a name="ln1872">	return attribute.Create(name, type, openMode, (attr_cookie**)_cookie);</a>
+<a name="ln1873">}</a>
+<a name="ln1874"> </a>
+<a name="ln1875"> </a>
+<a name="ln1876">static status_t</a>
+<a name="ln1877">bfs_open_attr(fs_volume* _volume, fs_vnode* _node, const char* name,</a>
+<a name="ln1878">	int openMode, void** _cookie)</a>
+<a name="ln1879">{</a>
+<a name="ln1880">	FUNCTION();</a>
+<a name="ln1881"> </a>
+<a name="ln1882">	Inode* inode = (Inode*)_node-&gt;private_node;</a>
+<a name="ln1883">	Attribute attribute(inode);</a>
+<a name="ln1884"> </a>
+<a name="ln1885">	return attribute.Open(name, openMode, (attr_cookie**)_cookie);</a>
+<a name="ln1886">}</a>
+<a name="ln1887"> </a>
+<a name="ln1888"> </a>
+<a name="ln1889">static status_t</a>
+<a name="ln1890">bfs_close_attr(fs_volume* _volume, fs_vnode* _file, void* cookie)</a>
+<a name="ln1891">{</a>
+<a name="ln1892">	return B_OK;</a>
+<a name="ln1893">}</a>
+<a name="ln1894"> </a>
+<a name="ln1895"> </a>
+<a name="ln1896">static status_t</a>
+<a name="ln1897">bfs_free_attr_cookie(fs_volume* _volume, fs_vnode* _file, void* cookie)</a>
+<a name="ln1898">{</a>
+<a name="ln1899">	delete (attr_cookie*)cookie;</a>
+<a name="ln1900">	return B_OK;</a>
+<a name="ln1901">}</a>
+<a name="ln1902"> </a>
+<a name="ln1903"> </a>
+<a name="ln1904">static status_t</a>
+<a name="ln1905">bfs_read_attr(fs_volume* _volume, fs_vnode* _file, void* _cookie, off_t pos,</a>
+<a name="ln1906">	void* buffer, size_t* _length)</a>
+<a name="ln1907">{</a>
+<a name="ln1908">	FUNCTION();</a>
+<a name="ln1909"> </a>
+<a name="ln1910">	attr_cookie* cookie = (attr_cookie*)_cookie;</a>
+<a name="ln1911">	Inode* inode = (Inode*)_file-&gt;private_node;</a>
+<a name="ln1912"> </a>
+<a name="ln1913">	Attribute attribute(inode, cookie);</a>
+<a name="ln1914"> </a>
+<a name="ln1915">	return attribute.Read(cookie, pos, (uint8*)buffer, _length);</a>
+<a name="ln1916">}</a>
+<a name="ln1917"> </a>
+<a name="ln1918"> </a>
+<a name="ln1919">static status_t</a>
+<a name="ln1920">bfs_write_attr(fs_volume* _volume, fs_vnode* _file, void* _cookie,</a>
+<a name="ln1921">	off_t pos, const void* buffer, size_t* _length)</a>
+<a name="ln1922">{</a>
+<a name="ln1923">	FUNCTION();</a>
+<a name="ln1924"> </a>
+<a name="ln1925">	attr_cookie* cookie = (attr_cookie*)_cookie;</a>
+<a name="ln1926">	Volume* volume = (Volume*)_volume-&gt;private_volume;</a>
+<a name="ln1927">	Inode* inode = (Inode*)_file-&gt;private_node;</a>
+<a name="ln1928"> </a>
+<a name="ln1929">	Transaction transaction(volume, inode-&gt;BlockNumber());</a>
+<a name="ln1930">	Attribute attribute(inode, cookie);</a>
+<a name="ln1931"> </a>
+<a name="ln1932">	bool created;</a>
+<a name="ln1933">	status_t status = attribute.Write(transaction, cookie, pos,</a>
+<a name="ln1934">		(const uint8*)buffer, _length, &amp;created);</a>
+<a name="ln1935">	if (status == B_OK) {</a>
+<a name="ln1936">		status = transaction.Done();</a>
+<a name="ln1937">		if (status == B_OK) {</a>
+<a name="ln1938">			notify_attribute_changed(volume-&gt;ID(), inode-&gt;ParentID(),</a>
+<a name="ln1939">				inode-&gt;ID(), cookie-&gt;name,</a>
+<a name="ln1940">				created ? B_ATTR_CREATED : B_ATTR_CHANGED);</a>
+<a name="ln1941">			notify_stat_changed(volume-&gt;ID(), inode-&gt;ParentID(), inode-&gt;ID(),</a>
+<a name="ln1942">				B_STAT_CHANGE_TIME);</a>
+<a name="ln1943">		}</a>
+<a name="ln1944">	}</a>
+<a name="ln1945"> </a>
+<a name="ln1946">	return status;</a>
+<a name="ln1947">}</a>
+<a name="ln1948"> </a>
+<a name="ln1949"> </a>
+<a name="ln1950">static status_t</a>
+<a name="ln1951">bfs_read_attr_stat(fs_volume* _volume, fs_vnode* _file, void* _cookie,</a>
+<a name="ln1952">	struct stat* stat)</a>
+<a name="ln1953">{</a>
+<a name="ln1954">	FUNCTION();</a>
+<a name="ln1955"> </a>
+<a name="ln1956">	attr_cookie* cookie = (attr_cookie*)_cookie;</a>
+<a name="ln1957">	Inode* inode = (Inode*)_file-&gt;private_node;</a>
+<a name="ln1958"> </a>
+<a name="ln1959">	Attribute attribute(inode, cookie);</a>
+<a name="ln1960"> </a>
+<a name="ln1961">	return attribute.Stat(*stat);</a>
+<a name="ln1962">}</a>
+<a name="ln1963"> </a>
+<a name="ln1964"> </a>
+<a name="ln1965">static status_t</a>
+<a name="ln1966">bfs_write_attr_stat(fs_volume* _volume, fs_vnode* file, void* cookie,</a>
+<a name="ln1967">	const struct stat* stat, int statMask)</a>
+<a name="ln1968">{</a>
+<a name="ln1969">	// TODO: Implement (at least setting the size)!</a>
+<a name="ln1970">	return EOPNOTSUPP;</a>
+<a name="ln1971">}</a>
+<a name="ln1972"> </a>
+<a name="ln1973"> </a>
+<a name="ln1974">static status_t</a>
+<a name="ln1975">bfs_rename_attr(fs_volume* _volume, fs_vnode* fromFile, const char* fromName,</a>
+<a name="ln1976">	fs_vnode* toFile, const char* toName)</a>
+<a name="ln1977">{</a>
+<a name="ln1978">	FUNCTION_START((&quot;name = \&quot;%s\&quot;, to = \&quot;%s\&quot;\n&quot;, fromName, toName));</a>
+<a name="ln1979"> </a>
+<a name="ln1980">	// TODO: implement bfs_rename_attr()!</a>
+<a name="ln1981">	// There will probably be an API to move one attribute to another file,</a>
+<a name="ln1982">	// making that function much more complicated - oh joy ;-)</a>
+<a name="ln1983"> </a>
+<a name="ln1984">	return EOPNOTSUPP;</a>
+<a name="ln1985">}</a>
+<a name="ln1986"> </a>
+<a name="ln1987"> </a>
+<a name="ln1988">static status_t</a>
+<a name="ln1989">bfs_remove_attr(fs_volume* _volume, fs_vnode* _node, const char* name)</a>
+<a name="ln1990">{</a>
+<a name="ln1991">	FUNCTION_START((&quot;name = \&quot;%s\&quot;\n&quot;, name));</a>
+<a name="ln1992"> </a>
+<a name="ln1993">	Volume* volume = (Volume*)_volume-&gt;private_volume;</a>
+<a name="ln1994">	Inode* inode = (Inode*)_node-&gt;private_node;</a>
+<a name="ln1995"> </a>
+<a name="ln1996">	status_t status = inode-&gt;CheckPermissions(W_OK);</a>
+<a name="ln1997">	if (status != B_OK)</a>
+<a name="ln1998">		return status;</a>
+<a name="ln1999"> </a>
+<a name="ln2000">	Transaction transaction(volume, inode-&gt;BlockNumber());</a>
+<a name="ln2001"> </a>
+<a name="ln2002">	status = inode-&gt;RemoveAttribute(transaction, name);</a>
+<a name="ln2003">	if (status == B_OK)</a>
+<a name="ln2004">		status = transaction.Done();</a>
+<a name="ln2005">	if (status == B_OK) {</a>
+<a name="ln2006">		notify_attribute_changed(volume-&gt;ID(), inode-&gt;ParentID(), inode-&gt;ID(),</a>
+<a name="ln2007">			name, B_ATTR_REMOVED);</a>
+<a name="ln2008">	}</a>
+<a name="ln2009"> </a>
+<a name="ln2010">	return status;</a>
+<a name="ln2011">}</a>
+<a name="ln2012"> </a>
+<a name="ln2013"> </a>
+<a name="ln2014">//	#pragma mark - Special Nodes</a>
+<a name="ln2015"> </a>
+<a name="ln2016"> </a>
+<a name="ln2017">status_t</a>
+<a name="ln2018">bfs_create_special_node(fs_volume* _volume, fs_vnode* _directory,</a>
+<a name="ln2019">	const char* name, fs_vnode* subVnode, mode_t mode, uint32 flags,</a>
+<a name="ln2020">	fs_vnode* _superVnode, ino_t* _nodeID)</a>
+<a name="ln2021">{</a>
+<a name="ln2022">	// no need to support entry-less nodes</a>
+<a name="ln2023">	if (name == NULL)</a>
+<a name="ln2024">		return B_UNSUPPORTED;</a>
+<a name="ln2025"> </a>
+<a name="ln2026">	FUNCTION_START((&quot;name = \&quot;%s\&quot;, mode = %d, flags = 0x%lx, subVnode: %p\n&quot;,</a>
+<a name="ln2027">		name, mode, flags, subVnode));</a>
+<a name="ln2028"> </a>
+<a name="ln2029">	Volume* volume = (Volume*)_volume-&gt;private_volume;</a>
+<a name="ln2030">	Inode* directory = (Inode*)_directory-&gt;private_node;</a>
+<a name="ln2031"> </a>
+<a name="ln2032">	if (volume-&gt;IsReadOnly())</a>
+<a name="ln2033">		return B_READ_ONLY_DEVICE;</a>
+<a name="ln2034"> </a>
+<a name="ln2035">	if (!directory-&gt;IsDirectory())</a>
+<a name="ln2036">		RETURN_ERROR(B_BAD_TYPE);</a>
+<a name="ln2037"> </a>
+<a name="ln2038">	status_t status = directory-&gt;CheckPermissions(W_OK);</a>
+<a name="ln2039">	if (status &lt; B_OK)</a>
+<a name="ln2040">		RETURN_ERROR(status);</a>
+<a name="ln2041"> </a>
+<a name="ln2042">	Transaction transaction(volume, directory-&gt;BlockNumber());</a>
+<a name="ln2043"> </a>
+<a name="ln2044">	off_t id;</a>
+<a name="ln2045">	Inode* inode;</a>
+<a name="ln2046">	status = Inode::Create(transaction, directory, name, mode, O_EXCL, 0, NULL,</a>
+<a name="ln2047">		&amp;id, &amp;inode, subVnode ? subVnode-&gt;ops : NULL, flags);</a>
+<a name="ln2048">	if (status == B_OK) {</a>
+<a name="ln2049">		_superVnode-&gt;private_node = inode;</a>
+<a name="ln2050">		_superVnode-&gt;ops = &amp;gBFSVnodeOps;</a>
+<a name="ln2051">		*_nodeID = id;</a>
+<a name="ln2052"> </a>
+<a name="ln2053">		entry_cache_add(volume-&gt;ID(), directory-&gt;ID(), name, id);</a>
+<a name="ln2054"> </a>
+<a name="ln2055">		status = transaction.Done();</a>
+<a name="ln2056">		if (status == B_OK)</a>
+<a name="ln2057">			notify_entry_created(volume-&gt;ID(), directory-&gt;ID(), name, id);</a>
+<a name="ln2058">		else</a>
+<a name="ln2059">			entry_cache_remove(volume-&gt;ID(), directory-&gt;ID(), name);</a>
+<a name="ln2060">	}</a>
+<a name="ln2061"> </a>
+<a name="ln2062">	return status;</a>
+<a name="ln2063">}</a>
+<a name="ln2064"> </a>
+<a name="ln2065"> </a>
+<a name="ln2066">//	#pragma mark - Index functions</a>
+<a name="ln2067"> </a>
+<a name="ln2068"> </a>
+<a name="ln2069">static status_t</a>
+<a name="ln2070">bfs_open_index_dir(fs_volume* _volume, void** _cookie)</a>
+<a name="ln2071">{</a>
+<a name="ln2072">	FUNCTION();</a>
+<a name="ln2073"> </a>
+<a name="ln2074">	Volume* volume = (Volume*)_volume-&gt;private_volume;</a>
+<a name="ln2075"> </a>
+<a name="ln2076">	if (volume-&gt;IndicesNode() == NULL) {</a>
+<a name="ln2077">		// This volume does not have any indices</a>
+<a name="ln2078">		RETURN_ERROR(B_ENTRY_NOT_FOUND);</a>
+<a name="ln2079">	}</a>
+<a name="ln2080"> </a>
+<a name="ln2081">	// Since the indices root node is just a directory, and we are storing</a>
+<a name="ln2082">	// a pointer to it in our Volume object, we can just use the directory</a>
+<a name="ln2083">	// traversal functions.</a>
+<a name="ln2084">	// In fact we're storing it in the Volume object for that reason.</a>
+<a name="ln2085"> </a>
+<a name="ln2086">	fs_vnode indicesNode;</a>
+<a name="ln2087">	indicesNode.private_node = volume-&gt;IndicesNode();</a>
+<a name="ln2088"> </a>
+<a name="ln2089">	RETURN_ERROR(bfs_open_dir(_volume, &amp;indicesNode, _cookie));</a>
+<a name="ln2090">}</a>
+<a name="ln2091"> </a>
+<a name="ln2092"> </a>
+<a name="ln2093">static status_t</a>
+<a name="ln2094">bfs_close_index_dir(fs_volume* _volume, void* _cookie)</a>
+<a name="ln2095">{</a>
+<a name="ln2096">	FUNCTION();</a>
+<a name="ln2097"> </a>
+<a name="ln2098">	Volume* volume = (Volume*)_volume-&gt;private_volume;</a>
+<a name="ln2099"> </a>
+<a name="ln2100">	fs_vnode indicesNode;</a>
+<a name="ln2101">	indicesNode.private_node = volume-&gt;IndicesNode();</a>
+<a name="ln2102"> </a>
+<a name="ln2103">	RETURN_ERROR(bfs_close_dir(_volume, &amp;indicesNode, _cookie));</a>
+<a name="ln2104">}</a>
+<a name="ln2105"> </a>
+<a name="ln2106"> </a>
+<a name="ln2107">static status_t</a>
+<a name="ln2108">bfs_free_index_dir_cookie(fs_volume* _volume, void* _cookie)</a>
+<a name="ln2109">{</a>
+<a name="ln2110">	FUNCTION();</a>
+<a name="ln2111"> </a>
+<a name="ln2112">	Volume* volume = (Volume*)_volume-&gt;private_volume;</a>
+<a name="ln2113"> </a>
+<a name="ln2114">	fs_vnode indicesNode;</a>
+<a name="ln2115">	indicesNode.private_node = volume-&gt;IndicesNode();</a>
+<a name="ln2116"> </a>
+<a name="ln2117">	RETURN_ERROR(bfs_free_dir_cookie(_volume, &amp;indicesNode, _cookie));</a>
+<a name="ln2118">}</a>
+<a name="ln2119"> </a>
+<a name="ln2120"> </a>
+<a name="ln2121">static status_t</a>
+<a name="ln2122">bfs_rewind_index_dir(fs_volume* _volume, void* _cookie)</a>
+<a name="ln2123">{</a>
+<a name="ln2124">	FUNCTION();</a>
+<a name="ln2125"> </a>
+<a name="ln2126">	Volume* volume = (Volume*)_volume-&gt;private_volume;</a>
+<a name="ln2127"> </a>
+<a name="ln2128">	fs_vnode indicesNode;</a>
+<a name="ln2129">	indicesNode.private_node = volume-&gt;IndicesNode();</a>
+<a name="ln2130"> </a>
+<a name="ln2131">	RETURN_ERROR(bfs_rewind_dir(_volume, &amp;indicesNode, _cookie));</a>
+<a name="ln2132">}</a>
+<a name="ln2133"> </a>
+<a name="ln2134"> </a>
+<a name="ln2135">static status_t</a>
+<a name="ln2136">bfs_read_index_dir(fs_volume* _volume, void* _cookie, struct dirent* dirent,</a>
+<a name="ln2137">	size_t bufferSize, uint32* _num)</a>
+<a name="ln2138">{</a>
+<a name="ln2139">	FUNCTION();</a>
+<a name="ln2140"> </a>
+<a name="ln2141">	Volume* volume = (Volume*)_volume-&gt;private_volume;</a>
+<a name="ln2142"> </a>
+<a name="ln2143">	fs_vnode indicesNode;</a>
+<a name="ln2144">	indicesNode.private_node = volume-&gt;IndicesNode();</a>
+<a name="ln2145"> </a>
+<a name="ln2146">	RETURN_ERROR(bfs_read_dir(_volume, &amp;indicesNode, _cookie, dirent,</a>
+<a name="ln2147">		bufferSize, _num));</a>
+<a name="ln2148">}</a>
+<a name="ln2149"> </a>
+<a name="ln2150"> </a>
+<a name="ln2151">static status_t</a>
+<a name="ln2152">bfs_create_index(fs_volume* _volume, const char* name, uint32 type,</a>
+<a name="ln2153">	uint32 flags)</a>
+<a name="ln2154">{</a>
+<a name="ln2155">	FUNCTION_START((&quot;name = \&quot;%s\&quot;, type = %ld, flags = %ld\n&quot;, name, type, flags));</a>
+<a name="ln2156"> </a>
+<a name="ln2157">	Volume* volume = (Volume*)_volume-&gt;private_volume;</a>
+<a name="ln2158"> </a>
+<a name="ln2159">	if (volume-&gt;IsReadOnly())</a>
+<a name="ln2160">		return B_READ_ONLY_DEVICE;</a>
+<a name="ln2161"> </a>
+<a name="ln2162">	// only root users are allowed to create indices</a>
+<a name="ln2163">	if (geteuid() != 0)</a>
+<a name="ln2164">		return B_NOT_ALLOWED;</a>
+<a name="ln2165"> </a>
+<a name="ln2166">	Transaction transaction(volume, volume-&gt;Indices());</a>
+<a name="ln2167"> </a>
+<a name="ln2168">	Index index(volume);</a>
+<a name="ln2169">	status_t status = index.Create(transaction, name, type);</a>
+<a name="ln2170"> </a>
+<a name="ln2171">	if (status == B_OK)</a>
+<a name="ln2172">		status = transaction.Done();</a>
+<a name="ln2173"> </a>
+<a name="ln2174">	RETURN_ERROR(status);</a>
+<a name="ln2175">}</a>
+<a name="ln2176"> </a>
+<a name="ln2177"> </a>
+<a name="ln2178">static status_t</a>
+<a name="ln2179">bfs_remove_index(fs_volume* _volume, const char* name)</a>
+<a name="ln2180">{</a>
+<a name="ln2181">	FUNCTION();</a>
+<a name="ln2182"> </a>
+<a name="ln2183">	Volume* volume = (Volume*)_volume-&gt;private_volume;</a>
+<a name="ln2184"> </a>
+<a name="ln2185">	if (volume-&gt;IsReadOnly())</a>
+<a name="ln2186">		return B_READ_ONLY_DEVICE;</a>
+<a name="ln2187"> </a>
+<a name="ln2188">	// only root users are allowed to remove indices</a>
+<a name="ln2189">	if (geteuid() != 0)</a>
+<a name="ln2190">		return B_NOT_ALLOWED;</a>
+<a name="ln2191"> </a>
+<a name="ln2192">	Inode* indices = volume-&gt;IndicesNode();</a>
+<a name="ln2193">	if (indices == NULL)</a>
+<a name="ln2194">		return B_ENTRY_NOT_FOUND;</a>
+<a name="ln2195"> </a>
+<a name="ln2196">	Transaction transaction(volume, volume-&gt;Indices());</a>
+<a name="ln2197"> </a>
+<a name="ln2198">	status_t status = indices-&gt;Remove(transaction, name);</a>
+<a name="ln2199">	if (status == B_OK)</a>
+<a name="ln2200">		status = transaction.Done();</a>
+<a name="ln2201"> </a>
+<a name="ln2202">	RETURN_ERROR(status);</a>
+<a name="ln2203">}</a>
+<a name="ln2204"> </a>
+<a name="ln2205"> </a>
+<a name="ln2206">static status_t</a>
+<a name="ln2207">bfs_stat_index(fs_volume* _volume, const char* name, struct stat* stat)</a>
+<a name="ln2208">{</a>
+<a name="ln2209">	FUNCTION_START((&quot;name = %s\n&quot;, name));</a>
+<a name="ln2210"> </a>
+<a name="ln2211">	Volume* volume = (Volume*)_volume-&gt;private_volume;</a>
+<a name="ln2212"> </a>
+<a name="ln2213">	Index index(volume);</a>
+<a name="ln2214">	status_t status = index.SetTo(name);</a>
+<a name="ln2215">	if (status &lt; B_OK)</a>
+<a name="ln2216">		RETURN_ERROR(status);</a>
+<a name="ln2217"> </a>
+<a name="ln2218">	bfs_inode&amp; node = index.Node()-&gt;Node();</a>
+<a name="ln2219"> </a>
+<a name="ln2220">	stat-&gt;st_type = index.Type();</a>
+<a name="ln2221">	stat-&gt;st_mode = node.Mode();</a>
+<a name="ln2222"> </a>
+<a name="ln2223">	stat-&gt;st_size = node.data.Size();</a>
+<a name="ln2224">	stat-&gt;st_blocks = index.Node()-&gt;AllocatedSize() / 512;</a>
+<a name="ln2225"> </a>
+<a name="ln2226">	stat-&gt;st_nlink = 1;</a>
+<a name="ln2227">	stat-&gt;st_blksize = 65536;</a>
+<a name="ln2228"> </a>
+<a name="ln2229">	stat-&gt;st_uid = node.UserID();</a>
+<a name="ln2230">	stat-&gt;st_gid = node.GroupID();</a>
+<a name="ln2231"> </a>
+<a name="ln2232">	fill_stat_time(node, *stat);</a>
+<a name="ln2233"> </a>
+<a name="ln2234">	return B_OK;</a>
+<a name="ln2235">}</a>
+<a name="ln2236"> </a>
+<a name="ln2237"> </a>
+<a name="ln2238">//	#pragma mark - Query functions</a>
+<a name="ln2239"> </a>
+<a name="ln2240"> </a>
+<a name="ln2241">static status_t</a>
+<a name="ln2242">bfs_open_query(fs_volume* _volume, const char* queryString, uint32 flags,</a>
+<a name="ln2243">	port_id port, uint32 token, void** _cookie)</a>
+<a name="ln2244">{</a>
+<a name="ln2245">	FUNCTION_START((&quot;bfs_open_query(\&quot;%s\&quot;, flags = %lu, port_id = %ld, token = %ld)\n&quot;,</a>
+<a name="ln2246">		queryString, flags, port, token));</a>
+<a name="ln2247"> </a>
+<a name="ln2248">	Volume* volume = (Volume*)_volume-&gt;private_volume;</a>
+<a name="ln2249"> </a>
+<a name="ln2250">	Expression* expression = new(std::nothrow) Expression((char*)queryString);</a>
+<a name="ln2251">	if (expression == NULL)</a>
+<a name="ln2252">		RETURN_ERROR(B_NO_MEMORY);</a>
+<a name="ln2253"> </a>
+<a name="ln2254">	if (expression-&gt;InitCheck() &lt; B_OK) {</a>
+<a name="ln2255">		INFORM((&quot;Could not parse query \&quot;%s\&quot;, stopped at: \&quot;%s\&quot;\n&quot;,</a>
+<a name="ln2256">			queryString, expression-&gt;Position()));</a>
+<a name="ln2257"> </a>
+<a name="ln2258">		delete expression;</a>
+<a name="ln2259">		RETURN_ERROR(B_BAD_VALUE);</a>
+<a name="ln2260">	}</a>
+<a name="ln2261"> </a>
+<a name="ln2262">	Query* query = new(std::nothrow) Query(volume, expression, flags);</a>
+<a name="ln2263">	if (query == NULL) {</a>
+<a name="ln2264">		delete expression;</a>
+<a name="ln2265">		RETURN_ERROR(B_NO_MEMORY);</a>
+<a name="ln2266">	}</a>
+<a name="ln2267"> </a>
+<a name="ln2268">	if (flags &amp; B_LIVE_QUERY)</a>
+<a name="ln2269">		query-&gt;SetLiveMode(port, token);</a>
+<a name="ln2270"> </a>
+<a name="ln2271">	*_cookie = (void*)query;</a>
+<a name="ln2272"> </a>
+<a name="ln2273">	return B_OK;</a>
+<a name="ln2274">}</a>
+<a name="ln2275"> </a>
+<a name="ln2276"> </a>
+<a name="ln2277">static status_t</a>
+<a name="ln2278">bfs_close_query(fs_volume* _volume, void* cookie)</a>
+<a name="ln2279">{</a>
+<a name="ln2280">	FUNCTION();</a>
+<a name="ln2281">	return B_OK;</a>
+<a name="ln2282">}</a>
+<a name="ln2283"> </a>
+<a name="ln2284"> </a>
+<a name="ln2285">static status_t</a>
+<a name="ln2286">bfs_free_query_cookie(fs_volume* _volume, void* cookie)</a>
+<a name="ln2287">{</a>
+<a name="ln2288">	FUNCTION();</a>
+<a name="ln2289"> </a>
+<a name="ln2290">	Query* query = (Query*)cookie;</a>
+<a name="ln2291">	Expression* expression = query-&gt;GetExpression();</a>
+<a name="ln2292">	delete query;</a>
+<a name="ln2293">	delete expression;</a>
+<a name="ln2294"> </a>
+<a name="ln2295">	return B_OK;</a>
+<a name="ln2296">}</a>
+<a name="ln2297"> </a>
+<a name="ln2298"> </a>
+<a name="ln2299">static status_t</a>
+<a name="ln2300">bfs_read_query(fs_volume* /*_volume*/, void* cookie, struct dirent* dirent,</a>
+<a name="ln2301">	size_t bufferSize, uint32* _num)</a>
+<a name="ln2302">{</a>
+<a name="ln2303">	FUNCTION();</a>
+<a name="ln2304">	Query* query = (Query*)cookie;</a>
+<a name="ln2305">	status_t status = query-&gt;GetNextEntry(dirent, bufferSize);</a>
+<a name="ln2306">	if (status == B_OK)</a>
+<a name="ln2307">		*_num = 1;</a>
+<a name="ln2308">	else if (status == B_ENTRY_NOT_FOUND)</a>
+<a name="ln2309">		*_num = 0;</a>
+<a name="ln2310">	else</a>
+<a name="ln2311">		return status;</a>
+<a name="ln2312"> </a>
+<a name="ln2313">	return B_OK;</a>
+<a name="ln2314">}</a>
+<a name="ln2315"> </a>
+<a name="ln2316"> </a>
+<a name="ln2317">static status_t</a>
+<a name="ln2318">bfs_rewind_query(fs_volume* /*_volume*/, void* cookie)</a>
+<a name="ln2319">{</a>
+<a name="ln2320">	FUNCTION();</a>
+<a name="ln2321"> </a>
+<a name="ln2322">	Query* query = (Query*)cookie;</a>
+<a name="ln2323">	return query-&gt;Rewind();</a>
+<a name="ln2324">}</a>
+<a name="ln2325"> </a>
+<a name="ln2326"> </a>
+<a name="ln2327">//	#pragma mark -</a>
+<a name="ln2328"> </a>
+<a name="ln2329"> </a>
+<a name="ln2330">static uint32</a>
+<a name="ln2331">bfs_get_supported_operations(partition_data* partition, uint32 mask)</a>
+<a name="ln2332">{</a>
+<a name="ln2333">	// TODO: We should at least check the partition size.</a>
+<a name="ln2334">	return B_DISK_SYSTEM_SUPPORTS_INITIALIZING</a>
+<a name="ln2335">		| B_DISK_SYSTEM_SUPPORTS_CONTENT_NAME</a>
+<a name="ln2336">		| B_DISK_SYSTEM_SUPPORTS_WRITING;</a>
+<a name="ln2337">}</a>
+<a name="ln2338"> </a>
+<a name="ln2339"> </a>
+<a name="ln2340">static status_t</a>
+<a name="ln2341">bfs_initialize(int fd, partition_id partitionID, const char* name,</a>
+<a name="ln2342">	const char* parameterString, off_t /*partitionSize*/, disk_job_id job)</a>
+<a name="ln2343">{</a>
+<a name="ln2344">	// check name</a>
+<a name="ln2345">	status_t status = check_volume_name(name);</a>
+<a name="ln2346">	if (status != B_OK)</a>
+<a name="ln2347">		return status;</a>
+<a name="ln2348"> </a>
+<a name="ln2349">	// parse parameters</a>
+<a name="ln2350">	initialize_parameters parameters;</a>
+<a name="ln2351">	status = parse_initialize_parameters(parameterString, parameters);</a>
+<a name="ln2352">	if (status != B_OK)</a>
+<a name="ln2353">		return status;</a>
+<a name="ln2354"> </a>
+<a name="ln2355">	update_disk_device_job_progress(job, 0);</a>
+<a name="ln2356"> </a>
+<a name="ln2357">	// initialize the volume</a>
+<a name="ln2358">	Volume volume(NULL);</a>
+<a name="ln2359">	status = volume.Initialize(fd, name, parameters.blockSize,</a>
+<a name="ln2360">		parameters.flags);</a>
+<a name="ln2361">	if (status &lt; B_OK) {</a>
+<a name="ln2362">		INFORM((&quot;Initializing volume failed: %s\n&quot;, strerror(status)));</a>
+<a name="ln2363">		return status;</a>
+<a name="ln2364">	}</a>
+<a name="ln2365"> </a>
+<a name="ln2366">	// rescan partition</a>
+<a name="ln2367">	status = scan_partition(partitionID);</a>
+<a name="ln2368">	if (status != B_OK)</a>
+<a name="ln2369">		return status;</a>
+<a name="ln2370"> </a>
+<a name="ln2371">	update_disk_device_job_progress(job, 1);</a>
+<a name="ln2372"> </a>
+<a name="ln2373">	// print some info, if desired</a>
+<a name="ln2374">	if (parameters.verbose) {</a>
+<a name="ln2375">		disk_super_block super = volume.SuperBlock();</a>
+<a name="ln2376"> </a>
+<a name="ln2377">		INFORM((&quot;Disk was initialized successfully.\n&quot;));</a>
+<a name="ln2378">		INFORM((&quot;\tname: \&quot;%s\&quot;\n&quot;, super.name));</a>
+<a name="ln2379">		INFORM((&quot;\tnum blocks: %&quot; B_PRIdOFF &quot;\n&quot;, super.NumBlocks()));</a>
+<a name="ln2380">		INFORM((&quot;\tused blocks: %&quot; B_PRIdOFF &quot;\n&quot;, super.UsedBlocks()));</a>
+<a name="ln2381">		INFORM((&quot;\tblock size: %u bytes\n&quot;, (unsigned)super.BlockSize()));</a>
+<a name="ln2382">		INFORM((&quot;\tnum allocation groups: %d\n&quot;,</a>
+<a name="ln2383">			(int)super.AllocationGroups()));</a>
+<a name="ln2384">		INFORM((&quot;\tallocation group size: %ld blocks\n&quot;,</a>
+<a name="ln2385">			1L &lt;&lt; super.AllocationGroupShift()));</a>
+<a name="ln2386">		INFORM((&quot;\tlog size: %u blocks\n&quot;, super.log_blocks.Length()));</a>
+<a name="ln2387">	}</a>
+<a name="ln2388"> </a>
+<a name="ln2389">	return B_OK;</a>
+<a name="ln2390">}</a>
+<a name="ln2391"> </a>
+<a name="ln2392"> </a>
+<a name="ln2393">static status_t</a>
+<a name="ln2394">bfs_uninitialize(int fd, partition_id partitionID, off_t partitionSize,</a>
+<a name="ln2395">	uint32 blockSize, disk_job_id job)</a>
+<a name="ln2396">{</a>
+<a name="ln2397">	if (blockSize == 0)</a>
+<a name="ln2398">		return B_BAD_VALUE;</a>
+<a name="ln2399"> </a>
+<a name="ln2400">	update_disk_device_job_progress(job, 0.0);</a>
+<a name="ln2401"> </a>
+<a name="ln2402">	// just overwrite the superblock</a>
+<a name="ln2403">	disk_super_block superBlock;</a>
+<a name="ln2404">	memset(&amp;superBlock, 0, sizeof(superBlock));</a>
+<a name="ln2405"> </a>
+<a name="ln2406">	if (write_pos(fd, 512, &amp;superBlock, sizeof(superBlock)) &lt; 0)</a>
+<a name="ln2407">		return errno;</a>
+<a name="ln2408"> </a>
+<a name="ln2409">	update_disk_device_job_progress(job, 1.0);</a>
+<a name="ln2410"> </a>
+<a name="ln2411">	return B_OK;</a>
+<a name="ln2412">}</a>
+<a name="ln2413"> </a>
+<a name="ln2414"> </a>
+<a name="ln2415">//	#pragma mark -</a>
+<a name="ln2416"> </a>
+<a name="ln2417"> </a>
+<a name="ln2418">static status_t</a>
+<a name="ln2419">bfs_std_ops(int32 op, ...)</a>
+<a name="ln2420">{</a>
+<a name="ln2421">	switch (op) {</a>
+<a name="ln2422">		case B_MODULE_INIT:</a>
+<a name="ln2423">#ifdef BFS_DEBUGGER_COMMANDS</a>
+<a name="ln2424">			add_debugger_commands();</a>
+<a name="ln2425">#endif</a>
+<a name="ln2426">			return B_OK;</a>
+<a name="ln2427">		case B_MODULE_UNINIT:</a>
+<a name="ln2428">#ifdef BFS_DEBUGGER_COMMANDS</a>
+<a name="ln2429">			remove_debugger_commands();</a>
+<a name="ln2430">#endif</a>
+<a name="ln2431">			return B_OK;</a>
+<a name="ln2432"> </a>
+<a name="ln2433">		default:</a>
+<a name="ln2434">			return B_ERROR;</a>
+<a name="ln2435">	}</a>
+<a name="ln2436">}</a>
+<a name="ln2437"> </a>
+<a name="ln2438">fs_volume_ops gBFSVolumeOps = {</a>
+<a name="ln2439">	&amp;bfs_unmount,</a>
+<a name="ln2440">	&amp;bfs_read_fs_stat,</a>
+<a name="ln2441">	&amp;bfs_write_fs_stat,</a>
+<a name="ln2442">	&amp;bfs_sync,</a>
+<a name="ln2443">	&amp;bfs_get_vnode,</a>
+<a name="ln2444"> </a>
+<a name="ln2445">	/* index directory &amp; index operations */</a>
+<a name="ln2446">	&amp;bfs_open_index_dir,</a>
+<a name="ln2447">	&amp;bfs_close_index_dir,</a>
+<a name="ln2448">	&amp;bfs_free_index_dir_cookie,</a>
+<a name="ln2449">	&amp;bfs_read_index_dir,</a>
+<a name="ln2450">	&amp;bfs_rewind_index_dir,</a>
+<a name="ln2451"> </a>
+<a name="ln2452">	&amp;bfs_create_index,</a>
+<a name="ln2453">	&amp;bfs_remove_index,</a>
+<a name="ln2454">	&amp;bfs_stat_index,</a>
+<a name="ln2455"> </a>
+<a name="ln2456">	/* query operations */</a>
+<a name="ln2457">	&amp;bfs_open_query,</a>
+<a name="ln2458">	&amp;bfs_close_query,</a>
+<a name="ln2459">	&amp;bfs_free_query_cookie,</a>
+<a name="ln2460">	&amp;bfs_read_query,</a>
+<a name="ln2461">	&amp;bfs_rewind_query,</a>
+<a name="ln2462">};</a>
+<a name="ln2463"> </a>
+<a name="ln2464">fs_vnode_ops gBFSVnodeOps = {</a>
+<a name="ln2465">	/* vnode operations */</a>
+<a name="ln2466">	&amp;bfs_lookup,</a>
+<a name="ln2467">	&amp;bfs_get_vnode_name,</a>
+<a name="ln2468">	&amp;bfs_put_vnode,</a>
+<a name="ln2469">	&amp;bfs_remove_vnode,</a>
+<a name="ln2470"> </a>
+<a name="ln2471">	/* VM file access */</a>
+<a name="ln2472">	&amp;bfs_can_page,</a>
+<a name="ln2473">	&amp;bfs_read_pages,</a>
+<a name="ln2474">	&amp;bfs_write_pages,</a>
+<a name="ln2475"> </a>
+<a name="ln2476">	&amp;bfs_io,</a>
+<a name="ln2477">	NULL,	// cancel_io()</a>
+<a name="ln2478"> </a>
+<a name="ln2479">	&amp;bfs_get_file_map,</a>
+<a name="ln2480"> </a>
+<a name="ln2481">	&amp;bfs_ioctl,</a>
+<a name="ln2482">	&amp;bfs_set_flags,</a>
+<a name="ln2483">	NULL,	// fs_select</a>
+<a name="ln2484">	NULL,	// fs_deselect</a>
+<a name="ln2485">	&amp;bfs_fsync,</a>
+<a name="ln2486"> </a>
+<a name="ln2487">	&amp;bfs_read_link,</a>
+<a name="ln2488">	&amp;bfs_create_symlink,</a>
+<a name="ln2489"> </a>
+<a name="ln2490">	&amp;bfs_link,</a>
+<a name="ln2491">	&amp;bfs_unlink,</a>
+<a name="ln2492">	&amp;bfs_rename,</a>
+<a name="ln2493"> </a>
+<a name="ln2494">	&amp;bfs_access,</a>
+<a name="ln2495">	&amp;bfs_read_stat,</a>
+<a name="ln2496">	&amp;bfs_write_stat,</a>
+<a name="ln2497">	NULL,	// fs_preallocate</a>
+<a name="ln2498"> </a>
+<a name="ln2499">	/* file operations */</a>
+<a name="ln2500">	&amp;bfs_create,</a>
+<a name="ln2501">	&amp;bfs_open,</a>
+<a name="ln2502">	&amp;bfs_close,</a>
+<a name="ln2503">	&amp;bfs_free_cookie,</a>
+<a name="ln2504">	&amp;bfs_read,</a>
+<a name="ln2505">	&amp;bfs_write,</a>
+<a name="ln2506"> </a>
+<a name="ln2507">	/* directory operations */</a>
+<a name="ln2508">	&amp;bfs_create_dir,</a>
+<a name="ln2509">	&amp;bfs_remove_dir,</a>
+<a name="ln2510">	&amp;bfs_open_dir,</a>
+<a name="ln2511">	&amp;bfs_close_dir,</a>
+<a name="ln2512">	&amp;bfs_free_dir_cookie,</a>
+<a name="ln2513">	&amp;bfs_read_dir,</a>
+<a name="ln2514">	&amp;bfs_rewind_dir,</a>
+<a name="ln2515"> </a>
+<a name="ln2516">	/* attribute directory operations */</a>
+<a name="ln2517">	&amp;bfs_open_attr_dir,</a>
+<a name="ln2518">	&amp;bfs_close_attr_dir,</a>
+<a name="ln2519">	&amp;bfs_free_attr_dir_cookie,</a>
+<a name="ln2520">	&amp;bfs_read_attr_dir,</a>
+<a name="ln2521">	&amp;bfs_rewind_attr_dir,</a>
+<a name="ln2522"> </a>
+<a name="ln2523">	/* attribute operations */</a>
+<a name="ln2524">	&amp;bfs_create_attr,</a>
+<a name="ln2525">	&amp;bfs_open_attr,</a>
+<a name="ln2526">	&amp;bfs_close_attr,</a>
+<a name="ln2527">	&amp;bfs_free_attr_cookie,</a>
+<a name="ln2528">	&amp;bfs_read_attr,</a>
+<a name="ln2529">	&amp;bfs_write_attr,</a>
+<a name="ln2530"> </a>
+<a name="ln2531">	&amp;bfs_read_attr_stat,</a>
+<a name="ln2532">	&amp;bfs_write_attr_stat,</a>
+<a name="ln2533">	&amp;bfs_rename_attr,</a>
+<a name="ln2534">	&amp;bfs_remove_attr,</a>
+<a name="ln2535"> </a>
+<a name="ln2536">	/* special nodes */</a>
+<a name="ln2537">	&amp;bfs_create_special_node</a>
+<a name="ln2538">};</a>
+<a name="ln2539"> </a>
+<a name="ln2540">static file_system_module_info sBeFileSystem = {</a>
+<a name="ln2541">	{</a>
+<a name="ln2542">		&quot;file_systems/bfs&quot; BFS_ENDIAN_SUFFIX B_CURRENT_FS_API_VERSION,</a>
+<a name="ln2543">		0,</a>
+<a name="ln2544">		bfs_std_ops,</a>
+<a name="ln2545">	},</a>
+<a name="ln2546"> </a>
+<a name="ln2547">	&quot;bfs&quot; BFS_ENDIAN_SUFFIX,						// short_name</a>
+<a name="ln2548">	&quot;Be File System&quot; BFS_ENDIAN_PRETTY_SUFFIX,		// pretty_name</a>
+<a name="ln2549"> </a>
+<a name="ln2550">	// DDM flags</a>
+<a name="ln2551">	0</a>
+<a name="ln2552">//	| B_DISK_SYSTEM_SUPPORTS_CHECKING</a>
+<a name="ln2553">//	| B_DISK_SYSTEM_SUPPORTS_REPAIRING</a>
+<a name="ln2554">//	| B_DISK_SYSTEM_SUPPORTS_RESIZING</a>
+<a name="ln2555">//	| B_DISK_SYSTEM_SUPPORTS_MOVING</a>
+<a name="ln2556">//	| B_DISK_SYSTEM_SUPPORTS_SETTING_CONTENT_NAME</a>
+<a name="ln2557">//	| B_DISK_SYSTEM_SUPPORTS_SETTING_CONTENT_PARAMETERS</a>
+<a name="ln2558">	| B_DISK_SYSTEM_SUPPORTS_INITIALIZING</a>
+<a name="ln2559">	| B_DISK_SYSTEM_SUPPORTS_CONTENT_NAME</a>
+<a name="ln2560">//	| B_DISK_SYSTEM_SUPPORTS_DEFRAGMENTING</a>
+<a name="ln2561">//	| B_DISK_SYSTEM_SUPPORTS_DEFRAGMENTING_WHILE_MOUNTED</a>
+<a name="ln2562">//	| B_DISK_SYSTEM_SUPPORTS_CHECKING_WHILE_MOUNTED</a>
+<a name="ln2563">//	| B_DISK_SYSTEM_SUPPORTS_REPAIRING_WHILE_MOUNTED</a>
+<a name="ln2564">//	| B_DISK_SYSTEM_SUPPORTS_RESIZING_WHILE_MOUNTED</a>
+<a name="ln2565">//	| B_DISK_SYSTEM_SUPPORTS_MOVING_WHILE_MOUNTED</a>
+<a name="ln2566">//	| B_DISK_SYSTEM_SUPPORTS_SETTING_CONTENT_NAME_WHILE_MOUNTED</a>
+<a name="ln2567">//	| B_DISK_SYSTEM_SUPPORTS_SETTING_CONTENT_PARAMETERS_WHILE_MOUNTED</a>
+<a name="ln2568">	| B_DISK_SYSTEM_SUPPORTS_WRITING</a>
+<a name="ln2569">	,</a>
+<a name="ln2570"> </a>
+<a name="ln2571">	// scanning</a>
+<a name="ln2572">	bfs_identify_partition,</a>
+<a name="ln2573">	bfs_scan_partition,</a>
+<a name="ln2574">	bfs_free_identify_partition_cookie,</a>
+<a name="ln2575">	NULL,	// free_partition_content_cookie()</a>
+<a name="ln2576"> </a>
+<a name="ln2577">	&amp;bfs_mount,</a>
+<a name="ln2578"> </a>
+<a name="ln2579">	/* capability querying operations */</a>
+<a name="ln2580">	&amp;bfs_get_supported_operations,</a>
+<a name="ln2581"> </a>
+<a name="ln2582">	NULL,	// validate_resize</a>
+<a name="ln2583">	NULL,	// validate_move</a>
+<a name="ln2584">	NULL,	// validate_set_content_name</a>
+<a name="ln2585">	NULL,	// validate_set_content_parameters</a>
+<a name="ln2586">	NULL,	// validate_initialize,</a>
+<a name="ln2587"> </a>
+<a name="ln2588">	/* shadow partition modification */</a>
+<a name="ln2589">	NULL,	// shadow_changed</a>
+<a name="ln2590"> </a>
+<a name="ln2591">	/* writing */</a>
+<a name="ln2592">	NULL,	// defragment</a>
+<a name="ln2593">	NULL,	// repair</a>
+<a name="ln2594">	NULL,	// resize</a>
+<a name="ln2595">	NULL,	// move</a>
+<a name="ln2596">	NULL,	// set_content_name</a>
+<a name="ln2597">	NULL,	// set_content_parameters</a>
+<a name="ln2598">	bfs_initialize,</a>
+<a name="ln2599">	bfs_uninitialize</a>
+<a name="ln2600">};</a>
+<a name="ln2601"> </a>
+<a name="ln2602">module_info* modules[] = {</a>
+<a name="ln2603">	(module_info*)&amp;sBeFileSystem,</a>
+<a name="ln2604">	NULL,</a>
+<a name="ln2605">};</a>
+
+</code></pre>
+<div class="balloon" rel="2379"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="190"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the third actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="292"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="299"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="542"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v629/" target="_blank">V629</a> Consider inspecting the '(uint32) run.Length() << blockShift' expression. Bit shifting of the 32-bit value with a subsequent expansion to the 64-bit type.</p></div>
+<div class="balloon" rel="308"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="2380"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="1505"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="542"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v629/" target="_blank">V629</a> Consider inspecting the '(uint32_t) run.Length() << blockShift' expression. Bit shifting of the 32-bit value with a subsequent expansion to the 64-bit type.</p></div>
+<div class="balloon" rel="306"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

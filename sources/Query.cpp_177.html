@@ -1,0 +1,1493 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>Query.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2001-2017, Axel Dörfler, axeld@pinc-software.de.</a>
+<a name="ln3"> * Copyright 2010, Clemens Zeidler &lt;haiku@clemens-zeidler.de&gt;</a>
+<a name="ln4"> * This file may be used under the terms of the MIT License.</a>
+<a name="ln5"> */</a>
+<a name="ln6"> </a>
+<a name="ln7"> </a>
+<a name="ln8">/*!	Query parsing and evaluation</a>
+<a name="ln9"> </a>
+<a name="ln10">	The pattern matching is roughly based on code originally written</a>
+<a name="ln11">	by J. Kercheval, and on code written by Kenneth Almquist, though</a>
+<a name="ln12">	it shares no code.</a>
+<a name="ln13">*/</a>
+<a name="ln14"> </a>
+<a name="ln15"> </a>
+<a name="ln16">#include &quot;Query.h&quot;</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &lt;file_systems/QueryParserUtils.h&gt;</a>
+<a name="ln19">#include &lt;query_private.h&gt;</a>
+<a name="ln20"> </a>
+<a name="ln21">#include &quot;BPlusTree.h&quot;</a>
+<a name="ln22">#include &quot;bfs.h&quot;</a>
+<a name="ln23">#include &quot;Debug.h&quot;</a>
+<a name="ln24">#include &quot;Index.h&quot;</a>
+<a name="ln25">#include &quot;Inode.h&quot;</a>
+<a name="ln26">#include &quot;Volume.h&quot;</a>
+<a name="ln27"> </a>
+<a name="ln28"> </a>
+<a name="ln29">// The parser has a very static design, but it will do what is required.</a>
+<a name="ln30">//</a>
+<a name="ln31">// ParseOr(), ParseAnd(), ParseEquation() are guarantying the operator</a>
+<a name="ln32">// precedence, that is =,!=,&gt;,&lt;,&gt;=,&lt;= .. &amp;&amp; .. ||.</a>
+<a name="ln33">// Apparently, the &quot;!&quot; (not) can only be used with brackets.</a>
+<a name="ln34">//</a>
+<a name="ln35">// If you think that there are too few NULL pointer checks in some places</a>
+<a name="ln36">// of the code, just read the beginning of the query constructor.</a>
+<a name="ln37">// The API is not fully available, just the Query and the Expression class</a>
+<a name="ln38">// are.</a>
+<a name="ln39"> </a>
+<a name="ln40"> </a>
+<a name="ln41">using namespace QueryParser;</a>
+<a name="ln42"> </a>
+<a name="ln43"> </a>
+<a name="ln44">enum ops {</a>
+<a name="ln45">	OP_NONE,</a>
+<a name="ln46"> </a>
+<a name="ln47">	OP_AND,</a>
+<a name="ln48">	OP_OR,</a>
+<a name="ln49"> </a>
+<a name="ln50">	OP_EQUATION,</a>
+<a name="ln51">		// is only used for invalid equations</a>
+<a name="ln52"> </a>
+<a name="ln53">	OP_EQUAL,</a>
+<a name="ln54">	OP_UNEQUAL,</a>
+<a name="ln55">	OP_GREATER_THAN,</a>
+<a name="ln56">	OP_LESS_THAN,</a>
+<a name="ln57">	OP_GREATER_THAN_OR_EQUAL,</a>
+<a name="ln58">	OP_LESS_THAN_OR_EQUAL,</a>
+<a name="ln59">};</a>
+<a name="ln60"> </a>
+<a name="ln61"> </a>
+<a name="ln62">union value {</a>
+<a name="ln63">	int64	Int64;</a>
+<a name="ln64">	uint64	Uint64;</a>
+<a name="ln65">	int32	Int32;</a>
+<a name="ln66">	uint32	Uint32;</a>
+<a name="ln67">	float	Float;</a>
+<a name="ln68">	double	Double;</a>
+<a name="ln69">	char	String[MAX_INDEX_KEY_LENGTH + 1];</a>
+<a name="ln70">};</a>
+<a name="ln71"> </a>
+<a name="ln72"> </a>
+<a name="ln73">/*!	Abstract base class for the operator/equation classes.</a>
+<a name="ln74">*/</a>
+<a name="ln75">class Term {</a>
+<a name="ln76">public:</a>
+<a name="ln77">								Term(int8 op) : fOp(op), fParent(NULL) {}</a>
+<a name="ln78">	virtual						~Term() {}</a>
+<a name="ln79"> </a>
+<a name="ln80">			int8				Op() const { return fOp; }</a>
+<a name="ln81"> </a>
+<a name="ln82">			void				SetParent(Term* parent) { fParent = parent; }</a>
+<a name="ln83">			Term*				Parent() const { return fParent; }</a>
+<a name="ln84"> </a>
+<a name="ln85">	virtual	status_t			Match(Inode* inode,</a>
+<a name="ln86">									const char* attribute = NULL,</a>
+<a name="ln87">									int32 type = 0, const uint8* key = NULL,</a>
+<a name="ln88">									size_t size = 0) = 0;</a>
+<a name="ln89">	virtual	void				Complement() = 0;</a>
+<a name="ln90"> </a>
+<a name="ln91">	virtual	void				CalculateScore(Index&amp; index) = 0;</a>
+<a name="ln92">	virtual	int32				Score() const = 0;</a>
+<a name="ln93"> </a>
+<a name="ln94">	virtual	status_t			InitCheck() = 0;</a>
+<a name="ln95"> </a>
+<a name="ln96">#ifdef DEBUG</a>
+<a name="ln97">	virtual	void				PrintToStream() = 0;</a>
+<a name="ln98">#endif</a>
+<a name="ln99"> </a>
+<a name="ln100">protected:</a>
+<a name="ln101">			int8				fOp;</a>
+<a name="ln102">			Term*				fParent;</a>
+<a name="ln103">};</a>
+<a name="ln104"> </a>
+<a name="ln105"> </a>
+<a name="ln106">/*!	An Equation object represents an &quot;attribute-equation operator-value&quot; pair.</a>
+<a name="ln107"> </a>
+<a name="ln108">	Although an Equation object is quite independent from the volume on which</a>
+<a name="ln109">	the query is run, there are some dependencies that are produced while</a>
+<a name="ln110">	querying:</a>
+<a name="ln111">	The type/size of the value, the score, and if it has an index or not.</a>
+<a name="ln112">	So you could run more than one query on the same volume, but it might return</a>
+<a name="ln113">	wrong values when it runs concurrently on another volume.</a>
+<a name="ln114">	That's not an issue right now, because we run single-threaded and don't use</a>
+<a name="ln115">	queries more than once.</a>
+<a name="ln116">*/</a>
+<a name="ln117">class Equation : public Term {</a>
+<a name="ln118">public:</a>
+<a name="ln119">								Equation(char** _expression);</a>
+<a name="ln120">	virtual						~Equation();</a>
+<a name="ln121"> </a>
+<a name="ln122">	virtual	status_t			InitCheck();</a>
+<a name="ln123"> </a>
+<a name="ln124">	virtual	status_t			Match(Inode* inode,</a>
+<a name="ln125">									const char* attribute = NULL,</a>
+<a name="ln126">									int32 type = 0, const uint8* key = NULL,</a>
+<a name="ln127">									size_t size = 0);</a>
+<a name="ln128">	virtual void				Complement();</a>
+<a name="ln129"> </a>
+<a name="ln130">			status_t			PrepareQuery(Volume* volume, Index&amp; index,</a>
+<a name="ln131">									TreeIterator** iterator,</a>
+<a name="ln132">									bool queryNonIndexed);</a>
+<a name="ln133">			status_t			GetNextMatching(Volume* volume,</a>
+<a name="ln134">									TreeIterator* iterator,</a>
+<a name="ln135">									struct dirent* dirent, size_t bufferSize);</a>
+<a name="ln136"> </a>
+<a name="ln137">	virtual	void				CalculateScore(Index &amp;index);</a>
+<a name="ln138">	virtual	int32				Score() const { return fScore; }</a>
+<a name="ln139"> </a>
+<a name="ln140">#ifdef DEBUG</a>
+<a name="ln141">	virtual	void				PrintToStream();</a>
+<a name="ln142">#endif</a>
+<a name="ln143"> </a>
+<a name="ln144">private:</a>
+<a name="ln145">								Equation(const Equation&amp; other);</a>
+<a name="ln146">								Equation&amp; operator=(const Equation&amp; other);</a>
+<a name="ln147">									// no implementation</a>
+<a name="ln148"> </a>
+<a name="ln149">			status_t			_ParseQuotedString(char** _start, char** _end);</a>
+<a name="ln150">			char*				_CopyString(char* start, char* end);</a>
+<a name="ln151">	inline	bool				_IsEquationChar(char c) const;</a>
+<a name="ln152">	inline	bool				_IsOperatorChar(char c) const;</a>
+<a name="ln153">			status_t			_ConvertValue(type_code type);</a>
+<a name="ln154">			bool				_CompareTo(const uint8* value, uint16 size);</a>
+<a name="ln155">			uint8*				_Value() const { return (uint8*)&amp;fValue; }</a>
+<a name="ln156"> </a>
+<a name="ln157">private:</a>
+<a name="ln158">			char*				fAttribute;</a>
+<a name="ln159">			char*				fString;</a>
+<a name="ln160">			union value			fValue;</a>
+<a name="ln161">			type_code			fType;</a>
+<a name="ln162">			size_t				fSize;</a>
+<a name="ln163">			bool				fIsPattern;</a>
+<a name="ln164">			bool				fIsSpecialTime;</a>
+<a name="ln165"> </a>
+<a name="ln166">			int32				fScore;</a>
+<a name="ln167">			bool				fHasIndex;</a>
+<a name="ln168">};</a>
+<a name="ln169"> </a>
+<a name="ln170"> </a>
+<a name="ln171">/*!	The Operator class does not represent a generic operator, but only those</a>
+<a name="ln172">	that combine two equations, namely &quot;or&quot;, and &quot;and&quot;.</a>
+<a name="ln173">*/</a>
+<a name="ln174">class Operator : public Term {</a>
+<a name="ln175">public:</a>
+<a name="ln176">								Operator(Term* left, int8 op, Term* right);</a>
+<a name="ln177">	virtual						~Operator();</a>
+<a name="ln178"> </a>
+<a name="ln179">			Term*				Left() const { return fLeft; }</a>
+<a name="ln180">			Term*				Right() const { return fRight; }</a>
+<a name="ln181"> </a>
+<a name="ln182">	virtual	status_t			Match(Inode* inode,</a>
+<a name="ln183">									const char* attribute = NULL,</a>
+<a name="ln184">									int32 type = 0, const uint8* key = NULL,</a>
+<a name="ln185">									size_t size = 0);</a>
+<a name="ln186">	virtual	void				Complement();</a>
+<a name="ln187"> </a>
+<a name="ln188">	virtual	void				CalculateScore(Index&amp; index);</a>
+<a name="ln189">	virtual	int32				Score() const;</a>
+<a name="ln190"> </a>
+<a name="ln191">	virtual	status_t			InitCheck();</a>
+<a name="ln192"> </a>
+<a name="ln193">#ifdef DEBUG</a>
+<a name="ln194">	virtual	void				PrintToStream();</a>
+<a name="ln195">#endif</a>
+<a name="ln196"> </a>
+<a name="ln197">private:</a>
+<a name="ln198">								Operator(const Operator&amp; other);</a>
+<a name="ln199">								Operator&amp; operator=(const Operator&amp; other);</a>
+<a name="ln200">									// no implementation</a>
+<a name="ln201"> </a>
+<a name="ln202">private:</a>
+<a name="ln203">			Term*				fLeft;</a>
+<a name="ln204">			Term*				fRight;</a>
+<a name="ln205">};</a>
+<a name="ln206"> </a>
+<a name="ln207"> </a>
+<a name="ln208">//	#pragma mark -</a>
+<a name="ln209"> </a>
+<a name="ln210"> </a>
+<a name="ln211">Equation::Equation(char** _expression)</a>
+<a name="ln212">	:</a>
+<a name="ln213">	Term(OP_EQUATION),</a>
+<a name="ln214">	fAttribute(NULL),</a>
+<a name="ln215">	fString(NULL),</a>
+<a name="ln216">	fType(0),</a>
+<a name="ln217">	fIsPattern(false)</a>
+<a name="ln218">{</a>
+<a name="ln219">	char* string = *_expression;</a>
+<a name="ln220">	char* start = string;</a>
+<a name="ln221">	char* end = NULL;</a>
+<a name="ln222"> </a>
+<a name="ln223">	// Since the equation is the integral part of any query, we're just parsing</a>
+<a name="ln224">	// the whole thing here.</a>
+<a name="ln225">	// The whitespace at the start is already removed in</a>
+<a name="ln226">	// Expression::ParseEquation()</a>
+<a name="ln227"> </a>
+<a name="ln228">	if (*start == '&quot;' || *start == '\'') {</a>
+<a name="ln229">		// string is quoted (start has to be on the beginning of a string)</a>
+<a name="ln230">		if (_ParseQuotedString(&amp;start, &amp;end) &lt; B_OK)</a>
+<a name="ln231">			return;</a>
+<a name="ln232"> </a>
+<a name="ln233">		// set string to a valid start of the equation symbol</a>
+<a name="ln234">		string = end + 2;</a>
+<a name="ln235">		skipWhitespace(&amp;string);</a>
+<a name="ln236">		if (!_IsEquationChar(string[0])) {</a>
+<a name="ln237">			*_expression = string;</a>
+<a name="ln238">			return;</a>
+<a name="ln239">		}</a>
+<a name="ln240">	} else {</a>
+<a name="ln241">		// search the (in)equation for the actual equation symbol (and for other operators</a>
+<a name="ln242">		// in case the equation is malformed)</a>
+<a name="ln243">		while (string[0] != 0 &amp;&amp; !_IsOperatorChar(string[0])</a>
+<a name="ln244">			&amp;&amp; !_IsEquationChar(string[0])) {</a>
+<a name="ln245">			if (string[0] == '\\' &amp;&amp; string[1] != 0)</a>
+<a name="ln246">				string++;</a>
+<a name="ln247">			string++;</a>
+<a name="ln248">		}</a>
+<a name="ln249"> </a>
+<a name="ln250">		// get the attribute string	(and trim whitespace), in case</a>
+<a name="ln251">		// the string was not quoted</a>
+<a name="ln252">		end = string - 1;</a>
+<a name="ln253">		skipWhitespaceReverse(&amp;end, start);</a>
+<a name="ln254">	}</a>
+<a name="ln255"> </a>
+<a name="ln256">	// attribute string is empty (which is not allowed)</a>
+<a name="ln257">	if (start &gt; end)</a>
+<a name="ln258">		return;</a>
+<a name="ln259"> </a>
+<a name="ln260">	// At this point, &quot;start&quot; points to the beginning of the string, &quot;end&quot;</a>
+<a name="ln261">	// points to the last character of the string, and &quot;string&quot; points to the</a>
+<a name="ln262">	// first character of the equation symbol</a>
+<a name="ln263"> </a>
+<a name="ln264">	// test for the right symbol (as this doesn't need any memory)</a>
+<a name="ln265">	switch (*string) {</a>
+<a name="ln266">		case '=':</a>
+<a name="ln267">			fOp = OP_EQUAL;</a>
+<a name="ln268">			break;</a>
+<a name="ln269">		case '&gt;':</a>
+<a name="ln270">			fOp = *(string + 1) == '='</a>
+<a name="ln271">				? OP_GREATER_THAN_OR_EQUAL : OP_GREATER_THAN;</a>
+<a name="ln272">			break;</a>
+<a name="ln273">		case '&lt;':</a>
+<a name="ln274">			fOp = *(string + 1) == '='</a>
+<a name="ln275">				? OP_LESS_THAN_OR_EQUAL : OP_LESS_THAN;</a>
+<a name="ln276">			break;</a>
+<a name="ln277">		case '!':</a>
+<a name="ln278">			if (*(string + 1) != '=')</a>
+<a name="ln279">				return;</a>
+<a name="ln280">			fOp = OP_UNEQUAL;</a>
+<a name="ln281">			break;</a>
+<a name="ln282"> </a>
+<a name="ln283">		// any invalid characters will be rejected</a>
+<a name="ln284">		default:</a>
+<a name="ln285">			*_expression = string;</a>
+<a name="ln286">			return;</a>
+<a name="ln287">	}</a>
+<a name="ln288"> </a>
+<a name="ln289">	// lets change &quot;start&quot; to point to the first character after the symbol</a>
+<a name="ln290">	if (*(string + 1) == '=')</a>
+<a name="ln291">		string++;</a>
+<a name="ln292">	string++;</a>
+<a name="ln293">	skipWhitespace(&amp;string);</a>
+<a name="ln294"> </a>
+<a name="ln295">	// allocate &amp; copy the attribute string</a>
+<a name="ln296"> </a>
+<a name="ln297">	fAttribute = _CopyString(start, end);</a>
+<a name="ln298">	if (fAttribute == NULL)</a>
+<a name="ln299">		return;</a>
+<a name="ln300"> </a>
+<a name="ln301">	start = string;</a>
+<a name="ln302">	if (*start == '&quot;' || *start == '\'') {</a>
+<a name="ln303">		// string is quoted (start has to be on the beginning of a string)</a>
+<a name="ln304">		if (_ParseQuotedString(&amp;start, &amp;end) &lt; B_OK)</a>
+<a name="ln305">			return;</a>
+<a name="ln306"> </a>
+<a name="ln307">		string = end + 2;</a>
+<a name="ln308">		skipWhitespace(&amp;string);</a>
+<a name="ln309">	} else {</a>
+<a name="ln310">		while (string[0] &amp;&amp; !_IsOperatorChar(string[0]) &amp;&amp; string[0] != ')')</a>
+<a name="ln311">			string++;</a>
+<a name="ln312"> </a>
+<a name="ln313">		end = string - 1;</a>
+<a name="ln314">		skipWhitespaceReverse(&amp;end, start);</a>
+<a name="ln315">	}</a>
+<a name="ln316"> </a>
+<a name="ln317">	// At this point, &quot;start&quot; will point to the first character of the value,</a>
+<a name="ln318">	// &quot;end&quot; will point to its last character, and &quot;start&quot; to the first non-</a>
+<a name="ln319">	// whitespace character after the value string.</a>
+<a name="ln320"> </a>
+<a name="ln321">	fString = _CopyString(start, end);</a>
+<a name="ln322">	if (fString == NULL)</a>
+<a name="ln323">		return;</a>
+<a name="ln324"> </a>
+<a name="ln325">	// Patterns are only allowed for these operations (and strings)</a>
+<a name="ln326">	if (fOp == OP_EQUAL || fOp == OP_UNEQUAL) {</a>
+<a name="ln327">		fIsPattern = isPattern(fString);</a>
+<a name="ln328">		if (fIsPattern &amp;&amp; isValidPattern(fString) &lt; B_OK) {</a>
+<a name="ln329">			// Only valid patterns are allowed; setting fString</a>
+<a name="ln330">			// to NULL will cause InitCheck() to fail</a>
+<a name="ln331">			free(fString);</a>
+<a name="ln332">			fString = NULL;</a>
+<a name="ln333">		}</a>
+<a name="ln334">	}</a>
+<a name="ln335"> </a>
+<a name="ln336">	// The special time flag is set if the time values are shifted</a>
+<a name="ln337">	// 64-bit values to reduce the number of duplicates.</a>
+<a name="ln338">	// We have to be able to compare them against unshifted values</a>
+<a name="ln339">	// later. The only index which needs this is the last_modified</a>
+<a name="ln340">	// index, but we may want to open that feature for other indices,</a>
+<a name="ln341">	// too one day.</a>
+<a name="ln342">	fIsSpecialTime = !strcmp(fAttribute, &quot;last_modified&quot;);</a>
+<a name="ln343"> </a>
+<a name="ln344">	*_expression = string;</a>
+<a name="ln345">}</a>
+<a name="ln346"> </a>
+<a name="ln347"> </a>
+<a name="ln348">Equation::~Equation()</a>
+<a name="ln349">{</a>
+<a name="ln350">	free(fAttribute);</a>
+<a name="ln351">	free(fString);</a>
+<a name="ln352">}</a>
+<a name="ln353"> </a>
+<a name="ln354"> </a>
+<a name="ln355">status_t</a>
+<a name="ln356">Equation::InitCheck()</a>
+<a name="ln357">{</a>
+<a name="ln358">	if (fAttribute == NULL || fString == NULL || fOp == OP_NONE)</a>
+<a name="ln359">		return B_BAD_VALUE;</a>
+<a name="ln360"> </a>
+<a name="ln361">	return B_OK;</a>
+<a name="ln362">}</a>
+<a name="ln363"> </a>
+<a name="ln364"> </a>
+<a name="ln365">/*!	Matches the inode's attribute value with the equation.</a>
+<a name="ln366">	Returns MATCH_OK if it matches, NO_MATCH if not, &lt; 0 if something went</a>
+<a name="ln367">	wrong.</a>
+<a name="ln368">*/</a>
+<a name="ln369">status_t</a>
+<a name="ln370">Equation::Match(Inode* inode, const char* attributeName, int32 type,</a>
+<a name="ln371">	const uint8* key, size_t size)</a>
+<a name="ln372">{</a>
+<a name="ln373">	// get a pointer to the attribute in question</a>
+<a name="ln374">	NodeGetter nodeGetter(inode-&gt;GetVolume());</a>
+<a name="ln375">	union value value;</a>
+<a name="ln376">	uint8* buffer = (uint8*)&amp;value;</a>
+<a name="ln377">	bool locked = false;</a>
+<a name="ln378"> </a>
+<a name="ln379">	// first, check if we are matching for a live query and use that value</a>
+<a name="ln380">	if (attributeName != NULL &amp;&amp; !strcmp(fAttribute, attributeName)) {</a>
+<a name="ln381">		if (key == NULL)</a>
+<a name="ln382">			return NO_MATCH;</a>
+<a name="ln383"> </a>
+<a name="ln384">		buffer = const_cast&lt;uint8*&gt;(key);</a>
+<a name="ln385">	} else if (!strcmp(fAttribute, &quot;name&quot;)) {</a>
+<a name="ln386">		// we need to lock before accessing Inode::Name()</a>
+<a name="ln387">		nodeGetter.SetToNode(inode);</a>
+<a name="ln388">		if (nodeGetter.Node() == NULL)</a>
+<a name="ln389">			return B_IO_ERROR;</a>
+<a name="ln390"> </a>
+<a name="ln391">		recursive_lock_lock(&amp;inode-&gt;SmallDataLock());</a>
+<a name="ln392">		locked = true;</a>
+<a name="ln393"> </a>
+<a name="ln394">		// if not, check for &quot;fake&quot; attributes (&quot;name&quot;, &quot;size&quot;, &quot;last_modified&quot;)</a>
+<a name="ln395">		buffer = (uint8*)inode-&gt;Name(nodeGetter.Node());</a>
+<a name="ln396">		if (buffer == NULL) {</a>
+<a name="ln397">			recursive_lock_unlock(&amp;inode-&gt;SmallDataLock());</a>
+<a name="ln398">			return B_ERROR;</a>
+<a name="ln399">		}</a>
+<a name="ln400"> </a>
+<a name="ln401">		type = B_STRING_TYPE;</a>
+<a name="ln402">		size = strlen((const char*)buffer);</a>
+<a name="ln403">	} else if (!strcmp(fAttribute, &quot;size&quot;)) {</a>
+<a name="ln404">#ifdef BFS_NATIVE_ENDIAN</a>
+<a name="ln405">		buffer = (uint8*)&amp;inode-&gt;Node().data.size;</a>
+<a name="ln406">#else</a>
+<a name="ln407">		value.Int64 = inode-&gt;Size();</a>
+<a name="ln408">#endif</a>
+<a name="ln409">		type = B_INT64_TYPE;</a>
+<a name="ln410">	} else if (!strcmp(fAttribute, &quot;last_modified&quot;)) {</a>
+<a name="ln411">#ifdef BFS_NATIVE_ENDIAN</a>
+<a name="ln412">		buffer = (uint8*)&amp;inode-&gt;Node().last_modified_time;</a>
+<a name="ln413">#else</a>
+<a name="ln414">		value.Int64 = inode-&gt;Node().LastModifiedTime();</a>
+<a name="ln415">#endif</a>
+<a name="ln416">		type = B_INT64_TYPE;</a>
+<a name="ln417">	} else {</a>
+<a name="ln418">		// then for attributes in the small_data section, and finally for the</a>
+<a name="ln419">		// real attributes</a>
+<a name="ln420">		nodeGetter.SetToNode(inode);</a>
+<a name="ln421">		if (nodeGetter.Node() == NULL)</a>
+<a name="ln422">			return B_IO_ERROR;</a>
+<a name="ln423"> </a>
+<a name="ln424">		Inode* attribute;</a>
+<a name="ln425"> </a>
+<a name="ln426">		recursive_lock_lock(&amp;inode-&gt;SmallDataLock());</a>
+<a name="ln427">		small_data* smallData = inode-&gt;FindSmallData(nodeGetter.Node(),</a>
+<a name="ln428">			fAttribute);</a>
+<a name="ln429">		if (smallData != NULL) {</a>
+<a name="ln430">			buffer = smallData-&gt;Data();</a>
+<a name="ln431">			type = smallData-&gt;type;</a>
+<a name="ln432">			size = smallData-&gt;data_size;</a>
+<a name="ln433">			locked = true;</a>
+<a name="ln434">		} else {</a>
+<a name="ln435">			// needed to unlock the small_data section as fast as possible</a>
+<a name="ln436">			recursive_lock_unlock(&amp;inode-&gt;SmallDataLock());</a>
+<a name="ln437">			nodeGetter.Unset();</a>
+<a name="ln438"> </a>
+<a name="ln439">			if (inode-&gt;GetAttribute(fAttribute, &amp;attribute) == B_OK) {</a>
+<a name="ln440">				buffer = (uint8*)&amp;value;</a>
+<a name="ln441">				type = attribute-&gt;Type();</a>
+<a name="ln442">				size = attribute-&gt;Size();</a>
+<a name="ln443"> </a>
+<a name="ln444">				if (size &gt; MAX_INDEX_KEY_LENGTH)</a>
+<a name="ln445">					size = MAX_INDEX_KEY_LENGTH;</a>
+<a name="ln446"> </a>
+<a name="ln447">				if (attribute-&gt;ReadAt(0, buffer, &amp;size) &lt; B_OK) {</a>
+<a name="ln448">					inode-&gt;ReleaseAttribute(attribute);</a>
+<a name="ln449">					return B_IO_ERROR;</a>
+<a name="ln450">				}</a>
+<a name="ln451">				inode-&gt;ReleaseAttribute(attribute);</a>
+<a name="ln452">			} else</a>
+<a name="ln453">				return NO_MATCH;</a>
+<a name="ln454">		}</a>
+<a name="ln455">	}</a>
+<a name="ln456">	// prepare own value for use, if it is possible to convert it</a>
+<a name="ln457">	status_t status = _ConvertValue(type);</a>
+<a name="ln458">	if (status == B_OK)</a>
+<a name="ln459">		status = _CompareTo(buffer, size) ? MATCH_OK : NO_MATCH;</a>
+<a name="ln460"> </a>
+<a name="ln461">	if (locked)</a>
+<a name="ln462">		recursive_lock_unlock(&amp;inode-&gt;SmallDataLock());</a>
+<a name="ln463"> </a>
+<a name="ln464">	RETURN_ERROR(status);</a>
+<a name="ln465">}</a>
+<a name="ln466"> </a>
+<a name="ln467"> </a>
+<a name="ln468">void</a>
+<a name="ln469">Equation::Complement()</a>
+<a name="ln470">{</a>
+<a name="ln471">	D(if (fOp &lt;= OP_EQUATION || fOp &gt; OP_LESS_THAN_OR_EQUAL) {</a>
+<a name="ln472">		FATAL((&quot;op out of range!&quot;));</a>
+<a name="ln473">		return;</a>
+<a name="ln474">	});</a>
+<a name="ln475"> </a>
+<a name="ln476">	int8 complementOp[] = {OP_UNEQUAL, OP_EQUAL, OP_LESS_THAN_OR_EQUAL,</a>
+<a name="ln477">			OP_GREATER_THAN_OR_EQUAL, OP_LESS_THAN, OP_GREATER_THAN};</a>
+<a name="ln478">	fOp = complementOp[fOp - OP_EQUAL];</a>
+<a name="ln479">}</a>
+<a name="ln480"> </a>
+<a name="ln481"> </a>
+<a name="ln482">status_t</a>
+<a name="ln483">Equation::PrepareQuery(Volume* /*volume*/, Index&amp; index,</a>
+<a name="ln484">	TreeIterator** iterator, bool queryNonIndexed)</a>
+<a name="ln485">{</a>
+<a name="ln486">	status_t status = index.SetTo(fAttribute);</a>
+<a name="ln487"> </a>
+<a name="ln488">	// if we should query attributes without an index, we can just proceed here</a>
+<a name="ln489">	if (status != B_OK &amp;&amp; !queryNonIndexed)</a>
+<a name="ln490">		return B_ENTRY_NOT_FOUND;</a>
+<a name="ln491"> </a>
+<a name="ln492">	type_code type;</a>
+<a name="ln493"> </a>
+<a name="ln494">	// Special case for OP_UNEQUAL - it will always operate through the whole</a>
+<a name="ln495">	// index but we need the call to the original index to get the correct type</a>
+<a name="ln496">	if (status != B_OK || fOp == OP_UNEQUAL) {</a>
+<a name="ln497">		// Try to get an index that holds all files (name)</a>
+<a name="ln498">		// Also sets the default type for all attributes without index</a>
+<a name="ln499">		// to string.</a>
+<a name="ln500">		type = status &lt; B_OK ? B_STRING_TYPE : index.Type();</a>
+<a name="ln501"> </a>
+<a name="ln502">		if (index.SetTo(&quot;name&quot;) != B_OK)</a>
+<a name="ln503">			return B_ENTRY_NOT_FOUND;</a>
+<a name="ln504"> </a>
+<a name="ln505">		fHasIndex = false;</a>
+<a name="ln506">	} else {</a>
+<a name="ln507">		fHasIndex = true;</a>
+<a name="ln508">		type = index.Type();</a>
+<a name="ln509">	}</a>
+<a name="ln510"> </a>
+<a name="ln511">	if (_ConvertValue(type) &lt; B_OK)</a>
+<a name="ln512">		return B_BAD_VALUE;</a>
+<a name="ln513"> </a>
+<a name="ln514">	BPlusTree* tree = index.Node()-&gt;Tree();</a>
+<a name="ln515">	if (tree == NULL)</a>
+<a name="ln516">		return B_ERROR;</a>
+<a name="ln517"> </a>
+<a name="ln518">	*iterator = new(std::nothrow) TreeIterator(tree);</a>
+<a name="ln519">	if (*iterator == NULL)</a>
+<a name="ln520">		return B_NO_MEMORY;</a>
+<a name="ln521"> </a>
+<a name="ln522">	if ((fOp == OP_EQUAL || fOp == OP_GREATER_THAN</a>
+<a name="ln523">			|| fOp == OP_GREATER_THAN_OR_EQUAL || fIsPattern)</a>
+<a name="ln524">		&amp;&amp; fHasIndex) {</a>
+<a name="ln525">		// set iterator to the exact position</a>
+<a name="ln526"> </a>
+<a name="ln527">		int32 keySize = index.KeySize();</a>
+<a name="ln528"> </a>
+<a name="ln529">		// At this point, fIsPattern is only true if it's a string type, and fOp</a>
+<a name="ln530">		// is either OP_EQUAL or OP_UNEQUAL</a>
+<a name="ln531">		if (fIsPattern) {</a>
+<a name="ln532">			// let's see if we can use the beginning of the key for positioning</a>
+<a name="ln533">			// the iterator and adjust the key size; if not, just leave the</a>
+<a name="ln534">			// iterator at the start and return success</a>
+<a name="ln535">			keySize = getFirstPatternSymbol(fString);</a>
+<a name="ln536">			if (keySize &lt;= 0)</a>
+<a name="ln537">				return B_OK;</a>
+<a name="ln538">		}</a>
+<a name="ln539"> </a>
+<a name="ln540">		if (keySize == 0) {</a>
+<a name="ln541">			// B_STRING_TYPE doesn't have a fixed length, so it was set</a>
+<a name="ln542">			// to 0 before - we compute the correct value here</a>
+<a name="ln543">			if (fType == B_STRING_TYPE) {</a>
+<a name="ln544">				keySize = strlen(fValue.String);</a>
+<a name="ln545"> </a>
+<a name="ln546">				// The empty string is a special case - we normally don't check</a>
+<a name="ln547">				// for the trailing null byte, in the case for the empty string</a>
+<a name="ln548">				// we do it explicitly, because there can't be keys in the</a>
+<a name="ln549">				// B+tree with a length of zero</a>
+<a name="ln550">				if (keySize == 0)</a>
+<a name="ln551">					keySize = 1;</a>
+<a name="ln552">			} else</a>
+<a name="ln553">				RETURN_ERROR(B_ENTRY_NOT_FOUND);</a>
+<a name="ln554">		}</a>
+<a name="ln555"> </a>
+<a name="ln556">		if (fIsSpecialTime) {</a>
+<a name="ln557">			// we have to find the first matching shifted value</a>
+<a name="ln558">			off_t value = fValue.Int64 &lt;&lt; INODE_TIME_SHIFT;</a>
+<a name="ln559">			status = (*iterator)-&gt;Find((uint8*)&amp;value, keySize);</a>
+<a name="ln560">			if (status == B_ENTRY_NOT_FOUND)</a>
+<a name="ln561">				return B_OK;</a>
+<a name="ln562">		} else {</a>
+<a name="ln563">			status = (*iterator)-&gt;Find(_Value(), keySize);</a>
+<a name="ln564">			if (fOp == OP_EQUAL &amp;&amp; !fIsPattern)</a>
+<a name="ln565">				return status;</a>
+<a name="ln566">			else if (status == B_ENTRY_NOT_FOUND</a>
+<a name="ln567">				&amp;&amp; (fIsPattern || fOp == OP_GREATER_THAN</a>
+<a name="ln568">					|| fOp == OP_GREATER_THAN_OR_EQUAL))</a>
+<a name="ln569">				return B_OK;</a>
+<a name="ln570">		}</a>
+<a name="ln571"> </a>
+<a name="ln572">		RETURN_ERROR(status);</a>
+<a name="ln573">	}</a>
+<a name="ln574"> </a>
+<a name="ln575">	return B_OK;</a>
+<a name="ln576">}</a>
+<a name="ln577"> </a>
+<a name="ln578"> </a>
+<a name="ln579">status_t</a>
+<a name="ln580">Equation::GetNextMatching(Volume* volume, TreeIterator* iterator,</a>
+<a name="ln581">	struct dirent* dirent, size_t bufferSize)</a>
+<a name="ln582">{</a>
+<a name="ln583">	while (true) {</a>
+<a name="ln584">		union value indexValue;</a>
+<a name="ln585">		uint16 keyLength;</a>
+<a name="ln586">		uint16 duplicate;</a>
+<a name="ln587">		off_t offset;</a>
+<a name="ln588"> </a>
+<a name="ln589">		status_t status = iterator-&gt;GetNextEntry(&amp;indexValue, &amp;keyLength,</a>
+<a name="ln590">			(uint16)sizeof(indexValue), &amp;offset, &amp;duplicate);</a>
+<a name="ln591">		if (status != B_OK)</a>
+<a name="ln592">			return status;</a>
+<a name="ln593"> </a>
+<a name="ln594">		// only compare against the index entry when this is the correct</a>
+<a name="ln595">		// index for the equation</a>
+<a name="ln596">		if (fHasIndex &amp;&amp; duplicate &lt; 2</a>
+<a name="ln597">			&amp;&amp; !_CompareTo((uint8*)&amp;indexValue, keyLength)) {</a>
+<a name="ln598">			// They aren't equal? Let the operation decide what to do. Since</a>
+<a name="ln599">			// we always start at the beginning of the index (or the correct</a>
+<a name="ln600">			// position), only some needs to be stopped if the entry doesn't</a>
+<a name="ln601">			// fit.</a>
+<a name="ln602">			if (fOp == OP_LESS_THAN</a>
+<a name="ln603">				|| fOp == OP_LESS_THAN_OR_EQUAL</a>
+<a name="ln604">				|| (fOp == OP_EQUAL &amp;&amp; !fIsPattern))</a>
+<a name="ln605">				return B_ENTRY_NOT_FOUND;</a>
+<a name="ln606"> </a>
+<a name="ln607">			if (duplicate &gt; 0)</a>
+<a name="ln608">				iterator-&gt;SkipDuplicates();</a>
+<a name="ln609">			continue;</a>
+<a name="ln610">		}</a>
+<a name="ln611"> </a>
+<a name="ln612">		Vnode vnode(volume, offset);</a>
+<a name="ln613">		Inode* inode;</a>
+<a name="ln614">		if ((status = vnode.Get(&amp;inode)) != B_OK) {</a>
+<a name="ln615">			REPORT_ERROR(status);</a>
+<a name="ln616">			FATAL((&quot;could not get inode %&quot; B_PRIdOFF &quot; in index \&quot;%s\&quot;!\n&quot;,</a>
+<a name="ln617">				offset, fAttribute));</a>
+<a name="ln618">			// try with next</a>
+<a name="ln619">			continue;</a>
+<a name="ln620">		}</a>
+<a name="ln621"> </a>
+<a name="ln622">		// TODO: check user permissions here - but which one?!</a>
+<a name="ln623">		// we could filter out all those where we don't have</a>
+<a name="ln624">		// read access... (we should check for every parent</a>
+<a name="ln625">		// directory if the X_OK is allowed)</a>
+<a name="ln626">		// Although it's quite expensive to open all parents,</a>
+<a name="ln627">		// it's likely that the application that runs the</a>
+<a name="ln628">		// query will do something similar (and we don't have</a>
+<a name="ln629">		// to do it for root, either).</a>
+<a name="ln630"> </a>
+<a name="ln631">		// go up in the tree until a &amp;&amp;-operator is found, and check if the</a>
+<a name="ln632">		// inode matches with the rest of the expression - we don't have to</a>
+<a name="ln633">		// check ||-operators for that</a>
+<a name="ln634">		Term* term = this;</a>
+<a name="ln635">		status = MATCH_OK;</a>
+<a name="ln636"> </a>
+<a name="ln637">		if (!fHasIndex)</a>
+<a name="ln638">			status = Match(inode);</a>
+<a name="ln639"> </a>
+<a name="ln640">		while (term != NULL &amp;&amp; status == MATCH_OK) {</a>
+<a name="ln641">			Operator* parent = (Operator*)term-&gt;Parent();</a>
+<a name="ln642">			if (parent == NULL)</a>
+<a name="ln643">				break;</a>
+<a name="ln644"> </a>
+<a name="ln645">			if (parent-&gt;Op() == OP_AND) {</a>
+<a name="ln646">				// choose the other child of the parent</a>
+<a name="ln647">				Term* other = parent-&gt;Right();</a>
+<a name="ln648">				if (other == term)</a>
+<a name="ln649">					other = parent-&gt;Left();</a>
+<a name="ln650"> </a>
+<a name="ln651">				if (other == NULL) {</a>
+<a name="ln652">					FATAL((&quot;&amp;&amp;-operator has only one child... (parent = %p)\n&quot;,</a>
+<a name="ln653">						parent));</a>
+<a name="ln654">					break;</a>
+<a name="ln655">				}</a>
+<a name="ln656">				status = other-&gt;Match(inode);</a>
+<a name="ln657">				if (status &lt; 0) {</a>
+<a name="ln658">					REPORT_ERROR(status);</a>
+<a name="ln659">					status = NO_MATCH;</a>
+<a name="ln660">				}</a>
+<a name="ln661">			}</a>
+<a name="ln662">			term = (Term*)parent;</a>
+<a name="ln663">		}</a>
+<a name="ln664"> </a>
+<a name="ln665">		if (status == MATCH_OK) {</a>
+<a name="ln666">			dirent-&gt;d_dev = volume-&gt;ID();</a>
+<a name="ln667">			dirent-&gt;d_ino = offset;</a>
+<a name="ln668">			dirent-&gt;d_pdev = volume-&gt;ID();</a>
+<a name="ln669">			dirent-&gt;d_pino = volume-&gt;ToVnode(inode-&gt;Parent());</a>
+<a name="ln670"> </a>
+<a name="ln671">			if (inode-&gt;GetName(dirent-&gt;d_name) &lt; B_OK) {</a>
+<a name="ln672">				FATAL((&quot;inode %&quot; B_PRIdOFF &quot; in query has no name!\n&quot;,</a>
+<a name="ln673">					inode-&gt;BlockNumber()));</a>
+<a name="ln674">			}</a>
+<a name="ln675"> </a>
+<a name="ln676">			dirent-&gt;d_reclen = sizeof(struct dirent) + strlen(dirent-&gt;d_name);</a>
+<a name="ln677">		}</a>
+<a name="ln678"> </a>
+<a name="ln679">		if (status == MATCH_OK)</a>
+<a name="ln680">			return B_OK;</a>
+<a name="ln681">	}</a>
+<a name="ln682">	RETURN_ERROR(B_ERROR);</a>
+<a name="ln683">}</a>
+<a name="ln684"> </a>
+<a name="ln685"> </a>
+<a name="ln686">void</a>
+<a name="ln687">Equation::CalculateScore(Index &amp;index)</a>
+<a name="ln688">{</a>
+<a name="ln689">	// As always, these values could be tuned and refined.</a>
+<a name="ln690">	// And the code could also need some real world testing :-)</a>
+<a name="ln691"> </a>
+<a name="ln692">	// do we have to operate on a &quot;foreign&quot; index?</a>
+<a name="ln693">	if (fOp == OP_UNEQUAL || index.SetTo(fAttribute) &lt; B_OK) {</a>
+<a name="ln694">		fScore = 0;</a>
+<a name="ln695">		return;</a>
+<a name="ln696">	}</a>
+<a name="ln697"> </a>
+<a name="ln698">	// if we have a pattern, how much does it help our search?</a>
+<a name="ln699">	if (fIsPattern)</a>
+<a name="ln700">		fScore = getFirstPatternSymbol(fString) &lt;&lt; 3;</a>
+<a name="ln701">	else {</a>
+<a name="ln702">		// Score by operator</a>
+<a name="ln703">		if (fOp == OP_EQUAL)</a>
+<a name="ln704">			// higher than pattern=&quot;255 chars+*&quot;</a>
+<a name="ln705">			fScore = 2048;</a>
+<a name="ln706">		else</a>
+<a name="ln707">			// the pattern search is regarded cheaper when you have at</a>
+<a name="ln708">			// least one character to set your index to</a>
+<a name="ln709">			fScore = 5;</a>
+<a name="ln710">	}</a>
+<a name="ln711"> </a>
+<a name="ln712">	// take index size into account (1024 is the current node size</a>
+<a name="ln713">	// in our B+trees)</a>
+<a name="ln714">	// 2048 * 2048 == 4194304 is the maximum score (for an empty</a>
+<a name="ln715">	// tree, since the header + 1 node are already 2048 bytes)</a>
+<a name="ln716">	fScore = fScore * ((2048 * 1024LL) / index.Node()-&gt;Size());</a>
+<a name="ln717">}</a>
+<a name="ln718"> </a>
+<a name="ln719"> </a>
+<a name="ln720">status_t</a>
+<a name="ln721">Equation::_ParseQuotedString(char** _start, char** _end)</a>
+<a name="ln722">{</a>
+<a name="ln723">	char* start = *_start;</a>
+<a name="ln724">	char quote = *start++;</a>
+<a name="ln725">	char* end = start;</a>
+<a name="ln726"> </a>
+<a name="ln727">	for (; *end &amp;&amp; *end != quote; end++) {</a>
+<a name="ln728">		if (*end == '\\')</a>
+<a name="ln729">			end++;</a>
+<a name="ln730">	}</a>
+<a name="ln731">	if (*end == '\0')</a>
+<a name="ln732">		return B_BAD_VALUE;</a>
+<a name="ln733"> </a>
+<a name="ln734">	*_start = start;</a>
+<a name="ln735">	*_end = end - 1;</a>
+<a name="ln736"> </a>
+<a name="ln737">	return B_OK;</a>
+<a name="ln738">}</a>
+<a name="ln739"> </a>
+<a name="ln740"> </a>
+<a name="ln741">char*</a>
+<a name="ln742">Equation::_CopyString(char* start, char* end)</a>
+<a name="ln743">{</a>
+<a name="ln744">	// end points to the last character of the string - and the length</a>
+<a name="ln745">	// also has to include the null-termination</a>
+<a name="ln746">	int32 length = end + 2 - start;</a>
+<a name="ln747">	// just to make sure; since that's the max. attribute name length and</a>
+<a name="ln748">	// the max. string in an index, it make sense to have it that way</a>
+<a name="ln749">	if (length &gt; MAX_INDEX_KEY_LENGTH + 1 || length &lt;= 0)</a>
+<a name="ln750">		return NULL;</a>
+<a name="ln751"> </a>
+<a name="ln752">	char* copy = (char*)malloc(length);</a>
+<a name="ln753">	if (copy == NULL)</a>
+<a name="ln754">		return NULL;</a>
+<a name="ln755"> </a>
+<a name="ln756">	// Filter out remaining escaping slashes</a>
+<a name="ln757">	for (int32 i = 0; i &lt; length; i++) {</a>
+<a name="ln758">		char c = start++[0];</a>
+<a name="ln759">		if (c == '\\' &amp;&amp; i &lt; length) {</a>
+<a name="ln760">			length--;</a>
+<a name="ln761">			i--;</a>
+<a name="ln762">			continue;</a>
+<a name="ln763">		}</a>
+<a name="ln764">		copy[i] = c;</a>
+<a name="ln765">	}</a>
+<a name="ln766">	copy[length - 1] = '\0';</a>
+<a name="ln767"> </a>
+<a name="ln768">	return copy;</a>
+<a name="ln769">}</a>
+<a name="ln770"> </a>
+<a name="ln771"> </a>
+<a name="ln772">bool</a>
+<a name="ln773">Equation::_IsEquationChar(char c) const</a>
+<a name="ln774">{</a>
+<a name="ln775">	return c == '=' || c == '&lt;' || c == '&gt;' || c == '!';</a>
+<a name="ln776">}</a>
+<a name="ln777"> </a>
+<a name="ln778"> </a>
+<a name="ln779">bool</a>
+<a name="ln780">Equation::_IsOperatorChar(char c) const</a>
+<a name="ln781">{</a>
+<a name="ln782">	return c == '&amp;' || c == '|';</a>
+<a name="ln783">}</a>
+<a name="ln784"> </a>
+<a name="ln785"> </a>
+<a name="ln786">status_t</a>
+<a name="ln787">Equation::_ConvertValue(type_code type)</a>
+<a name="ln788">{</a>
+<a name="ln789">	// Has the type already been converted?</a>
+<a name="ln790">	if (type == fType)</a>
+<a name="ln791">		return B_OK;</a>
+<a name="ln792"> </a>
+<a name="ln793">	char* string = fString;</a>
+<a name="ln794"> </a>
+<a name="ln795">	switch (type) {</a>
+<a name="ln796">		case B_MIME_STRING_TYPE:</a>
+<a name="ln797">			type = B_STRING_TYPE;</a>
+<a name="ln798">			// supposed to fall through</a>
+<a name="ln799">		case B_STRING_TYPE:</a>
+<a name="ln800">			strncpy(fValue.String, string, MAX_INDEX_KEY_LENGTH + 1);</a>
+<a name="ln801">			fValue.String[MAX_INDEX_KEY_LENGTH] = '\0';</a>
+<a name="ln802">			fSize = strlen(fValue.String);</a>
+<a name="ln803">			break;</a>
+<a name="ln804">		case B_TIME_TYPE:</a>
+<a name="ln805">			type = B_INT32_TYPE;</a>
+<a name="ln806">			// supposed to fall through</a>
+<a name="ln807">		case B_INT32_TYPE:</a>
+<a name="ln808">			fValue.Int32 = strtol(string, &amp;string, 0);</a>
+<a name="ln809">			fSize = sizeof(int32);</a>
+<a name="ln810">			break;</a>
+<a name="ln811">		case B_UINT32_TYPE:</a>
+<a name="ln812">			fValue.Int32 = strtoul(string, &amp;string, 0);</a>
+<a name="ln813">			fSize = sizeof(uint32);</a>
+<a name="ln814">			break;</a>
+<a name="ln815">		case B_INT64_TYPE:</a>
+<a name="ln816">			fValue.Int64 = strtoll(string, &amp;string, 0);</a>
+<a name="ln817">			fSize = sizeof(int64);</a>
+<a name="ln818">			break;</a>
+<a name="ln819">		case B_UINT64_TYPE:</a>
+<a name="ln820">			fValue.Uint64 = strtoull(string, &amp;string, 0);</a>
+<a name="ln821">			fSize = sizeof(uint64);</a>
+<a name="ln822">			break;</a>
+<a name="ln823">		case B_FLOAT_TYPE:</a>
+<a name="ln824">			fValue.Float = strtod(string, &amp;string);</a>
+<a name="ln825">			fSize = sizeof(float);</a>
+<a name="ln826">			break;</a>
+<a name="ln827">		case B_DOUBLE_TYPE:</a>
+<a name="ln828">			fValue.Double = strtod(string, &amp;string);</a>
+<a name="ln829">			fSize = sizeof(double);</a>
+<a name="ln830">			break;</a>
+<a name="ln831">		default:</a>
+<a name="ln832">			FATAL((&quot;query value conversion to 0x%x requested!\n&quot;, (int)type));</a>
+<a name="ln833">			// should we fail here or just do a safety int32 conversion?</a>
+<a name="ln834">			return B_ERROR;</a>
+<a name="ln835">	}</a>
+<a name="ln836"> </a>
+<a name="ln837">	fType = type;</a>
+<a name="ln838"> </a>
+<a name="ln839">	// patterns are only allowed for string types</a>
+<a name="ln840">	if (fType != B_STRING_TYPE &amp;&amp; fIsPattern)</a>
+<a name="ln841">		fIsPattern = false;</a>
+<a name="ln842"> </a>
+<a name="ln843">	return B_OK;</a>
+<a name="ln844">}</a>
+<a name="ln845"> </a>
+<a name="ln846"> </a>
+<a name="ln847">/*!	Returns true when the key matches the equation. You have to</a>
+<a name="ln848">	call ConvertValue() before this one.</a>
+<a name="ln849">*/</a>
+<a name="ln850">bool</a>
+<a name="ln851">Equation::_CompareTo(const uint8* value, uint16 size)</a>
+<a name="ln852">{</a>
+<a name="ln853">	int32 compare;</a>
+<a name="ln854"> </a>
+<a name="ln855">	// fIsPattern is only true if it's a string type, and fOp OP_EQUAL, or</a>
+<a name="ln856">	// OP_UNEQUAL</a>
+<a name="ln857">	if (fIsPattern) {</a>
+<a name="ln858">		// we have already validated the pattern, so we don't check for failing</a>
+<a name="ln859">		// here - if something is broken, and matchString() returns an error,</a>
+<a name="ln860">		// we just don't match</a>
+<a name="ln861">		compare = matchString(fValue.String, (char*)value) == MATCH_OK ? 0 : 1;</a>
+<a name="ln862">	} else if (fIsSpecialTime) {</a>
+<a name="ln863">		// the index is a shifted int64 index, but we have to match</a>
+<a name="ln864">		// against an unshifted value (i.e. the last_modified index)</a>
+<a name="ln865">		int64 timeValue = *(int64*)value &gt;&gt; INODE_TIME_SHIFT;</a>
+<a name="ln866">		compare = compareKeys(fType, &amp;timeValue, sizeof(int64), &amp;fValue.Int64,</a>
+<a name="ln867">			sizeof(int64));</a>
+<a name="ln868">	} else</a>
+<a name="ln869">		compare = compareKeys(fType, value, size, _Value(), fSize);</a>
+<a name="ln870"> </a>
+<a name="ln871">	switch (fOp) {</a>
+<a name="ln872">		case OP_EQUAL:</a>
+<a name="ln873">			return compare == 0;</a>
+<a name="ln874">		case OP_UNEQUAL:</a>
+<a name="ln875">			return compare != 0;</a>
+<a name="ln876">		case OP_LESS_THAN:</a>
+<a name="ln877">			return compare &lt; 0;</a>
+<a name="ln878">		case OP_LESS_THAN_OR_EQUAL:</a>
+<a name="ln879">			return compare &lt;= 0;</a>
+<a name="ln880">		case OP_GREATER_THAN:</a>
+<a name="ln881">			return compare &gt; 0;</a>
+<a name="ln882">		case OP_GREATER_THAN_OR_EQUAL:</a>
+<a name="ln883">			return compare &gt;= 0;</a>
+<a name="ln884">	}</a>
+<a name="ln885">	FATAL((&quot;Unknown/Unsupported operation: %d\n&quot;, fOp));</a>
+<a name="ln886">	return false;</a>
+<a name="ln887">}</a>
+<a name="ln888"> </a>
+<a name="ln889"> </a>
+<a name="ln890">//	#pragma mark -</a>
+<a name="ln891"> </a>
+<a name="ln892"> </a>
+<a name="ln893">Operator::Operator(Term* left, int8 op, Term* right)</a>
+<a name="ln894">	:</a>
+<a name="ln895">	Term(op),</a>
+<a name="ln896">	fLeft(left),</a>
+<a name="ln897">	fRight(right)</a>
+<a name="ln898">{</a>
+<a name="ln899">	if (left)</a>
+<a name="ln900">		left-&gt;SetParent(this);</a>
+<a name="ln901">	if (right)</a>
+<a name="ln902">		right-&gt;SetParent(this);</a>
+<a name="ln903">}</a>
+<a name="ln904"> </a>
+<a name="ln905"> </a>
+<a name="ln906">Operator::~Operator()</a>
+<a name="ln907">{</a>
+<a name="ln908">	delete fLeft;</a>
+<a name="ln909">	delete fRight;</a>
+<a name="ln910">}</a>
+<a name="ln911"> </a>
+<a name="ln912"> </a>
+<a name="ln913">status_t</a>
+<a name="ln914">Operator::Match(Inode* inode, const char* attribute, int32 type,</a>
+<a name="ln915">	const uint8* key, size_t size)</a>
+<a name="ln916">{</a>
+<a name="ln917">	if (fOp == OP_AND) {</a>
+<a name="ln918">		status_t status = fLeft-&gt;Match(inode, attribute, type, key, size);</a>
+<a name="ln919">		if (status != MATCH_OK)</a>
+<a name="ln920">			return status;</a>
+<a name="ln921"> </a>
+<a name="ln922">		return fRight-&gt;Match(inode, attribute, type, key, size);</a>
+<a name="ln923">	} else {</a>
+<a name="ln924">		// choose the term with the better score for OP_OR</a>
+<a name="ln925">		Term* first;</a>
+<a name="ln926">		Term* second;</a>
+<a name="ln927">		if (fRight-&gt;Score() &gt; fLeft-&gt;Score()) {</a>
+<a name="ln928">			first = fLeft;</a>
+<a name="ln929">			second = fRight;</a>
+<a name="ln930">		} else {</a>
+<a name="ln931">			first = fRight;</a>
+<a name="ln932">			second = fLeft;</a>
+<a name="ln933">		}</a>
+<a name="ln934"> </a>
+<a name="ln935">		status_t status = first-&gt;Match(inode, attribute, type, key, size);</a>
+<a name="ln936">		if (status != NO_MATCH)</a>
+<a name="ln937">			return status;</a>
+<a name="ln938"> </a>
+<a name="ln939">		return second-&gt;Match(inode, attribute, type, key, size);</a>
+<a name="ln940">	}</a>
+<a name="ln941">}</a>
+<a name="ln942"> </a>
+<a name="ln943"> </a>
+<a name="ln944">void</a>
+<a name="ln945">Operator::Complement()</a>
+<a name="ln946">{</a>
+<a name="ln947">	if (fOp == OP_AND)</a>
+<a name="ln948">		fOp = OP_OR;</a>
+<a name="ln949">	else</a>
+<a name="ln950">		fOp = OP_AND;</a>
+<a name="ln951"> </a>
+<a name="ln952">	fLeft-&gt;Complement();</a>
+<a name="ln953">	fRight-&gt;Complement();</a>
+<a name="ln954">}</a>
+<a name="ln955"> </a>
+<a name="ln956"> </a>
+<a name="ln957">void</a>
+<a name="ln958">Operator::CalculateScore(Index &amp;index)</a>
+<a name="ln959">{</a>
+<a name="ln960">	fLeft-&gt;CalculateScore(index);</a>
+<a name="ln961">	fRight-&gt;CalculateScore(index);</a>
+<a name="ln962">}</a>
+<a name="ln963"> </a>
+<a name="ln964"> </a>
+<a name="ln965">int32</a>
+<a name="ln966">Operator::Score() const</a>
+<a name="ln967">{</a>
+<a name="ln968">	if (fOp == OP_AND) {</a>
+<a name="ln969">		// return the one with the better score</a>
+<a name="ln970">		if (fRight-&gt;Score() &gt; fLeft-&gt;Score())</a>
+<a name="ln971">			return fRight-&gt;Score();</a>
+<a name="ln972"> </a>
+<a name="ln973">		return fLeft-&gt;Score();</a>
+<a name="ln974">	}</a>
+<a name="ln975"> </a>
+<a name="ln976">	// for OP_OR, be honest, and return the one with the worse score</a>
+<a name="ln977">	if (fRight-&gt;Score() &lt; fLeft-&gt;Score())</a>
+<a name="ln978">		return fRight-&gt;Score();</a>
+<a name="ln979"> </a>
+<a name="ln980">	return fLeft-&gt;Score();</a>
+<a name="ln981">}</a>
+<a name="ln982"> </a>
+<a name="ln983"> </a>
+<a name="ln984">status_t</a>
+<a name="ln985">Operator::InitCheck()</a>
+<a name="ln986">{</a>
+<a name="ln987">	if ((fOp != OP_AND &amp;&amp; fOp != OP_OR)</a>
+<a name="ln988">		|| fLeft == NULL || fLeft-&gt;InitCheck() &lt; B_OK</a>
+<a name="ln989">		|| fRight == NULL || fRight-&gt;InitCheck() &lt; B_OK)</a>
+<a name="ln990">		return B_ERROR;</a>
+<a name="ln991"> </a>
+<a name="ln992">	return B_OK;</a>
+<a name="ln993">}</a>
+<a name="ln994"> </a>
+<a name="ln995"> </a>
+<a name="ln996">#if 0</a>
+<a name="ln997">Term*</a>
+<a name="ln998">Operator::Copy() const</a>
+<a name="ln999">{</a>
+<a name="ln1000">	if (fEquation != NULL) {</a>
+<a name="ln1001">		Equation* equation = new(std::nothrow) Equation(*fEquation);</a>
+<a name="ln1002">		if (equation == NULL)</a>
+<a name="ln1003">			return NULL;</a>
+<a name="ln1004"> </a>
+<a name="ln1005">		Term* term = new(std::nothrow) Term(equation);</a>
+<a name="ln1006">		if (term == NULL)</a>
+<a name="ln1007">			delete equation;</a>
+<a name="ln1008"> </a>
+<a name="ln1009">		return term;</a>
+<a name="ln1010">	}</a>
+<a name="ln1011"> </a>
+<a name="ln1012">	Term* left = NULL;</a>
+<a name="ln1013">	Term* right = NULL;</a>
+<a name="ln1014"> </a>
+<a name="ln1015">	if (fLeft != NULL &amp;&amp; (left = fLeft-&gt;Copy()) == NULL)</a>
+<a name="ln1016">		return NULL;</a>
+<a name="ln1017">	if (fRight != NULL &amp;&amp; (right = fRight-&gt;Copy()) == NULL) {</a>
+<a name="ln1018">		delete left;</a>
+<a name="ln1019">		return NULL;</a>
+<a name="ln1020">	}</a>
+<a name="ln1021"> </a>
+<a name="ln1022">	Term* term = new(std::nothrow) Term(left, fOp, right);</a>
+<a name="ln1023">	if (term == NULL) {</a>
+<a name="ln1024">		delete left;</a>
+<a name="ln1025">		delete right;</a>
+<a name="ln1026">		return NULL;</a>
+<a name="ln1027">	}</a>
+<a name="ln1028">	return term;</a>
+<a name="ln1029">}</a>
+<a name="ln1030">#endif</a>
+<a name="ln1031"> </a>
+<a name="ln1032"> </a>
+<a name="ln1033">//	#pragma mark -</a>
+<a name="ln1034"> </a>
+<a name="ln1035">#ifdef DEBUG</a>
+<a name="ln1036"> </a>
+<a name="ln1037">void</a>
+<a name="ln1038">Operator::PrintToStream()</a>
+<a name="ln1039">{</a>
+<a name="ln1040">	__out(&quot;( &quot;);</a>
+<a name="ln1041">	if (fLeft != NULL)</a>
+<a name="ln1042">		fLeft-&gt;PrintToStream();</a>
+<a name="ln1043"> </a>
+<a name="ln1044">	const char* op;</a>
+<a name="ln1045">	switch (fOp) {</a>
+<a name="ln1046">		case OP_OR: op = &quot;OR&quot;; break;</a>
+<a name="ln1047">		case OP_AND: op = &quot;AND&quot;; break;</a>
+<a name="ln1048">		default: op = &quot;?&quot;; break;</a>
+<a name="ln1049">	}</a>
+<a name="ln1050">	__out(&quot; %s &quot;, op);</a>
+<a name="ln1051"> </a>
+<a name="ln1052">	if (fRight != NULL)</a>
+<a name="ln1053">		fRight-&gt;PrintToStream();</a>
+<a name="ln1054"> </a>
+<a name="ln1055">	__out(&quot; )&quot;);</a>
+<a name="ln1056">}</a>
+<a name="ln1057"> </a>
+<a name="ln1058"> </a>
+<a name="ln1059">void</a>
+<a name="ln1060">Equation::PrintToStream()</a>
+<a name="ln1061">{</a>
+<a name="ln1062">	const char* symbol = &quot;???&quot;;</a>
+<a name="ln1063">	switch (fOp) {</a>
+<a name="ln1064">		case OP_EQUAL: symbol = &quot;==&quot;; break;</a>
+<a name="ln1065">		case OP_UNEQUAL: symbol = &quot;!=&quot;; break;</a>
+<a name="ln1066">		case OP_GREATER_THAN: symbol = &quot;&gt;&quot;; break;</a>
+<a name="ln1067">		case OP_GREATER_THAN_OR_EQUAL: symbol = &quot;&gt;=&quot;; break;</a>
+<a name="ln1068">		case OP_LESS_THAN: symbol = &quot;&lt;&quot;; break;</a>
+<a name="ln1069">		case OP_LESS_THAN_OR_EQUAL: symbol = &quot;&lt;=&quot;; break;</a>
+<a name="ln1070">	}</a>
+<a name="ln1071">	__out(&quot;[\&quot;%s\&quot; %s \&quot;%s\&quot;]&quot;, fAttribute, symbol, fString);</a>
+<a name="ln1072">}</a>
+<a name="ln1073"> </a>
+<a name="ln1074">#endif	// DEBUG</a>
+<a name="ln1075"> </a>
+<a name="ln1076">//	#pragma mark -</a>
+<a name="ln1077"> </a>
+<a name="ln1078"> </a>
+<a name="ln1079">Expression::Expression(char* expr)</a>
+<a name="ln1080">{</a>
+<a name="ln1081">	if (expr == NULL)</a>
+<a name="ln1082">		return;</a>
+<a name="ln1083"> </a>
+<a name="ln1084">	fTerm = ParseOr(&amp;expr);</a>
+<a name="ln1085">	if (fTerm != NULL &amp;&amp; fTerm-&gt;InitCheck() &lt; B_OK) {</a>
+<a name="ln1086">		FATAL((&quot;Corrupt tree in expression!\n&quot;));</a>
+<a name="ln1087">		delete fTerm;</a>
+<a name="ln1088">		fTerm = NULL;</a>
+<a name="ln1089">	}</a>
+<a name="ln1090">	D(if (fTerm != NULL) {</a>
+<a name="ln1091">		fTerm-&gt;PrintToStream();</a>
+<a name="ln1092">		D(__out(&quot;\n&quot;));</a>
+<a name="ln1093">		if (*expr != '\0')</a>
+<a name="ln1094">			PRINT((&quot;Unexpected end of string: \&quot;%s\&quot;!\n&quot;, expr));</a>
+<a name="ln1095">	});</a>
+<a name="ln1096">	fPosition = expr;</a>
+<a name="ln1097">}</a>
+<a name="ln1098"> </a>
+<a name="ln1099"> </a>
+<a name="ln1100">Expression::~Expression()</a>
+<a name="ln1101">{</a>
+<a name="ln1102">	delete fTerm;</a>
+<a name="ln1103">}</a>
+<a name="ln1104"> </a>
+<a name="ln1105"> </a>
+<a name="ln1106">Term*</a>
+<a name="ln1107">Expression::ParseEquation(char** expr)</a>
+<a name="ln1108">{</a>
+<a name="ln1109">	skipWhitespace(expr);</a>
+<a name="ln1110"> </a>
+<a name="ln1111">	bool _not = false;</a>
+<a name="ln1112">	if (**expr == '!') {</a>
+<a name="ln1113">		skipWhitespace(expr, 1);</a>
+<a name="ln1114">		if (**expr != '(')</a>
+<a name="ln1115">			return NULL;</a>
+<a name="ln1116"> </a>
+<a name="ln1117">		_not = true;</a>
+<a name="ln1118">	}</a>
+<a name="ln1119"> </a>
+<a name="ln1120">	if (**expr == ')') {</a>
+<a name="ln1121">		// shouldn't be handled here</a>
+<a name="ln1122">		return NULL;</a>
+<a name="ln1123">	} else if (**expr == '(') {</a>
+<a name="ln1124">		skipWhitespace(expr, 1);</a>
+<a name="ln1125"> </a>
+<a name="ln1126">		Term* term = ParseOr(expr);</a>
+<a name="ln1127"> </a>
+<a name="ln1128">		skipWhitespace(expr);</a>
+<a name="ln1129"> </a>
+<a name="ln1130">		if (**expr != ')') {</a>
+<a name="ln1131">			delete term;</a>
+<a name="ln1132">			return NULL;</a>
+<a name="ln1133">		}</a>
+<a name="ln1134"> </a>
+<a name="ln1135">		// If the term is negated, we just complement the tree, to get</a>
+<a name="ln1136">		// rid of the not, a.k.a. DeMorgan's Law.</a>
+<a name="ln1137">		if (_not)</a>
+<a name="ln1138">			term-&gt;Complement();</a>
+<a name="ln1139"> </a>
+<a name="ln1140">		skipWhitespace(expr, 1);</a>
+<a name="ln1141"> </a>
+<a name="ln1142">		return term;</a>
+<a name="ln1143">	}</a>
+<a name="ln1144"> </a>
+<a name="ln1145">	Equation* equation = new(std::nothrow) Equation(expr);</a>
+<a name="ln1146">	if (equation == NULL || equation-&gt;InitCheck() &lt; B_OK) {</a>
+<a name="ln1147">		delete equation;</a>
+<a name="ln1148">		return NULL;</a>
+<a name="ln1149">	}</a>
+<a name="ln1150">	return equation;</a>
+<a name="ln1151">}</a>
+<a name="ln1152"> </a>
+<a name="ln1153"> </a>
+<a name="ln1154">Term*</a>
+<a name="ln1155">Expression::ParseAnd(char** expr)</a>
+<a name="ln1156">{</a>
+<a name="ln1157">	Term* left = ParseEquation(expr);</a>
+<a name="ln1158">	if (left == NULL)</a>
+<a name="ln1159">		return NULL;</a>
+<a name="ln1160"> </a>
+<a name="ln1161">	while (IsOperator(expr, '&amp;')) {</a>
+<a name="ln1162">		Term* right = ParseAnd(expr);</a>
+<a name="ln1163">		Term* newParent = NULL;</a>
+<a name="ln1164"> </a>
+<a name="ln1165">		if (right == NULL || (newParent = new(std::nothrow) Operator(left,</a>
+<a name="ln1166">				OP_AND, right)) == NULL) {</a>
+<a name="ln1167">			delete left;</a>
+<a name="ln1168">			delete right;</a>
+<a name="ln1169"> </a>
+<a name="ln1170">			return NULL;</a>
+<a name="ln1171">		}</a>
+<a name="ln1172">		left = newParent;</a>
+<a name="ln1173">	}</a>
+<a name="ln1174"> </a>
+<a name="ln1175">	return left;</a>
+<a name="ln1176">}</a>
+<a name="ln1177"> </a>
+<a name="ln1178"> </a>
+<a name="ln1179">Term*</a>
+<a name="ln1180">Expression::ParseOr(char** expr)</a>
+<a name="ln1181">{</a>
+<a name="ln1182">	Term* left = ParseAnd(expr);</a>
+<a name="ln1183">	if (left == NULL)</a>
+<a name="ln1184">		return NULL;</a>
+<a name="ln1185"> </a>
+<a name="ln1186">	while (IsOperator(expr, '|')) {</a>
+<a name="ln1187">		Term* right = ParseAnd(expr);</a>
+<a name="ln1188">		Term* newParent = NULL;</a>
+<a name="ln1189"> </a>
+<a name="ln1190">		if (right == NULL || (newParent = new(std::nothrow) Operator(left,</a>
+<a name="ln1191">				OP_OR, right)) == NULL) {</a>
+<a name="ln1192">			delete left;</a>
+<a name="ln1193">			delete right;</a>
+<a name="ln1194"> </a>
+<a name="ln1195">			return NULL;</a>
+<a name="ln1196">		}</a>
+<a name="ln1197">		left = newParent;</a>
+<a name="ln1198">	}</a>
+<a name="ln1199"> </a>
+<a name="ln1200">	return left;</a>
+<a name="ln1201">}</a>
+<a name="ln1202"> </a>
+<a name="ln1203"> </a>
+<a name="ln1204">bool</a>
+<a name="ln1205">Expression::IsOperator(char** expr, char op)</a>
+<a name="ln1206">{</a>
+<a name="ln1207">	char* string = *expr;</a>
+<a name="ln1208"> </a>
+<a name="ln1209">	if (*string == op &amp;&amp; *(string + 1) == op) {</a>
+<a name="ln1210">		*expr += 2;</a>
+<a name="ln1211">		return true;</a>
+<a name="ln1212">	}</a>
+<a name="ln1213">	return false;</a>
+<a name="ln1214">}</a>
+<a name="ln1215"> </a>
+<a name="ln1216"> </a>
+<a name="ln1217">status_t</a>
+<a name="ln1218">Expression::InitCheck()</a>
+<a name="ln1219">{</a>
+<a name="ln1220">	if (fTerm == NULL)</a>
+<a name="ln1221">		return B_BAD_VALUE;</a>
+<a name="ln1222"> </a>
+<a name="ln1223">	return B_OK;</a>
+<a name="ln1224">}</a>
+<a name="ln1225"> </a>
+<a name="ln1226"> </a>
+<a name="ln1227">//	#pragma mark -</a>
+<a name="ln1228"> </a>
+<a name="ln1229"> </a>
+<a name="ln1230">Query::Query(Volume* volume, Expression* expression, uint32 flags)</a>
+<a name="ln1231">	:</a>
+<a name="ln1232">	fVolume(volume),</a>
+<a name="ln1233">	fExpression(expression),</a>
+<a name="ln1234">	fCurrent(NULL),</a>
+<a name="ln1235">	fIterator(NULL),</a>
+<a name="ln1236">	fIndex(volume),</a>
+<a name="ln1237">	fFlags(flags),</a>
+<a name="ln1238">	fPort(-1)</a>
+<a name="ln1239">{</a>
+<a name="ln1240">	// If the expression has a valid root pointer, the whole tree has</a>
+<a name="ln1241">	// already passed the sanity check, so that we don't have to check</a>
+<a name="ln1242">	// every pointer</a>
+<a name="ln1243">	if (volume == NULL || expression == NULL || expression-&gt;Root() == NULL)</a>
+<a name="ln1244">		return;</a>
+<a name="ln1245"> </a>
+<a name="ln1246">	// create index on the stack and delete it afterwards</a>
+<a name="ln1247">	fExpression-&gt;Root()-&gt;CalculateScore(fIndex);</a>
+<a name="ln1248">	fIndex.Unset();</a>
+<a name="ln1249"> </a>
+<a name="ln1250">	Rewind();</a>
+<a name="ln1251"> </a>
+<a name="ln1252">	if ((fFlags &amp; B_LIVE_QUERY) != 0)</a>
+<a name="ln1253">		volume-&gt;AddQuery(this);</a>
+<a name="ln1254">}</a>
+<a name="ln1255"> </a>
+<a name="ln1256"> </a>
+<a name="ln1257">Query::~Query()</a>
+<a name="ln1258">{</a>
+<a name="ln1259">	if ((fFlags &amp; B_LIVE_QUERY) != 0)</a>
+<a name="ln1260">		fVolume-&gt;RemoveQuery(this);</a>
+<a name="ln1261">}</a>
+<a name="ln1262"> </a>
+<a name="ln1263"> </a>
+<a name="ln1264">status_t</a>
+<a name="ln1265">Query::Rewind()</a>
+<a name="ln1266">{</a>
+<a name="ln1267">	// free previous stuff</a>
+<a name="ln1268"> </a>
+<a name="ln1269">	fStack.MakeEmpty();</a>
+<a name="ln1270"> </a>
+<a name="ln1271">	delete fIterator;</a>
+<a name="ln1272">	fIterator = NULL;</a>
+<a name="ln1273">	fCurrent = NULL;</a>
+<a name="ln1274"> </a>
+<a name="ln1275">	// put the whole expression on the stack</a>
+<a name="ln1276"> </a>
+<a name="ln1277">	Stack&lt;Term*&gt; stack;</a>
+<a name="ln1278">	stack.Push(fExpression-&gt;Root());</a>
+<a name="ln1279"> </a>
+<a name="ln1280">	Term* term;</a>
+<a name="ln1281">	while (stack.Pop(&amp;term)) {</a>
+<a name="ln1282">		if (term-&gt;Op() &lt; OP_EQUATION) {</a>
+<a name="ln1283">			Operator* op = (Operator*)term;</a>
+<a name="ln1284"> </a>
+<a name="ln1285">			if (op-&gt;Op() == OP_OR) {</a>
+<a name="ln1286">				stack.Push(op-&gt;Left());</a>
+<a name="ln1287">				stack.Push(op-&gt;Right());</a>
+<a name="ln1288">			} else {</a>
+<a name="ln1289">				// For OP_AND, we can use the scoring system to decide which</a>
+<a name="ln1290">				// path to add</a>
+<a name="ln1291">				if (op-&gt;Right()-&gt;Score() &gt; op-&gt;Left()-&gt;Score())</a>
+<a name="ln1292">					stack.Push(op-&gt;Right());</a>
+<a name="ln1293">				else</a>
+<a name="ln1294">					stack.Push(op-&gt;Left());</a>
+<a name="ln1295">			}</a>
+<a name="ln1296">		} else if (term-&gt;Op() == OP_EQUATION</a>
+<a name="ln1297">			|| fStack.Push((Equation*)term) != B_OK)</a>
+<a name="ln1298">			FATAL((&quot;Unknown term on stack or stack error&quot;));</a>
+<a name="ln1299">	}</a>
+<a name="ln1300"> </a>
+<a name="ln1301">	return B_OK;</a>
+<a name="ln1302">}</a>
+<a name="ln1303"> </a>
+<a name="ln1304"> </a>
+<a name="ln1305">status_t</a>
+<a name="ln1306">Query::GetNextEntry(struct dirent* dirent, size_t size)</a>
+<a name="ln1307">{</a>
+<a name="ln1308">	// If we don't have an equation to use yet/anymore, get a new one</a>
+<a name="ln1309">	// from the stack</a>
+<a name="ln1310">	while (true) {</a>
+<a name="ln1311">		if (fIterator == NULL) {</a>
+<a name="ln1312">			if (!fStack.Pop(&amp;fCurrent)</a>
+<a name="ln1313">				|| fCurrent == NULL)</a>
+<a name="ln1314">				return B_ENTRY_NOT_FOUND;</a>
+<a name="ln1315"> </a>
+<a name="ln1316">			status_t status = fCurrent-&gt;PrepareQuery(fVolume, fIndex,</a>
+<a name="ln1317">				&amp;fIterator, fFlags &amp; B_QUERY_NON_INDEXED);</a>
+<a name="ln1318">			if (status == B_ENTRY_NOT_FOUND) {</a>
+<a name="ln1319">				// try next equation</a>
+<a name="ln1320">				continue;</a>
+<a name="ln1321">			}</a>
+<a name="ln1322"> </a>
+<a name="ln1323">			if (status != B_OK)</a>
+<a name="ln1324">				return status;</a>
+<a name="ln1325">		}</a>
+<a name="ln1326">		if (fCurrent == NULL)</a>
+<a name="ln1327">			RETURN_ERROR(B_ERROR);</a>
+<a name="ln1328"> </a>
+<a name="ln1329">		status_t status = fCurrent-&gt;GetNextMatching(fVolume, fIterator, dirent,</a>
+<a name="ln1330">			size);</a>
+<a name="ln1331">		if (status != B_OK) {</a>
+<a name="ln1332">			delete fIterator;</a>
+<a name="ln1333">			fIterator = NULL;</a>
+<a name="ln1334">			fCurrent = NULL;</a>
+<a name="ln1335">		} else {</a>
+<a name="ln1336">			// only return if we have another entry</a>
+<a name="ln1337">			return B_OK;</a>
+<a name="ln1338">		}</a>
+<a name="ln1339">	}</a>
+<a name="ln1340">}</a>
+<a name="ln1341"> </a>
+<a name="ln1342"> </a>
+<a name="ln1343">void</a>
+<a name="ln1344">Query::SetLiveMode(port_id port, int32 token)</a>
+<a name="ln1345">{</a>
+<a name="ln1346">	fPort = port;</a>
+<a name="ln1347">	fToken = token;</a>
+<a name="ln1348"> </a>
+<a name="ln1349">	if ((fFlags &amp; B_LIVE_QUERY) == 0) {</a>
+<a name="ln1350">		// you can decide at any point to set the live query mode,</a>
+<a name="ln1351">		// only live queries have to be updated by attribute changes</a>
+<a name="ln1352">		fFlags |= B_LIVE_QUERY;</a>
+<a name="ln1353">		fVolume-&gt;AddQuery(this);</a>
+<a name="ln1354">	}</a>
+<a name="ln1355">}</a>
+<a name="ln1356"> </a>
+<a name="ln1357"> </a>
+<a name="ln1358">void</a>
+<a name="ln1359">Query::LiveUpdate(Inode* inode, const char* attribute, int32 type,</a>
+<a name="ln1360">	const uint8* oldKey, size_t oldLength, const uint8* newKey,</a>
+<a name="ln1361">	size_t newLength)</a>
+<a name="ln1362">{</a>
+<a name="ln1363">	if (fPort &lt; 0 || fExpression == NULL || attribute == NULL)</a>
+<a name="ln1364">		return;</a>
+<a name="ln1365"> </a>
+<a name="ln1366">	// TODO: check if the attribute is part of the query at all...</a>
+<a name="ln1367"> </a>
+<a name="ln1368">	status_t oldStatus = fExpression-&gt;Root()-&gt;Match(inode, attribute, type,</a>
+<a name="ln1369">		oldKey, oldLength);</a>
+<a name="ln1370">	status_t newStatus = fExpression-&gt;Root()-&gt;Match(inode, attribute, type,</a>
+<a name="ln1371">		newKey, newLength);</a>
+<a name="ln1372"> </a>
+<a name="ln1373">	bool entryCreated = false;</a>
+<a name="ln1374">	bool stillInQuery = false;</a>
+<a name="ln1375"> </a>
+<a name="ln1376">	if (oldStatus != MATCH_OK) {</a>
+<a name="ln1377">		if (newStatus != MATCH_OK) {</a>
+<a name="ln1378">			// nothing has changed</a>
+<a name="ln1379">			return;</a>
+<a name="ln1380">		}</a>
+<a name="ln1381">		entryCreated = true;</a>
+<a name="ln1382">	} else if (newStatus != MATCH_OK) {</a>
+<a name="ln1383">		// entry got removed</a>
+<a name="ln1384">		entryCreated = false;</a>
+<a name="ln1385">	} else if ((fFlags &amp; B_ATTR_CHANGE_NOTIFICATION) != 0) {</a>
+<a name="ln1386">		// The entry stays in the query</a>
+<a name="ln1387">		stillInQuery = true;</a>
+<a name="ln1388">	} else</a>
+<a name="ln1389">		return;</a>
+<a name="ln1390"> </a>
+<a name="ln1391">	// we may need to get the name of the inode</a>
+<a name="ln1392"> </a>
+<a name="ln1393">	char nameBuffer[B_FILE_NAME_LENGTH];</a>
+<a name="ln1394">	const char* name;</a>
+<a name="ln1395"> </a>
+<a name="ln1396">	if (strcmp(attribute, &quot;name&quot;)) {</a>
+<a name="ln1397">		if (inode-&gt;GetName(nameBuffer) != B_OK)</a>
+<a name="ln1398">			nameBuffer[0] = '\0';</a>
+<a name="ln1399">		name = nameBuffer;</a>
+<a name="ln1400">	} else {</a>
+<a name="ln1401">		// a shortcut to prevent having to scan the attribute section</a>
+<a name="ln1402">		name = (const char*)newKey;</a>
+<a name="ln1403">	}</a>
+<a name="ln1404"> </a>
+<a name="ln1405">	// notify query listeners</a>
+<a name="ln1406"> </a>
+<a name="ln1407">	if (stillInQuery) {</a>
+<a name="ln1408">		notify_query_attr_changed(fPort, fToken, fVolume-&gt;ID(),</a>
+<a name="ln1409">			fVolume-&gt;ToVnode(inode-&gt;Parent()), name, inode-&gt;ID());</a>
+<a name="ln1410">	} else if (entryCreated) {</a>
+<a name="ln1411">		notify_query_entry_created(fPort, fToken, fVolume-&gt;ID(),</a>
+<a name="ln1412">			fVolume-&gt;ToVnode(inode-&gt;Parent()), name, inode-&gt;ID());</a>
+<a name="ln1413">	} else {</a>
+<a name="ln1414">		notify_query_entry_removed(fPort, fToken, fVolume-&gt;ID(),</a>
+<a name="ln1415">			fVolume-&gt;ToVnode(inode-&gt;Parent()), name, inode-&gt;ID());</a>
+<a name="ln1416">	}</a>
+<a name="ln1417">}</a>
+<a name="ln1418"> </a>
+<a name="ln1419"> </a>
+<a name="ln1420">void</a>
+<a name="ln1421">Query::LiveUpdateRenameMove(Inode* inode, ino_t oldDirectoryID,</a>
+<a name="ln1422">	const char* oldName, size_t oldLength, ino_t newDirectoryID,</a>
+<a name="ln1423">	const char* newName, size_t newLength)</a>
+<a name="ln1424">{</a>
+<a name="ln1425">	if (fPort &lt; 0 || fExpression == NULL)</a>
+<a name="ln1426">		return;</a>
+<a name="ln1427"> </a>
+<a name="ln1428">	// TODO: check if the attribute is part of the query at all...</a>
+<a name="ln1429"> </a>
+<a name="ln1430">	status_t oldStatus = fExpression-&gt;Root()-&gt;Match(inode, &quot;name&quot;,</a>
+<a name="ln1431">		B_STRING_TYPE, (const uint8*)oldName, oldLength);</a>
+<a name="ln1432">	status_t newStatus = fExpression-&gt;Root()-&gt;Match(inode, &quot;name&quot;,</a>
+<a name="ln1433">		B_STRING_TYPE, (const uint8*)newName, newLength);</a>
+<a name="ln1434"> </a>
+<a name="ln1435">	if (oldStatus != MATCH_OK || oldStatus != newStatus)</a>
+<a name="ln1436">		return;</a>
+<a name="ln1437"> </a>
+<a name="ln1438">	// The entry stays in the query, notify query listeners about the rename</a>
+<a name="ln1439">	// or move</a>
+<a name="ln1440"> </a>
+<a name="ln1441">	notify_query_entry_removed(fPort, fToken, fVolume-&gt;ID(),</a>
+<a name="ln1442">		oldDirectoryID, oldName, inode-&gt;ID());</a>
+<a name="ln1443"> </a>
+<a name="ln1444">	notify_query_entry_created(fPort, fToken, fVolume-&gt;ID(),</a>
+<a name="ln1445">		newDirectoryID, newName, inode-&gt;ID());</a>
+<a name="ln1446">}</a>
+
+</code></pre>
+<div class="balloon" rel="672"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="616"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

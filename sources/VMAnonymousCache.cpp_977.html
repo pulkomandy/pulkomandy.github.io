@@ -1,0 +1,1697 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>VMAnonymousCache.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2008, Zhao Shuai, upczhsh@163.com.</a>
+<a name="ln3"> * Copyright 2008-2011, Ingo Weinhold, ingo_weinhold@gmx.de.</a>
+<a name="ln4"> * Copyright 2002-2009, Axel Dörfler, axeld@pinc-software.de.</a>
+<a name="ln5"> * Distributed under the terms of the MIT License.</a>
+<a name="ln6"> *</a>
+<a name="ln7"> * Copyright 2001-2002, Travis Geiselbrecht. All rights reserved.</a>
+<a name="ln8"> * Distributed under the terms of the NewOS License.</a>
+<a name="ln9"> *</a>
+<a name="ln10"> * Copyright 2011-2012 Haiku, Inc. All rights reserved.</a>
+<a name="ln11"> * Distributed under the terms of the MIT License.</a>
+<a name="ln12"> *</a>
+<a name="ln13"> * Authors:</a>
+<a name="ln14"> *		Hamish Morrison, hamish@lavabit.com</a>
+<a name="ln15"> *		Alexander von Gluck IV, kallisti5@unixzen.com</a>
+<a name="ln16"> */</a>
+<a name="ln17"> </a>
+<a name="ln18"> </a>
+<a name="ln19">#include &quot;VMAnonymousCache.h&quot;</a>
+<a name="ln20"> </a>
+<a name="ln21">#include &lt;errno.h&gt;</a>
+<a name="ln22">#include &lt;fcntl.h&gt;</a>
+<a name="ln23">#include &lt;stdlib.h&gt;</a>
+<a name="ln24">#include &lt;string.h&gt;</a>
+<a name="ln25">#include &lt;unistd.h&gt;</a>
+<a name="ln26"> </a>
+<a name="ln27">#include &lt;FindDirectory.h&gt;</a>
+<a name="ln28">#include &lt;KernelExport.h&gt;</a>
+<a name="ln29">#include &lt;NodeMonitor.h&gt;</a>
+<a name="ln30"> </a>
+<a name="ln31">#include &lt;arch_config.h&gt;</a>
+<a name="ln32">#include &lt;boot_device.h&gt;</a>
+<a name="ln33">#include &lt;disk_device_manager/KDiskDevice.h&gt;</a>
+<a name="ln34">#include &lt;disk_device_manager/KDiskDeviceManager.h&gt;</a>
+<a name="ln35">#include &lt;disk_device_manager/KDiskSystem.h&gt;</a>
+<a name="ln36">#include &lt;disk_device_manager/KPartitionVisitor.h&gt;</a>
+<a name="ln37">#include &lt;driver_settings.h&gt;</a>
+<a name="ln38">#include &lt;fs/fd.h&gt;</a>
+<a name="ln39">#include &lt;fs/KPath.h&gt;</a>
+<a name="ln40">#include &lt;fs_info.h&gt;</a>
+<a name="ln41">#include &lt;fs_interface.h&gt;</a>
+<a name="ln42">#include &lt;heap.h&gt;</a>
+<a name="ln43">#include &lt;kernel_daemon.h&gt;</a>
+<a name="ln44">#include &lt;slab/Slab.h&gt;</a>
+<a name="ln45">#include &lt;syscalls.h&gt;</a>
+<a name="ln46">#include &lt;system_info.h&gt;</a>
+<a name="ln47">#include &lt;tracing.h&gt;</a>
+<a name="ln48">#include &lt;util/AutoLock.h&gt;</a>
+<a name="ln49">#include &lt;util/DoublyLinkedList.h&gt;</a>
+<a name="ln50">#include &lt;util/OpenHashTable.h&gt;</a>
+<a name="ln51">#include &lt;util/RadixBitmap.h&gt;</a>
+<a name="ln52">#include &lt;vfs.h&gt;</a>
+<a name="ln53">#include &lt;vm/vm.h&gt;</a>
+<a name="ln54">#include &lt;vm/vm_page.h&gt;</a>
+<a name="ln55">#include &lt;vm/vm_priv.h&gt;</a>
+<a name="ln56">#include &lt;vm/VMAddressSpace.h&gt;</a>
+<a name="ln57"> </a>
+<a name="ln58">#include &quot;IORequest.h&quot;</a>
+<a name="ln59">#include &quot;VMUtils.h&quot;</a>
+<a name="ln60"> </a>
+<a name="ln61"> </a>
+<a name="ln62">#if	ENABLE_SWAP_SUPPORT</a>
+<a name="ln63"> </a>
+<a name="ln64">//#define TRACE_VM_ANONYMOUS_CACHE</a>
+<a name="ln65">#ifdef TRACE_VM_ANONYMOUS_CACHE</a>
+<a name="ln66">#	define TRACE(x...) dprintf(x)</a>
+<a name="ln67">#else</a>
+<a name="ln68">#	define TRACE(x...) do { } while (false)</a>
+<a name="ln69">#endif</a>
+<a name="ln70"> </a>
+<a name="ln71"> </a>
+<a name="ln72">// number of free swap blocks the object cache shall minimally have</a>
+<a name="ln73">#define MIN_SWAP_BLOCK_RESERVE	4096</a>
+<a name="ln74"> </a>
+<a name="ln75">// interval the has resizer is triggered (in 0.1s)</a>
+<a name="ln76">#define SWAP_HASH_RESIZE_INTERVAL	5</a>
+<a name="ln77"> </a>
+<a name="ln78">#define INITIAL_SWAP_HASH_SIZE		1024</a>
+<a name="ln79"> </a>
+<a name="ln80">#define SWAP_SLOT_NONE	RADIX_SLOT_NONE</a>
+<a name="ln81"> </a>
+<a name="ln82">#define SWAP_BLOCK_PAGES 32</a>
+<a name="ln83">#define SWAP_BLOCK_SHIFT 5		/* 1 &lt;&lt; SWAP_BLOCK_SHIFT == SWAP_BLOCK_PAGES */</a>
+<a name="ln84">#define SWAP_BLOCK_MASK  (SWAP_BLOCK_PAGES - 1)</a>
+<a name="ln85"> </a>
+<a name="ln86"> </a>
+<a name="ln87">static const char* const kDefaultSwapPath = &quot;/var/swap&quot;;</a>
+<a name="ln88"> </a>
+<a name="ln89">struct swap_file : DoublyLinkedListLinkImpl&lt;swap_file&gt; {</a>
+<a name="ln90">	int				fd;</a>
+<a name="ln91">	struct vnode*	vnode;</a>
+<a name="ln92">	void*			cookie;</a>
+<a name="ln93">	swap_addr_t		first_slot;</a>
+<a name="ln94">	swap_addr_t		last_slot;</a>
+<a name="ln95">	radix_bitmap*	bmp;</a>
+<a name="ln96">};</a>
+<a name="ln97"> </a>
+<a name="ln98">struct swap_hash_key {</a>
+<a name="ln99">	VMAnonymousCache	*cache;</a>
+<a name="ln100">	off_t				page_index;  // page index in the cache</a>
+<a name="ln101">};</a>
+<a name="ln102"> </a>
+<a name="ln103">// Each swap block contains swap address information for</a>
+<a name="ln104">// SWAP_BLOCK_PAGES continuous pages from the same cache</a>
+<a name="ln105">struct swap_block {</a>
+<a name="ln106">	swap_block*		hash_link;</a>
+<a name="ln107">	swap_hash_key	key;</a>
+<a name="ln108">	uint32			used;</a>
+<a name="ln109">	swap_addr_t		swap_slots[SWAP_BLOCK_PAGES];</a>
+<a name="ln110">};</a>
+<a name="ln111"> </a>
+<a name="ln112">struct SwapHashTableDefinition {</a>
+<a name="ln113">	typedef swap_hash_key KeyType;</a>
+<a name="ln114">	typedef swap_block ValueType;</a>
+<a name="ln115"> </a>
+<a name="ln116">	SwapHashTableDefinition() {}</a>
+<a name="ln117"> </a>
+<a name="ln118">	size_t HashKey(const swap_hash_key&amp; key) const</a>
+<a name="ln119">	{</a>
+<a name="ln120">		off_t blockIndex = key.page_index &gt;&gt; SWAP_BLOCK_SHIFT;</a>
+<a name="ln121">		VMAnonymousCache* cache = key.cache;</a>
+<a name="ln122">		return blockIndex ^ (size_t)(int*)cache;</a>
+<a name="ln123">	}</a>
+<a name="ln124"> </a>
+<a name="ln125">	size_t Hash(const swap_block* value) const</a>
+<a name="ln126">	{</a>
+<a name="ln127">		return HashKey(value-&gt;key);</a>
+<a name="ln128">	}</a>
+<a name="ln129"> </a>
+<a name="ln130">	bool Compare(const swap_hash_key&amp; key, const swap_block* value) const</a>
+<a name="ln131">	{</a>
+<a name="ln132">		return (key.page_index &amp; ~(off_t)SWAP_BLOCK_MASK)</a>
+<a name="ln133">				== (value-&gt;key.page_index &amp; ~(off_t)SWAP_BLOCK_MASK)</a>
+<a name="ln134">			&amp;&amp; key.cache == value-&gt;key.cache;</a>
+<a name="ln135">	}</a>
+<a name="ln136"> </a>
+<a name="ln137">	swap_block*&amp; GetLink(swap_block* value) const</a>
+<a name="ln138">	{</a>
+<a name="ln139">		return value-&gt;hash_link;</a>
+<a name="ln140">	}</a>
+<a name="ln141">};</a>
+<a name="ln142"> </a>
+<a name="ln143">typedef BOpenHashTable&lt;SwapHashTableDefinition&gt; SwapHashTable;</a>
+<a name="ln144">typedef DoublyLinkedList&lt;swap_file&gt; SwapFileList;</a>
+<a name="ln145"> </a>
+<a name="ln146">static SwapHashTable sSwapHashTable;</a>
+<a name="ln147">static rw_lock sSwapHashLock;</a>
+<a name="ln148"> </a>
+<a name="ln149">static SwapFileList sSwapFileList;</a>
+<a name="ln150">static mutex sSwapFileListLock;</a>
+<a name="ln151">static swap_file* sSwapFileAlloc = NULL; // allocate from here</a>
+<a name="ln152">static uint32 sSwapFileCount = 0;</a>
+<a name="ln153"> </a>
+<a name="ln154">static off_t sAvailSwapSpace = 0;</a>
+<a name="ln155">static mutex sAvailSwapSpaceLock;</a>
+<a name="ln156"> </a>
+<a name="ln157">static object_cache* sSwapBlockCache;</a>
+<a name="ln158"> </a>
+<a name="ln159"> </a>
+<a name="ln160">#if SWAP_TRACING</a>
+<a name="ln161">namespace SwapTracing {</a>
+<a name="ln162"> </a>
+<a name="ln163">class SwapTraceEntry : public AbstractTraceEntry {</a>
+<a name="ln164">public:</a>
+<a name="ln165">	SwapTraceEntry(VMAnonymousCache* cache)</a>
+<a name="ln166">		:</a>
+<a name="ln167">		fCache(cache)</a>
+<a name="ln168">	{</a>
+<a name="ln169">	}</a>
+<a name="ln170"> </a>
+<a name="ln171">protected:</a>
+<a name="ln172">	VMAnonymousCache*	fCache;</a>
+<a name="ln173">};</a>
+<a name="ln174"> </a>
+<a name="ln175"> </a>
+<a name="ln176">class ReadPage : public SwapTraceEntry {</a>
+<a name="ln177">public:</a>
+<a name="ln178">	ReadPage(VMAnonymousCache* cache, page_num_t pageIndex,</a>
+<a name="ln179">		swap_addr_t swapSlotIndex)</a>
+<a name="ln180">		:</a>
+<a name="ln181">		SwapTraceEntry(cache),</a>
+<a name="ln182">		fPageIndex(pageIndex),</a>
+<a name="ln183">		fSwapSlotIndex(swapSlotIndex)</a>
+<a name="ln184">	{</a>
+<a name="ln185">		Initialized();</a>
+<a name="ln186">	}</a>
+<a name="ln187"> </a>
+<a name="ln188">	virtual void AddDump(TraceOutput&amp; out)</a>
+<a name="ln189">	{</a>
+<a name="ln190">		out.Print(&quot;swap read:  cache %p, page index: %lu &lt;- swap slot: %lu&quot;,</a>
+<a name="ln191">			fCache, fPageIndex, fSwapSlotIndex);</a>
+<a name="ln192">	}</a>
+<a name="ln193"> </a>
+<a name="ln194">private:</a>
+<a name="ln195">	page_num_t		fPageIndex;</a>
+<a name="ln196">	swap_addr_t		fSwapSlotIndex;</a>
+<a name="ln197">};</a>
+<a name="ln198"> </a>
+<a name="ln199"> </a>
+<a name="ln200">class WritePage : public SwapTraceEntry {</a>
+<a name="ln201">public:</a>
+<a name="ln202">	WritePage(VMAnonymousCache* cache, page_num_t pageIndex,</a>
+<a name="ln203">		swap_addr_t swapSlotIndex)</a>
+<a name="ln204">		:</a>
+<a name="ln205">		SwapTraceEntry(cache),</a>
+<a name="ln206">		fPageIndex(pageIndex),</a>
+<a name="ln207">		fSwapSlotIndex(swapSlotIndex)</a>
+<a name="ln208">	{</a>
+<a name="ln209">		Initialized();</a>
+<a name="ln210">	}</a>
+<a name="ln211"> </a>
+<a name="ln212">	virtual void AddDump(TraceOutput&amp; out)</a>
+<a name="ln213">	{</a>
+<a name="ln214">		out.Print(&quot;swap write: cache %p, page index: %lu -&gt; swap slot: %lu&quot;,</a>
+<a name="ln215">			fCache, fPageIndex, fSwapSlotIndex);</a>
+<a name="ln216">	}</a>
+<a name="ln217"> </a>
+<a name="ln218">private:</a>
+<a name="ln219">	page_num_t		fPageIndex;</a>
+<a name="ln220">	swap_addr_t		fSwapSlotIndex;</a>
+<a name="ln221">};</a>
+<a name="ln222"> </a>
+<a name="ln223">}	// namespace SwapTracing</a>
+<a name="ln224"> </a>
+<a name="ln225">#	define T(x) new(std::nothrow) SwapTracing::x;</a>
+<a name="ln226">#else</a>
+<a name="ln227">#	define T(x) ;</a>
+<a name="ln228">#endif</a>
+<a name="ln229"> </a>
+<a name="ln230"> </a>
+<a name="ln231">static int</a>
+<a name="ln232">dump_swap_info(int argc, char** argv)</a>
+<a name="ln233">{</a>
+<a name="ln234">	swap_addr_t totalSwapPages = 0;</a>
+<a name="ln235">	swap_addr_t freeSwapPages = 0;</a>
+<a name="ln236"> </a>
+<a name="ln237">	kprintf(&quot;swap files:\n&quot;);</a>
+<a name="ln238"> </a>
+<a name="ln239">	for (SwapFileList::Iterator it = sSwapFileList.GetIterator();</a>
+<a name="ln240">		swap_file* file = it.Next();) {</a>
+<a name="ln241">		swap_addr_t total = file-&gt;last_slot - file-&gt;first_slot;</a>
+<a name="ln242">		kprintf(&quot;  vnode: %p, pages: total: %&quot; B_PRIu32 &quot;, free: %&quot; B_PRIu32</a>
+<a name="ln243">			&quot;\n&quot;, file-&gt;vnode, total, file-&gt;bmp-&gt;free_slots);</a>
+<a name="ln244"> </a>
+<a name="ln245">		totalSwapPages += total;</a>
+<a name="ln246">		freeSwapPages += file-&gt;bmp-&gt;free_slots;</a>
+<a name="ln247">	}</a>
+<a name="ln248"> </a>
+<a name="ln249">	kprintf(&quot;\n&quot;);</a>
+<a name="ln250">	kprintf(&quot;swap space in pages:\n&quot;);</a>
+<a name="ln251">	kprintf(&quot;total:     %9&quot; B_PRIu32 &quot;\n&quot;, totalSwapPages);</a>
+<a name="ln252">	kprintf(&quot;available: %9&quot; B_PRIdOFF &quot;\n&quot;, sAvailSwapSpace / B_PAGE_SIZE);</a>
+<a name="ln253">	kprintf(&quot;reserved:  %9&quot; B_PRIdOFF &quot;\n&quot;,</a>
+<a name="ln254">		totalSwapPages - sAvailSwapSpace / B_PAGE_SIZE);</a>
+<a name="ln255">	kprintf(&quot;used:      %9&quot; B_PRIu32 &quot;\n&quot;, totalSwapPages - freeSwapPages);</a>
+<a name="ln256">	kprintf(&quot;free:      %9&quot; B_PRIu32 &quot;\n&quot;, freeSwapPages);</a>
+<a name="ln257"> </a>
+<a name="ln258">	return 0;</a>
+<a name="ln259">}</a>
+<a name="ln260"> </a>
+<a name="ln261"> </a>
+<a name="ln262">static swap_addr_t</a>
+<a name="ln263">swap_slot_alloc(uint32 count)</a>
+<a name="ln264">{</a>
+<a name="ln265">	mutex_lock(&amp;sSwapFileListLock);</a>
+<a name="ln266"> </a>
+<a name="ln267">	if (sSwapFileList.IsEmpty()) {</a>
+<a name="ln268">		mutex_unlock(&amp;sSwapFileListLock);</a>
+<a name="ln269">		panic(&quot;swap_slot_alloc(): no swap file in the system\n&quot;);</a>
+<a name="ln270">		return SWAP_SLOT_NONE;</a>
+<a name="ln271">	}</a>
+<a name="ln272"> </a>
+<a name="ln273">	// since radix bitmap could not handle more than 32 pages, we return</a>
+<a name="ln274">	// SWAP_SLOT_NONE, this forces Write() adjust allocation amount</a>
+<a name="ln275">	if (count &gt; BITMAP_RADIX) {</a>
+<a name="ln276">		mutex_unlock(&amp;sSwapFileListLock);</a>
+<a name="ln277">		return SWAP_SLOT_NONE;</a>
+<a name="ln278">	}</a>
+<a name="ln279"> </a>
+<a name="ln280">	swap_addr_t j, addr = SWAP_SLOT_NONE;</a>
+<a name="ln281">	for (j = 0; j &lt; sSwapFileCount; j++) {</a>
+<a name="ln282">		if (sSwapFileAlloc == NULL)</a>
+<a name="ln283">			sSwapFileAlloc = sSwapFileList.First();</a>
+<a name="ln284"> </a>
+<a name="ln285">		addr = radix_bitmap_alloc(sSwapFileAlloc-&gt;bmp, count);</a>
+<a name="ln286">		if (addr != SWAP_SLOT_NONE) {</a>
+<a name="ln287">			addr += sSwapFileAlloc-&gt;first_slot;</a>
+<a name="ln288">			break;</a>
+<a name="ln289">		}</a>
+<a name="ln290"> </a>
+<a name="ln291">		// this swap_file is full, find another</a>
+<a name="ln292">		sSwapFileAlloc = sSwapFileList.GetNext(sSwapFileAlloc);</a>
+<a name="ln293">	}</a>
+<a name="ln294"> </a>
+<a name="ln295">	if (j == sSwapFileCount) {</a>
+<a name="ln296">		mutex_unlock(&amp;sSwapFileListLock);</a>
+<a name="ln297">		panic(&quot;swap_slot_alloc: swap space exhausted!\n&quot;);</a>
+<a name="ln298">		return SWAP_SLOT_NONE;</a>
+<a name="ln299">	}</a>
+<a name="ln300"> </a>
+<a name="ln301">	// if this swap file has used more than 90% percent of its space</a>
+<a name="ln302">	// switch to another</a>
+<a name="ln303">	if (sSwapFileAlloc-&gt;bmp-&gt;free_slots</a>
+<a name="ln304">		&lt; (sSwapFileAlloc-&gt;last_slot - sSwapFileAlloc-&gt;first_slot) / 10) {</a>
+<a name="ln305">		sSwapFileAlloc = sSwapFileList.GetNext(sSwapFileAlloc);</a>
+<a name="ln306">	}</a>
+<a name="ln307"> </a>
+<a name="ln308">	mutex_unlock(&amp;sSwapFileListLock);</a>
+<a name="ln309"> </a>
+<a name="ln310">	return addr;</a>
+<a name="ln311">}</a>
+<a name="ln312"> </a>
+<a name="ln313"> </a>
+<a name="ln314">static swap_file*</a>
+<a name="ln315">find_swap_file(swap_addr_t slotIndex)</a>
+<a name="ln316">{</a>
+<a name="ln317">	for (SwapFileList::Iterator it = sSwapFileList.GetIterator();</a>
+<a name="ln318">		swap_file* swapFile = it.Next();) {</a>
+<a name="ln319">		if (slotIndex &gt;= swapFile-&gt;first_slot</a>
+<a name="ln320">			&amp;&amp; slotIndex &lt; swapFile-&gt;last_slot) {</a>
+<a name="ln321">			return swapFile;</a>
+<a name="ln322">		}</a>
+<a name="ln323">	}</a>
+<a name="ln324"> </a>
+<a name="ln325">	panic(&quot;find_swap_file(): can't find swap file for slot %&quot; B_PRIu32 &quot;\n&quot;,</a>
+<a name="ln326">		slotIndex);</a>
+<a name="ln327">	return NULL;</a>
+<a name="ln328">}</a>
+<a name="ln329"> </a>
+<a name="ln330"> </a>
+<a name="ln331">static void</a>
+<a name="ln332">swap_slot_dealloc(swap_addr_t slotIndex, uint32 count)</a>
+<a name="ln333">{</a>
+<a name="ln334">	if (slotIndex == SWAP_SLOT_NONE)</a>
+<a name="ln335">		return;</a>
+<a name="ln336"> </a>
+<a name="ln337">	mutex_lock(&amp;sSwapFileListLock);</a>
+<a name="ln338">	swap_file* swapFile = find_swap_file(slotIndex);</a>
+<a name="ln339">	slotIndex -= swapFile-&gt;first_slot;</a>
+<a name="ln340">	radix_bitmap_dealloc(swapFile-&gt;bmp, slotIndex, count);</a>
+<a name="ln341">	mutex_unlock(&amp;sSwapFileListLock);</a>
+<a name="ln342">}</a>
+<a name="ln343"> </a>
+<a name="ln344"> </a>
+<a name="ln345">static off_t</a>
+<a name="ln346">swap_space_reserve(off_t amount)</a>
+<a name="ln347">{</a>
+<a name="ln348">	mutex_lock(&amp;sAvailSwapSpaceLock);</a>
+<a name="ln349">	if (sAvailSwapSpace &gt;= amount)</a>
+<a name="ln350">		sAvailSwapSpace -= amount;</a>
+<a name="ln351">	else {</a>
+<a name="ln352">		amount = sAvailSwapSpace;</a>
+<a name="ln353">		sAvailSwapSpace = 0;</a>
+<a name="ln354">	}</a>
+<a name="ln355">	mutex_unlock(&amp;sAvailSwapSpaceLock);</a>
+<a name="ln356"> </a>
+<a name="ln357">	return amount;</a>
+<a name="ln358">}</a>
+<a name="ln359"> </a>
+<a name="ln360"> </a>
+<a name="ln361">static void</a>
+<a name="ln362">swap_space_unreserve(off_t amount)</a>
+<a name="ln363">{</a>
+<a name="ln364">	mutex_lock(&amp;sAvailSwapSpaceLock);</a>
+<a name="ln365">	sAvailSwapSpace += amount;</a>
+<a name="ln366">	mutex_unlock(&amp;sAvailSwapSpaceLock);</a>
+<a name="ln367">}</a>
+<a name="ln368"> </a>
+<a name="ln369"> </a>
+<a name="ln370">static void</a>
+<a name="ln371">swap_hash_resizer(void*, int)</a>
+<a name="ln372">{</a>
+<a name="ln373">	WriteLocker locker(sSwapHashLock);</a>
+<a name="ln374"> </a>
+<a name="ln375">	size_t size;</a>
+<a name="ln376">	void* allocation;</a>
+<a name="ln377"> </a>
+<a name="ln378">	do {</a>
+<a name="ln379">		size = sSwapHashTable.ResizeNeeded();</a>
+<a name="ln380">		if (size == 0)</a>
+<a name="ln381">			return;</a>
+<a name="ln382"> </a>
+<a name="ln383">		locker.Unlock();</a>
+<a name="ln384"> </a>
+<a name="ln385">		allocation = malloc(size);</a>
+<a name="ln386">		if (allocation == NULL)</a>
+<a name="ln387">			return;</a>
+<a name="ln388"> </a>
+<a name="ln389">		locker.Lock();</a>
+<a name="ln390"> </a>
+<a name="ln391">	} while (!sSwapHashTable.Resize(allocation, size));</a>
+<a name="ln392">}</a>
+<a name="ln393"> </a>
+<a name="ln394"> </a>
+<a name="ln395">// #pragma mark -</a>
+<a name="ln396"> </a>
+<a name="ln397"> </a>
+<a name="ln398">class VMAnonymousCache::WriteCallback : public StackableAsyncIOCallback {</a>
+<a name="ln399">public:</a>
+<a name="ln400">	WriteCallback(VMAnonymousCache* cache, AsyncIOCallback* callback)</a>
+<a name="ln401">		:</a>
+<a name="ln402">		StackableAsyncIOCallback(callback),</a>
+<a name="ln403">		fCache(cache)</a>
+<a name="ln404">	{</a>
+<a name="ln405">	}</a>
+<a name="ln406"> </a>
+<a name="ln407">	void SetTo(page_num_t pageIndex, swap_addr_t slotIndex, bool newSlot)</a>
+<a name="ln408">	{</a>
+<a name="ln409">		fPageIndex = pageIndex;</a>
+<a name="ln410">		fSlotIndex = slotIndex;</a>
+<a name="ln411">		fNewSlot = newSlot;</a>
+<a name="ln412">	}</a>
+<a name="ln413"> </a>
+<a name="ln414">	virtual void IOFinished(status_t status, bool partialTransfer,</a>
+<a name="ln415">		generic_size_t bytesTransferred)</a>
+<a name="ln416">	{</a>
+<a name="ln417">		if (fNewSlot) {</a>
+<a name="ln418">			if (status == B_OK) {</a>
+<a name="ln419">				fCache-&gt;_SwapBlockBuild(fPageIndex, fSlotIndex, 1);</a>
+<a name="ln420">			} else {</a>
+<a name="ln421">				AutoLocker&lt;VMCache&gt; locker(fCache);</a>
+<a name="ln422">				fCache-&gt;fAllocatedSwapSize -= B_PAGE_SIZE;</a>
+<a name="ln423">				locker.Unlock();</a>
+<a name="ln424"> </a>
+<a name="ln425">				swap_slot_dealloc(fSlotIndex, 1);</a>
+<a name="ln426">			}</a>
+<a name="ln427">		}</a>
+<a name="ln428"> </a>
+<a name="ln429">		fNextCallback-&gt;IOFinished(status, partialTransfer, bytesTransferred);</a>
+<a name="ln430"> </a>
+<a name="ln431">		delete this;</a>
+<a name="ln432">	}</a>
+<a name="ln433"> </a>
+<a name="ln434">private:</a>
+<a name="ln435">	VMAnonymousCache*	fCache;</a>
+<a name="ln436">	page_num_t			fPageIndex;</a>
+<a name="ln437">	swap_addr_t			fSlotIndex;</a>
+<a name="ln438">	bool				fNewSlot;</a>
+<a name="ln439">};</a>
+<a name="ln440"> </a>
+<a name="ln441"> </a>
+<a name="ln442">// #pragma mark -</a>
+<a name="ln443"> </a>
+<a name="ln444"> </a>
+<a name="ln445">VMAnonymousCache::~VMAnonymousCache()</a>
+<a name="ln446">{</a>
+<a name="ln447">	// free allocated swap space and swap block</a>
+<a name="ln448">	for (off_t offset = virtual_base, toFree = fAllocatedSwapSize;</a>
+<a name="ln449">		offset &lt; virtual_end &amp;&amp; toFree &gt; 0; offset += B_PAGE_SIZE) {</a>
+<a name="ln450">		swap_addr_t slotIndex = _SwapBlockGetAddress(offset &gt;&gt; PAGE_SHIFT);</a>
+<a name="ln451">		if (slotIndex == SWAP_SLOT_NONE)</a>
+<a name="ln452">			continue;</a>
+<a name="ln453"> </a>
+<a name="ln454">		swap_slot_dealloc(slotIndex, 1);</a>
+<a name="ln455">		_SwapBlockFree(offset &gt;&gt; PAGE_SHIFT, 1);</a>
+<a name="ln456">		toFree -= B_PAGE_SIZE;</a>
+<a name="ln457">	}</a>
+<a name="ln458"> </a>
+<a name="ln459">	swap_space_unreserve(fCommittedSwapSize);</a>
+<a name="ln460">	if (committed_size &gt; fCommittedSwapSize)</a>
+<a name="ln461">		vm_unreserve_memory(committed_size - fCommittedSwapSize);</a>
+<a name="ln462">}</a>
+<a name="ln463"> </a>
+<a name="ln464"> </a>
+<a name="ln465">status_t</a>
+<a name="ln466">VMAnonymousCache::Init(bool canOvercommit, int32 numPrecommittedPages,</a>
+<a name="ln467">	int32 numGuardPages, uint32 allocationFlags)</a>
+<a name="ln468">{</a>
+<a name="ln469">	TRACE(&quot;%p-&gt;VMAnonymousCache::Init(canOvercommit = %s, &quot;</a>
+<a name="ln470">		&quot;numPrecommittedPages = %&quot; B_PRId32 &quot;, numGuardPages = %&quot; B_PRId32</a>
+<a name="ln471">		&quot;)\n&quot;, this, canOvercommit ? &quot;yes&quot; : &quot;no&quot;, numPrecommittedPages,</a>
+<a name="ln472">		numGuardPages);</a>
+<a name="ln473"> </a>
+<a name="ln474">	status_t error = VMCache::Init(CACHE_TYPE_RAM, allocationFlags);</a>
+<a name="ln475">	if (error != B_OK)</a>
+<a name="ln476">		return error;</a>
+<a name="ln477"> </a>
+<a name="ln478">	fCanOvercommit = canOvercommit;</a>
+<a name="ln479">	fHasPrecommitted = false;</a>
+<a name="ln480">	fPrecommittedPages = min_c(numPrecommittedPages, 255);</a>
+<a name="ln481">	fGuardedSize = numGuardPages * B_PAGE_SIZE;</a>
+<a name="ln482">	fCommittedSwapSize = 0;</a>
+<a name="ln483">	fAllocatedSwapSize = 0;</a>
+<a name="ln484"> </a>
+<a name="ln485">	return B_OK;</a>
+<a name="ln486">}</a>
+<a name="ln487"> </a>
+<a name="ln488"> </a>
+<a name="ln489">status_t</a>
+<a name="ln490">VMAnonymousCache::Resize(off_t newSize, int priority)</a>
+<a name="ln491">{</a>
+<a name="ln492">	// If the cache size shrinks, drop all swap pages beyond the new size.</a>
+<a name="ln493">	if (fAllocatedSwapSize &gt; 0) {</a>
+<a name="ln494">		off_t oldPageCount = (virtual_end + B_PAGE_SIZE - 1) &gt;&gt; PAGE_SHIFT;</a>
+<a name="ln495">		swap_block* swapBlock = NULL;</a>
+<a name="ln496"> </a>
+<a name="ln497">		for (off_t pageIndex = (newSize + B_PAGE_SIZE - 1) &gt;&gt; PAGE_SHIFT;</a>
+<a name="ln498">			pageIndex &lt; oldPageCount &amp;&amp; fAllocatedSwapSize &gt; 0; pageIndex++) {</a>
+<a name="ln499"> </a>
+<a name="ln500">			WriteLocker locker(sSwapHashLock);</a>
+<a name="ln501"> </a>
+<a name="ln502">			// Get the swap slot index for the page.</a>
+<a name="ln503">			swap_addr_t blockIndex = pageIndex &amp; SWAP_BLOCK_MASK;</a>
+<a name="ln504">			if (swapBlock == NULL || blockIndex == 0) {</a>
+<a name="ln505">				swap_hash_key key = { this, pageIndex };</a>
+<a name="ln506">				swapBlock = sSwapHashTable.Lookup(key);</a>
+<a name="ln507"> </a>
+<a name="ln508">				if (swapBlock == NULL) {</a>
+<a name="ln509">					pageIndex = ROUNDUP(pageIndex + 1, SWAP_BLOCK_PAGES);</a>
+<a name="ln510">					continue;</a>
+<a name="ln511">				}</a>
+<a name="ln512">			}</a>
+<a name="ln513"> </a>
+<a name="ln514">			swap_addr_t slotIndex = swapBlock-&gt;swap_slots[blockIndex];</a>
+<a name="ln515">			vm_page* page;</a>
+<a name="ln516">			if (slotIndex != SWAP_SLOT_NONE</a>
+<a name="ln517">				&amp;&amp; ((page = LookupPage((off_t)pageIndex * B_PAGE_SIZE)) == NULL</a>
+<a name="ln518">					|| !page-&gt;busy)) {</a>
+<a name="ln519">					// TODO: We skip (i.e. leak) swap space of busy pages, since</a>
+<a name="ln520">					// there could be I/O going on (paging in/out). Waiting is</a>
+<a name="ln521">					// not an option as 1. unlocking the cache means that new</a>
+<a name="ln522">					// swap pages could be added in a range we've already</a>
+<a name="ln523">					// cleared (since the cache still has the old size) and 2.</a>
+<a name="ln524">					// we'd risk a deadlock in case we come from the file cache</a>
+<a name="ln525">					// and the FS holds the node's write-lock. We should mark</a>
+<a name="ln526">					// the page invalid and let the one responsible clean up.</a>
+<a name="ln527">					// There's just no such mechanism yet.</a>
+<a name="ln528">				swap_slot_dealloc(slotIndex, 1);</a>
+<a name="ln529">				fAllocatedSwapSize -= B_PAGE_SIZE;</a>
+<a name="ln530"> </a>
+<a name="ln531">				swapBlock-&gt;swap_slots[blockIndex] = SWAP_SLOT_NONE;</a>
+<a name="ln532">				if (--swapBlock-&gt;used == 0) {</a>
+<a name="ln533">					// All swap pages have been freed -- we can discard the swap</a>
+<a name="ln534">					// block.</a>
+<a name="ln535">					sSwapHashTable.RemoveUnchecked(swapBlock);</a>
+<a name="ln536">					object_cache_free(sSwapBlockCache, swapBlock,</a>
+<a name="ln537">						CACHE_DONT_WAIT_FOR_MEMORY</a>
+<a name="ln538">							| CACHE_DONT_LOCK_KERNEL_SPACE);</a>
+<a name="ln539">				}</a>
+<a name="ln540">			}</a>
+<a name="ln541">		}</a>
+<a name="ln542">	}</a>
+<a name="ln543"> </a>
+<a name="ln544">	return VMCache::Resize(newSize, priority);</a>
+<a name="ln545">}</a>
+<a name="ln546"> </a>
+<a name="ln547"> </a>
+<a name="ln548">status_t</a>
+<a name="ln549">VMAnonymousCache::Commit(off_t size, int priority)</a>
+<a name="ln550">{</a>
+<a name="ln551">	TRACE(&quot;%p-&gt;VMAnonymousCache::Commit(%&quot; B_PRIdOFF &quot;)\n&quot;, this, size);</a>
+<a name="ln552"> </a>
+<a name="ln553">	// If we can overcommit, we don't commit here, but in Fault(). We always</a>
+<a name="ln554">	// unreserve memory, if we're asked to shrink our commitment, though.</a>
+<a name="ln555">	if (fCanOvercommit &amp;&amp; size &gt; committed_size) {</a>
+<a name="ln556">		if (fHasPrecommitted)</a>
+<a name="ln557">			return B_OK;</a>
+<a name="ln558"> </a>
+<a name="ln559">		// pre-commit some pages to make a later failure less probable</a>
+<a name="ln560">		fHasPrecommitted = true;</a>
+<a name="ln561">		uint32 precommitted = fPrecommittedPages * B_PAGE_SIZE;</a>
+<a name="ln562">		if (size &gt; precommitted)</a>
+<a name="ln563">			size = precommitted;</a>
+<a name="ln564">	}</a>
+<a name="ln565"> </a>
+<a name="ln566">	return _Commit(size, priority);</a>
+<a name="ln567">}</a>
+<a name="ln568"> </a>
+<a name="ln569"> </a>
+<a name="ln570">bool</a>
+<a name="ln571">VMAnonymousCache::HasPage(off_t offset)</a>
+<a name="ln572">{</a>
+<a name="ln573">	if (_SwapBlockGetAddress(offset &gt;&gt; PAGE_SHIFT) != SWAP_SLOT_NONE)</a>
+<a name="ln574">		return true;</a>
+<a name="ln575"> </a>
+<a name="ln576">	return false;</a>
+<a name="ln577">}</a>
+<a name="ln578"> </a>
+<a name="ln579"> </a>
+<a name="ln580">bool</a>
+<a name="ln581">VMAnonymousCache::DebugHasPage(off_t offset)</a>
+<a name="ln582">{</a>
+<a name="ln583">	off_t pageIndex = offset &gt;&gt; PAGE_SHIFT;</a>
+<a name="ln584">	swap_hash_key key = { this, pageIndex };</a>
+<a name="ln585">	swap_block* swap = sSwapHashTable.Lookup(key);</a>
+<a name="ln586">	if (swap == NULL)</a>
+<a name="ln587">		return false;</a>
+<a name="ln588"> </a>
+<a name="ln589">	return swap-&gt;swap_slots[pageIndex &amp; SWAP_BLOCK_MASK] != SWAP_SLOT_NONE;</a>
+<a name="ln590">}</a>
+<a name="ln591"> </a>
+<a name="ln592"> </a>
+<a name="ln593">status_t</a>
+<a name="ln594">VMAnonymousCache::Read(off_t offset, const generic_io_vec* vecs, size_t count,</a>
+<a name="ln595">	uint32 flags, generic_size_t* _numBytes)</a>
+<a name="ln596">{</a>
+<a name="ln597">	off_t pageIndex = offset &gt;&gt; PAGE_SHIFT;</a>
+<a name="ln598"> </a>
+<a name="ln599">	for (uint32 i = 0, j = 0; i &lt; count; i = j) {</a>
+<a name="ln600">		swap_addr_t startSlotIndex = _SwapBlockGetAddress(pageIndex + i);</a>
+<a name="ln601">		for (j = i + 1; j &lt; count; j++) {</a>
+<a name="ln602">			swap_addr_t slotIndex = _SwapBlockGetAddress(pageIndex + j);</a>
+<a name="ln603">			if (slotIndex != startSlotIndex + j - i)</a>
+<a name="ln604">				break;</a>
+<a name="ln605">		}</a>
+<a name="ln606"> </a>
+<a name="ln607">		T(ReadPage(this, pageIndex, startSlotIndex));</a>
+<a name="ln608">			// TODO: Assumes that only one page is read.</a>
+<a name="ln609"> </a>
+<a name="ln610">		swap_file* swapFile = find_swap_file(startSlotIndex);</a>
+<a name="ln611"> </a>
+<a name="ln612">		off_t pos = (off_t)(startSlotIndex - swapFile-&gt;first_slot)</a>
+<a name="ln613">			* B_PAGE_SIZE;</a>
+<a name="ln614"> </a>
+<a name="ln615">		status_t status = vfs_read_pages(swapFile-&gt;vnode, swapFile-&gt;cookie, pos,</a>
+<a name="ln616">			vecs + i, j - i, flags, _numBytes);</a>
+<a name="ln617">		if (status != B_OK)</a>
+<a name="ln618">			return status;</a>
+<a name="ln619">	}</a>
+<a name="ln620"> </a>
+<a name="ln621">	return B_OK;</a>
+<a name="ln622">}</a>
+<a name="ln623"> </a>
+<a name="ln624"> </a>
+<a name="ln625">status_t</a>
+<a name="ln626">VMAnonymousCache::Write(off_t offset, const generic_io_vec* vecs, size_t count,</a>
+<a name="ln627">	uint32 flags, generic_size_t* _numBytes)</a>
+<a name="ln628">{</a>
+<a name="ln629">	off_t pageIndex = offset &gt;&gt; PAGE_SHIFT;</a>
+<a name="ln630"> </a>
+<a name="ln631">	AutoLocker&lt;VMCache&gt; locker(this);</a>
+<a name="ln632"> </a>
+<a name="ln633">	page_num_t totalPages = 0;</a>
+<a name="ln634">	for (uint32 i = 0; i &lt; count; i++) {</a>
+<a name="ln635">		page_num_t pageCount = (vecs[i].length + B_PAGE_SIZE - 1) &gt;&gt; PAGE_SHIFT;</a>
+<a name="ln636">		swap_addr_t slotIndex = _SwapBlockGetAddress(pageIndex + totalPages);</a>
+<a name="ln637">		if (slotIndex != SWAP_SLOT_NONE) {</a>
+<a name="ln638">			swap_slot_dealloc(slotIndex, pageCount);</a>
+<a name="ln639">			_SwapBlockFree(pageIndex + totalPages, pageCount);</a>
+<a name="ln640">			fAllocatedSwapSize -= pageCount * B_PAGE_SIZE;</a>
+<a name="ln641">		}</a>
+<a name="ln642"> </a>
+<a name="ln643">		totalPages += pageCount;</a>
+<a name="ln644">	}</a>
+<a name="ln645"> </a>
+<a name="ln646">	off_t totalSize = totalPages * B_PAGE_SIZE;</a>
+<a name="ln647">	if (fAllocatedSwapSize + totalSize &gt; fCommittedSwapSize)</a>
+<a name="ln648">		return B_ERROR;</a>
+<a name="ln649"> </a>
+<a name="ln650">	fAllocatedSwapSize += totalSize;</a>
+<a name="ln651">	locker.Unlock();</a>
+<a name="ln652"> </a>
+<a name="ln653">	page_num_t pagesLeft = totalPages;</a>
+<a name="ln654">	totalPages = 0;</a>
+<a name="ln655"> </a>
+<a name="ln656">	for (uint32 i = 0; i &lt; count; i++) {</a>
+<a name="ln657">		page_num_t pageCount = (vecs[i].length + B_PAGE_SIZE - 1) &gt;&gt; PAGE_SHIFT;</a>
+<a name="ln658"> </a>
+<a name="ln659">		generic_addr_t vectorBase = vecs[i].base;</a>
+<a name="ln660">		generic_size_t vectorLength = vecs[i].length;</a>
+<a name="ln661">		page_num_t n = pageCount;</a>
+<a name="ln662"> </a>
+<a name="ln663">		for (page_num_t j = 0; j &lt; pageCount; j += n) {</a>
+<a name="ln664">			swap_addr_t slotIndex;</a>
+<a name="ln665">			// try to allocate n slots, if fail, try to allocate n/2</a>
+<a name="ln666">			while ((slotIndex = swap_slot_alloc(n)) == SWAP_SLOT_NONE &amp;&amp; n &gt;= 2)</a>
+<a name="ln667">				n &gt;&gt;= 1;</a>
+<a name="ln668"> </a>
+<a name="ln669">			if (slotIndex == SWAP_SLOT_NONE)</a>
+<a name="ln670">				panic(&quot;VMAnonymousCache::Write(): can't allocate swap space\n&quot;);</a>
+<a name="ln671"> </a>
+<a name="ln672">			T(WritePage(this, pageIndex, slotIndex));</a>
+<a name="ln673">				// TODO: Assumes that only one page is written.</a>
+<a name="ln674"> </a>
+<a name="ln675">			swap_file* swapFile = find_swap_file(slotIndex);</a>
+<a name="ln676"> </a>
+<a name="ln677">			off_t pos = (off_t)(slotIndex - swapFile-&gt;first_slot) * B_PAGE_SIZE;</a>
+<a name="ln678"> </a>
+<a name="ln679">			generic_size_t length = (phys_addr_t)n * B_PAGE_SIZE;</a>
+<a name="ln680">			generic_io_vec vector[1];</a>
+<a name="ln681">			vector-&gt;base = vectorBase;</a>
+<a name="ln682">			vector-&gt;length = length;</a>
+<a name="ln683"> </a>
+<a name="ln684">			status_t status = vfs_write_pages(swapFile-&gt;vnode, swapFile-&gt;cookie,</a>
+<a name="ln685">				pos, vector, 1, flags, &amp;length);</a>
+<a name="ln686">			if (status != B_OK) {</a>
+<a name="ln687">				locker.Lock();</a>
+<a name="ln688">				fAllocatedSwapSize -= (off_t)pagesLeft * B_PAGE_SIZE;</a>
+<a name="ln689">				locker.Unlock();</a>
+<a name="ln690"> </a>
+<a name="ln691">				swap_slot_dealloc(slotIndex, n);</a>
+<a name="ln692">				return status;</a>
+<a name="ln693">			}</a>
+<a name="ln694"> </a>
+<a name="ln695">			_SwapBlockBuild(pageIndex + totalPages, slotIndex, n);</a>
+<a name="ln696">			pagesLeft -= n;</a>
+<a name="ln697"> </a>
+<a name="ln698">			if (n != pageCount) {</a>
+<a name="ln699">				vectorBase = vectorBase + n * B_PAGE_SIZE;</a>
+<a name="ln700">				vectorLength -= n * B_PAGE_SIZE;</a>
+<a name="ln701">			}</a>
+<a name="ln702">		}</a>
+<a name="ln703"> </a>
+<a name="ln704">		totalPages += pageCount;</a>
+<a name="ln705">	}</a>
+<a name="ln706"> </a>
+<a name="ln707">	ASSERT(pagesLeft == 0);</a>
+<a name="ln708">	return B_OK;</a>
+<a name="ln709">}</a>
+<a name="ln710"> </a>
+<a name="ln711"> </a>
+<a name="ln712">status_t</a>
+<a name="ln713">VMAnonymousCache::WriteAsync(off_t offset, const generic_io_vec* vecs,</a>
+<a name="ln714">	size_t count, generic_size_t numBytes, uint32 flags,</a>
+<a name="ln715">	AsyncIOCallback* _callback)</a>
+<a name="ln716">{</a>
+<a name="ln717">	// TODO: Currently this method is only used for single pages. Either make</a>
+<a name="ln718">	// more flexible use of it or change the interface!</a>
+<a name="ln719">	// This implementation relies on the current usage!</a>
+<a name="ln720">	ASSERT(count == 1);</a>
+<a name="ln721">	ASSERT(numBytes &lt;= B_PAGE_SIZE);</a>
+<a name="ln722"> </a>
+<a name="ln723">	page_num_t pageIndex = offset &gt;&gt; PAGE_SHIFT;</a>
+<a name="ln724">	swap_addr_t slotIndex = _SwapBlockGetAddress(pageIndex);</a>
+<a name="ln725">	bool newSlot = slotIndex == SWAP_SLOT_NONE;</a>
+<a name="ln726"> </a>
+<a name="ln727">	// If the page doesn't have any swap space yet, allocate it.</a>
+<a name="ln728">	if (newSlot) {</a>
+<a name="ln729">		AutoLocker&lt;VMCache&gt; locker(this);</a>
+<a name="ln730">		if (fAllocatedSwapSize + B_PAGE_SIZE &gt; fCommittedSwapSize) {</a>
+<a name="ln731">			_callback-&gt;IOFinished(B_ERROR, true, 0);</a>
+<a name="ln732">			return B_ERROR;</a>
+<a name="ln733">		}</a>
+<a name="ln734"> </a>
+<a name="ln735">		fAllocatedSwapSize += B_PAGE_SIZE;</a>
+<a name="ln736"> </a>
+<a name="ln737">		slotIndex = swap_slot_alloc(1);</a>
+<a name="ln738">	}</a>
+<a name="ln739"> </a>
+<a name="ln740">	// create our callback</a>
+<a name="ln741">	WriteCallback* callback = (flags &amp; B_VIP_IO_REQUEST) != 0</a>
+<a name="ln742">		? new(malloc_flags(HEAP_PRIORITY_VIP)) WriteCallback(this, _callback)</a>
+<a name="ln743">		: new(std::nothrow) WriteCallback(this, _callback);</a>
+<a name="ln744">	if (callback == NULL) {</a>
+<a name="ln745">		if (newSlot) {</a>
+<a name="ln746">			AutoLocker&lt;VMCache&gt; locker(this);</a>
+<a name="ln747">			fAllocatedSwapSize -= B_PAGE_SIZE;</a>
+<a name="ln748">			locker.Unlock();</a>
+<a name="ln749"> </a>
+<a name="ln750">			swap_slot_dealloc(slotIndex, 1);</a>
+<a name="ln751">		}</a>
+<a name="ln752">		_callback-&gt;IOFinished(B_NO_MEMORY, true, 0);</a>
+<a name="ln753">		return B_NO_MEMORY;</a>
+<a name="ln754">	}</a>
+<a name="ln755">	// TODO: If the page already had swap space assigned, we don't need an own</a>
+<a name="ln756">	// callback.</a>
+<a name="ln757"> </a>
+<a name="ln758">	callback-&gt;SetTo(pageIndex, slotIndex, newSlot);</a>
+<a name="ln759"> </a>
+<a name="ln760">	T(WritePage(this, pageIndex, slotIndex));</a>
+<a name="ln761"> </a>
+<a name="ln762">	// write the page asynchrounously</a>
+<a name="ln763">	swap_file* swapFile = find_swap_file(slotIndex);</a>
+<a name="ln764">	off_t pos = (off_t)(slotIndex - swapFile-&gt;first_slot) * B_PAGE_SIZE;</a>
+<a name="ln765"> </a>
+<a name="ln766">	return vfs_asynchronous_write_pages(swapFile-&gt;vnode, swapFile-&gt;cookie, pos,</a>
+<a name="ln767">		vecs, 1, numBytes, flags, callback);</a>
+<a name="ln768">}</a>
+<a name="ln769"> </a>
+<a name="ln770"> </a>
+<a name="ln771">bool</a>
+<a name="ln772">VMAnonymousCache::CanWritePage(off_t offset)</a>
+<a name="ln773">{</a>
+<a name="ln774">	// We can write the page, if we have not used all of our committed swap</a>
+<a name="ln775">	// space or the page already has a swap slot assigned.</a>
+<a name="ln776">	return fAllocatedSwapSize &lt; fCommittedSwapSize</a>
+<a name="ln777">		|| _SwapBlockGetAddress(offset &gt;&gt; PAGE_SHIFT) != SWAP_SLOT_NONE;</a>
+<a name="ln778">}</a>
+<a name="ln779"> </a>
+<a name="ln780"> </a>
+<a name="ln781">int32</a>
+<a name="ln782">VMAnonymousCache::MaxPagesPerAsyncWrite() const</a>
+<a name="ln783">{</a>
+<a name="ln784">	return 1;</a>
+<a name="ln785">}</a>
+<a name="ln786"> </a>
+<a name="ln787"> </a>
+<a name="ln788">status_t</a>
+<a name="ln789">VMAnonymousCache::Fault(struct VMAddressSpace* aspace, off_t offset)</a>
+<a name="ln790">{</a>
+<a name="ln791">	if (fGuardedSize &gt; 0) {</a>
+<a name="ln792">		uint32 guardOffset;</a>
+<a name="ln793"> </a>
+<a name="ln794">#ifdef STACK_GROWS_DOWNWARDS</a>
+<a name="ln795">		guardOffset = 0;</a>
+<a name="ln796">#elif defined(STACK_GROWS_UPWARDS)</a>
+<a name="ln797">		guardOffset = virtual_size - fGuardedSize;</a>
+<a name="ln798">#else</a>
+<a name="ln799">#	error Stack direction has not been defined in arch_config.h</a>
+<a name="ln800">#endif</a>
+<a name="ln801">		// report stack fault, guard page hit!</a>
+<a name="ln802">		if (offset &gt;= guardOffset &amp;&amp; offset &lt; guardOffset + fGuardedSize) {</a>
+<a name="ln803">			TRACE((&quot;stack overflow!\n&quot;));</a>
+<a name="ln804">			return B_BAD_ADDRESS;</a>
+<a name="ln805">		}</a>
+<a name="ln806">	}</a>
+<a name="ln807"> </a>
+<a name="ln808">	if (fCanOvercommit &amp;&amp; LookupPage(offset) == NULL &amp;&amp; !HasPage(offset)) {</a>
+<a name="ln809">		if (fPrecommittedPages == 0) {</a>
+<a name="ln810">			// never commit more than needed</a>
+<a name="ln811">			if (committed_size / B_PAGE_SIZE &gt; page_count)</a>
+<a name="ln812">				return B_BAD_HANDLER;</a>
+<a name="ln813"> </a>
+<a name="ln814">			// try to commit additional swap space/memory</a>
+<a name="ln815">			if (swap_space_reserve(B_PAGE_SIZE) == B_PAGE_SIZE) {</a>
+<a name="ln816">				fCommittedSwapSize += B_PAGE_SIZE;</a>
+<a name="ln817">			} else {</a>
+<a name="ln818">				int priority = aspace == VMAddressSpace::Kernel()</a>
+<a name="ln819">					? VM_PRIORITY_SYSTEM : VM_PRIORITY_USER;</a>
+<a name="ln820">				if (vm_try_reserve_memory(B_PAGE_SIZE, priority, 0) != B_OK) {</a>
+<a name="ln821">					dprintf(&quot;%p-&gt;VMAnonymousCache::Fault(): Failed to reserve &quot;</a>
+<a name="ln822">						&quot;%d bytes of RAM.\n&quot;, this, (int)B_PAGE_SIZE);</a>
+<a name="ln823">					return B_NO_MEMORY;</a>
+<a name="ln824">				}</a>
+<a name="ln825">			}</a>
+<a name="ln826"> </a>
+<a name="ln827">			committed_size += B_PAGE_SIZE;</a>
+<a name="ln828">		} else</a>
+<a name="ln829">			fPrecommittedPages--;</a>
+<a name="ln830">	}</a>
+<a name="ln831"> </a>
+<a name="ln832">	// This will cause vm_soft_fault() to handle the fault</a>
+<a name="ln833">	return B_BAD_HANDLER;</a>
+<a name="ln834">}</a>
+<a name="ln835"> </a>
+<a name="ln836"> </a>
+<a name="ln837">void</a>
+<a name="ln838">VMAnonymousCache::Merge(VMCache* _source)</a>
+<a name="ln839">{</a>
+<a name="ln840">	VMAnonymousCache* source = dynamic_cast&lt;VMAnonymousCache*&gt;(_source);</a>
+<a name="ln841">	if (source == NULL) {</a>
+<a name="ln842">		panic(&quot;VMAnonymousCache::MergeStore(): merge with incompatible cache &quot;</a>
+<a name="ln843">			&quot;%p requested&quot;, _source);</a>
+<a name="ln844">		return;</a>
+<a name="ln845">	}</a>
+<a name="ln846"> </a>
+<a name="ln847">	// take over the source' committed size</a>
+<a name="ln848">	fCommittedSwapSize += source-&gt;fCommittedSwapSize;</a>
+<a name="ln849">	source-&gt;fCommittedSwapSize = 0;</a>
+<a name="ln850">	committed_size += source-&gt;committed_size;</a>
+<a name="ln851">	source-&gt;committed_size = 0;</a>
+<a name="ln852"> </a>
+<a name="ln853">	off_t actualSize = virtual_end - virtual_base;</a>
+<a name="ln854">	if (committed_size &gt; actualSize)</a>
+<a name="ln855">		_Commit(actualSize, VM_PRIORITY_USER);</a>
+<a name="ln856"> </a>
+<a name="ln857">	// Move all not shadowed swap pages from the source to the consumer cache.</a>
+<a name="ln858">	// Also remove all source pages that are shadowed by consumer swap pages.</a>
+<a name="ln859">	_MergeSwapPages(source);</a>
+<a name="ln860"> </a>
+<a name="ln861">	// Move all not shadowed pages from the source to the consumer cache.</a>
+<a name="ln862">	if (source-&gt;page_count &lt; page_count)</a>
+<a name="ln863">		_MergePagesSmallerSource(source);</a>
+<a name="ln864">	else</a>
+<a name="ln865">		_MergePagesSmallerConsumer(source);</a>
+<a name="ln866">}</a>
+<a name="ln867"> </a>
+<a name="ln868"> </a>
+<a name="ln869">void</a>
+<a name="ln870">VMAnonymousCache::DeleteObject()</a>
+<a name="ln871">{</a>
+<a name="ln872">	object_cache_delete(gAnonymousCacheObjectCache, this);</a>
+<a name="ln873">}</a>
+<a name="ln874"> </a>
+<a name="ln875"> </a>
+<a name="ln876">void</a>
+<a name="ln877">VMAnonymousCache::_SwapBlockBuild(off_t startPageIndex,</a>
+<a name="ln878">	swap_addr_t startSlotIndex, uint32 count)</a>
+<a name="ln879">{</a>
+<a name="ln880">	WriteLocker locker(sSwapHashLock);</a>
+<a name="ln881"> </a>
+<a name="ln882">	uint32 left = count;</a>
+<a name="ln883">	for (uint32 i = 0, j = 0; i &lt; count; i += j) {</a>
+<a name="ln884">		off_t pageIndex = startPageIndex + i;</a>
+<a name="ln885">		swap_addr_t slotIndex = startSlotIndex + i;</a>
+<a name="ln886"> </a>
+<a name="ln887">		swap_hash_key key = { this, pageIndex };</a>
+<a name="ln888"> </a>
+<a name="ln889">		swap_block* swap = sSwapHashTable.Lookup(key);</a>
+<a name="ln890">		while (swap == NULL) {</a>
+<a name="ln891">			swap = (swap_block*)object_cache_alloc(sSwapBlockCache,</a>
+<a name="ln892">				CACHE_DONT_WAIT_FOR_MEMORY | CACHE_DONT_LOCK_KERNEL_SPACE);</a>
+<a name="ln893">			if (swap == NULL) {</a>
+<a name="ln894">				// Wait a short time until memory is available again.</a>
+<a name="ln895">				locker.Unlock();</a>
+<a name="ln896">				snooze(10000);</a>
+<a name="ln897">				locker.Lock();</a>
+<a name="ln898">				swap = sSwapHashTable.Lookup(key);</a>
+<a name="ln899">				continue;</a>
+<a name="ln900">			}</a>
+<a name="ln901"> </a>
+<a name="ln902">			swap-&gt;key.cache = this;</a>
+<a name="ln903">			swap-&gt;key.page_index = pageIndex &amp; ~(off_t)SWAP_BLOCK_MASK;</a>
+<a name="ln904">			swap-&gt;used = 0;</a>
+<a name="ln905">			for (uint32 i = 0; i &lt; SWAP_BLOCK_PAGES; i++)</a>
+<a name="ln906">				swap-&gt;swap_slots[i] = SWAP_SLOT_NONE;</a>
+<a name="ln907"> </a>
+<a name="ln908">			sSwapHashTable.InsertUnchecked(swap);</a>
+<a name="ln909">		}</a>
+<a name="ln910"> </a>
+<a name="ln911">		swap_addr_t blockIndex = pageIndex &amp; SWAP_BLOCK_MASK;</a>
+<a name="ln912">		for (j = 0; blockIndex &lt; SWAP_BLOCK_PAGES &amp;&amp; left &gt; 0; j++) {</a>
+<a name="ln913">			swap-&gt;swap_slots[blockIndex++] = slotIndex + j;</a>
+<a name="ln914">			left--;</a>
+<a name="ln915">		}</a>
+<a name="ln916"> </a>
+<a name="ln917">		swap-&gt;used += j;</a>
+<a name="ln918">	}</a>
+<a name="ln919">}</a>
+<a name="ln920"> </a>
+<a name="ln921"> </a>
+<a name="ln922">void</a>
+<a name="ln923">VMAnonymousCache::_SwapBlockFree(off_t startPageIndex, uint32 count)</a>
+<a name="ln924">{</a>
+<a name="ln925">	WriteLocker locker(sSwapHashLock);</a>
+<a name="ln926"> </a>
+<a name="ln927">	uint32 left = count;</a>
+<a name="ln928">	for (uint32 i = 0, j = 0; i &lt; count; i += j) {</a>
+<a name="ln929">		off_t pageIndex = startPageIndex + i;</a>
+<a name="ln930">		swap_hash_key key = { this, pageIndex };</a>
+<a name="ln931">		swap_block* swap = sSwapHashTable.Lookup(key);</a>
+<a name="ln932"> </a>
+<a name="ln933">		ASSERT(swap != NULL);</a>
+<a name="ln934"> </a>
+<a name="ln935">		swap_addr_t blockIndex = pageIndex &amp; SWAP_BLOCK_MASK;</a>
+<a name="ln936">		for (j = 0; blockIndex &lt; SWAP_BLOCK_PAGES &amp;&amp; left &gt; 0; j++) {</a>
+<a name="ln937">			swap-&gt;swap_slots[blockIndex++] = SWAP_SLOT_NONE;</a>
+<a name="ln938">			left--;</a>
+<a name="ln939">		}</a>
+<a name="ln940"> </a>
+<a name="ln941">		swap-&gt;used -= j;</a>
+<a name="ln942">		if (swap-&gt;used == 0) {</a>
+<a name="ln943">			sSwapHashTable.RemoveUnchecked(swap);</a>
+<a name="ln944">			object_cache_free(sSwapBlockCache, swap,</a>
+<a name="ln945">				CACHE_DONT_WAIT_FOR_MEMORY | CACHE_DONT_LOCK_KERNEL_SPACE);</a>
+<a name="ln946">		}</a>
+<a name="ln947">	}</a>
+<a name="ln948">}</a>
+<a name="ln949"> </a>
+<a name="ln950"> </a>
+<a name="ln951">swap_addr_t</a>
+<a name="ln952">VMAnonymousCache::_SwapBlockGetAddress(off_t pageIndex)</a>
+<a name="ln953">{</a>
+<a name="ln954">	ReadLocker locker(sSwapHashLock);</a>
+<a name="ln955"> </a>
+<a name="ln956">	swap_hash_key key = { this, pageIndex };</a>
+<a name="ln957">	swap_block* swap = sSwapHashTable.Lookup(key);</a>
+<a name="ln958">	swap_addr_t slotIndex = SWAP_SLOT_NONE;</a>
+<a name="ln959"> </a>
+<a name="ln960">	if (swap != NULL) {</a>
+<a name="ln961">		swap_addr_t blockIndex = pageIndex &amp; SWAP_BLOCK_MASK;</a>
+<a name="ln962">		slotIndex = swap-&gt;swap_slots[blockIndex];</a>
+<a name="ln963">	}</a>
+<a name="ln964"> </a>
+<a name="ln965">	return slotIndex;</a>
+<a name="ln966">}</a>
+<a name="ln967"> </a>
+<a name="ln968"> </a>
+<a name="ln969">status_t</a>
+<a name="ln970">VMAnonymousCache::_Commit(off_t size, int priority)</a>
+<a name="ln971">{</a>
+<a name="ln972">	TRACE(&quot;%p-&gt;VMAnonymousCache::_Commit(%&quot; B_PRIdOFF &quot;), already committed: &quot;</a>
+<a name="ln973">		&quot;%&quot; B_PRIdOFF &quot; (%&quot; B_PRIdOFF &quot; swap)\n&quot;, this, size, committed_size,</a>
+<a name="ln974">		fCommittedSwapSize);</a>
+<a name="ln975"> </a>
+<a name="ln976">	// Basic strategy: reserve swap space first, only when running out of swap</a>
+<a name="ln977">	// space, reserve real memory.</a>
+<a name="ln978"> </a>
+<a name="ln979">	off_t committedMemory = committed_size - fCommittedSwapSize;</a>
+<a name="ln980"> </a>
+<a name="ln981">	// Regardless of whether we're asked to grow or shrink the commitment,</a>
+<a name="ln982">	// we always try to reserve as much as possible of the final commitment</a>
+<a name="ln983">	// in the swap space.</a>
+<a name="ln984">	if (size &gt; fCommittedSwapSize) {</a>
+<a name="ln985">		fCommittedSwapSize += swap_space_reserve(size - fCommittedSwapSize);</a>
+<a name="ln986">		committed_size = fCommittedSwapSize + committedMemory;</a>
+<a name="ln987">		if (size &gt; fCommittedSwapSize) {</a>
+<a name="ln988">			TRACE(&quot;%p-&gt;VMAnonymousCache::_Commit(%&quot; B_PRIdOFF &quot;), reserved &quot;</a>
+<a name="ln989">				&quot;only %&quot; B_PRIdOFF &quot; swap\n&quot;, this, size, fCommittedSwapSize);</a>
+<a name="ln990">		}</a>
+<a name="ln991">	}</a>
+<a name="ln992"> </a>
+<a name="ln993">	if (committed_size == size)</a>
+<a name="ln994">		return B_OK;</a>
+<a name="ln995"> </a>
+<a name="ln996">	if (committed_size &gt; size) {</a>
+<a name="ln997">		// The commitment shrinks -- unreserve real memory first.</a>
+<a name="ln998">		off_t toUnreserve = committed_size - size;</a>
+<a name="ln999">		if (committedMemory &gt; 0) {</a>
+<a name="ln1000">			off_t unreserved = min_c(toUnreserve, committedMemory);</a>
+<a name="ln1001">			vm_unreserve_memory(unreserved);</a>
+<a name="ln1002">			committedMemory -= unreserved;</a>
+<a name="ln1003">			committed_size -= unreserved;</a>
+<a name="ln1004">			toUnreserve -= unreserved;</a>
+<a name="ln1005">		}</a>
+<a name="ln1006"> </a>
+<a name="ln1007">		// Unreserve swap space.</a>
+<a name="ln1008">		if (toUnreserve &gt; 0) {</a>
+<a name="ln1009">			swap_space_unreserve(toUnreserve);</a>
+<a name="ln1010">			fCommittedSwapSize -= toUnreserve;</a>
+<a name="ln1011">			committed_size -= toUnreserve;</a>
+<a name="ln1012">		}</a>
+<a name="ln1013"> </a>
+<a name="ln1014">		return B_OK;</a>
+<a name="ln1015">	}</a>
+<a name="ln1016"> </a>
+<a name="ln1017">	// The commitment grows -- we have already tried to reserve swap space at</a>
+<a name="ln1018">	// the start of the method, so we try to reserve real memory, now.</a>
+<a name="ln1019"> </a>
+<a name="ln1020">	off_t toReserve = size - committed_size;</a>
+<a name="ln1021">	if (vm_try_reserve_memory(toReserve, priority, 1000000) != B_OK) {</a>
+<a name="ln1022">		dprintf(&quot;%p-&gt;VMAnonymousCache::_Commit(%&quot; B_PRIdOFF &quot;): Failed to &quot;</a>
+<a name="ln1023">			&quot;reserve %&quot; B_PRIdOFF &quot; bytes of RAM\n&quot;, this, size, toReserve);</a>
+<a name="ln1024">		return B_NO_MEMORY;</a>
+<a name="ln1025">	}</a>
+<a name="ln1026"> </a>
+<a name="ln1027">	committed_size = size;</a>
+<a name="ln1028">	return B_OK;</a>
+<a name="ln1029">}</a>
+<a name="ln1030"> </a>
+<a name="ln1031"> </a>
+<a name="ln1032">void</a>
+<a name="ln1033">VMAnonymousCache::_MergePagesSmallerSource(VMAnonymousCache* source)</a>
+<a name="ln1034">{</a>
+<a name="ln1035">	// The source cache has less pages than the consumer (this cache), so we</a>
+<a name="ln1036">	// iterate through the source's pages and move the ones that are not</a>
+<a name="ln1037">	// shadowed up to the consumer.</a>
+<a name="ln1038"> </a>
+<a name="ln1039">	for (VMCachePagesTree::Iterator it = source-&gt;pages.GetIterator();</a>
+<a name="ln1040">			vm_page* page = it.Next();) {</a>
+<a name="ln1041">		// Note: Removing the current node while iterating through a</a>
+<a name="ln1042">		// IteratableSplayTree is safe.</a>
+<a name="ln1043">		vm_page* consumerPage = LookupPage(</a>
+<a name="ln1044">			(off_t)page-&gt;cache_offset &lt;&lt; PAGE_SHIFT);</a>
+<a name="ln1045">		if (consumerPage == NULL) {</a>
+<a name="ln1046">			// the page is not yet in the consumer cache - move it upwards</a>
+<a name="ln1047">			ASSERT_PRINT(!page-&gt;busy, &quot;page: %p&quot;, page);</a>
+<a name="ln1048">			MovePage(page);</a>
+<a name="ln1049">		}</a>
+<a name="ln1050">	}</a>
+<a name="ln1051">}</a>
+<a name="ln1052"> </a>
+<a name="ln1053"> </a>
+<a name="ln1054">void</a>
+<a name="ln1055">VMAnonymousCache::_MergePagesSmallerConsumer(VMAnonymousCache* source)</a>
+<a name="ln1056">{</a>
+<a name="ln1057">	// The consumer (this cache) has less pages than the source, so we move the</a>
+<a name="ln1058">	// consumer's pages to the source (freeing shadowed ones) and finally just</a>
+<a name="ln1059">	// all pages of the source back to the consumer.</a>
+<a name="ln1060"> </a>
+<a name="ln1061">	for (VMCachePagesTree::Iterator it = pages.GetIterator();</a>
+<a name="ln1062">		vm_page* page = it.Next();) {</a>
+<a name="ln1063">		// If a source page is in the way, remove and free it.</a>
+<a name="ln1064">		vm_page* sourcePage = source-&gt;LookupPage(</a>
+<a name="ln1065">			(off_t)page-&gt;cache_offset &lt;&lt; PAGE_SHIFT);</a>
+<a name="ln1066">		if (sourcePage != NULL) {</a>
+<a name="ln1067">			DEBUG_PAGE_ACCESS_START(sourcePage);</a>
+<a name="ln1068">			ASSERT_PRINT(!sourcePage-&gt;busy, &quot;page: %p&quot;, sourcePage);</a>
+<a name="ln1069">			ASSERT_PRINT(sourcePage-&gt;WiredCount() == 0</a>
+<a name="ln1070">					&amp;&amp; sourcePage-&gt;mappings.IsEmpty(),</a>
+<a name="ln1071">				&quot;sourcePage: %p, page: %p&quot;, sourcePage, page);</a>
+<a name="ln1072">			source-&gt;RemovePage(sourcePage);</a>
+<a name="ln1073">			vm_page_free(source, sourcePage);</a>
+<a name="ln1074">		}</a>
+<a name="ln1075"> </a>
+<a name="ln1076">		// Note: Removing the current node while iterating through a</a>
+<a name="ln1077">		// IteratableSplayTree is safe.</a>
+<a name="ln1078">		source-&gt;MovePage(page);</a>
+<a name="ln1079">	}</a>
+<a name="ln1080"> </a>
+<a name="ln1081">	MoveAllPages(source);</a>
+<a name="ln1082">}</a>
+<a name="ln1083"> </a>
+<a name="ln1084"> </a>
+<a name="ln1085">void</a>
+<a name="ln1086">VMAnonymousCache::_MergeSwapPages(VMAnonymousCache* source)</a>
+<a name="ln1087">{</a>
+<a name="ln1088">	// If neither source nor consumer have swap pages, we don't have to do</a>
+<a name="ln1089">	// anything.</a>
+<a name="ln1090">	if (source-&gt;fAllocatedSwapSize == 0 &amp;&amp; fAllocatedSwapSize == 0)</a>
+<a name="ln1091">		return;</a>
+<a name="ln1092"> </a>
+<a name="ln1093">	for (off_t offset = source-&gt;virtual_base</a>
+<a name="ln1094">		&amp; ~(off_t)(B_PAGE_SIZE * SWAP_BLOCK_PAGES - 1);</a>
+<a name="ln1095">		offset &lt; source-&gt;virtual_end;</a>
+<a name="ln1096">		offset += B_PAGE_SIZE * SWAP_BLOCK_PAGES) {</a>
+<a name="ln1097"> </a>
+<a name="ln1098">		WriteLocker locker(sSwapHashLock);</a>
+<a name="ln1099"> </a>
+<a name="ln1100">		off_t swapBlockPageIndex = offset &gt;&gt; PAGE_SHIFT;</a>
+<a name="ln1101">		swap_hash_key key = { source, swapBlockPageIndex };</a>
+<a name="ln1102">		swap_block* sourceSwapBlock = sSwapHashTable.Lookup(key);</a>
+<a name="ln1103"> </a>
+<a name="ln1104">		// remove the source swap block -- we will either take over the swap</a>
+<a name="ln1105">		// space (and the block) or free it</a>
+<a name="ln1106">		if (sourceSwapBlock != NULL)</a>
+<a name="ln1107">			sSwapHashTable.RemoveUnchecked(sourceSwapBlock);</a>
+<a name="ln1108"> </a>
+<a name="ln1109">		key.cache = this;</a>
+<a name="ln1110">		swap_block* swapBlock = sSwapHashTable.Lookup(key);</a>
+<a name="ln1111"> </a>
+<a name="ln1112">		locker.Unlock();</a>
+<a name="ln1113"> </a>
+<a name="ln1114">		// remove all source pages that are shadowed by consumer swap pages</a>
+<a name="ln1115">		if (swapBlock != NULL) {</a>
+<a name="ln1116">			for (uint32 i = 0; i &lt; SWAP_BLOCK_PAGES; i++) {</a>
+<a name="ln1117">				if (swapBlock-&gt;swap_slots[i] != SWAP_SLOT_NONE) {</a>
+<a name="ln1118">					vm_page* page = source-&gt;LookupPage(</a>
+<a name="ln1119">						(off_t)(swapBlockPageIndex + i) &lt;&lt; PAGE_SHIFT);</a>
+<a name="ln1120">					if (page != NULL) {</a>
+<a name="ln1121">						DEBUG_PAGE_ACCESS_START(page);</a>
+<a name="ln1122">						ASSERT_PRINT(!page-&gt;busy, &quot;page: %p&quot;, page);</a>
+<a name="ln1123">						source-&gt;RemovePage(page);</a>
+<a name="ln1124">						vm_page_free(source, page);</a>
+<a name="ln1125">					}</a>
+<a name="ln1126">				}</a>
+<a name="ln1127">			}</a>
+<a name="ln1128">		}</a>
+<a name="ln1129"> </a>
+<a name="ln1130">		if (sourceSwapBlock == NULL)</a>
+<a name="ln1131">			continue;</a>
+<a name="ln1132"> </a>
+<a name="ln1133">		for (uint32 i = 0; i &lt; SWAP_BLOCK_PAGES; i++) {</a>
+<a name="ln1134">			off_t pageIndex = swapBlockPageIndex + i;</a>
+<a name="ln1135">			swap_addr_t sourceSlotIndex = sourceSwapBlock-&gt;swap_slots[i];</a>
+<a name="ln1136"> </a>
+<a name="ln1137">			if (sourceSlotIndex == SWAP_SLOT_NONE)</a>
+<a name="ln1138">				continue;</a>
+<a name="ln1139"> </a>
+<a name="ln1140">			if ((swapBlock != NULL</a>
+<a name="ln1141">					&amp;&amp; swapBlock-&gt;swap_slots[i] != SWAP_SLOT_NONE)</a>
+<a name="ln1142">				|| LookupPage((off_t)pageIndex &lt;&lt; PAGE_SHIFT) != NULL) {</a>
+<a name="ln1143">				// The consumer already has a page or a swapped out page</a>
+<a name="ln1144">				// at this index. So we can free the source swap space.</a>
+<a name="ln1145">				swap_slot_dealloc(sourceSlotIndex, 1);</a>
+<a name="ln1146">				sourceSwapBlock-&gt;swap_slots[i] = SWAP_SLOT_NONE;</a>
+<a name="ln1147">				sourceSwapBlock-&gt;used--;</a>
+<a name="ln1148">			}</a>
+<a name="ln1149"> </a>
+<a name="ln1150">			// We've either freed the source swap page or are going to move it</a>
+<a name="ln1151">			// to the consumer. At any rate, the source cache doesn't own it</a>
+<a name="ln1152">			// anymore.</a>
+<a name="ln1153">			source-&gt;fAllocatedSwapSize -= B_PAGE_SIZE;</a>
+<a name="ln1154">		}</a>
+<a name="ln1155"> </a>
+<a name="ln1156">		// All source swap pages that have not been freed yet are taken over by</a>
+<a name="ln1157">		// the consumer.</a>
+<a name="ln1158">		fAllocatedSwapSize += B_PAGE_SIZE * (off_t)sourceSwapBlock-&gt;used;</a>
+<a name="ln1159"> </a>
+<a name="ln1160">		if (sourceSwapBlock-&gt;used == 0) {</a>
+<a name="ln1161">			// All swap pages have been freed -- we can discard the source swap</a>
+<a name="ln1162">			// block.</a>
+<a name="ln1163">			object_cache_free(sSwapBlockCache, sourceSwapBlock,</a>
+<a name="ln1164">				CACHE_DONT_WAIT_FOR_MEMORY | CACHE_DONT_LOCK_KERNEL_SPACE);</a>
+<a name="ln1165">		} else if (swapBlock == NULL) {</a>
+<a name="ln1166">			// We need to take over some of the source's swap pages and there's</a>
+<a name="ln1167">			// no swap block in the consumer cache. Just take over the source</a>
+<a name="ln1168">			// swap block.</a>
+<a name="ln1169">			sourceSwapBlock-&gt;key.cache = this;</a>
+<a name="ln1170">			locker.Lock();</a>
+<a name="ln1171">			sSwapHashTable.InsertUnchecked(sourceSwapBlock);</a>
+<a name="ln1172">			locker.Unlock();</a>
+<a name="ln1173">		} else {</a>
+<a name="ln1174">			// We need to take over some of the source's swap pages and there's</a>
+<a name="ln1175">			// already a swap block in the consumer cache. Copy the respective</a>
+<a name="ln1176">			// swap addresses and discard the source swap block.</a>
+<a name="ln1177">			for (uint32 i = 0; i &lt; SWAP_BLOCK_PAGES; i++) {</a>
+<a name="ln1178">				if (sourceSwapBlock-&gt;swap_slots[i] != SWAP_SLOT_NONE)</a>
+<a name="ln1179">					swapBlock-&gt;swap_slots[i] = sourceSwapBlock-&gt;swap_slots[i];</a>
+<a name="ln1180">			}</a>
+<a name="ln1181"> </a>
+<a name="ln1182">			object_cache_free(sSwapBlockCache, sourceSwapBlock,</a>
+<a name="ln1183">				CACHE_DONT_WAIT_FOR_MEMORY | CACHE_DONT_LOCK_KERNEL_SPACE);</a>
+<a name="ln1184">		}</a>
+<a name="ln1185">	}</a>
+<a name="ln1186">}</a>
+<a name="ln1187"> </a>
+<a name="ln1188"> </a>
+<a name="ln1189">// #pragma mark -</a>
+<a name="ln1190"> </a>
+<a name="ln1191"> </a>
+<a name="ln1192">// TODO: This can be removed if we get BFS uuid's</a>
+<a name="ln1193">struct VolumeInfo {</a>
+<a name="ln1194">	char name[B_FILE_NAME_LENGTH];</a>
+<a name="ln1195">	char device[B_FILE_NAME_LENGTH];</a>
+<a name="ln1196">	char filesystem[B_OS_NAME_LENGTH];</a>
+<a name="ln1197">	off_t capacity;</a>
+<a name="ln1198">};</a>
+<a name="ln1199"> </a>
+<a name="ln1200"> </a>
+<a name="ln1201">class PartitionScorer : public KPartitionVisitor {</a>
+<a name="ln1202">public:</a>
+<a name="ln1203">	PartitionScorer(VolumeInfo&amp; volumeInfo)</a>
+<a name="ln1204">		:</a>
+<a name="ln1205">		fBestPartition(NULL),</a>
+<a name="ln1206">		fBestScore(-1),</a>
+<a name="ln1207">		fVolumeInfo(volumeInfo)</a>
+<a name="ln1208">	{</a>
+<a name="ln1209">	}</a>
+<a name="ln1210"> </a>
+<a name="ln1211">	virtual bool VisitPre(KPartition* partition)</a>
+<a name="ln1212">	{</a>
+<a name="ln1213">		if (!partition-&gt;ContainsFileSystem())</a>
+<a name="ln1214">			return false;</a>
+<a name="ln1215"> </a>
+<a name="ln1216">		KPath path;</a>
+<a name="ln1217">		partition-&gt;GetPath(&amp;path);</a>
+<a name="ln1218"> </a>
+<a name="ln1219">		int score = 0;</a>
+<a name="ln1220">		if (strcmp(fVolumeInfo.name, partition-&gt;ContentName()) == 0)</a>
+<a name="ln1221">			score += 4;</a>
+<a name="ln1222">		if (strcmp(fVolumeInfo.device, path.Path()) == 0)</a>
+<a name="ln1223">			score += 3;</a>
+<a name="ln1224">		if (fVolumeInfo.capacity == partition-&gt;Size())</a>
+<a name="ln1225">			score += 2;</a>
+<a name="ln1226">		if (strcmp(fVolumeInfo.filesystem,</a>
+<a name="ln1227">			partition-&gt;DiskSystem()-&gt;ShortName()) == 0) {</a>
+<a name="ln1228">			score += 1;</a>
+<a name="ln1229">		}</a>
+<a name="ln1230">		if (score &gt;= 4 &amp;&amp; score &gt; fBestScore) {</a>
+<a name="ln1231">			fBestPartition = partition;</a>
+<a name="ln1232">			fBestScore = score;</a>
+<a name="ln1233">		}</a>
+<a name="ln1234"> </a>
+<a name="ln1235">		return false;</a>
+<a name="ln1236">	}</a>
+<a name="ln1237"> </a>
+<a name="ln1238">	KPartition* fBestPartition;</a>
+<a name="ln1239"> </a>
+<a name="ln1240">private:</a>
+<a name="ln1241">	int32		fBestScore;</a>
+<a name="ln1242">	VolumeInfo&amp;	fVolumeInfo;</a>
+<a name="ln1243">};</a>
+<a name="ln1244"> </a>
+<a name="ln1245"> </a>
+<a name="ln1246">status_t</a>
+<a name="ln1247">swap_file_add(const char* path)</a>
+<a name="ln1248">{</a>
+<a name="ln1249">	// open the file</a>
+<a name="ln1250">	int fd = open(path, O_RDWR | O_NOCACHE, S_IRUSR | S_IWUSR);</a>
+<a name="ln1251">	if (fd &lt; 0)</a>
+<a name="ln1252">		return errno;</a>
+<a name="ln1253"> </a>
+<a name="ln1254">	// fstat() it and check whether we can use it</a>
+<a name="ln1255">	struct stat st;</a>
+<a name="ln1256">	if (fstat(fd, &amp;st) &lt; 0) {</a>
+<a name="ln1257">		close(fd);</a>
+<a name="ln1258">		return errno;</a>
+<a name="ln1259">	}</a>
+<a name="ln1260"> </a>
+<a name="ln1261">	if (!(S_ISREG(st.st_mode) || S_ISCHR(st.st_mode) || S_ISBLK(st.st_mode))) {</a>
+<a name="ln1262">		close(fd);</a>
+<a name="ln1263">		return B_BAD_VALUE;</a>
+<a name="ln1264">	}</a>
+<a name="ln1265"> </a>
+<a name="ln1266">	if (st.st_size &lt; B_PAGE_SIZE) {</a>
+<a name="ln1267">		close(fd);</a>
+<a name="ln1268">		return B_BAD_VALUE;</a>
+<a name="ln1269">	}</a>
+<a name="ln1270"> </a>
+<a name="ln1271">	// get file descriptor, vnode, and cookie</a>
+<a name="ln1272">	file_descriptor* descriptor = get_fd(get_current_io_context(true), fd);</a>
+<a name="ln1273">	put_fd(descriptor);</a>
+<a name="ln1274"> </a>
+<a name="ln1275">	vnode* node = fd_vnode(descriptor);</a>
+<a name="ln1276">	if (node == NULL) {</a>
+<a name="ln1277">		close(fd);</a>
+<a name="ln1278">		return B_BAD_VALUE;</a>
+<a name="ln1279">	}</a>
+<a name="ln1280"> </a>
+<a name="ln1281">	// do the allocations and prepare the swap_file structure</a>
+<a name="ln1282">	swap_file* swap = (swap_file*)malloc(sizeof(swap_file));</a>
+<a name="ln1283">	if (swap == NULL) {</a>
+<a name="ln1284">		close(fd);</a>
+<a name="ln1285">		return B_NO_MEMORY;</a>
+<a name="ln1286">	}</a>
+<a name="ln1287"> </a>
+<a name="ln1288">	swap-&gt;fd = fd;</a>
+<a name="ln1289">	swap-&gt;vnode = node;</a>
+<a name="ln1290">	swap-&gt;cookie = descriptor-&gt;cookie;</a>
+<a name="ln1291"> </a>
+<a name="ln1292">	uint32 pageCount = st.st_size &gt;&gt; PAGE_SHIFT;</a>
+<a name="ln1293">	swap-&gt;bmp = radix_bitmap_create(pageCount);</a>
+<a name="ln1294">	if (swap-&gt;bmp == NULL) {</a>
+<a name="ln1295">		free(swap);</a>
+<a name="ln1296">		close(fd);</a>
+<a name="ln1297">		return B_NO_MEMORY;</a>
+<a name="ln1298">	}</a>
+<a name="ln1299"> </a>
+<a name="ln1300">	// set slot index and add this file to swap file list</a>
+<a name="ln1301">	mutex_lock(&amp;sSwapFileListLock);</a>
+<a name="ln1302">	// TODO: Also check whether the swap file is already registered!</a>
+<a name="ln1303">	if (sSwapFileList.IsEmpty()) {</a>
+<a name="ln1304">		swap-&gt;first_slot = 0;</a>
+<a name="ln1305">		swap-&gt;last_slot = pageCount;</a>
+<a name="ln1306">	} else {</a>
+<a name="ln1307">		// leave one page gap between two swap files</a>
+<a name="ln1308">		swap-&gt;first_slot = sSwapFileList.Last()-&gt;last_slot + 1;</a>
+<a name="ln1309">		swap-&gt;last_slot = swap-&gt;first_slot + pageCount;</a>
+<a name="ln1310">	}</a>
+<a name="ln1311">	sSwapFileList.Add(swap);</a>
+<a name="ln1312">	sSwapFileCount++;</a>
+<a name="ln1313">	mutex_unlock(&amp;sSwapFileListLock);</a>
+<a name="ln1314"> </a>
+<a name="ln1315">	mutex_lock(&amp;sAvailSwapSpaceLock);</a>
+<a name="ln1316">	sAvailSwapSpace += (off_t)pageCount * B_PAGE_SIZE;</a>
+<a name="ln1317">	mutex_unlock(&amp;sAvailSwapSpaceLock);</a>
+<a name="ln1318"> </a>
+<a name="ln1319">	return B_OK;</a>
+<a name="ln1320">}</a>
+<a name="ln1321"> </a>
+<a name="ln1322"> </a>
+<a name="ln1323">status_t</a>
+<a name="ln1324">swap_file_delete(const char* path)</a>
+<a name="ln1325">{</a>
+<a name="ln1326">	vnode* node = NULL;</a>
+<a name="ln1327">	status_t status = vfs_get_vnode_from_path(path, true, &amp;node);</a>
+<a name="ln1328">	if (status != B_OK)</a>
+<a name="ln1329">		return status;</a>
+<a name="ln1330"> </a>
+<a name="ln1331">	MutexLocker locker(sSwapFileListLock);</a>
+<a name="ln1332"> </a>
+<a name="ln1333">	swap_file* swapFile = NULL;</a>
+<a name="ln1334">	for (SwapFileList::Iterator it = sSwapFileList.GetIterator();</a>
+<a name="ln1335">			(swapFile = it.Next()) != NULL;) {</a>
+<a name="ln1336">		if (swapFile-&gt;vnode == node)</a>
+<a name="ln1337">			break;</a>
+<a name="ln1338">	}</a>
+<a name="ln1339"> </a>
+<a name="ln1340">	vfs_put_vnode(node);</a>
+<a name="ln1341"> </a>
+<a name="ln1342">	if (swapFile == NULL)</a>
+<a name="ln1343">		return B_ERROR;</a>
+<a name="ln1344"> </a>
+<a name="ln1345">	// if this file is currently used, we can't delete</a>
+<a name="ln1346">	// TODO: mark this swap file deleting, and remove it after releasing</a>
+<a name="ln1347">	// all the swap space</a>
+<a name="ln1348">	if (swapFile-&gt;bmp-&gt;free_slots &lt; swapFile-&gt;last_slot - swapFile-&gt;first_slot)</a>
+<a name="ln1349">		return B_ERROR;</a>
+<a name="ln1350"> </a>
+<a name="ln1351">	sSwapFileList.Remove(swapFile);</a>
+<a name="ln1352">	sSwapFileCount--;</a>
+<a name="ln1353">	locker.Unlock();</a>
+<a name="ln1354"> </a>
+<a name="ln1355">	mutex_lock(&amp;sAvailSwapSpaceLock);</a>
+<a name="ln1356">	sAvailSwapSpace -= (off_t)(swapFile-&gt;last_slot - swapFile-&gt;first_slot)</a>
+<a name="ln1357">		* B_PAGE_SIZE;</a>
+<a name="ln1358">	mutex_unlock(&amp;sAvailSwapSpaceLock);</a>
+<a name="ln1359"> </a>
+<a name="ln1360">	close(swapFile-&gt;fd);</a>
+<a name="ln1361">	radix_bitmap_destroy(swapFile-&gt;bmp);</a>
+<a name="ln1362">	free(swapFile);</a>
+<a name="ln1363"> </a>
+<a name="ln1364">	return B_OK;</a>
+<a name="ln1365">}</a>
+<a name="ln1366"> </a>
+<a name="ln1367"> </a>
+<a name="ln1368">void</a>
+<a name="ln1369">swap_init(void)</a>
+<a name="ln1370">{</a>
+<a name="ln1371">	// create swap block cache</a>
+<a name="ln1372">	sSwapBlockCache = create_object_cache(&quot;swapblock&quot;, sizeof(swap_block),</a>
+<a name="ln1373">		sizeof(void*), NULL, NULL, NULL);</a>
+<a name="ln1374">	if (sSwapBlockCache == NULL)</a>
+<a name="ln1375">		panic(&quot;swap_init(): can't create object cache for swap blocks\n&quot;);</a>
+<a name="ln1376"> </a>
+<a name="ln1377">	status_t error = object_cache_set_minimum_reserve(sSwapBlockCache,</a>
+<a name="ln1378">		MIN_SWAP_BLOCK_RESERVE);</a>
+<a name="ln1379">	if (error != B_OK) {</a>
+<a name="ln1380">		panic(&quot;swap_init(): object_cache_set_minimum_reserve() failed: %s&quot;,</a>
+<a name="ln1381">			strerror(error));</a>
+<a name="ln1382">	}</a>
+<a name="ln1383"> </a>
+<a name="ln1384">	// init swap hash table</a>
+<a name="ln1385">	sSwapHashTable.Init(INITIAL_SWAP_HASH_SIZE);</a>
+<a name="ln1386">	rw_lock_init(&amp;sSwapHashLock, &quot;swaphash&quot;);</a>
+<a name="ln1387"> </a>
+<a name="ln1388">	error = register_resource_resizer(swap_hash_resizer, NULL,</a>
+<a name="ln1389">		SWAP_HASH_RESIZE_INTERVAL);</a>
+<a name="ln1390">	if (error != B_OK) {</a>
+<a name="ln1391">		panic(&quot;swap_init(): Failed to register swap hash resizer: %s&quot;,</a>
+<a name="ln1392">			strerror(error));</a>
+<a name="ln1393">	}</a>
+<a name="ln1394"> </a>
+<a name="ln1395">	// init swap file list</a>
+<a name="ln1396">	mutex_init(&amp;sSwapFileListLock, &quot;swaplist&quot;);</a>
+<a name="ln1397">	sSwapFileAlloc = NULL;</a>
+<a name="ln1398">	sSwapFileCount = 0;</a>
+<a name="ln1399"> </a>
+<a name="ln1400">	// init available swap space</a>
+<a name="ln1401">	mutex_init(&amp;sAvailSwapSpaceLock, &quot;avail swap space&quot;);</a>
+<a name="ln1402">	sAvailSwapSpace = 0;</a>
+<a name="ln1403"> </a>
+<a name="ln1404">	add_debugger_command_etc(&quot;swap&quot;, &amp;dump_swap_info,</a>
+<a name="ln1405">		&quot;Print infos about the swap usage&quot;,</a>
+<a name="ln1406">		&quot;\n&quot;</a>
+<a name="ln1407">		&quot;Print infos about the swap usage.\n&quot;, 0);</a>
+<a name="ln1408">}</a>
+<a name="ln1409"> </a>
+<a name="ln1410"> </a>
+<a name="ln1411">void</a>
+<a name="ln1412">swap_init_post_modules()</a>
+<a name="ln1413">{</a>
+<a name="ln1414">	// Never try to create a swap file on a read-only device - when booting</a>
+<a name="ln1415">	// from CD, the write overlay is used.</a>
+<a name="ln1416">	if (gReadOnlyBootDevice)</a>
+<a name="ln1417">		return;</a>
+<a name="ln1418"> </a>
+<a name="ln1419">	bool swapEnabled = true;</a>
+<a name="ln1420">	bool swapAutomatic = true;</a>
+<a name="ln1421">	off_t swapSize = 0;</a>
+<a name="ln1422"> </a>
+<a name="ln1423">	dev_t swapDeviceID = -1;</a>
+<a name="ln1424">	VolumeInfo selectedVolume = {};</a>
+<a name="ln1425"> </a>
+<a name="ln1426">	void* settings = load_driver_settings(&quot;virtual_memory&quot;);</a>
+<a name="ln1427"> </a>
+<a name="ln1428">	if (settings != NULL) {</a>
+<a name="ln1429">		// We pass a lot of information on the swap device, this is mostly to</a>
+<a name="ln1430">		// ensure that we are dealing with the same device that was configured.</a>
+<a name="ln1431"> </a>
+<a name="ln1432">		// TODO: Some kind of BFS uuid would be great here :)</a>
+<a name="ln1433">		const char* enabled = get_driver_parameter(settings, &quot;vm&quot;, NULL, NULL);</a>
+<a name="ln1434"> </a>
+<a name="ln1435">		if (enabled != NULL) {</a>
+<a name="ln1436">			swapEnabled = get_driver_boolean_parameter(settings, &quot;vm&quot;,</a>
+<a name="ln1437">				true, false);</a>
+<a name="ln1438">			swapAutomatic = get_driver_boolean_parameter(settings, &quot;swap_auto&quot;,</a>
+<a name="ln1439">				true, false);</a>
+<a name="ln1440"> </a>
+<a name="ln1441">			if (swapEnabled &amp;&amp; !swapAutomatic) {</a>
+<a name="ln1442">				const char* size = get_driver_parameter(settings, &quot;swap_size&quot;,</a>
+<a name="ln1443">					NULL, NULL);</a>
+<a name="ln1444">				const char* volume = get_driver_parameter(settings,</a>
+<a name="ln1445">					&quot;swap_volume_name&quot;, NULL, NULL);</a>
+<a name="ln1446">				const char* device = get_driver_parameter(settings,</a>
+<a name="ln1447">					&quot;swap_volume_device&quot;, NULL, NULL);</a>
+<a name="ln1448">				const char* filesystem = get_driver_parameter(settings,</a>
+<a name="ln1449">					&quot;swap_volume_filesystem&quot;, NULL, NULL);</a>
+<a name="ln1450">				const char* capacity = get_driver_parameter(settings,</a>
+<a name="ln1451">					&quot;swap_volume_capacity&quot;, NULL, NULL);</a>
+<a name="ln1452"> </a>
+<a name="ln1453">				if (size != NULL &amp;&amp; device != NULL &amp;&amp; volume != NULL</a>
+<a name="ln1454">					&amp;&amp; filesystem != NULL &amp;&amp; capacity != NULL) {</a>
+<a name="ln1455">					// User specified a size / volume that seems valid</a>
+<a name="ln1456">					swapAutomatic = false;</a>
+<a name="ln1457">					swapSize = atoll(size);</a>
+<a name="ln1458">					strlcpy(selectedVolume.name, volume,</a>
+<a name="ln1459">						sizeof(selectedVolume.name));</a>
+<a name="ln1460">					strlcpy(selectedVolume.device, device,</a>
+<a name="ln1461">						sizeof(selectedVolume.device));</a>
+<a name="ln1462">					strlcpy(selectedVolume.filesystem, filesystem,</a>
+<a name="ln1463">						sizeof(selectedVolume.filesystem));</a>
+<a name="ln1464">					selectedVolume.capacity = atoll(capacity);</a>
+<a name="ln1465">				} else {</a>
+<a name="ln1466">					// Something isn't right with swap config, go auto</a>
+<a name="ln1467">					swapAutomatic = true;</a>
+<a name="ln1468">					dprintf(&quot;%s: virtual_memory configuration is invalid, &quot;</a>
+<a name="ln1469">						&quot;using automatic swap\n&quot;, __func__);</a>
+<a name="ln1470">				}</a>
+<a name="ln1471">			}</a>
+<a name="ln1472">		}</a>
+<a name="ln1473">		unload_driver_settings(settings);</a>
+<a name="ln1474">	}</a>
+<a name="ln1475"> </a>
+<a name="ln1476">	if (swapAutomatic) {</a>
+<a name="ln1477">		swapSize = (off_t)vm_page_num_pages() * B_PAGE_SIZE;</a>
+<a name="ln1478">		if (swapSize &lt;= (1024 * 1024 * 1024)) {</a>
+<a name="ln1479">			// Memory under 1GB? double the swap</a>
+<a name="ln1480">			swapSize *= 2;</a>
+<a name="ln1481">		}</a>
+<a name="ln1482">		// Automatic swap defaults to the boot device</a>
+<a name="ln1483">		swapDeviceID = gBootDevice;</a>
+<a name="ln1484">	}</a>
+<a name="ln1485"> </a>
+<a name="ln1486">	if (!swapEnabled || swapSize &lt; B_PAGE_SIZE) {</a>
+<a name="ln1487">		dprintf(&quot;%s: virtual_memory is disabled\n&quot;, __func__);</a>
+<a name="ln1488">		return;</a>
+<a name="ln1489">	}</a>
+<a name="ln1490"> </a>
+<a name="ln1491">	if (!swapAutomatic &amp;&amp; swapDeviceID &lt; 0) {</a>
+<a name="ln1492">		// If user-specified swap, and no swap device has been chosen yet...</a>
+<a name="ln1493">		KDiskDeviceManager::CreateDefault();</a>
+<a name="ln1494">		KDiskDeviceManager* manager = KDiskDeviceManager::Default();</a>
+<a name="ln1495">		PartitionScorer visitor(selectedVolume);</a>
+<a name="ln1496"> </a>
+<a name="ln1497">		KDiskDevice* device;</a>
+<a name="ln1498">		int32 cookie = 0;</a>
+<a name="ln1499">		while ((device = manager-&gt;NextDevice(&amp;cookie)) != NULL) {</a>
+<a name="ln1500">			if (device-&gt;IsReadOnlyMedia() || device-&gt;IsWriteOnce()</a>
+<a name="ln1501">				|| device-&gt;IsRemovable()) {</a>
+<a name="ln1502">				continue;</a>
+<a name="ln1503">			}</a>
+<a name="ln1504">			device-&gt;VisitEachDescendant(&amp;visitor);</a>
+<a name="ln1505">		}</a>
+<a name="ln1506"> </a>
+<a name="ln1507">		if (!visitor.fBestPartition) {</a>
+<a name="ln1508">			dprintf(&quot;%s: Can't find configured swap partition '%s'\n&quot;,</a>
+<a name="ln1509">				__func__, selectedVolume.name);</a>
+<a name="ln1510">		} else {</a>
+<a name="ln1511">			if (visitor.fBestPartition-&gt;IsMounted())</a>
+<a name="ln1512">				swapDeviceID = visitor.fBestPartition-&gt;VolumeID();</a>
+<a name="ln1513">			else {</a>
+<a name="ln1514">				KPath devPath, mountPoint;</a>
+<a name="ln1515">				visitor.fBestPartition-&gt;GetPath(&amp;devPath);</a>
+<a name="ln1516">				get_mount_point(visitor.fBestPartition, &amp;mountPoint);</a>
+<a name="ln1517">				const char* mountPath = mountPoint.Path();</a>
+<a name="ln1518">				mkdir(mountPath, S_IRWXU | S_IRWXG | S_IRWXO);</a>
+<a name="ln1519">				swapDeviceID = _kern_mount(mountPath, devPath.Path(),</a>
+<a name="ln1520">					NULL, 0, NULL, 0);</a>
+<a name="ln1521">				if (swapDeviceID &lt; 0) {</a>
+<a name="ln1522">					dprintf(&quot;%s: Can't mount configured swap partition '%s'\n&quot;,</a>
+<a name="ln1523">						__func__, selectedVolume.name);</a>
+<a name="ln1524">				}</a>
+<a name="ln1525">			}</a>
+<a name="ln1526">		}</a>
+<a name="ln1527">	}</a>
+<a name="ln1528"> </a>
+<a name="ln1529">	if (swapDeviceID &lt; 0)</a>
+<a name="ln1530">		swapDeviceID = gBootDevice;</a>
+<a name="ln1531"> </a>
+<a name="ln1532">	// We now have a swapDeviceID which is used for the swap file</a>
+<a name="ln1533"> </a>
+<a name="ln1534">	KPath path;</a>
+<a name="ln1535">	struct fs_info info;</a>
+<a name="ln1536">	_kern_read_fs_info(swapDeviceID, &amp;info);</a>
+<a name="ln1537">	if (swapDeviceID == gBootDevice)</a>
+<a name="ln1538">		path = kDefaultSwapPath;</a>
+<a name="ln1539">	else {</a>
+<a name="ln1540">		vfs_entry_ref_to_path(info.dev, info.root, &quot;.&quot;, true, path.LockBuffer(),</a>
+<a name="ln1541">			path.BufferSize());</a>
+<a name="ln1542">		path.UnlockBuffer();</a>
+<a name="ln1543">		path.Append(&quot;swap&quot;);</a>
+<a name="ln1544">	}</a>
+<a name="ln1545"> </a>
+<a name="ln1546">	const char* swapPath = path.Path();</a>
+<a name="ln1547"> </a>
+<a name="ln1548">	// Swap size limits prevent oversized swap files</a>
+<a name="ln1549">	if (swapAutomatic) {</a>
+<a name="ln1550">		off_t existingSwapSize = 0;</a>
+<a name="ln1551">		struct stat existingSwapStat;</a>
+<a name="ln1552">		if (stat(swapPath, &amp;existingSwapStat) == 0)</a>
+<a name="ln1553">			existingSwapSize = existingSwapStat.st_size;</a>
+<a name="ln1554"> </a>
+<a name="ln1555">		off_t freeSpace = info.free_blocks * info.block_size + existingSwapSize;</a>
+<a name="ln1556"> </a>
+<a name="ln1557">		// Adjust automatic swap to a maximum of 25% of the free space</a>
+<a name="ln1558">		if (swapSize &gt; (freeSpace / 4))</a>
+<a name="ln1559">			swapSize = (freeSpace / 4);</a>
+<a name="ln1560">	}</a>
+<a name="ln1561"> </a>
+<a name="ln1562">	// Create swap file</a>
+<a name="ln1563">	int fd = open(swapPath, O_RDWR | O_CREAT | O_NOCACHE, S_IRUSR | S_IWUSR);</a>
+<a name="ln1564">	if (fd &lt; 0) {</a>
+<a name="ln1565">		dprintf(&quot;%s: Can't open/create %s: %s\n&quot;, __func__,</a>
+<a name="ln1566">			swapPath, strerror(errno));</a>
+<a name="ln1567">		return;</a>
+<a name="ln1568">	}</a>
+<a name="ln1569"> </a>
+<a name="ln1570">	struct stat stat;</a>
+<a name="ln1571">	stat.st_size = swapSize;</a>
+<a name="ln1572">	status_t error = _kern_write_stat(fd, NULL, false, &amp;stat,</a>
+<a name="ln1573">		sizeof(struct stat), B_STAT_SIZE | B_STAT_SIZE_INSECURE);</a>
+<a name="ln1574">	if (error != B_OK) {</a>
+<a name="ln1575">		dprintf(&quot;%s: Failed to resize %s to %&quot; B_PRIdOFF &quot; bytes: %s\n&quot;,</a>
+<a name="ln1576">			__func__, swapPath, swapSize, strerror(error));</a>
+<a name="ln1577">	}</a>
+<a name="ln1578"> </a>
+<a name="ln1579">	close(fd);</a>
+<a name="ln1580"> </a>
+<a name="ln1581">	error = swap_file_add(swapPath);</a>
+<a name="ln1582">	if (error != B_OK) {</a>
+<a name="ln1583">		dprintf(&quot;%s: Failed to add swap file %s: %s\n&quot;, __func__, swapPath,</a>
+<a name="ln1584">			strerror(error));</a>
+<a name="ln1585">	}</a>
+<a name="ln1586">}</a>
+<a name="ln1587"> </a>
+<a name="ln1588"> </a>
+<a name="ln1589">//! Used by page daemon to free swap space.</a>
+<a name="ln1590">bool</a>
+<a name="ln1591">swap_free_page_swap_space(vm_page* page)</a>
+<a name="ln1592">{</a>
+<a name="ln1593">	VMAnonymousCache* cache = dynamic_cast&lt;VMAnonymousCache*&gt;(page-&gt;Cache());</a>
+<a name="ln1594">	if (cache == NULL)</a>
+<a name="ln1595">		return false;</a>
+<a name="ln1596"> </a>
+<a name="ln1597">	swap_addr_t slotIndex = cache-&gt;_SwapBlockGetAddress(page-&gt;cache_offset);</a>
+<a name="ln1598">	if (slotIndex == SWAP_SLOT_NONE)</a>
+<a name="ln1599">		return false;</a>
+<a name="ln1600"> </a>
+<a name="ln1601">	swap_slot_dealloc(slotIndex, 1);</a>
+<a name="ln1602">	cache-&gt;fAllocatedSwapSize -= B_PAGE_SIZE;</a>
+<a name="ln1603">	cache-&gt;_SwapBlockFree(page-&gt;cache_offset, 1);</a>
+<a name="ln1604"> </a>
+<a name="ln1605">	return true;</a>
+<a name="ln1606">}</a>
+<a name="ln1607"> </a>
+<a name="ln1608"> </a>
+<a name="ln1609">uint32</a>
+<a name="ln1610">swap_available_pages()</a>
+<a name="ln1611">{</a>
+<a name="ln1612">	mutex_lock(&amp;sAvailSwapSpaceLock);</a>
+<a name="ln1613">	uint32 avail = sAvailSwapSpace &gt;&gt; PAGE_SHIFT;</a>
+<a name="ln1614">	mutex_unlock(&amp;sAvailSwapSpaceLock);</a>
+<a name="ln1615"> </a>
+<a name="ln1616">	return avail;</a>
+<a name="ln1617">}</a>
+<a name="ln1618"> </a>
+<a name="ln1619"> </a>
+<a name="ln1620">uint32</a>
+<a name="ln1621">swap_total_swap_pages()</a>
+<a name="ln1622">{</a>
+<a name="ln1623">	mutex_lock(&amp;sSwapFileListLock);</a>
+<a name="ln1624"> </a>
+<a name="ln1625">	uint32 totalSwapSlots = 0;</a>
+<a name="ln1626">	for (SwapFileList::Iterator it = sSwapFileList.GetIterator();</a>
+<a name="ln1627">		swap_file* swapFile = it.Next();) {</a>
+<a name="ln1628">		totalSwapSlots += swapFile-&gt;last_slot - swapFile-&gt;first_slot;</a>
+<a name="ln1629">	}</a>
+<a name="ln1630"> </a>
+<a name="ln1631">	mutex_unlock(&amp;sSwapFileListLock);</a>
+<a name="ln1632"> </a>
+<a name="ln1633">	return totalSwapSlots;</a>
+<a name="ln1634">}</a>
+<a name="ln1635"> </a>
+<a name="ln1636"> </a>
+<a name="ln1637">#endif	// ENABLE_SWAP_SUPPORT</a>
+<a name="ln1638"> </a>
+<a name="ln1639"> </a>
+<a name="ln1640">void</a>
+<a name="ln1641">swap_get_info(system_info* info)</a>
+<a name="ln1642">{</a>
+<a name="ln1643">#if ENABLE_SWAP_SUPPORT</a>
+<a name="ln1644">	info-&gt;max_swap_pages = swap_total_swap_pages();</a>
+<a name="ln1645">	info-&gt;free_swap_pages = swap_available_pages();</a>
+<a name="ln1646">#else</a>
+<a name="ln1647">	info-&gt;max_swap_space = 0;</a>
+<a name="ln1648">	info-&gt;free_swap_space = 0;</a>
+<a name="ln1649">#endif</a>
+<a name="ln1650">}</a>
+<a name="ln1651"> </a>
+
+</code></pre>
+<div class="balloon" rel="385"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v773/" target="_blank">V773</a> The 'allocation' pointer was assigned values twice without releasing the memory. A memory leak is possible.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

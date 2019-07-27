@@ -1,0 +1,418 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>VMAddressSpace.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2009-2011, Ingo Weinhold, ingo_weinhold@gmx.de.</a>
+<a name="ln3"> * Copyright 2002-2009, Axel Dörfler, axeld@pinc-software.de.</a>
+<a name="ln4"> * Distributed under the terms of the MIT License.</a>
+<a name="ln5"> *</a>
+<a name="ln6"> * Copyright 2001-2002, Travis Geiselbrecht. All rights reserved.</a>
+<a name="ln7"> * Distributed under the terms of the NewOS License.</a>
+<a name="ln8"> */</a>
+<a name="ln9"> </a>
+<a name="ln10"> </a>
+<a name="ln11">#include &lt;vm/VMAddressSpace.h&gt;</a>
+<a name="ln12"> </a>
+<a name="ln13">#include &lt;stdlib.h&gt;</a>
+<a name="ln14"> </a>
+<a name="ln15">#include &lt;new&gt;</a>
+<a name="ln16"> </a>
+<a name="ln17">#include &lt;KernelExport.h&gt;</a>
+<a name="ln18"> </a>
+<a name="ln19">#include &lt;util/OpenHashTable.h&gt;</a>
+<a name="ln20"> </a>
+<a name="ln21">#include &lt;heap.h&gt;</a>
+<a name="ln22">#include &lt;thread.h&gt;</a>
+<a name="ln23">#include &lt;vm/vm.h&gt;</a>
+<a name="ln24">#include &lt;vm/VMArea.h&gt;</a>
+<a name="ln25">#include &lt;vm/VMCache.h&gt;</a>
+<a name="ln26"> </a>
+<a name="ln27">#include &quot;VMKernelAddressSpace.h&quot;</a>
+<a name="ln28">#include &quot;VMUserAddressSpace.h&quot;</a>
+<a name="ln29"> </a>
+<a name="ln30"> </a>
+<a name="ln31">//#define TRACE_VM</a>
+<a name="ln32">#ifdef TRACE_VM</a>
+<a name="ln33">#	define TRACE(x) dprintf x</a>
+<a name="ln34">#else</a>
+<a name="ln35">#	define TRACE(x) ;</a>
+<a name="ln36">#endif</a>
+<a name="ln37"> </a>
+<a name="ln38"> </a>
+<a name="ln39">#define ASPACE_HASH_TABLE_SIZE 1024</a>
+<a name="ln40"> </a>
+<a name="ln41"> </a>
+<a name="ln42">// #pragma mark - AddressSpaceHashDefinition</a>
+<a name="ln43"> </a>
+<a name="ln44"> </a>
+<a name="ln45">namespace {</a>
+<a name="ln46"> </a>
+<a name="ln47">struct AddressSpaceHashDefinition {</a>
+<a name="ln48">	typedef team_id			KeyType;</a>
+<a name="ln49">	typedef VMAddressSpace	ValueType;</a>
+<a name="ln50"> </a>
+<a name="ln51">	size_t HashKey(team_id key) const</a>
+<a name="ln52">	{</a>
+<a name="ln53">		return key;</a>
+<a name="ln54">	}</a>
+<a name="ln55"> </a>
+<a name="ln56">	size_t Hash(const VMAddressSpace* value) const</a>
+<a name="ln57">	{</a>
+<a name="ln58">		return HashKey(value-&gt;ID());</a>
+<a name="ln59">	}</a>
+<a name="ln60"> </a>
+<a name="ln61">	bool Compare(team_id key, const VMAddressSpace* value) const</a>
+<a name="ln62">	{</a>
+<a name="ln63">		return value-&gt;ID() == key;</a>
+<a name="ln64">	}</a>
+<a name="ln65"> </a>
+<a name="ln66">	VMAddressSpace*&amp; GetLink(VMAddressSpace* value) const</a>
+<a name="ln67">	{</a>
+<a name="ln68">		return value-&gt;HashTableLink();</a>
+<a name="ln69">	}</a>
+<a name="ln70">};</a>
+<a name="ln71"> </a>
+<a name="ln72">typedef BOpenHashTable&lt;AddressSpaceHashDefinition&gt; AddressSpaceTable;</a>
+<a name="ln73"> </a>
+<a name="ln74">} // namespace</a>
+<a name="ln75"> </a>
+<a name="ln76"> </a>
+<a name="ln77">static AddressSpaceTable	sAddressSpaceTable;</a>
+<a name="ln78">static rw_lock				sAddressSpaceTableLock;</a>
+<a name="ln79"> </a>
+<a name="ln80">VMAddressSpace* VMAddressSpace::sKernelAddressSpace;</a>
+<a name="ln81"> </a>
+<a name="ln82"> </a>
+<a name="ln83">// #pragma mark - VMAddressSpace</a>
+<a name="ln84"> </a>
+<a name="ln85"> </a>
+<a name="ln86">VMAddressSpace::VMAddressSpace(team_id id, addr_t base, size_t size,</a>
+<a name="ln87">	const char* name)</a>
+<a name="ln88">	:</a>
+<a name="ln89">	fBase(base),</a>
+<a name="ln90">	fEndAddress(base + (size - 1)),</a>
+<a name="ln91">	fFreeSpace(size),</a>
+<a name="ln92">	fID(id),</a>
+<a name="ln93">	fRefCount(1),</a>
+<a name="ln94">	fFaultCount(0),</a>
+<a name="ln95">	fChangeCount(0),</a>
+<a name="ln96">	fTranslationMap(NULL),</a>
+<a name="ln97">	fRandomizingEnabled(true),</a>
+<a name="ln98">	fDeleting(false)</a>
+<a name="ln99">{</a>
+<a name="ln100">	rw_lock_init(&amp;fLock, name);</a>
+<a name="ln101">//	rw_lock_init(&amp;fLock, kernel ? &quot;kernel address space&quot; : &quot;address space&quot;);</a>
+<a name="ln102">}</a>
+<a name="ln103"> </a>
+<a name="ln104"> </a>
+<a name="ln105">VMAddressSpace::~VMAddressSpace()</a>
+<a name="ln106">{</a>
+<a name="ln107">	TRACE((&quot;VMAddressSpace::~VMAddressSpace: called on aspace %&quot; B_PRId32 &quot;\n&quot;,</a>
+<a name="ln108">		ID()));</a>
+<a name="ln109"> </a>
+<a name="ln110">	WriteLock();</a>
+<a name="ln111"> </a>
+<a name="ln112">	delete fTranslationMap;</a>
+<a name="ln113"> </a>
+<a name="ln114">	rw_lock_destroy(&amp;fLock);</a>
+<a name="ln115">}</a>
+<a name="ln116"> </a>
+<a name="ln117"> </a>
+<a name="ln118">/*static*/ status_t</a>
+<a name="ln119">VMAddressSpace::Init()</a>
+<a name="ln120">{</a>
+<a name="ln121">	rw_lock_init(&amp;sAddressSpaceTableLock, &quot;address spaces table&quot;);</a>
+<a name="ln122"> </a>
+<a name="ln123">	// create the area and address space hash tables</a>
+<a name="ln124">	{</a>
+<a name="ln125">		new(&amp;sAddressSpaceTable) AddressSpaceTable;</a>
+<a name="ln126">		status_t error = sAddressSpaceTable.Init(ASPACE_HASH_TABLE_SIZE);</a>
+<a name="ln127">		if (error != B_OK)</a>
+<a name="ln128">			panic(&quot;vm_init: error creating aspace hash table\n&quot;);</a>
+<a name="ln129">	}</a>
+<a name="ln130"> </a>
+<a name="ln131">	// create the initial kernel address space</a>
+<a name="ln132">	if (Create(B_SYSTEM_TEAM, KERNEL_BASE, KERNEL_SIZE, true,</a>
+<a name="ln133">			&amp;sKernelAddressSpace) != B_OK) {</a>
+<a name="ln134">		panic(&quot;vm_init: error creating kernel address space!\n&quot;);</a>
+<a name="ln135">	}</a>
+<a name="ln136"> </a>
+<a name="ln137">	add_debugger_command(&quot;aspaces&quot;, &amp;_DumpListCommand,</a>
+<a name="ln138">		&quot;Dump a list of all address spaces&quot;);</a>
+<a name="ln139">	add_debugger_command(&quot;aspace&quot;, &amp;_DumpCommand,</a>
+<a name="ln140">		&quot;Dump info about a particular address space&quot;);</a>
+<a name="ln141"> </a>
+<a name="ln142">	return B_OK;</a>
+<a name="ln143">}</a>
+<a name="ln144"> </a>
+<a name="ln145"> </a>
+<a name="ln146">/*! Deletes all areas in the specified address space, and the address</a>
+<a name="ln147">	space by decreasing all reference counters. It also marks the</a>
+<a name="ln148">	address space of being in deletion state, so that no more areas</a>
+<a name="ln149">	can be created in it.</a>
+<a name="ln150">	After this, the address space is not operational anymore, but might</a>
+<a name="ln151">	still be in memory until the last reference has been released.</a>
+<a name="ln152">*/</a>
+<a name="ln153">void</a>
+<a name="ln154">VMAddressSpace::RemoveAndPut()</a>
+<a name="ln155">{</a>
+<a name="ln156">	WriteLock();</a>
+<a name="ln157">	fDeleting = true;</a>
+<a name="ln158">	WriteUnlock();</a>
+<a name="ln159"> </a>
+<a name="ln160">	vm_delete_areas(this, true);</a>
+<a name="ln161">	Put();</a>
+<a name="ln162">}</a>
+<a name="ln163"> </a>
+<a name="ln164"> </a>
+<a name="ln165">status_t</a>
+<a name="ln166">VMAddressSpace::InitObject()</a>
+<a name="ln167">{</a>
+<a name="ln168">	return B_OK;</a>
+<a name="ln169">}</a>
+<a name="ln170"> </a>
+<a name="ln171"> </a>
+<a name="ln172">void</a>
+<a name="ln173">VMAddressSpace::Dump() const</a>
+<a name="ln174">{</a>
+<a name="ln175">	kprintf(&quot;dump of address space at %p:\n&quot;, this);</a>
+<a name="ln176">	kprintf(&quot;id: %&quot; B_PRId32 &quot;\n&quot;, fID);</a>
+<a name="ln177">	kprintf(&quot;ref_count: %&quot; B_PRId32 &quot;\n&quot;, fRefCount);</a>
+<a name="ln178">	kprintf(&quot;fault_count: %&quot; B_PRId32 &quot;\n&quot;, fFaultCount);</a>
+<a name="ln179">	kprintf(&quot;translation_map: %p\n&quot;, fTranslationMap);</a>
+<a name="ln180">	kprintf(&quot;base: %#&quot; B_PRIxADDR &quot;\n&quot;, fBase);</a>
+<a name="ln181">	kprintf(&quot;end: %#&quot; B_PRIxADDR &quot;\n&quot;, fEndAddress);</a>
+<a name="ln182">	kprintf(&quot;change_count: %&quot; B_PRId32 &quot;\n&quot;, fChangeCount);</a>
+<a name="ln183">}</a>
+<a name="ln184"> </a>
+<a name="ln185"> </a>
+<a name="ln186">/*static*/ status_t</a>
+<a name="ln187">VMAddressSpace::Create(team_id teamID, addr_t base, size_t size, bool kernel,</a>
+<a name="ln188">	VMAddressSpace** _addressSpace)</a>
+<a name="ln189">{</a>
+<a name="ln190">	VMAddressSpace* addressSpace = kernel</a>
+<a name="ln191">		? (VMAddressSpace*)new(std::nothrow) VMKernelAddressSpace(teamID, base,</a>
+<a name="ln192">			size)</a>
+<a name="ln193">		: (VMAddressSpace*)new(std::nothrow) VMUserAddressSpace(teamID, base,</a>
+<a name="ln194">			size);</a>
+<a name="ln195">	if (addressSpace == NULL)</a>
+<a name="ln196">		return B_NO_MEMORY;</a>
+<a name="ln197"> </a>
+<a name="ln198">	status_t status = addressSpace-&gt;InitObject();</a>
+<a name="ln199">	if (status != B_OK) {</a>
+<a name="ln200">		delete addressSpace;</a>
+<a name="ln201">		return status;</a>
+<a name="ln202">	}</a>
+<a name="ln203"> </a>
+<a name="ln204">	TRACE((&quot;VMAddressSpace::Create(): team %&quot; B_PRId32 &quot; (%skernel): %#lx &quot;</a>
+<a name="ln205">		&quot;bytes starting at %#lx =&gt; %p\n&quot;, teamID, kernel ? &quot;&quot; : &quot;!&quot;, size,</a>
+<a name="ln206">		base, addressSpace));</a>
+<a name="ln207"> </a>
+<a name="ln208">	// create the corresponding translation map</a>
+<a name="ln209">	status = arch_vm_translation_map_create_map(kernel,</a>
+<a name="ln210">		&amp;addressSpace-&gt;fTranslationMap);</a>
+<a name="ln211">	if (status != B_OK) {</a>
+<a name="ln212">		delete addressSpace;</a>
+<a name="ln213">		return status;</a>
+<a name="ln214">	}</a>
+<a name="ln215"> </a>
+<a name="ln216">	// add the aspace to the global hash table</a>
+<a name="ln217">	rw_lock_write_lock(&amp;sAddressSpaceTableLock);</a>
+<a name="ln218">	sAddressSpaceTable.InsertUnchecked(addressSpace);</a>
+<a name="ln219">	rw_lock_write_unlock(&amp;sAddressSpaceTableLock);</a>
+<a name="ln220"> </a>
+<a name="ln221">	*_addressSpace = addressSpace;</a>
+<a name="ln222">	return B_OK;</a>
+<a name="ln223">}</a>
+<a name="ln224"> </a>
+<a name="ln225"> </a>
+<a name="ln226">/*static*/ VMAddressSpace*</a>
+<a name="ln227">VMAddressSpace::GetKernel()</a>
+<a name="ln228">{</a>
+<a name="ln229">	// we can treat this one a little differently since it can't be deleted</a>
+<a name="ln230">	sKernelAddressSpace-&gt;Get();</a>
+<a name="ln231">	return sKernelAddressSpace;</a>
+<a name="ln232">}</a>
+<a name="ln233"> </a>
+<a name="ln234"> </a>
+<a name="ln235">/*static*/ team_id</a>
+<a name="ln236">VMAddressSpace::CurrentID()</a>
+<a name="ln237">{</a>
+<a name="ln238">	Thread* thread = thread_get_current_thread();</a>
+<a name="ln239"> </a>
+<a name="ln240">	if (thread != NULL &amp;&amp; thread-&gt;team-&gt;address_space != NULL)</a>
+<a name="ln241">		return thread-&gt;team-&gt;id;</a>
+<a name="ln242"> </a>
+<a name="ln243">	return B_ERROR;</a>
+<a name="ln244">}</a>
+<a name="ln245"> </a>
+<a name="ln246"> </a>
+<a name="ln247">/*static*/ VMAddressSpace*</a>
+<a name="ln248">VMAddressSpace::GetCurrent()</a>
+<a name="ln249">{</a>
+<a name="ln250">	Thread* thread = thread_get_current_thread();</a>
+<a name="ln251"> </a>
+<a name="ln252">	if (thread != NULL) {</a>
+<a name="ln253">		VMAddressSpace* addressSpace = thread-&gt;team-&gt;address_space;</a>
+<a name="ln254">		if (addressSpace != NULL) {</a>
+<a name="ln255">			addressSpace-&gt;Get();</a>
+<a name="ln256">			return addressSpace;</a>
+<a name="ln257">		}</a>
+<a name="ln258">	}</a>
+<a name="ln259"> </a>
+<a name="ln260">	return NULL;</a>
+<a name="ln261">}</a>
+<a name="ln262"> </a>
+<a name="ln263"> </a>
+<a name="ln264">/*static*/ VMAddressSpace*</a>
+<a name="ln265">VMAddressSpace::Get(team_id teamID)</a>
+<a name="ln266">{</a>
+<a name="ln267">	rw_lock_read_lock(&amp;sAddressSpaceTableLock);</a>
+<a name="ln268">	VMAddressSpace* addressSpace = sAddressSpaceTable.Lookup(teamID);</a>
+<a name="ln269">	if (addressSpace)</a>
+<a name="ln270">		addressSpace-&gt;Get();</a>
+<a name="ln271">	rw_lock_read_unlock(&amp;sAddressSpaceTableLock);</a>
+<a name="ln272"> </a>
+<a name="ln273">	return addressSpace;</a>
+<a name="ln274">}</a>
+<a name="ln275"> </a>
+<a name="ln276"> </a>
+<a name="ln277">/*static*/ VMAddressSpace*</a>
+<a name="ln278">VMAddressSpace::DebugFirst()</a>
+<a name="ln279">{</a>
+<a name="ln280">	return sAddressSpaceTable.GetIterator().Next();</a>
+<a name="ln281">}</a>
+<a name="ln282"> </a>
+<a name="ln283"> </a>
+<a name="ln284">/*static*/ VMAddressSpace*</a>
+<a name="ln285">VMAddressSpace::DebugNext(VMAddressSpace* addressSpace)</a>
+<a name="ln286">{</a>
+<a name="ln287">	if (addressSpace == NULL)</a>
+<a name="ln288">		return NULL;</a>
+<a name="ln289"> </a>
+<a name="ln290">	AddressSpaceTable::Iterator it</a>
+<a name="ln291">		= sAddressSpaceTable.GetIterator(addressSpace-&gt;ID());</a>
+<a name="ln292">	it.Next();</a>
+<a name="ln293">	return it.Next();</a>
+<a name="ln294">}</a>
+<a name="ln295"> </a>
+<a name="ln296"> </a>
+<a name="ln297">/*static*/ VMAddressSpace*</a>
+<a name="ln298">VMAddressSpace::DebugGet(team_id teamID)</a>
+<a name="ln299">{</a>
+<a name="ln300">	return sAddressSpaceTable.Lookup(teamID);</a>
+<a name="ln301">}</a>
+<a name="ln302"> </a>
+<a name="ln303"> </a>
+<a name="ln304">/*static*/ void</a>
+<a name="ln305">VMAddressSpace::_DeleteIfUnreferenced(team_id id)</a>
+<a name="ln306">{</a>
+<a name="ln307">	rw_lock_write_lock(&amp;sAddressSpaceTableLock);</a>
+<a name="ln308"> </a>
+<a name="ln309">	bool remove = false;</a>
+<a name="ln310">	VMAddressSpace* addressSpace = sAddressSpaceTable.Lookup(id);</a>
+<a name="ln311">	if (addressSpace != NULL &amp;&amp; addressSpace-&gt;fRefCount == 0) {</a>
+<a name="ln312">		sAddressSpaceTable.RemoveUnchecked(addressSpace);</a>
+<a name="ln313">		remove = true;</a>
+<a name="ln314">	}</a>
+<a name="ln315"> </a>
+<a name="ln316">	rw_lock_write_unlock(&amp;sAddressSpaceTableLock);</a>
+<a name="ln317"> </a>
+<a name="ln318">	if (remove)</a>
+<a name="ln319">		delete addressSpace;</a>
+<a name="ln320">}</a>
+<a name="ln321"> </a>
+<a name="ln322"> </a>
+<a name="ln323">/*static*/ int</a>
+<a name="ln324">VMAddressSpace::_DumpCommand(int argc, char** argv)</a>
+<a name="ln325">{</a>
+<a name="ln326">	VMAddressSpace* aspace;</a>
+<a name="ln327"> </a>
+<a name="ln328">	if (argc &lt; 2) {</a>
+<a name="ln329">		kprintf(&quot;aspace: not enough arguments\n&quot;);</a>
+<a name="ln330">		return 0;</a>
+<a name="ln331">	}</a>
+<a name="ln332"> </a>
+<a name="ln333">	// if the argument looks like a number, treat it as such</a>
+<a name="ln334"> </a>
+<a name="ln335">	{</a>
+<a name="ln336">		team_id id = strtoul(argv[1], NULL, 0);</a>
+<a name="ln337"> </a>
+<a name="ln338">		aspace = sAddressSpaceTable.Lookup(id);</a>
+<a name="ln339">		if (aspace == NULL) {</a>
+<a name="ln340">			kprintf(&quot;invalid aspace id\n&quot;);</a>
+<a name="ln341">		} else {</a>
+<a name="ln342">			aspace-&gt;Dump();</a>
+<a name="ln343">		}</a>
+<a name="ln344">	}</a>
+<a name="ln345"> </a>
+<a name="ln346">	return 0;</a>
+<a name="ln347">}</a>
+<a name="ln348"> </a>
+<a name="ln349"> </a>
+<a name="ln350">/*static*/ int</a>
+<a name="ln351">VMAddressSpace::_DumpListCommand(int argc, char** argv)</a>
+<a name="ln352">{</a>
+<a name="ln353">	kprintf(&quot;  %*s      id     %*s     %*s   area count    area size\n&quot;,</a>
+<a name="ln354">		B_PRINTF_POINTER_WIDTH, &quot;address&quot;, B_PRINTF_POINTER_WIDTH, &quot;base&quot;,</a>
+<a name="ln355">		B_PRINTF_POINTER_WIDTH, &quot;end&quot;);</a>
+<a name="ln356"> </a>
+<a name="ln357">	AddressSpaceTable::Iterator it = sAddressSpaceTable.GetIterator();</a>
+<a name="ln358">	while (VMAddressSpace* space = it.Next()) {</a>
+<a name="ln359">		int32 areaCount = 0;</a>
+<a name="ln360">		off_t areaSize = 0;</a>
+<a name="ln361">		for (VMAddressSpace::AreaIterator areaIt = space-&gt;GetAreaIterator();</a>
+<a name="ln362">				VMArea* area = areaIt.Next();) {</a>
+<a name="ln363">			areaCount++;</a>
+<a name="ln364">			areaSize += area-&gt;Size();</a>
+<a name="ln365">		}</a>
+<a name="ln366">		kprintf(&quot;%p  %6&quot; B_PRId32 &quot;   %#010&quot; B_PRIxADDR &quot;   %#10&quot; B_PRIxADDR</a>
+<a name="ln367">			&quot;   %10&quot; B_PRId32 &quot;   %10&quot; B_PRIdOFF &quot;\n&quot;, space, space-&gt;ID(),</a>
+<a name="ln368">			space-&gt;Base(), space-&gt;EndAddress(), areaCount, areaSize);</a>
+<a name="ln369">	}</a>
+<a name="ln370"> </a>
+<a name="ln371">	return 0;</a>
+<a name="ln372">}</a>
+
+</code></pre>
+<div class="balloon" rel="86"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fHashTableLink.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

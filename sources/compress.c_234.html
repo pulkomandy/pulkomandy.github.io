@@ -1,0 +1,1988 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>compress.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/**</a>
+<a name="ln2"> * compress.c - Compressed attribute handling code.  Originated from the Linux-NTFS</a>
+<a name="ln3"> *		project.</a>
+<a name="ln4"> *</a>
+<a name="ln5"> * Copyright (c) 2004-2005 Anton Altaparmakov</a>
+<a name="ln6"> * Copyright (c) 2004-2006 Szabolcs Szakacsits</a>
+<a name="ln7"> * Copyright (c)      2005 Yura Pakhuchiy</a>
+<a name="ln8"> * Copyright (c) 2009-2014 Jean-Pierre Andre</a>
+<a name="ln9"> * Copyright (c)      2014 Eric Biggers</a>
+<a name="ln10"> *</a>
+<a name="ln11"> * This program/include file is free software; you can redistribute it and/or</a>
+<a name="ln12"> * modify it under the terms of the GNU General Public License as published</a>
+<a name="ln13"> * by the Free Software Foundation; either version 2 of the License, or</a>
+<a name="ln14"> * (at your option) any later version.</a>
+<a name="ln15"> *</a>
+<a name="ln16"> * This program/include file is distributed in the hope that it will be</a>
+<a name="ln17"> * useful, but WITHOUT ANY WARRANTY; without even the implied warranty</a>
+<a name="ln18"> * of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the</a>
+<a name="ln19"> * GNU General Public License for more details.</a>
+<a name="ln20"> *</a>
+<a name="ln21"> * You should have received a copy of the GNU General Public License</a>
+<a name="ln22"> * along with this program (in the main directory of the NTFS-3G</a>
+<a name="ln23"> * distribution in the file COPYING); if not, write to the Free Software</a>
+<a name="ln24"> * Foundation,Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA</a>
+<a name="ln25"> */</a>
+<a name="ln26"> </a>
+<a name="ln27">#ifdef HAVE_CONFIG_H</a>
+<a name="ln28">#include &quot;config.h&quot;</a>
+<a name="ln29">#endif</a>
+<a name="ln30"> </a>
+<a name="ln31">#ifdef HAVE_STDIO_H</a>
+<a name="ln32">#include &lt;stdio.h&gt;</a>
+<a name="ln33">#endif</a>
+<a name="ln34">#ifdef HAVE_STRING_H</a>
+<a name="ln35">#include &lt;string.h&gt;</a>
+<a name="ln36">#endif</a>
+<a name="ln37">#ifdef HAVE_STDLIB_H</a>
+<a name="ln38">#include &lt;stdlib.h&gt;</a>
+<a name="ln39">#endif</a>
+<a name="ln40">#ifdef HAVE_ERRNO_H</a>
+<a name="ln41">#include &lt;errno.h&gt;</a>
+<a name="ln42">#endif</a>
+<a name="ln43"> </a>
+<a name="ln44">#include &quot;attrib.h&quot;</a>
+<a name="ln45">#include &quot;debug.h&quot;</a>
+<a name="ln46">#include &quot;volume.h&quot;</a>
+<a name="ln47">#include &quot;types.h&quot;</a>
+<a name="ln48">#include &quot;layout.h&quot;</a>
+<a name="ln49">#include &quot;runlist.h&quot;</a>
+<a name="ln50">#include &quot;compress.h&quot;</a>
+<a name="ln51">#include &quot;lcnalloc.h&quot;</a>
+<a name="ln52">#include &quot;logging.h&quot;</a>
+<a name="ln53">#include &quot;misc.h&quot;</a>
+<a name="ln54"> </a>
+<a name="ln55">#undef le16_to_cpup </a>
+<a name="ln56">/* the standard le16_to_cpup() crashes for unaligned data on some processors */ </a>
+<a name="ln57">#define le16_to_cpup(p) (*(u8*)(p) + (((u8*)(p))[1] &lt;&lt; 8))</a>
+<a name="ln58"> </a>
+<a name="ln59">/**</a>
+<a name="ln60"> * enum ntfs_compression_constants - constants used in the compression code</a>
+<a name="ln61"> */</a>
+<a name="ln62">typedef enum {</a>
+<a name="ln63">	/* Token types and access mask. */</a>
+<a name="ln64">	NTFS_SYMBOL_TOKEN	=	0,</a>
+<a name="ln65">	NTFS_PHRASE_TOKEN	=	1,</a>
+<a name="ln66">	NTFS_TOKEN_MASK		=	1,</a>
+<a name="ln67"> </a>
+<a name="ln68">	/* Compression sub-block constants. */</a>
+<a name="ln69">	NTFS_SB_SIZE_MASK	=	0x0fff,</a>
+<a name="ln70">	NTFS_SB_SIZE		=	0x1000,</a>
+<a name="ln71">	NTFS_SB_IS_COMPRESSED	=	0x8000,</a>
+<a name="ln72">} ntfs_compression_constants;</a>
+<a name="ln73"> </a>
+<a name="ln74">/* Match length at or above which ntfs_best_match() will stop searching for</a>
+<a name="ln75"> * longer matches.  */</a>
+<a name="ln76">#define NICE_MATCH_LEN 18</a>
+<a name="ln77"> </a>
+<a name="ln78">/* Maximum number of potential matches that ntfs_best_match() will consider at</a>
+<a name="ln79"> * each position.  */</a>
+<a name="ln80">#define MAX_SEARCH_DEPTH 24</a>
+<a name="ln81"> </a>
+<a name="ln82">/* log base 2 of the number of entries in the hash table for match-finding.  */</a>
+<a name="ln83">#define HASH_SHIFT 14</a>
+<a name="ln84"> </a>
+<a name="ln85">/* Constant for the multiplicative hash function.  */</a>
+<a name="ln86">#define HASH_MULTIPLIER 0x1E35A7BD</a>
+<a name="ln87"> </a>
+<a name="ln88">struct COMPRESS_CONTEXT {</a>
+<a name="ln89">	const unsigned char *inbuf;</a>
+<a name="ln90">	int bufsize;</a>
+<a name="ln91">	int size;</a>
+<a name="ln92">	int rel;</a>
+<a name="ln93">	int mxsz;</a>
+<a name="ln94">	s16 head[1 &lt;&lt; HASH_SHIFT];</a>
+<a name="ln95">	s16 prev[NTFS_SB_SIZE];</a>
+<a name="ln96">} ;</a>
+<a name="ln97"> </a>
+<a name="ln98">/*</a>
+<a name="ln99"> *		Hash the next 3-byte sequence in the input buffer</a>
+<a name="ln100"> */</a>
+<a name="ln101">static inline unsigned int ntfs_hash(const u8 *p)</a>
+<a name="ln102">{</a>
+<a name="ln103">	u32 str;</a>
+<a name="ln104">	u32 hash;</a>
+<a name="ln105"> </a>
+<a name="ln106">#if defined(__i386__) || defined(__x86_64__)</a>
+<a name="ln107">	/* Unaligned access allowed, and little endian CPU.</a>
+<a name="ln108">	 * Callers ensure that at least 4 (not 3) bytes are remaining.  */</a>
+<a name="ln109">	str = *(const u32 *)p &amp; 0xFFFFFF;</a>
+<a name="ln110">#else</a>
+<a name="ln111">	str = ((u32)p[0] &lt;&lt; 0) | ((u32)p[1] &lt;&lt; 8) | ((u32)p[2] &lt;&lt; 16);</a>
+<a name="ln112">#endif</a>
+<a name="ln113"> </a>
+<a name="ln114">	hash = str * HASH_MULTIPLIER;</a>
+<a name="ln115"> </a>
+<a name="ln116">	/* High bits are more random than the low bits.  */</a>
+<a name="ln117">	return hash &gt;&gt; (32 - HASH_SHIFT);</a>
+<a name="ln118">}</a>
+<a name="ln119"> </a>
+<a name="ln120">/*</a>
+<a name="ln121"> *		Search for the longest sequence matching current position</a>
+<a name="ln122"> *</a>
+<a name="ln123"> *	A hash table, each entry of which points to a chain of sequence</a>
+<a name="ln124"> *	positions sharing the corresponding hash code, is maintained to speed up</a>
+<a name="ln125"> *	searching for matches.  To maintain the hash table, either</a>
+<a name="ln126"> *	ntfs_best_match() or ntfs_skip_position() has to be called for each</a>
+<a name="ln127"> *	consecutive position.</a>
+<a name="ln128"> *</a>
+<a name="ln129"> *	This function is heavily used; it has to be optimized carefully.</a>
+<a name="ln130"> *</a>
+<a name="ln131"> *	This function sets pctx-&gt;size and pctx-&gt;rel to the length and offset,</a>
+<a name="ln132"> *	respectively, of the longest match found.</a>
+<a name="ln133"> *</a>
+<a name="ln134"> *	The minimum match length is assumed to be 3, and the maximum match</a>
+<a name="ln135"> *	length is assumed to be pctx-&gt;mxsz.  If this function produces</a>
+<a name="ln136"> *	pctx-&gt;size &lt; 3, then no match was found.</a>
+<a name="ln137"> *</a>
+<a name="ln138"> *	Note: for the following reasons, this function is not guaranteed to find</a>
+<a name="ln139"> *	*the* longest match up to pctx-&gt;mxsz:</a>
+<a name="ln140"> *</a>
+<a name="ln141"> *	(1) If this function finds a match of NICE_MATCH_LEN bytes or greater,</a>
+<a name="ln142"> *	    it ends early because a match this long is good enough and it's not</a>
+<a name="ln143"> *	    worth spending more time searching.</a>
+<a name="ln144"> *</a>
+<a name="ln145"> *	(2) If this function considers MAX_SEARCH_DEPTH matches with a single</a>
+<a name="ln146"> *	    position, it ends early and returns the longest match found so far.</a>
+<a name="ln147"> *	    This saves a lot of time on degenerate inputs.</a>
+<a name="ln148"> */</a>
+<a name="ln149">static void ntfs_best_match(struct COMPRESS_CONTEXT *pctx, const int i,</a>
+<a name="ln150">			    int best_len)</a>
+<a name="ln151">{</a>
+<a name="ln152">	const u8 * const inbuf = pctx-&gt;inbuf;</a>
+<a name="ln153">	const u8 * const strptr = &amp;inbuf[i]; /* String we're matching against */</a>
+<a name="ln154">	s16 * const prev = pctx-&gt;prev;</a>
+<a name="ln155">	const int max_len = min(pctx-&gt;bufsize - i, pctx-&gt;mxsz);</a>
+<a name="ln156">	const int nice_len = min(NICE_MATCH_LEN, max_len);</a>
+<a name="ln157">	int depth_remaining = MAX_SEARCH_DEPTH;</a>
+<a name="ln158">	const u8 *best_matchptr = strptr;</a>
+<a name="ln159">	unsigned int hash;</a>
+<a name="ln160">	s16 cur_match;</a>
+<a name="ln161">	const u8 *matchptr;</a>
+<a name="ln162">	int len;</a>
+<a name="ln163"> </a>
+<a name="ln164">	if (max_len &lt; 4)</a>
+<a name="ln165">		goto out;</a>
+<a name="ln166"> </a>
+<a name="ln167">	/* Insert the current sequence into the appropriate hash chain.  */</a>
+<a name="ln168">	hash = ntfs_hash(strptr);</a>
+<a name="ln169">	cur_match = pctx-&gt;head[hash];</a>
+<a name="ln170">	prev[i] = cur_match;</a>
+<a name="ln171">	pctx-&gt;head[hash] = i;</a>
+<a name="ln172"> </a>
+<a name="ln173">	if (best_len &gt;= max_len) {</a>
+<a name="ln174">		/* Lazy match is being attempted, but there aren't enough length</a>
+<a name="ln175">		 * bits remaining to code a longer match.  */</a>
+<a name="ln176">		goto out;</a>
+<a name="ln177">	}</a>
+<a name="ln178"> </a>
+<a name="ln179">	/* Search the appropriate hash chain for matches.  */</a>
+<a name="ln180"> </a>
+<a name="ln181">	for (; cur_match &gt;= 0 &amp;&amp; depth_remaining--;</a>
+<a name="ln182">		cur_match = prev[cur_match])</a>
+<a name="ln183">	{</a>
+<a name="ln184"> </a>
+<a name="ln185">		matchptr = &amp;inbuf[cur_match];</a>
+<a name="ln186"> </a>
+<a name="ln187">		/* Considering the potential match at 'matchptr':  is it longer</a>
+<a name="ln188">		 * than 'best_len'?</a>
+<a name="ln189">		 *</a>
+<a name="ln190">		 * The bytes at index 'best_len' are the most likely to differ,</a>
+<a name="ln191">		 * so check them first.</a>
+<a name="ln192">		 *</a>
+<a name="ln193">		 * The bytes at indices 'best_len - 1' and '0' are less</a>
+<a name="ln194">		 * important to check separately.  But doing so still gives a</a>
+<a name="ln195">		 * slight performance improvement, at least on x86_64, probably</a>
+<a name="ln196">		 * because they create separate branches for the CPU to predict</a>
+<a name="ln197">		 * independently of the branches in the main comparison loops.</a>
+<a name="ln198">		 */</a>
+<a name="ln199">		if (matchptr[best_len] != strptr[best_len] ||</a>
+<a name="ln200">		    matchptr[best_len - 1] != strptr[best_len - 1] ||</a>
+<a name="ln201">		    matchptr[0] != strptr[0])</a>
+<a name="ln202">			goto next_match;</a>
+<a name="ln203"> </a>
+<a name="ln204">		for (len = 1; len &lt; best_len - 1; len++)</a>
+<a name="ln205">			if (matchptr[len] != strptr[len])</a>
+<a name="ln206">				goto next_match;</a>
+<a name="ln207"> </a>
+<a name="ln208">		/* The match is the longest found so far ---</a>
+<a name="ln209">		 * at least 'best_len' + 1 bytes.  Continue extending it.  */</a>
+<a name="ln210"> </a>
+<a name="ln211">		best_matchptr = matchptr;</a>
+<a name="ln212"> </a>
+<a name="ln213">		do {</a>
+<a name="ln214">			if (++best_len &gt;= nice_len) {</a>
+<a name="ln215">				/* 'nice_len' reached; don't waste time</a>
+<a name="ln216">				 * searching for longer matches.  Extend the</a>
+<a name="ln217">				 * match as far as possible and terminate the</a>
+<a name="ln218">				 * search.  */</a>
+<a name="ln219">				while (best_len &lt; max_len &amp;&amp;</a>
+<a name="ln220">					(best_matchptr[best_len] ==</a>
+<a name="ln221">						strptr[best_len]))</a>
+<a name="ln222">				{</a>
+<a name="ln223">					best_len++;</a>
+<a name="ln224">				}</a>
+<a name="ln225">				goto out;</a>
+<a name="ln226">			}</a>
+<a name="ln227">		} while (best_matchptr[best_len] == strptr[best_len]);</a>
+<a name="ln228"> </a>
+<a name="ln229">		/* Found a longer match, but 'nice_len' not yet reached.  */</a>
+<a name="ln230"> </a>
+<a name="ln231">	next_match:</a>
+<a name="ln232">		/* Continue to next match in the chain.  */</a>
+<a name="ln233">		;</a>
+<a name="ln234">	}</a>
+<a name="ln235"> </a>
+<a name="ln236">	/* Reached end of chain, or ended early due to reaching the maximum</a>
+<a name="ln237">	 * search depth.  */</a>
+<a name="ln238"> </a>
+<a name="ln239">out:</a>
+<a name="ln240">	/* Return the longest match we were able to find.  */</a>
+<a name="ln241">	pctx-&gt;size = best_len;</a>
+<a name="ln242">	pctx-&gt;rel = best_matchptr - strptr; /* given as a negative number! */</a>
+<a name="ln243">}</a>
+<a name="ln244"> </a>
+<a name="ln245">/*</a>
+<a name="ln246"> *		Advance the match-finder, but don't search for matches.</a>
+<a name="ln247"> */</a>
+<a name="ln248">static void ntfs_skip_position(struct COMPRESS_CONTEXT *pctx, const int i)</a>
+<a name="ln249">{</a>
+<a name="ln250">	unsigned int hash;</a>
+<a name="ln251"> </a>
+<a name="ln252">	if (pctx-&gt;bufsize - i &lt; 4)</a>
+<a name="ln253">		return;</a>
+<a name="ln254"> </a>
+<a name="ln255">	/* Insert the current sequence into the appropriate hash chain.  */</a>
+<a name="ln256">	hash = ntfs_hash(pctx-&gt;inbuf + i);</a>
+<a name="ln257">	pctx-&gt;prev[i] = pctx-&gt;head[hash];</a>
+<a name="ln258">	pctx-&gt;head[hash] = i;</a>
+<a name="ln259">}</a>
+<a name="ln260"> </a>
+<a name="ln261">/*</a>
+<a name="ln262"> *		Compress a 4096-byte block</a>
+<a name="ln263"> *</a>
+<a name="ln264"> *	Returns a header of two bytes followed by the compressed data.</a>
+<a name="ln265"> *	If compression is not effective, the header and an uncompressed</a>
+<a name="ln266"> *	block is returned.</a>
+<a name="ln267"> *</a>
+<a name="ln268"> *	Note : two bytes may be output before output buffer overflow</a>
+<a name="ln269"> *	is detected, so a 4100-bytes output buffer must be reserved.</a>
+<a name="ln270"> *</a>
+<a name="ln271"> *	Returns the size of the compressed block, including the</a>
+<a name="ln272"> *			header (minimal size is 2, maximum size is 4098)</a>
+<a name="ln273"> *		0 if an error has been met. </a>
+<a name="ln274"> */</a>
+<a name="ln275"> </a>
+<a name="ln276">static unsigned int ntfs_compress_block(const char *inbuf, const int bufsize,</a>
+<a name="ln277">				char *outbuf)</a>
+<a name="ln278">{</a>
+<a name="ln279">	struct COMPRESS_CONTEXT *pctx;</a>
+<a name="ln280">	int i; /* current position */</a>
+<a name="ln281">	int j; /* end of best match from current position */</a>
+<a name="ln282">	int k; /* end of best match from next position */</a>
+<a name="ln283">	int offs; /* offset to best match */</a>
+<a name="ln284">	int bp; /* bits to store offset */</a>
+<a name="ln285">	int bp_cur; /* saved bits to store offset at current position */</a>
+<a name="ln286">	int mxoff; /* max match offset : 1 &lt;&lt; bp */</a>
+<a name="ln287">	unsigned int xout;</a>
+<a name="ln288">	unsigned int q; /* aggregated offset and size */</a>
+<a name="ln289">	int have_match; /* do we have a match at the current position? */</a>
+<a name="ln290">	char *ptag; /* location reserved for a tag */</a>
+<a name="ln291">	int tag;    /* current value of tag */</a>
+<a name="ln292">	int ntag;   /* count of bits still undefined in tag */</a>
+<a name="ln293"> </a>
+<a name="ln294">	pctx = ntfs_malloc(sizeof(struct COMPRESS_CONTEXT));</a>
+<a name="ln295">	if (!pctx) {</a>
+<a name="ln296">		errno = ENOMEM;</a>
+<a name="ln297">		return 0;</a>
+<a name="ln298">	}</a>
+<a name="ln299"> </a>
+<a name="ln300">	/* All hash chains start as empty.  The special value '-1' indicates the</a>
+<a name="ln301">	 * end of each hash chain.  */</a>
+<a name="ln302">	memset(pctx-&gt;head, 0xFF, sizeof(pctx-&gt;head));</a>
+<a name="ln303"> </a>
+<a name="ln304">	pctx-&gt;inbuf = (const unsigned char*)inbuf;</a>
+<a name="ln305">	pctx-&gt;bufsize = bufsize;</a>
+<a name="ln306">	xout = 2;</a>
+<a name="ln307">	i = 0;</a>
+<a name="ln308">	bp = 4;</a>
+<a name="ln309">	mxoff = 1 &lt;&lt; bp;</a>
+<a name="ln310">	pctx-&gt;mxsz = (1 &lt;&lt; (16 - bp)) + 2;</a>
+<a name="ln311">	have_match = 0;</a>
+<a name="ln312">	tag = 0;</a>
+<a name="ln313">	ntag = 8;</a>
+<a name="ln314">	ptag = &amp;outbuf[xout++];</a>
+<a name="ln315"> </a>
+<a name="ln316">	while ((i &lt; bufsize) &amp;&amp; (xout &lt; (NTFS_SB_SIZE + 2))) {</a>
+<a name="ln317"> </a>
+<a name="ln318">		/* This implementation uses &quot;lazy&quot; parsing: it always chooses</a>
+<a name="ln319">		 * the longest match, unless the match at the next position is</a>
+<a name="ln320">		 * longer.  This is the same strategy used by the high</a>
+<a name="ln321">		 * compression modes of zlib.  */</a>
+<a name="ln322"> </a>
+<a name="ln323">		if (!have_match) {</a>
+<a name="ln324">			/* Find the longest match at the current position.  But</a>
+<a name="ln325">			 * first adjust the maximum match length if needed.</a>
+<a name="ln326">			 * (This loop might need to run more than one time in</a>
+<a name="ln327">			 * the case that we just output a long match.)  */</a>
+<a name="ln328">			while (mxoff &lt; i) {</a>
+<a name="ln329">				bp++;</a>
+<a name="ln330">				mxoff &lt;&lt;= 1;</a>
+<a name="ln331">				pctx-&gt;mxsz = (pctx-&gt;mxsz + 2) &gt;&gt; 1;</a>
+<a name="ln332">			}</a>
+<a name="ln333">			ntfs_best_match(pctx, i, 2);</a>
+<a name="ln334">		}</a>
+<a name="ln335"> </a>
+<a name="ln336">		if (pctx-&gt;size &gt;= 3) {</a>
+<a name="ln337"> </a>
+<a name="ln338">			/* Found a match at the current position.  */</a>
+<a name="ln339"> </a>
+<a name="ln340">			j = i + pctx-&gt;size;</a>
+<a name="ln341">			bp_cur = bp;</a>
+<a name="ln342">			offs = pctx-&gt;rel;</a>
+<a name="ln343"> </a>
+<a name="ln344">			if (pctx-&gt;size &gt;= NICE_MATCH_LEN) {</a>
+<a name="ln345"> </a>
+<a name="ln346">				/* Choose long matches immediately.  */</a>
+<a name="ln347"> </a>
+<a name="ln348">				q = (~offs &lt;&lt; (16 - bp_cur)) + (j - i - 3);</a>
+<a name="ln349">				outbuf[xout++] = q &amp; 255;</a>
+<a name="ln350">				outbuf[xout++] = (q &gt;&gt; 8) &amp; 255;</a>
+<a name="ln351">				tag |= (1 &lt;&lt; (8 - ntag));</a>
+<a name="ln352"> </a>
+<a name="ln353">				if (j == bufsize) {</a>
+<a name="ln354">					/* Shortcut if the match extends to the</a>
+<a name="ln355">					 * end of the buffer.  */</a>
+<a name="ln356">					i = j;</a>
+<a name="ln357">					--ntag;</a>
+<a name="ln358">					break;</a>
+<a name="ln359">				}</a>
+<a name="ln360">				i += 1;</a>
+<a name="ln361">				do {</a>
+<a name="ln362">					ntfs_skip_position(pctx, i);</a>
+<a name="ln363">				} while (++i != j);</a>
+<a name="ln364">				have_match = 0;</a>
+<a name="ln365">			} else {</a>
+<a name="ln366">				/* Check for a longer match at the next</a>
+<a name="ln367">				 * position.  */</a>
+<a name="ln368"> </a>
+<a name="ln369">				/* Doesn't need to be while() since we just</a>
+<a name="ln370">				 * adjusted the maximum match length at the</a>
+<a name="ln371">				 * previous position.  */</a>
+<a name="ln372">				if (mxoff &lt; i + 1) {</a>
+<a name="ln373">					bp++;</a>
+<a name="ln374">					mxoff &lt;&lt;= 1;</a>
+<a name="ln375">					pctx-&gt;mxsz = (pctx-&gt;mxsz + 2) &gt;&gt; 1;</a>
+<a name="ln376">				}</a>
+<a name="ln377">				ntfs_best_match(pctx, i + 1, pctx-&gt;size);</a>
+<a name="ln378">				k = i + 1 + pctx-&gt;size;</a>
+<a name="ln379"> </a>
+<a name="ln380">				if (k &gt; (j + 1)) {</a>
+<a name="ln381">					/* Next match is longer.</a>
+<a name="ln382">					 * Output a literal.  */</a>
+<a name="ln383">					outbuf[xout++] = inbuf[i++];</a>
+<a name="ln384">					have_match = 1;</a>
+<a name="ln385">				} else {</a>
+<a name="ln386">					/* Next match isn't longer.</a>
+<a name="ln387">					 * Output the current match.  */</a>
+<a name="ln388">					q = (~offs &lt;&lt; (16 - bp_cur)) +</a>
+<a name="ln389">							(j - i - 3);</a>
+<a name="ln390">					outbuf[xout++] = q &amp; 255;</a>
+<a name="ln391">					outbuf[xout++] = (q &gt;&gt; 8) &amp; 255;</a>
+<a name="ln392">					tag |= (1 &lt;&lt; (8 - ntag));</a>
+<a name="ln393"> </a>
+<a name="ln394">					/* The minimum match length is 3, and</a>
+<a name="ln395">					 * we've run two bytes through the</a>
+<a name="ln396">					 * matchfinder already.  So the minimum</a>
+<a name="ln397">					 * number of positions we need to skip</a>
+<a name="ln398">					 * is 1.  */</a>
+<a name="ln399">					i += 2;</a>
+<a name="ln400">					do {</a>
+<a name="ln401">						ntfs_skip_position(pctx, i);</a>
+<a name="ln402">					} while (++i != j);</a>
+<a name="ln403">					have_match = 0;</a>
+<a name="ln404">				}</a>
+<a name="ln405">			}</a>
+<a name="ln406">		} else {</a>
+<a name="ln407">			/* No match at current position.  Output a literal.  */</a>
+<a name="ln408">			outbuf[xout++] = inbuf[i++];</a>
+<a name="ln409">			have_match = 0;</a>
+<a name="ln410">		}</a>
+<a name="ln411"> </a>
+<a name="ln412">		/* Store the tag if fully used.  */</a>
+<a name="ln413">		if (!--ntag) {</a>
+<a name="ln414">			*ptag = tag;</a>
+<a name="ln415">			ntag = 8;</a>
+<a name="ln416">			ptag = &amp;outbuf[xout++];</a>
+<a name="ln417">			tag = 0;</a>
+<a name="ln418">		}</a>
+<a name="ln419">	}</a>
+<a name="ln420"> </a>
+<a name="ln421">	/* Store the last tag if partially used.  */</a>
+<a name="ln422">	if (ntag == 8)</a>
+<a name="ln423">		xout--;</a>
+<a name="ln424">	else</a>
+<a name="ln425">		*ptag = tag;</a>
+<a name="ln426"> </a>
+<a name="ln427">	/* Determine whether to store the data compressed or uncompressed.  */</a>
+<a name="ln428"> </a>
+<a name="ln429">	if ((i &gt;= bufsize) &amp;&amp; (xout &lt; (NTFS_SB_SIZE + 2))) {</a>
+<a name="ln430">		/* Compressed.  */</a>
+<a name="ln431">		outbuf[0] = (xout - 3) &amp; 255;</a>
+<a name="ln432">		outbuf[1] = 0xb0 + (((xout - 3) &gt;&gt; 8) &amp; 15);</a>
+<a name="ln433">	} else {</a>
+<a name="ln434">		/* Uncompressed.  */</a>
+<a name="ln435">		memcpy(&amp;outbuf[2], inbuf, bufsize);</a>
+<a name="ln436">		if (bufsize &lt; NTFS_SB_SIZE)</a>
+<a name="ln437">			memset(&amp;outbuf[bufsize + 2], 0, NTFS_SB_SIZE - bufsize);</a>
+<a name="ln438">		outbuf[0] = 0xff;</a>
+<a name="ln439">		outbuf[1] = 0x3f;</a>
+<a name="ln440">		xout = NTFS_SB_SIZE + 2;</a>
+<a name="ln441">	}</a>
+<a name="ln442"> </a>
+<a name="ln443">	/* Free the compression context and return the total number of bytes</a>
+<a name="ln444">	 * written to 'outbuf'.  */</a>
+<a name="ln445">	free(pctx);</a>
+<a name="ln446">	return (xout);</a>
+<a name="ln447">}</a>
+<a name="ln448"> </a>
+<a name="ln449">/**</a>
+<a name="ln450"> * ntfs_decompress - decompress a compression block into an array of pages</a>
+<a name="ln451"> * @dest:	buffer to which to write the decompressed data</a>
+<a name="ln452"> * @dest_size:	size of buffer @dest in bytes</a>
+<a name="ln453"> * @cb_start:	compression block to decompress</a>
+<a name="ln454"> * @cb_size:	size of compression block @cb_start in bytes</a>
+<a name="ln455"> *</a>
+<a name="ln456"> * This decompresses the compression block @cb_start into the destination</a>
+<a name="ln457"> * buffer @dest.</a>
+<a name="ln458"> *</a>
+<a name="ln459"> * @cb_start is a pointer to the compression block which needs decompressing</a>
+<a name="ln460"> * and @cb_size is the size of @cb_start in bytes (8-64kiB).</a>
+<a name="ln461"> *</a>
+<a name="ln462"> * Return 0 if success or -EOVERFLOW on error in the compressed stream.</a>
+<a name="ln463"> */</a>
+<a name="ln464">static int ntfs_decompress(u8 *dest, const u32 dest_size,</a>
+<a name="ln465">		u8 *const cb_start, const u32 cb_size)</a>
+<a name="ln466">{</a>
+<a name="ln467">	/*</a>
+<a name="ln468">	 * Pointers into the compressed data, i.e. the compression block (cb),</a>
+<a name="ln469">	 * and the therein contained sub-blocks (sb).</a>
+<a name="ln470">	 */</a>
+<a name="ln471">	u8 *cb_end = cb_start + cb_size; /* End of cb. */</a>
+<a name="ln472">	u8 *cb = cb_start;	/* Current position in cb. */</a>
+<a name="ln473">	u8 *cb_sb_start = cb;	/* Beginning of the current sb in the cb. */</a>
+<a name="ln474">	u8 *cb_sb_end;		/* End of current sb / beginning of next sb. */</a>
+<a name="ln475">	/* Variables for uncompressed data / destination. */</a>
+<a name="ln476">	u8 *dest_end = dest + dest_size;	/* End of dest buffer. */</a>
+<a name="ln477">	u8 *dest_sb_start;	/* Start of current sub-block in dest. */</a>
+<a name="ln478">	u8 *dest_sb_end;	/* End of current sb in dest. */</a>
+<a name="ln479">	/* Variables for tag and token parsing. */</a>
+<a name="ln480">	u8 tag;			/* Current tag. */</a>
+<a name="ln481">	int token;		/* Loop counter for the eight tokens in tag. */</a>
+<a name="ln482"> </a>
+<a name="ln483">	ntfs_log_trace(&quot;Entering, cb_size = 0x%x.\n&quot;, (unsigned)cb_size);</a>
+<a name="ln484">do_next_sb:</a>
+<a name="ln485">	ntfs_log_debug(&quot;Beginning sub-block at offset = %d in the cb.\n&quot;,</a>
+<a name="ln486">			(int)(cb - cb_start));</a>
+<a name="ln487">	/*</a>
+<a name="ln488">	 * Have we reached the end of the compression block or the end of the</a>
+<a name="ln489">	 * decompressed data?  The latter can happen for example if the current</a>
+<a name="ln490">	 * position in the compression block is one byte before its end so the</a>
+<a name="ln491">	 * first two checks do not detect it.</a>
+<a name="ln492">	 */</a>
+<a name="ln493">	if (cb == cb_end || !le16_to_cpup((le16*)cb) || dest == dest_end) {</a>
+<a name="ln494">		ntfs_log_debug(&quot;Completed. Returning success (0).\n&quot;);</a>
+<a name="ln495">		return 0;</a>
+<a name="ln496">	}</a>
+<a name="ln497">	/* Setup offset for the current sub-block destination. */</a>
+<a name="ln498">	dest_sb_start = dest;</a>
+<a name="ln499">	dest_sb_end = dest + NTFS_SB_SIZE;</a>
+<a name="ln500">	/* Check that we are still within allowed boundaries. */</a>
+<a name="ln501">	if (dest_sb_end &gt; dest_end)</a>
+<a name="ln502">		goto return_overflow;</a>
+<a name="ln503">	/* Does the minimum size of a compressed sb overflow valid range? */</a>
+<a name="ln504">	if (cb + 6 &gt; cb_end)</a>
+<a name="ln505">		goto return_overflow;</a>
+<a name="ln506">	/* Setup the current sub-block source pointers and validate range. */</a>
+<a name="ln507">	cb_sb_start = cb;</a>
+<a name="ln508">	cb_sb_end = cb_sb_start + (le16_to_cpup((le16*)cb) &amp; NTFS_SB_SIZE_MASK)</a>
+<a name="ln509">			+ 3;</a>
+<a name="ln510">	if (cb_sb_end &gt; cb_end)</a>
+<a name="ln511">		goto return_overflow;</a>
+<a name="ln512">	/* Now, we are ready to process the current sub-block (sb). */</a>
+<a name="ln513">	if (!(le16_to_cpup((le16*)cb) &amp; NTFS_SB_IS_COMPRESSED)) {</a>
+<a name="ln514">		ntfs_log_debug(&quot;Found uncompressed sub-block.\n&quot;);</a>
+<a name="ln515">		/* This sb is not compressed, just copy it into destination. */</a>
+<a name="ln516">		/* Advance source position to first data byte. */</a>
+<a name="ln517">		cb += 2;</a>
+<a name="ln518">		/* An uncompressed sb must be full size. */</a>
+<a name="ln519">		if (cb_sb_end - cb != NTFS_SB_SIZE)</a>
+<a name="ln520">			goto return_overflow;</a>
+<a name="ln521">		/* Copy the block and advance the source position. */</a>
+<a name="ln522">		memcpy(dest, cb, NTFS_SB_SIZE);</a>
+<a name="ln523">		cb += NTFS_SB_SIZE;</a>
+<a name="ln524">		/* Advance destination position to next sub-block. */</a>
+<a name="ln525">		dest += NTFS_SB_SIZE;</a>
+<a name="ln526">		goto do_next_sb;</a>
+<a name="ln527">	}</a>
+<a name="ln528">	ntfs_log_debug(&quot;Found compressed sub-block.\n&quot;);</a>
+<a name="ln529">	/* This sb is compressed, decompress it into destination. */</a>
+<a name="ln530">	/* Forward to the first tag in the sub-block. */</a>
+<a name="ln531">	cb += 2;</a>
+<a name="ln532">do_next_tag:</a>
+<a name="ln533">	if (cb == cb_sb_end) {</a>
+<a name="ln534">		/* Check if the decompressed sub-block was not full-length. */</a>
+<a name="ln535">		if (dest &lt; dest_sb_end) {</a>
+<a name="ln536">			int nr_bytes = dest_sb_end - dest;</a>
+<a name="ln537"> </a>
+<a name="ln538">			ntfs_log_debug(&quot;Filling incomplete sub-block with zeroes.\n&quot;);</a>
+<a name="ln539">			/* Zero remainder and update destination position. */</a>
+<a name="ln540">			memset(dest, 0, nr_bytes);</a>
+<a name="ln541">			dest += nr_bytes;</a>
+<a name="ln542">		}</a>
+<a name="ln543">		/* We have finished the current sub-block. */</a>
+<a name="ln544">		goto do_next_sb;</a>
+<a name="ln545">	}</a>
+<a name="ln546">	/* Check we are still in range. */</a>
+<a name="ln547">	if (cb &gt; cb_sb_end || dest &gt; dest_sb_end)</a>
+<a name="ln548">		goto return_overflow;</a>
+<a name="ln549">	/* Get the next tag and advance to first token. */</a>
+<a name="ln550">	tag = *cb++;</a>
+<a name="ln551">	/* Parse the eight tokens described by the tag. */</a>
+<a name="ln552">	for (token = 0; token &lt; 8; token++, tag &gt;&gt;= 1) {</a>
+<a name="ln553">		u16 lg, pt, length, max_non_overlap;</a>
+<a name="ln554">		register u16 i;</a>
+<a name="ln555">		u8 *dest_back_addr;</a>
+<a name="ln556"> </a>
+<a name="ln557">		/* Check if we are done / still in range. */</a>
+<a name="ln558">		if (cb &gt;= cb_sb_end || dest &gt; dest_sb_end)</a>
+<a name="ln559">			break;</a>
+<a name="ln560">		/* Determine token type and parse appropriately.*/</a>
+<a name="ln561">		if ((tag &amp; NTFS_TOKEN_MASK) == NTFS_SYMBOL_TOKEN) {</a>
+<a name="ln562">			/*</a>
+<a name="ln563">			 * We have a symbol token, copy the symbol across, and</a>
+<a name="ln564">			 * advance the source and destination positions.</a>
+<a name="ln565">			 */</a>
+<a name="ln566">			*dest++ = *cb++;</a>
+<a name="ln567">			/* Continue with the next token. */</a>
+<a name="ln568">			continue;</a>
+<a name="ln569">		}</a>
+<a name="ln570">		/*</a>
+<a name="ln571">		 * We have a phrase token. Make sure it is not the first tag in</a>
+<a name="ln572">		 * the sb as this is illegal and would confuse the code below.</a>
+<a name="ln573">		 */</a>
+<a name="ln574">		if (dest == dest_sb_start)</a>
+<a name="ln575">			goto return_overflow;</a>
+<a name="ln576">		/*</a>
+<a name="ln577">		 * Determine the number of bytes to go back (p) and the number</a>
+<a name="ln578">		 * of bytes to copy (l). We use an optimized algorithm in which</a>
+<a name="ln579">		 * we first calculate log2(current destination position in sb),</a>
+<a name="ln580">		 * which allows determination of l and p in O(1) rather than</a>
+<a name="ln581">		 * O(n). We just need an arch-optimized log2() function now.</a>
+<a name="ln582">		 */</a>
+<a name="ln583">		lg = 0;</a>
+<a name="ln584">		for (i = dest - dest_sb_start - 1; i &gt;= 0x10; i &gt;&gt;= 1)</a>
+<a name="ln585">			lg++;</a>
+<a name="ln586">		/* Get the phrase token into i. */</a>
+<a name="ln587">		pt = le16_to_cpup((le16*)cb);</a>
+<a name="ln588">		/*</a>
+<a name="ln589">		 * Calculate starting position of the byte sequence in</a>
+<a name="ln590">		 * the destination using the fact that p = (pt &gt;&gt; (12 - lg)) + 1</a>
+<a name="ln591">		 * and make sure we don't go too far back.</a>
+<a name="ln592">		 */</a>
+<a name="ln593">		dest_back_addr = dest - (pt &gt;&gt; (12 - lg)) - 1;</a>
+<a name="ln594">		if (dest_back_addr &lt; dest_sb_start)</a>
+<a name="ln595">			goto return_overflow;</a>
+<a name="ln596">		/* Now calculate the length of the byte sequence. */</a>
+<a name="ln597">		length = (pt &amp; (0xfff &gt;&gt; lg)) + 3;</a>
+<a name="ln598">		/* Verify destination is in range. */</a>
+<a name="ln599">		if (dest + length &gt; dest_sb_end)</a>
+<a name="ln600">			goto return_overflow;</a>
+<a name="ln601">		/* The number of non-overlapping bytes. */</a>
+<a name="ln602">		max_non_overlap = dest - dest_back_addr;</a>
+<a name="ln603">		if (length &lt;= max_non_overlap) {</a>
+<a name="ln604">			/* The byte sequence doesn't overlap, just copy it. */</a>
+<a name="ln605">			memcpy(dest, dest_back_addr, length);</a>
+<a name="ln606">			/* Advance destination pointer. */</a>
+<a name="ln607">			dest += length;</a>
+<a name="ln608">		} else {</a>
+<a name="ln609">			/*</a>
+<a name="ln610">			 * The byte sequence does overlap, copy non-overlapping</a>
+<a name="ln611">			 * part and then do a slow byte by byte copy for the</a>
+<a name="ln612">			 * overlapping part. Also, advance the destination</a>
+<a name="ln613">			 * pointer.</a>
+<a name="ln614">			 */</a>
+<a name="ln615">			memcpy(dest, dest_back_addr, max_non_overlap);</a>
+<a name="ln616">			dest += max_non_overlap;</a>
+<a name="ln617">			dest_back_addr += max_non_overlap;</a>
+<a name="ln618">			length -= max_non_overlap;</a>
+<a name="ln619">			while (length--)</a>
+<a name="ln620">				*dest++ = *dest_back_addr++;</a>
+<a name="ln621">		}</a>
+<a name="ln622">		/* Advance source position and continue with the next token. */</a>
+<a name="ln623">		cb += 2;</a>
+<a name="ln624">	}</a>
+<a name="ln625">	/* No tokens left in the current tag. Continue with the next tag. */</a>
+<a name="ln626">	goto do_next_tag;</a>
+<a name="ln627">return_overflow:</a>
+<a name="ln628">	errno = EOVERFLOW;</a>
+<a name="ln629">	ntfs_log_perror(&quot;Failed to decompress file&quot;);</a>
+<a name="ln630">	return -1;</a>
+<a name="ln631">}</a>
+<a name="ln632"> </a>
+<a name="ln633">/**</a>
+<a name="ln634"> * ntfs_is_cb_compressed - internal function, do not use</a>
+<a name="ln635"> *</a>
+<a name="ln636"> * This is a very specialised function determining if a cb is compressed or</a>
+<a name="ln637"> * uncompressed.  It is assumed that checking for a sparse cb has already been</a>
+<a name="ln638"> * performed and that the cb is not sparse.  It makes all sorts of other</a>
+<a name="ln639"> * assumptions as well and hence it is not useful anywhere other than where it</a>
+<a name="ln640"> * is used at the moment.  Please, do not make this function available for use</a>
+<a name="ln641"> * outside of compress.c as it is bound to confuse people and not do what they</a>
+<a name="ln642"> * want.</a>
+<a name="ln643"> *</a>
+<a name="ln644"> * Return TRUE on errors so that the error will be detected later on in the</a>
+<a name="ln645"> * code.  Might be a bit confusing to debug but there really should never be</a>
+<a name="ln646"> * errors coming from here.</a>
+<a name="ln647"> */</a>
+<a name="ln648">static BOOL ntfs_is_cb_compressed(ntfs_attr *na, runlist_element *rl, </a>
+<a name="ln649">				  VCN cb_start_vcn, int cb_clusters)</a>
+<a name="ln650">{</a>
+<a name="ln651">	/*</a>
+<a name="ln652">	 * The simplest case: the run starting at @cb_start_vcn contains</a>
+<a name="ln653">	 * @cb_clusters clusters which are all not sparse, thus the cb is not</a>
+<a name="ln654">	 * compressed.</a>
+<a name="ln655">	 */</a>
+<a name="ln656">restart:</a>
+<a name="ln657">	cb_clusters -= rl-&gt;length - (cb_start_vcn - rl-&gt;vcn);</a>
+<a name="ln658">	while (cb_clusters &gt; 0) {</a>
+<a name="ln659">		/* Go to the next run. */</a>
+<a name="ln660">		rl++;</a>
+<a name="ln661">		/* Map the next runlist fragment if it is not mapped. */</a>
+<a name="ln662">		if (rl-&gt;lcn &lt; LCN_HOLE || !rl-&gt;length) {</a>
+<a name="ln663">			cb_start_vcn = rl-&gt;vcn;</a>
+<a name="ln664">			rl = ntfs_attr_find_vcn(na, rl-&gt;vcn);</a>
+<a name="ln665">			if (!rl || rl-&gt;lcn &lt; LCN_HOLE || !rl-&gt;length)</a>
+<a name="ln666">				return TRUE;</a>
+<a name="ln667">			/*</a>
+<a name="ln668">			 * If the runs were merged need to deal with the</a>
+<a name="ln669">			 * resulting partial run so simply restart.</a>
+<a name="ln670">			 */</a>
+<a name="ln671">			if (rl-&gt;vcn &lt; cb_start_vcn)</a>
+<a name="ln672">				goto restart;</a>
+<a name="ln673">		}</a>
+<a name="ln674">		/* If the current run is sparse, the cb is compressed. */</a>
+<a name="ln675">		if (rl-&gt;lcn == LCN_HOLE)</a>
+<a name="ln676">			return TRUE;</a>
+<a name="ln677">		/* If the whole cb is not sparse, it is not compressed. */</a>
+<a name="ln678">		if (rl-&gt;length &gt;= cb_clusters)</a>
+<a name="ln679">			return FALSE;</a>
+<a name="ln680">		cb_clusters -= rl-&gt;length;</a>
+<a name="ln681">	};</a>
+<a name="ln682">	/* All cb_clusters were not sparse thus the cb is not compressed. */</a>
+<a name="ln683">	return FALSE;</a>
+<a name="ln684">}</a>
+<a name="ln685"> </a>
+<a name="ln686">/**</a>
+<a name="ln687"> * ntfs_compressed_attr_pread - read from a compressed attribute</a>
+<a name="ln688"> * @na:		ntfs attribute to read from</a>
+<a name="ln689"> * @pos:	byte position in the attribute to begin reading from</a>
+<a name="ln690"> * @count:	number of bytes to read</a>
+<a name="ln691"> * @b:		output data buffer</a>
+<a name="ln692"> *</a>
+<a name="ln693"> * NOTE:  You probably want to be using attrib.c::ntfs_attr_pread() instead.</a>
+<a name="ln694"> *</a>
+<a name="ln695"> * This function will read @count bytes starting at offset @pos from the</a>
+<a name="ln696"> * compressed ntfs attribute @na into the data buffer @b.</a>
+<a name="ln697"> *</a>
+<a name="ln698"> * On success, return the number of successfully read bytes.  If this number</a>
+<a name="ln699"> * is lower than @count this means that the read reached end of file or that</a>
+<a name="ln700"> * an error was encountered during the read so that the read is partial.</a>
+<a name="ln701"> * 0 means end of file or nothing was read (also return 0 when @count is 0).</a>
+<a name="ln702"> *</a>
+<a name="ln703"> * On error and nothing has been read, return -1 with errno set appropriately</a>
+<a name="ln704"> * to the return code of ntfs_pread(), or to EINVAL in case of invalid</a>
+<a name="ln705"> * arguments.</a>
+<a name="ln706"> */</a>
+<a name="ln707">s64 ntfs_compressed_attr_pread(ntfs_attr *na, s64 pos, s64 count, void *b)</a>
+<a name="ln708">{</a>
+<a name="ln709">	s64 br, to_read, ofs, total, total2;</a>
+<a name="ln710">	u64 cb_size_mask;</a>
+<a name="ln711">	VCN start_vcn, vcn, end_vcn;</a>
+<a name="ln712">	ntfs_volume *vol;</a>
+<a name="ln713">	runlist_element *rl;</a>
+<a name="ln714">	u8 *dest, *cb, *cb_pos, *cb_end;</a>
+<a name="ln715">	u32 cb_size;</a>
+<a name="ln716">	int err;</a>
+<a name="ln717">	ATTR_FLAGS data_flags;</a>
+<a name="ln718">	FILE_ATTR_FLAGS compression;</a>
+<a name="ln719">	unsigned int nr_cbs, cb_clusters;</a>
+<a name="ln720"> </a>
+<a name="ln721">	ntfs_log_trace(&quot;Entering for inode 0x%llx, attr 0x%x, pos 0x%llx, count 0x%llx.\n&quot;,</a>
+<a name="ln722">			(unsigned long long)na-&gt;ni-&gt;mft_no, le32_to_cpu(na-&gt;type),</a>
+<a name="ln723">			(long long)pos, (long long)count);</a>
+<a name="ln724">	data_flags = na-&gt;data_flags;</a>
+<a name="ln725">	compression = na-&gt;ni-&gt;flags &amp; FILE_ATTR_COMPRESSED;</a>
+<a name="ln726">	if (!na || !na-&gt;ni || !na-&gt;ni-&gt;vol || !b</a>
+<a name="ln727">			|| ((data_flags &amp; ATTR_COMPRESSION_MASK)</a>
+<a name="ln728">				!= ATTR_IS_COMPRESSED)</a>
+<a name="ln729">			|| pos &lt; 0 || count &lt; 0) {</a>
+<a name="ln730">		errno = EINVAL;</a>
+<a name="ln731">		return -1;</a>
+<a name="ln732">	}</a>
+<a name="ln733">	/*</a>
+<a name="ln734">	 * Encrypted attributes are not supported.  We return access denied,</a>
+<a name="ln735">	 * which is what Windows NT4 does, too.</a>
+<a name="ln736">	 */</a>
+<a name="ln737">	if (NAttrEncrypted(na)) {</a>
+<a name="ln738">		errno = EACCES;</a>
+<a name="ln739">		return -1;</a>
+<a name="ln740">	}</a>
+<a name="ln741">	if (!count)</a>
+<a name="ln742">		return 0;</a>
+<a name="ln743">	/* Truncate reads beyond end of attribute. */</a>
+<a name="ln744">	if (pos + count &gt; na-&gt;data_size) {</a>
+<a name="ln745">		if (pos &gt;= na-&gt;data_size) {</a>
+<a name="ln746">			return 0;</a>
+<a name="ln747">		}</a>
+<a name="ln748">		count = na-&gt;data_size - pos;</a>
+<a name="ln749">	}</a>
+<a name="ln750">	/* If it is a resident attribute, simply use ntfs_attr_pread(). */</a>
+<a name="ln751">	if (!NAttrNonResident(na))</a>
+<a name="ln752">		return ntfs_attr_pread(na, pos, count, b);</a>
+<a name="ln753">	total = total2 = 0;</a>
+<a name="ln754">	/* Zero out reads beyond initialized size. */</a>
+<a name="ln755">	if (pos + count &gt; na-&gt;initialized_size) {</a>
+<a name="ln756">		if (pos &gt;= na-&gt;initialized_size) {</a>
+<a name="ln757">			memset(b, 0, count);</a>
+<a name="ln758">			return count;</a>
+<a name="ln759">		}</a>
+<a name="ln760">		total2 = pos + count - na-&gt;initialized_size;</a>
+<a name="ln761">		count -= total2;</a>
+<a name="ln762">		memset((u8*)b + count, 0, total2);</a>
+<a name="ln763">	}</a>
+<a name="ln764">	vol = na-&gt;ni-&gt;vol;</a>
+<a name="ln765">	cb_size = na-&gt;compression_block_size;</a>
+<a name="ln766">	cb_size_mask = cb_size - 1UL;</a>
+<a name="ln767">	cb_clusters = na-&gt;compression_block_clusters;</a>
+<a name="ln768">	</a>
+<a name="ln769">	/* Need a temporary buffer for each loaded compression block. */</a>
+<a name="ln770">	cb = (u8*)ntfs_malloc(cb_size);</a>
+<a name="ln771">	if (!cb)</a>
+<a name="ln772">		return -1;</a>
+<a name="ln773">	</a>
+<a name="ln774">	/* Need a temporary buffer for each uncompressed block. */</a>
+<a name="ln775">	dest = (u8*)ntfs_malloc(cb_size);</a>
+<a name="ln776">	if (!dest) {</a>
+<a name="ln777">		free(cb);</a>
+<a name="ln778">		return -1;</a>
+<a name="ln779">	}</a>
+<a name="ln780">	/*</a>
+<a name="ln781">	 * The first vcn in the first compression block (cb) which we need to</a>
+<a name="ln782">	 * decompress.</a>
+<a name="ln783">	 */</a>
+<a name="ln784">	start_vcn = (pos &amp; ~cb_size_mask) &gt;&gt; vol-&gt;cluster_size_bits;</a>
+<a name="ln785">	/* Offset in the uncompressed cb at which to start reading data. */</a>
+<a name="ln786">	ofs = pos &amp; cb_size_mask;</a>
+<a name="ln787">	/*</a>
+<a name="ln788">	 * The first vcn in the cb after the last cb which we need to</a>
+<a name="ln789">	 * decompress.</a>
+<a name="ln790">	 */</a>
+<a name="ln791">	end_vcn = ((pos + count + cb_size - 1) &amp; ~cb_size_mask) &gt;&gt;</a>
+<a name="ln792">			vol-&gt;cluster_size_bits;</a>
+<a name="ln793">	/* Number of compression blocks (cbs) in the wanted vcn range. */</a>
+<a name="ln794">	nr_cbs = (end_vcn - start_vcn) &lt;&lt; vol-&gt;cluster_size_bits &gt;&gt;</a>
+<a name="ln795">			na-&gt;compression_block_size_bits;</a>
+<a name="ln796">	cb_end = cb + cb_size;</a>
+<a name="ln797">do_next_cb:</a>
+<a name="ln798">	nr_cbs--;</a>
+<a name="ln799">	cb_pos = cb;</a>
+<a name="ln800">	vcn = start_vcn;</a>
+<a name="ln801">	start_vcn += cb_clusters;</a>
+<a name="ln802"> </a>
+<a name="ln803">	/* Check whether the compression block is sparse. */</a>
+<a name="ln804">	rl = ntfs_attr_find_vcn(na, vcn);</a>
+<a name="ln805">	if (!rl || rl-&gt;lcn &lt; LCN_HOLE) {</a>
+<a name="ln806">		free(cb);</a>
+<a name="ln807">		free(dest);</a>
+<a name="ln808">		if (total)</a>
+<a name="ln809">			return total;</a>
+<a name="ln810">		/* FIXME: Do we want EIO or the error code? (AIA) */</a>
+<a name="ln811">		errno = EIO;</a>
+<a name="ln812">		return -1;</a>
+<a name="ln813">	}</a>
+<a name="ln814">	if (rl-&gt;lcn == LCN_HOLE) {</a>
+<a name="ln815">		/* Sparse cb, zero out destination range overlapping the cb. */</a>
+<a name="ln816">		ntfs_log_debug(&quot;Found sparse compression block.\n&quot;);</a>
+<a name="ln817">		to_read = min(count, cb_size - ofs);</a>
+<a name="ln818">		memset(b, 0, to_read);</a>
+<a name="ln819">		ofs = 0;</a>
+<a name="ln820">		total += to_read;</a>
+<a name="ln821">		count -= to_read;</a>
+<a name="ln822">		b = (u8*)b + to_read;</a>
+<a name="ln823">	} else if (!ntfs_is_cb_compressed(na, rl, vcn, cb_clusters)) {</a>
+<a name="ln824">		s64 tdata_size, tinitialized_size;</a>
+<a name="ln825">		/*</a>
+<a name="ln826">		 * Uncompressed cb, read it straight into the destination range</a>
+<a name="ln827">		 * overlapping the cb.</a>
+<a name="ln828">		 */</a>
+<a name="ln829">		ntfs_log_debug(&quot;Found uncompressed compression block.\n&quot;);</a>
+<a name="ln830">		/*</a>
+<a name="ln831">		 * Read the uncompressed data into the destination buffer.</a>
+<a name="ln832">		 * NOTE: We cheat a little bit here by marking the attribute as</a>
+<a name="ln833">		 * not compressed in the ntfs_attr structure so that we can</a>
+<a name="ln834">		 * read the data by simply using ntfs_attr_pread().  (-8</a>
+<a name="ln835">		 * NOTE: we have to modify data_size and initialized_size</a>
+<a name="ln836">		 * temporarily as well...</a>
+<a name="ln837">		 */</a>
+<a name="ln838">		to_read = min(count, cb_size - ofs);</a>
+<a name="ln839">		ofs += vcn &lt;&lt; vol-&gt;cluster_size_bits;</a>
+<a name="ln840">		NAttrClearCompressed(na);</a>
+<a name="ln841">		na-&gt;data_flags &amp;= ~ATTR_COMPRESSION_MASK;</a>
+<a name="ln842">		tdata_size = na-&gt;data_size;</a>
+<a name="ln843">		tinitialized_size = na-&gt;initialized_size;</a>
+<a name="ln844">		na-&gt;data_size = na-&gt;initialized_size = na-&gt;allocated_size;</a>
+<a name="ln845">		do {</a>
+<a name="ln846">			br = ntfs_attr_pread(na, ofs, to_read, b);</a>
+<a name="ln847">			if (br &lt;= 0) {</a>
+<a name="ln848">				if (!br) {</a>
+<a name="ln849">					ntfs_log_error(&quot;Failed to read an&quot;</a>
+<a name="ln850">						&quot; uncompressed cluster,&quot;</a>
+<a name="ln851">						&quot; inode %lld offs 0x%llx\n&quot;,</a>
+<a name="ln852">						(long long)na-&gt;ni-&gt;mft_no,</a>
+<a name="ln853">						(long long)ofs);</a>
+<a name="ln854">					errno = EIO;</a>
+<a name="ln855">				}</a>
+<a name="ln856">				err = errno;</a>
+<a name="ln857">				na-&gt;data_size = tdata_size;</a>
+<a name="ln858">				na-&gt;initialized_size = tinitialized_size;</a>
+<a name="ln859">				na-&gt;ni-&gt;flags |= compression;</a>
+<a name="ln860">				na-&gt;data_flags = data_flags;</a>
+<a name="ln861">				free(cb);</a>
+<a name="ln862">				free(dest);</a>
+<a name="ln863">				if (total)</a>
+<a name="ln864">					return total;</a>
+<a name="ln865">				errno = err;</a>
+<a name="ln866">				return br;</a>
+<a name="ln867">			}</a>
+<a name="ln868">			total += br;</a>
+<a name="ln869">			count -= br;</a>
+<a name="ln870">			b = (u8*)b + br;</a>
+<a name="ln871">			to_read -= br;</a>
+<a name="ln872">			ofs += br;</a>
+<a name="ln873">		} while (to_read &gt; 0);</a>
+<a name="ln874">		na-&gt;data_size = tdata_size;</a>
+<a name="ln875">		na-&gt;initialized_size = tinitialized_size;</a>
+<a name="ln876">		na-&gt;ni-&gt;flags |= compression;</a>
+<a name="ln877">		na-&gt;data_flags = data_flags;</a>
+<a name="ln878">		ofs = 0;</a>
+<a name="ln879">	} else {</a>
+<a name="ln880">		s64 tdata_size, tinitialized_size;</a>
+<a name="ln881">		u32 decompsz;</a>
+<a name="ln882"> </a>
+<a name="ln883">		/*</a>
+<a name="ln884">		 * Compressed cb, decompress it into the temporary buffer, then</a>
+<a name="ln885">		 * copy the data to the destination range overlapping the cb.</a>
+<a name="ln886">		 */</a>
+<a name="ln887">		ntfs_log_debug(&quot;Found compressed compression block.\n&quot;);</a>
+<a name="ln888">		/*</a>
+<a name="ln889">		 * Read the compressed data into the temporary buffer.</a>
+<a name="ln890">		 * NOTE: We cheat a little bit here by marking the attribute as</a>
+<a name="ln891">		 * not compressed in the ntfs_attr structure so that we can</a>
+<a name="ln892">		 * read the raw, compressed data by simply using</a>
+<a name="ln893">		 * ntfs_attr_pread().  (-8</a>
+<a name="ln894">		 * NOTE: We have to modify data_size and initialized_size</a>
+<a name="ln895">		 * temporarily as well...</a>
+<a name="ln896">		 */</a>
+<a name="ln897">		to_read = cb_size;</a>
+<a name="ln898">		NAttrClearCompressed(na);</a>
+<a name="ln899">		na-&gt;data_flags &amp;= ~ATTR_COMPRESSION_MASK;</a>
+<a name="ln900">		tdata_size = na-&gt;data_size;</a>
+<a name="ln901">		tinitialized_size = na-&gt;initialized_size;</a>
+<a name="ln902">		na-&gt;data_size = na-&gt;initialized_size = na-&gt;allocated_size;</a>
+<a name="ln903">		do {</a>
+<a name="ln904">			br = ntfs_attr_pread(na,</a>
+<a name="ln905">					(vcn &lt;&lt; vol-&gt;cluster_size_bits) +</a>
+<a name="ln906">					(cb_pos - cb), to_read, cb_pos);</a>
+<a name="ln907">			if (br &lt;= 0) {</a>
+<a name="ln908">				if (!br) {</a>
+<a name="ln909">					ntfs_log_error(&quot;Failed to read a&quot;</a>
+<a name="ln910">						&quot; compressed cluster, &quot;</a>
+<a name="ln911">						&quot; inode %lld offs 0x%llx\n&quot;,</a>
+<a name="ln912">						(long long)na-&gt;ni-&gt;mft_no,</a>
+<a name="ln913">						(long long)(vcn &lt;&lt; vol-&gt;cluster_size_bits));</a>
+<a name="ln914">					errno = EIO;</a>
+<a name="ln915">				}</a>
+<a name="ln916">				err = errno;</a>
+<a name="ln917">				na-&gt;data_size = tdata_size;</a>
+<a name="ln918">				na-&gt;initialized_size = tinitialized_size;</a>
+<a name="ln919">				na-&gt;ni-&gt;flags |= compression;</a>
+<a name="ln920">				na-&gt;data_flags = data_flags;</a>
+<a name="ln921">				free(cb);</a>
+<a name="ln922">				free(dest);</a>
+<a name="ln923">				if (total)</a>
+<a name="ln924">					return total;</a>
+<a name="ln925">				errno = err;</a>
+<a name="ln926">				return br;</a>
+<a name="ln927">			}</a>
+<a name="ln928">			cb_pos += br;</a>
+<a name="ln929">			to_read -= br;</a>
+<a name="ln930">		} while (to_read &gt; 0);</a>
+<a name="ln931">		na-&gt;data_size = tdata_size;</a>
+<a name="ln932">		na-&gt;initialized_size = tinitialized_size;</a>
+<a name="ln933">		na-&gt;ni-&gt;flags |= compression;</a>
+<a name="ln934">		na-&gt;data_flags = data_flags;</a>
+<a name="ln935">		/* Just a precaution. */</a>
+<a name="ln936">		if (cb_pos + 2 &lt;= cb_end)</a>
+<a name="ln937">			*(u16*)cb_pos = 0;</a>
+<a name="ln938">		ntfs_log_debug(&quot;Successfully read the compression block.\n&quot;);</a>
+<a name="ln939">		/* Do not decompress beyond the requested block */</a>
+<a name="ln940">		to_read = min(count, cb_size - ofs);</a>
+<a name="ln941">		decompsz = ((ofs + to_read - 1) | (NTFS_SB_SIZE - 1)) + 1;</a>
+<a name="ln942">		if (ntfs_decompress(dest, decompsz, cb, cb_size) &lt; 0) {</a>
+<a name="ln943">			err = errno;</a>
+<a name="ln944">			free(cb);</a>
+<a name="ln945">			free(dest);</a>
+<a name="ln946">			if (total)</a>
+<a name="ln947">				return total;</a>
+<a name="ln948">			errno = err;</a>
+<a name="ln949">			return -1;</a>
+<a name="ln950">		}</a>
+<a name="ln951">		memcpy(b, dest + ofs, to_read);</a>
+<a name="ln952">		total += to_read;</a>
+<a name="ln953">		count -= to_read;</a>
+<a name="ln954">		b = (u8*)b + to_read;</a>
+<a name="ln955">		ofs = 0;</a>
+<a name="ln956">	}</a>
+<a name="ln957">	/* Do we have more work to do? */</a>
+<a name="ln958">	if (nr_cbs)</a>
+<a name="ln959">		goto do_next_cb;</a>
+<a name="ln960">	/* We no longer need the buffers. */</a>
+<a name="ln961">	free(cb);</a>
+<a name="ln962">	free(dest);</a>
+<a name="ln963">	/* Return number of bytes read. */</a>
+<a name="ln964">	return total + total2;</a>
+<a name="ln965">}</a>
+<a name="ln966"> </a>
+<a name="ln967">/*</a>
+<a name="ln968"> *		Read data from a set of clusters</a>
+<a name="ln969"> *</a>
+<a name="ln970"> *	Returns the amount of data read</a>
+<a name="ln971"> */</a>
+<a name="ln972"> </a>
+<a name="ln973">static u32 read_clusters(ntfs_volume *vol, const runlist_element *rl,</a>
+<a name="ln974">			s64 offs, u32 to_read, char *inbuf)</a>
+<a name="ln975">{</a>
+<a name="ln976">	u32 count;</a>
+<a name="ln977">	int xgot;</a>
+<a name="ln978">	u32 got;</a>
+<a name="ln979">	s64 xpos;</a>
+<a name="ln980">	BOOL first;</a>
+<a name="ln981">	char *xinbuf;</a>
+<a name="ln982">	const runlist_element *xrl;</a>
+<a name="ln983"> </a>
+<a name="ln984">	got = 0;</a>
+<a name="ln985">	xrl = rl;</a>
+<a name="ln986">	xinbuf = inbuf;</a>
+<a name="ln987">	first = TRUE;</a>
+<a name="ln988">	do {</a>
+<a name="ln989">		count = xrl-&gt;length &lt;&lt; vol-&gt;cluster_size_bits;</a>
+<a name="ln990">		xpos = xrl-&gt;lcn &lt;&lt; vol-&gt;cluster_size_bits;</a>
+<a name="ln991">		if (first) {</a>
+<a name="ln992">			count -= offs;</a>
+<a name="ln993">			xpos += offs;</a>
+<a name="ln994">		}</a>
+<a name="ln995">		if ((to_read - got) &lt; count)</a>
+<a name="ln996">			count = to_read - got;</a>
+<a name="ln997">		xgot = ntfs_pread(vol-&gt;dev, xpos, count, xinbuf);</a>
+<a name="ln998">		if (xgot == (int)count) {</a>
+<a name="ln999">			got += count;</a>
+<a name="ln1000">			xpos += count;</a>
+<a name="ln1001">			xinbuf += count;</a>
+<a name="ln1002">			xrl++;</a>
+<a name="ln1003">		}</a>
+<a name="ln1004">		first = FALSE;</a>
+<a name="ln1005">	} while ((xgot == (int)count) &amp;&amp; (got &lt; to_read));</a>
+<a name="ln1006">	return (got);</a>
+<a name="ln1007">}</a>
+<a name="ln1008"> </a>
+<a name="ln1009">/*</a>
+<a name="ln1010"> *		Write data to a set of clusters</a>
+<a name="ln1011"> *</a>
+<a name="ln1012"> *	Returns the amount of data written</a>
+<a name="ln1013"> */</a>
+<a name="ln1014"> </a>
+<a name="ln1015">static s32 write_clusters(ntfs_volume *vol, const runlist_element *rl,</a>
+<a name="ln1016">			s64 offs, s32 to_write, const char *outbuf)</a>
+<a name="ln1017">{</a>
+<a name="ln1018">	s32 count;</a>
+<a name="ln1019">	s32 put, xput;</a>
+<a name="ln1020">	s64 xpos;</a>
+<a name="ln1021">	BOOL first;</a>
+<a name="ln1022">	const char *xoutbuf;</a>
+<a name="ln1023">	const runlist_element *xrl;</a>
+<a name="ln1024"> </a>
+<a name="ln1025">	put = 0;</a>
+<a name="ln1026">	xrl = rl;</a>
+<a name="ln1027">	xoutbuf = outbuf;</a>
+<a name="ln1028">	first = TRUE;</a>
+<a name="ln1029">	do {</a>
+<a name="ln1030">		count = xrl-&gt;length &lt;&lt; vol-&gt;cluster_size_bits;</a>
+<a name="ln1031">		xpos = xrl-&gt;lcn &lt;&lt; vol-&gt;cluster_size_bits;</a>
+<a name="ln1032">		if (first) {</a>
+<a name="ln1033">			count -= offs;</a>
+<a name="ln1034">			xpos += offs;</a>
+<a name="ln1035">		}</a>
+<a name="ln1036">		if ((to_write - put) &lt; count)</a>
+<a name="ln1037">			count = to_write - put;</a>
+<a name="ln1038">		xput = ntfs_pwrite(vol-&gt;dev, xpos, count, xoutbuf);</a>
+<a name="ln1039">		if (xput == count) {</a>
+<a name="ln1040">			put += count;</a>
+<a name="ln1041">			xpos += count;</a>
+<a name="ln1042">			xoutbuf += count;</a>
+<a name="ln1043">			xrl++;</a>
+<a name="ln1044">		}</a>
+<a name="ln1045">		first = FALSE;</a>
+<a name="ln1046">	} while ((xput == count) &amp;&amp; (put &lt; to_write));</a>
+<a name="ln1047">	return (put);</a>
+<a name="ln1048">}</a>
+<a name="ln1049"> </a>
+<a name="ln1050"> </a>
+<a name="ln1051">/*</a>
+<a name="ln1052"> *		Compress and write a set of blocks</a>
+<a name="ln1053"> *</a>
+<a name="ln1054"> *	returns the size actually written (rounded to a full cluster)</a>
+<a name="ln1055"> *		or 0 if all zeroes (nothing is written)</a>
+<a name="ln1056"> *		or -1 if could not compress (nothing is written)</a>
+<a name="ln1057"> *		or -2 if there were an irrecoverable error (errno set)</a>
+<a name="ln1058"> */</a>
+<a name="ln1059"> </a>
+<a name="ln1060">static s32 ntfs_comp_set(ntfs_attr *na, runlist_element *rl,</a>
+<a name="ln1061">			s64 offs, u32 insz, const char *inbuf)</a>
+<a name="ln1062">{</a>
+<a name="ln1063">	ntfs_volume *vol;</a>
+<a name="ln1064">	char *outbuf;</a>
+<a name="ln1065">	char *pbuf;</a>
+<a name="ln1066">	u32 compsz;</a>
+<a name="ln1067">	s32 written;</a>
+<a name="ln1068">	s32 rounded;</a>
+<a name="ln1069">	unsigned int clsz;</a>
+<a name="ln1070">	u32 p;</a>
+<a name="ln1071">	unsigned int sz;</a>
+<a name="ln1072">	unsigned int bsz;</a>
+<a name="ln1073">	BOOL fail;</a>
+<a name="ln1074">	BOOL allzeroes;</a>
+<a name="ln1075">		/* a single compressed zero */</a>
+<a name="ln1076">	static char onezero[] = { 0x01, 0xb0, 0x00, 0x00 } ;</a>
+<a name="ln1077">		/* a couple of compressed zeroes */</a>
+<a name="ln1078">	static char twozeroes[] = { 0x02, 0xb0, 0x00, 0x00, 0x00 } ;</a>
+<a name="ln1079">		/* more compressed zeroes, to be followed by some count */</a>
+<a name="ln1080">	static char morezeroes[] = { 0x03, 0xb0, 0x02, 0x00 } ;</a>
+<a name="ln1081"> </a>
+<a name="ln1082">	vol = na-&gt;ni-&gt;vol;</a>
+<a name="ln1083">	written = -1; /* default return */</a>
+<a name="ln1084">	clsz = 1 &lt;&lt; vol-&gt;cluster_size_bits;</a>
+<a name="ln1085">		/* may need 2 extra bytes per block and 2 more bytes */</a>
+<a name="ln1086">	outbuf = (char*)ntfs_malloc(na-&gt;compression_block_size</a>
+<a name="ln1087">			+ 2*(na-&gt;compression_block_size/NTFS_SB_SIZE)</a>
+<a name="ln1088">			+ 2);</a>
+<a name="ln1089">	if (outbuf) {</a>
+<a name="ln1090">		fail = FALSE;</a>
+<a name="ln1091">		compsz = 0;</a>
+<a name="ln1092">		allzeroes = TRUE;</a>
+<a name="ln1093">		for (p=0; (p&lt;insz) &amp;&amp; !fail; p+=NTFS_SB_SIZE) {</a>
+<a name="ln1094">			if ((p + NTFS_SB_SIZE) &lt; insz)</a>
+<a name="ln1095">				bsz = NTFS_SB_SIZE;</a>
+<a name="ln1096">			else</a>
+<a name="ln1097">				bsz = insz - p;</a>
+<a name="ln1098">			pbuf = &amp;outbuf[compsz];</a>
+<a name="ln1099">			sz = ntfs_compress_block(&amp;inbuf[p],bsz,pbuf);</a>
+<a name="ln1100">			/* fail if all the clusters (or more) are needed */</a>
+<a name="ln1101">			if (!sz || ((compsz + sz + clsz + 2)</a>
+<a name="ln1102">					 &gt; na-&gt;compression_block_size))</a>
+<a name="ln1103">				fail = TRUE;</a>
+<a name="ln1104">			else {</a>
+<a name="ln1105">				if (allzeroes) {</a>
+<a name="ln1106">				/* check whether this is all zeroes */</a>
+<a name="ln1107">					switch (sz) {</a>
+<a name="ln1108">					case 4 :</a>
+<a name="ln1109">						allzeroes = !memcmp(</a>
+<a name="ln1110">							pbuf,onezero,4);</a>
+<a name="ln1111">						break;</a>
+<a name="ln1112">					case 5 :</a>
+<a name="ln1113">						allzeroes = !memcmp(</a>
+<a name="ln1114">							pbuf,twozeroes,5);</a>
+<a name="ln1115">						break;</a>
+<a name="ln1116">					case 6 :</a>
+<a name="ln1117">						allzeroes = !memcmp(</a>
+<a name="ln1118">							pbuf,morezeroes,4);</a>
+<a name="ln1119">						break;</a>
+<a name="ln1120">					default :</a>
+<a name="ln1121">						allzeroes = FALSE;</a>
+<a name="ln1122">						break;</a>
+<a name="ln1123">					}</a>
+<a name="ln1124">				}</a>
+<a name="ln1125">			compsz += sz;</a>
+<a name="ln1126">			}</a>
+<a name="ln1127">		}</a>
+<a name="ln1128">		if (!fail &amp;&amp; !allzeroes) {</a>
+<a name="ln1129">			/* add a couple of null bytes, space has been checked */</a>
+<a name="ln1130">			outbuf[compsz++] = 0;</a>
+<a name="ln1131">			outbuf[compsz++] = 0;</a>
+<a name="ln1132">			/* write a full cluster, to avoid partial reading */</a>
+<a name="ln1133">			rounded = ((compsz - 1) | (clsz - 1)) + 1;</a>
+<a name="ln1134">			memset(&amp;outbuf[compsz], 0, rounded - compsz);</a>
+<a name="ln1135">			written = write_clusters(vol, rl, offs, rounded, outbuf);</a>
+<a name="ln1136">			if (written != rounded) {</a>
+<a name="ln1137">				/*</a>
+<a name="ln1138">				 * TODO : previously written text has been</a>
+<a name="ln1139">				 * spoilt, should return a specific error</a>
+<a name="ln1140">				 */</a>
+<a name="ln1141">				ntfs_log_error(&quot;error writing compressed data\n&quot;);</a>
+<a name="ln1142">				errno = EIO;</a>
+<a name="ln1143">				written = -2;</a>
+<a name="ln1144">			}</a>
+<a name="ln1145">		} else</a>
+<a name="ln1146">			if (!fail)</a>
+<a name="ln1147">				written = 0;</a>
+<a name="ln1148">		free(outbuf);</a>
+<a name="ln1149">	}</a>
+<a name="ln1150">	return (written);</a>
+<a name="ln1151">}</a>
+<a name="ln1152"> </a>
+<a name="ln1153">/*</a>
+<a name="ln1154"> *		Check the validity of a compressed runlist</a>
+<a name="ln1155"> *	The check starts at the beginning of current run and ends</a>
+<a name="ln1156"> *	at the end of runlist</a>
+<a name="ln1157"> *	errno is set if the runlist is not valid</a>
+<a name="ln1158"> */</a>
+<a name="ln1159"> </a>
+<a name="ln1160">static BOOL valid_compressed_run(ntfs_attr *na, runlist_element *rl,</a>
+<a name="ln1161">			BOOL fullcheck, const char *text)</a>
+<a name="ln1162">{</a>
+<a name="ln1163">	runlist_element *xrl;</a>
+<a name="ln1164">	const char *err;</a>
+<a name="ln1165">	BOOL ok = TRUE;</a>
+<a name="ln1166"> </a>
+<a name="ln1167">	xrl = rl;</a>
+<a name="ln1168">	while (xrl-&gt;vcn &amp; (na-&gt;compression_block_clusters - 1))</a>
+<a name="ln1169">		xrl--;</a>
+<a name="ln1170">	err = (const char*)NULL;</a>
+<a name="ln1171">	while (xrl-&gt;length) {</a>
+<a name="ln1172">		if ((xrl-&gt;vcn + xrl-&gt;length) != xrl[1].vcn)</a>
+<a name="ln1173">			err = &quot;Runs not adjacent&quot;;</a>
+<a name="ln1174">		if (xrl-&gt;lcn == LCN_HOLE) {</a>
+<a name="ln1175">			if ((xrl-&gt;vcn + xrl-&gt;length)</a>
+<a name="ln1176">			    &amp; (na-&gt;compression_block_clusters - 1)) {</a>
+<a name="ln1177">				err = &quot;Invalid hole&quot;;</a>
+<a name="ln1178">			}</a>
+<a name="ln1179">			if (fullcheck &amp;&amp; (xrl[1].lcn == LCN_HOLE)) {</a>
+<a name="ln1180">				err = &quot;Adjacent holes&quot;;</a>
+<a name="ln1181">			}</a>
+<a name="ln1182">		}</a>
+<a name="ln1183">		if (err) {</a>
+<a name="ln1184">			ntfs_log_error(&quot;%s at %s index %ld inode %lld\n&quot;,</a>
+<a name="ln1185">				err, text, (long)(xrl - na-&gt;rl),</a>
+<a name="ln1186">				(long long)na-&gt;ni-&gt;mft_no);</a>
+<a name="ln1187">			errno = EIO;</a>
+<a name="ln1188">			ok = FALSE;</a>
+<a name="ln1189">			err = (const char*)NULL;</a>
+<a name="ln1190">		}</a>
+<a name="ln1191">		xrl++;</a>
+<a name="ln1192">	}</a>
+<a name="ln1193">	return (ok);</a>
+<a name="ln1194">}</a>
+<a name="ln1195"> </a>
+<a name="ln1196">/*</a>
+<a name="ln1197"> *		Free unneeded clusters after overwriting compressed data</a>
+<a name="ln1198"> *</a>
+<a name="ln1199"> *	This generally requires one or two empty slots at the end of runlist,</a>
+<a name="ln1200"> *	but we do not want to reallocate the runlist here because</a>
+<a name="ln1201"> *	there are many pointers to it.</a>
+<a name="ln1202"> *	So the empty slots have to be reserved beforehand</a>
+<a name="ln1203"> *</a>
+<a name="ln1204"> *	Returns zero unless some error occurred (described by errno)</a>
+<a name="ln1205"> *</a>
+<a name="ln1206"> *         +======= start of block =====+</a>
+<a name="ln1207"> *      0  |A     chunk may overflow    | &lt;-- rl         usedcnt : A + B</a>
+<a name="ln1208"> *         |A     on previous block     |                        then B</a>
+<a name="ln1209"> *         |A                           |</a>
+<a name="ln1210"> *         +-- end of allocated chunk --+                freelength : C</a>
+<a name="ln1211"> *         |B                           |                      (incl overflow)</a>
+<a name="ln1212"> *         +== end of compressed data ==+</a>
+<a name="ln1213"> *         |C                           | &lt;-- freerl     freecnt : C + D</a>
+<a name="ln1214"> *         |C     chunk may overflow    |</a>
+<a name="ln1215"> *         |C     on next block         |</a>
+<a name="ln1216"> *         +-- end of allocated chunk --+</a>
+<a name="ln1217"> *         |D                           |</a>
+<a name="ln1218"> *         |D     chunk may overflow    |</a>
+<a name="ln1219"> *     15  |D     on next block         |</a>
+<a name="ln1220"> *         +======== end of block ======+</a>
+<a name="ln1221"> *</a>
+<a name="ln1222"> */</a>
+<a name="ln1223"> </a>
+<a name="ln1224">static int ntfs_compress_overwr_free(ntfs_attr *na, runlist_element *rl,</a>
+<a name="ln1225">			s32 usedcnt, s32 freecnt, VCN *update_from)</a>
+<a name="ln1226">{</a>
+<a name="ln1227">	BOOL beginhole;</a>
+<a name="ln1228">	BOOL mergeholes;</a>
+<a name="ln1229">	s32 oldlength;</a>
+<a name="ln1230">	s32 freelength;</a>
+<a name="ln1231">	s64 freelcn;</a>
+<a name="ln1232">	s64 freevcn;</a>
+<a name="ln1233">	runlist_element *freerl;</a>
+<a name="ln1234">	ntfs_volume *vol;</a>
+<a name="ln1235">	s32 carry;</a>
+<a name="ln1236">	int res;</a>
+<a name="ln1237"> </a>
+<a name="ln1238">	vol = na-&gt;ni-&gt;vol;</a>
+<a name="ln1239">	res = 0;</a>
+<a name="ln1240">	freelcn = rl-&gt;lcn + usedcnt;</a>
+<a name="ln1241">	freevcn = rl-&gt;vcn + usedcnt;</a>
+<a name="ln1242">	freelength = rl-&gt;length - usedcnt;</a>
+<a name="ln1243">	beginhole = !usedcnt &amp;&amp; !rl-&gt;vcn;</a>
+<a name="ln1244">		/* can merge with hole before ? */</a>
+<a name="ln1245">	mergeholes = !usedcnt</a>
+<a name="ln1246">			&amp;&amp; rl[0].vcn</a>
+<a name="ln1247">			&amp;&amp; (rl[-1].lcn == LCN_HOLE);</a>
+<a name="ln1248">		/* truncate current run, carry to subsequent hole */</a>
+<a name="ln1249">	carry = freelength;</a>
+<a name="ln1250">	oldlength = rl-&gt;length;</a>
+<a name="ln1251">	if (mergeholes) {</a>
+<a name="ln1252">			/* merging with a hole before */</a>
+<a name="ln1253">		freerl = rl;</a>
+<a name="ln1254">	} else {</a>
+<a name="ln1255">		rl-&gt;length -= freelength; /* warning : can be zero */</a>
+<a name="ln1256">		freerl = ++rl;</a>
+<a name="ln1257">	}</a>
+<a name="ln1258">	if (!mergeholes &amp;&amp; (usedcnt || beginhole)) {</a>
+<a name="ln1259">		s32 freed;</a>
+<a name="ln1260">		runlist_element *frl;</a>
+<a name="ln1261">		runlist_element *erl;</a>
+<a name="ln1262">		int holes = 0;</a>
+<a name="ln1263">		BOOL threeparts;</a>
+<a name="ln1264"> </a>
+<a name="ln1265">		/* free the unneeded clusters from initial run, then freerl */</a>
+<a name="ln1266">		threeparts = (freelength &gt; freecnt);</a>
+<a name="ln1267">		freed = 0;</a>
+<a name="ln1268">		frl = freerl;</a>
+<a name="ln1269">		if (freelength) {</a>
+<a name="ln1270">      			res = ntfs_cluster_free_basic(vol,freelcn,</a>
+<a name="ln1271">				(threeparts ? freecnt : freelength));</a>
+<a name="ln1272">			if (!res)</a>
+<a name="ln1273">				freed += (threeparts ? freecnt : freelength);</a>
+<a name="ln1274">			if (!usedcnt) {</a>
+<a name="ln1275">				holes++;</a>
+<a name="ln1276">				freerl--;</a>
+<a name="ln1277">				freerl-&gt;length += (threeparts</a>
+<a name="ln1278">						? freecnt : freelength);</a>
+<a name="ln1279">				if (freerl-&gt;vcn &lt; *update_from)</a>
+<a name="ln1280">					*update_from = freerl-&gt;vcn;</a>
+<a name="ln1281">			}</a>
+<a name="ln1282">   		}</a>
+<a name="ln1283">   		while (!res &amp;&amp; frl-&gt;length &amp;&amp; (freed &lt; freecnt)) {</a>
+<a name="ln1284">      			if (frl-&gt;length &lt;= (freecnt - freed)) {</a>
+<a name="ln1285">         			res = ntfs_cluster_free_basic(vol, frl-&gt;lcn,</a>
+<a name="ln1286">						frl-&gt;length);</a>
+<a name="ln1287">				if (!res) {</a>
+<a name="ln1288">         				freed += frl-&gt;length;</a>
+<a name="ln1289">         				frl-&gt;lcn = LCN_HOLE;</a>
+<a name="ln1290">					frl-&gt;length += carry;</a>
+<a name="ln1291">					carry = 0;</a>
+<a name="ln1292">         				holes++;</a>
+<a name="ln1293">				}</a>
+<a name="ln1294">      			} else {</a>
+<a name="ln1295">         			res = ntfs_cluster_free_basic(vol, frl-&gt;lcn,</a>
+<a name="ln1296">						freecnt - freed);</a>
+<a name="ln1297">				if (!res) {</a>
+<a name="ln1298">         				frl-&gt;lcn += freecnt - freed;</a>
+<a name="ln1299">         				frl-&gt;vcn += freecnt - freed;</a>
+<a name="ln1300">         				frl-&gt;length -= freecnt - freed;</a>
+<a name="ln1301">         				freed = freecnt;</a>
+<a name="ln1302">				}</a>
+<a name="ln1303">      			}</a>
+<a name="ln1304">      			frl++;</a>
+<a name="ln1305">   		}</a>
+<a name="ln1306">		na-&gt;compressed_size -= freed &lt;&lt; vol-&gt;cluster_size_bits;</a>
+<a name="ln1307">		switch (holes) {</a>
+<a name="ln1308">		case 0 :</a>
+<a name="ln1309">			/* there are no hole, must insert one */</a>
+<a name="ln1310">			/* space for hole has been prereserved */</a>
+<a name="ln1311">			if (freerl-&gt;lcn == LCN_HOLE) {</a>
+<a name="ln1312">				if (threeparts) {</a>
+<a name="ln1313">					erl = freerl;</a>
+<a name="ln1314">					while (erl-&gt;length)</a>
+<a name="ln1315">						erl++;</a>
+<a name="ln1316">					do {</a>
+<a name="ln1317">						erl[2] = *erl;</a>
+<a name="ln1318">					} while (erl-- != freerl);</a>
+<a name="ln1319"> </a>
+<a name="ln1320">					freerl[1].length = freelength - freecnt;</a>
+<a name="ln1321">					freerl-&gt;length = freecnt;</a>
+<a name="ln1322">					freerl[1].lcn = freelcn + freecnt;</a>
+<a name="ln1323">					freerl[1].vcn = freevcn + freecnt;</a>
+<a name="ln1324">					freerl[2].lcn = LCN_HOLE;</a>
+<a name="ln1325">					freerl[2].vcn = freerl[1].vcn</a>
+<a name="ln1326">							+ freerl[1].length;</a>
+<a name="ln1327">					freerl-&gt;vcn = freevcn;</a>
+<a name="ln1328">				} else {</a>
+<a name="ln1329">					freerl-&gt;vcn = freevcn;</a>
+<a name="ln1330">					freerl-&gt;length += freelength;</a>
+<a name="ln1331">				}</a>
+<a name="ln1332">			} else {</a>
+<a name="ln1333">				erl = freerl;</a>
+<a name="ln1334">				while (erl-&gt;length)</a>
+<a name="ln1335">					erl++;</a>
+<a name="ln1336">				if (threeparts) {</a>
+<a name="ln1337">					do {</a>
+<a name="ln1338">						erl[2] = *erl;</a>
+<a name="ln1339">					} while (erl-- != freerl);</a>
+<a name="ln1340">					freerl[1].lcn = freelcn + freecnt;</a>
+<a name="ln1341">					freerl[1].vcn = freevcn + freecnt;</a>
+<a name="ln1342">					freerl[1].length = oldlength - usedcnt - freecnt;</a>
+<a name="ln1343">				} else {</a>
+<a name="ln1344">					do {</a>
+<a name="ln1345">						erl[1] = *erl;</a>
+<a name="ln1346">					} while (erl-- != freerl);</a>
+<a name="ln1347">				}</a>
+<a name="ln1348">				freerl-&gt;lcn = LCN_HOLE;</a>
+<a name="ln1349">				freerl-&gt;vcn = freevcn;</a>
+<a name="ln1350">				freerl-&gt;length = freecnt;</a>
+<a name="ln1351">			}</a>
+<a name="ln1352">			break;</a>
+<a name="ln1353">		case 1 :</a>
+<a name="ln1354">			/* there is a single hole, may have to merge */</a>
+<a name="ln1355">			freerl-&gt;vcn = freevcn;</a>
+<a name="ln1356">			freerl-&gt;length = freecnt;</a>
+<a name="ln1357">			if (freerl[1].lcn == LCN_HOLE) {</a>
+<a name="ln1358">				freerl-&gt;length += freerl[1].length;</a>
+<a name="ln1359">				erl = freerl;</a>
+<a name="ln1360">				do {</a>
+<a name="ln1361">					erl++;</a>
+<a name="ln1362">					*erl = erl[1];</a>
+<a name="ln1363">				} while (erl-&gt;length);</a>
+<a name="ln1364">			}</a>
+<a name="ln1365">			break;</a>
+<a name="ln1366">		default :</a>
+<a name="ln1367">			/* there were several holes, must merge them */</a>
+<a name="ln1368">			freerl-&gt;lcn = LCN_HOLE;</a>
+<a name="ln1369">			freerl-&gt;vcn = freevcn;</a>
+<a name="ln1370">			freerl-&gt;length = freecnt;</a>
+<a name="ln1371">			if (freerl[holes].lcn == LCN_HOLE) {</a>
+<a name="ln1372">				freerl-&gt;length += freerl[holes].length;</a>
+<a name="ln1373">				holes++;</a>
+<a name="ln1374">			}</a>
+<a name="ln1375">			erl = freerl;</a>
+<a name="ln1376">			do {</a>
+<a name="ln1377">				erl++;</a>
+<a name="ln1378">				*erl = erl[holes - 1];</a>
+<a name="ln1379">			} while (erl-&gt;length);</a>
+<a name="ln1380">			break;</a>
+<a name="ln1381">		}</a>
+<a name="ln1382">	} else {</a>
+<a name="ln1383">		s32 freed;</a>
+<a name="ln1384">		runlist_element *frl;</a>
+<a name="ln1385">		runlist_element *xrl;</a>
+<a name="ln1386"> </a>
+<a name="ln1387">		freed = 0;</a>
+<a name="ln1388">		frl = freerl--;</a>
+<a name="ln1389">		if (freerl-&gt;vcn &lt; *update_from)</a>
+<a name="ln1390">			*update_from = freerl-&gt;vcn;</a>
+<a name="ln1391">		while (!res &amp;&amp; frl-&gt;length &amp;&amp; (freed &lt; freecnt)) {</a>
+<a name="ln1392">			if (frl-&gt;length &lt;= (freecnt - freed)) {</a>
+<a name="ln1393">				freerl-&gt;length += frl-&gt;length;</a>
+<a name="ln1394">				freed += frl-&gt;length;</a>
+<a name="ln1395">				res = ntfs_cluster_free_basic(vol, frl-&gt;lcn,</a>
+<a name="ln1396">						frl-&gt;length);</a>
+<a name="ln1397">				frl++;</a>
+<a name="ln1398">			} else {</a>
+<a name="ln1399">				freerl-&gt;length += freecnt - freed;</a>
+<a name="ln1400">				res = ntfs_cluster_free_basic(vol, frl-&gt;lcn,</a>
+<a name="ln1401">						freecnt - freed);</a>
+<a name="ln1402">				frl-&gt;lcn += freecnt - freed;</a>
+<a name="ln1403">				frl-&gt;vcn += freecnt - freed;</a>
+<a name="ln1404">				frl-&gt;length -= freecnt - freed;</a>
+<a name="ln1405">				freed = freecnt;</a>
+<a name="ln1406">			}</a>
+<a name="ln1407">		}</a>
+<a name="ln1408">			/* remove unneded runlist entries */</a>
+<a name="ln1409">		xrl = freerl;</a>
+<a name="ln1410">			/* group with next run if also a hole */</a>
+<a name="ln1411">		if (frl-&gt;length &amp;&amp; (frl-&gt;lcn == LCN_HOLE)) {</a>
+<a name="ln1412">			xrl-&gt;length += frl-&gt;length;</a>
+<a name="ln1413">			frl++;</a>
+<a name="ln1414">		}</a>
+<a name="ln1415">		while (frl-&gt;length) {</a>
+<a name="ln1416">			*++xrl = *frl++;</a>
+<a name="ln1417">		}</a>
+<a name="ln1418">		*++xrl = *frl; /* terminator */</a>
+<a name="ln1419">	na-&gt;compressed_size -= freed &lt;&lt; vol-&gt;cluster_size_bits;</a>
+<a name="ln1420">	}</a>
+<a name="ln1421">	return (res);</a>
+<a name="ln1422">}</a>
+<a name="ln1423"> </a>
+<a name="ln1424"> </a>
+<a name="ln1425">/*</a>
+<a name="ln1426"> *		Free unneeded clusters after compression</a>
+<a name="ln1427"> *</a>
+<a name="ln1428"> *	This generally requires one or two empty slots at the end of runlist,</a>
+<a name="ln1429"> *	but we do not want to reallocate the runlist here because</a>
+<a name="ln1430"> *	there are many pointers to it.</a>
+<a name="ln1431"> *	So the empty slots have to be reserved beforehand</a>
+<a name="ln1432"> *</a>
+<a name="ln1433"> *	Returns zero unless some error occurred (described by errno)</a>
+<a name="ln1434"> */</a>
+<a name="ln1435"> </a>
+<a name="ln1436">static int ntfs_compress_free(ntfs_attr *na, runlist_element *rl,</a>
+<a name="ln1437">				s64 used, s64 reserved, BOOL appending,</a>
+<a name="ln1438">				VCN *update_from)</a>
+<a name="ln1439">{</a>
+<a name="ln1440">	s32 freecnt;</a>
+<a name="ln1441">	s32 usedcnt;</a>
+<a name="ln1442">	int res;</a>
+<a name="ln1443">	s64 freelcn;</a>
+<a name="ln1444">	s64 freevcn;</a>
+<a name="ln1445">	s32 freelength;</a>
+<a name="ln1446">	BOOL mergeholes;</a>
+<a name="ln1447">	BOOL beginhole;</a>
+<a name="ln1448">	ntfs_volume *vol;</a>
+<a name="ln1449">	runlist_element *freerl;</a>
+<a name="ln1450"> </a>
+<a name="ln1451">	res = -1; /* default return */</a>
+<a name="ln1452">	vol = na-&gt;ni-&gt;vol;</a>
+<a name="ln1453">	freecnt = (reserved - used) &gt;&gt; vol-&gt;cluster_size_bits;</a>
+<a name="ln1454">	usedcnt = (reserved &gt;&gt; vol-&gt;cluster_size_bits) - freecnt;</a>
+<a name="ln1455">	if (rl-&gt;vcn &lt; *update_from)</a>
+<a name="ln1456">		*update_from = rl-&gt;vcn;</a>
+<a name="ln1457">		/* skip entries fully used, if any */</a>
+<a name="ln1458">	while (rl-&gt;length &amp;&amp; (rl-&gt;length &lt; usedcnt)) {</a>
+<a name="ln1459">		usedcnt -= rl-&gt;length; /* must be &gt; 0 */</a>
+<a name="ln1460">		rl++;</a>
+<a name="ln1461">	}</a>
+<a name="ln1462">	if (rl-&gt;length) {</a>
+<a name="ln1463">		/*</a>
+<a name="ln1464">		 * Splitting the current allocation block requires</a>
+<a name="ln1465">		 * an extra runlist element to create the hole.</a>
+<a name="ln1466">		 * The required entry has been prereserved when</a>
+<a name="ln1467">		 * mapping the runlist.</a>
+<a name="ln1468">		 */</a>
+<a name="ln1469">			/* get the free part in initial run */</a>
+<a name="ln1470">		freelcn = rl-&gt;lcn + usedcnt;</a>
+<a name="ln1471">		freevcn = rl-&gt;vcn + usedcnt;</a>
+<a name="ln1472">			/* new count of allocated clusters */</a>
+<a name="ln1473">		if (!((freevcn + freecnt)</a>
+<a name="ln1474">			    &amp; (na-&gt;compression_block_clusters - 1))) {</a>
+<a name="ln1475">			if (!appending)</a>
+<a name="ln1476">				res = ntfs_compress_overwr_free(na,rl,</a>
+<a name="ln1477">						usedcnt,freecnt,update_from);</a>
+<a name="ln1478">			else {</a>
+<a name="ln1479">				freelength = rl-&gt;length - usedcnt;</a>
+<a name="ln1480">				beginhole = !usedcnt &amp;&amp; !rl-&gt;vcn;</a>
+<a name="ln1481">				mergeholes = !usedcnt</a>
+<a name="ln1482">						&amp;&amp; rl[0].vcn</a>
+<a name="ln1483">						&amp;&amp; (rl[-1].lcn == LCN_HOLE);</a>
+<a name="ln1484">				if (mergeholes) {</a>
+<a name="ln1485">					s32 carry;</a>
+<a name="ln1486"> </a>
+<a name="ln1487">				/* shorten the runs which have free space */</a>
+<a name="ln1488">					carry = freecnt;</a>
+<a name="ln1489">					freerl = rl;</a>
+<a name="ln1490">					while (freerl-&gt;length &lt; carry) {</a>
+<a name="ln1491">						carry -= freerl-&gt;length;</a>
+<a name="ln1492">						freerl++;</a>
+<a name="ln1493">					}</a>
+<a name="ln1494">					freerl-&gt;length = carry;</a>
+<a name="ln1495">					freerl = rl;</a>
+<a name="ln1496">				} else {</a>
+<a name="ln1497">					rl-&gt;length = usedcnt; /* can be zero ? */</a>
+<a name="ln1498">					freerl = ++rl;</a>
+<a name="ln1499">				}</a>
+<a name="ln1500">				if ((freelength &gt; 0)</a>
+<a name="ln1501">				    &amp;&amp; !mergeholes</a>
+<a name="ln1502">				    &amp;&amp; (usedcnt || beginhole)) {</a>
+<a name="ln1503">				/*</a>
+<a name="ln1504">				 * move the unused part to the end. Doing so,</a>
+<a name="ln1505">				 * the vcn will be out of order. This does</a>
+<a name="ln1506">				 * not harm, the vcn are meaningless now, and</a>
+<a name="ln1507">				 * only the lcn are meaningful for freeing.</a>
+<a name="ln1508">				 */</a>
+<a name="ln1509">					/* locate current end */</a>
+<a name="ln1510">					while (rl-&gt;length)</a>
+<a name="ln1511">						rl++;</a>
+<a name="ln1512">					/* new terminator relocated */</a>
+<a name="ln1513">					rl[1].vcn = rl-&gt;vcn;</a>
+<a name="ln1514">					rl[1].lcn = LCN_ENOENT;</a>
+<a name="ln1515">					rl[1].length = 0;</a>
+<a name="ln1516">					/* hole, currently allocated */</a>
+<a name="ln1517">					rl-&gt;vcn = freevcn;</a>
+<a name="ln1518">					rl-&gt;lcn = freelcn;</a>
+<a name="ln1519">					rl-&gt;length = freelength;</a>
+<a name="ln1520">				} else {</a>
+<a name="ln1521">	/* why is this different from the begin hole case ? */</a>
+<a name="ln1522">					if ((freelength &gt; 0)</a>
+<a name="ln1523">					    &amp;&amp; !mergeholes</a>
+<a name="ln1524">					    &amp;&amp; !usedcnt) {</a>
+<a name="ln1525">						freerl--;</a>
+<a name="ln1526">						freerl-&gt;length = freelength;</a>
+<a name="ln1527">						if (freerl-&gt;vcn &lt; *update_from)</a>
+<a name="ln1528">							*update_from</a>
+<a name="ln1529">								= freerl-&gt;vcn;</a>
+<a name="ln1530">					}</a>
+<a name="ln1531">				}</a>
+<a name="ln1532">				/* free the hole */</a>
+<a name="ln1533">				res = ntfs_cluster_free_from_rl(vol,freerl);</a>
+<a name="ln1534">				if (!res) {</a>
+<a name="ln1535">					na-&gt;compressed_size -= freecnt</a>
+<a name="ln1536">						&lt;&lt; vol-&gt;cluster_size_bits;</a>
+<a name="ln1537">					if (mergeholes) {</a>
+<a name="ln1538">						/* merge with adjacent hole */</a>
+<a name="ln1539">						freerl--;</a>
+<a name="ln1540">						freerl-&gt;length += freecnt;</a>
+<a name="ln1541">					} else {</a>
+<a name="ln1542">						if (beginhole)</a>
+<a name="ln1543">							freerl--;</a>
+<a name="ln1544">						/* mark hole as free */</a>
+<a name="ln1545">						freerl-&gt;lcn = LCN_HOLE;</a>
+<a name="ln1546">						freerl-&gt;vcn = freevcn;</a>
+<a name="ln1547">						freerl-&gt;length = freecnt;</a>
+<a name="ln1548">					}</a>
+<a name="ln1549">					if (freerl-&gt;vcn &lt; *update_from)</a>
+<a name="ln1550">						*update_from = freerl-&gt;vcn;</a>
+<a name="ln1551">						/* and set up the new end */</a>
+<a name="ln1552">					freerl[1].lcn = LCN_ENOENT;</a>
+<a name="ln1553">					freerl[1].vcn = freevcn + freecnt;</a>
+<a name="ln1554">					freerl[1].length = 0;</a>
+<a name="ln1555">				}</a>
+<a name="ln1556">			}</a>
+<a name="ln1557">		} else {</a>
+<a name="ln1558">			ntfs_log_error(&quot;Bad end of a compression block set\n&quot;);</a>
+<a name="ln1559">			errno = EIO;</a>
+<a name="ln1560">		}</a>
+<a name="ln1561">	} else {</a>
+<a name="ln1562">		ntfs_log_error(&quot;No cluster to free after compression\n&quot;);</a>
+<a name="ln1563">		errno = EIO;</a>
+<a name="ln1564">	}</a>
+<a name="ln1565">	NAttrSetRunlistDirty(na);</a>
+<a name="ln1566">	return (res);</a>
+<a name="ln1567">}</a>
+<a name="ln1568"> </a>
+<a name="ln1569">/*</a>
+<a name="ln1570"> *		Read existing data, decompress and append buffer</a>
+<a name="ln1571"> *	Do nothing if something fails</a>
+<a name="ln1572"> */</a>
+<a name="ln1573"> </a>
+<a name="ln1574">static int ntfs_read_append(ntfs_attr *na, const runlist_element *rl,</a>
+<a name="ln1575">			s64 offs, u32 compsz, s32 pos, BOOL appending,</a>
+<a name="ln1576">			char *outbuf, s64 to_write, const void *b)</a>
+<a name="ln1577">{</a>
+<a name="ln1578">	int fail = 1;</a>
+<a name="ln1579">	char *compbuf;</a>
+<a name="ln1580">	u32 decompsz;</a>
+<a name="ln1581">	u32 got;</a>
+<a name="ln1582"> </a>
+<a name="ln1583">	if (compsz == na-&gt;compression_block_size) {</a>
+<a name="ln1584">			/* if the full block was requested, it was a hole */</a>
+<a name="ln1585">		memset(outbuf,0,compsz);</a>
+<a name="ln1586">		memcpy(&amp;outbuf[pos],b,to_write);</a>
+<a name="ln1587">		fail = 0;</a>
+<a name="ln1588">	} else {</a>
+<a name="ln1589">		compbuf = (char*)ntfs_malloc(compsz);</a>
+<a name="ln1590">		if (compbuf) {</a>
+<a name="ln1591">			/* must align to full block for decompression */</a>
+<a name="ln1592">			if (appending)</a>
+<a name="ln1593">				decompsz = ((pos - 1) | (NTFS_SB_SIZE - 1)) + 1;</a>
+<a name="ln1594">			else</a>
+<a name="ln1595">				decompsz = na-&gt;compression_block_size;</a>
+<a name="ln1596">			got = read_clusters(na-&gt;ni-&gt;vol, rl, offs,</a>
+<a name="ln1597">					compsz, compbuf);</a>
+<a name="ln1598">			if ((got == compsz)</a>
+<a name="ln1599">			    &amp;&amp; !ntfs_decompress((u8*)outbuf,decompsz,</a>
+<a name="ln1600">					(u8*)compbuf,compsz)) {</a>
+<a name="ln1601">				memcpy(&amp;outbuf[pos],b,to_write);</a>
+<a name="ln1602">				fail = 0;</a>
+<a name="ln1603">			}</a>
+<a name="ln1604">			free(compbuf);</a>
+<a name="ln1605">		}</a>
+<a name="ln1606">	}</a>
+<a name="ln1607">	return (fail);</a>
+<a name="ln1608">}</a>
+<a name="ln1609"> </a>
+<a name="ln1610">/*</a>
+<a name="ln1611"> *		Flush a full compression block</a>
+<a name="ln1612"> *</a>
+<a name="ln1613"> *	returns the size actually written (rounded to a full cluster)</a>
+<a name="ln1614"> *		or 0 if could not compress (and written uncompressed)</a>
+<a name="ln1615"> *		or -1 if there were an irrecoverable error (errno set)</a>
+<a name="ln1616"> */</a>
+<a name="ln1617"> </a>
+<a name="ln1618">static s32 ntfs_flush(ntfs_attr *na, runlist_element *rl, s64 offs,</a>
+<a name="ln1619">			const char *outbuf, s32 count, BOOL compress,</a>
+<a name="ln1620">			BOOL appending, VCN *update_from)</a>
+<a name="ln1621">{</a>
+<a name="ln1622">	s32 rounded;</a>
+<a name="ln1623">	s32 written;</a>
+<a name="ln1624">	int clsz;</a>
+<a name="ln1625"> </a>
+<a name="ln1626">	if (compress) {</a>
+<a name="ln1627">		written = ntfs_comp_set(na, rl, offs, count, outbuf);</a>
+<a name="ln1628">		if (written == -1)</a>
+<a name="ln1629">			compress = FALSE;</a>
+<a name="ln1630">		if ((written &gt;= 0)</a>
+<a name="ln1631">		   &amp;&amp; ntfs_compress_free(na,rl,offs + written,</a>
+<a name="ln1632">				offs + na-&gt;compression_block_size, appending,</a>
+<a name="ln1633">				update_from))</a>
+<a name="ln1634">			written = -1;</a>
+<a name="ln1635">	} else</a>
+<a name="ln1636">		written = 0;</a>
+<a name="ln1637">	if (!compress) {</a>
+<a name="ln1638">		clsz = 1 &lt;&lt; na-&gt;ni-&gt;vol-&gt;cluster_size_bits;</a>
+<a name="ln1639">		rounded = ((count - 1) | (clsz - 1)) + 1;</a>
+<a name="ln1640">		written = write_clusters(na-&gt;ni-&gt;vol, rl,</a>
+<a name="ln1641">				offs, rounded, outbuf);</a>
+<a name="ln1642">		if (written != rounded)</a>
+<a name="ln1643">			written = -1;</a>
+<a name="ln1644">	}</a>
+<a name="ln1645">	return (written);</a>
+<a name="ln1646">}</a>
+<a name="ln1647"> </a>
+<a name="ln1648">/*</a>
+<a name="ln1649"> *		Write some data to be compressed.</a>
+<a name="ln1650"> *	Compression only occurs when a few clusters (usually 16) are</a>
+<a name="ln1651"> *	full. When this occurs an extra runlist slot may be needed, so</a>
+<a name="ln1652"> *	it has to be reserved beforehand.</a>
+<a name="ln1653"> *</a>
+<a name="ln1654"> *	Returns the size of uncompressed data written,</a>
+<a name="ln1655"> *		or negative if an error occurred.</a>
+<a name="ln1656"> *	When the returned size is less than requested, new clusters have</a>
+<a name="ln1657"> *	to be allocated before the function is called again.</a>
+<a name="ln1658"> */</a>
+<a name="ln1659"> </a>
+<a name="ln1660">s64 ntfs_compressed_pwrite(ntfs_attr *na, runlist_element *wrl, s64 wpos,</a>
+<a name="ln1661">				s64 offs, s64 to_write, s64 rounded,</a>
+<a name="ln1662">				const void *b, int compressed_part,</a>
+<a name="ln1663">				VCN *update_from)</a>
+<a name="ln1664">{</a>
+<a name="ln1665">	ntfs_volume *vol;</a>
+<a name="ln1666">	runlist_element *brl; /* entry containing the beginning of block */</a>
+<a name="ln1667">	int compression_length;</a>
+<a name="ln1668">	s64 written;</a>
+<a name="ln1669">	s64 to_read;</a>
+<a name="ln1670">	s64 to_flush;</a>
+<a name="ln1671">	s64 roffs;</a>
+<a name="ln1672">	s64 got;</a>
+<a name="ln1673">	s64 start_vcn;</a>
+<a name="ln1674">	s64 nextblock;</a>
+<a name="ln1675">	s64 endwrite;</a>
+<a name="ln1676">	u32 compsz;</a>
+<a name="ln1677">	char *inbuf;</a>
+<a name="ln1678">	char *outbuf;</a>
+<a name="ln1679">	BOOL fail;</a>
+<a name="ln1680">	BOOL done;</a>
+<a name="ln1681">	BOOL compress;</a>
+<a name="ln1682">	BOOL appending;</a>
+<a name="ln1683"> </a>
+<a name="ln1684">	if (!valid_compressed_run(na,wrl,FALSE,&quot;begin compressed write&quot;)) {</a>
+<a name="ln1685">		return (-1);</a>
+<a name="ln1686">	}</a>
+<a name="ln1687">	if ((*update_from &lt; 0)</a>
+<a name="ln1688">	    || (compressed_part &lt; 0)</a>
+<a name="ln1689">	    || (compressed_part &gt; (int)na-&gt;compression_block_clusters)) {</a>
+<a name="ln1690">		ntfs_log_error(&quot;Bad update vcn or compressed_part %d for compressed write\n&quot;,</a>
+<a name="ln1691">			compressed_part);</a>
+<a name="ln1692">		errno = EIO;</a>
+<a name="ln1693">		return (-1);</a>
+<a name="ln1694">	}</a>
+<a name="ln1695">		/* make sure there are two unused entries in runlist */</a>
+<a name="ln1696">	if (na-&gt;unused_runs &lt; 2) {</a>
+<a name="ln1697">		ntfs_log_error(&quot;No unused runs for compressed write\n&quot;);</a>
+<a name="ln1698">		errno = EIO;</a>
+<a name="ln1699">		return (-1);</a>
+<a name="ln1700">	}</a>
+<a name="ln1701">	if (wrl-&gt;vcn &lt; *update_from)</a>
+<a name="ln1702">		*update_from = wrl-&gt;vcn;</a>
+<a name="ln1703">	written = -1; /* default return */</a>
+<a name="ln1704">	vol = na-&gt;ni-&gt;vol;</a>
+<a name="ln1705">	compression_length = na-&gt;compression_block_clusters;</a>
+<a name="ln1706">	compress = FALSE;</a>
+<a name="ln1707">	done = FALSE;</a>
+<a name="ln1708">		/*</a>
+<a name="ln1709">		 * Cannot accept writing beyond the current compression set</a>
+<a name="ln1710">		 * because when compression occurs, clusters are freed</a>
+<a name="ln1711">		 * and have to be reallocated.</a>
+<a name="ln1712">		 * (cannot happen with standard fuse 4K buffers)</a>
+<a name="ln1713">		 * Caller has to avoid this situation, or face consequences.</a>
+<a name="ln1714">		 */</a>
+<a name="ln1715">	nextblock = ((offs + (wrl-&gt;vcn &lt;&lt; vol-&gt;cluster_size_bits))</a>
+<a name="ln1716">			| (na-&gt;compression_block_size - 1)) + 1;</a>
+<a name="ln1717">		/* determine whether we are appending to file */</a>
+<a name="ln1718">	endwrite = offs + to_write + (wrl-&gt;vcn &lt;&lt; vol-&gt;cluster_size_bits);</a>
+<a name="ln1719">	appending = endwrite &gt;= na-&gt;initialized_size;</a>
+<a name="ln1720">	if (endwrite &gt;= nextblock) {</a>
+<a name="ln1721">			/* it is time to compress */</a>
+<a name="ln1722">		compress = TRUE;</a>
+<a name="ln1723">			/* only process what we can */</a>
+<a name="ln1724">		to_write = rounded = nextblock</a>
+<a name="ln1725">			- (offs + (wrl-&gt;vcn &lt;&lt; vol-&gt;cluster_size_bits));</a>
+<a name="ln1726">	}</a>
+<a name="ln1727">	start_vcn = 0;</a>
+<a name="ln1728">	fail = FALSE;</a>
+<a name="ln1729">	brl = wrl;</a>
+<a name="ln1730">	roffs = 0;</a>
+<a name="ln1731">		/*</a>
+<a name="ln1732">		 * If we are about to compress or we need to decompress</a>
+<a name="ln1733">		 * existing data, we have to process a full set of blocks.</a>
+<a name="ln1734">		 * So relocate the parameters to the beginning of allocation</a>
+<a name="ln1735">		 * containing the first byte of the set of blocks.</a>
+<a name="ln1736">		 */</a>
+<a name="ln1737">	if (compress || compressed_part) {</a>
+<a name="ln1738">		/* find the beginning of block */</a>
+<a name="ln1739">		start_vcn = (wrl-&gt;vcn + (offs &gt;&gt; vol-&gt;cluster_size_bits))</a>
+<a name="ln1740">				&amp; -compression_length;</a>
+<a name="ln1741">		if (start_vcn &lt; *update_from)</a>
+<a name="ln1742">			*update_from = start_vcn;</a>
+<a name="ln1743">		while (brl-&gt;vcn &amp;&amp; (brl-&gt;vcn &gt; start_vcn)) {</a>
+<a name="ln1744">			/* jumping back a hole means big trouble */</a>
+<a name="ln1745">			if (brl-&gt;lcn == (LCN)LCN_HOLE) {</a>
+<a name="ln1746">				ntfs_log_error(&quot;jump back over a hole when appending\n&quot;);</a>
+<a name="ln1747">				fail = TRUE;</a>
+<a name="ln1748">				errno = EIO;</a>
+<a name="ln1749">			}</a>
+<a name="ln1750">			brl--;</a>
+<a name="ln1751">			offs += brl-&gt;length &lt;&lt; vol-&gt;cluster_size_bits;</a>
+<a name="ln1752">		}</a>
+<a name="ln1753">		roffs = (start_vcn - brl-&gt;vcn) &lt;&lt; vol-&gt;cluster_size_bits;</a>
+<a name="ln1754">	}</a>
+<a name="ln1755">	if (compressed_part &amp;&amp; !fail) {</a>
+<a name="ln1756">		/*</a>
+<a name="ln1757">		 * The set of compression blocks contains compressed data</a>
+<a name="ln1758">		 * (we are reopening an existing file to append to it)</a>
+<a name="ln1759">		 * Decompress the data and append</a>
+<a name="ln1760">		 */</a>
+<a name="ln1761">		compsz = (s32)compressed_part &lt;&lt; vol-&gt;cluster_size_bits;</a>
+<a name="ln1762">		outbuf = (char*)ntfs_malloc(na-&gt;compression_block_size);</a>
+<a name="ln1763">		if (outbuf) {</a>
+<a name="ln1764">			if (appending) {</a>
+<a name="ln1765">				to_read = offs - roffs;</a>
+<a name="ln1766">				to_flush = to_read + to_write;</a>
+<a name="ln1767">			} else {</a>
+<a name="ln1768">				to_read = na-&gt;data_size</a>
+<a name="ln1769">					- (brl-&gt;vcn &lt;&lt; vol-&gt;cluster_size_bits);</a>
+<a name="ln1770">				if (to_read &gt; na-&gt;compression_block_size)</a>
+<a name="ln1771">					to_read = na-&gt;compression_block_size;</a>
+<a name="ln1772">				to_flush = to_read;</a>
+<a name="ln1773">			}</a>
+<a name="ln1774">			if (!ntfs_read_append(na, brl, roffs, compsz,</a>
+<a name="ln1775">					(s32)(offs - roffs), appending,</a>
+<a name="ln1776">					outbuf, to_write, b)) {</a>
+<a name="ln1777">				written = ntfs_flush(na, brl, roffs,</a>
+<a name="ln1778">					outbuf, to_flush, compress, appending,</a>
+<a name="ln1779">					update_from);</a>
+<a name="ln1780">				if (written &gt;= 0) {</a>
+<a name="ln1781">					written = to_write;</a>
+<a name="ln1782">					done = TRUE;</a>
+<a name="ln1783">				}</a>
+<a name="ln1784">			}</a>
+<a name="ln1785">		free(outbuf);</a>
+<a name="ln1786">		}</a>
+<a name="ln1787">	} else {</a>
+<a name="ln1788">		if (compress &amp;&amp; !fail) {</a>
+<a name="ln1789">			/*</a>
+<a name="ln1790">			 * we are filling up a block, read the full set</a>
+<a name="ln1791">			 * of blocks and compress it</a>
+<a name="ln1792">		 	 */</a>
+<a name="ln1793">			inbuf = (char*)ntfs_malloc(na-&gt;compression_block_size);</a>
+<a name="ln1794">			if (inbuf) {</a>
+<a name="ln1795">				to_read = offs - roffs;</a>
+<a name="ln1796">				if (to_read)</a>
+<a name="ln1797">					got = read_clusters(vol, brl, roffs,</a>
+<a name="ln1798">							to_read, inbuf);</a>
+<a name="ln1799">				else</a>
+<a name="ln1800">					got = 0;</a>
+<a name="ln1801">				if (got == to_read) {</a>
+<a name="ln1802">					memcpy(&amp;inbuf[to_read],b,to_write);</a>
+<a name="ln1803">					written = ntfs_comp_set(na, brl, roffs,</a>
+<a name="ln1804">						to_read + to_write, inbuf);</a>
+<a name="ln1805">				/*</a>
+<a name="ln1806">				 * if compression was not successful,</a>
+<a name="ln1807">				 * only write the part which was requested</a>
+<a name="ln1808">				 */</a>
+<a name="ln1809">					if ((written &gt;= 0)</a>
+<a name="ln1810">						/* free the unused clusters */</a>
+<a name="ln1811">				  	  &amp;&amp; !ntfs_compress_free(na,brl,</a>
+<a name="ln1812">						    written + roffs,</a>
+<a name="ln1813">						    na-&gt;compression_block_size</a>
+<a name="ln1814">						         + roffs,</a>
+<a name="ln1815">						    appending, update_from)) {</a>
+<a name="ln1816">						done = TRUE;</a>
+<a name="ln1817">						written = to_write;</a>
+<a name="ln1818">					}</a>
+<a name="ln1819">				}</a>
+<a name="ln1820">				free(inbuf);</a>
+<a name="ln1821">			}</a>
+<a name="ln1822">		}</a>
+<a name="ln1823">		if (!done) {</a>
+<a name="ln1824">			/*</a>
+<a name="ln1825">			 * if the compression block is not full, or</a>
+<a name="ln1826">			 * if compression failed for whatever reason,</a>
+<a name="ln1827">		 	 * write uncompressed</a>
+<a name="ln1828">			 */</a>
+<a name="ln1829">			/* check we are not overflowing current allocation */</a>
+<a name="ln1830">			if ((wpos + rounded)</a>
+<a name="ln1831">			    &gt; ((wrl-&gt;lcn + wrl-&gt;length)</a>
+<a name="ln1832">				 &lt;&lt; vol-&gt;cluster_size_bits)) {</a>
+<a name="ln1833">				ntfs_log_error(&quot;writing on unallocated clusters\n&quot;);</a>
+<a name="ln1834">				errno = EIO;</a>
+<a name="ln1835">			} else {</a>
+<a name="ln1836">				written = ntfs_pwrite(vol-&gt;dev, wpos,</a>
+<a name="ln1837">					rounded, b);</a>
+<a name="ln1838">				if (written == rounded)</a>
+<a name="ln1839">					written = to_write;</a>
+<a name="ln1840">			}</a>
+<a name="ln1841">		}</a>
+<a name="ln1842">	}</a>
+<a name="ln1843">	if ((written &gt;= 0)</a>
+<a name="ln1844">	    &amp;&amp; !valid_compressed_run(na,wrl,TRUE,&quot;end compressed write&quot;))</a>
+<a name="ln1845">		written = -1;</a>
+<a name="ln1846">	return (written);</a>
+<a name="ln1847">}</a>
+<a name="ln1848"> </a>
+<a name="ln1849">/*</a>
+<a name="ln1850"> *		Close a file written compressed.</a>
+<a name="ln1851"> *	This compresses the last partial compression block of the file.</a>
+<a name="ln1852"> *	Two empty runlist slots have to be reserved beforehand.</a>
+<a name="ln1853"> *</a>
+<a name="ln1854"> *	Returns zero if closing is successful.</a>
+<a name="ln1855"> */</a>
+<a name="ln1856"> </a>
+<a name="ln1857">int ntfs_compressed_close(ntfs_attr *na, runlist_element *wrl, s64 offs,</a>
+<a name="ln1858">			VCN *update_from)</a>
+<a name="ln1859">{</a>
+<a name="ln1860">	ntfs_volume *vol;</a>
+<a name="ln1861">	runlist_element *brl; /* entry containing the beginning of block */</a>
+<a name="ln1862">	int compression_length;</a>
+<a name="ln1863">	s64 written;</a>
+<a name="ln1864">	s64 to_read;</a>
+<a name="ln1865">	s64 roffs;</a>
+<a name="ln1866">	s64 got;</a>
+<a name="ln1867">	s64 start_vcn;</a>
+<a name="ln1868">	char *inbuf;</a>
+<a name="ln1869">	BOOL fail;</a>
+<a name="ln1870">	BOOL done;</a>
+<a name="ln1871"> </a>
+<a name="ln1872">	if (na-&gt;unused_runs &lt; 2) {</a>
+<a name="ln1873">		ntfs_log_error(&quot;No unused runs for compressed close\n&quot;);</a>
+<a name="ln1874">		errno = EIO;</a>
+<a name="ln1875">		return (-1);</a>
+<a name="ln1876">	}</a>
+<a name="ln1877">	if (*update_from &lt; 0) {</a>
+<a name="ln1878">		ntfs_log_error(&quot;Bad update vcn for compressed close\n&quot;);</a>
+<a name="ln1879">		errno = EIO;</a>
+<a name="ln1880">		return (-1);</a>
+<a name="ln1881">	}</a>
+<a name="ln1882">	if (wrl-&gt;vcn &lt; *update_from)</a>
+<a name="ln1883">		*update_from = wrl-&gt;vcn;</a>
+<a name="ln1884">	vol = na-&gt;ni-&gt;vol;</a>
+<a name="ln1885">	compression_length = na-&gt;compression_block_clusters;</a>
+<a name="ln1886">	done = FALSE;</a>
+<a name="ln1887">		/*</a>
+<a name="ln1888">		 * There generally is an uncompressed block at end of file,</a>
+<a name="ln1889">		 * read the full block and compress it</a>
+<a name="ln1890">		 */</a>
+<a name="ln1891">	inbuf = (char*)ntfs_malloc(na-&gt;compression_block_size);</a>
+<a name="ln1892">	if (inbuf) {</a>
+<a name="ln1893">		start_vcn = (wrl-&gt;vcn + (offs &gt;&gt; vol-&gt;cluster_size_bits))</a>
+<a name="ln1894">				&amp; -compression_length;</a>
+<a name="ln1895">		if (start_vcn &lt; *update_from)</a>
+<a name="ln1896">			*update_from = start_vcn;</a>
+<a name="ln1897">		to_read = offs + ((wrl-&gt;vcn - start_vcn)</a>
+<a name="ln1898">					&lt;&lt; vol-&gt;cluster_size_bits);</a>
+<a name="ln1899">		brl = wrl;</a>
+<a name="ln1900">		fail = FALSE;</a>
+<a name="ln1901">		while (brl-&gt;vcn &amp;&amp; (brl-&gt;vcn &gt; start_vcn)) {</a>
+<a name="ln1902">			if (brl-&gt;lcn == (LCN)LCN_HOLE) {</a>
+<a name="ln1903">				ntfs_log_error(&quot;jump back over a hole when closing\n&quot;);</a>
+<a name="ln1904">				fail = TRUE;</a>
+<a name="ln1905">				errno = EIO;</a>
+<a name="ln1906">			}</a>
+<a name="ln1907">			brl--;</a>
+<a name="ln1908">		}</a>
+<a name="ln1909">		if (!fail) {</a>
+<a name="ln1910">			/* roffs can be an offset from another uncomp block */</a>
+<a name="ln1911">			roffs = (start_vcn - brl-&gt;vcn)</a>
+<a name="ln1912">						&lt;&lt; vol-&gt;cluster_size_bits;</a>
+<a name="ln1913">			if (to_read) {</a>
+<a name="ln1914">				got = read_clusters(vol, brl, roffs, to_read,</a>
+<a name="ln1915">						 inbuf);</a>
+<a name="ln1916">				if (got == to_read) {</a>
+<a name="ln1917">					written = ntfs_comp_set(na, brl, roffs,</a>
+<a name="ln1918">							to_read, inbuf);</a>
+<a name="ln1919">					if ((written &gt;= 0)</a>
+<a name="ln1920">					/* free the unused clusters */</a>
+<a name="ln1921">					    &amp;&amp; !ntfs_compress_free(na,brl,</a>
+<a name="ln1922">							written + roffs,</a>
+<a name="ln1923">							na-&gt;compression_block_size + roffs,</a>
+<a name="ln1924">							TRUE, update_from)) {</a>
+<a name="ln1925">						done = TRUE;</a>
+<a name="ln1926">					} else</a>
+<a name="ln1927">				/* if compression failed, leave uncompressed */</a>
+<a name="ln1928">						if (written == -1)</a>
+<a name="ln1929">							done = TRUE;</a>
+<a name="ln1930">				}</a>
+<a name="ln1931">			} else</a>
+<a name="ln1932">				done = TRUE;</a>
+<a name="ln1933">			free(inbuf);</a>
+<a name="ln1934">		}</a>
+<a name="ln1935">	}</a>
+<a name="ln1936">	if (done &amp;&amp; !valid_compressed_run(na,wrl,TRUE,&quot;end compressed close&quot;))</a>
+<a name="ln1937">		done = FALSE;</a>
+<a name="ln1938">	return (!done);</a>
+<a name="ln1939">}</a>
+
+</code></pre>
+<div class="balloon" rel="1535"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v629/" target="_blank">V629</a> Consider inspecting the 'freecnt << vol->cluster_size_bits' expression. Bit shifting of the 32-bit value with a subsequent expansion to the 64-bit type.</p></div>
+<div class="balloon" rel="1419"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v629/" target="_blank">V629</a> Consider inspecting the 'freed << vol->cluster_size_bits' expression. Bit shifting of the 32-bit value with a subsequent expansion to the 64-bit type.</p></div>
+<div class="balloon" rel="1306"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v629/" target="_blank">V629</a> Consider inspecting the 'freed << vol->cluster_size_bits' expression. Bit shifting of the 32-bit value with a subsequent expansion to the 64-bit type.</p></div>
+<div class="balloon" rel="724"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v595/" target="_blank">V595</a> The 'na' pointer was utilized before it was verified against nullptr. Check lines: 724, 726.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

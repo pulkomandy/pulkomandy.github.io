@@ -1,0 +1,923 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>driver_settings.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2002-2007, Axel Dörfler, axeld@pinc-software.de.</a>
+<a name="ln3"> * This file may be used under the terms of the MIT License.</a>
+<a name="ln4"> */</a>
+<a name="ln5"> </a>
+<a name="ln6">/*!	\brief Implements the driver settings API</a>
+<a name="ln7">	This file is used by three different components with different needs:</a>
+<a name="ln8">	  1) the boot loader</a>
+<a name="ln9">		Buffers a list of settings files to move over to the kernel - the</a>
+<a name="ln10">		actual buffering is located in the boot loader directly, though.</a>
+<a name="ln11">		Creates driver_settings structures out of those on demand only.</a>
+<a name="ln12">	  2) the kernel</a>
+<a name="ln13">		Maintains a list of settings so that no disk access is required</a>
+<a name="ln14">		for known settings (such as those passed over from the boot</a>
+<a name="ln15">		loader).</a>
+<a name="ln16">	  3) libroot.so</a>
+<a name="ln17">		Exports the parser to userland applications, so that they can</a>
+<a name="ln18">		easily make use of driver_settings styled files.</a>
+<a name="ln19"> </a>
+<a name="ln20">	The file has to be recompiled for every component separately, so that</a>
+<a name="ln21">	it properly exports the required functionality (which is specified by</a>
+<a name="ln22">	_BOOT_MODE for the boot loader, and _KERNEL_MODE for the kernel).</a>
+<a name="ln23">*/</a>
+<a name="ln24"> </a>
+<a name="ln25">#include &quot;fssh_driver_settings.h&quot;</a>
+<a name="ln26"> </a>
+<a name="ln27">#include &lt;ctype.h&gt;</a>
+<a name="ln28">#include &lt;stdlib.h&gt;</a>
+<a name="ln29"> </a>
+<a name="ln30">#include &quot;fssh_fcntl.h&quot;</a>
+<a name="ln31">#include &quot;fssh_lock.h&quot;</a>
+<a name="ln32">#include &quot;fssh_os.h&quot;</a>
+<a name="ln33">#include &quot;fssh_stat.h&quot;</a>
+<a name="ln34">#include &quot;fssh_string.h&quot;</a>
+<a name="ln35">#include &quot;fssh_unistd.h&quot;</a>
+<a name="ln36"> </a>
+<a name="ln37">#include &quot;list.h&quot;</a>
+<a name="ln38"> </a>
+<a name="ln39"> </a>
+<a name="ln40">using namespace FSShell;</a>
+<a name="ln41"> </a>
+<a name="ln42">#define SETTINGS_DIRECTORY &quot;/kernel/drivers/&quot;</a>
+<a name="ln43">#define SETTINGS_MAGIC		'DrvS'</a>
+<a name="ln44"> </a>
+<a name="ln45">// Those maximum values are independent from the implementation - they</a>
+<a name="ln46">// have been chosen to make the code more robust against bad files</a>
+<a name="ln47">#define MAX_SETTINGS_SIZE	32768</a>
+<a name="ln48">#define MAX_SETTINGS_LEVEL	8</a>
+<a name="ln49"> </a>
+<a name="ln50">#define CONTINUE_PARAMETER	1</a>
+<a name="ln51">#define NO_PARAMETER 2</a>
+<a name="ln52"> </a>
+<a name="ln53"> </a>
+<a name="ln54">typedef struct settings_handle {</a>
+<a name="ln55">	list_link	link;</a>
+<a name="ln56">	char		name[FSSH_B_OS_NAME_LENGTH];</a>
+<a name="ln57">	int32_t		ref_count;</a>
+<a name="ln58">	int32_t		magic;</a>
+<a name="ln59">	struct		fssh_driver_settings settings;</a>
+<a name="ln60">	char		*text;</a>
+<a name="ln61">} settings_handle;</a>
+<a name="ln62"> </a>
+<a name="ln63"> </a>
+<a name="ln64">enum assignment_mode {</a>
+<a name="ln65">	NO_ASSIGNMENT,</a>
+<a name="ln66">	ALLOW_ASSIGNMENT,</a>
+<a name="ln67">	IGNORE_ASSIGNMENT</a>
+<a name="ln68">};</a>
+<a name="ln69"> </a>
+<a name="ln70"> </a>
+<a name="ln71">static struct list sHandles;</a>
+<a name="ln72">static fssh_mutex sLock;</a>
+<a name="ln73"> </a>
+<a name="ln74"> </a>
+<a name="ln75">//	#pragma mark - private functions</a>
+<a name="ln76"> </a>
+<a name="ln77"> </a>
+<a name="ln78">/*!</a>
+<a name="ln79">	Returns true for any characters that separate parameters -</a>
+<a name="ln80">	those are ignored in the input stream and won't be added</a>
+<a name="ln81">	to any words.</a>
+<a name="ln82">*/</a>
+<a name="ln83">static inline bool</a>
+<a name="ln84">is_parameter_separator(char c)</a>
+<a name="ln85">{</a>
+<a name="ln86">	return c == '\n' || c == ';';</a>
+<a name="ln87">}</a>
+<a name="ln88"> </a>
+<a name="ln89"> </a>
+<a name="ln90">/** Indicates if &quot;c&quot; begins a new word or not.</a>
+<a name="ln91"> */</a>
+<a name="ln92"> </a>
+<a name="ln93">static inline bool</a>
+<a name="ln94">is_word_break(char c)</a>
+<a name="ln95">{</a>
+<a name="ln96">	return isspace(c) || is_parameter_separator(c);</a>
+<a name="ln97">}</a>
+<a name="ln98"> </a>
+<a name="ln99"> </a>
+<a name="ln100">static inline bool</a>
+<a name="ln101">check_handle(void *_handle)</a>
+<a name="ln102">{</a>
+<a name="ln103">	settings_handle *handle = (settings_handle *)_handle;</a>
+<a name="ln104">	if (handle == NULL</a>
+<a name="ln105">		|| handle-&gt;magic != SETTINGS_MAGIC)</a>
+<a name="ln106">		return false;</a>
+<a name="ln107"> </a>
+<a name="ln108">	return true;</a>
+<a name="ln109">}</a>
+<a name="ln110"> </a>
+<a name="ln111"> </a>
+<a name="ln112">static fssh_driver_parameter *</a>
+<a name="ln113">get_parameter(settings_handle *handle, const char *name)</a>
+<a name="ln114">{</a>
+<a name="ln115">	int32_t i;</a>
+<a name="ln116">	for (i = handle-&gt;settings.parameter_count; i-- &gt; 0;) {</a>
+<a name="ln117">		if (!fssh_strcmp(handle-&gt;settings.parameters[i].name, name))</a>
+<a name="ln118">			return &amp;handle-&gt;settings.parameters[i];</a>
+<a name="ln119">	}</a>
+<a name="ln120">	return NULL;</a>
+<a name="ln121">}</a>
+<a name="ln122"> </a>
+<a name="ln123"> </a>
+<a name="ln124">/*!</a>
+<a name="ln125">	Returns the next word in the input buffer passed in via &quot;_pos&quot; - if</a>
+<a name="ln126">	this function returns, it will bump the input position after the word.</a>
+<a name="ln127">	It automatically cares about quoted strings and escaped characters.</a>
+<a name="ln128">	If &quot;allowNewLine&quot; is true, it reads over comments to get to the next</a>
+<a name="ln129">	word.</a>
+<a name="ln130">	Depending on the &quot;assignmentMode&quot; parameter, the '=' sign is either</a>
+<a name="ln131">	used as a work break, or not.</a>
+<a name="ln132">	The input buffer will be changed to contain the word without quotes</a>
+<a name="ln133">	or escaped characters and adds a terminating NULL byte. The &quot;_word&quot;</a>
+<a name="ln134">	parameter will be set to the beginning of the word.</a>
+<a name="ln135">	If the word is followed by a newline it will return FSSH_B_OK, if white</a>
+<a name="ln136">	spaces follows, it will return CONTINUE_PARAMETER.</a>
+<a name="ln137">*/</a>
+<a name="ln138">static fssh_status_t</a>
+<a name="ln139">get_word(char **_pos, char **_word, int32_t assignmentMode, bool allowNewLine)</a>
+<a name="ln140">{</a>
+<a name="ln141">	char *pos = *_pos;</a>
+<a name="ln142">	char quoted = 0;</a>
+<a name="ln143">	bool newLine = false, end = false;</a>
+<a name="ln144">	int escaped = 0;</a>
+<a name="ln145">	bool charEscaped = false;</a>
+<a name="ln146"> </a>
+<a name="ln147">	// Skip any white space and comments</a>
+<a name="ln148">	while (pos[0]</a>
+<a name="ln149">		&amp;&amp; ((allowNewLine &amp;&amp; (isspace(pos[0]) || is_parameter_separator(pos[0])</a>
+<a name="ln150">				|| pos[0] == '#'))</a>
+<a name="ln151">			|| (!allowNewLine &amp;&amp; (pos[0] == '\t' || pos[0] == ' '))</a>
+<a name="ln152">			|| (assignmentMode == ALLOW_ASSIGNMENT &amp;&amp; pos[0] == '='))) {</a>
+<a name="ln153">		// skip any comment lines</a>
+<a name="ln154">		if (pos[0] == '#') {</a>
+<a name="ln155">			while (pos[0] &amp;&amp; pos[0] != '\n')</a>
+<a name="ln156">				pos++;</a>
+<a name="ln157">		}</a>
+<a name="ln158">		pos++;</a>
+<a name="ln159">	}</a>
+<a name="ln160"> </a>
+<a name="ln161">	if (pos[0] == '}' || pos[0] == '\0') {</a>
+<a name="ln162">		// if we just read some white space before an end of a</a>
+<a name="ln163">		// parameter, this is just no parameter at all</a>
+<a name="ln164">		*_pos = pos;</a>
+<a name="ln165">		return NO_PARAMETER;</a>
+<a name="ln166">	}</a>
+<a name="ln167"> </a>
+<a name="ln168">	// Read in a word - might contain escaped (\) spaces, or it</a>
+<a name="ln169">	// might also be quoted (&quot; or ').</a>
+<a name="ln170"> </a>
+<a name="ln171">	if (pos[0] == '&quot;' || pos[0] == '\'') {</a>
+<a name="ln172">		quoted = pos[0];</a>
+<a name="ln173">		pos++;</a>
+<a name="ln174">	}</a>
+<a name="ln175">	*_word = pos;</a>
+<a name="ln176"> </a>
+<a name="ln177">	while (pos[0]) {</a>
+<a name="ln178">		if (charEscaped)</a>
+<a name="ln179">			charEscaped = false;</a>
+<a name="ln180">		else if (pos[0] == '\\') {</a>
+<a name="ln181">			charEscaped = true;</a>
+<a name="ln182">			escaped++;</a>
+<a name="ln183">		} else if ((!quoted &amp;&amp; (is_word_break(pos[0])</a>
+<a name="ln184">				|| (assignmentMode != IGNORE_ASSIGNMENT &amp;&amp; pos[0] == '=')))</a>
+<a name="ln185">			|| (quoted &amp;&amp; pos[0] == quoted))</a>
+<a name="ln186">			break;</a>
+<a name="ln187"> </a>
+<a name="ln188">		pos++;</a>
+<a name="ln189">	}</a>
+<a name="ln190"> </a>
+<a name="ln191">	// &quot;String exceeds line&quot; - missing end quote</a>
+<a name="ln192">	if (quoted &amp;&amp; pos[0] != quoted)</a>
+<a name="ln193">		return FSSH_B_BAD_DATA;</a>
+<a name="ln194"> </a>
+<a name="ln195">	// last character is a backslash</a>
+<a name="ln196">	if (charEscaped)</a>
+<a name="ln197">		return FSSH_B_BAD_DATA;</a>
+<a name="ln198"> </a>
+<a name="ln199">	end = pos[0] == '\0';</a>
+<a name="ln200">	newLine = is_parameter_separator(pos[0]) || end;</a>
+<a name="ln201">	pos[0] = '\0';</a>
+<a name="ln202"> </a>
+<a name="ln203">	// Correct name if there were any escaped characters</a>
+<a name="ln204">	if (escaped) {</a>
+<a name="ln205">		char *word = *_word;</a>
+<a name="ln206">		int offset = 0;</a>
+<a name="ln207">		while (word &lt;= pos) {</a>
+<a name="ln208">			if (word[0] == '\\') {</a>
+<a name="ln209">				offset--;</a>
+<a name="ln210">				word++;</a>
+<a name="ln211">			}</a>
+<a name="ln212">			word[offset] = word[0];</a>
+<a name="ln213">			word++;</a>
+<a name="ln214">		}</a>
+<a name="ln215">	}</a>
+<a name="ln216"> </a>
+<a name="ln217">	if (end) {</a>
+<a name="ln218">		*_pos = pos;</a>
+<a name="ln219">		return FSSH_B_OK;</a>
+<a name="ln220">	}</a>
+<a name="ln221"> </a>
+<a name="ln222">	// Scan for next beginning word, open brackets, or comment start</a>
+<a name="ln223"> </a>
+<a name="ln224">	pos++;</a>
+<a name="ln225">	while (true) {</a>
+<a name="ln226">		*_pos = pos;</a>
+<a name="ln227">		if (!pos[0])</a>
+<a name="ln228">			return FSSH_B_NO_ERROR;</a>
+<a name="ln229"> </a>
+<a name="ln230">		if (is_parameter_separator(pos[0])) {</a>
+<a name="ln231">			// an open bracket '{' could follow after the first</a>
+<a name="ln232">			// newline, but not later</a>
+<a name="ln233">			if (newLine)</a>
+<a name="ln234">				return FSSH_B_NO_ERROR;</a>
+<a name="ln235"> </a>
+<a name="ln236">			newLine = true;</a>
+<a name="ln237">		} else if (pos[0] == '{' || pos[0] == '}' || pos[0] == '#')</a>
+<a name="ln238">			return FSSH_B_NO_ERROR;</a>
+<a name="ln239">		else if (!isspace(pos[0]))</a>
+<a name="ln240">			return newLine ? FSSH_B_NO_ERROR : CONTINUE_PARAMETER;</a>
+<a name="ln241"> </a>
+<a name="ln242">		pos++;</a>
+<a name="ln243">	}</a>
+<a name="ln244">}</a>
+<a name="ln245"> </a>
+<a name="ln246"> </a>
+<a name="ln247">static fssh_status_t</a>
+<a name="ln248">parse_parameter(struct fssh_driver_parameter *parameter, char **_pos, int32_t level)</a>
+<a name="ln249">{</a>
+<a name="ln250">	char *pos = *_pos;</a>
+<a name="ln251">	fssh_status_t status;</a>
+<a name="ln252"> </a>
+<a name="ln253">	// initialize parameter first</a>
+<a name="ln254">	fssh_memset(parameter, 0, sizeof(struct fssh_driver_parameter));</a>
+<a name="ln255"> </a>
+<a name="ln256">	status = get_word(&amp;pos, &amp;parameter-&gt;name, NO_ASSIGNMENT, true);</a>
+<a name="ln257">	if (status == CONTINUE_PARAMETER) {</a>
+<a name="ln258">		while (status == CONTINUE_PARAMETER) {</a>
+<a name="ln259">			char **newArray, *value;</a>
+<a name="ln260">			status = get_word(&amp;pos, &amp;value, parameter-&gt;value_count == 0</a>
+<a name="ln261">				? ALLOW_ASSIGNMENT : IGNORE_ASSIGNMENT, false);</a>
+<a name="ln262">			if (status &lt; FSSH_B_OK)</a>
+<a name="ln263">				break;</a>
+<a name="ln264"> </a>
+<a name="ln265">			// enlarge value array and save the value</a>
+<a name="ln266"> </a>
+<a name="ln267">			newArray = (char**)realloc(parameter-&gt;values,</a>
+<a name="ln268">				(parameter-&gt;value_count + 1) * sizeof(char *));</a>
+<a name="ln269">			if (newArray == NULL)</a>
+<a name="ln270">				return FSSH_B_NO_MEMORY;</a>
+<a name="ln271"> </a>
+<a name="ln272">			parameter-&gt;values = newArray;</a>
+<a name="ln273">			parameter-&gt;values[parameter-&gt;value_count++] = value;</a>
+<a name="ln274">		}</a>
+<a name="ln275">	}</a>
+<a name="ln276"> </a>
+<a name="ln277">	*_pos = pos;</a>
+<a name="ln278">	return status;</a>
+<a name="ln279">}</a>
+<a name="ln280"> </a>
+<a name="ln281"> </a>
+<a name="ln282">static fssh_status_t</a>
+<a name="ln283">parse_parameters(struct fssh_driver_parameter **_parameters, int *_count,</a>
+<a name="ln284">	char **_pos, int32_t level)</a>
+<a name="ln285">{</a>
+<a name="ln286">	if (level &gt; MAX_SETTINGS_LEVEL)</a>
+<a name="ln287">		return FSSH_B_LINK_LIMIT;</a>
+<a name="ln288"> </a>
+<a name="ln289">	while (true) {</a>
+<a name="ln290">		struct fssh_driver_parameter parameter;</a>
+<a name="ln291">		struct fssh_driver_parameter *newArray;</a>
+<a name="ln292">		fssh_status_t status;</a>
+<a name="ln293"> </a>
+<a name="ln294">		status = parse_parameter(&amp;parameter, _pos, level);</a>
+<a name="ln295">		if (status &lt; FSSH_B_OK)</a>
+<a name="ln296">			return status;</a>
+<a name="ln297"> </a>
+<a name="ln298">		if (status != NO_PARAMETER) {</a>
+<a name="ln299">			fssh_driver_parameter *newParameter;</a>
+<a name="ln300"> </a>
+<a name="ln301">			newArray = (fssh_driver_parameter*)realloc(*_parameters, (*_count + 1)</a>
+<a name="ln302">				* sizeof(struct fssh_driver_parameter));</a>
+<a name="ln303">			if (newArray == NULL)</a>
+<a name="ln304">				return FSSH_B_NO_MEMORY;</a>
+<a name="ln305">	</a>
+<a name="ln306">			fssh_memcpy(&amp;newArray[*_count], &amp;parameter, sizeof(struct fssh_driver_parameter));</a>
+<a name="ln307">			newParameter = &amp;newArray[*_count];</a>
+<a name="ln308"> </a>
+<a name="ln309">			*_parameters = newArray;</a>
+<a name="ln310">			(*_count)++;</a>
+<a name="ln311"> </a>
+<a name="ln312">			// check for level beginning and end</a>
+<a name="ln313">			if (**_pos == '{') {</a>
+<a name="ln314">				// if we go a level deeper, just start all over again...</a>
+<a name="ln315">				(*_pos)++;</a>
+<a name="ln316">				status = parse_parameters(&amp;newParameter-&gt;parameters,</a>
+<a name="ln317">							&amp;newParameter-&gt;parameter_count, _pos, level + 1);</a>
+<a name="ln318">				if (status &lt; FSSH_B_OK)</a>
+<a name="ln319">					return status;</a>
+<a name="ln320">			}</a>
+<a name="ln321">		}</a>
+<a name="ln322"> </a>
+<a name="ln323">		if ((**_pos == '}' &amp;&amp; level &gt; 0)</a>
+<a name="ln324">			|| (**_pos == '\0' &amp;&amp; level == 0)) {</a>
+<a name="ln325">			// take the closing bracket from the stack</a>
+<a name="ln326">			(*_pos)++;</a>
+<a name="ln327">			return FSSH_B_OK;</a>
+<a name="ln328">		}</a>
+<a name="ln329"> </a>
+<a name="ln330">		// obviously, something has gone wrong</a>
+<a name="ln331">		if (**_pos == '}' || **_pos == '\0')</a>
+<a name="ln332">			return FSSH_B_ERROR;</a>
+<a name="ln333">	}</a>
+<a name="ln334">}</a>
+<a name="ln335"> </a>
+<a name="ln336"> </a>
+<a name="ln337">static fssh_status_t</a>
+<a name="ln338">parse_settings(settings_handle *handle)</a>
+<a name="ln339">{</a>
+<a name="ln340">	char *text = handle-&gt;text;</a>
+<a name="ln341"> </a>
+<a name="ln342">	fssh_memset(&amp;handle-&gt;settings, 0, sizeof(struct fssh_driver_settings));</a>
+<a name="ln343"> </a>
+<a name="ln344">	// empty settings are allowed</a>
+<a name="ln345">	if (text == NULL)</a>
+<a name="ln346">		return FSSH_B_OK;</a>
+<a name="ln347"> </a>
+<a name="ln348">	return parse_parameters(&amp;handle-&gt;settings.parameters,</a>
+<a name="ln349">		&amp;handle-&gt;settings.parameter_count, &amp;text, 0);</a>
+<a name="ln350">}</a>
+<a name="ln351"> </a>
+<a name="ln352"> </a>
+<a name="ln353">static void</a>
+<a name="ln354">free_parameter(struct fssh_driver_parameter *parameter)</a>
+<a name="ln355">{</a>
+<a name="ln356">	int32_t i;</a>
+<a name="ln357">	for (i = parameter-&gt;parameter_count; i-- &gt; 0;)</a>
+<a name="ln358">		free_parameter(&amp;parameter-&gt;parameters[i]);</a>
+<a name="ln359"> </a>
+<a name="ln360">	free(parameter-&gt;parameters);</a>
+<a name="ln361">	free(parameter-&gt;values);</a>
+<a name="ln362">}</a>
+<a name="ln363"> </a>
+<a name="ln364"> </a>
+<a name="ln365">static void</a>
+<a name="ln366">free_settings(settings_handle *handle)</a>
+<a name="ln367">{</a>
+<a name="ln368">	int32_t i;</a>
+<a name="ln369">	for (i = handle-&gt;settings.parameter_count; i-- &gt; 0;)</a>
+<a name="ln370">		free_parameter(&amp;handle-&gt;settings.parameters[i]);</a>
+<a name="ln371"> </a>
+<a name="ln372">	free(handle-&gt;settings.parameters);</a>
+<a name="ln373">	free(handle-&gt;text);</a>
+<a name="ln374">	free(handle);</a>
+<a name="ln375">}</a>
+<a name="ln376"> </a>
+<a name="ln377"> </a>
+<a name="ln378">static settings_handle *</a>
+<a name="ln379">new_settings(char *buffer, const char *driverName)</a>
+<a name="ln380">{</a>
+<a name="ln381">	settings_handle *handle = (settings_handle*)malloc(sizeof(settings_handle));</a>
+<a name="ln382">	if (handle == NULL)</a>
+<a name="ln383">		return NULL;</a>
+<a name="ln384"> </a>
+<a name="ln385">	handle-&gt;magic = SETTINGS_MAGIC;</a>
+<a name="ln386">	handle-&gt;text = buffer;</a>
+<a name="ln387"> </a>
+<a name="ln388">	fssh_strlcpy(handle-&gt;name, driverName, sizeof(handle-&gt;name));</a>
+<a name="ln389"> </a>
+<a name="ln390">	if (parse_settings(handle) == FSSH_B_OK)</a>
+<a name="ln391">		return handle;</a>
+<a name="ln392"> </a>
+<a name="ln393">	free(handle);</a>
+<a name="ln394">	return NULL;</a>
+<a name="ln395">}</a>
+<a name="ln396"> </a>
+<a name="ln397"> </a>
+<a name="ln398">static settings_handle *</a>
+<a name="ln399">load_driver_settings_from_file(int file, const char *driverName)</a>
+<a name="ln400">{</a>
+<a name="ln401">	struct fssh_stat stat;</a>
+<a name="ln402"> </a>
+<a name="ln403">	// Allocate a buffer and read the whole file into it.</a>
+<a name="ln404">	// We will keep this buffer in memory, until the settings</a>
+<a name="ln405">	// are unloaded.</a>
+<a name="ln406">	// The fssh_driver_parameter::name field will point directly</a>
+<a name="ln407">	// to this buffer.</a>
+<a name="ln408"> </a>
+<a name="ln409">	if (fssh_fstat(file, &amp;stat) &lt; FSSH_B_OK)</a>
+<a name="ln410">		return NULL;</a>
+<a name="ln411"> </a>
+<a name="ln412">	if (stat.fssh_st_size &gt; FSSH_B_OK &amp;&amp; stat.fssh_st_size &lt; MAX_SETTINGS_SIZE) {</a>
+<a name="ln413">		char *text = (char *)malloc(stat.fssh_st_size + 1);</a>
+<a name="ln414">		if (text != NULL &amp;&amp; fssh_read(file, text, stat.fssh_st_size) == stat.fssh_st_size) {</a>
+<a name="ln415">			settings_handle *handle;</a>
+<a name="ln416"> </a>
+<a name="ln417">			text[stat.fssh_st_size] = '\0';</a>
+<a name="ln418">				// make sure the string is null terminated</a>
+<a name="ln419">				// to avoid misbehaviour</a>
+<a name="ln420"> </a>
+<a name="ln421">			handle = new_settings(text, driverName);</a>
+<a name="ln422">			if (handle != NULL) {</a>
+<a name="ln423">				// everything went fine!</a>
+<a name="ln424">				return handle;</a>
+<a name="ln425">			}</a>
+<a name="ln426"> </a>
+<a name="ln427">			free(handle);</a>
+<a name="ln428">		}</a>
+<a name="ln429">		// &quot;text&quot; might be NULL here, but that's allowed</a>
+<a name="ln430">		free(text);</a>
+<a name="ln431">	}</a>
+<a name="ln432"> </a>
+<a name="ln433">	return NULL;</a>
+<a name="ln434">}</a>
+<a name="ln435"> </a>
+<a name="ln436"> </a>
+<a name="ln437">static bool</a>
+<a name="ln438">put_string(char **_buffer, fssh_size_t *_bufferSize, char *string)</a>
+<a name="ln439">{</a>
+<a name="ln440">	fssh_size_t length, reserved, quotes;</a>
+<a name="ln441">	char *buffer = *_buffer, c;</a>
+<a name="ln442">	bool quoted;</a>
+<a name="ln443"> </a>
+<a name="ln444">	if (string == NULL)</a>
+<a name="ln445">		return true;</a>
+<a name="ln446"> </a>
+<a name="ln447">	for (length = reserved = quotes = 0; (c = string[length]) != '\0'; length++) {</a>
+<a name="ln448">		if (c == '&quot;')</a>
+<a name="ln449">			quotes++;</a>
+<a name="ln450">		else if (is_word_break(c))</a>
+<a name="ln451">			reserved++;</a>
+<a name="ln452">	}</a>
+<a name="ln453">	quoted = reserved || quotes;</a>
+<a name="ln454"> </a>
+<a name="ln455">	// update _bufferSize in any way, so that we can chain several</a>
+<a name="ln456">	// of these calls without having to check the return value</a>
+<a name="ln457">	// everytime</a>
+<a name="ln458">	*_bufferSize -= length + (quoted ? 2 + quotes : 0);</a>
+<a name="ln459"> </a>
+<a name="ln460">	if (*_bufferSize &lt;= 0)</a>
+<a name="ln461">		return false;</a>
+<a name="ln462"> </a>
+<a name="ln463">	if (quoted)</a>
+<a name="ln464">		*(buffer++) = '&quot;';</a>
+<a name="ln465"> </a>
+<a name="ln466">	for (;(c = string[0]) != '\0'; string++) {</a>
+<a name="ln467">		if (c == '&quot;')</a>
+<a name="ln468">			*(buffer++) = '\\';</a>
+<a name="ln469"> </a>
+<a name="ln470">		*(buffer++) = c;</a>
+<a name="ln471">	}</a>
+<a name="ln472"> </a>
+<a name="ln473">	if (quoted)</a>
+<a name="ln474">		*(buffer++) = '&quot;';</a>
+<a name="ln475"> </a>
+<a name="ln476">	buffer[0] = '\0';</a>
+<a name="ln477"> </a>
+<a name="ln478">	// update the buffer position</a>
+<a name="ln479">	*_buffer = buffer;</a>
+<a name="ln480"> </a>
+<a name="ln481">	return true;</a>
+<a name="ln482">}</a>
+<a name="ln483"> </a>
+<a name="ln484"> </a>
+<a name="ln485">static bool</a>
+<a name="ln486">put_chars(char **_buffer, fssh_size_t *_bufferSize, const char *chars)</a>
+<a name="ln487">{</a>
+<a name="ln488">	char *buffer = *_buffer;</a>
+<a name="ln489">	fssh_size_t length;</a>
+<a name="ln490"> </a>
+<a name="ln491">	if (chars == NULL)</a>
+<a name="ln492">		return true;</a>
+<a name="ln493"> </a>
+<a name="ln494">	length = fssh_strlen(chars);</a>
+<a name="ln495">	*_bufferSize -= length;</a>
+<a name="ln496"> </a>
+<a name="ln497">	if (*_bufferSize &lt;= 0)</a>
+<a name="ln498">		return false;</a>
+<a name="ln499"> </a>
+<a name="ln500">	fssh_memcpy(buffer, chars, length);</a>
+<a name="ln501">	buffer += length;</a>
+<a name="ln502">	buffer[0] = '\0';</a>
+<a name="ln503"> </a>
+<a name="ln504">	// update the buffer position</a>
+<a name="ln505">	*_buffer = buffer;</a>
+<a name="ln506"> </a>
+<a name="ln507">	return true;</a>
+<a name="ln508">}</a>
+<a name="ln509"> </a>
+<a name="ln510"> </a>
+<a name="ln511">static bool</a>
+<a name="ln512">put_char(char **_buffer, fssh_size_t *_bufferSize, char c)</a>
+<a name="ln513">{</a>
+<a name="ln514">	char *buffer = *_buffer;</a>
+<a name="ln515"> </a>
+<a name="ln516">	*_bufferSize -= 1;</a>
+<a name="ln517"> </a>
+<a name="ln518">	if (*_bufferSize &lt;= 0)</a>
+<a name="ln519">		return false;</a>
+<a name="ln520"> </a>
+<a name="ln521">	buffer[0] = c;</a>
+<a name="ln522">	buffer[1] = '\0';</a>
+<a name="ln523"> </a>
+<a name="ln524">	// update the buffer position</a>
+<a name="ln525">	*_buffer = buffer + 1;</a>
+<a name="ln526"> </a>
+<a name="ln527">	return true;</a>
+<a name="ln528">}</a>
+<a name="ln529"> </a>
+<a name="ln530"> </a>
+<a name="ln531">static void</a>
+<a name="ln532">put_level_space(char **_buffer, fssh_size_t *_bufferSize, int32_t level)</a>
+<a name="ln533">{</a>
+<a name="ln534">	while (level-- &gt; 0)</a>
+<a name="ln535">		put_char(_buffer, _bufferSize, '\t');</a>
+<a name="ln536">}</a>
+<a name="ln537"> </a>
+<a name="ln538"> </a>
+<a name="ln539">static bool</a>
+<a name="ln540">put_parameter(char **_buffer, fssh_size_t *_bufferSize,</a>
+<a name="ln541">	struct fssh_driver_parameter *parameter, int32_t level, bool flat)</a>
+<a name="ln542">{</a>
+<a name="ln543">	int32_t i;</a>
+<a name="ln544"> </a>
+<a name="ln545">	if (!flat)</a>
+<a name="ln546">		put_level_space(_buffer, _bufferSize, level);</a>
+<a name="ln547"> </a>
+<a name="ln548">	put_string(_buffer, _bufferSize, parameter-&gt;name);</a>
+<a name="ln549">	if (flat &amp;&amp; parameter-&gt;value_count &gt; 0)</a>
+<a name="ln550">		put_chars(_buffer, _bufferSize, &quot; =&quot;);</a>
+<a name="ln551"> </a>
+<a name="ln552">	for (i = 0; i &lt; parameter-&gt;value_count; i++) {</a>
+<a name="ln553">		put_char(_buffer, _bufferSize, ' ');</a>
+<a name="ln554">		put_string(_buffer, _bufferSize, parameter-&gt;values[i]);</a>
+<a name="ln555">	}</a>
+<a name="ln556"> </a>
+<a name="ln557">	if (parameter-&gt;parameter_count &gt; 0) {</a>
+<a name="ln558">		put_chars(_buffer, _bufferSize, &quot; {&quot;);</a>
+<a name="ln559">		if (!flat)</a>
+<a name="ln560">			put_char(_buffer, _bufferSize, '\n');</a>
+<a name="ln561"> </a>
+<a name="ln562">		for (i = 0; i &lt; parameter-&gt;parameter_count; i++) {</a>
+<a name="ln563">			put_parameter(_buffer, _bufferSize, &amp;parameter-&gt;parameters[i],</a>
+<a name="ln564">				level + 1, flat);</a>
+<a name="ln565"> </a>
+<a name="ln566">			if (parameter-&gt;parameters[i].parameter_count == 0)</a>
+<a name="ln567">				put_chars(_buffer, _bufferSize, flat ? &quot;; &quot; : &quot;\n&quot;);</a>
+<a name="ln568">		}</a>
+<a name="ln569"> </a>
+<a name="ln570">		if (!flat)</a>
+<a name="ln571">			put_level_space(_buffer, _bufferSize, level);</a>
+<a name="ln572">		put_chars(_buffer, _bufferSize, flat ? &quot;}&quot; : &quot;}\n&quot;);</a>
+<a name="ln573">	}</a>
+<a name="ln574"> </a>
+<a name="ln575">	return *_bufferSize &gt;= 0;</a>
+<a name="ln576">}</a>
+<a name="ln577"> </a>
+<a name="ln578"> </a>
+<a name="ln579">//	#pragma mark - Kernel only functions</a>
+<a name="ln580"> </a>
+<a name="ln581"> </a>
+<a name="ln582">static settings_handle *</a>
+<a name="ln583">find_driver_settings(const char *name)</a>
+<a name="ln584">{</a>
+<a name="ln585">	settings_handle *handle = NULL;</a>
+<a name="ln586"> </a>
+<a name="ln587">	FSSH_ASSERT_LOCKED_MUTEX(&amp;sLock);</a>
+<a name="ln588"> </a>
+<a name="ln589">	while ((handle = (settings_handle*)list_get_next_item(&amp;sHandles, handle)) != NULL) {</a>
+<a name="ln590">		if (!fssh_strcmp(handle-&gt;name, name))</a>
+<a name="ln591">			return handle;</a>
+<a name="ln592">	}</a>
+<a name="ln593"> </a>
+<a name="ln594">	return NULL;</a>
+<a name="ln595">}</a>
+<a name="ln596"> </a>
+<a name="ln597"> </a>
+<a name="ln598">namespace FSShell {</a>
+<a name="ln599"> </a>
+<a name="ln600">fssh_status_t</a>
+<a name="ln601">driver_settings_init()</a>
+<a name="ln602">{</a>
+<a name="ln603">	fssh_mutex_init(&amp;sLock, &quot;driver settings&quot;);</a>
+<a name="ln604">	return FSSH_B_OK;</a>
+<a name="ln605">}</a>
+<a name="ln606"> </a>
+<a name="ln607">}	// namespace FSShell</a>
+<a name="ln608"> </a>
+<a name="ln609"> </a>
+<a name="ln610">//	#pragma mark - public API</a>
+<a name="ln611"> </a>
+<a name="ln612"> </a>
+<a name="ln613">fssh_status_t</a>
+<a name="ln614">fssh_unload_driver_settings(void *handle)</a>
+<a name="ln615">{</a>
+<a name="ln616">	if (!check_handle(handle))</a>
+<a name="ln617">		return FSSH_B_BAD_VALUE;</a>
+<a name="ln618"> </a>
+<a name="ln619">#if 0</a>
+<a name="ln620">	fssh_mutex_lock(&amp;sLock);</a>
+<a name="ln621">	// ToDo: as soon as &quot;/boot&quot; is accessible, we should start throwing away settings</a>
+<a name="ln622">	if (--handle-&gt;ref_count == 0) {</a>
+<a name="ln623">		list_remove_link(&amp;handle-&gt;link);</a>
+<a name="ln624">	} else</a>
+<a name="ln625">		handle = NULL;</a>
+<a name="ln626">	fssh_mutex_unlock(&amp;sLock);</a>
+<a name="ln627">#endif</a>
+<a name="ln628"> </a>
+<a name="ln629">	if (handle != NULL)</a>
+<a name="ln630">		free_settings((settings_handle*)handle);</a>
+<a name="ln631"> </a>
+<a name="ln632">	return FSSH_B_OK;</a>
+<a name="ln633">}</a>
+<a name="ln634"> </a>
+<a name="ln635"> </a>
+<a name="ln636">void *</a>
+<a name="ln637">fssh_load_driver_settings(const char *driverName)</a>
+<a name="ln638">{</a>
+<a name="ln639">	settings_handle *handle;</a>
+<a name="ln640">	int file = -1;</a>
+<a name="ln641">	</a>
+<a name="ln642">	if (driverName == NULL)</a>
+<a name="ln643">		return NULL;</a>
+<a name="ln644"> </a>
+<a name="ln645">	// see if we already have these settings loaded</a>
+<a name="ln646">	fssh_mutex_lock(&amp;sLock);</a>
+<a name="ln647">	handle = find_driver_settings(driverName);</a>
+<a name="ln648">	if (handle != NULL) {</a>
+<a name="ln649">		handle-&gt;ref_count++;</a>
+<a name="ln650"> </a>
+<a name="ln651">		// we got it, now let's see if it already has been parsed</a>
+<a name="ln652">		if (handle-&gt;magic != SETTINGS_MAGIC) {</a>
+<a name="ln653">			handle-&gt;magic = SETTINGS_MAGIC;</a>
+<a name="ln654"> </a>
+<a name="ln655">			if (parse_settings(handle) != FSSH_B_OK) {</a>
+<a name="ln656">				// no valid settings, let's cut down its memory requirements</a>
+<a name="ln657">				free(handle-&gt;text);</a>
+<a name="ln658">				handle-&gt;text = NULL;</a>
+<a name="ln659">				handle = NULL;</a>
+<a name="ln660">			}</a>
+<a name="ln661">		}</a>
+<a name="ln662">		fssh_mutex_unlock(&amp;sLock);</a>
+<a name="ln663">		return handle;</a>
+<a name="ln664">	}</a>
+<a name="ln665"> </a>
+<a name="ln666">	// open the settings from the standardized location</a>
+<a name="ln667">	if (driverName[0] != '/') {</a>
+<a name="ln668">		char path[FSSH_B_FILE_NAME_LENGTH + 64];</a>
+<a name="ln669"> </a>
+<a name="ln670">		// This location makes at least a bit sense under BeOS compatible</a>
+<a name="ln671">		// systems.</a>
+<a name="ln672">		fssh_strcpy(path, &quot;/boot/home/config/settings/fs_shell&quot;);</a>
+<a name="ln673"> </a>
+<a name="ln674">		{</a>
+<a name="ln675">			fssh_strlcat(path, SETTINGS_DIRECTORY, sizeof(path));</a>
+<a name="ln676">			fssh_strlcat(path, driverName, sizeof(path));</a>
+<a name="ln677">		}</a>
+<a name="ln678"> </a>
+<a name="ln679">		file = fssh_open(path, FSSH_O_RDONLY);</a>
+<a name="ln680">	} else</a>
+<a name="ln681">		file = fssh_open(driverName, FSSH_O_RDONLY);</a>
+<a name="ln682"> </a>
+<a name="ln683">	if (file &lt; FSSH_B_OK) {</a>
+<a name="ln684">		fssh_mutex_unlock(&amp;sLock);</a>
+<a name="ln685">		return NULL;</a>
+<a name="ln686">	}</a>
+<a name="ln687"> </a>
+<a name="ln688">	handle = load_driver_settings_from_file(file, driverName);</a>
+<a name="ln689"> </a>
+<a name="ln690">	if (handle != NULL)</a>
+<a name="ln691">		list_add_item(&amp;sHandles, handle);</a>
+<a name="ln692">	fssh_mutex_unlock(&amp;sLock);</a>
+<a name="ln693"> </a>
+<a name="ln694">	fssh_close(file);</a>
+<a name="ln695">	return (void *)handle;</a>
+<a name="ln696">}</a>
+<a name="ln697"> </a>
+<a name="ln698"> </a>
+<a name="ln699">/** Loads a driver settings file using the full path, instead of</a>
+<a name="ln700"> *	only defining the leaf name (as load_driver_settings() does).</a>
+<a name="ln701"> *	I am not sure if this function is really necessary - I would</a>
+<a name="ln702"> *	probably prefer something like a search order (if it's not</a>
+<a name="ln703"> *	an absolute path):</a>
+<a name="ln704"> *		~/config/settings/kernel/driver</a>
+<a name="ln705"> *		current directory</a>
+<a name="ln706"> *	That would render this function useless.</a>
+<a name="ln707"> */</a>
+<a name="ln708"> </a>
+<a name="ln709">#if 0</a>
+<a name="ln710">void *</a>
+<a name="ln711">fssh_load_driver_settings_from_path(const char *path)</a>
+<a name="ln712">{</a>
+<a name="ln713">	settings_handle *handle;</a>
+<a name="ln714">	int file;</a>
+<a name="ln715"> </a>
+<a name="ln716">	if (path == NULL)</a>
+<a name="ln717">		return NULL;</a>
+<a name="ln718"> </a>
+<a name="ln719">	file = fssh_open(path, FSSH_O_RDONLY);</a>
+<a name="ln720">	if (file &lt; FSSH_B_OK)</a>
+<a name="ln721">		return NULL;</a>
+<a name="ln722"> </a>
+<a name="ln723">	handle = load_driver_settings_from_file(file);</a>
+<a name="ln724"> </a>
+<a name="ln725">	fssh_close(file);</a>
+<a name="ln726">	return (void *)handle;</a>
+<a name="ln727">}</a>
+<a name="ln728">#endif</a>
+<a name="ln729"> </a>
+<a name="ln730"> </a>
+<a name="ln731">/*!</a>
+<a name="ln732">	Returns a new driver_settings handle that has the parsed contents</a>
+<a name="ln733">	of the passed string.</a>
+<a name="ln734">	You can get an empty driver_settings object when you pass NULL as</a>
+<a name="ln735">	the &quot;settingsString&quot; parameter.</a>
+<a name="ln736">*/</a>
+<a name="ln737">void *</a>
+<a name="ln738">fssh_parse_driver_settings_string(const char *settingsString)</a>
+<a name="ln739">{</a>
+<a name="ln740">	// we simply copy the whole string to use it as our internal buffer</a>
+<a name="ln741">	char *text = fssh_strdup(settingsString);</a>
+<a name="ln742">	if (settingsString == NULL || text != NULL) {</a>
+<a name="ln743">		settings_handle *handle = (settings_handle*)malloc(sizeof(settings_handle));</a>
+<a name="ln744">		if (handle != NULL) {</a>
+<a name="ln745">			handle-&gt;magic = SETTINGS_MAGIC;</a>
+<a name="ln746">			handle-&gt;text = text;</a>
+<a name="ln747"> </a>
+<a name="ln748">			if (parse_settings(handle) == FSSH_B_OK)</a>
+<a name="ln749">				return handle;</a>
+<a name="ln750"> </a>
+<a name="ln751">			free(handle);</a>
+<a name="ln752">		}</a>
+<a name="ln753">		free(text);</a>
+<a name="ln754">	}</a>
+<a name="ln755"> </a>
+<a name="ln756">	return NULL;</a>
+<a name="ln757">}</a>
+<a name="ln758"> </a>
+<a name="ln759"> </a>
+<a name="ln760">/*!</a>
+<a name="ln761">	This function prints out a driver settings structure to a human</a>
+<a name="ln762">	readable string.</a>
+<a name="ln763">	It's either in standard style or the single line style speficied</a>
+<a name="ln764">	by the &quot;flat&quot; parameter.</a>
+<a name="ln765">	If the buffer is too small to hold the string, FSSH_B_BUFFER_OVERFLOW</a>
+<a name="ln766">	is returned, and the needed amount of bytes if placed in the</a>
+<a name="ln767">	&quot;_bufferSize&quot; parameter.</a>
+<a name="ln768">	If the &quot;handle&quot; parameter is not a valid driver settings handle, or</a>
+<a name="ln769">	the &quot;buffer&quot; parameter is NULL, FSSH_B_BAD_VALUE is returned.</a>
+<a name="ln770">*/</a>
+<a name="ln771">fssh_status_t</a>
+<a name="ln772">fssh_get_driver_settings_string(void *_handle, char *buffer,</a>
+<a name="ln773">	fssh_size_t *_bufferSize, bool flat)</a>
+<a name="ln774">{</a>
+<a name="ln775">	settings_handle *handle = (settings_handle *)_handle;</a>
+<a name="ln776">	fssh_size_t bufferSize = *_bufferSize;</a>
+<a name="ln777">	int32_t i;</a>
+<a name="ln778"> </a>
+<a name="ln779">	if (!check_handle(handle) || !buffer || *_bufferSize == 0)</a>
+<a name="ln780">		return FSSH_B_BAD_VALUE;</a>
+<a name="ln781"> </a>
+<a name="ln782">	for (i = 0; i &lt; handle-&gt;settings.parameter_count; i++) {</a>
+<a name="ln783">		put_parameter(&amp;buffer, &amp;bufferSize, &amp;handle-&gt;settings.parameters[i],</a>
+<a name="ln784">			0, flat);</a>
+<a name="ln785">	}</a>
+<a name="ln786"> </a>
+<a name="ln787">	*_bufferSize -= bufferSize;</a>
+<a name="ln788">	return bufferSize &gt;= 0 ? FSSH_B_OK : FSSH_B_BUFFER_OVERFLOW;</a>
+<a name="ln789">}</a>
+<a name="ln790"> </a>
+<a name="ln791"> </a>
+<a name="ln792">/*!</a>
+<a name="ln793">	Matches the first value of the parameter matching &quot;keyName&quot; with a set</a>
+<a name="ln794">	of boolean values like 1/true/yes/on/enabled/...</a>
+<a name="ln795">	Returns &quot;unknownValue&quot; if the parameter could not be found or doesn't</a>
+<a name="ln796">	have any valid boolean setting, and &quot;noArgValue&quot; if the parameter</a>
+<a name="ln797">	doesn't have any values.</a>
+<a name="ln798">	Also returns &quot;unknownValue&quot; if the handle passed in was not valid.</a>
+<a name="ln799">*/</a>
+<a name="ln800">bool</a>
+<a name="ln801">fssh_get_driver_boolean_parameter(void *handle, const char *keyName,</a>
+<a name="ln802">	bool unknownValue, bool noArgValue)</a>
+<a name="ln803">{</a>
+<a name="ln804">	fssh_driver_parameter *parameter;</a>
+<a name="ln805">	char *boolean;</a>
+<a name="ln806"> </a>
+<a name="ln807">	if (!check_handle(handle))</a>
+<a name="ln808">		return unknownValue;</a>
+<a name="ln809"> </a>
+<a name="ln810">	// check for the parameter</a>
+<a name="ln811">	if ((parameter = get_parameter((settings_handle*)handle, keyName)) == NULL)</a>
+<a name="ln812">		return unknownValue;</a>
+<a name="ln813"> </a>
+<a name="ln814">	// check for the argument</a>
+<a name="ln815">	if (parameter-&gt;value_count &lt;= 0)</a>
+<a name="ln816">		return noArgValue;</a>
+<a name="ln817"> </a>
+<a name="ln818">	boolean = parameter-&gt;values[0];</a>
+<a name="ln819">	if (!fssh_strcmp(boolean, &quot;1&quot;)</a>
+<a name="ln820">		|| !fssh_strcasecmp(boolean, &quot;true&quot;)</a>
+<a name="ln821">		|| !fssh_strcasecmp(boolean, &quot;yes&quot;)</a>
+<a name="ln822">		|| !fssh_strcasecmp(boolean, &quot;on&quot;)</a>
+<a name="ln823">		|| !fssh_strcasecmp(boolean, &quot;enable&quot;)</a>
+<a name="ln824">		|| !fssh_strcasecmp(boolean, &quot;enabled&quot;))</a>
+<a name="ln825">		return true;</a>
+<a name="ln826"> </a>
+<a name="ln827">	if (!fssh_strcmp(boolean, &quot;0&quot;)</a>
+<a name="ln828">		|| !fssh_strcasecmp(boolean, &quot;false&quot;)</a>
+<a name="ln829">		|| !fssh_strcasecmp(boolean, &quot;no&quot;)</a>
+<a name="ln830">		|| !fssh_strcasecmp(boolean, &quot;off&quot;)</a>
+<a name="ln831">		|| !fssh_strcasecmp(boolean, &quot;disable&quot;)</a>
+<a name="ln832">		|| !fssh_strcasecmp(boolean, &quot;disabled&quot;))</a>
+<a name="ln833">		return false;</a>
+<a name="ln834"> </a>
+<a name="ln835">	// if no known keyword is found, &quot;unknownValue&quot; is returned</a>
+<a name="ln836">	return unknownValue;</a>
+<a name="ln837">}</a>
+<a name="ln838"> </a>
+<a name="ln839"> </a>
+<a name="ln840">const char *</a>
+<a name="ln841">fssh_get_driver_parameter(void *handle, const char *keyName,</a>
+<a name="ln842">	const char *unknownValue, const char *noArgValue)</a>
+<a name="ln843">{</a>
+<a name="ln844">	struct fssh_driver_parameter *parameter;</a>
+<a name="ln845"> </a>
+<a name="ln846">	if (!check_handle(handle))</a>
+<a name="ln847">		return unknownValue;</a>
+<a name="ln848"> </a>
+<a name="ln849">	// check for the parameter</a>
+<a name="ln850">	if ((parameter = get_parameter((settings_handle*)handle, keyName)) == NULL)</a>
+<a name="ln851">		return unknownValue;</a>
+<a name="ln852"> </a>
+<a name="ln853">	// check for the argument</a>
+<a name="ln854">	if (parameter-&gt;value_count &lt;= 0)</a>
+<a name="ln855">		return noArgValue;</a>
+<a name="ln856"> </a>
+<a name="ln857">	return parameter-&gt;values[0];</a>
+<a name="ln858">}</a>
+<a name="ln859"> </a>
+<a name="ln860"> </a>
+<a name="ln861">const fssh_driver_settings *</a>
+<a name="ln862">fssh_get_driver_settings(void *handle)</a>
+<a name="ln863">{</a>
+<a name="ln864">	if (!check_handle(handle))</a>
+<a name="ln865">		return NULL;</a>
+<a name="ln866"> </a>
+<a name="ln867">	return &amp;((settings_handle *)handle)-&gt;settings;</a>
+<a name="ln868">}</a>
+<a name="ln869"> </a>
+<a name="ln870"> </a>
+<a name="ln871">fssh_status_t</a>
+<a name="ln872">fssh_delete_driver_settings(void *handle)</a>
+<a name="ln873">{</a>
+<a name="ln874">	return fssh_unload_driver_settings(handle);</a>
+<a name="ln875">}</a>
+
+</code></pre>
+<div class="balloon" rel="788"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v547/" target="_blank">V547</a> Expression 'bufferSize >= 0' is always true. Unsigned type value is always >= 0.</p></div>
+<div class="balloon" rel="575"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v547/" target="_blank">V547</a> Expression '* _bufferSize >= 0' is always true. Unsigned type value is always >= 0.</p></div>
+<div class="balloon" rel="427"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v575/" target="_blank">V575</a> The null pointer is passed into 'free' function. Inspect the first argument.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

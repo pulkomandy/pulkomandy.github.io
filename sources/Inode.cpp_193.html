@@ -1,0 +1,955 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>Inode.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2011, Jérôme Duval, korli@users.berlios.de.</a>
+<a name="ln3"> * Copyright 2008-2014, Axel Dörfler, axeld@pinc-software.de.</a>
+<a name="ln4"> * This file may be used under the terms of the MIT License.</a>
+<a name="ln5"> */</a>
+<a name="ln6"> </a>
+<a name="ln7"> </a>
+<a name="ln8">#include &quot;Inode.h&quot;</a>
+<a name="ln9"> </a>
+<a name="ln10">#include &lt;string.h&gt;</a>
+<a name="ln11">#include &lt;util/AutoLock.h&gt;</a>
+<a name="ln12">#include &lt;NodeMonitor.h&gt;</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &quot;CachedBlock.h&quot;</a>
+<a name="ln15">#include &quot;DataStream.h&quot;</a>
+<a name="ln16">#include &quot;DirectoryIterator.h&quot;</a>
+<a name="ln17">#include &quot;ExtentStream.h&quot;</a>
+<a name="ln18">#include &quot;HTree.h&quot;</a>
+<a name="ln19">#include &quot;Utility.h&quot;</a>
+<a name="ln20"> </a>
+<a name="ln21"> </a>
+<a name="ln22">#undef ASSERT</a>
+<a name="ln23">//#define TRACE_EXT2</a>
+<a name="ln24">#ifdef TRACE_EXT2</a>
+<a name="ln25">#	define TRACE(x...) dprintf(&quot;\33[34mext2:\33[0m &quot; x)</a>
+<a name="ln26">#	define ASSERT(x) { if (!(x)) kernel_debugger(&quot;ext2: assert failed: &quot; #x &quot;\n&quot;); }</a>
+<a name="ln27">#else</a>
+<a name="ln28">#	define TRACE(x...) ;</a>
+<a name="ln29">#	define ASSERT(x) ;</a>
+<a name="ln30">#endif</a>
+<a name="ln31">#define ERROR(x...) dprintf(&quot;\33[34mext2:\33[0m &quot; x)</a>
+<a name="ln32"> </a>
+<a name="ln33"> </a>
+<a name="ln34">Inode::Inode(Volume* volume, ino_t id)</a>
+<a name="ln35">	:</a>
+<a name="ln36">	fVolume(volume),</a>
+<a name="ln37">	fID(id),</a>
+<a name="ln38">	fCache(NULL),</a>
+<a name="ln39">	fMap(NULL),</a>
+<a name="ln40">	fHasExtraAttributes(false)</a>
+<a name="ln41">{</a>
+<a name="ln42">	rw_lock_init(&amp;fLock, &quot;ext2 inode&quot;);</a>
+<a name="ln43">	recursive_lock_init(&amp;fSmallDataLock, &quot;ext2 inode small data&quot;);</a>
+<a name="ln44"> </a>
+<a name="ln45">	TRACE(&quot;Inode::Inode(): ext2_inode: %lu, disk inode: %&quot; B_PRIu32</a>
+<a name="ln46">		&quot;\n&quot;, sizeof(ext2_inode), fVolume-&gt;InodeSize());</a>
+<a name="ln47">	fNodeSize = sizeof(ext2_inode) &gt; fVolume-&gt;InodeSize()</a>
+<a name="ln48">		? fVolume-&gt;InodeSize() : sizeof(ext2_inode);</a>
+<a name="ln49"> </a>
+<a name="ln50">	fInitStatus = UpdateNodeFromDisk();</a>
+<a name="ln51">	if (fInitStatus == B_OK) {</a>
+<a name="ln52">		fHasExtraAttributes = (fNodeSize == sizeof(ext2_inode)</a>
+<a name="ln53">			&amp;&amp; fNode.ExtraInodeSize() + EXT2_INODE_NORMAL_SIZE</a>
+<a name="ln54">				== sizeof(ext2_inode));</a>
+<a name="ln55"> </a>
+<a name="ln56">		if (IsDirectory() || (IsSymLink() &amp;&amp; Size() &lt; 60)) {</a>
+<a name="ln57">			TRACE(&quot;Inode::Inode(): Not creating the file cache\n&quot;);</a>
+<a name="ln58">			fInitStatus = B_OK;</a>
+<a name="ln59">		} else</a>
+<a name="ln60">			fInitStatus = CreateFileCache();</a>
+<a name="ln61">	} else</a>
+<a name="ln62">		TRACE(&quot;Inode: Failed initialization\n&quot;);</a>
+<a name="ln63">}</a>
+<a name="ln64"> </a>
+<a name="ln65"> </a>
+<a name="ln66">Inode::Inode(Volume* volume)</a>
+<a name="ln67">	:</a>
+<a name="ln68">	fVolume(volume),</a>
+<a name="ln69">	fID(0),</a>
+<a name="ln70">	fCache(NULL),</a>
+<a name="ln71">	fMap(NULL),</a>
+<a name="ln72">	fInitStatus(B_NO_INIT)</a>
+<a name="ln73">{</a>
+<a name="ln74">	rw_lock_init(&amp;fLock, &quot;ext2 inode&quot;);</a>
+<a name="ln75">	recursive_lock_init(&amp;fSmallDataLock, &quot;ext2 inode small data&quot;);</a>
+<a name="ln76"> </a>
+<a name="ln77">	TRACE(&quot;Inode::Inode(): ext2_inode: %lu, disk inode: %&quot; B_PRIu32 &quot;\n&quot;,</a>
+<a name="ln78">		sizeof(ext2_inode), fVolume-&gt;InodeSize());</a>
+<a name="ln79">	fNodeSize = sizeof(ext2_inode) &gt; fVolume-&gt;InodeSize()</a>
+<a name="ln80">		? fVolume-&gt;InodeSize() : sizeof(ext2_inode);</a>
+<a name="ln81">}</a>
+<a name="ln82"> </a>
+<a name="ln83"> </a>
+<a name="ln84">Inode::~Inode()</a>
+<a name="ln85">{</a>
+<a name="ln86">	TRACE(&quot;Inode destructor\n&quot;);</a>
+<a name="ln87"> </a>
+<a name="ln88">	DeleteFileCache();</a>
+<a name="ln89"> </a>
+<a name="ln90">	TRACE(&quot;Inode destructor: Done\n&quot;);</a>
+<a name="ln91">}</a>
+<a name="ln92"> </a>
+<a name="ln93"> </a>
+<a name="ln94">status_t</a>
+<a name="ln95">Inode::InitCheck()</a>
+<a name="ln96">{</a>
+<a name="ln97">	return fInitStatus;</a>
+<a name="ln98">}</a>
+<a name="ln99"> </a>
+<a name="ln100"> </a>
+<a name="ln101">void</a>
+<a name="ln102">Inode::WriteLockInTransaction(Transaction&amp; transaction)</a>
+<a name="ln103">{</a>
+<a name="ln104">	acquire_vnode(fVolume-&gt;FSVolume(), ID());</a>
+<a name="ln105"> </a>
+<a name="ln106">	TRACE(&quot;Inode::WriteLockInTransaction(): Locking\n&quot;);</a>
+<a name="ln107">	rw_lock_write_lock(&amp;fLock);</a>
+<a name="ln108"> </a>
+<a name="ln109">	transaction.AddListener(this);</a>
+<a name="ln110">}</a>
+<a name="ln111"> </a>
+<a name="ln112"> </a>
+<a name="ln113">status_t</a>
+<a name="ln114">Inode::WriteBack(Transaction&amp; transaction)</a>
+<a name="ln115">{</a>
+<a name="ln116">	off_t blockNum;</a>
+<a name="ln117"> </a>
+<a name="ln118">	status_t status = fVolume-&gt;GetInodeBlock(fID, blockNum);</a>
+<a name="ln119">	if (status != B_OK)</a>
+<a name="ln120">		return status;</a>
+<a name="ln121"> </a>
+<a name="ln122"> 	if (Node().Size() &gt; 0x7fffffffLL) {</a>
+<a name="ln123">		status = fVolume-&gt;ActivateLargeFiles(transaction);</a>
+<a name="ln124">		 if (status != B_OK)</a>
+<a name="ln125">			  return status;</a>
+<a name="ln126">	}</a>
+<a name="ln127"> </a>
+<a name="ln128">	CachedBlock cached(fVolume);</a>
+<a name="ln129">	uint8* inodeBlockData = cached.SetToWritable(transaction, blockNum);</a>
+<a name="ln130">	if (inodeBlockData == NULL)</a>
+<a name="ln131">		return B_IO_ERROR;</a>
+<a name="ln132"> </a>
+<a name="ln133">	TRACE(&quot;Inode::WriteBack(): Inode ID: %&quot; B_PRIdINO &quot;, inode block: %&quot;</a>
+<a name="ln134">		B_PRIdOFF &quot;, data: %p, index: %&quot; B_PRIu32 &quot;, inode size: %&quot; B_PRIu32</a>
+<a name="ln135">		&quot;, node size: %&quot; B_PRIu32 &quot;, this: %p, node: %p\n&quot;,</a>
+<a name="ln136">		fID, blockNum, inodeBlockData, fVolume-&gt;InodeBlockIndex(fID),</a>
+<a name="ln137">		fVolume-&gt;InodeSize(), fNodeSize, this, &amp;fNode);</a>
+<a name="ln138">	memcpy(inodeBlockData +</a>
+<a name="ln139">			fVolume-&gt;InodeBlockIndex(fID) * fVolume-&gt;InodeSize(),</a>
+<a name="ln140">		(uint8*)&amp;fNode, fNodeSize);</a>
+<a name="ln141"> </a>
+<a name="ln142">	TRACE(&quot;Inode::WriteBack() finished %&quot; B_PRId32 &quot;\n&quot;, Node().stream.direct[0]);</a>
+<a name="ln143"> </a>
+<a name="ln144">	return B_OK;</a>
+<a name="ln145">}</a>
+<a name="ln146"> </a>
+<a name="ln147"> </a>
+<a name="ln148">status_t</a>
+<a name="ln149">Inode::UpdateNodeFromDisk()</a>
+<a name="ln150">{</a>
+<a name="ln151">	off_t blockNum;</a>
+<a name="ln152"> </a>
+<a name="ln153">	status_t status = fVolume-&gt;GetInodeBlock(fID, blockNum);</a>
+<a name="ln154">	if (status != B_OK)</a>
+<a name="ln155">		return status;</a>
+<a name="ln156"> </a>
+<a name="ln157">	TRACE(&quot;inode %&quot; B_PRIdINO &quot; at block %&quot; B_PRIdOFF &quot;\n&quot;, fID, blockNum);</a>
+<a name="ln158"> </a>
+<a name="ln159">	CachedBlock cached(fVolume);</a>
+<a name="ln160">	const uint8* inodeBlock = cached.SetTo(blockNum);</a>
+<a name="ln161"> </a>
+<a name="ln162">	if (inodeBlock == NULL)</a>
+<a name="ln163">		return B_IO_ERROR;</a>
+<a name="ln164"> </a>
+<a name="ln165">	TRACE(&quot;Inode size: %&quot; B_PRIu32 &quot;, inode index: %&quot; B_PRIu32 &quot;\n&quot;,</a>
+<a name="ln166">		fVolume-&gt;InodeSize(), fVolume-&gt;InodeBlockIndex(fID));</a>
+<a name="ln167">	ext2_inode* inode = (ext2_inode*)(inodeBlock</a>
+<a name="ln168">		+ fVolume-&gt;InodeBlockIndex(fID) * fVolume-&gt;InodeSize());</a>
+<a name="ln169"> </a>
+<a name="ln170">	TRACE(&quot;Attempting to copy inode data from %p to %p, ext2_inode &quot;</a>
+<a name="ln171">		&quot;size: %&quot; B_PRIu32 &quot;\n&quot;, inode, &amp;fNode, fNodeSize);</a>
+<a name="ln172"> </a>
+<a name="ln173">	memcpy(&amp;fNode, inode, fNodeSize);</a>
+<a name="ln174"> </a>
+<a name="ln175">	uint32 numLinks = fNode.NumLinks();</a>
+<a name="ln176">	fUnlinked = numLinks == 0 || (IsDirectory() &amp;&amp; numLinks == 1);</a>
+<a name="ln177"> </a>
+<a name="ln178">	return B_OK;</a>
+<a name="ln179">}</a>
+<a name="ln180"> </a>
+<a name="ln181"> </a>
+<a name="ln182">status_t</a>
+<a name="ln183">Inode::CheckPermissions(int accessMode) const</a>
+<a name="ln184">{</a>
+<a name="ln185">	// you never have write access to a read-only volume</a>
+<a name="ln186">	if ((accessMode &amp; W_OK) != 0 &amp;&amp; fVolume-&gt;IsReadOnly())</a>
+<a name="ln187">		return B_READ_ONLY_DEVICE;</a>
+<a name="ln188"> </a>
+<a name="ln189">	return check_access_permissions(accessMode, Mode(), (gid_t)fNode.GroupID(),</a>
+<a name="ln190">		(uid_t)fNode.UserID());</a>
+<a name="ln191">}</a>
+<a name="ln192"> </a>
+<a name="ln193"> </a>
+<a name="ln194">status_t</a>
+<a name="ln195">Inode::FindBlock(off_t offset, fsblock_t&amp; block, uint32 *_count)</a>
+<a name="ln196">{</a>
+<a name="ln197">	if (Flags() &amp; EXT2_INODE_EXTENTS) {</a>
+<a name="ln198">		ExtentStream stream(fVolume, &amp;fNode.extent_stream, Size());</a>
+<a name="ln199">		return stream.FindBlock(offset, block, _count);</a>
+<a name="ln200">	}</a>
+<a name="ln201">	DataStream stream(fVolume, &amp;fNode.stream, Size());</a>
+<a name="ln202">	return stream.FindBlock(offset, block, _count);</a>
+<a name="ln203">}</a>
+<a name="ln204"> </a>
+<a name="ln205"> </a>
+<a name="ln206">status_t</a>
+<a name="ln207">Inode::ReadAt(off_t pos, uint8* buffer, size_t* _length)</a>
+<a name="ln208">{</a>
+<a name="ln209">	return file_cache_read(FileCache(), NULL, pos, buffer, _length);</a>
+<a name="ln210">}</a>
+<a name="ln211"> </a>
+<a name="ln212"> </a>
+<a name="ln213">status_t</a>
+<a name="ln214">Inode::WriteAt(Transaction&amp; transaction, off_t pos, const uint8* buffer,</a>
+<a name="ln215">	size_t* _length)</a>
+<a name="ln216">{</a>
+<a name="ln217">	TRACE(&quot;Inode::WriteAt(%&quot; B_PRIdOFF &quot;, %p, *(%p) = %&quot; B_PRIuSIZE &quot;)\n&quot;, pos,</a>
+<a name="ln218">		buffer, _length, *_length);</a>
+<a name="ln219">	ReadLocker readLocker(fLock);</a>
+<a name="ln220"> </a>
+<a name="ln221">	if (!HasFileCache())</a>
+<a name="ln222">		return B_BAD_VALUE;</a>
+<a name="ln223"> </a>
+<a name="ln224">	if (pos &lt; 0)</a>
+<a name="ln225">		return B_BAD_VALUE;</a>
+<a name="ln226"> </a>
+<a name="ln227">	readLocker.Unlock();</a>
+<a name="ln228"> </a>
+<a name="ln229">	TRACE(&quot;Inode::WriteAt(): Starting transaction\n&quot;);</a>
+<a name="ln230">	transaction.Start(fVolume-&gt;GetJournal());</a>
+<a name="ln231"> </a>
+<a name="ln232">	WriteLocker writeLocker(fLock);</a>
+<a name="ln233"> </a>
+<a name="ln234">	TRACE(&quot;Inode::WriteAt(): Updating modification time\n&quot;);</a>
+<a name="ln235">	struct timespec timespec;</a>
+<a name="ln236">	_BigtimeToTimespec(real_time_clock_usecs(), &amp;timespec);</a>
+<a name="ln237">	SetModificationTime(&amp;timespec);</a>
+<a name="ln238"> </a>
+<a name="ln239">	// NOTE: Debugging info to find why sometimes resize doesn't happen</a>
+<a name="ln240">	size_t length = *_length;</a>
+<a name="ln241">#ifdef TRACE_EXT2</a>
+<a name="ln242">	off_t oldEnd = pos + length;</a>
+<a name="ln243">	TRACE(&quot;Inode::WriteAt(): Old calc for end? %x:%x\n&quot;,</a>
+<a name="ln244">		(int)(oldEnd &gt;&gt; 32), (int)(oldEnd &amp; 0xFFFFFFFF));</a>
+<a name="ln245">#endif</a>
+<a name="ln246"> </a>
+<a name="ln247">	off_t end = pos + (off_t)length;</a>
+<a name="ln248">	off_t oldSize = Size();</a>
+<a name="ln249"> </a>
+<a name="ln250">	TRACE(&quot;Inode::WriteAt(): Old size: %&quot; B_PRIdOFF &quot;:%&quot; B_PRIdOFF</a>
+<a name="ln251">		&quot;, new size: %&quot; B_PRIdOFF &quot;:%&quot; B_PRIdOFF &quot;\n&quot;,</a>
+<a name="ln252">		oldSize &gt;&gt; 32, oldSize &amp; 0xFFFFFFFF,</a>
+<a name="ln253">		end &gt;&gt; 32, end &amp; 0xFFFFFFFF);</a>
+<a name="ln254"> </a>
+<a name="ln255">	if (end &gt; oldSize) {</a>
+<a name="ln256">		status_t status = Resize(transaction, end);</a>
+<a name="ln257">		if (status != B_OK) {</a>
+<a name="ln258">			*_length = 0;</a>
+<a name="ln259">			WriteLockInTransaction(transaction);</a>
+<a name="ln260">			return status;</a>
+<a name="ln261">		}</a>
+<a name="ln262"> </a>
+<a name="ln263">		status = WriteBack(transaction);</a>
+<a name="ln264">		if (status != B_OK) {</a>
+<a name="ln265">			*_length = 0;</a>
+<a name="ln266">			WriteLockInTransaction(transaction);</a>
+<a name="ln267">			return status;</a>
+<a name="ln268">		}</a>
+<a name="ln269">	}</a>
+<a name="ln270"> </a>
+<a name="ln271">	writeLocker.Unlock();</a>
+<a name="ln272"> </a>
+<a name="ln273">	if (oldSize &lt; pos)</a>
+<a name="ln274">		FillGapWithZeros(oldSize, pos);</a>
+<a name="ln275"> </a>
+<a name="ln276">	if (length == 0) {</a>
+<a name="ln277">		// Probably just changed the file size with the pos parameter</a>
+<a name="ln278">		return B_OK;</a>
+<a name="ln279">	}</a>
+<a name="ln280"> </a>
+<a name="ln281">	TRACE(&quot;Inode::WriteAt(): Performing write: %p, %&quot; B_PRIdOFF &quot;, %p, %&quot;</a>
+<a name="ln282">		B_PRIuSIZE &quot;\n&quot;, FileCache(), pos, buffer, *_length);</a>
+<a name="ln283">	status_t status = file_cache_write(FileCache(), NULL, pos, buffer,</a>
+<a name="ln284">		_length);</a>
+<a name="ln285"> </a>
+<a name="ln286">	WriteLockInTransaction(transaction);</a>
+<a name="ln287"> </a>
+<a name="ln288">	TRACE(&quot;Inode::WriteAt(): Done\n&quot;);</a>
+<a name="ln289"> </a>
+<a name="ln290">	return status;</a>
+<a name="ln291">}</a>
+<a name="ln292"> </a>
+<a name="ln293"> </a>
+<a name="ln294">status_t</a>
+<a name="ln295">Inode::FillGapWithZeros(off_t start, off_t end)</a>
+<a name="ln296">{</a>
+<a name="ln297">	TRACE(&quot;Inode::FileGapWithZeros(%&quot; B_PRIdOFF &quot; - %&quot; B_PRIdOFF &quot;)\n&quot;, start,</a>
+<a name="ln298">		end);</a>
+<a name="ln299"> </a>
+<a name="ln300">	while (start &lt; end) {</a>
+<a name="ln301">		size_t size;</a>
+<a name="ln302"> </a>
+<a name="ln303">		if (end &gt; start + 1024 * 1024 * 1024)</a>
+<a name="ln304">			size = 1024 * 1024 * 1024;</a>
+<a name="ln305">		else</a>
+<a name="ln306">			size = end - start;</a>
+<a name="ln307"> </a>
+<a name="ln308">		TRACE(&quot;Inode::FillGapWithZeros(): Calling file_cache_write(%p, NULL, &quot;</a>
+<a name="ln309">			&quot;%&quot; B_PRIdOFF &quot;, NULL, &amp;(%&quot; B_PRIuSIZE &quot;) = %p)\n&quot;, fCache, start,</a>
+<a name="ln310">			size, &amp;size);</a>
+<a name="ln311">		status_t status = file_cache_write(fCache, NULL, start, NULL,</a>
+<a name="ln312">			&amp;size);</a>
+<a name="ln313">		if (status != B_OK)</a>
+<a name="ln314">			return status;</a>
+<a name="ln315"> </a>
+<a name="ln316">		start += size;</a>
+<a name="ln317">	}</a>
+<a name="ln318"> </a>
+<a name="ln319">	return B_OK;</a>
+<a name="ln320">}</a>
+<a name="ln321"> </a>
+<a name="ln322"> </a>
+<a name="ln323">status_t</a>
+<a name="ln324">Inode::Resize(Transaction&amp; transaction, off_t size)</a>
+<a name="ln325">{</a>
+<a name="ln326">	TRACE(&quot;Inode::Resize() ID:%&quot; B_PRIdINO &quot; size: %&quot; B_PRIdOFF &quot;\n&quot;, ID(),</a>
+<a name="ln327">		size);</a>
+<a name="ln328">	if (size &lt; 0)</a>
+<a name="ln329">		return B_BAD_VALUE;</a>
+<a name="ln330"> </a>
+<a name="ln331">	off_t oldSize = Size();</a>
+<a name="ln332"> </a>
+<a name="ln333">	if (size == oldSize)</a>
+<a name="ln334">		return B_OK;</a>
+<a name="ln335"> </a>
+<a name="ln336">	TRACE(&quot;Inode::Resize(): old size: %&quot; B_PRIdOFF &quot;, new size: %&quot; B_PRIdOFF</a>
+<a name="ln337">		&quot;\n&quot;, oldSize, size);</a>
+<a name="ln338"> </a>
+<a name="ln339">	status_t status;</a>
+<a name="ln340">	if (size &gt; oldSize) {</a>
+<a name="ln341">		status = _EnlargeDataStream(transaction, size);</a>
+<a name="ln342">		if (status != B_OK) {</a>
+<a name="ln343">			// Restore original size</a>
+<a name="ln344">			_ShrinkDataStream(transaction, oldSize);</a>
+<a name="ln345">		}</a>
+<a name="ln346">	} else</a>
+<a name="ln347">		status = _ShrinkDataStream(transaction, size);</a>
+<a name="ln348"> </a>
+<a name="ln349">	TRACE(&quot;Inode::Resize(): Updating file map and cache\n&quot;);</a>
+<a name="ln350"> </a>
+<a name="ln351">	if (status != B_OK)</a>
+<a name="ln352">		return status;</a>
+<a name="ln353"> </a>
+<a name="ln354">	file_cache_set_size(FileCache(), size);</a>
+<a name="ln355">	file_map_set_size(Map(), size);</a>
+<a name="ln356"> </a>
+<a name="ln357">	TRACE(&quot;Inode::Resize(): Writing back inode changes. Size: %&quot; B_PRIdOFF</a>
+<a name="ln358">		&quot;\n&quot;, Size());</a>
+<a name="ln359"> </a>
+<a name="ln360">	return WriteBack(transaction);</a>
+<a name="ln361">}</a>
+<a name="ln362"> </a>
+<a name="ln363"> </a>
+<a name="ln364">status_t</a>
+<a name="ln365">Inode::InitDirectory(Transaction&amp; transaction, Inode* parent)</a>
+<a name="ln366">{</a>
+<a name="ln367">	TRACE(&quot;Inode::InitDirectory()\n&quot;);</a>
+<a name="ln368">	uint32 blockSize = fVolume-&gt;BlockSize();</a>
+<a name="ln369"> </a>
+<a name="ln370">	status_t status = Resize(transaction, blockSize);</a>
+<a name="ln371">	if (status != B_OK)</a>
+<a name="ln372">		return status;</a>
+<a name="ln373"> </a>
+<a name="ln374">	fsblock_t blockNum;</a>
+<a name="ln375">	if (Flags() &amp; EXT2_INODE_EXTENTS) {</a>
+<a name="ln376">		ExtentStream stream(fVolume, &amp;fNode.extent_stream, Size());</a>
+<a name="ln377">		status = stream.FindBlock(0, blockNum);</a>
+<a name="ln378">	} else {</a>
+<a name="ln379">		DataStream stream(fVolume, &amp;fNode.stream, Size());</a>
+<a name="ln380">		status = stream.FindBlock(0, blockNum);</a>
+<a name="ln381">	}</a>
+<a name="ln382">	if (status != B_OK)</a>
+<a name="ln383">		return status;</a>
+<a name="ln384"> </a>
+<a name="ln385">	CachedBlock cached(fVolume);</a>
+<a name="ln386">	uint8* block = cached.SetToWritable(transaction, blockNum, true);</a>
+<a name="ln387"> </a>
+<a name="ln388">	HTreeRoot* root = (HTreeRoot*)block;</a>
+<a name="ln389">	root-&gt;dot.inode_id = fID;</a>
+<a name="ln390">	root-&gt;dot.entry_length = 12;</a>
+<a name="ln391">	root-&gt;dot.name_length = 1;</a>
+<a name="ln392">	root-&gt;dot.file_type = EXT2_TYPE_DIRECTORY;</a>
+<a name="ln393">	root-&gt;dot_entry_name[0] = '.';</a>
+<a name="ln394"> </a>
+<a name="ln395">	root-&gt;dotdot.inode_id = parent == NULL ? fID : parent-&gt;ID();</a>
+<a name="ln396">	root-&gt;dotdot.entry_length = blockSize - 12;</a>
+<a name="ln397">	root-&gt;dotdot.name_length = 2;</a>
+<a name="ln398">	root-&gt;dotdot.file_type = EXT2_TYPE_DIRECTORY;</a>
+<a name="ln399">	root-&gt;dotdot_entry_name[0] = '.';</a>
+<a name="ln400">	root-&gt;dotdot_entry_name[1] = '.';</a>
+<a name="ln401"> </a>
+<a name="ln402">	parent-&gt;IncrementNumLinks(transaction);</a>
+<a name="ln403"> </a>
+<a name="ln404">	return parent-&gt;WriteBack(transaction);</a>
+<a name="ln405">}</a>
+<a name="ln406"> </a>
+<a name="ln407"> </a>
+<a name="ln408">status_t</a>
+<a name="ln409">Inode::Unlink(Transaction&amp; transaction)</a>
+<a name="ln410">{</a>
+<a name="ln411">	uint32 numLinks = fNode.NumLinks();</a>
+<a name="ln412">	TRACE(&quot;Inode::Unlink(): Current links: %&quot; B_PRIu32 &quot;\n&quot;, numLinks);</a>
+<a name="ln413"> </a>
+<a name="ln414">	if (numLinks == 0)</a>
+<a name="ln415">		return B_BAD_VALUE;</a>
+<a name="ln416"> </a>
+<a name="ln417">	if ((IsDirectory() &amp;&amp; numLinks == 2) || (numLinks == 1))  {</a>
+<a name="ln418">		fUnlinked = true;</a>
+<a name="ln419"> </a>
+<a name="ln420">		TRACE(&quot;Inode::Unlink(): Putting inode in orphan list\n&quot;);</a>
+<a name="ln421">		ino_t firstOrphanID;</a>
+<a name="ln422">		status_t status = fVolume-&gt;SaveOrphan(transaction, fID, firstOrphanID);</a>
+<a name="ln423">		if (status != B_OK)</a>
+<a name="ln424">			return status;</a>
+<a name="ln425"> </a>
+<a name="ln426">		if (firstOrphanID != 0) {</a>
+<a name="ln427">			Vnode firstOrphan(fVolume, firstOrphanID);</a>
+<a name="ln428">			Inode* nextOrphan;</a>
+<a name="ln429"> </a>
+<a name="ln430">			status = firstOrphan.Get(&amp;nextOrphan);</a>
+<a name="ln431">			if (status != B_OK)</a>
+<a name="ln432">				return status;</a>
+<a name="ln433"> </a>
+<a name="ln434">			fNode.SetNextOrphan(nextOrphan-&gt;ID());</a>
+<a name="ln435">		} else {</a>
+<a name="ln436">			// Next orphan link is stored in deletion time</a>
+<a name="ln437">			fNode.deletion_time = 0;</a>
+<a name="ln438">		}</a>
+<a name="ln439"> </a>
+<a name="ln440">		fNode.num_links = 0;</a>
+<a name="ln441"> </a>
+<a name="ln442">		status = remove_vnode(fVolume-&gt;FSVolume(), fID);</a>
+<a name="ln443">		if (status != B_OK)</a>
+<a name="ln444">			return status;</a>
+<a name="ln445">	} else</a>
+<a name="ln446">		fNode.SetNumLinks(--numLinks);</a>
+<a name="ln447"> </a>
+<a name="ln448">	return WriteBack(transaction);</a>
+<a name="ln449">}</a>
+<a name="ln450"> </a>
+<a name="ln451"> </a>
+<a name="ln452">/*static*/ status_t</a>
+<a name="ln453">Inode::Create(Transaction&amp; transaction, Inode* parent, const char* name,</a>
+<a name="ln454">	int32 mode, int openMode, uint8 type, bool* _created, ino_t* _id,</a>
+<a name="ln455">	Inode** _inode, fs_vnode_ops* vnodeOps, uint32 publishFlags)</a>
+<a name="ln456">{</a>
+<a name="ln457">	TRACE(&quot;Inode::Create()\n&quot;);</a>
+<a name="ln458">	Volume* volume = transaction.GetVolume();</a>
+<a name="ln459"> </a>
+<a name="ln460">	DirectoryIterator* entries = NULL;</a>
+<a name="ln461">	ObjectDeleter&lt;DirectoryIterator&gt; entriesDeleter;</a>
+<a name="ln462"> </a>
+<a name="ln463">	if (parent != NULL) {</a>
+<a name="ln464">		parent-&gt;WriteLockInTransaction(transaction);</a>
+<a name="ln465"> </a>
+<a name="ln466">		TRACE(&quot;Inode::Create(): Looking up entry destination\n&quot;);</a>
+<a name="ln467">		HTree htree(volume, parent);</a>
+<a name="ln468"> </a>
+<a name="ln469">		status_t status = htree.Lookup(name, &amp;entries);</a>
+<a name="ln470">		if (status == B_ENTRY_NOT_FOUND) {</a>
+<a name="ln471">			panic(&quot;We need to add the first node.\n&quot;);</a>
+<a name="ln472">			return B_ERROR;</a>
+<a name="ln473">		}</a>
+<a name="ln474">		if (status != B_OK)</a>
+<a name="ln475">			return status;</a>
+<a name="ln476">		entriesDeleter.SetTo(entries);</a>
+<a name="ln477"> </a>
+<a name="ln478">		TRACE(&quot;Inode::Create(): Looking up to see if file already exists\n&quot;);</a>
+<a name="ln479">		ino_t entryID;</a>
+<a name="ln480"> </a>
+<a name="ln481">		status = entries-&gt;FindEntry(name, &amp;entryID);</a>
+<a name="ln482">		if (status == B_OK) {</a>
+<a name="ln483">			// File already exists</a>
+<a name="ln484">			TRACE(&quot;Inode::Create(): File already exists\n&quot;);</a>
+<a name="ln485">			if (S_ISDIR(mode) || S_ISLNK(mode) || (openMode &amp; O_EXCL) != 0)</a>
+<a name="ln486">				return B_FILE_EXISTS;</a>
+<a name="ln487"> </a>
+<a name="ln488">			Vnode vnode(volume, entryID);</a>
+<a name="ln489">			Inode* inode;</a>
+<a name="ln490"> </a>
+<a name="ln491">			status = vnode.Get(&amp;inode);</a>
+<a name="ln492">			if (status != B_OK) {</a>
+<a name="ln493">				TRACE(&quot;Inode::Create() Failed to get the inode from the &quot;</a>
+<a name="ln494">					&quot;vnode\n&quot;);</a>
+<a name="ln495">				return B_ENTRY_NOT_FOUND;</a>
+<a name="ln496">			}</a>
+<a name="ln497"> </a>
+<a name="ln498">			if (inode-&gt;IsDirectory() &amp;&amp; (openMode &amp; O_RWMASK) != O_RDONLY)</a>
+<a name="ln499">				return B_IS_A_DIRECTORY;</a>
+<a name="ln500">			if ((openMode &amp; O_DIRECTORY) != 0 &amp;&amp; !inode-&gt;IsDirectory())</a>
+<a name="ln501">				return B_NOT_A_DIRECTORY;</a>
+<a name="ln502"> </a>
+<a name="ln503">			if (inode-&gt;CheckPermissions(open_mode_to_access(openMode)</a>
+<a name="ln504">					| ((openMode &amp; O_TRUNC) != 0 ? W_OK : 0)) != B_OK)</a>
+<a name="ln505">				return B_NOT_ALLOWED;</a>
+<a name="ln506"> </a>
+<a name="ln507">			if ((openMode &amp; O_TRUNC) != 0) {</a>
+<a name="ln508">				// Truncate requested</a>
+<a name="ln509">				TRACE(&quot;Inode::Create(): Truncating file\n&quot;);</a>
+<a name="ln510">				inode-&gt;WriteLockInTransaction(transaction);</a>
+<a name="ln511"> </a>
+<a name="ln512">				status = inode-&gt;Resize(transaction, 0);</a>
+<a name="ln513">				if (status != B_OK)</a>
+<a name="ln514">					return status;</a>
+<a name="ln515">			}</a>
+<a name="ln516"> </a>
+<a name="ln517">			if (_created != NULL)</a>
+<a name="ln518">				*_created = false;</a>
+<a name="ln519">			if (_id != NULL)</a>
+<a name="ln520">				*_id = inode-&gt;ID();</a>
+<a name="ln521">			if (_inode != NULL)</a>
+<a name="ln522">				*_inode = inode;</a>
+<a name="ln523"> </a>
+<a name="ln524">			if (_id != NULL || _inode != NULL)</a>
+<a name="ln525">				vnode.Keep();</a>
+<a name="ln526"> </a>
+<a name="ln527">			TRACE(&quot;Inode::Create(): Done opening file\n&quot;);</a>
+<a name="ln528">			return B_OK;</a>
+<a name="ln529">		/*} else if ((mode &amp; S_ATTR_DIR) == 0) {</a>
+<a name="ln530">			TRACE(&quot;Inode::Create(): (mode &amp; S_ATTR_DIR) == 0\n&quot;);</a>
+<a name="ln531">			return B_BAD_VALUE;*/</a>
+<a name="ln532">		} else if ((openMode &amp; O_DIRECTORY) != 0) {</a>
+<a name="ln533">			TRACE(&quot;Inode::Create(): (openMode &amp; O_DIRECTORY) != 0\n&quot;);</a>
+<a name="ln534">			return B_ENTRY_NOT_FOUND;</a>
+<a name="ln535">		}</a>
+<a name="ln536"> </a>
+<a name="ln537">		// Return to initial position</a>
+<a name="ln538">		TRACE(&quot;Inode::Create(): Restarting iterator\n&quot;);</a>
+<a name="ln539">		entries-&gt;Restart();</a>
+<a name="ln540">	}</a>
+<a name="ln541"> </a>
+<a name="ln542">	status_t status;</a>
+<a name="ln543">	if (parent != NULL) {</a>
+<a name="ln544">		status = parent-&gt;CheckPermissions(W_OK);</a>
+<a name="ln545">		if (status != B_OK)</a>
+<a name="ln546">			return status;</a>
+<a name="ln547">	}</a>
+<a name="ln548"> </a>
+<a name="ln549">	TRACE(&quot;Inode::Create(): Allocating inode\n&quot;);</a>
+<a name="ln550">	ino_t id;</a>
+<a name="ln551">	status = volume-&gt;AllocateInode(transaction, parent, mode, id);</a>
+<a name="ln552">	if (status != B_OK) {</a>
+<a name="ln553">		ERROR(&quot;Inode::Create(): AllocateInode() failed\n&quot;);</a>
+<a name="ln554">		return status;</a>
+<a name="ln555">	}</a>
+<a name="ln556"> </a>
+<a name="ln557">	if (entries != NULL) {</a>
+<a name="ln558">		size_t nameLength = strlen(name);</a>
+<a name="ln559">		status = entries-&gt;AddEntry(transaction, name, nameLength, id, type);</a>
+<a name="ln560">		if (status != B_OK) {</a>
+<a name="ln561">			ERROR(&quot;Inode::Create(): AddEntry() failed\n&quot;);</a>
+<a name="ln562">			return status;</a>
+<a name="ln563">		}</a>
+<a name="ln564">	}</a>
+<a name="ln565"> </a>
+<a name="ln566">	TRACE(&quot;Inode::Create(): Creating inode\n&quot;);</a>
+<a name="ln567">	Inode* inode = new(std::nothrow) Inode(volume);</a>
+<a name="ln568">	if (inode == NULL)</a>
+<a name="ln569">		return B_NO_MEMORY;</a>
+<a name="ln570"> </a>
+<a name="ln571">	TRACE(&quot;Inode::Create(): Getting node structure\n&quot;);</a>
+<a name="ln572">	ext2_inode&amp; node = inode-&gt;Node();</a>
+<a name="ln573">	TRACE(&quot;Inode::Create(): Initializing inode data\n&quot;);</a>
+<a name="ln574">	memset(&amp;node, 0, sizeof(ext2_inode));</a>
+<a name="ln575">	node.SetMode(mode);</a>
+<a name="ln576">	node.SetUserID(geteuid());</a>
+<a name="ln577">	node.SetGroupID(parent != NULL ? parent-&gt;Node().GroupID() : getegid());</a>
+<a name="ln578">	node.SetNumLinks(inode-&gt;IsDirectory() ? 2 : 1);</a>
+<a name="ln579">	TRACE(&quot;Inode::Create(): Updating time\n&quot;);</a>
+<a name="ln580">	struct timespec timespec;</a>
+<a name="ln581">	_BigtimeToTimespec(real_time_clock_usecs(), &amp;timespec);</a>
+<a name="ln582">	inode-&gt;SetAccessTime(&amp;timespec);</a>
+<a name="ln583">	inode-&gt;SetCreationTime(&amp;timespec);</a>
+<a name="ln584">	inode-&gt;SetModificationTime(&amp;timespec);</a>
+<a name="ln585">	if (parent != NULL)</a>
+<a name="ln586">		node.SetFlags(parent-&gt;Flags() &amp; EXT2_INODE_INHERITED);</a>
+<a name="ln587">	if (volume-&gt;HasExtentsFeature()</a>
+<a name="ln588">		&amp;&amp; (inode-&gt;IsDirectory() || inode-&gt;IsFile())) {</a>
+<a name="ln589">		node.SetFlag(EXT2_INODE_EXTENTS);</a>
+<a name="ln590">		ExtentStream stream(volume, &amp;node.extent_stream, 0);</a>
+<a name="ln591">		stream.Init();</a>
+<a name="ln592">		ASSERT(stream.Check());</a>
+<a name="ln593">	}</a>
+<a name="ln594"> </a>
+<a name="ln595">	if (sizeof(ext2_inode) &lt; volume-&gt;InodeSize())</a>
+<a name="ln596">		node.SetExtraInodeSize(sizeof(ext2_inode) - EXT2_INODE_NORMAL_SIZE);</a>
+<a name="ln597"> </a>
+<a name="ln598">	TRACE(&quot;Inode::Create(): Updating ID\n&quot;);</a>
+<a name="ln599">	inode-&gt;fID = id;</a>
+<a name="ln600"> </a>
+<a name="ln601">	if (inode-&gt;IsDirectory()) {</a>
+<a name="ln602">		TRACE(&quot;Inode::Create(): Initializing directory\n&quot;);</a>
+<a name="ln603">		status = inode-&gt;InitDirectory(transaction, parent);</a>
+<a name="ln604">		if (status != B_OK) {</a>
+<a name="ln605">			ERROR(&quot;Inode::Create(): InitDirectory() failed\n&quot;);</a>
+<a name="ln606">			delete inode;</a>
+<a name="ln607">			return status;</a>
+<a name="ln608">		}</a>
+<a name="ln609">	}</a>
+<a name="ln610"> </a>
+<a name="ln611">	// TODO: Maybe it can be better</a>
+<a name="ln612">	/*if (volume-&gt;HasExtendedAttributes()) {</a>
+<a name="ln613">		TRACE(&quot;Inode::Create(): Initializing extended attributes\n&quot;);</a>
+<a name="ln614">		uint32 blockGroup = 0;</a>
+<a name="ln615">		uint32 pos = 0;</a>
+<a name="ln616">		uint32 allocated;</a>
+<a name="ln617"> </a>
+<a name="ln618">		status = volume-&gt;AllocateBlocks(transaction, 1, 1, blockGroup, pos,</a>
+<a name="ln619">			allocated);</a>
+<a name="ln620">		if (status != B_OK)</a>
+<a name="ln621">			return status;</a>
+<a name="ln622"> </a>
+<a name="ln623">		// Clear the new block</a>
+<a name="ln624">		uint32 blockNum = volume-&gt;FirstDataBlock() + pos +</a>
+<a name="ln625">			volume-&gt;BlocksPerGroup() * blockGroup;</a>
+<a name="ln626">		CachedBlock cached(volume);</a>
+<a name="ln627">		cached.SetToWritable(transaction, blockNum, true);</a>
+<a name="ln628"> </a>
+<a name="ln629">		node.SetExtendedAttributesBlock(blockNum);</a>
+<a name="ln630">	}*/</a>
+<a name="ln631"> </a>
+<a name="ln632">	TRACE(&quot;Inode::Create(): Saving inode\n&quot;);</a>
+<a name="ln633">	status = inode-&gt;WriteBack(transaction);</a>
+<a name="ln634">	if (status != B_OK) {</a>
+<a name="ln635">		delete inode;</a>
+<a name="ln636">		return status;</a>
+<a name="ln637">	}</a>
+<a name="ln638"> </a>
+<a name="ln639">	TRACE(&quot;Inode::Create(): Creating vnode\n&quot;);</a>
+<a name="ln640"> </a>
+<a name="ln641">	Vnode vnode;</a>
+<a name="ln642">	status = vnode.Publish(transaction, inode, vnodeOps, publishFlags);</a>
+<a name="ln643">	if (status != B_OK)</a>
+<a name="ln644">		return status;</a>
+<a name="ln645"> </a>
+<a name="ln646">	if (!inode-&gt;IsSymLink()) {</a>
+<a name="ln647">		// Vnode::Publish doesn't publish symlinks</a>
+<a name="ln648">		if (!inode-&gt;IsDirectory()) {</a>
+<a name="ln649">			status = inode-&gt;CreateFileCache();</a>
+<a name="ln650">			if (status != B_OK)</a>
+<a name="ln651">				return status;</a>
+<a name="ln652">		}</a>
+<a name="ln653"> </a>
+<a name="ln654">		inode-&gt;WriteLockInTransaction(transaction);</a>
+<a name="ln655">	}</a>
+<a name="ln656"> </a>
+<a name="ln657">	if (_created)</a>
+<a name="ln658">		*_created = true;</a>
+<a name="ln659">	if (_id != NULL)</a>
+<a name="ln660">		*_id = id;</a>
+<a name="ln661">	if (_inode != NULL)</a>
+<a name="ln662">		*_inode = inode;</a>
+<a name="ln663"> </a>
+<a name="ln664">	if (_id != NULL || _inode != NULL)</a>
+<a name="ln665">		vnode.Keep();</a>
+<a name="ln666"> </a>
+<a name="ln667">	TRACE(&quot;Inode::Create(): Deleting entries iterator\n&quot;);</a>
+<a name="ln668">	DirectoryIterator* iterator = entriesDeleter.Detach();</a>
+<a name="ln669">	TRACE(&quot;Inode::Create(): Entries iterator: %p\n&quot;, entries);</a>
+<a name="ln670">	delete iterator;</a>
+<a name="ln671">	TRACE(&quot;Inode::Create(): Done\n&quot;);</a>
+<a name="ln672"> </a>
+<a name="ln673">	return B_OK;</a>
+<a name="ln674">}</a>
+<a name="ln675"> </a>
+<a name="ln676"> </a>
+<a name="ln677">status_t</a>
+<a name="ln678">Inode::CreateFileCache()</a>
+<a name="ln679">{</a>
+<a name="ln680">	TRACE(&quot;Inode::CreateFileCache()\n&quot;);</a>
+<a name="ln681"> </a>
+<a name="ln682">	if (fCache != NULL)</a>
+<a name="ln683">		return B_OK;</a>
+<a name="ln684"> </a>
+<a name="ln685">	TRACE(&quot;Inode::CreateFileCache(): Creating file cache: %&quot; B_PRIu32 &quot;, %&quot;</a>
+<a name="ln686">		B_PRIdINO &quot;, %&quot; B_PRIdOFF &quot;\n&quot;, fVolume-&gt;ID(), ID(), Size());</a>
+<a name="ln687"> </a>
+<a name="ln688">	fCache = file_cache_create(fVolume-&gt;ID(), ID(), Size());</a>
+<a name="ln689">	if (fCache == NULL) {</a>
+<a name="ln690">		ERROR(&quot;Inode::CreateFileCache(): Failed to create file cache\n&quot;);</a>
+<a name="ln691">		return B_ERROR;</a>
+<a name="ln692">	}</a>
+<a name="ln693"> </a>
+<a name="ln694">	fMap = file_map_create(fVolume-&gt;ID(), ID(), Size());</a>
+<a name="ln695">	if (fMap == NULL) {</a>
+<a name="ln696">		ERROR(&quot;Inode::CreateFileCache(): Failed to create file map\n&quot;);</a>
+<a name="ln697">		file_cache_delete(fCache);</a>
+<a name="ln698">		fCache = NULL;</a>
+<a name="ln699">		return B_ERROR;</a>
+<a name="ln700">	}</a>
+<a name="ln701"> </a>
+<a name="ln702">	TRACE(&quot;Inode::CreateFileCache(): Done\n&quot;);</a>
+<a name="ln703"> </a>
+<a name="ln704">	return B_OK;</a>
+<a name="ln705">}</a>
+<a name="ln706"> </a>
+<a name="ln707"> </a>
+<a name="ln708">void</a>
+<a name="ln709">Inode::DeleteFileCache()</a>
+<a name="ln710">{</a>
+<a name="ln711">	TRACE(&quot;Inode::DeleteFileCache()\n&quot;);</a>
+<a name="ln712"> </a>
+<a name="ln713">	if (fCache == NULL)</a>
+<a name="ln714">		return;</a>
+<a name="ln715"> </a>
+<a name="ln716">	file_cache_delete(fCache);</a>
+<a name="ln717">	file_map_delete(fMap);</a>
+<a name="ln718"> </a>
+<a name="ln719">	fCache = NULL;</a>
+<a name="ln720">	fMap = NULL;</a>
+<a name="ln721">}</a>
+<a name="ln722"> </a>
+<a name="ln723"> </a>
+<a name="ln724">status_t</a>
+<a name="ln725">Inode::EnableFileCache()</a>
+<a name="ln726">{</a>
+<a name="ln727">	if (fCache == NULL)</a>
+<a name="ln728">		return B_BAD_VALUE;</a>
+<a name="ln729"> </a>
+<a name="ln730">	file_cache_enable(fCache);</a>
+<a name="ln731">	return B_OK;</a>
+<a name="ln732">}</a>
+<a name="ln733"> </a>
+<a name="ln734"> </a>
+<a name="ln735">status_t</a>
+<a name="ln736">Inode::DisableFileCache()</a>
+<a name="ln737">{</a>
+<a name="ln738">	status_t error = file_cache_disable(fCache);</a>
+<a name="ln739">	if (error != B_OK)</a>
+<a name="ln740">		return error;</a>
+<a name="ln741"> </a>
+<a name="ln742">	return B_OK;</a>
+<a name="ln743">}</a>
+<a name="ln744"> </a>
+<a name="ln745"> </a>
+<a name="ln746">status_t</a>
+<a name="ln747">Inode::Sync()</a>
+<a name="ln748">{</a>
+<a name="ln749">	if (HasFileCache())</a>
+<a name="ln750">		return file_cache_sync(fCache);</a>
+<a name="ln751"> </a>
+<a name="ln752">	return B_OK;</a>
+<a name="ln753">}</a>
+<a name="ln754"> </a>
+<a name="ln755"> </a>
+<a name="ln756">void</a>
+<a name="ln757">Inode::TransactionDone(bool success)</a>
+<a name="ln758">{</a>
+<a name="ln759">	if (!success) {</a>
+<a name="ln760">		// Revert any changes to the inode</a>
+<a name="ln761">		if (fInitStatus == B_OK &amp;&amp; UpdateNodeFromDisk() != B_OK)</a>
+<a name="ln762">			panic(&quot;Failed to reload inode from disk!\n&quot;);</a>
+<a name="ln763">		else if (fInitStatus == B_NO_INIT) {</a>
+<a name="ln764">			// TODO: Unpublish vnode?</a>
+<a name="ln765">			panic(&quot;Failed to finish creating inode\n&quot;);</a>
+<a name="ln766">		}</a>
+<a name="ln767">	} else {</a>
+<a name="ln768">		if (fInitStatus == B_NO_INIT) {</a>
+<a name="ln769">			TRACE(&quot;Inode::TransactionDone(): Inode creation succeeded\n&quot;);</a>
+<a name="ln770">			fInitStatus = B_OK;</a>
+<a name="ln771">		}</a>
+<a name="ln772">	}</a>
+<a name="ln773">}</a>
+<a name="ln774"> </a>
+<a name="ln775"> </a>
+<a name="ln776">void</a>
+<a name="ln777">Inode::RemovedFromTransaction()</a>
+<a name="ln778">{</a>
+<a name="ln779">	TRACE(&quot;Inode::RemovedFromTransaction(): Unlocking\n&quot;);</a>
+<a name="ln780">	rw_lock_write_unlock(&amp;fLock);</a>
+<a name="ln781"> </a>
+<a name="ln782">	put_vnode(fVolume-&gt;FSVolume(), ID());</a>
+<a name="ln783">}</a>
+<a name="ln784"> </a>
+<a name="ln785"> </a>
+<a name="ln786">status_t</a>
+<a name="ln787">Inode::_EnlargeDataStream(Transaction&amp; transaction, off_t size)</a>
+<a name="ln788">{</a>
+<a name="ln789">	if (size &lt; 0)</a>
+<a name="ln790">		return B_BAD_VALUE;</a>
+<a name="ln791"> </a>
+<a name="ln792">	TRACE(&quot;Inode::_EnlargeDataStream()\n&quot;);</a>
+<a name="ln793"> </a>
+<a name="ln794">	uint32 blockSize = fVolume-&gt;BlockSize();</a>
+<a name="ln795">	off_t oldSize = Size();</a>
+<a name="ln796">	off_t maxSize = oldSize;</a>
+<a name="ln797">	if (maxSize % blockSize != 0)</a>
+<a name="ln798">		maxSize += blockSize - maxSize % blockSize;</a>
+<a name="ln799"> </a>
+<a name="ln800">	if (size &lt;= maxSize) {</a>
+<a name="ln801">		// No need to allocate more blocks</a>
+<a name="ln802">		TRACE(&quot;Inode::_EnlargeDataStream(): No need to allocate more blocks\n&quot;);</a>
+<a name="ln803">		TRACE(&quot;Inode::_EnlargeDataStream(): Setting size to %&quot; B_PRIdOFF &quot;\n&quot;,</a>
+<a name="ln804">			size);</a>
+<a name="ln805">		fNode.SetSize(size);</a>
+<a name="ln806">		return B_OK;</a>
+<a name="ln807">	}</a>
+<a name="ln808"> </a>
+<a name="ln809">	off_t end = size == 0 ? 0 : (size - 1) / fVolume-&gt;BlockSize() + 1;</a>
+<a name="ln810">	if (Flags() &amp; EXT2_INODE_EXTENTS) {</a>
+<a name="ln811">		ExtentStream stream(fVolume, &amp;fNode.extent_stream, Size());</a>
+<a name="ln812">		stream.Enlarge(transaction, end);</a>
+<a name="ln813">		ASSERT(stream.Check());</a>
+<a name="ln814">	} else {</a>
+<a name="ln815">		DataStream stream(fVolume, &amp;fNode.stream, oldSize);</a>
+<a name="ln816">		stream.Enlarge(transaction, end);</a>
+<a name="ln817">	}</a>
+<a name="ln818">	TRACE(&quot;Inode::_EnlargeDataStream(): Setting size to %&quot; B_PRIdOFF &quot;\n&quot;,</a>
+<a name="ln819">		size);</a>
+<a name="ln820">	fNode.SetSize(size);</a>
+<a name="ln821">	TRACE(&quot;Inode::_EnlargeDataStream(): Setting allocated block count to %&quot;</a>
+<a name="ln822">		B_PRIdOFF &quot;\n&quot;, end);</a>
+<a name="ln823">	return _SetNumBlocks(_NumBlocks() + end * (fVolume-&gt;BlockSize() / 512));</a>
+<a name="ln824">}</a>
+<a name="ln825"> </a>
+<a name="ln826"> </a>
+<a name="ln827">status_t</a>
+<a name="ln828">Inode::_ShrinkDataStream(Transaction&amp; transaction, off_t size)</a>
+<a name="ln829">{</a>
+<a name="ln830">	TRACE(&quot;Inode::_ShrinkDataStream()\n&quot;);</a>
+<a name="ln831"> </a>
+<a name="ln832">	if (size &lt; 0)</a>
+<a name="ln833">		return B_BAD_VALUE;</a>
+<a name="ln834"> </a>
+<a name="ln835">	uint32 blockSize = fVolume-&gt;BlockSize();</a>
+<a name="ln836">	off_t oldSize = Size();</a>
+<a name="ln837">	off_t lastByte = oldSize == 0 ? 0 : oldSize - 1;</a>
+<a name="ln838">	off_t minSize = (lastByte / blockSize + 1) * blockSize;</a>
+<a name="ln839">		// Minimum size that doesn't require freeing blocks</a>
+<a name="ln840"> </a>
+<a name="ln841">	if (size &gt; minSize) {</a>
+<a name="ln842">		// No need to allocate more blocks</a>
+<a name="ln843">		TRACE(&quot;Inode::_ShrinkDataStream(): No need to allocate more blocks\n&quot;);</a>
+<a name="ln844">		TRACE(&quot;Inode::_ShrinkDataStream(): Setting size to %&quot; B_PRIdOFF &quot;\n&quot;,</a>
+<a name="ln845">			size);</a>
+<a name="ln846">		fNode.SetSize(size);</a>
+<a name="ln847">		return B_OK;</a>
+<a name="ln848">	}</a>
+<a name="ln849"> </a>
+<a name="ln850">	off_t end = size == 0 ? 0 : (size - 1) / fVolume-&gt;BlockSize() + 1;</a>
+<a name="ln851">	if (Flags() &amp; EXT2_INODE_EXTENTS) {</a>
+<a name="ln852">		ExtentStream stream(fVolume, &amp;fNode.extent_stream, Size());</a>
+<a name="ln853">		stream.Shrink(transaction, end);</a>
+<a name="ln854">		ASSERT(stream.Check());</a>
+<a name="ln855">	} else {</a>
+<a name="ln856">		DataStream stream(fVolume, &amp;fNode.stream, oldSize);</a>
+<a name="ln857">		stream.Shrink(transaction, end);</a>
+<a name="ln858">	}</a>
+<a name="ln859"> </a>
+<a name="ln860">	fNode.SetSize(size);</a>
+<a name="ln861">	return _SetNumBlocks(_NumBlocks() - end * (fVolume-&gt;BlockSize() / 512));</a>
+<a name="ln862">}</a>
+<a name="ln863"> </a>
+<a name="ln864"> </a>
+<a name="ln865">uint64</a>
+<a name="ln866">Inode::_NumBlocks()</a>
+<a name="ln867">{</a>
+<a name="ln868">	if (fVolume-&gt;HugeFiles()) {</a>
+<a name="ln869">		if (fNode.Flags() &amp; EXT2_INODE_HUGE_FILE)</a>
+<a name="ln870">			return fNode.NumBlocks64() * (fVolume-&gt;BlockSize() / 512);</a>
+<a name="ln871">		else</a>
+<a name="ln872">			return fNode.NumBlocks64();</a>
+<a name="ln873">	} else</a>
+<a name="ln874">		return fNode.NumBlocks();</a>
+<a name="ln875">}</a>
+<a name="ln876"> </a>
+<a name="ln877"> </a>
+<a name="ln878">status_t</a>
+<a name="ln879">Inode::_SetNumBlocks(uint64 numBlocks)</a>
+<a name="ln880">{</a>
+<a name="ln881">	if (numBlocks &lt;= 0xffffffff) {</a>
+<a name="ln882">		fNode.SetNumBlocks(numBlocks);</a>
+<a name="ln883">		fNode.ClearFlag(EXT2_INODE_HUGE_FILE);</a>
+<a name="ln884">		return B_OK;</a>
+<a name="ln885">	}</a>
+<a name="ln886">	if (!fVolume-&gt;HugeFiles())</a>
+<a name="ln887">		return E2BIG;</a>
+<a name="ln888"> </a>
+<a name="ln889">	if (numBlocks &gt; 0xffffffffffffULL) {</a>
+<a name="ln890">		fNode.SetFlag(EXT2_INODE_HUGE_FILE);</a>
+<a name="ln891">		numBlocks /= (fVolume-&gt;BlockSize() / 512);</a>
+<a name="ln892">	} else</a>
+<a name="ln893">		fNode.ClearFlag(EXT2_INODE_HUGE_FILE);</a>
+<a name="ln894"> </a>
+<a name="ln895">	fNode.SetNumBlocks64(numBlocks);</a>
+<a name="ln896">	return B_OK;</a>
+<a name="ln897">}</a>
+<a name="ln898"> </a>
+<a name="ln899"> </a>
+<a name="ln900">void</a>
+<a name="ln901">Inode::IncrementNumLinks(Transaction&amp; transaction)</a>
+<a name="ln902">{</a>
+<a name="ln903">	fNode.SetNumLinks(fNode.NumLinks() + 1);</a>
+<a name="ln904">	if (IsIndexed() &amp;&amp; (fNode.NumLinks() &gt;= EXT2_INODE_MAX_LINKS</a>
+<a name="ln905">		|| fNode.NumLinks() == 2)) {</a>
+<a name="ln906">		fNode.SetNumLinks(1);</a>
+<a name="ln907">		fVolume-&gt;ActivateDirNLink(transaction);</a>
+<a name="ln908">	}</a>
+<a name="ln909">}</a>
+
+</code></pre>
+<div class="balloon" rel="66"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fUnlinked, fHasExtraAttributes, fNode.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

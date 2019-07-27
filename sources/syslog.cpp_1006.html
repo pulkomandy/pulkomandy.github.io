@@ -1,0 +1,370 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>syslog.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2003-2015, Axel Dörfler, axeld@pinc-software.de.</a>
+<a name="ln3"> * Distributed under the terms of the MIT License.</a>
+<a name="ln4"> */</a>
+<a name="ln5"> </a>
+<a name="ln6"> </a>
+<a name="ln7">#include &lt;syslog.h&gt;</a>
+<a name="ln8"> </a>
+<a name="ln9">#include &lt;stdlib.h&gt;</a>
+<a name="ln10">#include &lt;stdio.h&gt;</a>
+<a name="ln11">#include &lt;string.h&gt;</a>
+<a name="ln12">#include &lt;stdarg.h&gt;</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &lt;launch.h&gt;</a>
+<a name="ln15">#include &lt;syslog_daemon.h&gt;</a>
+<a name="ln16">#include &lt;TLS.h&gt;</a>
+<a name="ln17">#include &lt;util/KMessage.h&gt;</a>
+<a name="ln18"> </a>
+<a name="ln19"> </a>
+<a name="ln20">struct syslog_context {</a>
+<a name="ln21">	char	ident[B_OS_NAME_LENGTH];</a>
+<a name="ln22">	int16	mask;</a>
+<a name="ln23">	int16	facility;</a>
+<a name="ln24">	int32	options;</a>
+<a name="ln25">};</a>
+<a name="ln26"> </a>
+<a name="ln27">static syslog_context sTeamContext = {</a>
+<a name="ln28">	&quot;&quot;,</a>
+<a name="ln29">	-1,</a>
+<a name="ln30">	LOG_USER,</a>
+<a name="ln31">	LOG_CONS</a>
+<a name="ln32">};</a>
+<a name="ln33">static int32 sThreadContextSlot = -1;</a>
+<a name="ln34">static port_id sSystemLoggerPort = -1;</a>
+<a name="ln35"> </a>
+<a name="ln36"> </a>
+<a name="ln37">static syslog_context *</a>
+<a name="ln38">allocate_context()</a>
+<a name="ln39">{</a>
+<a name="ln40">	syslog_context *context = (syslog_context *)malloc(sizeof(syslog_context));</a>
+<a name="ln41">	if (context == NULL)</a>
+<a name="ln42">		return NULL;</a>
+<a name="ln43"> </a>
+<a name="ln44">	// inherit the attributes of the team context</a>
+<a name="ln45">	memcpy(context, &amp;sTeamContext, sizeof(syslog_context));</a>
+<a name="ln46">	return context;</a>
+<a name="ln47">}</a>
+<a name="ln48"> </a>
+<a name="ln49"> </a>
+<a name="ln50">/*! This function returns the current syslog context structure.</a>
+<a name="ln51">	If there is none for the current thread, it will create one</a>
+<a name="ln52">	that inherits the context attributes from the team and put it</a>
+<a name="ln53">	into TLS.</a>
+<a name="ln54">	If it could not allocate a thread context, it will return the</a>
+<a name="ln55">	team context; this function is guaranteed to return a valid</a>
+<a name="ln56">	syslog context.</a>
+<a name="ln57">*/</a>
+<a name="ln58">static syslog_context *</a>
+<a name="ln59">get_context()</a>
+<a name="ln60">{</a>
+<a name="ln61">	if (sThreadContextSlot == B_NO_MEMORY)</a>
+<a name="ln62">		return &amp;sTeamContext;</a>
+<a name="ln63"> </a>
+<a name="ln64">	if (sThreadContextSlot &lt; 0) {</a>
+<a name="ln65">		static int32 lock = 0;</a>
+<a name="ln66">		if (atomic_add(&amp;lock, 1) == 0) {</a>
+<a name="ln67">			int32 slot = tls_allocate();</a>
+<a name="ln68"> </a>
+<a name="ln69">			if (slot &lt; 0) {</a>
+<a name="ln70">				sThreadContextSlot = B_NO_MEMORY;</a>
+<a name="ln71">				return &amp;sTeamContext;</a>
+<a name="ln72">			}</a>
+<a name="ln73"> </a>
+<a name="ln74">			sThreadContextSlot = slot;</a>
+<a name="ln75">		} else {</a>
+<a name="ln76">			while (sThreadContextSlot == -1)</a>
+<a name="ln77">				snooze(10000);</a>
+<a name="ln78">		}</a>
+<a name="ln79">	}</a>
+<a name="ln80"> </a>
+<a name="ln81">	syslog_context *context = (syslog_context *)tls_get(sThreadContextSlot);</a>
+<a name="ln82">	if (context == NULL) {</a>
+<a name="ln83">		// try to allocate the context again; it might have</a>
+<a name="ln84">		// been deleted, or there was not enough memory last</a>
+<a name="ln85">		// time</a>
+<a name="ln86">		*tls_address(sThreadContextSlot) = context = allocate_context();</a>
+<a name="ln87">	}</a>
+<a name="ln88">	if (context != NULL)</a>
+<a name="ln89">		return context;</a>
+<a name="ln90"> </a>
+<a name="ln91">	return &amp;sTeamContext;</a>
+<a name="ln92">}</a>
+<a name="ln93"> </a>
+<a name="ln94"> </a>
+<a name="ln95">//! Prints simplified syslog message to stderr.</a>
+<a name="ln96">static void</a>
+<a name="ln97">message_to_console(syslog_context *context, const char *text, va_list args)</a>
+<a name="ln98">{</a>
+<a name="ln99">	if (context-&gt;ident[0])</a>
+<a name="ln100">		fprintf(stderr, &quot;'%s' &quot;, context-&gt;ident);</a>
+<a name="ln101">	if (context-&gt;options &amp; LOG_PID)</a>
+<a name="ln102">		fprintf(stderr, &quot;[%&quot; B_PRId32 &quot;] &quot;, find_thread(NULL));</a>
+<a name="ln103"> </a>
+<a name="ln104">	vfprintf(stderr, text, args);</a>
+<a name="ln105">	fputc('\n', stderr);</a>
+<a name="ln106">}</a>
+<a name="ln107"> </a>
+<a name="ln108"> </a>
+<a name="ln109">/*!	Retrieves the port of the system logger from the launch_daemon.</a>
+<a name="ln110">*/</a>
+<a name="ln111">static port_id</a>
+<a name="ln112">get_system_logger_port()</a>
+<a name="ln113">{</a>
+<a name="ln114">	if (sSystemLoggerPort &gt;= 0)</a>
+<a name="ln115">		return sSystemLoggerPort;</a>
+<a name="ln116"> </a>
+<a name="ln117">	BPrivate::KMessage data;</a>
+<a name="ln118">	if (BPrivate::get_launch_data(B_SYSTEM_LOGGER_SIGNATURE, data) == B_OK)</a>
+<a name="ln119">		sSystemLoggerPort = data.GetInt32(&quot;logger_port&quot;, -1);</a>
+<a name="ln120"> </a>
+<a name="ln121">	return sSystemLoggerPort;</a>
+<a name="ln122">}</a>
+<a name="ln123"> </a>
+<a name="ln124"> </a>
+<a name="ln125">/*!	Creates the message from the given context and sends it to the syslog</a>
+<a name="ln126">	daemon, if the priority mask matches.</a>
+<a name="ln127">	If the message couldn't be delivered, and LOG_CONS was set, it will</a>
+<a name="ln128">	redirect the message to stderr.</a>
+<a name="ln129">*/</a>
+<a name="ln130">static void</a>
+<a name="ln131">send_syslog_message(syslog_context *context, int priority, const char *text,</a>
+<a name="ln132">	va_list args)</a>
+<a name="ln133">{</a>
+<a name="ln134">	int options = context-&gt;options;</a>
+<a name="ln135"> </a>
+<a name="ln136">	// do we have to do anything?</a>
+<a name="ln137">	if ((context-&gt;mask &amp; LOG_MASK(SYSLOG_PRIORITY(priority))) == 0)</a>
+<a name="ln138">		return;</a>
+<a name="ln139"> </a>
+<a name="ln140">	port_id port = get_system_logger_port();</a>
+<a name="ln141">	if ((options &amp; LOG_PERROR) != 0</a>
+<a name="ln142">		|| ((options &amp; LOG_CONS) != 0 &amp;&amp; port &lt; B_OK)) {</a>
+<a name="ln143">		// if asked for, print out the (simplified) message on stderr</a>
+<a name="ln144">		message_to_console(context, text, args);</a>
+<a name="ln145">	}</a>
+<a name="ln146">	if (port &lt; B_OK) {</a>
+<a name="ln147">		// apparently, there is no syslog daemon running;</a>
+<a name="ln148">		return;</a>
+<a name="ln149">	}</a>
+<a name="ln150"> </a>
+<a name="ln151">	// adopt facility from openlog() if not yet set</a>
+<a name="ln152">	if (SYSLOG_FACILITY(priority) == 0)</a>
+<a name="ln153">		priority |= context-&gt;facility;</a>
+<a name="ln154"> </a>
+<a name="ln155">	char buffer[2048];</a>
+<a name="ln156">	syslog_message &amp;message = *(syslog_message *)&amp;buffer[0];</a>
+<a name="ln157"> </a>
+<a name="ln158">	message.from = find_thread(NULL);</a>
+<a name="ln159">	message.when = real_time_clock();</a>
+<a name="ln160">	message.options = options;</a>
+<a name="ln161">	message.priority = priority;</a>
+<a name="ln162">	strcpy(message.ident, context-&gt;ident);</a>
+<a name="ln163"> </a>
+<a name="ln164">	int length = vsnprintf(message.message, sizeof(buffer)</a>
+<a name="ln165">		- sizeof(syslog_message), text, args);</a>
+<a name="ln166">	if (message.message + length - buffer &lt; (int32)sizeof(buffer)) {</a>
+<a name="ln167">		if (length == 0 || message.message[length - 1] != '\n')</a>
+<a name="ln168">			message.message[length++] = '\n';</a>
+<a name="ln169">	} else</a>
+<a name="ln170">		buffer[length - 1] = '\n';</a>
+<a name="ln171"> </a>
+<a name="ln172">	status_t status;</a>
+<a name="ln173">	do {</a>
+<a name="ln174">		// make sure the message gets send (if there is a valid port)</a>
+<a name="ln175">		status = write_port(port, SYSLOG_MESSAGE, &amp;message,</a>
+<a name="ln176">			sizeof(syslog_message) + length);</a>
+<a name="ln177">	} while (status == B_INTERRUPTED);</a>
+<a name="ln178"> </a>
+<a name="ln179">	if (status &lt; B_OK &amp;&amp; (options &amp; LOG_CONS) != 0</a>
+<a name="ln180">		&amp;&amp; (options &amp; LOG_PERROR) == 0) {</a>
+<a name="ln181">		// LOG_CONS redirects all output to the console in case contacting</a>
+<a name="ln182">		// the syslog daemon failed</a>
+<a name="ln183">		message_to_console(context, text, args);</a>
+<a name="ln184">	}</a>
+<a name="ln185">}</a>
+<a name="ln186"> </a>
+<a name="ln187"> </a>
+<a name="ln188">//	#pragma mark - POSIX API</a>
+<a name="ln189"> </a>
+<a name="ln190"> </a>
+<a name="ln191">void</a>
+<a name="ln192">closelog(void)</a>
+<a name="ln193">{</a>
+<a name="ln194">	closelog_thread();</a>
+<a name="ln195">}</a>
+<a name="ln196"> </a>
+<a name="ln197"> </a>
+<a name="ln198">void</a>
+<a name="ln199">openlog(const char *ident, int options, int facility)</a>
+<a name="ln200">{</a>
+<a name="ln201">	openlog_thread(ident, options, facility);</a>
+<a name="ln202">}</a>
+<a name="ln203"> </a>
+<a name="ln204"> </a>
+<a name="ln205">int</a>
+<a name="ln206">setlogmask(int priorityMask)</a>
+<a name="ln207">{</a>
+<a name="ln208">	return setlogmask_thread(priorityMask);</a>
+<a name="ln209">}</a>
+<a name="ln210"> </a>
+<a name="ln211"> </a>
+<a name="ln212">void</a>
+<a name="ln213">syslog(int priority, const char *message, ...)</a>
+<a name="ln214">{</a>
+<a name="ln215">	va_list args;</a>
+<a name="ln216"> </a>
+<a name="ln217">	va_start(args, message);</a>
+<a name="ln218">	send_syslog_message(get_context(), priority, message, args);</a>
+<a name="ln219">	va_end(args);</a>
+<a name="ln220">}</a>
+<a name="ln221"> </a>
+<a name="ln222"> </a>
+<a name="ln223">//	#pragma mark - Be extensions</a>
+<a name="ln224">// ToDo: it would probably be better to export these symbols as weak symbols only</a>
+<a name="ln225"> </a>
+<a name="ln226"> </a>
+<a name="ln227">void</a>
+<a name="ln228">closelog_team(void)</a>
+<a name="ln229">{</a>
+<a name="ln230">	// nothing to do here...</a>
+<a name="ln231">}</a>
+<a name="ln232"> </a>
+<a name="ln233"> </a>
+<a name="ln234">void</a>
+<a name="ln235">openlog_team(const char *ident, int options, int facility)</a>
+<a name="ln236">{</a>
+<a name="ln237">	if (ident != NULL)</a>
+<a name="ln238">		strlcpy(sTeamContext.ident, ident, sizeof(sTeamContext.ident));</a>
+<a name="ln239"> </a>
+<a name="ln240">	sTeamContext.options = options;</a>
+<a name="ln241">	sTeamContext.facility = SYSLOG_FACILITY(facility);</a>
+<a name="ln242">}</a>
+<a name="ln243"> </a>
+<a name="ln244"> </a>
+<a name="ln245">int</a>
+<a name="ln246">setlogmask_team(int priorityMask)</a>
+<a name="ln247">{</a>
+<a name="ln248">	int oldMask = sTeamContext.mask;</a>
+<a name="ln249"> </a>
+<a name="ln250">	if (priorityMask != 0)</a>
+<a name="ln251">		sTeamContext.mask = priorityMask;</a>
+<a name="ln252"> </a>
+<a name="ln253">	return oldMask;</a>
+<a name="ln254">}</a>
+<a name="ln255"> </a>
+<a name="ln256"> </a>
+<a name="ln257">void</a>
+<a name="ln258">log_team(int priority, const char *message, ...)</a>
+<a name="ln259">{</a>
+<a name="ln260">	va_list args;</a>
+<a name="ln261"> </a>
+<a name="ln262">	va_start(args, message);</a>
+<a name="ln263">	send_syslog_message(&amp;sTeamContext, priority, message, args);</a>
+<a name="ln264">	va_end(args);</a>
+<a name="ln265">}</a>
+<a name="ln266"> </a>
+<a name="ln267"> </a>
+<a name="ln268">void</a>
+<a name="ln269">closelog_thread(void)</a>
+<a name="ln270">{</a>
+<a name="ln271">	if (sThreadContextSlot &lt; 0)</a>
+<a name="ln272">		return;</a>
+<a name="ln273"> </a>
+<a name="ln274">	free(tls_get(sThreadContextSlot));</a>
+<a name="ln275">	*tls_address(sThreadContextSlot) = NULL;</a>
+<a name="ln276">}</a>
+<a name="ln277"> </a>
+<a name="ln278"> </a>
+<a name="ln279">void</a>
+<a name="ln280">openlog_thread(const char *ident, int options, int facility)</a>
+<a name="ln281">{</a>
+<a name="ln282">	syslog_context *context = get_context();</a>
+<a name="ln283"> </a>
+<a name="ln284">	if (ident)</a>
+<a name="ln285">		strcpy(context-&gt;ident, ident);</a>
+<a name="ln286"> </a>
+<a name="ln287">	context-&gt;options = options;</a>
+<a name="ln288">	context-&gt;facility = SYSLOG_FACILITY(facility);</a>
+<a name="ln289">}</a>
+<a name="ln290"> </a>
+<a name="ln291"> </a>
+<a name="ln292">int</a>
+<a name="ln293">setlogmask_thread(int priorityMask)</a>
+<a name="ln294">{</a>
+<a name="ln295">	syslog_context *context = get_context();</a>
+<a name="ln296">	int oldMask = context-&gt;mask;</a>
+<a name="ln297"> </a>
+<a name="ln298">	if (priorityMask != 0)</a>
+<a name="ln299">		context-&gt;mask = priorityMask;</a>
+<a name="ln300"> </a>
+<a name="ln301">	return oldMask;</a>
+<a name="ln302">}</a>
+<a name="ln303"> </a>
+<a name="ln304"> </a>
+<a name="ln305">void</a>
+<a name="ln306">log_thread(int priority, const char *message, ...)</a>
+<a name="ln307">{</a>
+<a name="ln308">	va_list args;</a>
+<a name="ln309"> </a>
+<a name="ln310">	va_start(args, message);</a>
+<a name="ln311">	send_syslog_message(get_context(), priority, message, args);</a>
+<a name="ln312">	va_end(args);</a>
+<a name="ln313">}</a>
+<a name="ln314"> </a>
+<a name="ln315"> </a>
+<a name="ln316">//	#pragma mark - BSD extensions</a>
+<a name="ln317"> </a>
+<a name="ln318"> </a>
+<a name="ln319">void</a>
+<a name="ln320">vsyslog(int priority, const char *message, va_list args)</a>
+<a name="ln321">{</a>
+<a name="ln322">	send_syslog_message(get_context(), priority, message, args);</a>
+<a name="ln323">}</a>
+<a name="ln324"> </a>
+
+</code></pre>
+<div class="balloon" rel="164"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v512/" target="_blank">V512</a> A call of the 'vsnprintf' function will lead to overflow of the buffer 'message.message'.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

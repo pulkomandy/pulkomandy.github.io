@@ -1,0 +1,1296 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>ipv6_datagram.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2010, Haiku, Inc. All Rights Reserved.</a>
+<a name="ln3"> * Distributed under the terms of the MIT License.</a>
+<a name="ln4"> *</a>
+<a name="ln5"> * Authors:</a>
+<a name="ln6"> *		Atis Elsts, the.kfx@gmail.com</a>
+<a name="ln7"> */</a>
+<a name="ln8"> </a>
+<a name="ln9"> </a>
+<a name="ln10">#include &lt;net_datalink.h&gt;</a>
+<a name="ln11">#include &lt;net_datalink_protocol.h&gt;</a>
+<a name="ln12">#include &lt;net_device.h&gt;</a>
+<a name="ln13">#include &lt;net_stack.h&gt;</a>
+<a name="ln14">#include &lt;net_protocol.h&gt;</a>
+<a name="ln15">#include &lt;NetBufferUtilities.h&gt;</a>
+<a name="ln16"> </a>
+<a name="ln17">#include &lt;generic_syscall.h&gt;</a>
+<a name="ln18">#include &lt;util/atomic.h&gt;</a>
+<a name="ln19">#include &lt;util/AutoLock.h&gt;</a>
+<a name="ln20">#include &lt;util/DoublyLinkedList.h&gt;</a>
+<a name="ln21">#include &lt;KernelExport.h&gt;</a>
+<a name="ln22"> </a>
+<a name="ln23">#include &lt;netinet/in.h&gt;</a>
+<a name="ln24">#include &lt;netinet6/in6.h&gt;</a>
+<a name="ln25">#include &lt;netinet/icmp6.h&gt;</a>
+<a name="ln26">#include &lt;net/ethernet.h&gt;</a>
+<a name="ln27">#include &lt;net/if.h&gt;</a>
+<a name="ln28">#include &lt;net/if_types.h&gt;</a>
+<a name="ln29">#include &lt;net/if_dl.h&gt;</a>
+<a name="ln30">#include &lt;sys/sockio.h&gt;</a>
+<a name="ln31">#include &lt;new&gt;</a>
+<a name="ln32"> </a>
+<a name="ln33">#include &lt;ipv6/jenkins.h&gt;</a>
+<a name="ln34">#include &lt;ipv6/ipv6_address.h&gt;</a>
+<a name="ln35">#include &quot;ndp.h&quot;</a>
+<a name="ln36"> </a>
+<a name="ln37"> </a>
+<a name="ln38">#define TRACE_NDP</a>
+<a name="ln39">#ifdef TRACE_NDP</a>
+<a name="ln40">#	define TRACE(x) dprintf x</a>
+<a name="ln41">#else</a>
+<a name="ln42">#	define TRACE(x) ;</a>
+<a name="ln43">#endif</a>
+<a name="ln44"> </a>
+<a name="ln45"> </a>
+<a name="ln46">struct ipv6_datalink_protocol : net_datalink_protocol {</a>
+<a name="ln47">	sockaddr_dl	hardware_address;</a>
+<a name="ln48">	in6_addr	local_address;</a>
+<a name="ln49">};</a>
+<a name="ln50"> </a>
+<a name="ln51"> </a>
+<a name="ln52">static void ndp_timer(struct net_timer* timer, void* data);</a>
+<a name="ln53"> </a>
+<a name="ln54"> </a>
+<a name="ln55">net_buffer_module_info* gBufferModule;</a>
+<a name="ln56">static net_stack_module_info* sStackModule;</a>
+<a name="ln57">static net_datalink_module_info* sDatalinkModule;</a>
+<a name="ln58">static net_protocol_module_info* sIPv6Module;</a>
+<a name="ln59">static net_protocol* sIPv6Protocol;</a>
+<a name="ln60">static mutex sCacheLock;</a>
+<a name="ln61">static const net_buffer* kDeletedBuffer = (net_buffer*)~0;</a>
+<a name="ln62"> </a>
+<a name="ln63">// needed for IN6_IS_ADDR_UNSPECIFIED() macro</a>
+<a name="ln64">const struct in6_addr in6addr_any = IN6ADDR_ANY_INIT;</a>
+<a name="ln65"> </a>
+<a name="ln66">//	#pragma mark -</a>
+<a name="ln67"> </a>
+<a name="ln68"> </a>
+<a name="ln69">struct neighbor_discovery_header {</a>
+<a name="ln70">	uint8		icmp6_type;</a>
+<a name="ln71">	uint8		icmp6_code;</a>
+<a name="ln72">	uint16		icmp6_checksum;</a>
+<a name="ln73">	uint32		flags;</a>
+<a name="ln74">	in6_addr	target_address;</a>
+<a name="ln75"> </a>
+<a name="ln76">	// This part is specific for Ethernet;</a>
+<a name="ln77">	// also, theoretically there could be more than one option.</a>
+<a name="ln78">	uint8		option_type;</a>
+<a name="ln79">	uint8		option_length;</a>
+<a name="ln80">	uint8		link_address[ETHER_ADDRESS_LENGTH];</a>
+<a name="ln81">} _PACKED;</a>
+<a name="ln82"> </a>
+<a name="ln83">struct router_advertisement_header {</a>
+<a name="ln84">	uint8		icmp6_type;</a>
+<a name="ln85">	uint8		icmp6_code;</a>
+<a name="ln86">	uint16		icmp6_checksum;</a>
+<a name="ln87">	uint8		hop_limit;</a>
+<a name="ln88">	uint8		flags;</a>
+<a name="ln89">	uint16		router_lifetime;</a>
+<a name="ln90">	uint32		reachable_time;</a>
+<a name="ln91">	uint32		retransmit_timer;</a>
+<a name="ln92">	uint8		options[0];</a>
+<a name="ln93">} _PACKED;</a>
+<a name="ln94"> </a>
+<a name="ln95"> </a>
+<a name="ln96">struct ndp_entry {</a>
+<a name="ln97">	ndp_entry*	next;</a>
+<a name="ln98">	in6_addr	protocol_address;</a>
+<a name="ln99">	sockaddr_dl	hardware_address;</a>
+<a name="ln100">	uint32		flags;</a>
+<a name="ln101">	net_buffer*	request_buffer;</a>
+<a name="ln102">	net_timer	timer;</a>
+<a name="ln103">	uint32		timer_state;</a>
+<a name="ln104">	bigtime_t	timestamp;</a>
+<a name="ln105">	net_datalink_protocol* protocol;</a>
+<a name="ln106"> </a>
+<a name="ln107">	typedef DoublyLinkedListCLink&lt;net_buffer&gt; NetBufferLink;</a>
+<a name="ln108">	typedef DoublyLinkedList&lt;net_buffer, NetBufferLink&gt; BufferList;</a>
+<a name="ln109"> </a>
+<a name="ln110">	BufferList  queue;</a>
+<a name="ln111"> </a>
+<a name="ln112">	static ndp_entry* Lookup(const in6_addr&amp; protocolAddress);</a>
+<a name="ln113">	static ndp_entry* Add(const in6_addr&amp; protocolAddress,</a>
+<a name="ln114">		sockaddr_dl* hardwareAddress, uint32 flags);</a>
+<a name="ln115"> </a>
+<a name="ln116">	~ndp_entry();</a>
+<a name="ln117"> </a>
+<a name="ln118">	void ClearQueue();</a>
+<a name="ln119">	void MarkFailed();</a>
+<a name="ln120">	void MarkValid();</a>
+<a name="ln121">	void ScheduleRemoval();</a>
+<a name="ln122">};</a>
+<a name="ln123"> </a>
+<a name="ln124"> </a>
+<a name="ln125">struct ndpHash {</a>
+<a name="ln126">	typedef in6_addr KeyType;</a>
+<a name="ln127">	typedef ndp_entry ValueType;</a>
+<a name="ln128"> </a>
+<a name="ln129">	size_t HashKey(in6_addr key) const</a>
+<a name="ln130">	{</a>
+<a name="ln131">		return jenkins_hashword((const uint32*)&amp;(key),</a>
+<a name="ln132">			sizeof(in6_addr) / sizeof(uint32), 0);</a>
+<a name="ln133">	}</a>
+<a name="ln134"> </a>
+<a name="ln135">	size_t Hash(ndp_entry* value) const</a>
+<a name="ln136">	{</a>
+<a name="ln137">		return HashKey(value-&gt;protocol_address);</a>
+<a name="ln138">	}</a>
+<a name="ln139"> </a>
+<a name="ln140">	bool Compare(in6_addr key, ndp_entry* value) const</a>
+<a name="ln141">	{</a>
+<a name="ln142">		return value-&gt;protocol_address == key;</a>
+<a name="ln143">	}</a>
+<a name="ln144"> </a>
+<a name="ln145">	ndp_entry*&amp; GetLink(ndp_entry* value) const</a>
+<a name="ln146">	{</a>
+<a name="ln147">		return value-&gt;next;</a>
+<a name="ln148">	}</a>
+<a name="ln149">};</a>
+<a name="ln150"> </a>
+<a name="ln151"> </a>
+<a name="ln152">typedef BOpenHashTable&lt;ndpHash&gt; AddressCache;</a>
+<a name="ln153">static AddressCache* sCache;</a>
+<a name="ln154"> </a>
+<a name="ln155"> </a>
+<a name="ln156">#define NDP_FLAG_LOCAL		0x01</a>
+<a name="ln157">#define NDP_FLAG_REJECT		0x02</a>
+<a name="ln158">#define NDP_FLAG_PERMANENT	0x04</a>
+<a name="ln159">#define NDP_FLAG_PUBLISH	0x08</a>
+<a name="ln160">#define NDP_FLAG_VALID		0x10</a>
+<a name="ln161"> </a>
+<a name="ln162">#define NDP_FLAG_REMOVED			0x00010000</a>
+<a name="ln163">#define NDP_PUBLIC_FLAG_MASK		0x0000ffff</a>
+<a name="ln164"> </a>
+<a name="ln165">#define NDP_NO_STATE				0</a>
+<a name="ln166">#define NDP_STATE_REQUEST			1</a>
+<a name="ln167">#define NDP_STATE_LAST_REQUEST		5</a>
+<a name="ln168">#define NDP_STATE_REQUEST_FAILED	6</a>
+<a name="ln169">#define NDP_STATE_REMOVE_FAILED		7</a>
+<a name="ln170">#define NDP_STATE_STALE				8</a>
+<a name="ln171"> </a>
+<a name="ln172">#define NDP_STALE_TIMEOUT	30 * 60000000LL		// 30 minutes</a>
+<a name="ln173">#define NDP_REJECT_TIMEOUT	20000000LL			// 20 seconds</a>
+<a name="ln174">#define NDP_REQUEST_TIMEOUT	1000000LL			// 1 second</a>
+<a name="ln175"> </a>
+<a name="ln176"> </a>
+<a name="ln177">//	#pragma mark -</a>
+<a name="ln178"> </a>
+<a name="ln179"> </a>
+<a name="ln180">static void</a>
+<a name="ln181">ipv6_to_ether_multicast(sockaddr_dl* destination, const sockaddr_in6* source)</a>
+<a name="ln182">{</a>
+<a name="ln183">	// To send an IPv6 multicast packet over Ethernet,</a>
+<a name="ln184">	// take the last 32 bits of the destination IPv6 address,</a>
+<a name="ln185">	// prepend 33-33- and use that as the destination Ethernet address.</a>
+<a name="ln186"> </a>
+<a name="ln187">	destination-&gt;sdl_len = sizeof(sockaddr_dl);</a>
+<a name="ln188">	destination-&gt;sdl_family = AF_LINK;</a>
+<a name="ln189">	destination-&gt;sdl_index = 0;</a>
+<a name="ln190">	destination-&gt;sdl_type = IFT_ETHER;</a>
+<a name="ln191">	destination-&gt;sdl_e_type = htons(ETHER_TYPE_IPV6);</a>
+<a name="ln192">	destination-&gt;sdl_nlen = destination-&gt;sdl_slen = 0;</a>
+<a name="ln193">	destination-&gt;sdl_alen = ETHER_ADDRESS_LENGTH;</a>
+<a name="ln194"> </a>
+<a name="ln195">	destination-&gt;sdl_data[0] = 0x33;</a>
+<a name="ln196">	destination-&gt;sdl_data[1] = 0x33;</a>
+<a name="ln197">	memcpy(&amp;destination-&gt;sdl_data[2], &amp;source-&gt;sin6_addr.s6_addr[12], 4);</a>
+<a name="ln198">}</a>
+<a name="ln199"> </a>
+<a name="ln200"> </a>
+<a name="ln201">static inline sockaddr*</a>
+<a name="ln202">ipv6_to_sockaddr(sockaddr_in6* target, const in6_addr&amp; address)</a>
+<a name="ln203">{</a>
+<a name="ln204">	target-&gt;sin6_family = AF_INET6;</a>
+<a name="ln205">	target-&gt;sin6_len = sizeof(sockaddr_in6);</a>
+<a name="ln206">	target-&gt;sin6_port = 0;</a>
+<a name="ln207">	target-&gt;sin6_flowinfo = 0;</a>
+<a name="ln208">	target-&gt;sin6_scope_id = 0;</a>
+<a name="ln209">	memcpy(target-&gt;sin6_addr.s6_addr, address.s6_addr, sizeof(in6_addr));</a>
+<a name="ln210">	return (sockaddr*)target;</a>
+<a name="ln211">}</a>
+<a name="ln212"> </a>
+<a name="ln213"> </a>
+<a name="ln214">static inline sockaddr*</a>
+<a name="ln215">ipv6_to_solicited_multicast(sockaddr_in6* target, const in6_addr&amp; address)</a>
+<a name="ln216">{</a>
+<a name="ln217">	// The solicited-node multicast address for a given unicast address</a>
+<a name="ln218">	// is constructed by taking the last three octets of the unicast address</a>
+<a name="ln219">	// and prepending FF02::1:FF00:0000/104.</a>
+<a name="ln220"> </a>
+<a name="ln221">	target-&gt;sin6_family = AF_INET6;</a>
+<a name="ln222">	target-&gt;sin6_len = sizeof(sockaddr_in6);</a>
+<a name="ln223">	target-&gt;sin6_port = 0;</a>
+<a name="ln224">	target-&gt;sin6_flowinfo = 0;</a>
+<a name="ln225">	target-&gt;sin6_scope_id = 0;</a>
+<a name="ln226"> </a>
+<a name="ln227">	uint8* targetIPv6 = target-&gt;sin6_addr.s6_addr;</a>
+<a name="ln228">	memset(targetIPv6, 0, sizeof(in6_addr));</a>
+<a name="ln229">	targetIPv6[0] = 0xff;</a>
+<a name="ln230">	targetIPv6[1] = 0x02;</a>
+<a name="ln231">	targetIPv6[11] = 0x01;</a>
+<a name="ln232">	targetIPv6[12] = 0xff;</a>
+<a name="ln233"> 	memcpy(&amp;targetIPv6[13], &amp;address.s6_addr[13], 3);</a>
+<a name="ln234"> </a>
+<a name="ln235">	return (sockaddr*)target;</a>
+<a name="ln236">}</a>
+<a name="ln237"> </a>
+<a name="ln238"> </a>
+<a name="ln239">//	#pragma mark -</a>
+<a name="ln240"> </a>
+<a name="ln241"> </a>
+<a name="ln242">static net_buffer*</a>
+<a name="ln243">get_request_buffer(ndp_entry* entry)</a>
+<a name="ln244">{</a>
+<a name="ln245">	net_buffer* buffer = entry-&gt;request_buffer;</a>
+<a name="ln246">	if (buffer == NULL || buffer == kDeletedBuffer)</a>
+<a name="ln247">		return NULL;</a>
+<a name="ln248"> </a>
+<a name="ln249">	buffer = atomic_pointer_test_and_set(&amp;entry-&gt;request_buffer,</a>
+<a name="ln250">		(net_buffer*)NULL, buffer);</a>
+<a name="ln251">	if (buffer == kDeletedBuffer)</a>
+<a name="ln252">		return NULL;</a>
+<a name="ln253"> </a>
+<a name="ln254">	return buffer;</a>
+<a name="ln255">}</a>
+<a name="ln256"> </a>
+<a name="ln257"> </a>
+<a name="ln258">static void</a>
+<a name="ln259">put_request_buffer(ndp_entry* entry, net_buffer* buffer)</a>
+<a name="ln260">{</a>
+<a name="ln261">	net_buffer* requestBuffer = atomic_pointer_test_and_set(</a>
+<a name="ln262">		&amp;entry-&gt;request_buffer, buffer, (net_buffer*)NULL);</a>
+<a name="ln263">	if (requestBuffer != NULL) {</a>
+<a name="ln264">		// someone else took over ownership of the request buffer</a>
+<a name="ln265">		gBufferModule-&gt;free(buffer);</a>
+<a name="ln266">	}</a>
+<a name="ln267">}</a>
+<a name="ln268"> </a>
+<a name="ln269"> </a>
+<a name="ln270">static void</a>
+<a name="ln271">delete_request_buffer(ndp_entry* entry)</a>
+<a name="ln272">{</a>
+<a name="ln273">	net_buffer* buffer = atomic_pointer_get_and_set(&amp;entry-&gt;request_buffer,</a>
+<a name="ln274">		kDeletedBuffer);</a>
+<a name="ln275">	if (buffer != NULL &amp;&amp; buffer != kDeletedBuffer)</a>
+<a name="ln276">		gBufferModule-&gt;free(buffer);</a>
+<a name="ln277">}</a>
+<a name="ln278"> </a>
+<a name="ln279"> </a>
+<a name="ln280">ndp_entry*</a>
+<a name="ln281">ndp_entry::Lookup(const in6_addr&amp; address)</a>
+<a name="ln282">{</a>
+<a name="ln283">	return sCache-&gt;Lookup(address);</a>
+<a name="ln284">}</a>
+<a name="ln285"> </a>
+<a name="ln286"> </a>
+<a name="ln287">ndp_entry*</a>
+<a name="ln288">ndp_entry::Add(const in6_addr&amp; protocolAddress, sockaddr_dl* hardwareAddress,</a>
+<a name="ln289">	uint32 flags)</a>
+<a name="ln290">{</a>
+<a name="ln291">	ASSERT_LOCKED_MUTEX(&amp;sCacheLock);</a>
+<a name="ln292"> </a>
+<a name="ln293">	ndp_entry* entry = new (std::nothrow) ndp_entry;</a>
+<a name="ln294">	if (entry == NULL)</a>
+<a name="ln295">		return NULL;</a>
+<a name="ln296"> </a>
+<a name="ln297">	entry-&gt;protocol_address = protocolAddress;</a>
+<a name="ln298">	entry-&gt;flags = flags;</a>
+<a name="ln299">	entry-&gt;timestamp = system_time();</a>
+<a name="ln300">	entry-&gt;protocol = NULL;</a>
+<a name="ln301">	entry-&gt;request_buffer = NULL;</a>
+<a name="ln302">	entry-&gt;timer_state = NDP_NO_STATE;</a>
+<a name="ln303">	sStackModule-&gt;init_timer(&amp;entry-&gt;timer, ndp_timer, entry);</a>
+<a name="ln304"> </a>
+<a name="ln305">	if (hardwareAddress != NULL) {</a>
+<a name="ln306">		// this entry is already resolved</a>
+<a name="ln307">		entry-&gt;hardware_address = *hardwareAddress;</a>
+<a name="ln308">		entry-&gt;hardware_address.sdl_e_type = htons(ETHER_TYPE_IPV6);</a>
+<a name="ln309">	} else {</a>
+<a name="ln310">		// this entry still needs to be resolved</a>
+<a name="ln311">		entry-&gt;hardware_address.sdl_alen = 0;</a>
+<a name="ln312">	}</a>
+<a name="ln313">	if (entry-&gt;hardware_address.sdl_len != sizeof(sockaddr_dl)) {</a>
+<a name="ln314">		// explicitly set correct length in case our caller hasn't...</a>
+<a name="ln315">		entry-&gt;hardware_address.sdl_len = sizeof(sockaddr_dl);</a>
+<a name="ln316">	}</a>
+<a name="ln317"> </a>
+<a name="ln318">	if (sCache-&gt;Insert(entry) != B_OK) {</a>
+<a name="ln319">		// We can delete the entry here with the sCacheLock held, since it's</a>
+<a name="ln320">		// guaranteed there are no timers pending.</a>
+<a name="ln321">		delete entry;</a>
+<a name="ln322">		return NULL;</a>
+<a name="ln323">	}</a>
+<a name="ln324"> </a>
+<a name="ln325">	return entry;</a>
+<a name="ln326">}</a>
+<a name="ln327"> </a>
+<a name="ln328"> </a>
+<a name="ln329">ndp_entry::~ndp_entry()</a>
+<a name="ln330">{</a>
+<a name="ln331">	// make sure there is no active timer left for us</a>
+<a name="ln332">	sStackModule-&gt;cancel_timer(&amp;timer);</a>
+<a name="ln333">	sStackModule-&gt;wait_for_timer(&amp;timer);</a>
+<a name="ln334"> </a>
+<a name="ln335">	ClearQueue();</a>
+<a name="ln336">}</a>
+<a name="ln337"> </a>
+<a name="ln338"> </a>
+<a name="ln339">void</a>
+<a name="ln340">ndp_entry::ClearQueue()</a>
+<a name="ln341">{</a>
+<a name="ln342">	BufferList::Iterator iterator = queue.GetIterator();</a>
+<a name="ln343">	while (iterator.HasNext()) {</a>
+<a name="ln344">		net_buffer* buffer = iterator.Next();</a>
+<a name="ln345">		iterator.Remove();</a>
+<a name="ln346">		gBufferModule-&gt;free(buffer);</a>
+<a name="ln347">	}</a>
+<a name="ln348">}</a>
+<a name="ln349"> </a>
+<a name="ln350"> </a>
+<a name="ln351">void</a>
+<a name="ln352">ndp_entry::MarkFailed()</a>
+<a name="ln353">{</a>
+<a name="ln354">	TRACE((&quot;NDP entry %p Marked as FAILED\n&quot;, this));</a>
+<a name="ln355"> </a>
+<a name="ln356">	flags = (flags &amp; ~NDP_FLAG_VALID) | NDP_FLAG_REJECT;</a>
+<a name="ln357">	ClearQueue();</a>
+<a name="ln358">}</a>
+<a name="ln359"> </a>
+<a name="ln360"> </a>
+<a name="ln361">void</a>
+<a name="ln362">ndp_entry::MarkValid()</a>
+<a name="ln363">{</a>
+<a name="ln364">	TRACE((&quot;NDP entry %p Marked as VALID\n&quot;, this));</a>
+<a name="ln365"> </a>
+<a name="ln366">	flags = (flags &amp; ~NDP_FLAG_REJECT) | NDP_FLAG_VALID;</a>
+<a name="ln367"> </a>
+<a name="ln368">	BufferList::Iterator iterator = queue.GetIterator();</a>
+<a name="ln369">	while (iterator.HasNext()) {</a>
+<a name="ln370">		net_buffer* buffer = iterator.Next();</a>
+<a name="ln371">		iterator.Remove();</a>
+<a name="ln372"> </a>
+<a name="ln373">		TRACE((&quot;  NDP Dequeing packet %p...\n&quot;, buffer));</a>
+<a name="ln374"> </a>
+<a name="ln375">		memcpy(buffer-&gt;destination, &amp;hardware_address,</a>
+<a name="ln376">			hardware_address.sdl_len);</a>
+<a name="ln377">		protocol-&gt;next-&gt;module-&gt;send_data(protocol-&gt;next, buffer);</a>
+<a name="ln378">	}</a>
+<a name="ln379">}</a>
+<a name="ln380"> </a>
+<a name="ln381"> </a>
+<a name="ln382">void</a>
+<a name="ln383">ndp_entry::ScheduleRemoval()</a>
+<a name="ln384">{</a>
+<a name="ln385">	// schedule a timer to remove this entry</a>
+<a name="ln386">	timer_state = NDP_STATE_REMOVE_FAILED;</a>
+<a name="ln387">	sStackModule-&gt;set_timer(&amp;timer, 0);</a>
+<a name="ln388">}</a>
+<a name="ln389"> </a>
+<a name="ln390"> </a>
+<a name="ln391">//	#pragma mark -</a>
+<a name="ln392"> </a>
+<a name="ln393"> </a>
+<a name="ln394">static status_t</a>
+<a name="ln395">ndp_init()</a>
+<a name="ln396">{</a>
+<a name="ln397">	sIPv6Protocol = sIPv6Module-&gt;init_protocol(NULL);</a>
+<a name="ln398">	if (sIPv6Protocol == NULL)</a>
+<a name="ln399">		return B_NO_MEMORY;</a>
+<a name="ln400">	sIPv6Protocol-&gt;module = sIPv6Module;</a>
+<a name="ln401">	sIPv6Protocol-&gt;socket = NULL;</a>
+<a name="ln402">	sIPv6Protocol-&gt;next = NULL;</a>
+<a name="ln403"> </a>
+<a name="ln404">	int value = 255;</a>
+<a name="ln405">	sIPv6Module-&gt;setsockopt(sIPv6Protocol, IPPROTO_IPV6, IPV6_MULTICAST_HOPS,</a>
+<a name="ln406">		&amp;value, sizeof(value));</a>
+<a name="ln407"> </a>
+<a name="ln408">	mutex_init(&amp;sCacheLock, &quot;ndp cache&quot;);</a>
+<a name="ln409"> </a>
+<a name="ln410">	sCache = new(std::nothrow) AddressCache();</a>
+<a name="ln411">	if (sCache == NULL || sCache-&gt;Init(64) != B_OK) {</a>
+<a name="ln412">		mutex_destroy(&amp;sCacheLock);</a>
+<a name="ln413">		return B_NO_MEMORY;</a>
+<a name="ln414">	}</a>
+<a name="ln415"> </a>
+<a name="ln416">	return B_OK;</a>
+<a name="ln417">}</a>
+<a name="ln418"> </a>
+<a name="ln419"> </a>
+<a name="ln420">static status_t</a>
+<a name="ln421">ndp_uninit()</a>
+<a name="ln422">{</a>
+<a name="ln423">	if (sIPv6Protocol)</a>
+<a name="ln424">		sIPv6Module-&gt;uninit_protocol(sIPv6Protocol);</a>
+<a name="ln425"> </a>
+<a name="ln426">	return B_OK;</a>
+<a name="ln427">}</a>
+<a name="ln428"> </a>
+<a name="ln429"> </a>
+<a name="ln430">//	#pragma mark -</a>
+<a name="ln431"> </a>
+<a name="ln432"> </a>
+<a name="ln433">/*!	Updates the entry determined by \a protocolAddress with the specified</a>
+<a name="ln434">	\a hardwareAddress.</a>
+<a name="ln435">	If such an entry does not exist yet, a new entry is added. If you try</a>
+<a name="ln436">	to update a local existing entry but didn't ask for it (by setting</a>
+<a name="ln437">	\a flags to NDP_FLAG_LOCAL), an error is returned.</a>
+<a name="ln438"> </a>
+<a name="ln439">	This function does not lock the cache - you have to do it yourself</a>
+<a name="ln440">	before calling it.</a>
+<a name="ln441">*/</a>
+<a name="ln442">status_t</a>
+<a name="ln443">ndp_update_entry(const in6_addr&amp; protocolAddress, sockaddr_dl* hardwareAddress,</a>
+<a name="ln444">	uint32 flags, ndp_entry** _entry = NULL)</a>
+<a name="ln445">{</a>
+<a name="ln446">	ASSERT_LOCKED_MUTEX(&amp;sCacheLock);</a>
+<a name="ln447"> </a>
+<a name="ln448">	ndp_entry* entry = ndp_entry::Lookup(protocolAddress);</a>
+<a name="ln449">	if (entry != NULL) {</a>
+<a name="ln450">		// We disallow updating of entries that had been resolved before,</a>
+<a name="ln451">		// but to a different address (only for those that belong to a</a>
+<a name="ln452">		// specific address - redefining INADDR_ANY is always allowed).</a>
+<a name="ln453">		// Right now, you have to manually purge the NDP entries (or wait some</a>
+<a name="ln454">		// time) to let us switch to the new address.</a>
+<a name="ln455">		if (!IN6_IS_ADDR_UNSPECIFIED(&amp;protocolAddress)</a>
+<a name="ln456">			&amp;&amp; entry-&gt;hardware_address.sdl_alen != 0</a>
+<a name="ln457">			&amp;&amp; memcmp(LLADDR(&amp;entry-&gt;hardware_address),</a>
+<a name="ln458">				LLADDR(hardwareAddress), ETHER_ADDRESS_LENGTH)) {</a>
+<a name="ln459">			// TODO: also printf the address</a>
+<a name="ln460">			dprintf(&quot;NDP host updated with different hardware address &quot;</a>
+<a name="ln461">				&quot;%02x:%02x:%02x:%02x:%02x:%02x.\n&quot;,</a>
+<a name="ln462">				hardwareAddress-&gt;sdl_data[0], hardwareAddress-&gt;sdl_data[1],</a>
+<a name="ln463">				hardwareAddress-&gt;sdl_data[2], hardwareAddress-&gt;sdl_data[3],</a>
+<a name="ln464">				hardwareAddress-&gt;sdl_data[4], hardwareAddress-&gt;sdl_data[5]);</a>
+<a name="ln465">			return B_ERROR;</a>
+<a name="ln466">		}</a>
+<a name="ln467"> </a>
+<a name="ln468">		entry-&gt;hardware_address = *hardwareAddress;</a>
+<a name="ln469">		entry-&gt;timestamp = system_time();</a>
+<a name="ln470">	} else {</a>
+<a name="ln471">		entry = ndp_entry::Add(protocolAddress, hardwareAddress, flags);</a>
+<a name="ln472">		if (entry == NULL)</a>
+<a name="ln473">			return B_NO_MEMORY;</a>
+<a name="ln474">	}</a>
+<a name="ln475"> </a>
+<a name="ln476">	delete_request_buffer(entry);</a>
+<a name="ln477"> </a>
+<a name="ln478">	if ((entry-&gt;flags &amp; NDP_FLAG_PERMANENT) == 0) {</a>
+<a name="ln479">		// (re)start the stale timer</a>
+<a name="ln480">		entry-&gt;timer_state = NDP_STATE_STALE;</a>
+<a name="ln481">		sStackModule-&gt;set_timer(&amp;entry-&gt;timer, NDP_STALE_TIMEOUT);</a>
+<a name="ln482">	}</a>
+<a name="ln483"> </a>
+<a name="ln484">	if ((entry-&gt;flags &amp; NDP_FLAG_REJECT) != 0)</a>
+<a name="ln485">		entry-&gt;MarkFailed();</a>
+<a name="ln486">	else</a>
+<a name="ln487">		entry-&gt;MarkValid();</a>
+<a name="ln488"> </a>
+<a name="ln489">	if (_entry)</a>
+<a name="ln490">		*_entry = entry;</a>
+<a name="ln491"> </a>
+<a name="ln492">	return B_OK;</a>
+<a name="ln493">}</a>
+<a name="ln494"> </a>
+<a name="ln495"> </a>
+<a name="ln496">static void</a>
+<a name="ln497">ndp_remove_local_entry(ipv6_datalink_protocol* protocol, const sockaddr* local,</a>
+<a name="ln498">	bool updateLocalAddress)</a>
+<a name="ln499">{</a>
+<a name="ln500">	in6_addr inetAddress;</a>
+<a name="ln501"> </a>
+<a name="ln502">	if (local == NULL) {</a>
+<a name="ln503">		// interface has not yet been set</a>
+<a name="ln504">		memset(&amp;inetAddress, 0, sizeof(in6_addr));</a>
+<a name="ln505">	} else {</a>
+<a name="ln506">		memcpy(&amp;inetAddress, &amp;((sockaddr_in6*)local)-&gt;sin6_addr,</a>
+<a name="ln507">			sizeof(in6_addr));</a>
+<a name="ln508"> </a>
+<a name="ln509">		// leave the NS multicast address</a>
+<a name="ln510">		sockaddr_in6 multicast;</a>
+<a name="ln511">		ipv6_to_solicited_multicast(&amp;multicast, inetAddress);</a>
+<a name="ln512"> </a>
+<a name="ln513">		struct ipv6_mreq mreq;</a>
+<a name="ln514">		memcpy(&amp;mreq.ipv6mr_multiaddr, &amp;multicast.sin6_addr, sizeof(in6_addr));</a>
+<a name="ln515">		mreq.ipv6mr_interface = protocol-&gt;interface-&gt;index;</a>
+<a name="ln516"> </a>
+<a name="ln517">		if (sIPv6Protocol != NULL) {</a>
+<a name="ln518">			sIPv6Module-&gt;setsockopt(sIPv6Protocol, IPPROTO_IPV6,</a>
+<a name="ln519">				IPV6_LEAVE_GROUP, &amp;mreq, sizeof(mreq));</a>
+<a name="ln520">		}</a>
+<a name="ln521">	}</a>
+<a name="ln522"> </a>
+<a name="ln523">	// TRACE((&quot;%s(): address %s\n&quot;, __FUNCTION__, inet6_to_string(inetAddress)));</a>
+<a name="ln524"> </a>
+<a name="ln525">	MutexLocker locker(sCacheLock);</a>
+<a name="ln526"> </a>
+<a name="ln527">	ndp_entry* entry = ndp_entry::Lookup(inetAddress);</a>
+<a name="ln528">	if (entry != NULL) {</a>
+<a name="ln529">		sCache-&gt;Remove(entry);</a>
+<a name="ln530">		entry-&gt;flags |= NDP_FLAG_REMOVED;</a>
+<a name="ln531">	}</a>
+<a name="ln532"> </a>
+<a name="ln533">	if (updateLocalAddress &amp;&amp; protocol-&gt;local_address == inetAddress) {</a>
+<a name="ln534">		// find new local sender address</a>
+<a name="ln535">		memset(&amp;protocol-&gt;local_address, 0, sizeof(in6_addr));</a>
+<a name="ln536"> </a>
+<a name="ln537">		net_interface_address* address = NULL;</a>
+<a name="ln538">		while (sDatalinkModule-&gt;get_next_interface_address(protocol-&gt;interface,</a>
+<a name="ln539">				&amp;address)) {</a>
+<a name="ln540">			if (address-&gt;local == NULL || address-&gt;local-&gt;sa_family != AF_INET6)</a>
+<a name="ln541">				continue;</a>
+<a name="ln542"> </a>
+<a name="ln543">			memcpy(&amp;protocol-&gt;local_address,</a>
+<a name="ln544">				&amp;((sockaddr_in6*)address-&gt;local)-&gt;sin6_addr, sizeof(in6_addr));</a>
+<a name="ln545">		}</a>
+<a name="ln546">	}</a>
+<a name="ln547"> </a>
+<a name="ln548">	locker.Unlock();</a>
+<a name="ln549">	delete entry;</a>
+<a name="ln550">}</a>
+<a name="ln551"> </a>
+<a name="ln552"> </a>
+<a name="ln553">/*!	Removes all entries belonging to the local interface of the \a procotol</a>
+<a name="ln554">	given.</a>
+<a name="ln555">*/</a>
+<a name="ln556">static void</a>
+<a name="ln557">ndp_remove_local(ipv6_datalink_protocol* protocol)</a>
+<a name="ln558">{</a>
+<a name="ln559">	net_interface_address* address = NULL;</a>
+<a name="ln560">	while (sDatalinkModule-&gt;get_next_interface_address(protocol-&gt;interface,</a>
+<a name="ln561">			&amp;address)) {</a>
+<a name="ln562">		if (address-&gt;local == NULL || address-&gt;local-&gt;sa_family != AF_INET6)</a>
+<a name="ln563">			continue;</a>
+<a name="ln564"> </a>
+<a name="ln565">		ndp_remove_local_entry(protocol, address-&gt;local, false);</a>
+<a name="ln566">	}</a>
+<a name="ln567">}</a>
+<a name="ln568"> </a>
+<a name="ln569"> </a>
+<a name="ln570">static status_t</a>
+<a name="ln571">ndp_set_local_entry(ipv6_datalink_protocol* protocol, const sockaddr* local)</a>
+<a name="ln572">{</a>
+<a name="ln573">	MutexLocker locker(sCacheLock);</a>
+<a name="ln574"> </a>
+<a name="ln575">	net_interface* interface = protocol-&gt;interface;</a>
+<a name="ln576">	in6_addr inetAddress;</a>
+<a name="ln577"> </a>
+<a name="ln578">	if (local == NULL) {</a>
+<a name="ln579">		// interface has not yet been set</a>
+<a name="ln580">		memset(&amp;inetAddress, 0, sizeof(in6_addr));</a>
+<a name="ln581">	} else {</a>
+<a name="ln582">		memcpy(&amp;inetAddress,</a>
+<a name="ln583">			&amp;((sockaddr_in6*)local)-&gt;sin6_addr,</a>
+<a name="ln584">			sizeof(in6_addr));</a>
+<a name="ln585"> </a>
+<a name="ln586">		// join multicast address for listening to NS packets</a>
+<a name="ln587">		sockaddr_in6 multicast;</a>
+<a name="ln588">		ipv6_to_solicited_multicast(&amp;multicast, inetAddress);</a>
+<a name="ln589"> </a>
+<a name="ln590">		struct ipv6_mreq mreq;</a>
+<a name="ln591">		memcpy(&amp;mreq.ipv6mr_multiaddr, &amp;multicast.sin6_addr, sizeof(in6_addr));</a>
+<a name="ln592">		mreq.ipv6mr_interface = protocol-&gt;interface-&gt;index;</a>
+<a name="ln593"> </a>
+<a name="ln594">		if (sIPv6Protocol != NULL) {</a>
+<a name="ln595">			sIPv6Module-&gt;setsockopt(sIPv6Protocol, IPPROTO_IPV6,</a>
+<a name="ln596">				IPV6_JOIN_GROUP, &amp;mreq, sizeof(mreq));</a>
+<a name="ln597">		}</a>
+<a name="ln598">	}</a>
+<a name="ln599"> </a>
+<a name="ln600">	// TRACE((&quot;%s(): address %s\n&quot;, __FUNCTION__, inet6_to_string(inetAddress)));</a>
+<a name="ln601"> </a>
+<a name="ln602">	if (IN6_IS_ADDR_UNSPECIFIED(&amp;protocol-&gt;local_address))</a>
+<a name="ln603">		memcpy(&amp;protocol-&gt;local_address, &amp;inetAddress, sizeof(in6_addr));</a>
+<a name="ln604"> </a>
+<a name="ln605">	sockaddr_dl address;</a>
+<a name="ln606">	address.sdl_len = sizeof(sockaddr_dl);</a>
+<a name="ln607">	address.sdl_family = AF_LINK;</a>
+<a name="ln608">	address.sdl_type = IFT_ETHER;</a>
+<a name="ln609">	address.sdl_e_type = htons(ETHER_TYPE_IPV6);</a>
+<a name="ln610">	address.sdl_nlen = 0;</a>
+<a name="ln611">	address.sdl_slen = 0;</a>
+<a name="ln612">	address.sdl_alen = interface-&gt;device-&gt;address.length;</a>
+<a name="ln613">	memcpy(LLADDR(&amp;address), interface-&gt;device-&gt;address.data, address.sdl_alen);</a>
+<a name="ln614"> </a>
+<a name="ln615">	memcpy(&amp;protocol-&gt;hardware_address, &amp;address, sizeof(sockaddr_dl));</a>
+<a name="ln616">		// cache the address in our protocol</a>
+<a name="ln617"> </a>
+<a name="ln618">	ndp_entry* entry;</a>
+<a name="ln619">	status_t status = ndp_update_entry(inetAddress, &amp;address,</a>
+<a name="ln620">		NDP_FLAG_LOCAL | NDP_FLAG_PERMANENT, &amp;entry);</a>
+<a name="ln621">	if (status == B_OK)</a>
+<a name="ln622">		entry-&gt;protocol = protocol;</a>
+<a name="ln623"> </a>
+<a name="ln624">	return status;</a>
+<a name="ln625">}</a>
+<a name="ln626"> </a>
+<a name="ln627"> </a>
+<a name="ln628">/*!	Creates permanent local entries for all addresses of the interface belonging</a>
+<a name="ln629">	to this protocol.</a>
+<a name="ln630">	Returns an error if no entry could be added.</a>
+<a name="ln631">*/</a>
+<a name="ln632">static status_t</a>
+<a name="ln633">ndp_update_local(ipv6_datalink_protocol* protocol)</a>
+<a name="ln634">{</a>
+<a name="ln635">	memset(&amp;protocol-&gt;local_address, 0, sizeof(in6_addr));</a>
+<a name="ln636"> </a>
+<a name="ln637">	ssize_t count = 0;</a>
+<a name="ln638"> </a>
+<a name="ln639">	net_interface_address* address = NULL;</a>
+<a name="ln640">	while (sDatalinkModule-&gt;get_next_interface_address(protocol-&gt;interface,</a>
+<a name="ln641">			&amp;address)) {</a>
+<a name="ln642">		if (address-&gt;local == NULL || address-&gt;local-&gt;sa_family != AF_INET6)</a>
+<a name="ln643">			continue;</a>
+<a name="ln644"> </a>
+<a name="ln645">		if (ndp_set_local_entry(protocol, address-&gt;local) == B_OK) {</a>
+<a name="ln646">			count++;</a>
+<a name="ln647">		}</a>
+<a name="ln648">	}</a>
+<a name="ln649"> </a>
+<a name="ln650">	if (count == 0)</a>
+<a name="ln651">		return ndp_set_local_entry(protocol, NULL);</a>
+<a name="ln652"> </a>
+<a name="ln653">	return B_OK;</a>
+<a name="ln654">}</a>
+<a name="ln655"> </a>
+<a name="ln656"> </a>
+<a name="ln657">static status_t</a>
+<a name="ln658">ndp_receive_solicitation(net_buffer* buffer, bool* reuseBuffer)</a>
+<a name="ln659">{</a>
+<a name="ln660">	*reuseBuffer = false;</a>
+<a name="ln661"> </a>
+<a name="ln662">	NetBufferHeaderReader&lt;neighbor_discovery_header&gt; bufferHeader(buffer);</a>
+<a name="ln663">	if (bufferHeader.Status() &lt; B_OK)</a>
+<a name="ln664">		return bufferHeader.Status();</a>
+<a name="ln665"> </a>
+<a name="ln666">	neighbor_discovery_header&amp; header = bufferHeader.Data();</a>
+<a name="ln667">	if (header.option_type != ND_OPT_SOURCE_LINKADDR</a>
+<a name="ln668">		|| header.option_length != 1)</a>
+<a name="ln669">		return B_OK;</a>
+<a name="ln670"> </a>
+<a name="ln671">	{</a>
+<a name="ln672">		MutexLocker locker(sCacheLock);</a>
+<a name="ln673"> </a>
+<a name="ln674">		// remember the address of the sender as we might need it later</a>
+<a name="ln675">		sockaddr_dl hardwareAddress;</a>
+<a name="ln676">		hardwareAddress.sdl_len = sizeof(sockaddr_dl);</a>
+<a name="ln677">		hardwareAddress.sdl_family = AF_LINK;</a>
+<a name="ln678">		hardwareAddress.sdl_index = 0;</a>
+<a name="ln679">		hardwareAddress.sdl_type = IFT_ETHER;</a>
+<a name="ln680">		hardwareAddress.sdl_e_type = htons(ETHER_TYPE_IPV6);</a>
+<a name="ln681">		hardwareAddress.sdl_nlen = hardwareAddress.sdl_slen = 0;</a>
+<a name="ln682">		hardwareAddress.sdl_alen = ETHER_ADDRESS_LENGTH;</a>
+<a name="ln683">		memcpy(LLADDR(&amp;hardwareAddress), header.link_address,</a>
+<a name="ln684">			ETHER_ADDRESS_LENGTH);</a>
+<a name="ln685"> </a>
+<a name="ln686">		ndp_update_entry(header.target_address, &amp;hardwareAddress, 0);</a>
+<a name="ln687"> </a>
+<a name="ln688">		// check if this request is for us</a>
+<a name="ln689"> </a>
+<a name="ln690">		ndp_entry* entry = ndp_entry::Lookup(header.target_address);</a>
+<a name="ln691">		if (entry == NULL</a>
+<a name="ln692">			|| (entry-&gt;flags &amp; (NDP_FLAG_LOCAL | NDP_FLAG_PUBLISH)) == 0) {</a>
+<a name="ln693">			// We're not the one to answer this request</a>
+<a name="ln694">			// TODO: instead of letting the other's request time-out, can we</a>
+<a name="ln695">			//	reply failure somehow?</a>
+<a name="ln696">			TRACE((&quot;  not for us\n&quot;));</a>
+<a name="ln697">			return B_ERROR;</a>
+<a name="ln698">		}</a>
+<a name="ln699"> </a>
+<a name="ln700">		// send a reply (by reusing the buffer we got)</a>
+<a name="ln701">		gBufferModule-&gt;trim(buffer, sizeof(neighbor_discovery_header));</a>
+<a name="ln702"> </a>
+<a name="ln703">		header.icmp6_type = ND_NEIGHBOR_SOLICIT;</a>
+<a name="ln704">		header.icmp6_code = 0;</a>
+<a name="ln705">		header.icmp6_checksum = 0;</a>
+<a name="ln706">		header.flags = ND_NA_FLAG_SOLICITED;</a>
+<a name="ln707">		header.option_type = ND_OPT_TARGET_LINKADDR;</a>
+<a name="ln708">		memcpy(&amp;header.link_address, LLADDR(&amp;entry-&gt;hardware_address),</a>
+<a name="ln709">			ETHER_ADDRESS_LENGTH);</a>
+<a name="ln710">		bufferHeader.Sync();</a>
+<a name="ln711">	}</a>
+<a name="ln712"> </a>
+<a name="ln713">	// fix source and destination address</a>
+<a name="ln714">	sockaddr_in6* source = (sockaddr_in6*)buffer-&gt;source;</a>
+<a name="ln715">	sockaddr_in6* destination = (sockaddr_in6*)buffer-&gt;destination;</a>
+<a name="ln716">	memcpy(&amp;destination-&gt;sin6_addr, &amp;source-&gt;sin6_addr, sizeof(in6_addr));</a>
+<a name="ln717">	memcpy(&amp;source-&gt;sin6_addr, &amp;header.target_address, sizeof(in6_addr));</a>
+<a name="ln718"> </a>
+<a name="ln719">	buffer-&gt;flags = 0;</a>
+<a name="ln720">		// make sure this won't be a broadcast message</a>
+<a name="ln721"> </a>
+<a name="ln722">	if (sIPv6Protocol == NULL)</a>
+<a name="ln723">		return B_ERROR;</a>
+<a name="ln724"> </a>
+<a name="ln725">	*reuseBuffer = true;</a>
+<a name="ln726"> </a>
+<a name="ln727">	// send the ICMPv6 packet out</a>
+<a name="ln728">	TRACE((&quot;Sending Neighbor Advertisement\n&quot;));</a>
+<a name="ln729">	return sIPv6Module-&gt;send_data(sIPv6Protocol, buffer);</a>
+<a name="ln730">}</a>
+<a name="ln731"> </a>
+<a name="ln732"> </a>
+<a name="ln733">static void</a>
+<a name="ln734">ndp_receive_advertisement(net_buffer* buffer)</a>
+<a name="ln735">{</a>
+<a name="ln736">	// TODO: also process unsolicited advertisments?</a>
+<a name="ln737">	if ((buffer-&gt;flags &amp; MSG_MCAST) != 0)</a>
+<a name="ln738">		return;</a>
+<a name="ln739"> </a>
+<a name="ln740">	NetBufferHeaderReader&lt;neighbor_discovery_header&gt; bufferHeader(buffer);</a>
+<a name="ln741">	if (bufferHeader.Status() &lt; B_OK)</a>
+<a name="ln742">		return;</a>
+<a name="ln743"> </a>
+<a name="ln744">	neighbor_discovery_header&amp; header = bufferHeader.Data();</a>
+<a name="ln745">	if (header.option_type != ND_OPT_TARGET_LINKADDR</a>
+<a name="ln746">		|| header.option_length != 1) {</a>
+<a name="ln747">		return;</a>
+<a name="ln748">	}</a>
+<a name="ln749"> </a>
+<a name="ln750">	sockaddr_dl hardwareAddress;</a>
+<a name="ln751">	hardwareAddress.sdl_len = sizeof(sockaddr_dl);</a>
+<a name="ln752">	hardwareAddress.sdl_family = AF_LINK;</a>
+<a name="ln753">	hardwareAddress.sdl_index = 0;</a>
+<a name="ln754">	hardwareAddress.sdl_type = IFT_ETHER;</a>
+<a name="ln755">	hardwareAddress.sdl_e_type = htons(ETHER_TYPE_IPV6);</a>
+<a name="ln756">	hardwareAddress.sdl_nlen = hardwareAddress.sdl_slen = 0;</a>
+<a name="ln757">	hardwareAddress.sdl_alen = ETHER_ADDRESS_LENGTH;</a>
+<a name="ln758">	memcpy(LLADDR(&amp;hardwareAddress), header.link_address, ETHER_ADDRESS_LENGTH);</a>
+<a name="ln759"> </a>
+<a name="ln760">	MutexLocker locker(sCacheLock);</a>
+<a name="ln761">	// TODO: take in account ND_NA_FLAGs</a>
+<a name="ln762">	ndp_update_entry(header.target_address, &amp;hardwareAddress, 0);</a>
+<a name="ln763">}</a>
+<a name="ln764"> </a>
+<a name="ln765"> </a>
+<a name="ln766">static void</a>
+<a name="ln767">ndp_receive_router_advertisement(net_buffer* buffer)</a>
+<a name="ln768">{</a>
+<a name="ln769">	NetBufferHeaderReader&lt;router_advertisement_header&gt; bufferHeader(buffer);</a>
+<a name="ln770">	if (bufferHeader.Status() &lt; B_OK)</a>
+<a name="ln771">		return;</a>
+<a name="ln772"> </a>
+<a name="ln773">	// TODO: check for validity</a>
+<a name="ln774"> </a>
+<a name="ln775">	// TODO: parse the options</a>
+<a name="ln776">}</a>
+<a name="ln777"> </a>
+<a name="ln778"> </a>
+<a name="ln779">static status_t</a>
+<a name="ln780">ndp_receive_data(net_buffer* buffer)</a>
+<a name="ln781">{</a>
+<a name="ln782">	dprintf(&quot;ndp_receive_data\n&quot;);</a>
+<a name="ln783"> </a>
+<a name="ln784">	NetBufferHeaderReader&lt;icmp6_hdr&gt; icmp6Header(buffer);</a>
+<a name="ln785">	if (icmp6Header.Status() &lt; B_OK)</a>
+<a name="ln786">		return icmp6Header.Status();</a>
+<a name="ln787"> </a>
+<a name="ln788">	bool reuseBuffer = false;</a>
+<a name="ln789"> </a>
+<a name="ln790">	switch (icmp6Header-&gt;icmp6_type) {</a>
+<a name="ln791">		case ND_NEIGHBOR_SOLICIT:</a>
+<a name="ln792">			TRACE((&quot;  received Neighbor Solicitation\n&quot;));</a>
+<a name="ln793">			ndp_receive_solicitation(buffer, &amp;reuseBuffer);</a>
+<a name="ln794">			break;</a>
+<a name="ln795"> </a>
+<a name="ln796">		case ND_NEIGHBOR_ADVERT:</a>
+<a name="ln797">			TRACE((&quot;  received Neighbor Advertisement\n&quot;));</a>
+<a name="ln798">			ndp_receive_advertisement(buffer);</a>
+<a name="ln799">			break;</a>
+<a name="ln800"> </a>
+<a name="ln801">		case ND_ROUTER_ADVERT:</a>
+<a name="ln802">			TRACE((&quot;  received Router Advertisement\n&quot;));</a>
+<a name="ln803">			ndp_receive_router_advertisement(buffer);</a>
+<a name="ln804">			break;</a>
+<a name="ln805">	}</a>
+<a name="ln806"> </a>
+<a name="ln807">	if (reuseBuffer == false)</a>
+<a name="ln808">		gBufferModule-&gt;free(buffer);</a>
+<a name="ln809">	return B_OK;</a>
+<a name="ln810">}</a>
+<a name="ln811"> </a>
+<a name="ln812"> </a>
+<a name="ln813">static void</a>
+<a name="ln814">ndp_timer(struct net_timer* timer, void* data)</a>
+<a name="ln815">{</a>
+<a name="ln816">	ndp_entry* entry = (ndp_entry*)data;</a>
+<a name="ln817">	TRACE((&quot;NDP timer %&quot; B_PRId32 &quot;, entry %p!\n&quot;, entry-&gt;timer_state, entry));</a>
+<a name="ln818"> </a>
+<a name="ln819">	switch (entry-&gt;timer_state) {</a>
+<a name="ln820">		case NDP_NO_STATE:</a>
+<a name="ln821">			// who are you kidding?</a>
+<a name="ln822">			break;</a>
+<a name="ln823"> </a>
+<a name="ln824">		case NDP_STATE_REQUEST_FAILED:</a>
+<a name="ln825">			// Requesting the NDP entry failed, we keep it around for a while,</a>
+<a name="ln826">			// though, so that we won't try to request the same address again</a>
+<a name="ln827">			// too soon.</a>
+<a name="ln828">			TRACE((&quot;  requesting NDP entry %p failed!\n&quot;, entry));</a>
+<a name="ln829">			entry-&gt;timer_state = NDP_STATE_REMOVE_FAILED;</a>
+<a name="ln830">			entry-&gt;MarkFailed();</a>
+<a name="ln831">			sStackModule-&gt;set_timer(&amp;entry-&gt;timer, NDP_REJECT_TIMEOUT);</a>
+<a name="ln832">			break;</a>
+<a name="ln833"> </a>
+<a name="ln834">		case NDP_STATE_REMOVE_FAILED:</a>
+<a name="ln835">		case NDP_STATE_STALE:</a>
+<a name="ln836">			// the entry has aged so much that we're going to remove it</a>
+<a name="ln837">			TRACE((&quot;  remove NDP entry %p!\n&quot;, entry));</a>
+<a name="ln838"> </a>
+<a name="ln839">			mutex_lock(&amp;sCacheLock);</a>
+<a name="ln840">			if ((entry-&gt;flags &amp; NDP_FLAG_REMOVED) != 0) {</a>
+<a name="ln841">				// The entry has already been removed, and is about to be deleted</a>
+<a name="ln842">				mutex_unlock(&amp;sCacheLock);</a>
+<a name="ln843">				break;</a>
+<a name="ln844">			}</a>
+<a name="ln845"> </a>
+<a name="ln846">			sCache-&gt;Remove(entry);</a>
+<a name="ln847">			mutex_unlock(&amp;sCacheLock);</a>
+<a name="ln848"> </a>
+<a name="ln849">			delete entry;</a>
+<a name="ln850">			break;</a>
+<a name="ln851"> </a>
+<a name="ln852">		default:</a>
+<a name="ln853">		{</a>
+<a name="ln854">			if (entry-&gt;timer_state &gt; NDP_STATE_LAST_REQUEST)</a>
+<a name="ln855">				break;</a>
+<a name="ln856"> </a>
+<a name="ln857">			TRACE((&quot;  send request for NDP entry %p!\n&quot;, entry));</a>
+<a name="ln858"> </a>
+<a name="ln859">			net_buffer* request = get_request_buffer(entry);</a>
+<a name="ln860">			if (request == NULL)</a>
+<a name="ln861">				break;</a>
+<a name="ln862"> </a>
+<a name="ln863">			if (entry-&gt;timer_state &lt; NDP_STATE_LAST_REQUEST) {</a>
+<a name="ln864">				// we'll still need our buffer, so in order to prevent it being</a>
+<a name="ln865">				// freed by a successful send, we need to clone it</a>
+<a name="ln866">				net_buffer* clone = gBufferModule-&gt;clone(request, true);</a>
+<a name="ln867">				if (clone == NULL) {</a>
+<a name="ln868">					// cloning failed - that means we won't be able to send as</a>
+<a name="ln869">					// many requests as originally planned</a>
+<a name="ln870">					entry-&gt;timer_state = NDP_STATE_LAST_REQUEST;</a>
+<a name="ln871">				} else {</a>
+<a name="ln872">					put_request_buffer(entry, request);</a>
+<a name="ln873">					request = clone;</a>
+<a name="ln874">				}</a>
+<a name="ln875">			}</a>
+<a name="ln876"> </a>
+<a name="ln877">			if (sIPv6Protocol == NULL)</a>
+<a name="ln878">				break;</a>
+<a name="ln879"> </a>
+<a name="ln880">			// we're trying to resolve the address, so keep sending requests</a>
+<a name="ln881">			status_t status = sIPv6Module-&gt;send_data(sIPv6Protocol, request);</a>
+<a name="ln882">			if (status &lt; B_OK)</a>
+<a name="ln883">				gBufferModule-&gt;free(request);</a>
+<a name="ln884"> </a>
+<a name="ln885">			entry-&gt;timer_state++;</a>
+<a name="ln886">			sStackModule-&gt;set_timer(&amp;entry-&gt;timer, NDP_REQUEST_TIMEOUT);</a>
+<a name="ln887">			break;</a>
+<a name="ln888">		}</a>
+<a name="ln889">	}</a>
+<a name="ln890">}</a>
+<a name="ln891"> </a>
+<a name="ln892"> </a>
+<a name="ln893">static status_t</a>
+<a name="ln894">ndp_start_resolve(ipv6_datalink_protocol* protocol, const in6_addr&amp; address,</a>
+<a name="ln895">	ndp_entry** _entry)</a>
+<a name="ln896">{</a>
+<a name="ln897">	ASSERT_LOCKED_MUTEX(&amp;sCacheLock);</a>
+<a name="ln898"> </a>
+<a name="ln899">	// create an unresolved entry as a placeholder</a>
+<a name="ln900">	ndp_entry* entry = ndp_entry::Add(address, NULL, 0);</a>
+<a name="ln901">	if (entry == NULL)</a>
+<a name="ln902">		return B_NO_MEMORY;</a>
+<a name="ln903"> </a>
+<a name="ln904">	// prepare NDP request</a>
+<a name="ln905"> </a>
+<a name="ln906">	net_buffer* buffer = entry-&gt;request_buffer = gBufferModule-&gt;create(256);</a>
+<a name="ln907">	if (entry-&gt;request_buffer == NULL) {</a>
+<a name="ln908">		entry-&gt;ScheduleRemoval();</a>
+<a name="ln909">		return B_NO_MEMORY;</a>
+<a name="ln910">	}</a>
+<a name="ln911"> </a>
+<a name="ln912">	NetBufferPrepend&lt;neighbor_discovery_header&gt; header(buffer);</a>
+<a name="ln913">	status_t status = header.Status();</a>
+<a name="ln914">	if (status &lt; B_OK) {</a>
+<a name="ln915">		entry-&gt;ScheduleRemoval();</a>
+<a name="ln916">		return status;</a>
+<a name="ln917">	}</a>
+<a name="ln918"> </a>
+<a name="ln919">	net_interface* interface = protocol-&gt;interface;</a>
+<a name="ln920">	net_device* device = interface-&gt;device;</a>
+<a name="ln921"> </a>
+<a name="ln922">	// prepare source and target addresses</a>
+<a name="ln923"> </a>
+<a name="ln924">	sockaddr_in6* source = (sockaddr_in6*)buffer-&gt;source;</a>
+<a name="ln925">	ipv6_to_sockaddr(source, protocol-&gt;local_address);</a>
+<a name="ln926">	// protocol-&gt;local_address</a>
+<a name="ln927"> </a>
+<a name="ln928">	sockaddr_in6* destination = (sockaddr_in6*)buffer-&gt;destination;</a>
+<a name="ln929">	ipv6_to_solicited_multicast(destination, address);</a>
+<a name="ln930"> </a>
+<a name="ln931">	buffer-&gt;protocol = IPPROTO_ICMPV6;</a>
+<a name="ln932"> </a>
+<a name="ln933">	// prepare Neighbor Solicitation header</a>
+<a name="ln934"> </a>
+<a name="ln935">	header-&gt;icmp6_type = ND_NEIGHBOR_SOLICIT;</a>
+<a name="ln936">	header-&gt;icmp6_code = 0;</a>
+<a name="ln937">	header-&gt;icmp6_checksum = 0;</a>
+<a name="ln938">	header-&gt;flags = 0;</a>
+<a name="ln939">	memcpy(&amp;header-&gt;target_address, &amp;address, sizeof(in6_addr));</a>
+<a name="ln940">	header-&gt;option_type = ND_OPT_SOURCE_LINKADDR;</a>
+<a name="ln941">	header-&gt;option_length = (sizeof(nd_opt_hdr) + ETHER_ADDRESS_LENGTH) &gt;&gt; 3;</a>
+<a name="ln942">	memcpy(&amp;header-&gt;link_address, device-&gt;address.data, ETHER_ADDRESS_LENGTH);</a>
+<a name="ln943">	header.Sync();</a>
+<a name="ln944"> </a>
+<a name="ln945">	if (sIPv6Protocol == NULL) {</a>
+<a name="ln946">		entry-&gt;ScheduleRemoval();</a>
+<a name="ln947">		return B_NO_MEMORY;</a>
+<a name="ln948">	}</a>
+<a name="ln949"> </a>
+<a name="ln950">	// this does not work, because multicast for now is only looped back!</a>
+<a name="ln951">#if FIXME</a>
+<a name="ln952">	// hack: set to use the correct interface by setting socket option</a>
+<a name="ln953">	sIPv6Module-&gt;setsockopt(sIPv6Protocol, IPPROTO_IPV6, IPV6_MULTICAST_IF,</a>
+<a name="ln954">		&amp;source-&gt;sin6_addr, sizeof(in6_addr));</a>
+<a name="ln955">#endif</a>
+<a name="ln956"> </a>
+<a name="ln957">	net_buffer* clone = gBufferModule-&gt;clone(buffer, true);</a>
+<a name="ln958">	if (clone == NULL) {</a>
+<a name="ln959">		entry-&gt;ScheduleRemoval();</a>
+<a name="ln960">		return B_NO_MEMORY;</a>
+<a name="ln961">	}</a>
+<a name="ln962"> </a>
+<a name="ln963">	// send the ICMPv6 packet out</a>
+<a name="ln964">	TRACE((&quot;Sending Neighbor Solicitation\n&quot;));</a>
+<a name="ln965">	status = sIPv6Module-&gt;send_data(sIPv6Protocol, clone);</a>
+<a name="ln966">	if (status &lt; B_OK) {</a>
+<a name="ln967">		entry-&gt;ScheduleRemoval();</a>
+<a name="ln968">		return status;</a>
+<a name="ln969">	}</a>
+<a name="ln970"> </a>
+<a name="ln971">	entry-&gt;protocol = protocol;</a>
+<a name="ln972">	entry-&gt;timer_state = NDP_STATE_REQUEST;</a>
+<a name="ln973">	sStackModule-&gt;set_timer(&amp;entry-&gt;timer, 0);</a>
+<a name="ln974">		// start request timer</a>
+<a name="ln975"> </a>
+<a name="ln976">	*_entry = entry;</a>
+<a name="ln977">	return B_OK;</a>
+<a name="ln978">}</a>
+<a name="ln979"> </a>
+<a name="ln980"> </a>
+<a name="ln981">//	#pragma mark -</a>
+<a name="ln982"> </a>
+<a name="ln983"> </a>
+<a name="ln984">static status_t</a>
+<a name="ln985">ipv6_datalink_init(net_interface* interface, net_domain* domain,</a>
+<a name="ln986">	net_datalink_protocol** _protocol)</a>
+<a name="ln987">{</a>
+<a name="ln988">	if (domain-&gt;family != AF_INET6)</a>
+<a name="ln989">		return B_BAD_TYPE;</a>
+<a name="ln990"> </a>
+<a name="ln991">	status_t status = sStackModule-&gt;register_domain_device_handler(</a>
+<a name="ln992">		interface-&gt;device, B_NET_FRAME_TYPE(IFT_ETHER, ETHER_TYPE_IPV6), domain);</a>
+<a name="ln993">	if (status != B_OK)</a>
+<a name="ln994">		return status;</a>
+<a name="ln995"> </a>
+<a name="ln996">	ipv6_datalink_protocol* protocol = new(std::nothrow) ipv6_datalink_protocol;</a>
+<a name="ln997">	if (protocol == NULL)</a>
+<a name="ln998">		return B_NO_MEMORY;</a>
+<a name="ln999"> </a>
+<a name="ln1000">	memset(&amp;protocol-&gt;hardware_address, 0, sizeof(sockaddr_dl));</a>
+<a name="ln1001">	memset(&amp;protocol-&gt;local_address, 0, sizeof(in6_addr));</a>
+<a name="ln1002">	*_protocol = protocol;</a>
+<a name="ln1003">	return B_OK;</a>
+<a name="ln1004">}</a>
+<a name="ln1005"> </a>
+<a name="ln1006"> </a>
+<a name="ln1007">static status_t</a>
+<a name="ln1008">ipv6_datalink_uninit(net_datalink_protocol* protocol)</a>
+<a name="ln1009">{</a>
+<a name="ln1010">	sStackModule-&gt;unregister_device_handler(protocol-&gt;interface-&gt;device,</a>
+<a name="ln1011">		B_NET_FRAME_TYPE(IFT_ETHER, ETHER_TYPE_IPV6));</a>
+<a name="ln1012"> </a>
+<a name="ln1013">	delete protocol;</a>
+<a name="ln1014"> 	return B_OK;</a>
+<a name="ln1015">}</a>
+<a name="ln1016"> </a>
+<a name="ln1017"> </a>
+<a name="ln1018">static status_t</a>
+<a name="ln1019">ipv6_datalink_send_data(net_datalink_protocol* _protocol, net_buffer* buffer)</a>
+<a name="ln1020">{</a>
+<a name="ln1021">	ipv6_datalink_protocol* protocol = (ipv6_datalink_protocol*)_protocol;</a>
+<a name="ln1022"> </a>
+<a name="ln1023">	memcpy(buffer-&gt;source, &amp;protocol-&gt;hardware_address,</a>
+<a name="ln1024">		protocol-&gt;hardware_address.sdl_len);</a>
+<a name="ln1025"> </a>
+<a name="ln1026">	if ((buffer-&gt;flags &amp; MSG_MCAST) != 0) {</a>
+<a name="ln1027">		sockaddr_dl multicastDestination;</a>
+<a name="ln1028">		ipv6_to_ether_multicast(&amp;multicastDestination,</a>
+<a name="ln1029">			(sockaddr_in6*)buffer-&gt;destination);</a>
+<a name="ln1030">		memcpy(buffer-&gt;destination, &amp;multicastDestination,</a>
+<a name="ln1031">			sizeof(sockaddr_dl));</a>
+<a name="ln1032">	} else {</a>
+<a name="ln1033">		MutexLocker locker(sCacheLock);</a>
+<a name="ln1034"> </a>
+<a name="ln1035">		// Lookup destination (we may need to wait for this)</a>
+<a name="ln1036">		ndp_entry* entry = ndp_entry::Lookup(</a>
+<a name="ln1037">			((struct sockaddr_in6*)buffer-&gt;destination)-&gt;sin6_addr);</a>
+<a name="ln1038">		if (entry == NULL) {</a>
+<a name="ln1039">			status_t status = ndp_start_resolve(protocol,</a>
+<a name="ln1040">				((struct sockaddr_in6*)buffer-&gt;destination)-&gt;sin6_addr, &amp;entry);</a>
+<a name="ln1041">			if (status &lt; B_OK)</a>
+<a name="ln1042">				return status;</a>
+<a name="ln1043">		}</a>
+<a name="ln1044"> </a>
+<a name="ln1045">		if ((entry-&gt;flags &amp; NDP_FLAG_REJECT) != 0)</a>
+<a name="ln1046">			return EHOSTUNREACH;</a>
+<a name="ln1047">		if (!(entry-&gt;flags &amp; NDP_FLAG_VALID)) {</a>
+<a name="ln1048">			// entry is still being resolved.</a>
+<a name="ln1049">			TRACE((&quot;NDP Queuing packet %p, entry still being resolved.\n&quot;,</a>
+<a name="ln1050">					buffer));</a>
+<a name="ln1051">			entry-&gt;queue.Add(buffer);</a>
+<a name="ln1052">			return B_OK;</a>
+<a name="ln1053">		}</a>
+<a name="ln1054"> </a>
+<a name="ln1055">		memcpy(buffer-&gt;destination, &amp;entry-&gt;hardware_address,</a>
+<a name="ln1056">			entry-&gt;hardware_address.sdl_len);</a>
+<a name="ln1057">	}</a>
+<a name="ln1058"> </a>
+<a name="ln1059">	return protocol-&gt;next-&gt;module-&gt;send_data(protocol-&gt;next, buffer);</a>
+<a name="ln1060">}</a>
+<a name="ln1061"> </a>
+<a name="ln1062"> </a>
+<a name="ln1063"> </a>
+<a name="ln1064">static status_t</a>
+<a name="ln1065">ipv6_datalink_up(net_datalink_protocol* _protocol)</a>
+<a name="ln1066">{</a>
+<a name="ln1067">	ipv6_datalink_protocol* protocol = (ipv6_datalink_protocol*)_protocol;</a>
+<a name="ln1068">	status_t status = protocol-&gt;next-&gt;module-&gt;interface_up(protocol-&gt;next);</a>
+<a name="ln1069">	if (status != B_OK)</a>
+<a name="ln1070">		return status;</a>
+<a name="ln1071"> </a>
+<a name="ln1072">	// cache this device's address for later use</a>
+<a name="ln1073"> </a>
+<a name="ln1074">	status = ndp_update_local(protocol);</a>
+<a name="ln1075">	if (status != B_OK) {</a>
+<a name="ln1076">		protocol-&gt;next-&gt;module-&gt;interface_down(protocol-&gt;next);</a>
+<a name="ln1077">		return status;</a>
+<a name="ln1078">	}</a>
+<a name="ln1079"> </a>
+<a name="ln1080">	return B_OK;</a>
+<a name="ln1081">}</a>
+<a name="ln1082"> </a>
+<a name="ln1083"> </a>
+<a name="ln1084">static void</a>
+<a name="ln1085">ipv6_datalink_down(net_datalink_protocol *protocol)</a>
+<a name="ln1086">{</a>
+<a name="ln1087">	// remove local NDP entries from the cache</a>
+<a name="ln1088">	ndp_remove_local((ipv6_datalink_protocol*)protocol);</a>
+<a name="ln1089"> </a>
+<a name="ln1090">	protocol-&gt;next-&gt;module-&gt;interface_down(protocol-&gt;next);</a>
+<a name="ln1091">}</a>
+<a name="ln1092"> </a>
+<a name="ln1093"> </a>
+<a name="ln1094">status_t</a>
+<a name="ln1095">ipv6_datalink_change_address(net_datalink_protocol* _protocol,</a>
+<a name="ln1096">	net_interface_address* address, int32 option,</a>
+<a name="ln1097">	const struct sockaddr* oldAddress, const struct sockaddr* newAddress)</a>
+<a name="ln1098">{</a>
+<a name="ln1099">	ipv6_datalink_protocol* protocol = (ipv6_datalink_protocol*)_protocol;</a>
+<a name="ln1100">	switch (option) {</a>
+<a name="ln1101">		case SIOCSIFADDR:</a>
+<a name="ln1102">		case SIOCAIFADDR:</a>
+<a name="ln1103">		case SIOCDIFADDR:</a>
+<a name="ln1104">			// Those are the options we handle</a>
+<a name="ln1105">			if ((protocol-&gt;interface-&gt;flags &amp; IFF_UP) != 0) {</a>
+<a name="ln1106">				// Update NDP entry for the local address</a>
+<a name="ln1107"> </a>
+<a name="ln1108">				if (newAddress != NULL &amp;&amp; newAddress-&gt;sa_family == AF_INET6) {</a>
+<a name="ln1109">					status_t status = ndp_set_local_entry(protocol, newAddress);</a>
+<a name="ln1110">					if (status != B_OK)</a>
+<a name="ln1111">						return status;</a>
+<a name="ln1112"> </a>
+<a name="ln1113">					// add IPv6 multicast route (ff00::/8)</a>
+<a name="ln1114">					sockaddr_in6 socketAddress;</a>
+<a name="ln1115">					memset(&amp;socketAddress, 0, sizeof(sockaddr_in6));</a>
+<a name="ln1116">					socketAddress.sin6_family = AF_INET6;</a>
+<a name="ln1117">					socketAddress.sin6_len = sizeof(sockaddr_in6);</a>
+<a name="ln1118">					socketAddress.sin6_addr.s6_addr[0] = 0xff;</a>
+<a name="ln1119"> </a>
+<a name="ln1120">					net_route route;</a>
+<a name="ln1121">					memset(&amp;route, 0, sizeof(net_route));</a>
+<a name="ln1122">					route.destination = (sockaddr*)&amp;socketAddress;</a>
+<a name="ln1123">					route.mask = (sockaddr*)&amp;socketAddress;</a>
+<a name="ln1124">					route.flags = 0;</a>
+<a name="ln1125">					sDatalinkModule-&gt;add_route(address-&gt;domain, &amp;route);</a>
+<a name="ln1126">				}</a>
+<a name="ln1127"> </a>
+<a name="ln1128">				if (oldAddress != NULL &amp;&amp; oldAddress-&gt;sa_family == AF_INET6) {</a>
+<a name="ln1129">					ndp_remove_local_entry(protocol, oldAddress, true);</a>
+<a name="ln1130"> </a>
+<a name="ln1131">					// remove IPv6 multicast route (ff00::/8)</a>
+<a name="ln1132">					sockaddr_in6 socketAddress;</a>
+<a name="ln1133">					memset(&amp;socketAddress, 0, sizeof(sockaddr_in6));</a>
+<a name="ln1134">					socketAddress.sin6_family = AF_INET6;</a>
+<a name="ln1135">					socketAddress.sin6_len = sizeof(sockaddr_in6);</a>
+<a name="ln1136">					socketAddress.sin6_addr.s6_addr[0] = 0xff;</a>
+<a name="ln1137"> </a>
+<a name="ln1138">					net_route route;</a>
+<a name="ln1139">					memset(&amp;route, 0, sizeof(net_route));</a>
+<a name="ln1140">					route.destination = (sockaddr*)&amp;socketAddress;</a>
+<a name="ln1141">					route.mask = (sockaddr*)&amp;socketAddress;</a>
+<a name="ln1142">					route.flags = 0;</a>
+<a name="ln1143">					sDatalinkModule-&gt;remove_route(address-&gt;domain, &amp;route);</a>
+<a name="ln1144">				}</a>
+<a name="ln1145">			}</a>
+<a name="ln1146">			break;</a>
+<a name="ln1147"> </a>
+<a name="ln1148">		default:</a>
+<a name="ln1149">			break;</a>
+<a name="ln1150">	}</a>
+<a name="ln1151"> </a>
+<a name="ln1152">	return protocol-&gt;next-&gt;module-&gt;change_address(protocol-&gt;next, address,</a>
+<a name="ln1153">		option, oldAddress, newAddress);</a>
+<a name="ln1154">}</a>
+<a name="ln1155"> </a>
+<a name="ln1156"> </a>
+<a name="ln1157">static status_t</a>
+<a name="ln1158">ipv6_datalink_control(net_datalink_protocol* protocol, int32 op, void* argument,</a>
+<a name="ln1159">	size_t length)</a>
+<a name="ln1160">{</a>
+<a name="ln1161">	return protocol-&gt;next-&gt;module-&gt;control(protocol-&gt;next, op, argument,</a>
+<a name="ln1162">		length);</a>
+<a name="ln1163">}</a>
+<a name="ln1164"> </a>
+<a name="ln1165"> </a>
+<a name="ln1166">static status_t</a>
+<a name="ln1167">ipv6_datalink_join_multicast(net_datalink_protocol* protocol,</a>
+<a name="ln1168">	const sockaddr* address)</a>
+<a name="ln1169">{</a>
+<a name="ln1170">	if (address-&gt;sa_family != AF_INET6)</a>
+<a name="ln1171">		return EINVAL;</a>
+<a name="ln1172"> </a>
+<a name="ln1173">	sockaddr_dl multicastAddress;</a>
+<a name="ln1174">	ipv6_to_ether_multicast(&amp;multicastAddress, (const sockaddr_in6*)address);</a>
+<a name="ln1175"> </a>
+<a name="ln1176">	return protocol-&gt;next-&gt;module-&gt;join_multicast(protocol-&gt;next,</a>
+<a name="ln1177">		(sockaddr*)&amp;multicastAddress);</a>
+<a name="ln1178">}</a>
+<a name="ln1179"> </a>
+<a name="ln1180"> </a>
+<a name="ln1181">static status_t</a>
+<a name="ln1182">ipv6_datalink_leave_multicast(net_datalink_protocol* protocol,</a>
+<a name="ln1183">	const sockaddr* address)</a>
+<a name="ln1184">{</a>
+<a name="ln1185">	if (address-&gt;sa_family != AF_INET6)</a>
+<a name="ln1186">		return EINVAL;</a>
+<a name="ln1187"> </a>
+<a name="ln1188">	sockaddr_dl multicastAddress;</a>
+<a name="ln1189">	ipv6_to_ether_multicast(&amp;multicastAddress, (const sockaddr_in6*)address);</a>
+<a name="ln1190"> </a>
+<a name="ln1191">	return protocol-&gt;next-&gt;module-&gt;leave_multicast(protocol-&gt;next,</a>
+<a name="ln1192">		(sockaddr*)&amp;multicastAddress);</a>
+<a name="ln1193">}</a>
+<a name="ln1194"> </a>
+<a name="ln1195"> </a>
+<a name="ln1196">static status_t</a>
+<a name="ln1197">ipv6_datalink_std_ops(int32 op, ...)</a>
+<a name="ln1198">{</a>
+<a name="ln1199">	switch (op) {</a>
+<a name="ln1200">	case B_MODULE_INIT:</a>
+<a name="ln1201">		return ndp_init();</a>
+<a name="ln1202"> </a>
+<a name="ln1203">	case B_MODULE_UNINIT:</a>
+<a name="ln1204">		return ndp_uninit();</a>
+<a name="ln1205">	}</a>
+<a name="ln1206"> </a>
+<a name="ln1207">	return B_ERROR;</a>
+<a name="ln1208">}</a>
+<a name="ln1209"> </a>
+<a name="ln1210"> </a>
+<a name="ln1211">net_datalink_protocol_module_info gIPv6DataLinkModule = {</a>
+<a name="ln1212">	{</a>
+<a name="ln1213">		&quot;network/datalink_protocols/ipv6_datagram/v1&quot;,</a>
+<a name="ln1214">		0,</a>
+<a name="ln1215">		ipv6_datalink_std_ops</a>
+<a name="ln1216">	},</a>
+<a name="ln1217">	ipv6_datalink_init,</a>
+<a name="ln1218">	ipv6_datalink_uninit,</a>
+<a name="ln1219">	ipv6_datalink_send_data,</a>
+<a name="ln1220">	ipv6_datalink_up,</a>
+<a name="ln1221">	ipv6_datalink_down,</a>
+<a name="ln1222">	ipv6_datalink_change_address,</a>
+<a name="ln1223">	ipv6_datalink_control,</a>
+<a name="ln1224">	ipv6_datalink_join_multicast,</a>
+<a name="ln1225">	ipv6_datalink_leave_multicast,</a>
+<a name="ln1226">};</a>
+<a name="ln1227"> </a>
+<a name="ln1228">net_ndp_module_info gIPv6NDPModule = {</a>
+<a name="ln1229">	{</a>
+<a name="ln1230">		&quot;network/datalink_protocols/ipv6_datagram/ndp/v1&quot;,</a>
+<a name="ln1231">		0,</a>
+<a name="ln1232">		NULL</a>
+<a name="ln1233">	},</a>
+<a name="ln1234">	ndp_receive_data</a>
+<a name="ln1235">};</a>
+<a name="ln1236"> </a>
+<a name="ln1237">module_dependency module_dependencies[] = {</a>
+<a name="ln1238">	{NET_STACK_MODULE_NAME, (module_info**)&amp;sStackModule},</a>
+<a name="ln1239">	{NET_DATALINK_MODULE_NAME, (module_info**)&amp;sDatalinkModule},</a>
+<a name="ln1240">	{NET_BUFFER_MODULE_NAME, (module_info**)&amp;gBufferModule},</a>
+<a name="ln1241">	{&quot;network/protocols/ipv6/v1&quot;, (module_info**)&amp;sIPv6Module},</a>
+<a name="ln1242">	{}</a>
+<a name="ln1243">};</a>
+<a name="ln1244"> </a>
+<a name="ln1245">module_info* modules[] = {</a>
+<a name="ln1246">	(module_info*)&amp;gIPv6DataLinkModule,</a>
+<a name="ln1247">	(module_info*)&amp;gIPv6NDPModule,</a>
+<a name="ln1248">	NULL</a>
+<a name="ln1249">};</a>
+
+</code></pre>
+<div class="balloon" rel="1030"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v512/" target="_blank">V512</a> A call of the 'memcpy' function will lead to overflow of the buffer 'buffer->destination'.</p></div>
+<div class="balloon" rel="942"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v512/" target="_blank">V512</a> A call of the 'memcpy' function will lead to underflow of the buffer 'device->address.data'.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,416 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>ev_connects.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright (c) 2004 by Internet Systems Consortium, Inc. (&quot;ISC&quot;)</a>
+<a name="ln3"> * Copyright (c) 1995-1999 by Internet Software Consortium</a>
+<a name="ln4"> *</a>
+<a name="ln5"> * Permission to use, copy, modify, and distribute this software for any</a>
+<a name="ln6"> * purpose with or without fee is hereby granted, provided that the above</a>
+<a name="ln7"> * copyright notice and this permission notice appear in all copies.</a>
+<a name="ln8"> *</a>
+<a name="ln9"> * THE SOFTWARE IS PROVIDED &quot;AS IS&quot; AND ISC DISCLAIMS ALL WARRANTIES</a>
+<a name="ln10"> * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF</a>
+<a name="ln11"> * MERCHANTABILITY AND FITNESS.  IN NO EVENT SHALL ISC BE LIABLE FOR</a>
+<a name="ln12"> * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES</a>
+<a name="ln13"> * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN</a>
+<a name="ln14"> * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT</a>
+<a name="ln15"> * OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.</a>
+<a name="ln16"> */</a>
+<a name="ln17"> </a>
+<a name="ln18">/* ev_connects.c - implement asynch connect/accept for the eventlib</a>
+<a name="ln19"> * vix 16sep96 [initial]</a>
+<a name="ln20"> */</a>
+<a name="ln21"> </a>
+<a name="ln22">#if !defined(LINT) &amp;&amp; !defined(CODECENTER)</a>
+<a name="ln23">static const char rcsid[] = &quot;$Id: ev_connects.c,v 1.8 2006/03/09 23:57:56 marka Exp $&quot;;</a>
+<a name="ln24">#endif</a>
+<a name="ln25"> </a>
+<a name="ln26">/* Import. */</a>
+<a name="ln27"> </a>
+<a name="ln28">#include &quot;port_before.h&quot;</a>
+<a name="ln29">#include &quot;fd_setsize.h&quot;</a>
+<a name="ln30"> </a>
+<a name="ln31">#include &lt;sys/types.h&gt;</a>
+<a name="ln32">#include &lt;sys/socket.h&gt;</a>
+<a name="ln33">#include &lt;sys/ioctl.h&gt;</a>
+<a name="ln34"> </a>
+<a name="ln35">#include &lt;unistd.h&gt;</a>
+<a name="ln36"> </a>
+<a name="ln37">#include &lt;isc/eventlib.h&gt;</a>
+<a name="ln38">#include &lt;isc/assertions.h&gt;</a>
+<a name="ln39">#include &quot;eventlib_p.h&quot;</a>
+<a name="ln40"> </a>
+<a name="ln41">#include &quot;port_after.h&quot;</a>
+<a name="ln42"> </a>
+<a name="ln43">/* Macros. */</a>
+<a name="ln44"> </a>
+<a name="ln45">#define GETXXXNAME(f, s, sa, len) ( \</a>
+<a name="ln46">	(f((s), (&amp;sa), (&amp;len)) &gt;= 0) ? 0 : \</a>
+<a name="ln47">		(errno != EAFNOSUPPORT &amp;&amp; errno != EOPNOTSUPP) ? -1 : ( \</a>
+<a name="ln48">			memset(&amp;(sa), 0, sizeof (sa)), \</a>
+<a name="ln49">			(len) = sizeof (sa), \</a>
+<a name="ln50">			(sa).sa_family = AF_UNIX, \</a>
+<a name="ln51">			0 \</a>
+<a name="ln52">		) \</a>
+<a name="ln53">	)</a>
+<a name="ln54"> </a>
+<a name="ln55">/* Forward. */</a>
+<a name="ln56"> </a>
+<a name="ln57">static void	listener(evContext ctx, void *uap, int fd, int evmask);</a>
+<a name="ln58">static void	connector(evContext ctx, void *uap, int fd, int evmask);</a>
+<a name="ln59"> </a>
+<a name="ln60">/* Public. */</a>
+<a name="ln61"> </a>
+<a name="ln62">int</a>
+<a name="ln63">evListen(evContext opaqueCtx, int fd, int maxconn,</a>
+<a name="ln64">	 evConnFunc func, void *uap, evConnID *id)</a>
+<a name="ln65">{</a>
+<a name="ln66">	evContext_p *ctx = opaqueCtx.opaque;</a>
+<a name="ln67">	evConn *new;</a>
+<a name="ln68">	int mode;</a>
+<a name="ln69"> </a>
+<a name="ln70">	OKNEW(new);</a>
+<a name="ln71">	new-&gt;flags = EV_CONN_LISTEN;</a>
+<a name="ln72">	OKFREE(mode = fcntl(fd, F_GETFL, NULL), new);	/*%&lt; side effect: validate fd. */</a>
+<a name="ln73">	/*</a>
+<a name="ln74">	 * Remember the nonblocking status.  We assume that either evSelectFD</a>
+<a name="ln75">	 * has not been done to this fd, or that if it has then the caller</a>
+<a name="ln76">	 * will evCancelConn before they evDeselectFD.  If our assumptions</a>
+<a name="ln77">	 * are not met, then we might restore the old nonblocking status</a>
+<a name="ln78">	 * incorrectly.</a>
+<a name="ln79">	 */</a>
+<a name="ln80">	if ((mode &amp; PORT_NONBLOCK) == 0) {</a>
+<a name="ln81">#ifdef USE_FIONBIO_IOCTL</a>
+<a name="ln82">		int on = 1;</a>
+<a name="ln83">		OKFREE(ioctl(fd, FIONBIO, (char *)&amp;on), new);</a>
+<a name="ln84">#else</a>
+<a name="ln85">		OKFREE(fcntl(fd, F_SETFL, mode | PORT_NONBLOCK), new);</a>
+<a name="ln86">#endif</a>
+<a name="ln87">		new-&gt;flags |= EV_CONN_BLOCK;</a>
+<a name="ln88">	}</a>
+<a name="ln89">	OKFREE(listen(fd, maxconn), new);</a>
+<a name="ln90">	if (evSelectFD(opaqueCtx, fd, EV_READ, listener, new, &amp;new-&gt;file) &lt; 0){</a>
+<a name="ln91">		int save = errno;</a>
+<a name="ln92"> </a>
+<a name="ln93">		FREE(new);</a>
+<a name="ln94">		errno = save;</a>
+<a name="ln95">		return (-1);</a>
+<a name="ln96">	}</a>
+<a name="ln97">	new-&gt;flags |= EV_CONN_SELECTED;</a>
+<a name="ln98">	new-&gt;func = func;</a>
+<a name="ln99">	new-&gt;uap = uap;</a>
+<a name="ln100">	new-&gt;fd = fd;</a>
+<a name="ln101">	if (ctx-&gt;conns != NULL)</a>
+<a name="ln102">		ctx-&gt;conns-&gt;prev = new;</a>
+<a name="ln103">	new-&gt;prev = NULL;</a>
+<a name="ln104">	new-&gt;next = ctx-&gt;conns;</a>
+<a name="ln105">	ctx-&gt;conns = new;</a>
+<a name="ln106">	if (id)</a>
+<a name="ln107">		id-&gt;opaque = new;</a>
+<a name="ln108">	return (0);</a>
+<a name="ln109">}</a>
+<a name="ln110"> </a>
+<a name="ln111">int</a>
+<a name="ln112">evConnect(evContext opaqueCtx, int fd, const void *ra, int ralen,</a>
+<a name="ln113">	  evConnFunc func, void *uap, evConnID *id)</a>
+<a name="ln114">{</a>
+<a name="ln115">	evContext_p *ctx = opaqueCtx.opaque;</a>
+<a name="ln116">	evConn *new;</a>
+<a name="ln117"> </a>
+<a name="ln118">	OKNEW(new);</a>
+<a name="ln119">	new-&gt;flags = 0;</a>
+<a name="ln120">	/* Do the select() first to get the socket into nonblocking mode. */</a>
+<a name="ln121">	if (evSelectFD(opaqueCtx, fd, EV_MASK_ALL,</a>
+<a name="ln122">		       connector, new, &amp;new-&gt;file) &lt; 0) {</a>
+<a name="ln123">		int save = errno;</a>
+<a name="ln124"> </a>
+<a name="ln125">		FREE(new);</a>
+<a name="ln126">		errno = save;</a>
+<a name="ln127">		return (-1);</a>
+<a name="ln128">	}</a>
+<a name="ln129">	new-&gt;flags |= EV_CONN_SELECTED;</a>
+<a name="ln130">	if (connect(fd, ra, ralen) &lt; 0 &amp;&amp;</a>
+<a name="ln131">	    errno != EWOULDBLOCK &amp;&amp;</a>
+<a name="ln132">	    errno != EAGAIN &amp;&amp;</a>
+<a name="ln133">	    errno != EINPROGRESS) {</a>
+<a name="ln134">		int save = errno;</a>
+<a name="ln135"> </a>
+<a name="ln136">		(void) evDeselectFD(opaqueCtx, new-&gt;file);</a>
+<a name="ln137">		FREE(new);</a>
+<a name="ln138">		errno = save;</a>
+<a name="ln139">		return (-1);</a>
+<a name="ln140">	}</a>
+<a name="ln141">	/* No error, or EWOULDBLOCK.  select() tells when it's ready. */</a>
+<a name="ln142">	new-&gt;func = func;</a>
+<a name="ln143">	new-&gt;uap = uap;</a>
+<a name="ln144">	new-&gt;fd = fd;</a>
+<a name="ln145">	if (ctx-&gt;conns != NULL)</a>
+<a name="ln146">		ctx-&gt;conns-&gt;prev = new;</a>
+<a name="ln147">	new-&gt;prev = NULL;</a>
+<a name="ln148">	new-&gt;next = ctx-&gt;conns;</a>
+<a name="ln149">	ctx-&gt;conns = new;</a>
+<a name="ln150">	if (id)</a>
+<a name="ln151">		id-&gt;opaque = new;</a>
+<a name="ln152">	return (0);</a>
+<a name="ln153">}</a>
+<a name="ln154"> </a>
+<a name="ln155">int</a>
+<a name="ln156">evCancelConn(evContext opaqueCtx, evConnID id) {</a>
+<a name="ln157">	evContext_p *ctx = opaqueCtx.opaque;</a>
+<a name="ln158">	evConn *this = id.opaque;</a>
+<a name="ln159">	evAccept *acc, *nxtacc;</a>
+<a name="ln160">	int mode;</a>
+<a name="ln161"> </a>
+<a name="ln162">	if ((this-&gt;flags &amp; EV_CONN_SELECTED) != 0)</a>
+<a name="ln163">		(void) evDeselectFD(opaqueCtx, this-&gt;file);</a>
+<a name="ln164">	if ((this-&gt;flags &amp; EV_CONN_BLOCK) != 0) {</a>
+<a name="ln165">		mode = fcntl(this-&gt;fd, F_GETFL, NULL);</a>
+<a name="ln166">		if (mode == -1) {</a>
+<a name="ln167">			if (errno != EBADF)</a>
+<a name="ln168">				return (-1);</a>
+<a name="ln169">		} else {</a>
+<a name="ln170">#ifdef USE_FIONBIO_IOCTL</a>
+<a name="ln171">			int off = 0;</a>
+<a name="ln172">			OK(ioctl(this-&gt;fd, FIONBIO, (char *)&amp;off));</a>
+<a name="ln173">#else</a>
+<a name="ln174">			OK(fcntl(this-&gt;fd, F_SETFL, mode &amp; ~PORT_NONBLOCK));</a>
+<a name="ln175">#endif</a>
+<a name="ln176">		}</a>
+<a name="ln177">	}</a>
+<a name="ln178">	</a>
+<a name="ln179">	/* Unlink from ctx-&gt;conns. */</a>
+<a name="ln180">	if (this-&gt;prev != NULL)</a>
+<a name="ln181">		this-&gt;prev-&gt;next = this-&gt;next;</a>
+<a name="ln182">	else</a>
+<a name="ln183">		ctx-&gt;conns = this-&gt;next;</a>
+<a name="ln184">	if (this-&gt;next != NULL)</a>
+<a name="ln185">		this-&gt;next-&gt;prev = this-&gt;prev;</a>
+<a name="ln186"> </a>
+<a name="ln187">	/*</a>
+<a name="ln188">	 * Remove `this' from the ctx-&gt;accepts list (zero or more times).</a>
+<a name="ln189">	 */</a>
+<a name="ln190">	for (acc = HEAD(ctx-&gt;accepts), nxtacc = NULL;</a>
+<a name="ln191">	     acc != NULL;</a>
+<a name="ln192">	     acc = nxtacc)</a>
+<a name="ln193">	{</a>
+<a name="ln194">		nxtacc = NEXT(acc, link);</a>
+<a name="ln195">		if (acc-&gt;conn == this) {</a>
+<a name="ln196">			UNLINK(ctx-&gt;accepts, acc, link);</a>
+<a name="ln197">			close(acc-&gt;fd);</a>
+<a name="ln198">			FREE(acc);</a>
+<a name="ln199">		}</a>
+<a name="ln200">	}</a>
+<a name="ln201"> </a>
+<a name="ln202">	/* Wrap up and get out. */</a>
+<a name="ln203">	FREE(this);</a>
+<a name="ln204">	return (0);</a>
+<a name="ln205">}</a>
+<a name="ln206"> </a>
+<a name="ln207">int evHold(evContext opaqueCtx, evConnID id) {</a>
+<a name="ln208">	evConn *this = id.opaque;</a>
+<a name="ln209"> </a>
+<a name="ln210">	if ((this-&gt;flags &amp; EV_CONN_LISTEN) == 0) {</a>
+<a name="ln211">		errno = EINVAL;</a>
+<a name="ln212">		return (-1);</a>
+<a name="ln213">	}</a>
+<a name="ln214">	if ((this-&gt;flags &amp; EV_CONN_SELECTED) == 0)</a>
+<a name="ln215">		return (0);</a>
+<a name="ln216">	this-&gt;flags &amp;= ~EV_CONN_SELECTED;</a>
+<a name="ln217">	return (evDeselectFD(opaqueCtx, this-&gt;file));</a>
+<a name="ln218">}</a>
+<a name="ln219"> </a>
+<a name="ln220">int evUnhold(evContext opaqueCtx, evConnID id) {</a>
+<a name="ln221">	evConn *this = id.opaque;</a>
+<a name="ln222">	int ret;</a>
+<a name="ln223"> </a>
+<a name="ln224">	if ((this-&gt;flags &amp; EV_CONN_LISTEN) == 0) {</a>
+<a name="ln225">		errno = EINVAL;</a>
+<a name="ln226">		return (-1);</a>
+<a name="ln227">	}</a>
+<a name="ln228">	if ((this-&gt;flags &amp; EV_CONN_SELECTED) != 0)</a>
+<a name="ln229">		return (0);</a>
+<a name="ln230">	ret = evSelectFD(opaqueCtx, this-&gt;fd, EV_READ, listener, this,</a>
+<a name="ln231">			 &amp;this-&gt;file);</a>
+<a name="ln232">	if (ret == 0)</a>
+<a name="ln233">		this-&gt;flags |= EV_CONN_SELECTED;</a>
+<a name="ln234">	return (ret);</a>
+<a name="ln235">}</a>
+<a name="ln236"> </a>
+<a name="ln237">int</a>
+<a name="ln238">evTryAccept(evContext opaqueCtx, evConnID id, int *sys_errno) {</a>
+<a name="ln239">	evContext_p *ctx = opaqueCtx.opaque;</a>
+<a name="ln240">	evConn *conn = id.opaque;</a>
+<a name="ln241">	evAccept *new;</a>
+<a name="ln242"> </a>
+<a name="ln243">	if ((conn-&gt;flags &amp; EV_CONN_LISTEN) == 0) {</a>
+<a name="ln244">		errno = EINVAL;</a>
+<a name="ln245">		return (-1);</a>
+<a name="ln246">	}</a>
+<a name="ln247">	OKNEW(new);</a>
+<a name="ln248">	new-&gt;conn = conn;</a>
+<a name="ln249">	new-&gt;ralen = sizeof new-&gt;ra;</a>
+<a name="ln250">	new-&gt;fd = accept(conn-&gt;fd, &amp;new-&gt;ra.sa, &amp;new-&gt;ralen);</a>
+<a name="ln251">	if (new-&gt;fd &gt; ctx-&gt;highestFD) {</a>
+<a name="ln252">		close(new-&gt;fd);</a>
+<a name="ln253">		new-&gt;fd = -1;</a>
+<a name="ln254">		new-&gt;ioErrno = ENOTSOCK;</a>
+<a name="ln255">	}</a>
+<a name="ln256">	if (new-&gt;fd &gt;= 0) {</a>
+<a name="ln257">		new-&gt;lalen = sizeof new-&gt;la;</a>
+<a name="ln258">		if (GETXXXNAME(getsockname, new-&gt;fd, new-&gt;la.sa, new-&gt;lalen) &lt; 0) {</a>
+<a name="ln259">			new-&gt;ioErrno = errno;</a>
+<a name="ln260">			(void) close(new-&gt;fd);</a>
+<a name="ln261">			new-&gt;fd = -1;</a>
+<a name="ln262">		} else</a>
+<a name="ln263">			new-&gt;ioErrno = 0;</a>
+<a name="ln264">	} else {</a>
+<a name="ln265">		new-&gt;ioErrno = errno;</a>
+<a name="ln266">		if (errno == EAGAIN || errno == EWOULDBLOCK) {</a>
+<a name="ln267">			FREE(new);</a>
+<a name="ln268">			return (-1);</a>
+<a name="ln269">		}</a>
+<a name="ln270">	}</a>
+<a name="ln271">	INIT_LINK(new, link);</a>
+<a name="ln272">	APPEND(ctx-&gt;accepts, new, link);</a>
+<a name="ln273">	*sys_errno = new-&gt;ioErrno;</a>
+<a name="ln274">	return (0);</a>
+<a name="ln275">}</a>
+<a name="ln276"> </a>
+<a name="ln277">/* Private. */</a>
+<a name="ln278"> </a>
+<a name="ln279">static void</a>
+<a name="ln280">listener(evContext opaqueCtx, void *uap, int fd, int evmask) {</a>
+<a name="ln281">	evContext_p *ctx = opaqueCtx.opaque;</a>
+<a name="ln282">	evConn *conn = uap;</a>
+<a name="ln283">	union {</a>
+<a name="ln284">		struct sockaddr    sa;</a>
+<a name="ln285">		struct sockaddr_in in;</a>
+<a name="ln286">#ifndef NO_SOCKADDR_UN</a>
+<a name="ln287">		struct sockaddr_un un;</a>
+<a name="ln288">#endif</a>
+<a name="ln289">	} la, ra;</a>
+<a name="ln290">	int new; </a>
+<a name="ln291">	ISC_SOCKLEN_T lalen = 0, ralen;</a>
+<a name="ln292"> </a>
+<a name="ln293">	REQUIRE((evmask &amp; EV_READ) != 0);</a>
+<a name="ln294">	ralen = sizeof ra;</a>
+<a name="ln295">	new = accept(fd, &amp;ra.sa, &amp;ralen);</a>
+<a name="ln296">	if (new &gt; ctx-&gt;highestFD) {</a>
+<a name="ln297">		close(new);</a>
+<a name="ln298">		new = -1;</a>
+<a name="ln299">		errno = ENOTSOCK;</a>
+<a name="ln300">	}</a>
+<a name="ln301">	if (new &gt;= 0) {</a>
+<a name="ln302">		lalen = sizeof la;</a>
+<a name="ln303">		if (GETXXXNAME(getsockname, new, la.sa, lalen) &lt; 0) {</a>
+<a name="ln304">			int save = errno;</a>
+<a name="ln305"> </a>
+<a name="ln306">			(void) close(new);</a>
+<a name="ln307">			errno = save;</a>
+<a name="ln308">			new = -1;</a>
+<a name="ln309">		}</a>
+<a name="ln310">	} else if (errno == EAGAIN || errno == EWOULDBLOCK)</a>
+<a name="ln311">		return;</a>
+<a name="ln312">	(*conn-&gt;func)(opaqueCtx, conn-&gt;uap, new, &amp;la.sa, lalen, &amp;ra.sa, ralen);</a>
+<a name="ln313">}</a>
+<a name="ln314"> </a>
+<a name="ln315">static void</a>
+<a name="ln316">connector(evContext opaqueCtx, void *uap, int fd, int evmask) {</a>
+<a name="ln317">	evConn *conn = uap;</a>
+<a name="ln318">	union {</a>
+<a name="ln319">		struct sockaddr    sa;</a>
+<a name="ln320">		struct sockaddr_in in;</a>
+<a name="ln321">#ifndef NO_SOCKADDR_UN</a>
+<a name="ln322">		struct sockaddr_un un;</a>
+<a name="ln323">#endif</a>
+<a name="ln324">	} la, ra;</a>
+<a name="ln325">	ISC_SOCKLEN_T lalen, ralen;</a>
+<a name="ln326">#ifndef NETREAD_BROKEN</a>
+<a name="ln327">	char buf[1];</a>
+<a name="ln328">#endif</a>
+<a name="ln329">	void *conn_uap;</a>
+<a name="ln330">	evConnFunc conn_func;</a>
+<a name="ln331">	evConnID id;</a>
+<a name="ln332">	int socket_errno = 0;</a>
+<a name="ln333">	ISC_SOCKLEN_T optlen;</a>
+<a name="ln334"> </a>
+<a name="ln335">	UNUSED(evmask);</a>
+<a name="ln336"> </a>
+<a name="ln337">	lalen = sizeof la;</a>
+<a name="ln338">	ralen = sizeof ra;</a>
+<a name="ln339">	conn_uap = conn-&gt;uap;</a>
+<a name="ln340">	conn_func = conn-&gt;func;</a>
+<a name="ln341">	id.opaque = conn;</a>
+<a name="ln342">#ifdef SO_ERROR</a>
+<a name="ln343">	optlen = sizeof socket_errno;</a>
+<a name="ln344">	if (fd &lt; 0 &amp;&amp;</a>
+<a name="ln345">	    getsockopt(conn-&gt;fd, SOL_SOCKET, SO_ERROR, (char *)&amp;socket_errno,</a>
+<a name="ln346">		       &amp;optlen) &lt; 0)</a>
+<a name="ln347">		socket_errno = errno;</a>
+<a name="ln348">	else</a>
+<a name="ln349">		errno = socket_errno;</a>
+<a name="ln350">#endif</a>
+<a name="ln351">	if (evCancelConn(opaqueCtx, id) &lt; 0 ||</a>
+<a name="ln352">	    socket_errno ||</a>
+<a name="ln353">#ifdef NETREAD_BROKEN</a>
+<a name="ln354">	    0 ||</a>
+<a name="ln355">#else</a>
+<a name="ln356">	    read(fd, buf, 0) &lt; 0 ||</a>
+<a name="ln357">#endif</a>
+<a name="ln358">	    GETXXXNAME(getsockname, fd, la.sa, lalen) &lt; 0 ||</a>
+<a name="ln359">	    GETXXXNAME(getpeername, fd, ra.sa, ralen) &lt; 0) {</a>
+<a name="ln360">		int save = errno;</a>
+<a name="ln361"> </a>
+<a name="ln362">		(void) close(fd);	/*%&lt; XXX closing caller's fd */</a>
+<a name="ln363">		errno = save;</a>
+<a name="ln364">		fd = -1;</a>
+<a name="ln365">	}</a>
+<a name="ln366">	(*conn_func)(opaqueCtx, conn_uap, fd, &amp;la.sa, lalen, &amp;ra.sa, ralen);</a>
+<a name="ln367">}</a>
+<a name="ln368"> </a>
+<a name="ln369">/*! \file */</a>
+
+</code></pre>
+<div class="balloon" rel="356"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v575/" target="_blank">V575</a> The 'read' function processes '0' elements. Inspect the third argument.</p></div>
+<div class="balloon" rel="72"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v570/" target="_blank">V570</a> The '* (_errnop())' variable is assigned to itself.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

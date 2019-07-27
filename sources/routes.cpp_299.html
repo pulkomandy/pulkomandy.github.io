@@ -1,0 +1,778 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>routes.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2006-2010, Haiku, Inc. All Rights Reserved.</a>
+<a name="ln3"> * Distributed under the terms of the MIT License.</a>
+<a name="ln4"> *</a>
+<a name="ln5"> * Authors:</a>
+<a name="ln6"> *		Axel Dörfler, axeld@pinc-software.de</a>
+<a name="ln7"> */</a>
+<a name="ln8"> </a>
+<a name="ln9"> </a>
+<a name="ln10">#include &quot;domains.h&quot;</a>
+<a name="ln11">#include &quot;interfaces.h&quot;</a>
+<a name="ln12">#include &quot;routes.h&quot;</a>
+<a name="ln13">#include &quot;stack_private.h&quot;</a>
+<a name="ln14">#include &quot;utility.h&quot;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &lt;net_device.h&gt;</a>
+<a name="ln17">#include &lt;NetUtilities.h&gt;</a>
+<a name="ln18"> </a>
+<a name="ln19">#include &lt;lock.h&gt;</a>
+<a name="ln20">#include &lt;util/AutoLock.h&gt;</a>
+<a name="ln21"> </a>
+<a name="ln22">#include &lt;KernelExport.h&gt;</a>
+<a name="ln23"> </a>
+<a name="ln24">#include &lt;net/if_dl.h&gt;</a>
+<a name="ln25">#include &lt;net/route.h&gt;</a>
+<a name="ln26">#include &lt;new&gt;</a>
+<a name="ln27">#include &lt;stdlib.h&gt;</a>
+<a name="ln28">#include &lt;string.h&gt;</a>
+<a name="ln29">#include &lt;sys/sockio.h&gt;</a>
+<a name="ln30"> </a>
+<a name="ln31"> </a>
+<a name="ln32">//#define TRACE_ROUTES</a>
+<a name="ln33">#ifdef TRACE_ROUTES</a>
+<a name="ln34">#	define TRACE(x...) dprintf(STACK_DEBUG_PREFIX x)</a>
+<a name="ln35">#else</a>
+<a name="ln36">#	define TRACE(x...) ;</a>
+<a name="ln37">#endif</a>
+<a name="ln38"> </a>
+<a name="ln39"> </a>
+<a name="ln40">net_route_private::net_route_private()</a>
+<a name="ln41">{</a>
+<a name="ln42">	destination = mask = gateway = NULL;</a>
+<a name="ln43">}</a>
+<a name="ln44"> </a>
+<a name="ln45"> </a>
+<a name="ln46">net_route_private::~net_route_private()</a>
+<a name="ln47">{</a>
+<a name="ln48">	free(destination);</a>
+<a name="ln49">	free(mask);</a>
+<a name="ln50">	free(gateway);</a>
+<a name="ln51">}</a>
+<a name="ln52"> </a>
+<a name="ln53"> </a>
+<a name="ln54">//	#pragma mark - private functions</a>
+<a name="ln55"> </a>
+<a name="ln56"> </a>
+<a name="ln57">static status_t</a>
+<a name="ln58">user_copy_address(const sockaddr* from, sockaddr** to)</a>
+<a name="ln59">{</a>
+<a name="ln60">	if (from == NULL) {</a>
+<a name="ln61">		*to = NULL;</a>
+<a name="ln62">		return B_OK;</a>
+<a name="ln63">	}</a>
+<a name="ln64"> </a>
+<a name="ln65">	sockaddr address;</a>
+<a name="ln66">	if (user_memcpy(&amp;address, from, sizeof(struct sockaddr)) &lt; B_OK)</a>
+<a name="ln67">		return B_BAD_ADDRESS;</a>
+<a name="ln68"> </a>
+<a name="ln69">	*to = (sockaddr*)malloc(address.sa_len);</a>
+<a name="ln70">	if (*to == NULL)</a>
+<a name="ln71">		return B_NO_MEMORY;</a>
+<a name="ln72"> </a>
+<a name="ln73">	if (address.sa_len &gt; sizeof(struct sockaddr)) {</a>
+<a name="ln74">		if (user_memcpy(*to, from, address.sa_len) &lt; B_OK)</a>
+<a name="ln75">			return B_BAD_ADDRESS;</a>
+<a name="ln76">	} else</a>
+<a name="ln77">		memcpy(*to, &amp;address, address.sa_len);</a>
+<a name="ln78"> </a>
+<a name="ln79">	return B_OK;</a>
+<a name="ln80">}</a>
+<a name="ln81"> </a>
+<a name="ln82"> </a>
+<a name="ln83">static status_t</a>
+<a name="ln84">user_copy_address(const sockaddr* from, sockaddr_storage* to)</a>
+<a name="ln85">{</a>
+<a name="ln86">	if (from == NULL)</a>
+<a name="ln87">		return B_BAD_ADDRESS;</a>
+<a name="ln88"> </a>
+<a name="ln89">	if (user_memcpy(to, from, sizeof(sockaddr)) &lt; B_OK)</a>
+<a name="ln90">		return B_BAD_ADDRESS;</a>
+<a name="ln91"> </a>
+<a name="ln92">	if (to-&gt;ss_len &gt; sizeof(sockaddr)) {</a>
+<a name="ln93">		if (to-&gt;ss_len &gt; sizeof(sockaddr_storage))</a>
+<a name="ln94">			return B_BAD_VALUE;</a>
+<a name="ln95">		if (user_memcpy(to, from, to-&gt;ss_len) &lt; B_OK)</a>
+<a name="ln96">			return B_BAD_ADDRESS;</a>
+<a name="ln97">	}</a>
+<a name="ln98"> </a>
+<a name="ln99">	return B_OK;</a>
+<a name="ln100">}</a>
+<a name="ln101"> </a>
+<a name="ln102"> </a>
+<a name="ln103">static net_route_private*</a>
+<a name="ln104">find_route(struct net_domain* _domain, const net_route* description)</a>
+<a name="ln105">{</a>
+<a name="ln106">	struct net_domain_private* domain = (net_domain_private*)_domain;</a>
+<a name="ln107">	RouteList::Iterator iterator = domain-&gt;routes.GetIterator();</a>
+<a name="ln108"> </a>
+<a name="ln109">	while (iterator.HasNext()) {</a>
+<a name="ln110">		net_route_private* route = iterator.Next();</a>
+<a name="ln111"> </a>
+<a name="ln112">		if ((route-&gt;flags &amp; RTF_DEFAULT) != 0</a>
+<a name="ln113">			&amp;&amp; (description-&gt;flags &amp; RTF_DEFAULT) != 0) {</a>
+<a name="ln114">			// there can only be one default route per interface address family</a>
+<a name="ln115">			// TODO: check this better</a>
+<a name="ln116">			if (route-&gt;interface_address == description-&gt;interface_address)</a>
+<a name="ln117">				return route;</a>
+<a name="ln118"> </a>
+<a name="ln119">			continue;</a>
+<a name="ln120">		}</a>
+<a name="ln121"> </a>
+<a name="ln122">		if ((route-&gt;flags &amp; (RTF_GATEWAY | RTF_HOST | RTF_LOCAL | RTF_DEFAULT))</a>
+<a name="ln123">				== (description-&gt;flags</a>
+<a name="ln124">					&amp; (RTF_GATEWAY | RTF_HOST | RTF_LOCAL | RTF_DEFAULT))</a>
+<a name="ln125">			&amp;&amp; domain-&gt;address_module-&gt;equal_masked_addresses(</a>
+<a name="ln126">				route-&gt;destination, description-&gt;destination, description-&gt;mask)</a>
+<a name="ln127">			&amp;&amp; domain-&gt;address_module-&gt;equal_addresses(route-&gt;mask,</a>
+<a name="ln128">				description-&gt;mask)</a>
+<a name="ln129">			&amp;&amp; domain-&gt;address_module-&gt;equal_addresses(route-&gt;gateway,</a>
+<a name="ln130">				description-&gt;gateway)</a>
+<a name="ln131">			&amp;&amp; (description-&gt;interface_address == NULL</a>
+<a name="ln132">				|| description-&gt;interface_address == route-&gt;interface_address))</a>
+<a name="ln133">			return route;</a>
+<a name="ln134">	}</a>
+<a name="ln135"> </a>
+<a name="ln136">	return NULL;</a>
+<a name="ln137">}</a>
+<a name="ln138"> </a>
+<a name="ln139"> </a>
+<a name="ln140">static net_route_private*</a>
+<a name="ln141">find_route(net_domain* _domain, const sockaddr* address)</a>
+<a name="ln142">{</a>
+<a name="ln143">	net_domain_private* domain = (net_domain_private*)_domain;</a>
+<a name="ln144"> </a>
+<a name="ln145">	// find last matching route</a>
+<a name="ln146"> </a>
+<a name="ln147">	RouteList::Iterator iterator = domain-&gt;routes.GetIterator();</a>
+<a name="ln148">	net_route_private* candidate = NULL;</a>
+<a name="ln149"> </a>
+<a name="ln150">	TRACE(&quot;test address %s for routes...\n&quot;,</a>
+<a name="ln151">		AddressString(domain, address).Data());</a>
+<a name="ln152"> </a>
+<a name="ln153">	// TODO: alternate equal default routes</a>
+<a name="ln154"> </a>
+<a name="ln155">	while (iterator.HasNext()) {</a>
+<a name="ln156">		net_route_private* route = iterator.Next();</a>
+<a name="ln157"> </a>
+<a name="ln158">		if (route-&gt;mask) {</a>
+<a name="ln159">			sockaddr maskedAddress;</a>
+<a name="ln160">			domain-&gt;address_module-&gt;mask_address(address, route-&gt;mask,</a>
+<a name="ln161">				&amp;maskedAddress);</a>
+<a name="ln162">			if (!domain-&gt;address_module-&gt;equal_addresses(&amp;maskedAddress,</a>
+<a name="ln163">					route-&gt;destination))</a>
+<a name="ln164">				continue;</a>
+<a name="ln165">		} else if (!domain-&gt;address_module-&gt;equal_addresses(address,</a>
+<a name="ln166">				route-&gt;destination))</a>
+<a name="ln167">			continue;</a>
+<a name="ln168"> </a>
+<a name="ln169">		// neglect routes that point to devices that have no link</a>
+<a name="ln170">		if ((route-&gt;interface_address-&gt;interface-&gt;device-&gt;flags &amp; IFF_LINK)</a>
+<a name="ln171">				== 0) {</a>
+<a name="ln172">			if (candidate == NULL) {</a>
+<a name="ln173">				TRACE(&quot;  found candidate: %s, flags %lx\n&quot;, AddressString(</a>
+<a name="ln174">					domain, route-&gt;destination).Data(), route-&gt;flags);</a>
+<a name="ln175">				candidate = route;</a>
+<a name="ln176">			}</a>
+<a name="ln177">			continue;</a>
+<a name="ln178">		}</a>
+<a name="ln179"> </a>
+<a name="ln180">		TRACE(&quot;  found route: %s, flags %lx\n&quot;,</a>
+<a name="ln181">			AddressString(domain, route-&gt;destination).Data(), route-&gt;flags);</a>
+<a name="ln182"> </a>
+<a name="ln183">		return route;</a>
+<a name="ln184">	}</a>
+<a name="ln185"> </a>
+<a name="ln186">	return candidate;</a>
+<a name="ln187">}</a>
+<a name="ln188"> </a>
+<a name="ln189"> </a>
+<a name="ln190">static void</a>
+<a name="ln191">put_route_internal(struct net_domain_private* domain, net_route* _route)</a>
+<a name="ln192">{</a>
+<a name="ln193">	ASSERT_LOCKED_RECURSIVE(&amp;domain-&gt;lock);</a>
+<a name="ln194"> </a>
+<a name="ln195">	net_route_private* route = (net_route_private*)_route;</a>
+<a name="ln196">	if (route == NULL || atomic_add(&amp;route-&gt;ref_count, -1) != 1)</a>
+<a name="ln197">		return;</a>
+<a name="ln198"> </a>
+<a name="ln199">	// delete route - it must already have been removed at this point</a>
+<a name="ln200">	if (route-&gt;interface_address != NULL)</a>
+<a name="ln201">		((InterfaceAddress*)route-&gt;interface_address)-&gt;ReleaseReference();</a>
+<a name="ln202"> </a>
+<a name="ln203">	delete route;</a>
+<a name="ln204">}</a>
+<a name="ln205"> </a>
+<a name="ln206"> </a>
+<a name="ln207">static struct net_route*</a>
+<a name="ln208">get_route_internal(struct net_domain_private* domain,</a>
+<a name="ln209">	const struct sockaddr* address)</a>
+<a name="ln210">{</a>
+<a name="ln211">	ASSERT_LOCKED_RECURSIVE(&amp;domain-&gt;lock);</a>
+<a name="ln212">	net_route_private* route = NULL;</a>
+<a name="ln213"> </a>
+<a name="ln214">	if (address-&gt;sa_family == AF_LINK) {</a>
+<a name="ln215">		// special address to find an interface directly</a>
+<a name="ln216">		RouteList::Iterator iterator = domain-&gt;routes.GetIterator();</a>
+<a name="ln217">		const sockaddr_dl* link = (const sockaddr_dl*)address;</a>
+<a name="ln218"> </a>
+<a name="ln219">		while (iterator.HasNext()) {</a>
+<a name="ln220">			route = iterator.Next();</a>
+<a name="ln221"> </a>
+<a name="ln222">			net_device* device = route-&gt;interface_address-&gt;interface-&gt;device;</a>
+<a name="ln223"> </a>
+<a name="ln224">			if ((link-&gt;sdl_nlen &gt; 0</a>
+<a name="ln225">					&amp;&amp; !strncmp(device-&gt;name, (const char*)link-&gt;sdl_data,</a>
+<a name="ln226">							IF_NAMESIZE))</a>
+<a name="ln227">				|| (link-&gt;sdl_nlen == 0 &amp;&amp; link-&gt;sdl_alen &gt; 0</a>
+<a name="ln228">					&amp;&amp; !memcmp(LLADDR(link), device-&gt;address.data,</a>
+<a name="ln229">							device-&gt;address.length)))</a>
+<a name="ln230">				break;</a>
+<a name="ln231">		}</a>
+<a name="ln232">	} else</a>
+<a name="ln233">		route = find_route(domain, address);</a>
+<a name="ln234"> </a>
+<a name="ln235">	if (route != NULL &amp;&amp; atomic_add(&amp;route-&gt;ref_count, 1) == 0) {</a>
+<a name="ln236">		// route has been deleted already</a>
+<a name="ln237">		route = NULL;</a>
+<a name="ln238">	}</a>
+<a name="ln239"> </a>
+<a name="ln240">	return route;</a>
+<a name="ln241">}</a>
+<a name="ln242"> </a>
+<a name="ln243"> </a>
+<a name="ln244">static void</a>
+<a name="ln245">update_route_infos(struct net_domain_private* domain)</a>
+<a name="ln246">{</a>
+<a name="ln247">	ASSERT_LOCKED_RECURSIVE(&amp;domain-&gt;lock);</a>
+<a name="ln248">	RouteInfoList::Iterator iterator = domain-&gt;route_infos.GetIterator();</a>
+<a name="ln249"> </a>
+<a name="ln250">	while (iterator.HasNext()) {</a>
+<a name="ln251">		net_route_info* info = iterator.Next();</a>
+<a name="ln252"> </a>
+<a name="ln253">		put_route_internal(domain, info-&gt;route);</a>
+<a name="ln254">		info-&gt;route = get_route_internal(domain, &amp;info-&gt;address);</a>
+<a name="ln255">	}</a>
+<a name="ln256">}</a>
+<a name="ln257"> </a>
+<a name="ln258"> </a>
+<a name="ln259">static sockaddr*</a>
+<a name="ln260">copy_address(UserBuffer&amp; buffer, sockaddr* address)</a>
+<a name="ln261">{</a>
+<a name="ln262">	if (address == NULL)</a>
+<a name="ln263">		return NULL;</a>
+<a name="ln264"> </a>
+<a name="ln265">	return (sockaddr*)buffer.Push(address, address-&gt;sa_len);</a>
+<a name="ln266">}</a>
+<a name="ln267"> </a>
+<a name="ln268"> </a>
+<a name="ln269">static status_t</a>
+<a name="ln270">fill_route_entry(route_entry* target, void* _buffer, size_t bufferSize,</a>
+<a name="ln271">	net_route* route)</a>
+<a name="ln272">{</a>
+<a name="ln273">	UserBuffer buffer(((uint8*)_buffer) + sizeof(route_entry),</a>
+<a name="ln274">		bufferSize - sizeof(route_entry));</a>
+<a name="ln275"> </a>
+<a name="ln276">	target-&gt;destination = copy_address(buffer, route-&gt;destination);</a>
+<a name="ln277">	target-&gt;mask = copy_address(buffer, route-&gt;mask);</a>
+<a name="ln278">	target-&gt;gateway = copy_address(buffer, route-&gt;gateway);</a>
+<a name="ln279">	target-&gt;source = copy_address(buffer, route-&gt;interface_address-&gt;local);</a>
+<a name="ln280">	target-&gt;flags = route-&gt;flags;</a>
+<a name="ln281">	target-&gt;mtu = route-&gt;mtu;</a>
+<a name="ln282"> </a>
+<a name="ln283">	return buffer.Status();</a>
+<a name="ln284">}</a>
+<a name="ln285"> </a>
+<a name="ln286"> </a>
+<a name="ln287">//	#pragma mark - exported functions</a>
+<a name="ln288"> </a>
+<a name="ln289"> </a>
+<a name="ln290">/*!	Determines the size of a buffer large enough to contain the whole</a>
+<a name="ln291">	routing table.</a>
+<a name="ln292">*/</a>
+<a name="ln293">uint32</a>
+<a name="ln294">route_table_size(net_domain_private* domain)</a>
+<a name="ln295">{</a>
+<a name="ln296">	RecursiveLocker locker(domain-&gt;lock);</a>
+<a name="ln297">	uint32 size = 0;</a>
+<a name="ln298"> </a>
+<a name="ln299">	RouteList::Iterator iterator = domain-&gt;routes.GetIterator();</a>
+<a name="ln300">	while (iterator.HasNext()) {</a>
+<a name="ln301">		net_route_private* route = iterator.Next();</a>
+<a name="ln302">		size += IF_NAMESIZE + sizeof(route_entry);</a>
+<a name="ln303"> </a>
+<a name="ln304">		if (route-&gt;destination)</a>
+<a name="ln305">			size += route-&gt;destination-&gt;sa_len;</a>
+<a name="ln306">		if (route-&gt;mask)</a>
+<a name="ln307">			size += route-&gt;mask-&gt;sa_len;</a>
+<a name="ln308">		if (route-&gt;gateway)</a>
+<a name="ln309">			size += route-&gt;gateway-&gt;sa_len;</a>
+<a name="ln310">	}</a>
+<a name="ln311"> </a>
+<a name="ln312">	return size;</a>
+<a name="ln313">}</a>
+<a name="ln314"> </a>
+<a name="ln315"> </a>
+<a name="ln316">/*!	Dumps a list of all routes into the supplied userland buffer.</a>
+<a name="ln317">	If the routes don't fit into the buffer, an error (\c ENOBUFS) is</a>
+<a name="ln318">	returned.</a>
+<a name="ln319">*/</a>
+<a name="ln320">status_t</a>
+<a name="ln321">list_routes(net_domain_private* domain, void* buffer, size_t size)</a>
+<a name="ln322">{</a>
+<a name="ln323">	RecursiveLocker _(domain-&gt;lock);</a>
+<a name="ln324"> </a>
+<a name="ln325">	RouteList::Iterator iterator = domain-&gt;routes.GetIterator();</a>
+<a name="ln326">	const size_t kBaseSize = IF_NAMESIZE + sizeof(route_entry);</a>
+<a name="ln327">	size_t spaceLeft = size;</a>
+<a name="ln328"> </a>
+<a name="ln329">	sockaddr zeros;</a>
+<a name="ln330">	memset(&amp;zeros, 0, sizeof(sockaddr));</a>
+<a name="ln331">	zeros.sa_family = domain-&gt;family;</a>
+<a name="ln332">	zeros.sa_len = sizeof(sockaddr);</a>
+<a name="ln333"> </a>
+<a name="ln334">	while (iterator.HasNext()) {</a>
+<a name="ln335">		net_route* route = iterator.Next();</a>
+<a name="ln336"> </a>
+<a name="ln337">		size = kBaseSize;</a>
+<a name="ln338"> </a>
+<a name="ln339">		sockaddr* destination = NULL;</a>
+<a name="ln340">		sockaddr* mask = NULL;</a>
+<a name="ln341">		sockaddr* gateway = NULL;</a>
+<a name="ln342">		uint8* next = (uint8*)buffer + size;</a>
+<a name="ln343"> </a>
+<a name="ln344">		if (route-&gt;destination != NULL) {</a>
+<a name="ln345">			destination = (sockaddr*)next;</a>
+<a name="ln346">			next += route-&gt;destination-&gt;sa_len;</a>
+<a name="ln347">			size += route-&gt;destination-&gt;sa_len;</a>
+<a name="ln348">		}</a>
+<a name="ln349">		if (route-&gt;mask != NULL) {</a>
+<a name="ln350">			mask = (sockaddr*)next;</a>
+<a name="ln351">			next += route-&gt;mask-&gt;sa_len;</a>
+<a name="ln352">			size += route-&gt;mask-&gt;sa_len;</a>
+<a name="ln353">		}</a>
+<a name="ln354">		if (route-&gt;gateway != NULL) {</a>
+<a name="ln355">			gateway = (sockaddr*)next;</a>
+<a name="ln356">			next += route-&gt;gateway-&gt;sa_len;</a>
+<a name="ln357">			size += route-&gt;gateway-&gt;sa_len;</a>
+<a name="ln358">		}</a>
+<a name="ln359"> </a>
+<a name="ln360">		if (spaceLeft &lt; size)</a>
+<a name="ln361">			return ENOBUFS;</a>
+<a name="ln362"> </a>
+<a name="ln363">		ifreq request;</a>
+<a name="ln364">		memset(&amp;request, 0, sizeof(request));</a>
+<a name="ln365"> </a>
+<a name="ln366">		strlcpy(request.ifr_name, route-&gt;interface_address-&gt;interface-&gt;name,</a>
+<a name="ln367">			IF_NAMESIZE);</a>
+<a name="ln368">		request.ifr_route.destination = destination;</a>
+<a name="ln369">		request.ifr_route.mask = mask;</a>
+<a name="ln370">		request.ifr_route.gateway = gateway;</a>
+<a name="ln371">		request.ifr_route.mtu = route-&gt;mtu;</a>
+<a name="ln372">		request.ifr_route.flags = route-&gt;flags;</a>
+<a name="ln373"> </a>
+<a name="ln374">		// copy data into userland buffer</a>
+<a name="ln375">		if (user_memcpy(buffer, &amp;request, kBaseSize) &lt; B_OK</a>
+<a name="ln376">			|| (route-&gt;destination != NULL</a>
+<a name="ln377">				&amp;&amp; user_memcpy(request.ifr_route.destination,</a>
+<a name="ln378">					route-&gt;destination, route-&gt;destination-&gt;sa_len) &lt; B_OK)</a>
+<a name="ln379">			|| (route-&gt;mask != NULL &amp;&amp; user_memcpy(request.ifr_route.mask,</a>
+<a name="ln380">					route-&gt;mask, route-&gt;mask-&gt;sa_len) &lt; B_OK)</a>
+<a name="ln381">			|| (route-&gt;gateway != NULL &amp;&amp; user_memcpy(request.ifr_route.gateway,</a>
+<a name="ln382">					route-&gt;gateway, route-&gt;gateway-&gt;sa_len) &lt; B_OK))</a>
+<a name="ln383">			return B_BAD_ADDRESS;</a>
+<a name="ln384"> </a>
+<a name="ln385">		buffer = (void*)next;</a>
+<a name="ln386">		spaceLeft -= size;</a>
+<a name="ln387">	}</a>
+<a name="ln388"> </a>
+<a name="ln389">	return B_OK;</a>
+<a name="ln390">}</a>
+<a name="ln391"> </a>
+<a name="ln392"> </a>
+<a name="ln393">status_t</a>
+<a name="ln394">control_routes(struct net_interface* _interface, net_domain* domain,</a>
+<a name="ln395">	int32 option, void* argument, size_t length)</a>
+<a name="ln396">{</a>
+<a name="ln397">	TRACE(&quot;control_routes(interface %p, domain %p, option %&quot; B_PRId32 &quot;)\n&quot;,</a>
+<a name="ln398">		_interface, domain, option);</a>
+<a name="ln399">	Interface* interface = (Interface*)_interface;</a>
+<a name="ln400"> </a>
+<a name="ln401">	switch (option) {</a>
+<a name="ln402">		case SIOCADDRT:</a>
+<a name="ln403">		case SIOCDELRT:</a>
+<a name="ln404">		{</a>
+<a name="ln405">			// add or remove a route</a>
+<a name="ln406">			if (length != sizeof(struct ifreq))</a>
+<a name="ln407">				return B_BAD_VALUE;</a>
+<a name="ln408"> </a>
+<a name="ln409">			route_entry entry;</a>
+<a name="ln410">			if (user_memcpy(&amp;entry, &amp;((ifreq*)argument)-&gt;ifr_route,</a>
+<a name="ln411">					sizeof(route_entry)) != B_OK)</a>
+<a name="ln412">				return B_BAD_ADDRESS;</a>
+<a name="ln413"> </a>
+<a name="ln414">			net_route_private route;</a>
+<a name="ln415">			status_t status;</a>
+<a name="ln416">			if ((status = user_copy_address(entry.destination,</a>
+<a name="ln417">					&amp;route.destination)) != B_OK</a>
+<a name="ln418">				|| (status = user_copy_address(entry.mask, &amp;route.mask)) != B_OK</a>
+<a name="ln419">				|| (status = user_copy_address(entry.gateway, &amp;route.gateway))</a>
+<a name="ln420">					!= B_OK)</a>
+<a name="ln421">				return status;</a>
+<a name="ln422"> </a>
+<a name="ln423">			InterfaceAddress* address</a>
+<a name="ln424">				= interface-&gt;FirstForFamily(domain-&gt;family);</a>
+<a name="ln425"> </a>
+<a name="ln426">			route.mtu = entry.mtu;</a>
+<a name="ln427">			route.flags = entry.flags;</a>
+<a name="ln428">			route.interface_address = address;</a>
+<a name="ln429"> </a>
+<a name="ln430">			if (option == SIOCADDRT)</a>
+<a name="ln431">				status = add_route(domain, &amp;route);</a>
+<a name="ln432">			else</a>
+<a name="ln433">				status = remove_route(domain, &amp;route);</a>
+<a name="ln434"> </a>
+<a name="ln435">			if (address != NULL)</a>
+<a name="ln436">				address-&gt;ReleaseReference();</a>
+<a name="ln437">			return status;</a>
+<a name="ln438">		}</a>
+<a name="ln439">	}</a>
+<a name="ln440">	return B_BAD_VALUE;</a>
+<a name="ln441">}</a>
+<a name="ln442"> </a>
+<a name="ln443"> </a>
+<a name="ln444">status_t</a>
+<a name="ln445">add_route(struct net_domain* _domain, const struct net_route* newRoute)</a>
+<a name="ln446">{</a>
+<a name="ln447">	struct net_domain_private* domain = (net_domain_private*)_domain;</a>
+<a name="ln448"> </a>
+<a name="ln449">	TRACE(&quot;add route to domain %s: dest %s, mask %s, gw %s, flags %lx\n&quot;,</a>
+<a name="ln450">		domain-&gt;name,</a>
+<a name="ln451">		AddressString(domain, newRoute-&gt;destination</a>
+<a name="ln452">			? newRoute-&gt;destination : NULL).Data(),</a>
+<a name="ln453">		AddressString(domain, newRoute-&gt;mask ? newRoute-&gt;mask : NULL).Data(),</a>
+<a name="ln454">		AddressString(domain, newRoute-&gt;gateway</a>
+<a name="ln455">			? newRoute-&gt;gateway : NULL).Data(),</a>
+<a name="ln456">		newRoute-&gt;flags);</a>
+<a name="ln457"> </a>
+<a name="ln458">	if (domain == NULL || newRoute == NULL</a>
+<a name="ln459">		|| newRoute-&gt;interface_address == NULL</a>
+<a name="ln460">		|| ((newRoute-&gt;flags &amp; RTF_HOST) != 0 &amp;&amp; newRoute-&gt;mask != NULL)</a>
+<a name="ln461">		|| ((newRoute-&gt;flags &amp; RTF_DEFAULT) == 0</a>
+<a name="ln462">			&amp;&amp; newRoute-&gt;destination == NULL)</a>
+<a name="ln463">		|| ((newRoute-&gt;flags &amp; RTF_GATEWAY) != 0 &amp;&amp; newRoute-&gt;gateway == NULL)</a>
+<a name="ln464">		|| !domain-&gt;address_module-&gt;check_mask(newRoute-&gt;mask))</a>
+<a name="ln465">		return B_BAD_VALUE;</a>
+<a name="ln466"> </a>
+<a name="ln467">	RecursiveLocker _(domain-&gt;lock);</a>
+<a name="ln468"> </a>
+<a name="ln469">	net_route_private* route = find_route(domain, newRoute);</a>
+<a name="ln470">	if (route != NULL)</a>
+<a name="ln471">		return B_FILE_EXISTS;</a>
+<a name="ln472"> </a>
+<a name="ln473">	route = new (std::nothrow) net_route_private;</a>
+<a name="ln474">	if (route == NULL)</a>
+<a name="ln475">		return B_NO_MEMORY;</a>
+<a name="ln476"> </a>
+<a name="ln477">	if (domain-&gt;address_module-&gt;copy_address(newRoute-&gt;destination,</a>
+<a name="ln478">			&amp;route-&gt;destination, (newRoute-&gt;flags &amp; RTF_DEFAULT) != 0,</a>
+<a name="ln479">			newRoute-&gt;mask) != B_OK</a>
+<a name="ln480">		|| domain-&gt;address_module-&gt;copy_address(newRoute-&gt;mask, &amp;route-&gt;mask,</a>
+<a name="ln481">			(newRoute-&gt;flags &amp; RTF_DEFAULT) != 0, NULL) != B_OK</a>
+<a name="ln482">		|| domain-&gt;address_module-&gt;copy_address(newRoute-&gt;gateway,</a>
+<a name="ln483">			&amp;route-&gt;gateway, false, NULL) != B_OK) {</a>
+<a name="ln484">		delete route;</a>
+<a name="ln485">		return B_NO_MEMORY;</a>
+<a name="ln486">	}</a>
+<a name="ln487"> </a>
+<a name="ln488">	route-&gt;flags = newRoute-&gt;flags;</a>
+<a name="ln489">	route-&gt;interface_address = newRoute-&gt;interface_address;</a>
+<a name="ln490">	((InterfaceAddress*)route-&gt;interface_address)-&gt;AcquireReference();</a>
+<a name="ln491">	route-&gt;mtu = 0;</a>
+<a name="ln492">	route-&gt;ref_count = 1;</a>
+<a name="ln493"> </a>
+<a name="ln494">	// Insert the route sorted by completeness of its mask</a>
+<a name="ln495"> </a>
+<a name="ln496">	RouteList::Iterator iterator = domain-&gt;routes.GetIterator();</a>
+<a name="ln497">	net_route_private* before = NULL;</a>
+<a name="ln498"> </a>
+<a name="ln499">	while ((before = iterator.Next()) != NULL) {</a>
+<a name="ln500">		// if the before mask is less specific than the one of the route,</a>
+<a name="ln501">		// we can insert it before that route.</a>
+<a name="ln502">		if (domain-&gt;address_module-&gt;first_mask_bit(before-&gt;mask)</a>
+<a name="ln503">				&gt; domain-&gt;address_module-&gt;first_mask_bit(route-&gt;mask))</a>
+<a name="ln504">			break;</a>
+<a name="ln505"> </a>
+<a name="ln506">		if ((route-&gt;flags &amp; RTF_DEFAULT) != 0</a>
+<a name="ln507">			&amp;&amp; (before-&gt;flags &amp; RTF_DEFAULT) != 0) {</a>
+<a name="ln508">			// both routes are equal - let the link speed decide the</a>
+<a name="ln509">			// order</a>
+<a name="ln510">			if (before-&gt;interface_address-&gt;interface-&gt;device-&gt;link_speed</a>
+<a name="ln511">					&lt; route-&gt;interface_address-&gt;interface-&gt;device-&gt;link_speed)</a>
+<a name="ln512">				break;</a>
+<a name="ln513">		}</a>
+<a name="ln514">	}</a>
+<a name="ln515"> </a>
+<a name="ln516">	domain-&gt;routes.Insert(before, route);</a>
+<a name="ln517">	update_route_infos(domain);</a>
+<a name="ln518"> </a>
+<a name="ln519">	return B_OK;</a>
+<a name="ln520">}</a>
+<a name="ln521"> </a>
+<a name="ln522"> </a>
+<a name="ln523">status_t</a>
+<a name="ln524">remove_route(struct net_domain* _domain, const struct net_route* removeRoute)</a>
+<a name="ln525">{</a>
+<a name="ln526">	struct net_domain_private* domain = (net_domain_private*)_domain;</a>
+<a name="ln527"> </a>
+<a name="ln528">	TRACE(&quot;remove route from domain %s: dest %s, mask %s, gw %s, flags %lx\n&quot;,</a>
+<a name="ln529">		domain-&gt;name,</a>
+<a name="ln530">		AddressString(domain, removeRoute-&gt;destination</a>
+<a name="ln531">			? removeRoute-&gt;destination : NULL).Data(),</a>
+<a name="ln532">		AddressString(domain, removeRoute-&gt;mask</a>
+<a name="ln533">			? removeRoute-&gt;mask : NULL).Data(),</a>
+<a name="ln534">		AddressString(domain, removeRoute-&gt;gateway</a>
+<a name="ln535">			? removeRoute-&gt;gateway : NULL).Data(),</a>
+<a name="ln536">		removeRoute-&gt;flags);</a>
+<a name="ln537"> </a>
+<a name="ln538">	RecursiveLocker locker(domain-&gt;lock);</a>
+<a name="ln539"> </a>
+<a name="ln540">	net_route_private* route = find_route(domain, removeRoute);</a>
+<a name="ln541">	if (route == NULL)</a>
+<a name="ln542">		return B_ENTRY_NOT_FOUND;</a>
+<a name="ln543"> </a>
+<a name="ln544">	domain-&gt;routes.Remove(route);</a>
+<a name="ln545"> </a>
+<a name="ln546">	put_route_internal(domain, route);</a>
+<a name="ln547">	update_route_infos(domain);</a>
+<a name="ln548"> </a>
+<a name="ln549">	return B_OK;</a>
+<a name="ln550">}</a>
+<a name="ln551"> </a>
+<a name="ln552"> </a>
+<a name="ln553">status_t</a>
+<a name="ln554">get_route_information(struct net_domain* _domain, void* value, size_t length)</a>
+<a name="ln555">{</a>
+<a name="ln556">	struct net_domain_private* domain = (net_domain_private*)_domain;</a>
+<a name="ln557"> </a>
+<a name="ln558">	if (length &lt; sizeof(route_entry))</a>
+<a name="ln559">		return B_BAD_VALUE;</a>
+<a name="ln560"> </a>
+<a name="ln561">	route_entry entry;</a>
+<a name="ln562">	if (user_memcpy(&amp;entry, value, sizeof(route_entry)) &lt; B_OK)</a>
+<a name="ln563">		return B_BAD_ADDRESS;</a>
+<a name="ln564"> </a>
+<a name="ln565">	sockaddr_storage destination;</a>
+<a name="ln566">	status_t status = user_copy_address(entry.destination, &amp;destination);</a>
+<a name="ln567">	if (status != B_OK)</a>
+<a name="ln568">		return status;</a>
+<a name="ln569"> </a>
+<a name="ln570">	RecursiveLocker locker(domain-&gt;lock);</a>
+<a name="ln571"> </a>
+<a name="ln572">	net_route_private* route = find_route(domain, (sockaddr*)&amp;destination);</a>
+<a name="ln573">	if (route == NULL)</a>
+<a name="ln574">		return B_ENTRY_NOT_FOUND;</a>
+<a name="ln575"> </a>
+<a name="ln576">	status = fill_route_entry(&amp;entry, value, length, route);</a>
+<a name="ln577">	if (status != B_OK)</a>
+<a name="ln578">		return status;</a>
+<a name="ln579"> </a>
+<a name="ln580">	return user_memcpy(value, &amp;entry, sizeof(route_entry));</a>
+<a name="ln581">}</a>
+<a name="ln582"> </a>
+<a name="ln583"> </a>
+<a name="ln584">void</a>
+<a name="ln585">invalidate_routes(net_domain* _domain, net_interface* interface)</a>
+<a name="ln586">{</a>
+<a name="ln587">	net_domain_private* domain = (net_domain_private*)_domain;</a>
+<a name="ln588">	RecursiveLocker locker(domain-&gt;lock);</a>
+<a name="ln589"> </a>
+<a name="ln590">	TRACE(&quot;invalidate_routes(%i, %s)\n&quot;, domain-&gt;family, interface-&gt;name);</a>
+<a name="ln591"> </a>
+<a name="ln592">	RouteList::Iterator iterator = domain-&gt;routes.GetIterator();</a>
+<a name="ln593">	while (iterator.HasNext()) {</a>
+<a name="ln594">		net_route* route = iterator.Next();</a>
+<a name="ln595"> </a>
+<a name="ln596">		if (route-&gt;interface_address-&gt;interface == interface)</a>
+<a name="ln597">			remove_route(domain, route);</a>
+<a name="ln598">	}</a>
+<a name="ln599">}</a>
+<a name="ln600"> </a>
+<a name="ln601"> </a>
+<a name="ln602">void</a>
+<a name="ln603">invalidate_routes(InterfaceAddress* address)</a>
+<a name="ln604">{</a>
+<a name="ln605">	net_domain_private* domain = (net_domain_private*)address-&gt;domain;</a>
+<a name="ln606"> </a>
+<a name="ln607">	TRACE(&quot;invalidate_routes(%s)\n&quot;,</a>
+<a name="ln608">		AddressString(domain, address-&gt;local).Data());</a>
+<a name="ln609"> </a>
+<a name="ln610">	RecursiveLocker locker(domain-&gt;lock);</a>
+<a name="ln611"> </a>
+<a name="ln612">	RouteList::Iterator iterator = domain-&gt;routes.GetIterator();</a>
+<a name="ln613">	while (iterator.HasNext()) {</a>
+<a name="ln614">		net_route* route = iterator.Next();</a>
+<a name="ln615"> </a>
+<a name="ln616">		if (route-&gt;interface_address == address)</a>
+<a name="ln617">			remove_route(domain, route);</a>
+<a name="ln618">	}</a>
+<a name="ln619">}</a>
+<a name="ln620"> </a>
+<a name="ln621"> </a>
+<a name="ln622">struct net_route*</a>
+<a name="ln623">get_route(struct net_domain* _domain, const struct sockaddr* address)</a>
+<a name="ln624">{</a>
+<a name="ln625">	struct net_domain_private* domain = (net_domain_private*)_domain;</a>
+<a name="ln626">	RecursiveLocker locker(domain-&gt;lock);</a>
+<a name="ln627"> </a>
+<a name="ln628">	return get_route_internal(domain, address);</a>
+<a name="ln629">}</a>
+<a name="ln630"> </a>
+<a name="ln631"> </a>
+<a name="ln632">status_t</a>
+<a name="ln633">get_device_route(struct net_domain* domain, uint32 index, net_route** _route)</a>
+<a name="ln634">{</a>
+<a name="ln635">	Interface* interface = get_interface_for_device(domain, index);</a>
+<a name="ln636">	if (interface == NULL)</a>
+<a name="ln637">		return ENETUNREACH;</a>
+<a name="ln638"> </a>
+<a name="ln639">	net_route_private* route</a>
+<a name="ln640">		= &amp;interface-&gt;DomainDatalink(domain-&gt;family)-&gt;direct_route;</a>
+<a name="ln641"> </a>
+<a name="ln642">	atomic_add(&amp;route-&gt;ref_count, 1);</a>
+<a name="ln643">	*_route = route;</a>
+<a name="ln644"> </a>
+<a name="ln645">	interface-&gt;ReleaseReference();</a>
+<a name="ln646">	return B_OK;</a>
+<a name="ln647">}</a>
+<a name="ln648"> </a>
+<a name="ln649"> </a>
+<a name="ln650">status_t</a>
+<a name="ln651">get_buffer_route(net_domain* _domain, net_buffer* buffer, net_route** _route)</a>
+<a name="ln652">{</a>
+<a name="ln653">	net_domain_private* domain = (net_domain_private*)_domain;</a>
+<a name="ln654"> </a>
+<a name="ln655">	RecursiveLocker _(domain-&gt;lock);</a>
+<a name="ln656"> </a>
+<a name="ln657">	net_route* route = get_route_internal(domain, buffer-&gt;destination);</a>
+<a name="ln658">	if (route == NULL)</a>
+<a name="ln659">		return ENETUNREACH;</a>
+<a name="ln660"> </a>
+<a name="ln661">	status_t status = B_OK;</a>
+<a name="ln662">	sockaddr* source = buffer-&gt;source;</a>
+<a name="ln663"> </a>
+<a name="ln664">	// TODO: we are quite relaxed in the address checking here</a>
+<a name="ln665">	// as we might proceed with source = INADDR_ANY.</a>
+<a name="ln666"> </a>
+<a name="ln667">	if (route-&gt;interface_address != NULL</a>
+<a name="ln668">		&amp;&amp; route-&gt;interface_address-&gt;local != NULL) {</a>
+<a name="ln669">		status = domain-&gt;address_module-&gt;update_to(source,</a>
+<a name="ln670">			route-&gt;interface_address-&gt;local);</a>
+<a name="ln671">	}</a>
+<a name="ln672"> </a>
+<a name="ln673">	if (status != B_OK)</a>
+<a name="ln674">		put_route_internal(domain, route);</a>
+<a name="ln675">	else</a>
+<a name="ln676">		*_route = route;</a>
+<a name="ln677"> </a>
+<a name="ln678">	return status;</a>
+<a name="ln679">}</a>
+<a name="ln680"> </a>
+<a name="ln681"> </a>
+<a name="ln682">void</a>
+<a name="ln683">put_route(struct net_domain* _domain, net_route* route)</a>
+<a name="ln684">{</a>
+<a name="ln685">	struct net_domain_private* domain = (net_domain_private*)_domain;</a>
+<a name="ln686">	if (domain == NULL || route == NULL)</a>
+<a name="ln687">		return;</a>
+<a name="ln688"> </a>
+<a name="ln689">	RecursiveLocker locker(domain-&gt;lock);</a>
+<a name="ln690"> </a>
+<a name="ln691">	put_route_internal(domain, (net_route*)route);</a>
+<a name="ln692">}</a>
+<a name="ln693"> </a>
+<a name="ln694"> </a>
+<a name="ln695">status_t</a>
+<a name="ln696">register_route_info(struct net_domain* _domain, struct net_route_info* info)</a>
+<a name="ln697">{</a>
+<a name="ln698">	struct net_domain_private* domain = (net_domain_private*)_domain;</a>
+<a name="ln699">	RecursiveLocker locker(domain-&gt;lock);</a>
+<a name="ln700"> </a>
+<a name="ln701">	domain-&gt;route_infos.Add(info);</a>
+<a name="ln702">	info-&gt;route = get_route_internal(domain, &amp;info-&gt;address);</a>
+<a name="ln703"> </a>
+<a name="ln704">	return B_OK;</a>
+<a name="ln705">}</a>
+<a name="ln706"> </a>
+<a name="ln707"> </a>
+<a name="ln708">status_t</a>
+<a name="ln709">unregister_route_info(struct net_domain* _domain, struct net_route_info* info)</a>
+<a name="ln710">{</a>
+<a name="ln711">	struct net_domain_private* domain = (net_domain_private*)_domain;</a>
+<a name="ln712">	RecursiveLocker locker(domain-&gt;lock);</a>
+<a name="ln713"> </a>
+<a name="ln714">	domain-&gt;route_infos.Remove(info);</a>
+<a name="ln715">	if (info-&gt;route != NULL)</a>
+<a name="ln716">		put_route_internal(domain, info-&gt;route);</a>
+<a name="ln717"> </a>
+<a name="ln718">	return B_OK;</a>
+<a name="ln719">}</a>
+<a name="ln720"> </a>
+<a name="ln721"> </a>
+<a name="ln722">status_t</a>
+<a name="ln723">update_route_info(struct net_domain* _domain, struct net_route_info* info)</a>
+<a name="ln724">{</a>
+<a name="ln725">	struct net_domain_private* domain = (net_domain_private*)_domain;</a>
+<a name="ln726">	RecursiveLocker locker(domain-&gt;lock);</a>
+<a name="ln727"> </a>
+<a name="ln728">	put_route_internal(domain, info-&gt;route);</a>
+<a name="ln729">	info-&gt;route = get_route_internal(domain, &amp;info-&gt;address);</a>
+<a name="ln730">	return B_OK;</a>
+<a name="ln731">}</a>
+<a name="ln732"> </a>
+
+</code></pre>
+<div class="balloon" rel="40"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: ref_count.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

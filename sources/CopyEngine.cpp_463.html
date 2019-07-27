@@ -1,0 +1,630 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>CopyEngine.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2008-2009, Stephan Aßmus &lt;superstippi@gmx.de&gt;</a>
+<a name="ln3"> * Copyright 2014, Axel Dörfler, axeld@pinc-software.de</a>
+<a name="ln4"> * All rights reserved. Distributed under the terms of the MIT License.</a>
+<a name="ln5"> */</a>
+<a name="ln6"> </a>
+<a name="ln7"> </a>
+<a name="ln8">#include &quot;CopyEngine.h&quot;</a>
+<a name="ln9"> </a>
+<a name="ln10">#include &lt;new&gt;</a>
+<a name="ln11"> </a>
+<a name="ln12">#include &lt;math.h&gt;</a>
+<a name="ln13">#include &lt;stdio.h&gt;</a>
+<a name="ln14">#include &lt;string.h&gt;</a>
+<a name="ln15">#include &lt;sys/resource.h&gt;</a>
+<a name="ln16"> </a>
+<a name="ln17">#include &lt;Directory.h&gt;</a>
+<a name="ln18">#include &lt;fs_attr.h&gt;</a>
+<a name="ln19">#include &lt;NodeInfo.h&gt;</a>
+<a name="ln20">#include &lt;Path.h&gt;</a>
+<a name="ln21">#include &lt;SymLink.h&gt;</a>
+<a name="ln22"> </a>
+<a name="ln23">#include &quot;SemaphoreLocker.h&quot;</a>
+<a name="ln24">#include &quot;ProgressReporter.h&quot;</a>
+<a name="ln25"> </a>
+<a name="ln26"> </a>
+<a name="ln27">using std::nothrow;</a>
+<a name="ln28"> </a>
+<a name="ln29"> </a>
+<a name="ln30">// #pragma mark - EntryFilter</a>
+<a name="ln31"> </a>
+<a name="ln32"> </a>
+<a name="ln33">CopyEngine::EntryFilter::~EntryFilter()</a>
+<a name="ln34">{</a>
+<a name="ln35">}</a>
+<a name="ln36"> </a>
+<a name="ln37"> </a>
+<a name="ln38">// #pragma mark - CopyEngine</a>
+<a name="ln39"> </a>
+<a name="ln40"> </a>
+<a name="ln41">CopyEngine::CopyEngine(ProgressReporter* reporter, EntryFilter* entryFilter)</a>
+<a name="ln42">	:</a>
+<a name="ln43">	fBufferQueue(),</a>
+<a name="ln44">	fWriterThread(-1),</a>
+<a name="ln45">	fQuitting(false),</a>
+<a name="ln46"> </a>
+<a name="ln47">	fAbsoluteSourcePath(),</a>
+<a name="ln48"> </a>
+<a name="ln49">	fBytesRead(0),</a>
+<a name="ln50">	fLastBytesRead(0),</a>
+<a name="ln51">	fItemsCopied(0),</a>
+<a name="ln52">	fLastItemsCopied(0),</a>
+<a name="ln53">	fTimeRead(0),</a>
+<a name="ln54"> </a>
+<a name="ln55">	fBytesWritten(0),</a>
+<a name="ln56">	fTimeWritten(0),</a>
+<a name="ln57"> </a>
+<a name="ln58">	fBytesToCopy(0),</a>
+<a name="ln59">	fItemsToCopy(0),</a>
+<a name="ln60"> </a>
+<a name="ln61">	fCurrentTargetFolder(NULL),</a>
+<a name="ln62">	fCurrentItem(NULL),</a>
+<a name="ln63"> </a>
+<a name="ln64">	fProgressReporter(reporter),</a>
+<a name="ln65">	fEntryFilter(entryFilter)</a>
+<a name="ln66">{</a>
+<a name="ln67">	fWriterThread = spawn_thread(_WriteThreadEntry, &quot;buffer writer&quot;,</a>
+<a name="ln68">		B_NORMAL_PRIORITY, this);</a>
+<a name="ln69"> </a>
+<a name="ln70">	if (fWriterThread &gt;= B_OK)</a>
+<a name="ln71">		resume_thread(fWriterThread);</a>
+<a name="ln72"> </a>
+<a name="ln73">	// ask for a bunch more file descriptors so that nested copying works well</a>
+<a name="ln74">	struct rlimit rl;</a>
+<a name="ln75">	rl.rlim_cur = 512;</a>
+<a name="ln76">	rl.rlim_max = RLIM_SAVED_MAX;</a>
+<a name="ln77">	setrlimit(RLIMIT_NOFILE, &amp;rl);</a>
+<a name="ln78">}</a>
+<a name="ln79"> </a>
+<a name="ln80"> </a>
+<a name="ln81">CopyEngine::~CopyEngine()</a>
+<a name="ln82">{</a>
+<a name="ln83">	while (fBufferQueue.Size() &gt; 0)</a>
+<a name="ln84">		snooze(10000);</a>
+<a name="ln85"> </a>
+<a name="ln86">	fQuitting = true;</a>
+<a name="ln87">	if (fWriterThread &gt;= B_OK) {</a>
+<a name="ln88">		int32 exitValue;</a>
+<a name="ln89">		wait_for_thread(fWriterThread, &amp;exitValue);</a>
+<a name="ln90">	}</a>
+<a name="ln91">}</a>
+<a name="ln92"> </a>
+<a name="ln93"> </a>
+<a name="ln94">void</a>
+<a name="ln95">CopyEngine::ResetTargets(const char* source)</a>
+<a name="ln96">{</a>
+<a name="ln97">	// TODO: One could subtract the bytes/items which were added to the</a>
+<a name="ln98">	// ProgressReporter before resetting them...</a>
+<a name="ln99"> </a>
+<a name="ln100">	fAbsoluteSourcePath = source;</a>
+<a name="ln101"> </a>
+<a name="ln102">	fBytesRead = 0;</a>
+<a name="ln103">	fLastBytesRead = 0;</a>
+<a name="ln104">	fItemsCopied = 0;</a>
+<a name="ln105">	fLastItemsCopied = 0;</a>
+<a name="ln106">	fTimeRead = 0;</a>
+<a name="ln107"> </a>
+<a name="ln108">	fBytesWritten = 0;</a>
+<a name="ln109">	fTimeWritten = 0;</a>
+<a name="ln110"> </a>
+<a name="ln111">	fBytesToCopy = 0;</a>
+<a name="ln112">	fItemsToCopy = 0;</a>
+<a name="ln113"> </a>
+<a name="ln114">	fCurrentTargetFolder = NULL;</a>
+<a name="ln115">	fCurrentItem = NULL;</a>
+<a name="ln116">}</a>
+<a name="ln117"> </a>
+<a name="ln118"> </a>
+<a name="ln119">status_t</a>
+<a name="ln120">CopyEngine::CollectTargets(const char* source, sem_id cancelSemaphore)</a>
+<a name="ln121">{</a>
+<a name="ln122">	int32 level = 0;</a>
+<a name="ln123">	status_t ret = _CollectCopyInfo(source, level, cancelSemaphore);</a>
+<a name="ln124">	if (ret == B_OK &amp;&amp; fProgressReporter != NULL)</a>
+<a name="ln125">		fProgressReporter-&gt;AddItems(fItemsToCopy, fBytesToCopy);</a>
+<a name="ln126">	return ret;</a>
+<a name="ln127">}</a>
+<a name="ln128"> </a>
+<a name="ln129"> </a>
+<a name="ln130">status_t</a>
+<a name="ln131">CopyEngine::CopyFolder(const char* source, const char* destination,</a>
+<a name="ln132">	sem_id cancelSemaphore)</a>
+<a name="ln133">{</a>
+<a name="ln134">	int32 level = 0;</a>
+<a name="ln135">	return _CopyFolder(source, destination, level, cancelSemaphore);</a>
+<a name="ln136">}</a>
+<a name="ln137"> </a>
+<a name="ln138"> </a>
+<a name="ln139">status_t</a>
+<a name="ln140">CopyEngine::CopyFile(const BEntry&amp; _source, const BEntry&amp; _destination,</a>
+<a name="ln141">	sem_id cancelSemaphore)</a>
+<a name="ln142">{</a>
+<a name="ln143">	SemaphoreLocker lock(cancelSemaphore);</a>
+<a name="ln144">	if (cancelSemaphore &gt;= 0 &amp;&amp; !lock.IsLocked()) {</a>
+<a name="ln145">		// We are supposed to quit</a>
+<a name="ln146">		return B_CANCELED;</a>
+<a name="ln147">	}</a>
+<a name="ln148"> </a>
+<a name="ln149">	BFile source(&amp;_source, B_READ_ONLY);</a>
+<a name="ln150">	status_t ret = source.InitCheck();</a>
+<a name="ln151">	if (ret &lt; B_OK)</a>
+<a name="ln152">		return ret;</a>
+<a name="ln153"> </a>
+<a name="ln154">	BFile* destination = new (nothrow) BFile(&amp;_destination,</a>
+<a name="ln155">		B_WRITE_ONLY | B_CREATE_FILE | B_ERASE_FILE);</a>
+<a name="ln156">	ret = destination-&gt;InitCheck();</a>
+<a name="ln157">	if (ret &lt; B_OK) {</a>
+<a name="ln158">		delete destination;</a>
+<a name="ln159">		return ret;</a>
+<a name="ln160">	}</a>
+<a name="ln161"> </a>
+<a name="ln162">	int32 loopIteration = 0;</a>
+<a name="ln163"> </a>
+<a name="ln164">	while (true) {</a>
+<a name="ln165">		if (fBufferQueue.Size() &gt;= BUFFER_COUNT) {</a>
+<a name="ln166">			// the queue is &quot;full&quot;, just wait a bit, the</a>
+<a name="ln167">			// write thread will empty it</a>
+<a name="ln168">			snooze(1000);</a>
+<a name="ln169">			continue;</a>
+<a name="ln170">		}</a>
+<a name="ln171"> </a>
+<a name="ln172">		// allocate buffer</a>
+<a name="ln173">		Buffer* buffer = new (nothrow) Buffer(destination);</a>
+<a name="ln174">		if (!buffer || !buffer-&gt;buffer) {</a>
+<a name="ln175">			delete destination;</a>
+<a name="ln176">			delete buffer;</a>
+<a name="ln177">			fprintf(stderr, &quot;reading loop: out of memory\n&quot;);</a>
+<a name="ln178">			return B_NO_MEMORY;</a>
+<a name="ln179">		}</a>
+<a name="ln180"> </a>
+<a name="ln181">		// fill buffer</a>
+<a name="ln182">		ssize_t read = source.Read(buffer-&gt;buffer, buffer-&gt;size);</a>
+<a name="ln183">		if (read &lt; 0) {</a>
+<a name="ln184">			ret = (status_t)read;</a>
+<a name="ln185">			fprintf(stderr, &quot;Failed to read data: %s\n&quot;, strerror(ret));</a>
+<a name="ln186">			delete buffer;</a>
+<a name="ln187">			delete destination;</a>
+<a name="ln188">			break;</a>
+<a name="ln189">		}</a>
+<a name="ln190"> </a>
+<a name="ln191">		fBytesRead += read;</a>
+<a name="ln192">		loopIteration += 1;</a>
+<a name="ln193">		if (loopIteration % 2 == 0)</a>
+<a name="ln194">			_UpdateProgress();</a>
+<a name="ln195"> </a>
+<a name="ln196">		buffer-&gt;deleteFile = read == 0;</a>
+<a name="ln197">		if (read &gt; 0)</a>
+<a name="ln198">			buffer-&gt;validBytes = (size_t)read;</a>
+<a name="ln199">		else</a>
+<a name="ln200">			buffer-&gt;validBytes = 0;</a>
+<a name="ln201"> </a>
+<a name="ln202">		// enqueue the buffer</a>
+<a name="ln203">		ret = fBufferQueue.Push(buffer);</a>
+<a name="ln204">		if (ret &lt; B_OK) {</a>
+<a name="ln205">			buffer-&gt;deleteFile = false;</a>
+<a name="ln206">			delete buffer;</a>
+<a name="ln207">			delete destination;</a>
+<a name="ln208">			return ret;</a>
+<a name="ln209">		}</a>
+<a name="ln210"> </a>
+<a name="ln211">		// quit if done</a>
+<a name="ln212">		if (read == 0)</a>
+<a name="ln213">			break;</a>
+<a name="ln214">	}</a>
+<a name="ln215"> </a>
+<a name="ln216">	return ret;</a>
+<a name="ln217">}</a>
+<a name="ln218"> </a>
+<a name="ln219"> </a>
+<a name="ln220">// #pragma mark -</a>
+<a name="ln221"> </a>
+<a name="ln222"> </a>
+<a name="ln223">status_t</a>
+<a name="ln224">CopyEngine::_CollectCopyInfo(const char* _source, int32&amp; level,</a>
+<a name="ln225">	sem_id cancelSemaphore)</a>
+<a name="ln226">{</a>
+<a name="ln227">	level++;</a>
+<a name="ln228"> </a>
+<a name="ln229">	BDirectory source(_source);</a>
+<a name="ln230">	status_t ret = source.InitCheck();</a>
+<a name="ln231">	if (ret &lt; B_OK)</a>
+<a name="ln232">		return ret;</a>
+<a name="ln233"> </a>
+<a name="ln234">	BEntry entry;</a>
+<a name="ln235">	while (source.GetNextEntry(&amp;entry) == B_OK) {</a>
+<a name="ln236">		SemaphoreLocker lock(cancelSemaphore);</a>
+<a name="ln237">		if (cancelSemaphore &gt;= 0 &amp;&amp; !lock.IsLocked()) {</a>
+<a name="ln238">			// We are supposed to quit</a>
+<a name="ln239">			return B_CANCELED;</a>
+<a name="ln240">		}</a>
+<a name="ln241"> </a>
+<a name="ln242">		struct stat statInfo;</a>
+<a name="ln243">		entry.GetStat(&amp;statInfo);</a>
+<a name="ln244"> </a>
+<a name="ln245">		BPath sourceEntryPath;</a>
+<a name="ln246">		status_t ret = entry.GetPath(&amp;sourceEntryPath);</a>
+<a name="ln247">		if (ret &lt; B_OK)</a>
+<a name="ln248">			return ret;</a>
+<a name="ln249"> </a>
+<a name="ln250">		if (fEntryFilter != NULL</a>
+<a name="ln251">			&amp;&amp; !fEntryFilter-&gt;ShouldCopyEntry(entry,</a>
+<a name="ln252">				_RelativeEntryPath(sourceEntryPath.Path()), statInfo, level)) {</a>
+<a name="ln253">			continue;</a>
+<a name="ln254">		}</a>
+<a name="ln255"> </a>
+<a name="ln256">		if (S_ISDIR(statInfo.st_mode)) {</a>
+<a name="ln257">			// handle recursive directory copy</a>
+<a name="ln258">			BPath srcFolder;</a>
+<a name="ln259">			ret = entry.GetPath(&amp;srcFolder);</a>
+<a name="ln260">			if (ret &lt; B_OK)</a>
+<a name="ln261">				return ret;</a>
+<a name="ln262"> </a>
+<a name="ln263">			if (cancelSemaphore &gt;= 0)</a>
+<a name="ln264">				lock.Unlock();</a>
+<a name="ln265"> </a>
+<a name="ln266">			ret = _CollectCopyInfo(srcFolder.Path(), level, cancelSemaphore);</a>
+<a name="ln267">			if (ret &lt; B_OK)</a>
+<a name="ln268">				return ret;</a>
+<a name="ln269">		} else if (S_ISLNK(statInfo.st_mode)) {</a>
+<a name="ln270">			// link, ignore size</a>
+<a name="ln271">		} else {</a>
+<a name="ln272">			// file data</a>
+<a name="ln273">			fBytesToCopy += statInfo.st_size;</a>
+<a name="ln274">		}</a>
+<a name="ln275"> </a>
+<a name="ln276">		fItemsToCopy++;</a>
+<a name="ln277">	}</a>
+<a name="ln278"> </a>
+<a name="ln279">	level--;</a>
+<a name="ln280">	return B_OK;</a>
+<a name="ln281">}</a>
+<a name="ln282"> </a>
+<a name="ln283"> </a>
+<a name="ln284">status_t</a>
+<a name="ln285">CopyEngine::_CopyFolder(const char* _source, const char* _destination,</a>
+<a name="ln286">	int32&amp; level, sem_id cancelSemaphore)</a>
+<a name="ln287">{</a>
+<a name="ln288">	level++;</a>
+<a name="ln289"> </a>
+<a name="ln290">	BDirectory source(_source);</a>
+<a name="ln291">	status_t ret = source.InitCheck();</a>
+<a name="ln292">	if (ret &lt; B_OK)</a>
+<a name="ln293">		return ret;</a>
+<a name="ln294"> </a>
+<a name="ln295">	ret = create_directory(_destination, 0777);</a>
+<a name="ln296">	if (ret &lt; B_OK &amp;&amp; ret != B_FILE_EXISTS) {</a>
+<a name="ln297">		fprintf(stderr, &quot;Could not create '%s': %s\n&quot;, _destination,</a>
+<a name="ln298">			strerror(ret));</a>
+<a name="ln299">		return ret;</a>
+<a name="ln300">	}</a>
+<a name="ln301"> </a>
+<a name="ln302">	BDirectory destination(_destination);</a>
+<a name="ln303">	ret = destination.InitCheck();</a>
+<a name="ln304">	if (ret &lt; B_OK)</a>
+<a name="ln305">		return ret;</a>
+<a name="ln306"> </a>
+<a name="ln307">	BEntry entry;</a>
+<a name="ln308">	while (source.GetNextEntry(&amp;entry) == B_OK) {</a>
+<a name="ln309">		SemaphoreLocker lock(cancelSemaphore);</a>
+<a name="ln310">		if (cancelSemaphore &gt;= 0 &amp;&amp; !lock.IsLocked()) {</a>
+<a name="ln311">			// We are supposed to quit</a>
+<a name="ln312">			return B_CANCELED;</a>
+<a name="ln313">		}</a>
+<a name="ln314"> </a>
+<a name="ln315">		const char* name = entry.Name();</a>
+<a name="ln316">		BPath sourceEntryPath;</a>
+<a name="ln317">		status_t ret = entry.GetPath(&amp;sourceEntryPath);</a>
+<a name="ln318">		if (ret != B_OK)</a>
+<a name="ln319">			return ret;</a>
+<a name="ln320">		const char* relativeSourceEntryPath</a>
+<a name="ln321">			= _RelativeEntryPath(sourceEntryPath.Path());</a>
+<a name="ln322"> </a>
+<a name="ln323">		struct stat statInfo;</a>
+<a name="ln324">		entry.GetStat(&amp;statInfo);</a>
+<a name="ln325"> </a>
+<a name="ln326">		if (fEntryFilter != NULL</a>
+<a name="ln327">			&amp;&amp; !fEntryFilter-&gt;ShouldCopyEntry(entry, relativeSourceEntryPath,</a>
+<a name="ln328">				statInfo, level)) {</a>
+<a name="ln329">			continue;</a>
+<a name="ln330">		}</a>
+<a name="ln331"> </a>
+<a name="ln332">		fItemsCopied++;</a>
+<a name="ln333">		fCurrentItem = name;</a>
+<a name="ln334">		fCurrentTargetFolder = _destination;</a>
+<a name="ln335">		_UpdateProgress();</a>
+<a name="ln336"> </a>
+<a name="ln337">		BEntry copy(&amp;destination, name);</a>
+<a name="ln338">		bool copyAttributes = true;</a>
+<a name="ln339"> </a>
+<a name="ln340">		if (S_ISDIR(statInfo.st_mode)) {</a>
+<a name="ln341">			// handle recursive directory copy</a>
+<a name="ln342"> </a>
+<a name="ln343">			if (copy.Exists()) {</a>
+<a name="ln344">				ret = B_OK;</a>
+<a name="ln345">				if (copy.IsDirectory()) {</a>
+<a name="ln346">					if (fEntryFilter</a>
+<a name="ln347">						&amp;&amp; fEntryFilter-&gt;ShouldClobberFolder(entry,</a>
+<a name="ln348">							relativeSourceEntryPath, statInfo, level)) {</a>
+<a name="ln349">						ret = _RemoveFolder(copy);</a>
+<a name="ln350">					} else {</a>
+<a name="ln351">						// Do not overwrite attributes on folders that exist.</a>
+<a name="ln352">						// This should work better when the install target</a>
+<a name="ln353">						// already contains a Haiku installation.</a>
+<a name="ln354">						copyAttributes = false;</a>
+<a name="ln355">					}</a>
+<a name="ln356">				} else</a>
+<a name="ln357">					ret = copy.Remove();</a>
+<a name="ln358"> </a>
+<a name="ln359">				if (ret != B_OK) {</a>
+<a name="ln360">					fprintf(stderr, &quot;Failed to make room for folder '%s': &quot;</a>
+<a name="ln361">						&quot;%s\n&quot;, name, strerror(ret));</a>
+<a name="ln362">					return ret;</a>
+<a name="ln363">				}</a>
+<a name="ln364">			}</a>
+<a name="ln365"> </a>
+<a name="ln366">			BPath dstFolder;</a>
+<a name="ln367">			ret = copy.GetPath(&amp;dstFolder);</a>
+<a name="ln368">			if (ret &lt; B_OK)</a>
+<a name="ln369">				return ret;</a>
+<a name="ln370"> </a>
+<a name="ln371">			if (cancelSemaphore &gt;= 0)</a>
+<a name="ln372">				lock.Unlock();</a>
+<a name="ln373"> </a>
+<a name="ln374">			ret = _CopyFolder(sourceEntryPath.Path(), dstFolder.Path(), level,</a>
+<a name="ln375">				cancelSemaphore);</a>
+<a name="ln376">			if (ret &lt; B_OK)</a>
+<a name="ln377">				return ret;</a>
+<a name="ln378"> </a>
+<a name="ln379">			if (cancelSemaphore &gt;= 0 &amp;&amp; !lock.Lock()) {</a>
+<a name="ln380">				// We are supposed to quit</a>
+<a name="ln381">				return B_CANCELED;</a>
+<a name="ln382">			}</a>
+<a name="ln383">		} else {</a>
+<a name="ln384">			if (copy.Exists()) {</a>
+<a name="ln385">				if (copy.IsDirectory())</a>
+<a name="ln386">					ret = _RemoveFolder(copy);</a>
+<a name="ln387">				else</a>
+<a name="ln388">					ret = copy.Remove();</a>
+<a name="ln389">				if (ret != B_OK) {</a>
+<a name="ln390">					fprintf(stderr, &quot;Failed to make room for entry '%s': &quot;</a>
+<a name="ln391">						&quot;%s\n&quot;, name, strerror(ret));</a>
+<a name="ln392">					return ret;</a>
+<a name="ln393">				}</a>
+<a name="ln394">			}</a>
+<a name="ln395">			if (S_ISLNK(statInfo.st_mode)) {</a>
+<a name="ln396">				// copy symbolic links</a>
+<a name="ln397">				BSymLink srcLink(&amp;entry);</a>
+<a name="ln398">				if (ret &lt; B_OK)</a>
+<a name="ln399">					return ret;</a>
+<a name="ln400"> </a>
+<a name="ln401">				char linkPath[B_PATH_NAME_LENGTH];</a>
+<a name="ln402">				ssize_t read = srcLink.ReadLink(linkPath, B_PATH_NAME_LENGTH - 1);</a>
+<a name="ln403">				if (read &lt; 0)</a>
+<a name="ln404">					return (status_t)read;</a>
+<a name="ln405"> </a>
+<a name="ln406">				// just in case it already exists...</a>
+<a name="ln407">				copy.Remove();</a>
+<a name="ln408"> </a>
+<a name="ln409">				BSymLink dstLink;</a>
+<a name="ln410">				ret = destination.CreateSymLink(name, linkPath, &amp;dstLink);</a>
+<a name="ln411">				if (ret &lt; B_OK)</a>
+<a name="ln412">					return ret;</a>
+<a name="ln413">			} else {</a>
+<a name="ln414">				// copy file data</a>
+<a name="ln415">				// NOTE: Do not pass the locker, we simply keep holding the lock!</a>
+<a name="ln416">				ret = CopyFile(entry, copy);</a>
+<a name="ln417">				if (ret &lt; B_OK)</a>
+<a name="ln418">					return ret;</a>
+<a name="ln419">			}</a>
+<a name="ln420">		}</a>
+<a name="ln421"> </a>
+<a name="ln422">		if (!copyAttributes)</a>
+<a name="ln423">			continue;</a>
+<a name="ln424"> </a>
+<a name="ln425">		ret = copy.SetTo(&amp;destination, name);</a>
+<a name="ln426">		if (ret != B_OK)</a>
+<a name="ln427">			return ret;</a>
+<a name="ln428"> </a>
+<a name="ln429">		// copy attributes</a>
+<a name="ln430">		BNode sourceNode(&amp;entry);</a>
+<a name="ln431">		BNode targetNode(&amp;copy);</a>
+<a name="ln432">		char attrName[B_ATTR_NAME_LENGTH];</a>
+<a name="ln433">		while (sourceNode.GetNextAttrName(attrName) == B_OK) {</a>
+<a name="ln434">			attr_info info;</a>
+<a name="ln435">			if (sourceNode.GetAttrInfo(attrName, &amp;info) &lt; B_OK)</a>
+<a name="ln436">				continue;</a>
+<a name="ln437">			size_t size = 4096;</a>
+<a name="ln438">			uint8 buffer[size];</a>
+<a name="ln439">			off_t offset = 0;</a>
+<a name="ln440">			ssize_t read = sourceNode.ReadAttr(attrName, info.type,</a>
+<a name="ln441">				offset, buffer, std::min((off_t)size, info.size));</a>
+<a name="ln442">			// NOTE: It's important to still write the attribute even if</a>
+<a name="ln443">			// we have read 0 bytes!</a>
+<a name="ln444">			while (read &gt;= 0) {</a>
+<a name="ln445">				targetNode.WriteAttr(attrName, info.type, offset, buffer, read);</a>
+<a name="ln446">				offset += read;</a>
+<a name="ln447">				read = sourceNode.ReadAttr(attrName, info.type,</a>
+<a name="ln448">					offset, buffer, std::min((off_t)size, info.size - offset));</a>
+<a name="ln449">				if (read == 0)</a>
+<a name="ln450">					break;</a>
+<a name="ln451">			}</a>
+<a name="ln452">		}</a>
+<a name="ln453"> </a>
+<a name="ln454">		// copy basic attributes</a>
+<a name="ln455">		copy.SetPermissions(statInfo.st_mode);</a>
+<a name="ln456">		copy.SetOwner(statInfo.st_uid);</a>
+<a name="ln457">		copy.SetGroup(statInfo.st_gid);</a>
+<a name="ln458">		copy.SetModificationTime(statInfo.st_mtime);</a>
+<a name="ln459">		copy.SetCreationTime(statInfo.st_crtime);</a>
+<a name="ln460">	}</a>
+<a name="ln461"> </a>
+<a name="ln462">	level--;</a>
+<a name="ln463">	return B_OK;</a>
+<a name="ln464">}</a>
+<a name="ln465"> </a>
+<a name="ln466"> </a>
+<a name="ln467">status_t</a>
+<a name="ln468">CopyEngine::_RemoveFolder(BEntry&amp; entry)</a>
+<a name="ln469">{</a>
+<a name="ln470">	BDirectory directory(&amp;entry);</a>
+<a name="ln471">	status_t ret = directory.InitCheck();</a>
+<a name="ln472">	if (ret != B_OK)</a>
+<a name="ln473">		return ret;</a>
+<a name="ln474"> </a>
+<a name="ln475">	BEntry subEntry;</a>
+<a name="ln476">	while (directory.GetNextEntry(&amp;subEntry) == B_OK) {</a>
+<a name="ln477">		if (subEntry.IsDirectory()) {</a>
+<a name="ln478">			ret = _RemoveFolder(subEntry);</a>
+<a name="ln479">			if (ret != B_OK)</a>
+<a name="ln480">				return ret;</a>
+<a name="ln481">		} else {</a>
+<a name="ln482">			ret = subEntry.Remove();</a>
+<a name="ln483">			if (ret != B_OK)</a>
+<a name="ln484">				return ret;</a>
+<a name="ln485">		}</a>
+<a name="ln486">	}</a>
+<a name="ln487">	return entry.Remove();</a>
+<a name="ln488">}</a>
+<a name="ln489"> </a>
+<a name="ln490"> </a>
+<a name="ln491">const char*</a>
+<a name="ln492">CopyEngine::_RelativeEntryPath(const char* absoluteSourcePath) const</a>
+<a name="ln493">{</a>
+<a name="ln494">	if (strncmp(absoluteSourcePath, fAbsoluteSourcePath,</a>
+<a name="ln495">			fAbsoluteSourcePath.Length()) != 0) {</a>
+<a name="ln496">		return absoluteSourcePath;</a>
+<a name="ln497">	}</a>
+<a name="ln498"> </a>
+<a name="ln499">	const char* relativePath</a>
+<a name="ln500">		= absoluteSourcePath + fAbsoluteSourcePath.Length();</a>
+<a name="ln501">	return relativePath[0] == '/' ? relativePath + 1 : relativePath;</a>
+<a name="ln502">}</a>
+<a name="ln503"> </a>
+<a name="ln504"> </a>
+<a name="ln505">void</a>
+<a name="ln506">CopyEngine::_UpdateProgress()</a>
+<a name="ln507">{</a>
+<a name="ln508">	if (fProgressReporter == NULL)</a>
+<a name="ln509">		return;</a>
+<a name="ln510"> </a>
+<a name="ln511">	uint64 items = 0;</a>
+<a name="ln512">	if (fLastItemsCopied &lt; fItemsCopied) {</a>
+<a name="ln513">		items = fItemsCopied - fLastItemsCopied;</a>
+<a name="ln514">		fLastItemsCopied = fItemsCopied;</a>
+<a name="ln515">	}</a>
+<a name="ln516"> </a>
+<a name="ln517">	off_t bytes = 0;</a>
+<a name="ln518">	if (fLastBytesRead &lt; fBytesRead) {</a>
+<a name="ln519">		bytes = fBytesRead - fLastBytesRead;</a>
+<a name="ln520">		fLastBytesRead = fBytesRead;</a>
+<a name="ln521">	}</a>
+<a name="ln522"> </a>
+<a name="ln523">	fProgressReporter-&gt;ItemsWritten(items, bytes, fCurrentItem,</a>
+<a name="ln524">		fCurrentTargetFolder);</a>
+<a name="ln525">}</a>
+<a name="ln526"> </a>
+<a name="ln527"> </a>
+<a name="ln528">int32</a>
+<a name="ln529">CopyEngine::_WriteThreadEntry(void* cookie)</a>
+<a name="ln530">{</a>
+<a name="ln531">	CopyEngine* engine = (CopyEngine*)cookie;</a>
+<a name="ln532">	engine-&gt;_WriteThread();</a>
+<a name="ln533">	return B_OK;</a>
+<a name="ln534">}</a>
+<a name="ln535"> </a>
+<a name="ln536"> </a>
+<a name="ln537">void</a>
+<a name="ln538">CopyEngine::_WriteThread()</a>
+<a name="ln539">{</a>
+<a name="ln540">	bigtime_t bufferWaitTimeout = 100000;</a>
+<a name="ln541"> </a>
+<a name="ln542">	while (!fQuitting) {</a>
+<a name="ln543"> </a>
+<a name="ln544">		bigtime_t now = system_time();</a>
+<a name="ln545"> </a>
+<a name="ln546">		Buffer* buffer = NULL;</a>
+<a name="ln547">		status_t ret = fBufferQueue.Pop(&amp;buffer, bufferWaitTimeout);</a>
+<a name="ln548">		if (ret == B_TIMED_OUT) {</a>
+<a name="ln549">			// no buffer, timeout</a>
+<a name="ln550">			continue;</a>
+<a name="ln551">		} else if (ret == B_NO_INIT) {</a>
+<a name="ln552">			// real error</a>
+<a name="ln553">			return;</a>
+<a name="ln554">		} else if (ret != B_OK) {</a>
+<a name="ln555">			// no buffer, queue error</a>
+<a name="ln556">			snooze(10000);</a>
+<a name="ln557">			continue;</a>
+<a name="ln558">		}</a>
+<a name="ln559"> </a>
+<a name="ln560">		if (!buffer-&gt;deleteFile) {</a>
+<a name="ln561">			ssize_t written = buffer-&gt;file-&gt;Write(buffer-&gt;buffer,</a>
+<a name="ln562">				buffer-&gt;validBytes);</a>
+<a name="ln563">			if (written != (ssize_t)buffer-&gt;validBytes) {</a>
+<a name="ln564">				// TODO: this should somehow be propagated back</a>
+<a name="ln565">				// to the main thread!</a>
+<a name="ln566">				fprintf(stderr, &quot;Failed to write data: %s\n&quot;,</a>
+<a name="ln567">					strerror((status_t)written));</a>
+<a name="ln568">			}</a>
+<a name="ln569">			fBytesWritten += written;</a>
+<a name="ln570">		}</a>
+<a name="ln571"> </a>
+<a name="ln572">		delete buffer;</a>
+<a name="ln573"> </a>
+<a name="ln574">		// measure performance</a>
+<a name="ln575">		fTimeWritten += system_time() - now;</a>
+<a name="ln576">	}</a>
+<a name="ln577"> </a>
+<a name="ln578">	double megaBytes = (double)fBytesWritten / (1024 * 1024);</a>
+<a name="ln579">	double seconds = (double)fTimeWritten / 1000000;</a>
+<a name="ln580">	if (seconds &gt; 0) {</a>
+<a name="ln581">		printf(&quot;%.2f MB written (%.2f MB/s)\n&quot;, megaBytes,</a>
+<a name="ln582">			megaBytes / seconds);</a>
+<a name="ln583">	}</a>
+<a name="ln584">}</a>
+
+</code></pre>
+<div class="balloon" rel="398"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v547/" target="_blank">V547</a> Expression 'ret < ((int) 0)' is always false.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

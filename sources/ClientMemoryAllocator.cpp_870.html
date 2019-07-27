@@ -1,0 +1,467 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>ClientMemoryAllocator.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2006-2013, Haiku, Inc. All Rights Reserved.</a>
+<a name="ln3"> * Distributed under the terms of the MIT License.</a>
+<a name="ln4"> *</a>
+<a name="ln5"> * Authors:</a>
+<a name="ln6"> *		Axel Dörfler, axeld@pinc-software.de</a>
+<a name="ln7"> */</a>
+<a name="ln8"> </a>
+<a name="ln9"> </a>
+<a name="ln10">/*!	This class manages a pool of areas for one client. The client is supposed</a>
+<a name="ln11">	to clone these areas into its own address space to access the data.</a>
+<a name="ln12">	This mechanism is only used for bitmaps for far.</a>
+<a name="ln13">*/</a>
+<a name="ln14"> </a>
+<a name="ln15"> </a>
+<a name="ln16">// TODO: areas could be relocated if needed (to be able to resize them)</a>
+<a name="ln17">//		However, this would require a lock whenever a block of memory</a>
+<a name="ln18">//		allocated by this allocator is accessed.</a>
+<a name="ln19"> </a>
+<a name="ln20"> </a>
+<a name="ln21">#include &quot;ClientMemoryAllocator.h&quot;</a>
+<a name="ln22"> </a>
+<a name="ln23">#include &lt;stdio.h&gt;</a>
+<a name="ln24">#include &lt;stdlib.h&gt;</a>
+<a name="ln25"> </a>
+<a name="ln26">#include &lt;Autolock.h&gt;</a>
+<a name="ln27"> </a>
+<a name="ln28">#include &quot;ServerApp.h&quot;</a>
+<a name="ln29"> </a>
+<a name="ln30"> </a>
+<a name="ln31">typedef block_list::Iterator block_iterator;</a>
+<a name="ln32">typedef chunk_list::Iterator chunk_iterator;</a>
+<a name="ln33"> </a>
+<a name="ln34"> </a>
+<a name="ln35">ClientMemoryAllocator::ClientMemoryAllocator(ServerApp* application)</a>
+<a name="ln36">	:</a>
+<a name="ln37">	fApplication(application),</a>
+<a name="ln38">	fLock(&quot;client memory lock&quot;)</a>
+<a name="ln39">{</a>
+<a name="ln40">}</a>
+<a name="ln41"> </a>
+<a name="ln42"> </a>
+<a name="ln43">ClientMemoryAllocator::~ClientMemoryAllocator()</a>
+<a name="ln44">{</a>
+<a name="ln45">	// delete all areas and chunks/blocks that are still allocated</a>
+<a name="ln46"> </a>
+<a name="ln47">	while (true) {</a>
+<a name="ln48">		struct block* block = fFreeBlocks.RemoveHead();</a>
+<a name="ln49">		if (block == NULL)</a>
+<a name="ln50">			break;</a>
+<a name="ln51"> </a>
+<a name="ln52">		free(block);</a>
+<a name="ln53">	}</a>
+<a name="ln54"> </a>
+<a name="ln55">	while (true) {</a>
+<a name="ln56">		struct chunk* chunk = fChunks.RemoveHead();</a>
+<a name="ln57">		if (chunk == NULL)</a>
+<a name="ln58">			break;</a>
+<a name="ln59"> </a>
+<a name="ln60">		delete_area(chunk-&gt;area);</a>
+<a name="ln61">		free(chunk);</a>
+<a name="ln62">	}</a>
+<a name="ln63">}</a>
+<a name="ln64"> </a>
+<a name="ln65"> </a>
+<a name="ln66">void*</a>
+<a name="ln67">ClientMemoryAllocator::Allocate(size_t size, block** _address, bool&amp; newArea)</a>
+<a name="ln68">{</a>
+<a name="ln69">	// A detached allocator no longer allows any further allocations</a>
+<a name="ln70">	if (fApplication == NULL)</a>
+<a name="ln71">		return NULL;</a>
+<a name="ln72"> </a>
+<a name="ln73">	BAutolock locker(fLock);</a>
+<a name="ln74"> </a>
+<a name="ln75">	// Search best matching free block from the list</a>
+<a name="ln76"> </a>
+<a name="ln77">	block_iterator iterator = fFreeBlocks.GetIterator();</a>
+<a name="ln78">	struct block* block;</a>
+<a name="ln79">	struct block* best = NULL;</a>
+<a name="ln80"> </a>
+<a name="ln81">	while ((block = iterator.Next()) != NULL) {</a>
+<a name="ln82">		if (block-&gt;size &gt;= size &amp;&amp; (best == NULL || block-&gt;size &lt; best-&gt;size))</a>
+<a name="ln83">			best = block;</a>
+<a name="ln84">	}</a>
+<a name="ln85"> </a>
+<a name="ln86">	if (best == NULL) {</a>
+<a name="ln87">		// We didn't find a free block - we need to allocate</a>
+<a name="ln88">		// another chunk, or resize an existing chunk</a>
+<a name="ln89">		best = _AllocateChunk(size, newArea);</a>
+<a name="ln90">		if (best == NULL)</a>
+<a name="ln91">			return NULL;</a>
+<a name="ln92">	} else</a>
+<a name="ln93">		newArea = false;</a>
+<a name="ln94"> </a>
+<a name="ln95">	// We need to split the chunk into two parts: the one to keep</a>
+<a name="ln96">	// and the one to give away</a>
+<a name="ln97"> </a>
+<a name="ln98">	if (best-&gt;size == size) {</a>
+<a name="ln99">		// The simple case: the free block has exactly the size we wanted to have</a>
+<a name="ln100">		fFreeBlocks.Remove(best);</a>
+<a name="ln101">		*_address = best;</a>
+<a name="ln102">		return best-&gt;base;</a>
+<a name="ln103">	}</a>
+<a name="ln104"> </a>
+<a name="ln105">	// TODO: maybe we should have the user reserve memory in its object</a>
+<a name="ln106">	//	for us, so we don't have to do this here...</a>
+<a name="ln107"> </a>
+<a name="ln108">	struct block* usedBlock = (struct block*)malloc(sizeof(struct block));</a>
+<a name="ln109">	if (usedBlock == NULL)</a>
+<a name="ln110">		return NULL;</a>
+<a name="ln111"> </a>
+<a name="ln112">	usedBlock-&gt;base = best-&gt;base;</a>
+<a name="ln113">	usedBlock-&gt;size = size;</a>
+<a name="ln114">	usedBlock-&gt;chunk = best-&gt;chunk;</a>
+<a name="ln115"> </a>
+<a name="ln116">	best-&gt;base += size;</a>
+<a name="ln117">	best-&gt;size -= size;</a>
+<a name="ln118"> </a>
+<a name="ln119">	*_address = usedBlock;</a>
+<a name="ln120">	return usedBlock-&gt;base;</a>
+<a name="ln121">}</a>
+<a name="ln122"> </a>
+<a name="ln123"> </a>
+<a name="ln124">void</a>
+<a name="ln125">ClientMemoryAllocator::Free(block* freeBlock)</a>
+<a name="ln126">{</a>
+<a name="ln127">	if (freeBlock == NULL)</a>
+<a name="ln128">		return;</a>
+<a name="ln129"> </a>
+<a name="ln130">	BAutolock locker(fLock);</a>
+<a name="ln131"> </a>
+<a name="ln132">	// search for an adjacent free block</a>
+<a name="ln133"> </a>
+<a name="ln134">	block_iterator iterator = fFreeBlocks.GetIterator();</a>
+<a name="ln135">	struct block* before = NULL;</a>
+<a name="ln136">	struct block* after = NULL;</a>
+<a name="ln137">	bool inFreeList = true;</a>
+<a name="ln138"> </a>
+<a name="ln139">	if (freeBlock-&gt;size != freeBlock-&gt;chunk-&gt;size) {</a>
+<a name="ln140">		// TODO: this could be done better if free blocks are sorted,</a>
+<a name="ln141">		//	and if we had one free blocks list per chunk!</a>
+<a name="ln142">		//	IOW this is a bit slow...</a>
+<a name="ln143"> </a>
+<a name="ln144">		while (struct block* block = iterator.Next()) {</a>
+<a name="ln145">			if (block-&gt;chunk != freeBlock-&gt;chunk)</a>
+<a name="ln146">				continue;</a>
+<a name="ln147"> </a>
+<a name="ln148">			if (block-&gt;base + block-&gt;size == freeBlock-&gt;base)</a>
+<a name="ln149">				before = block;</a>
+<a name="ln150"> </a>
+<a name="ln151">			if (block-&gt;base == freeBlock-&gt;base + freeBlock-&gt;size)</a>
+<a name="ln152">				after = block;</a>
+<a name="ln153">		}</a>
+<a name="ln154"> </a>
+<a name="ln155">		if (before != NULL &amp;&amp; after != NULL) {</a>
+<a name="ln156">			// merge with adjacent blocks</a>
+<a name="ln157">			before-&gt;size += after-&gt;size + freeBlock-&gt;size;</a>
+<a name="ln158">			fFreeBlocks.Remove(after);</a>
+<a name="ln159">			free(after);</a>
+<a name="ln160">			free(freeBlock);</a>
+<a name="ln161">			freeBlock = before;</a>
+<a name="ln162">		} else if (before != NULL) {</a>
+<a name="ln163">			before-&gt;size += freeBlock-&gt;size;</a>
+<a name="ln164">			free(freeBlock);</a>
+<a name="ln165">			freeBlock = before;</a>
+<a name="ln166">		} else if (after != NULL) {</a>
+<a name="ln167">			after-&gt;base -= freeBlock-&gt;size;</a>
+<a name="ln168">			after-&gt;size += freeBlock-&gt;size;</a>
+<a name="ln169">			free(freeBlock);</a>
+<a name="ln170">			freeBlock = after;</a>
+<a name="ln171">		} else</a>
+<a name="ln172">			fFreeBlocks.Add(freeBlock);</a>
+<a name="ln173">	} else</a>
+<a name="ln174">		inFreeList = false;</a>
+<a name="ln175"> </a>
+<a name="ln176">	if (freeBlock-&gt;size == freeBlock-&gt;chunk-&gt;size) {</a>
+<a name="ln177">		// We can delete the chunk now</a>
+<a name="ln178">		struct chunk* chunk = freeBlock-&gt;chunk;</a>
+<a name="ln179"> </a>
+<a name="ln180">		if (inFreeList)</a>
+<a name="ln181">			fFreeBlocks.Remove(freeBlock);</a>
+<a name="ln182">		free(freeBlock);</a>
+<a name="ln183"> </a>
+<a name="ln184">		fChunks.Remove(chunk);</a>
+<a name="ln185">		delete_area(chunk-&gt;area);</a>
+<a name="ln186"> </a>
+<a name="ln187">		if (fApplication != NULL)</a>
+<a name="ln188">			fApplication-&gt;NotifyDeleteClientArea(chunk-&gt;area);</a>
+<a name="ln189"> </a>
+<a name="ln190">		free(chunk);</a>
+<a name="ln191">	}</a>
+<a name="ln192">}</a>
+<a name="ln193"> </a>
+<a name="ln194"> </a>
+<a name="ln195">void</a>
+<a name="ln196">ClientMemoryAllocator::Detach()</a>
+<a name="ln197">{</a>
+<a name="ln198">	BAutolock locker(fLock);</a>
+<a name="ln199">	fApplication = NULL;</a>
+<a name="ln200">}</a>
+<a name="ln201"> </a>
+<a name="ln202"> </a>
+<a name="ln203">void</a>
+<a name="ln204">ClientMemoryAllocator::Dump()</a>
+<a name="ln205">{</a>
+<a name="ln206">	if (fApplication != NULL) {</a>
+<a name="ln207">		debug_printf(&quot;Application %&quot; B_PRId32 &quot;, %s: chunks:\n&quot;,</a>
+<a name="ln208">			fApplication-&gt;ClientTeam(), fApplication-&gt;Signature());</a>
+<a name="ln209">	}</a>
+<a name="ln210"> </a>
+<a name="ln211">	chunk_list::Iterator iterator = fChunks.GetIterator();</a>
+<a name="ln212">	int32 i = 0;</a>
+<a name="ln213">	while (struct chunk* chunk = iterator.Next()) {</a>
+<a name="ln214">		debug_printf(&quot;  [%4&quot; B_PRId32 &quot;] %p, area %&quot; B_PRId32 &quot;, base %p, &quot;</a>
+<a name="ln215">			&quot;size %lu\n&quot;, i++, chunk, chunk-&gt;area, chunk-&gt;base, chunk-&gt;size);</a>
+<a name="ln216">	}</a>
+<a name="ln217"> </a>
+<a name="ln218">	debug_printf(&quot;free blocks:\n&quot;);</a>
+<a name="ln219"> </a>
+<a name="ln220">	block_list::Iterator blockIterator = fFreeBlocks.GetIterator();</a>
+<a name="ln221">	i = 0;</a>
+<a name="ln222">	while (struct block* block = blockIterator.Next()) {</a>
+<a name="ln223">		debug_printf(&quot;  [%6&quot; B_PRId32 &quot;] %p, chunk %p, base %p, size %lu\n&quot;,</a>
+<a name="ln224">			i++, block, block-&gt;chunk, block-&gt;base, block-&gt;size);</a>
+<a name="ln225">	}</a>
+<a name="ln226">}</a>
+<a name="ln227"> </a>
+<a name="ln228"> </a>
+<a name="ln229">struct block*</a>
+<a name="ln230">ClientMemoryAllocator::_AllocateChunk(size_t size, bool&amp; newArea)</a>
+<a name="ln231">{</a>
+<a name="ln232">	// round up to multiple of page size</a>
+<a name="ln233">	size = (size + B_PAGE_SIZE - 1) &amp; ~(B_PAGE_SIZE - 1);</a>
+<a name="ln234"> </a>
+<a name="ln235">	// At first, try to resize our existing areas</a>
+<a name="ln236"> </a>
+<a name="ln237">	chunk_iterator iterator = fChunks.GetIterator();</a>
+<a name="ln238">	struct chunk* chunk;</a>
+<a name="ln239">	while ((chunk = iterator.Next()) != NULL) {</a>
+<a name="ln240">		status_t status = resize_area(chunk-&gt;area, chunk-&gt;size + size);</a>
+<a name="ln241">		if (status == B_OK) {</a>
+<a name="ln242">			newArea = false;</a>
+<a name="ln243">			break;</a>
+<a name="ln244">		}</a>
+<a name="ln245">	}</a>
+<a name="ln246"> </a>
+<a name="ln247">	// TODO: resize and relocate while holding the write lock</a>
+<a name="ln248"> </a>
+<a name="ln249">	struct block* block;</a>
+<a name="ln250">	uint8* address;</a>
+<a name="ln251"> </a>
+<a name="ln252">	if (chunk == NULL) {</a>
+<a name="ln253">		// TODO: temporary measurement as long as resizing areas doesn't</a>
+<a name="ln254">		//	work the way we need (with relocating the area, if needed)</a>
+<a name="ln255">		if (size &lt; B_PAGE_SIZE * 32)</a>
+<a name="ln256">			size = B_PAGE_SIZE * 32;</a>
+<a name="ln257"> </a>
+<a name="ln258">		// create new area for this allocation</a>
+<a name="ln259">		chunk = (struct chunk*)malloc(sizeof(struct chunk));</a>
+<a name="ln260">		if (chunk == NULL)</a>
+<a name="ln261">			return NULL;</a>
+<a name="ln262"> </a>
+<a name="ln263">		block = (struct block*)malloc(sizeof(struct block));</a>
+<a name="ln264">		if (block == NULL) {</a>
+<a name="ln265">			free(chunk);</a>
+<a name="ln266">			return NULL;</a>
+<a name="ln267">		}</a>
+<a name="ln268"> </a>
+<a name="ln269">		char name[B_OS_NAME_LENGTH];</a>
+<a name="ln270">#ifdef HAIKU_TARGET_PLATFORM_LIBBE_TEST</a>
+<a name="ln271">		strcpy(name, &quot;client heap&quot;);</a>
+<a name="ln272">#else</a>
+<a name="ln273">		snprintf(name, sizeof(name), &quot;heap:%&quot; B_PRId32 &quot;:%s&quot;,</a>
+<a name="ln274">			fApplication-&gt;ClientTeam(), fApplication-&gt;SignatureLeaf());</a>
+<a name="ln275">#endif</a>
+<a name="ln276">		area_id area = create_area(name, (void**)&amp;address, B_ANY_ADDRESS, size,</a>
+<a name="ln277">			B_NO_LOCK, B_READ_AREA | B_WRITE_AREA);</a>
+<a name="ln278">		if (area &lt; B_OK) {</a>
+<a name="ln279">			free(block);</a>
+<a name="ln280">			free(chunk);</a>
+<a name="ln281">			return NULL;</a>
+<a name="ln282">		}</a>
+<a name="ln283"> </a>
+<a name="ln284">		// add chunk to list</a>
+<a name="ln285"> </a>
+<a name="ln286">		chunk-&gt;area = area;</a>
+<a name="ln287">		chunk-&gt;base = address;</a>
+<a name="ln288">		chunk-&gt;size = size;</a>
+<a name="ln289"> </a>
+<a name="ln290">		fChunks.Add(chunk);</a>
+<a name="ln291">		newArea = true;</a>
+<a name="ln292">	} else {</a>
+<a name="ln293">		// create new free block for this chunk</a>
+<a name="ln294">		block = (struct block *)malloc(sizeof(struct block));</a>
+<a name="ln295">		if (block == NULL)</a>
+<a name="ln296">			return NULL;</a>
+<a name="ln297"> </a>
+<a name="ln298">		address = chunk-&gt;base + chunk-&gt;size;</a>
+<a name="ln299">		chunk-&gt;size += size;</a>
+<a name="ln300">	}</a>
+<a name="ln301"> </a>
+<a name="ln302">	// add block to free list</a>
+<a name="ln303"> </a>
+<a name="ln304">	block-&gt;chunk = chunk;</a>
+<a name="ln305">	block-&gt;base = address;</a>
+<a name="ln306">	block-&gt;size = size;</a>
+<a name="ln307"> </a>
+<a name="ln308">	fFreeBlocks.Add(block);</a>
+<a name="ln309"> </a>
+<a name="ln310">	return block;</a>
+<a name="ln311">}</a>
+<a name="ln312"> </a>
+<a name="ln313"> </a>
+<a name="ln314">// #pragma mark -</a>
+<a name="ln315"> </a>
+<a name="ln316"> </a>
+<a name="ln317">ClientMemory::ClientMemory()</a>
+<a name="ln318">	:</a>
+<a name="ln319">	fAllocator(NULL),</a>
+<a name="ln320">	fBlock(NULL)</a>
+<a name="ln321">{</a>
+<a name="ln322">}</a>
+<a name="ln323"> </a>
+<a name="ln324"> </a>
+<a name="ln325">ClientMemory::~ClientMemory()</a>
+<a name="ln326">{</a>
+<a name="ln327">	if (fBlock != NULL)</a>
+<a name="ln328">		fAllocator-&gt;Free(fBlock);</a>
+<a name="ln329">	if (fAllocator != NULL)</a>
+<a name="ln330">		fAllocator-&gt;ReleaseReference();</a>
+<a name="ln331">}</a>
+<a name="ln332"> </a>
+<a name="ln333"> </a>
+<a name="ln334">void*</a>
+<a name="ln335">ClientMemory::Allocate(ClientMemoryAllocator* allocator, size_t size,</a>
+<a name="ln336">	bool&amp; newArea)</a>
+<a name="ln337">{</a>
+<a name="ln338">	fAllocator = allocator;</a>
+<a name="ln339">	fAllocator-&gt;AcquireReference();</a>
+<a name="ln340"> </a>
+<a name="ln341">	return fAllocator-&gt;Allocate(size, &amp;fBlock, newArea);</a>
+<a name="ln342">}</a>
+<a name="ln343"> </a>
+<a name="ln344"> </a>
+<a name="ln345">area_id</a>
+<a name="ln346">ClientMemory::Area()</a>
+<a name="ln347">{</a>
+<a name="ln348">	if (fBlock != NULL)</a>
+<a name="ln349">		return fBlock-&gt;chunk-&gt;area;</a>
+<a name="ln350">	return B_ERROR;</a>
+<a name="ln351">}</a>
+<a name="ln352"> </a>
+<a name="ln353"> </a>
+<a name="ln354">uint8*</a>
+<a name="ln355">ClientMemory::Address()</a>
+<a name="ln356">{</a>
+<a name="ln357">	if (fBlock != NULL)</a>
+<a name="ln358">		return fBlock-&gt;base;</a>
+<a name="ln359">	return 0;</a>
+<a name="ln360">}</a>
+<a name="ln361"> </a>
+<a name="ln362"> </a>
+<a name="ln363">uint32</a>
+<a name="ln364">ClientMemory::AreaOffset()</a>
+<a name="ln365">{</a>
+<a name="ln366">	if (fBlock != NULL)</a>
+<a name="ln367">		return fBlock-&gt;base - fBlock-&gt;chunk-&gt;base;</a>
+<a name="ln368">	return 0;</a>
+<a name="ln369">}</a>
+<a name="ln370"> </a>
+<a name="ln371"> </a>
+<a name="ln372">// #pragma mark -</a>
+<a name="ln373"> </a>
+<a name="ln374"> </a>
+<a name="ln375">ClonedAreaMemory::ClonedAreaMemory()</a>
+<a name="ln376">	:</a>
+<a name="ln377">	fClonedArea(-1),</a>
+<a name="ln378">	fOffset(0),</a>
+<a name="ln379">	fBase(NULL)</a>
+<a name="ln380">{</a>
+<a name="ln381">}</a>
+<a name="ln382"> </a>
+<a name="ln383"> </a>
+<a name="ln384">ClonedAreaMemory::~ClonedAreaMemory()</a>
+<a name="ln385">{</a>
+<a name="ln386">	if (fClonedArea &gt;= 0)</a>
+<a name="ln387">		delete_area(fClonedArea);</a>
+<a name="ln388">}</a>
+<a name="ln389"> </a>
+<a name="ln390"> </a>
+<a name="ln391">void*</a>
+<a name="ln392">ClonedAreaMemory::Clone(area_id area, uint32 offset)</a>
+<a name="ln393">{</a>
+<a name="ln394">	fClonedArea = clone_area(&quot;server_memory&quot;, (void**)&amp;fBase, B_ANY_ADDRESS,</a>
+<a name="ln395">		B_READ_AREA | B_WRITE_AREA, area);</a>
+<a name="ln396">	if (fBase == NULL)</a>
+<a name="ln397">		return NULL;</a>
+<a name="ln398">	fOffset = offset;</a>
+<a name="ln399">	return Address();</a>
+<a name="ln400">}</a>
+<a name="ln401"> </a>
+<a name="ln402"> </a>
+<a name="ln403">area_id</a>
+<a name="ln404">ClonedAreaMemory::Area()</a>
+<a name="ln405">{</a>
+<a name="ln406">	return fClonedArea;</a>
+<a name="ln407">}</a>
+<a name="ln408"> </a>
+<a name="ln409"> </a>
+<a name="ln410">uint8*</a>
+<a name="ln411">ClonedAreaMemory::Address()</a>
+<a name="ln412">{</a>
+<a name="ln413">	return fBase + fOffset;</a>
+<a name="ln414">}</a>
+<a name="ln415"> </a>
+<a name="ln416"> </a>
+<a name="ln417">uint32</a>
+<a name="ln418">ClonedAreaMemory::AreaOffset()</a>
+<a name="ln419">{</a>
+<a name="ln420">	return fOffset;</a>
+<a name="ln421">}</a>
+
+</code></pre>
+<div class="balloon" rel="328"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v595/" target="_blank">V595</a> The 'fAllocator' pointer was utilized before it was verified against nullptr. Check lines: 328, 329.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

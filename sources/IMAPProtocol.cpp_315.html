@@ -1,0 +1,382 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>IMAPProtocol.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2013-2016, Axel Dörfler, axeld@pinc-software.de.</a>
+<a name="ln3"> * Distributed under the terms of the MIT License.</a>
+<a name="ln4"> */</a>
+<a name="ln5"> </a>
+<a name="ln6"> </a>
+<a name="ln7">#include &quot;IMAPProtocol.h&quot;</a>
+<a name="ln8"> </a>
+<a name="ln9">#include &lt;Directory.h&gt;</a>
+<a name="ln10">#include &lt;Messenger.h&gt;</a>
+<a name="ln11"> </a>
+<a name="ln12">#include &quot;IMAPConnectionWorker.h&quot;</a>
+<a name="ln13">#include &quot;IMAPFolder.h&quot;</a>
+<a name="ln14">#include &quot;Utilities.h&quot;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &lt;mail_util.h&gt;</a>
+<a name="ln17"> </a>
+<a name="ln18"> </a>
+<a name="ln19">IMAPProtocol::IMAPProtocol(const BMailAccountSettings&amp; settings)</a>
+<a name="ln20">	:</a>
+<a name="ln21">	BInboundMailProtocol(&quot;IMAP&quot;, settings),</a>
+<a name="ln22">	fSettings(settings.Name(), settings.InboundSettings()),</a>
+<a name="ln23">	fWorkers(5, false)</a>
+<a name="ln24">{</a>
+<a name="ln25">	BPath destination = fSettings.Destination();</a>
+<a name="ln26"> </a>
+<a name="ln27">	status_t status = create_directory(destination.Path(), 0755);</a>
+<a name="ln28">	if (status != B_OK) {</a>
+<a name="ln29">		fprintf(stderr, &quot;IMAP: Could not create destination directory %s: %s\n&quot;,</a>
+<a name="ln30">			destination.Path(), strerror(status));</a>
+<a name="ln31">	}</a>
+<a name="ln32"> </a>
+<a name="ln33">	mutex_init(&amp;fWorkerLock, &quot;imap worker lock&quot;);</a>
+<a name="ln34"> </a>
+<a name="ln35">	PostMessage(B_READY_TO_RUN);</a>
+<a name="ln36">}</a>
+<a name="ln37"> </a>
+<a name="ln38"> </a>
+<a name="ln39">IMAPProtocol::~IMAPProtocol()</a>
+<a name="ln40">{</a>
+<a name="ln41">	MutexLocker locker(fWorkerLock);</a>
+<a name="ln42">	std::vector&lt;thread_id&gt; threads;</a>
+<a name="ln43">	for (int32 i = 0; i &lt; fWorkers.CountItems(); i++) {</a>
+<a name="ln44">		threads.push_back(fWorkers.ItemAt(i)-&gt;Thread());</a>
+<a name="ln45">		fWorkers.ItemAt(i)-&gt;Quit();</a>
+<a name="ln46">	}</a>
+<a name="ln47">	locker.Unlock();</a>
+<a name="ln48"> </a>
+<a name="ln49">	for (uint32 i = 0; i &lt; threads.size(); i++)</a>
+<a name="ln50">		wait_for_thread(threads[i], NULL);</a>
+<a name="ln51"> </a>
+<a name="ln52">	FolderMap::iterator iterator = fFolders.begin();</a>
+<a name="ln53">	for (; iterator != fFolders.end(); iterator++) {</a>
+<a name="ln54">		IMAPFolder* folder = iterator-&gt;second;</a>
+<a name="ln55">		delete folder; // to stop thread</a>
+<a name="ln56">	}</a>
+<a name="ln57">}</a>
+<a name="ln58"> </a>
+<a name="ln59">status_t</a>
+<a name="ln60">IMAPProtocol::CheckSubscribedFolders(IMAP::Protocol&amp; protocol, bool idle)</a>
+<a name="ln61">{</a>
+<a name="ln62">	// Get list of subscribed folders</a>
+<a name="ln63"> </a>
+<a name="ln64">	BStringList newFolders;</a>
+<a name="ln65">	BString separator;</a>
+<a name="ln66">	status_t status = protocol.GetSubscribedFolders(newFolders, separator);</a>
+<a name="ln67">	if (status != B_OK)</a>
+<a name="ln68">		return status;</a>
+<a name="ln69"> </a>
+<a name="ln70">	// Determine how many new mailboxes we have</a>
+<a name="ln71"> </a>
+<a name="ln72">	for (int32 i = 0; i &lt; newFolders.CountStrings();) {</a>
+<a name="ln73">		if (fFolders.find(newFolders.StringAt(i)) != fFolders.end())</a>
+<a name="ln74">			newFolders.Remove(i);</a>
+<a name="ln75">		else</a>
+<a name="ln76">			i++;</a>
+<a name="ln77">	}</a>
+<a name="ln78"> </a>
+<a name="ln79">	int32 totalMailboxes = fFolders.size() + newFolders.CountStrings();</a>
+<a name="ln80">	int32 workersWanted = 1;</a>
+<a name="ln81">	if (idle)</a>
+<a name="ln82">		workersWanted = std::min(fSettings.MaxConnections(), totalMailboxes);</a>
+<a name="ln83"> </a>
+<a name="ln84">	MutexLocker locker(fWorkerLock);</a>
+<a name="ln85"> </a>
+<a name="ln86">	if (newFolders.IsEmpty() &amp;&amp; fWorkers.CountItems() == workersWanted) {</a>
+<a name="ln87">		// Nothing to do - we've already distributed everything</a>
+<a name="ln88">		return _EnqueueCheckMailboxes();</a>
+<a name="ln89">	}</a>
+<a name="ln90"> </a>
+<a name="ln91">	// Remove mailboxes from workers</a>
+<a name="ln92">	for (int32 i = 0; i &lt; fWorkers.CountItems(); i++) {</a>
+<a name="ln93">		fWorkers.ItemAt(i)-&gt;RemoveAllMailboxes();</a>
+<a name="ln94">	}</a>
+<a name="ln95">	fWorkerMap.clear();</a>
+<a name="ln96"> </a>
+<a name="ln97">	// Create/remove connection workers as allowed and needed</a>
+<a name="ln98">	while (fWorkers.CountItems() &lt; workersWanted) {</a>
+<a name="ln99">		IMAPConnectionWorker* worker = new IMAPConnectionWorker(*this,</a>
+<a name="ln100">			fSettings);</a>
+<a name="ln101">		if (!fWorkers.AddItem(worker)) {</a>
+<a name="ln102">			delete worker;</a>
+<a name="ln103">			break;</a>
+<a name="ln104">		}</a>
+<a name="ln105"> </a>
+<a name="ln106">		status = worker-&gt;Run();</a>
+<a name="ln107">		if (status != B_OK) {</a>
+<a name="ln108">			fWorkers.RemoveItem(worker);</a>
+<a name="ln109">			delete worker;</a>
+<a name="ln110">		}</a>
+<a name="ln111">	}</a>
+<a name="ln112"> </a>
+<a name="ln113">	while (fWorkers.CountItems() &gt; workersWanted) {</a>
+<a name="ln114">		IMAPConnectionWorker* worker</a>
+<a name="ln115">			= fWorkers.RemoveItemAt(fWorkers.CountItems() - 1);</a>
+<a name="ln116">		worker-&gt;Quit();</a>
+<a name="ln117">	}</a>
+<a name="ln118"> </a>
+<a name="ln119">	// Update known mailboxes</a>
+<a name="ln120">	for (int32 i = 0; i &lt; newFolders.CountStrings(); i++) {</a>
+<a name="ln121">		const BString&amp; mailbox = newFolders.StringAt(i);</a>
+<a name="ln122">		fFolders.insert(std::make_pair(mailbox,</a>
+<a name="ln123">			_CreateFolder(mailbox, separator)));</a>
+<a name="ln124">	}</a>
+<a name="ln125"> </a>
+<a name="ln126">	// Distribute the mailboxes evenly to the workers</a>
+<a name="ln127">	FolderMap::iterator iterator = fFolders.begin();</a>
+<a name="ln128">	int32 index = 0;</a>
+<a name="ln129">	for (; iterator != fFolders.end(); iterator++) {</a>
+<a name="ln130">		IMAPConnectionWorker* worker = fWorkers.ItemAt(index);</a>
+<a name="ln131">		IMAPFolder* folder = iterator-&gt;second;</a>
+<a name="ln132">		worker-&gt;AddMailbox(folder);</a>
+<a name="ln133">		fWorkerMap.insert(std::make_pair(folder, worker));</a>
+<a name="ln134"> </a>
+<a name="ln135">		index = (index + 1) % fWorkers.CountItems();</a>
+<a name="ln136">	}</a>
+<a name="ln137"> </a>
+<a name="ln138">	// Start waiting workers</a>
+<a name="ln139">	return _EnqueueCheckMailboxes();</a>
+<a name="ln140">}</a>
+<a name="ln141"> </a>
+<a name="ln142"> </a>
+<a name="ln143">void</a>
+<a name="ln144">IMAPProtocol::WorkerQuit(IMAPConnectionWorker* worker)</a>
+<a name="ln145">{</a>
+<a name="ln146">	MutexLocker locker(fWorkerLock);</a>
+<a name="ln147">	fWorkers.RemoveItem(worker);</a>
+<a name="ln148"> </a>
+<a name="ln149">	WorkerMap::iterator iterator = fWorkerMap.begin();</a>
+<a name="ln150">	while (iterator != fWorkerMap.end()) {</a>
+<a name="ln151">		WorkerMap::iterator removed = iterator++;</a>
+<a name="ln152">		if (removed-&gt;second == worker)</a>
+<a name="ln153">			fWorkerMap.erase(removed);</a>
+<a name="ln154">	}</a>
+<a name="ln155">}</a>
+<a name="ln156"> </a>
+<a name="ln157"> </a>
+<a name="ln158">void</a>
+<a name="ln159">IMAPProtocol::MessageStored(IMAPFolder&amp; folder, entry_ref&amp; ref,</a>
+<a name="ln160">	BFile&amp; stream, uint32 fetchFlags, BMessage&amp; attributes)</a>
+<a name="ln161">{</a>
+<a name="ln162">	if ((fetchFlags &amp; (IMAP::kFetchHeader | IMAP::kFetchBody))</a>
+<a name="ln163">			== (IMAP::kFetchHeader | IMAP::kFetchBody)) {</a>
+<a name="ln164">		ProcessMessageFetched(ref, stream, attributes);</a>
+<a name="ln165">	} else if ((fetchFlags &amp; IMAP::kFetchHeader) != 0) {</a>
+<a name="ln166">		ProcessHeaderFetched(ref, stream, attributes);</a>
+<a name="ln167">	} else if ((fetchFlags &amp; IMAP::kFetchBody) != 0) {</a>
+<a name="ln168">		NotifyBodyFetched(ref, stream, attributes);</a>
+<a name="ln169">	}</a>
+<a name="ln170">}</a>
+<a name="ln171"> </a>
+<a name="ln172"> </a>
+<a name="ln173">status_t</a>
+<a name="ln174">IMAPProtocol::UpdateMessageFlags(IMAPFolder&amp; folder, uint32 uid, uint32 flags)</a>
+<a name="ln175">{</a>
+<a name="ln176">	MutexLocker locker(fWorkerLock);</a>
+<a name="ln177"> </a>
+<a name="ln178">	WorkerMap::const_iterator found = fWorkerMap.find(&amp;folder);</a>
+<a name="ln179">	if (found == fWorkerMap.end())</a>
+<a name="ln180">		return B_ERROR;</a>
+<a name="ln181"> </a>
+<a name="ln182">	IMAPConnectionWorker* worker = found-&gt;second;</a>
+<a name="ln183">	return worker-&gt;EnqueueUpdateFlags(folder, uid, flags);</a>
+<a name="ln184">}</a>
+<a name="ln185"> </a>
+<a name="ln186"> </a>
+<a name="ln187">status_t</a>
+<a name="ln188">IMAPProtocol::SyncMessages()</a>
+<a name="ln189">{</a>
+<a name="ln190">	puts(&quot;IMAP: sync&quot;);</a>
+<a name="ln191"> </a>
+<a name="ln192">	MutexLocker locker(fWorkerLock);</a>
+<a name="ln193">	if (fWorkers.IsEmpty()) {</a>
+<a name="ln194">		// Create main (and possibly initial) connection worker</a>
+<a name="ln195">		IMAPConnectionWorker* worker = new IMAPConnectionWorker(*this,</a>
+<a name="ln196">			fSettings, true);</a>
+<a name="ln197">		if (!fWorkers.AddItem(worker)) {</a>
+<a name="ln198">			delete worker;</a>
+<a name="ln199">			return B_NO_MEMORY;</a>
+<a name="ln200">		}</a>
+<a name="ln201"> </a>
+<a name="ln202">		worker-&gt;EnqueueCheckSubscribedFolders();</a>
+<a name="ln203">		return worker-&gt;Run();</a>
+<a name="ln204">	}</a>
+<a name="ln205">	fWorkers.ItemAt(0)-&gt;EnqueueCheckSubscribedFolders();</a>
+<a name="ln206">	return B_OK;</a>
+<a name="ln207">}</a>
+<a name="ln208"> </a>
+<a name="ln209"> </a>
+<a name="ln210">status_t</a>
+<a name="ln211">IMAPProtocol::MarkMessageAsRead(const entry_ref&amp; ref, read_flags flags)</a>
+<a name="ln212">{</a>
+<a name="ln213">	printf(&quot;IMAP: mark as read %s: %d\n&quot;, ref.name, flags);</a>
+<a name="ln214">	return B_ERROR;</a>
+<a name="ln215">}</a>
+<a name="ln216"> </a>
+<a name="ln217"> </a>
+<a name="ln218">void</a>
+<a name="ln219">IMAPProtocol::MessageReceived(BMessage* message)</a>
+<a name="ln220">{</a>
+<a name="ln221">	switch (message-&gt;what) {</a>
+<a name="ln222">		case B_READY_TO_RUN:</a>
+<a name="ln223">			ReadyToRun();</a>
+<a name="ln224">			break;</a>
+<a name="ln225"> </a>
+<a name="ln226">		default:</a>
+<a name="ln227">			BInboundMailProtocol::MessageReceived(message);</a>
+<a name="ln228">			break;</a>
+<a name="ln229">	}</a>
+<a name="ln230">}</a>
+<a name="ln231"> </a>
+<a name="ln232"> </a>
+<a name="ln233">status_t</a>
+<a name="ln234">IMAPProtocol::HandleFetchBody(const entry_ref&amp; ref, const BMessenger&amp; replyTo)</a>
+<a name="ln235">{</a>
+<a name="ln236">	printf(&quot;IMAP: fetch body %s\n&quot;, ref.name);</a>
+<a name="ln237">	MutexLocker locker(fWorkerLock);</a>
+<a name="ln238"> </a>
+<a name="ln239">	IMAPFolder* folder = _FolderFor(ref.directory);</a>
+<a name="ln240">	if (folder == NULL)</a>
+<a name="ln241">		return B_ENTRY_NOT_FOUND;</a>
+<a name="ln242"> </a>
+<a name="ln243">	uint32 uid;</a>
+<a name="ln244">	status_t status = folder-&gt;GetMessageUID(ref, uid);</a>
+<a name="ln245">	if (status != B_OK)</a>
+<a name="ln246">		return status;</a>
+<a name="ln247"> </a>
+<a name="ln248">	WorkerMap::const_iterator found = fWorkerMap.find(folder);</a>
+<a name="ln249">	if (found == fWorkerMap.end())</a>
+<a name="ln250">		return B_ERROR;</a>
+<a name="ln251"> </a>
+<a name="ln252">	IMAPConnectionWorker* worker = found-&gt;second;</a>
+<a name="ln253">	return worker-&gt;EnqueueFetchBody(*folder, uid, replyTo);</a>
+<a name="ln254">}</a>
+<a name="ln255"> </a>
+<a name="ln256"> </a>
+<a name="ln257">void</a>
+<a name="ln258">IMAPProtocol::ReadyToRun()</a>
+<a name="ln259">{</a>
+<a name="ln260">	puts(&quot;IMAP: ready to run!&quot;);</a>
+<a name="ln261">	if (fSettings.IdleMode())</a>
+<a name="ln262">		SyncMessages();</a>
+<a name="ln263">}</a>
+<a name="ln264"> </a>
+<a name="ln265"> </a>
+<a name="ln266">IMAPFolder*</a>
+<a name="ln267">IMAPProtocol::_CreateFolder(const BString&amp; mailbox, const BString&amp; separator)</a>
+<a name="ln268">{</a>
+<a name="ln269">	BString name = MailboxToFolderName(mailbox, separator);</a>
+<a name="ln270"> </a>
+<a name="ln271">	BPath path(fSettings.Destination());</a>
+<a name="ln272">	if (path.Append(name.String()) != B_OK) {</a>
+<a name="ln273">		fprintf(stderr, &quot;Could not append path: %s\n&quot;, name.String());</a>
+<a name="ln274">		return NULL;</a>
+<a name="ln275">	}</a>
+<a name="ln276"> </a>
+<a name="ln277">	status_t status = create_directory(path.Path(), 0755);</a>
+<a name="ln278">	if (status != B_OK) {</a>
+<a name="ln279">		fprintf(stderr, &quot;Could not create path %s: %s\n&quot;, path.Path(),</a>
+<a name="ln280">			strerror(status));</a>
+<a name="ln281">		return NULL;</a>
+<a name="ln282">	}</a>
+<a name="ln283"> </a>
+<a name="ln284">	CopyMailFolderAttributes(path.Path());</a>
+<a name="ln285"> </a>
+<a name="ln286">	entry_ref ref;</a>
+<a name="ln287">	status = get_ref_for_path(path.Path(), &amp;ref);</a>
+<a name="ln288">	if (status != B_OK) {</a>
+<a name="ln289">		fprintf(stderr, &quot;Could not get ref for %s: %s\n&quot;, path.Path(),</a>
+<a name="ln290">			strerror(status));</a>
+<a name="ln291">		return NULL;</a>
+<a name="ln292">	}</a>
+<a name="ln293"> </a>
+<a name="ln294">	IMAPFolder* folder = new IMAPFolder(*this, mailbox, ref);</a>
+<a name="ln295">	status = folder-&gt;Init();</a>
+<a name="ln296">	if (status != B_OK) {</a>
+<a name="ln297">		fprintf(stderr, &quot;Initializing folder %s failed: %s\n&quot;, path.Path(),</a>
+<a name="ln298">			strerror(status));</a>
+<a name="ln299">		return NULL;</a>
+<a name="ln300">	}</a>
+<a name="ln301"> </a>
+<a name="ln302">	fFolderNodeMap.insert(std::make_pair(folder-&gt;NodeID(), folder));</a>
+<a name="ln303">	return folder;</a>
+<a name="ln304">}</a>
+<a name="ln305"> </a>
+<a name="ln306"> </a>
+<a name="ln307">IMAPFolder*</a>
+<a name="ln308">IMAPProtocol::_FolderFor(ino_t directory)</a>
+<a name="ln309">{</a>
+<a name="ln310">	FolderNodeMap::const_iterator found = fFolderNodeMap.find(directory);</a>
+<a name="ln311">	if (found != fFolderNodeMap.end())</a>
+<a name="ln312">		return found-&gt;second;</a>
+<a name="ln313"> </a>
+<a name="ln314">	return NULL;</a>
+<a name="ln315">}</a>
+<a name="ln316"> </a>
+<a name="ln317"> </a>
+<a name="ln318">status_t</a>
+<a name="ln319">IMAPProtocol::_EnqueueCheckMailboxes()</a>
+<a name="ln320">{</a>
+<a name="ln321">	for (int32 i = 0; i &lt; fWorkers.CountItems(); i++) {</a>
+<a name="ln322">		fWorkers.ItemAt(i)-&gt;EnqueueCheckMailboxes();</a>
+<a name="ln323">	}</a>
+<a name="ln324"> </a>
+<a name="ln325">	return B_OK;</a>
+<a name="ln326">}</a>
+<a name="ln327"> </a>
+<a name="ln328"> </a>
+<a name="ln329">// #pragma mark -</a>
+<a name="ln330"> </a>
+<a name="ln331"> </a>
+<a name="ln332">extern &quot;C&quot; BInboundMailProtocol*</a>
+<a name="ln333">instantiate_inbound_protocol(const BMailAccountSettings&amp; settings)</a>
+<a name="ln334">{</a>
+<a name="ln335">	return new IMAPProtocol(settings);</a>
+<a name="ln336">}</a>
+
+</code></pre>
+<div class="balloon" rel="299"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v773/" target="_blank">V773</a> The function was exited without releasing the 'folder' pointer. A memory leak is possible.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

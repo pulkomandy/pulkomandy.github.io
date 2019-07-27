@@ -1,0 +1,1039 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=windows-1250" />
+  <title>Inode.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2012-2016 Haiku, Inc. All rights reserved.</a>
+<a name="ln3"> * Distributed under the terms of the MIT License.</a>
+<a name="ln4"> *</a>
+<a name="ln5"> * Authors:</a>
+<a name="ln6"> *		Paweł Dziepak, pdziepak@quarnos.org</a>
+<a name="ln7"> */</a>
+<a name="ln8"> </a>
+<a name="ln9"> </a>
+<a name="ln10">#include &quot;Inode.h&quot;</a>
+<a name="ln11"> </a>
+<a name="ln12">#include &lt;ctype.h&gt;</a>
+<a name="ln13">#include &lt;string.h&gt;</a>
+<a name="ln14"> </a>
+<a name="ln15">#include &lt;AutoDeleter.h&gt;</a>
+<a name="ln16">#include &lt;fs_cache.h&gt;</a>
+<a name="ln17">#include &lt;NodeMonitor.h&gt;</a>
+<a name="ln18"> </a>
+<a name="ln19">#include &quot;IdMap.h&quot;</a>
+<a name="ln20">#include &quot;Request.h&quot;</a>
+<a name="ln21">#include &quot;RootInode.h&quot;</a>
+<a name="ln22"> </a>
+<a name="ln23"> </a>
+<a name="ln24">Inode::Inode()</a>
+<a name="ln25">	:</a>
+<a name="ln26">	fMetaCache(this),</a>
+<a name="ln27">	fCache(NULL),</a>
+<a name="ln28">	fAttrCache(NULL),</a>
+<a name="ln29">	fDelegation(NULL),</a>
+<a name="ln30">	fFileCache(NULL),</a>
+<a name="ln31">	fMaxFileSize(0),</a>
+<a name="ln32">	fOpenState(NULL),</a>
+<a name="ln33">	fWriteDirty(false),</a>
+<a name="ln34">	fAIOWait(create_sem(1, NULL)),</a>
+<a name="ln35">	fAIOCount(0)</a>
+<a name="ln36">{</a>
+<a name="ln37">	rw_lock_init(&amp;fDelegationLock, NULL);</a>
+<a name="ln38">	mutex_init(&amp;fStateLock, NULL);</a>
+<a name="ln39">	mutex_init(&amp;fFileCacheLock, NULL);</a>
+<a name="ln40">	rw_lock_init(&amp;fWriteLock, NULL);</a>
+<a name="ln41">	mutex_init(&amp;fAIOLock, NULL);</a>
+<a name="ln42">}</a>
+<a name="ln43"> </a>
+<a name="ln44"> </a>
+<a name="ln45">status_t</a>
+<a name="ln46">Inode::CreateInode(FileSystem* fs, const FileInfo&amp; fi, Inode** _inode)</a>
+<a name="ln47">{</a>
+<a name="ln48">	ASSERT(fs != NULL);</a>
+<a name="ln49">	ASSERT(_inode != NULL);</a>
+<a name="ln50"> </a>
+<a name="ln51">	Inode* inode = NULL;</a>
+<a name="ln52">	if (fs-&gt;Root() == NULL)</a>
+<a name="ln53">		inode = new(std::nothrow) RootInode;</a>
+<a name="ln54">	else</a>
+<a name="ln55">		inode = new(std::nothrow) Inode;</a>
+<a name="ln56"> </a>
+<a name="ln57">	if (inode == NULL)</a>
+<a name="ln58">		return B_NO_MEMORY;</a>
+<a name="ln59"> </a>
+<a name="ln60">	inode-&gt;fInfo = fi;</a>
+<a name="ln61">	inode-&gt;fFileSystem = fs;</a>
+<a name="ln62"> </a>
+<a name="ln63">	uint32 attempt = 0;</a>
+<a name="ln64">	uint64 size;</a>
+<a name="ln65">	do {</a>
+<a name="ln66">		RPC::Server* serv = fs-&gt;Server();</a>
+<a name="ln67">		Request request(serv, fs);</a>
+<a name="ln68">		RequestBuilder&amp; req = request.Builder();</a>
+<a name="ln69"> </a>
+<a name="ln70">		req.PutFH(inode-&gt;fInfo.fHandle);</a>
+<a name="ln71"> </a>
+<a name="ln72">		Attribute attr[] = { FATTR4_TYPE, FATTR4_CHANGE, FATTR4_SIZE,</a>
+<a name="ln73">			FATTR4_FSID, FATTR4_FILEID };</a>
+<a name="ln74">		req.GetAttr(attr, sizeof(attr) / sizeof(Attribute));</a>
+<a name="ln75"> </a>
+<a name="ln76">		status_t result = request.Send();</a>
+<a name="ln77">		if (result != B_OK)</a>
+<a name="ln78">			return result;</a>
+<a name="ln79"> </a>
+<a name="ln80">		ReplyInterpreter&amp; reply = request.Reply();</a>
+<a name="ln81"> </a>
+<a name="ln82">		if (inode-&gt;HandleErrors(attempt, reply.NFS4Error(), serv))</a>
+<a name="ln83">			continue;</a>
+<a name="ln84"> </a>
+<a name="ln85">		reply.PutFH();</a>
+<a name="ln86"> </a>
+<a name="ln87">		AttrValue* values;</a>
+<a name="ln88">		uint32 count;</a>
+<a name="ln89">		result = reply.GetAttr(&amp;values, &amp;count);</a>
+<a name="ln90">		if (result != B_OK)</a>
+<a name="ln91">			return result;</a>
+<a name="ln92"> </a>
+<a name="ln93">		if (fi.fFileId == 0) {</a>
+<a name="ln94">			if (count &lt; 5 || values[4].fAttribute != FATTR4_FILEID)</a>
+<a name="ln95">				inode-&gt;fInfo.fFileId = fs-&gt;AllocFileId();</a>
+<a name="ln96">			else</a>
+<a name="ln97">				inode-&gt;fInfo.fFileId = values[4].fData.fValue64;</a>
+<a name="ln98">		} else</a>
+<a name="ln99">			inode-&gt;fInfo.fFileId = fi.fFileId;</a>
+<a name="ln100"> </a>
+<a name="ln101">		// FATTR4_TYPE is mandatory</a>
+<a name="ln102">		inode-&gt;fType = values[0].fData.fValue32;</a>
+<a name="ln103"> </a>
+<a name="ln104">		if (inode-&gt;fType == NF4DIR)</a>
+<a name="ln105">			inode-&gt;fCache = new DirectoryCache(inode);</a>
+<a name="ln106">		inode-&gt;fAttrCache = new DirectoryCache(inode, true);</a>
+<a name="ln107"> </a>
+<a name="ln108">		// FATTR4_CHANGE is mandatory</a>
+<a name="ln109">		inode-&gt;fChange = values[1].fData.fValue64;</a>
+<a name="ln110"> </a>
+<a name="ln111">		// FATTR4_SIZE is mandatory</a>
+<a name="ln112">		size = values[2].fData.fValue64;</a>
+<a name="ln113">		inode-&gt;fMaxFileSize = size;</a>
+<a name="ln114"> </a>
+<a name="ln115">		// FATTR4_FSID is mandatory</a>
+<a name="ln116">		FileSystemId* fsid</a>
+<a name="ln117">			= reinterpret_cast&lt;FileSystemId*&gt;(values[3].fData.fPointer);</a>
+<a name="ln118">		if (*fsid != fs-&gt;FsId()) {</a>
+<a name="ln119">			delete[] values;</a>
+<a name="ln120">			return B_ENTRY_NOT_FOUND;</a>
+<a name="ln121">		}</a>
+<a name="ln122"> </a>
+<a name="ln123">		delete[] values;</a>
+<a name="ln124"> </a>
+<a name="ln125">		*_inode = inode;</a>
+<a name="ln126"> </a>
+<a name="ln127">		break;</a>
+<a name="ln128">	} while (true);</a>
+<a name="ln129"> </a>
+<a name="ln130">	if (inode-&gt;fType == NF4REG)</a>
+<a name="ln131">		inode-&gt;fFileCache = file_cache_create(fs-&gt;DevId(), inode-&gt;ID(), size);</a>
+<a name="ln132"> </a>
+<a name="ln133">	return B_OK;</a>
+<a name="ln134">}</a>
+<a name="ln135"> </a>
+<a name="ln136"> </a>
+<a name="ln137">Inode::~Inode()</a>
+<a name="ln138">{</a>
+<a name="ln139">	if (fDelegation != NULL)</a>
+<a name="ln140">		RecallDelegation();</a>
+<a name="ln141"> </a>
+<a name="ln142">	if (fFileCache != NULL)</a>
+<a name="ln143">		file_cache_delete(fFileCache);</a>
+<a name="ln144"> </a>
+<a name="ln145">	delete fCache;</a>
+<a name="ln146">	delete fAttrCache;</a>
+<a name="ln147"> </a>
+<a name="ln148">	delete_sem(fAIOWait);</a>
+<a name="ln149">	mutex_destroy(&amp;fAIOLock);</a>
+<a name="ln150">	mutex_destroy(&amp;fStateLock);</a>
+<a name="ln151">	mutex_destroy(&amp;fFileCacheLock);</a>
+<a name="ln152">	rw_lock_destroy(&amp;fDelegationLock);</a>
+<a name="ln153">	rw_lock_destroy(&amp;fWriteLock);</a>
+<a name="ln154"> </a>
+<a name="ln155">	ASSERT(fAIOCount == 0);</a>
+<a name="ln156">}</a>
+<a name="ln157"> </a>
+<a name="ln158"> </a>
+<a name="ln159">status_t</a>
+<a name="ln160">Inode::RevalidateFileCache()</a>
+<a name="ln161">{</a>
+<a name="ln162">	if (fDelegation != NULL)</a>
+<a name="ln163">		return B_OK;</a>
+<a name="ln164"> </a>
+<a name="ln165">	uint64 change;</a>
+<a name="ln166">	status_t result = GetChangeInfo(&amp;change);</a>
+<a name="ln167">	if (result != B_OK)</a>
+<a name="ln168">		return result;</a>
+<a name="ln169"> </a>
+<a name="ln170">	MutexLocker _(fFileCacheLock);</a>
+<a name="ln171">	if (change == fChange)</a>
+<a name="ln172">		return B_OK;</a>
+<a name="ln173">	SyncAndCommit(true);</a>
+<a name="ln174"> </a>
+<a name="ln175">	file_cache_delete(fFileCache);</a>
+<a name="ln176"> </a>
+<a name="ln177">	struct stat st;</a>
+<a name="ln178">	fMetaCache.InvalidateStat();</a>
+<a name="ln179">	result = Stat(&amp;st);</a>
+<a name="ln180">	if (result == B_OK)</a>
+<a name="ln181">		fMaxFileSize = st.st_size;</a>
+<a name="ln182">	fFileCache = file_cache_create(fFileSystem-&gt;DevId(), ID(), fMaxFileSize);</a>
+<a name="ln183"> </a>
+<a name="ln184">	change = fChange;</a>
+<a name="ln185">	return B_OK;</a>
+<a name="ln186">}</a>
+<a name="ln187"> </a>
+<a name="ln188"> </a>
+<a name="ln189">status_t</a>
+<a name="ln190">Inode::LookUp(const char* name, ino_t* id)</a>
+<a name="ln191">{</a>
+<a name="ln192">	ASSERT(name != NULL);</a>
+<a name="ln193">	ASSERT(id != NULL);</a>
+<a name="ln194"> </a>
+<a name="ln195">	if (fType != NF4DIR)</a>
+<a name="ln196">		return B_NOT_A_DIRECTORY;</a>
+<a name="ln197"> </a>
+<a name="ln198">	uint64 change;</a>
+<a name="ln199">	uint64 fileID;</a>
+<a name="ln200">	FileHandle handle;</a>
+<a name="ln201">	status_t result = NFS4Inode::LookUp(name, &amp;change, &amp;fileID, &amp;handle);</a>
+<a name="ln202">	if (result != B_OK)</a>
+<a name="ln203">		return result;</a>
+<a name="ln204"> </a>
+<a name="ln205">	*id = FileIdToInoT(fileID);</a>
+<a name="ln206"> </a>
+<a name="ln207">	result = ChildAdded(name, fileID, handle);</a>
+<a name="ln208">	if (result != B_OK)</a>
+<a name="ln209">		return result;</a>
+<a name="ln210"> </a>
+<a name="ln211">	fCache-&gt;Lock();</a>
+<a name="ln212">	if (!fCache-&gt;Valid()) {</a>
+<a name="ln213">		fCache-&gt;Reset();</a>
+<a name="ln214">		fCache-&gt;SetChangeInfo(change);</a>
+<a name="ln215">	} else</a>
+<a name="ln216">		fCache-&gt;ValidateChangeInfo(change);</a>
+<a name="ln217"> </a>
+<a name="ln218">	fCache-&gt;AddEntry(name, *id);</a>
+<a name="ln219">	fCache-&gt;Unlock();</a>
+<a name="ln220"> </a>
+<a name="ln221">	return B_OK;</a>
+<a name="ln222">}</a>
+<a name="ln223"> </a>
+<a name="ln224"> </a>
+<a name="ln225">status_t</a>
+<a name="ln226">Inode::Link(Inode* dir, const char* name)</a>
+<a name="ln227">{</a>
+<a name="ln228">	ASSERT(dir != NULL);</a>
+<a name="ln229">	ASSERT(name != NULL);</a>
+<a name="ln230"> </a>
+<a name="ln231">	ChangeInfo changeInfo;</a>
+<a name="ln232">	status_t result = NFS4Inode::Link(dir, name, &amp;changeInfo);</a>
+<a name="ln233">	if (result != B_OK)</a>
+<a name="ln234">		return result;</a>
+<a name="ln235"> </a>
+<a name="ln236">	fFileSystem-&gt;Root()-&gt;MakeInfoInvalid();</a>
+<a name="ln237">	fInfo.fNames-&gt;AddName(dir-&gt;fInfo.fNames, name);</a>
+<a name="ln238"> </a>
+<a name="ln239">	dir-&gt;fCache-&gt;Lock();</a>
+<a name="ln240">	if (dir-&gt;fCache-&gt;Valid()) {</a>
+<a name="ln241">		if (changeInfo.fAtomic</a>
+<a name="ln242">			&amp;&amp; dir-&gt;fCache-&gt;ChangeInfo() == changeInfo.fBefore) {</a>
+<a name="ln243">			dir-&gt;fCache-&gt;AddEntry(name, fInfo.fFileId, true);</a>
+<a name="ln244">			dir-&gt;fCache-&gt;SetChangeInfo(changeInfo.fAfter);</a>
+<a name="ln245">		} else</a>
+<a name="ln246">			dir-&gt;fCache-&gt;Trash();</a>
+<a name="ln247">	}</a>
+<a name="ln248">	dir-&gt;fCache-&gt;Unlock();</a>
+<a name="ln249"> </a>
+<a name="ln250">	notify_entry_created(fFileSystem-&gt;DevId(), dir-&gt;ID(), name, ID());</a>
+<a name="ln251"> </a>
+<a name="ln252">	return B_OK;</a>
+<a name="ln253">}</a>
+<a name="ln254"> </a>
+<a name="ln255"> </a>
+<a name="ln256">status_t</a>
+<a name="ln257">Inode::Remove(const char* name, FileType type, ino_t* id)</a>
+<a name="ln258">{</a>
+<a name="ln259">	ASSERT(name != NULL);</a>
+<a name="ln260"> </a>
+<a name="ln261">	MemoryDeleter nameDeleter;</a>
+<a name="ln262">	if (type == NF4NAMEDATTR) {</a>
+<a name="ln263">		status_t result = LoadAttrDirHandle();</a>
+<a name="ln264">		if (result != B_OK)</a>
+<a name="ln265">			return result;</a>
+<a name="ln266"> </a>
+<a name="ln267">		name = AttrToFileName(name);</a>
+<a name="ln268">		if (name == NULL)</a>
+<a name="ln269">			return B_NO_MEMORY;</a>
+<a name="ln270">		nameDeleter.SetTo(const_cast&lt;char*&gt;(name));</a>
+<a name="ln271">	}</a>
+<a name="ln272"> </a>
+<a name="ln273">	ChangeInfo changeInfo;</a>
+<a name="ln274">	uint64 fileID;</a>
+<a name="ln275">	status_t result = NFS4Inode::RemoveObject(name, type, &amp;changeInfo, &amp;fileID);</a>
+<a name="ln276">	if (result != B_OK)</a>
+<a name="ln277">		return result;</a>
+<a name="ln278"> </a>
+<a name="ln279">	DirectoryCache* cache = type != NF4NAMEDATTR ? fCache : fAttrCache;</a>
+<a name="ln280">	cache-&gt;Lock();</a>
+<a name="ln281">	if (cache-&gt;Valid()) {</a>
+<a name="ln282">		if (changeInfo.fAtomic</a>
+<a name="ln283">			&amp;&amp; fCache-&gt;ChangeInfo() == changeInfo.fBefore) {</a>
+<a name="ln284">			cache-&gt;RemoveEntry(name);</a>
+<a name="ln285">			cache-&gt;SetChangeInfo(changeInfo.fAfter);</a>
+<a name="ln286">		} else if (cache-&gt;ChangeInfo() != changeInfo.fBefore)</a>
+<a name="ln287">			cache-&gt;Trash();</a>
+<a name="ln288">	}</a>
+<a name="ln289">	cache-&gt;Unlock();</a>
+<a name="ln290"> </a>
+<a name="ln291">	fFileSystem-&gt;Root()-&gt;MakeInfoInvalid();</a>
+<a name="ln292">	if (id != NULL)</a>
+<a name="ln293">		*id = FileIdToInoT(fileID);</a>
+<a name="ln294"> </a>
+<a name="ln295">	if (type == NF4NAMEDATTR) {</a>
+<a name="ln296">		notify_attribute_changed(fFileSystem-&gt;DevId(), -1, ID(), name,</a>
+<a name="ln297">			B_ATTR_REMOVED);</a>
+<a name="ln298">	} else {</a>
+<a name="ln299">		notify_entry_removed(fFileSystem-&gt;DevId(), ID(), name,</a>
+<a name="ln300">			FileIdToInoT(fileID));</a>
+<a name="ln301">	}</a>
+<a name="ln302"> </a>
+<a name="ln303">	return B_OK;</a>
+<a name="ln304">}</a>
+<a name="ln305"> </a>
+<a name="ln306"> </a>
+<a name="ln307">status_t</a>
+<a name="ln308">Inode::Rename(Inode* from, Inode* to, const char* fromName, const char* toName,</a>
+<a name="ln309">	bool attribute, ino_t* id, ino_t* oldID)</a>
+<a name="ln310">{</a>
+<a name="ln311">	ASSERT(from != NULL);</a>
+<a name="ln312">	ASSERT(fromName != NULL);</a>
+<a name="ln313">	ASSERT(to != NULL);</a>
+<a name="ln314">	ASSERT(toName != NULL);</a>
+<a name="ln315"> </a>
+<a name="ln316">	if (from-&gt;fFileSystem != to-&gt;fFileSystem)</a>
+<a name="ln317">		return B_DONT_DO_THAT;</a>
+<a name="ln318"> </a>
+<a name="ln319">	MemoryDeleter fromNameDeleter;</a>
+<a name="ln320">	MemoryDeleter toNameDeleter;</a>
+<a name="ln321">	if (attribute) {</a>
+<a name="ln322">		status_t result = from-&gt;LoadAttrDirHandle();</a>
+<a name="ln323">		if (result != B_OK)</a>
+<a name="ln324">			return result;</a>
+<a name="ln325"> </a>
+<a name="ln326">		result = to-&gt;LoadAttrDirHandle();</a>
+<a name="ln327">		if (result != B_OK)</a>
+<a name="ln328">			return result;</a>
+<a name="ln329"> </a>
+<a name="ln330">		fromName = from-&gt;AttrToFileName(fromName);</a>
+<a name="ln331">		toName = to-&gt;AttrToFileName(toName);</a>
+<a name="ln332"> </a>
+<a name="ln333">		fromNameDeleter.SetTo(const_cast&lt;char*&gt;(fromName));</a>
+<a name="ln334">		toNameDeleter.SetTo(const_cast&lt;char*&gt;(toName));</a>
+<a name="ln335">		if (fromName == NULL || toName == NULL)</a>
+<a name="ln336">			return B_NO_MEMORY;</a>
+<a name="ln337">	}</a>
+<a name="ln338"> </a>
+<a name="ln339">	uint64 oldFileID = 0;</a>
+<a name="ln340">	if (!attribute)</a>
+<a name="ln341">		to-&gt;NFS4Inode::LookUp(toName, NULL, &amp;oldFileID, NULL);</a>
+<a name="ln342"> </a>
+<a name="ln343">	uint64 fileID;</a>
+<a name="ln344">	ChangeInfo fromChange, toChange;</a>
+<a name="ln345">	status_t result = NFS4Inode::RenameNode(from, to, fromName, toName,</a>
+<a name="ln346">		&amp;fromChange, &amp;toChange, &amp;fileID, attribute);</a>
+<a name="ln347">	if (result != B_OK)</a>
+<a name="ln348">		return result;</a>
+<a name="ln349"> </a>
+<a name="ln350">	from-&gt;fFileSystem-&gt;Root()-&gt;MakeInfoInvalid();</a>
+<a name="ln351"> </a>
+<a name="ln352">	if (id != NULL)</a>
+<a name="ln353">		*id = FileIdToInoT(fileID);</a>
+<a name="ln354">	if (oldID != NULL)</a>
+<a name="ln355">		*oldID = FileIdToInoT(oldFileID);</a>
+<a name="ln356"> </a>
+<a name="ln357">	DirectoryCache* cache = attribute ? from-&gt;fAttrCache : from-&gt;fCache;</a>
+<a name="ln358">	cache-&gt;Lock();</a>
+<a name="ln359">	if (cache-&gt;Valid()) {</a>
+<a name="ln360">		if (fromChange.fAtomic &amp;&amp; cache-&gt;ChangeInfo() == fromChange.fBefore) {</a>
+<a name="ln361">			cache-&gt;RemoveEntry(fromName);</a>
+<a name="ln362">			if (to == from)</a>
+<a name="ln363">				cache-&gt;AddEntry(toName, fileID, true);</a>
+<a name="ln364">			cache-&gt;SetChangeInfo(fromChange.fAfter);</a>
+<a name="ln365">		} else</a>
+<a name="ln366">			cache-&gt;Trash();</a>
+<a name="ln367">	}</a>
+<a name="ln368">	cache-&gt;Unlock();</a>
+<a name="ln369"> </a>
+<a name="ln370">	if (to != from) {</a>
+<a name="ln371">		cache = attribute ? to-&gt;fAttrCache : to-&gt;fCache;</a>
+<a name="ln372">		cache-&gt;Lock();</a>
+<a name="ln373">		if (cache-&gt;Valid()) {</a>
+<a name="ln374">			if (toChange.fAtomic</a>
+<a name="ln375">				&amp;&amp; (cache-&gt;ChangeInfo() == toChange.fBefore)) {</a>
+<a name="ln376">				cache-&gt;AddEntry(toName, fileID, true);</a>
+<a name="ln377">				cache-&gt;SetChangeInfo(toChange.fAfter);</a>
+<a name="ln378">			} else</a>
+<a name="ln379">				cache-&gt;Trash();</a>
+<a name="ln380">		}</a>
+<a name="ln381">		cache-&gt;Unlock();</a>
+<a name="ln382">	}</a>
+<a name="ln383"> </a>
+<a name="ln384">	if (attribute) {</a>
+<a name="ln385">		notify_attribute_changed(from-&gt;fFileSystem-&gt;DevId(), -1, from-&gt;ID(),</a>
+<a name="ln386">			fromName, B_ATTR_REMOVED);</a>
+<a name="ln387">		notify_attribute_changed(to-&gt;fFileSystem-&gt;DevId(), -1, to-&gt;ID(), toName,</a>
+<a name="ln388">			B_ATTR_CREATED);</a>
+<a name="ln389">	} else {</a>
+<a name="ln390">		notify_entry_moved(from-&gt;fFileSystem-&gt;DevId(), from-&gt;ID(), fromName,</a>
+<a name="ln391">			to-&gt;ID(), toName, FileIdToInoT(fileID));</a>
+<a name="ln392">	}</a>
+<a name="ln393"> </a>
+<a name="ln394">	return B_OK;</a>
+<a name="ln395">}</a>
+<a name="ln396"> </a>
+<a name="ln397"> </a>
+<a name="ln398">status_t</a>
+<a name="ln399">Inode::CreateLink(const char* name, const char* path, int mode, ino_t* id)</a>
+<a name="ln400">{</a>
+<a name="ln401">	return CreateObject(name, path, mode, NF4LNK, id);</a>
+<a name="ln402">}</a>
+<a name="ln403"> </a>
+<a name="ln404"> </a>
+<a name="ln405">status_t</a>
+<a name="ln406">Inode::CreateObject(const char* name, const char* path, int mode, FileType type,</a>
+<a name="ln407">	ino_t* id)</a>
+<a name="ln408">{</a>
+<a name="ln409">	ASSERT(name != NULL);</a>
+<a name="ln410">	ASSERT(type != NF4LNK || path != NULL);</a>
+<a name="ln411"> </a>
+<a name="ln412">	ChangeInfo changeInfo;</a>
+<a name="ln413">	uint64 fileID;</a>
+<a name="ln414">	FileHandle handle;</a>
+<a name="ln415"> </a>
+<a name="ln416">	status_t result = NFS4Inode::CreateObject(name, path, mode, type,</a>
+<a name="ln417">		&amp;changeInfo, &amp;fileID, &amp;handle);</a>
+<a name="ln418">	if (result != B_OK)</a>
+<a name="ln419">		return result;</a>
+<a name="ln420"> </a>
+<a name="ln421">	fFileSystem-&gt;Root()-&gt;MakeInfoInvalid();</a>
+<a name="ln422"> </a>
+<a name="ln423">	result = ChildAdded(name, fileID, handle);</a>
+<a name="ln424">	if (result != B_OK)</a>
+<a name="ln425">		return result;</a>
+<a name="ln426"> </a>
+<a name="ln427">	fCache-&gt;Lock();</a>
+<a name="ln428">	if (fCache-&gt;Valid()) {</a>
+<a name="ln429">		if (changeInfo.fAtomic &amp;&amp; fCache-&gt;ChangeInfo() == changeInfo.fBefore) {</a>
+<a name="ln430">			fCache-&gt;AddEntry(name, fileID, true);</a>
+<a name="ln431">			fCache-&gt;SetChangeInfo(changeInfo.fAfter);</a>
+<a name="ln432">		} else</a>
+<a name="ln433">			fCache-&gt;Trash();</a>
+<a name="ln434">	}</a>
+<a name="ln435">	fCache-&gt;Unlock();</a>
+<a name="ln436"> </a>
+<a name="ln437">	notify_entry_created(fFileSystem-&gt;DevId(), ID(), name,</a>
+<a name="ln438">		FileIdToInoT(fileID));</a>
+<a name="ln439"> </a>
+<a name="ln440">	*id = FileIdToInoT(fileID);</a>
+<a name="ln441">	return B_OK;</a>
+<a name="ln442">}</a>
+<a name="ln443"> </a>
+<a name="ln444"> </a>
+<a name="ln445">status_t</a>
+<a name="ln446">Inode::Access(int mode)</a>
+<a name="ln447">{</a>
+<a name="ln448">	int acc = 0;</a>
+<a name="ln449"> </a>
+<a name="ln450">	uint32 allowed;</a>
+<a name="ln451">	bool cache = fFileSystem-&gt;GetConfiguration().fCacheMetadata;</a>
+<a name="ln452">	status_t result = fMetaCache.GetAccess(geteuid(), &amp;allowed);</a>
+<a name="ln453">	if (result != B_OK || !cache) {</a>
+<a name="ln454">		result = NFS4Inode::Access(&amp;allowed);</a>
+<a name="ln455">		if (result != B_OK)</a>
+<a name="ln456">			return result;</a>
+<a name="ln457">		fMetaCache.SetAccess(geteuid(), allowed);</a>
+<a name="ln458">	}</a>
+<a name="ln459"> </a>
+<a name="ln460">	if ((allowed &amp; ACCESS4_READ) != 0)</a>
+<a name="ln461">		acc |= R_OK;</a>
+<a name="ln462"> </a>
+<a name="ln463">	if ((allowed &amp; ACCESS4_LOOKUP) != 0)</a>
+<a name="ln464">		acc |= X_OK | R_OK;</a>
+<a name="ln465"> </a>
+<a name="ln466">	if ((allowed &amp; ACCESS4_EXECUTE) != 0)</a>
+<a name="ln467">		acc |= X_OK;</a>
+<a name="ln468"> </a>
+<a name="ln469">	if ((allowed &amp; ACCESS4_MODIFY) != 0)</a>
+<a name="ln470">		acc |= W_OK;</a>
+<a name="ln471"> </a>
+<a name="ln472">	if ((mode &amp; acc) != mode)</a>
+<a name="ln473">		return B_NOT_ALLOWED;</a>
+<a name="ln474"> </a>
+<a name="ln475">	return B_OK;</a>
+<a name="ln476">}</a>
+<a name="ln477"> </a>
+<a name="ln478"> </a>
+<a name="ln479">status_t</a>
+<a name="ln480">Inode::Stat(struct stat* st, OpenAttrCookie* attr)</a>
+<a name="ln481">{</a>
+<a name="ln482">	ASSERT(st != NULL);</a>
+<a name="ln483"> </a>
+<a name="ln484">	if (attr != NULL)</a>
+<a name="ln485">		return GetStat(st, attr);</a>
+<a name="ln486"> </a>
+<a name="ln487">	bool cache = fFileSystem-&gt;GetConfiguration().fCacheMetadata;</a>
+<a name="ln488">	if (!cache)</a>
+<a name="ln489">		return GetStat(st, NULL);</a>
+<a name="ln490"> </a>
+<a name="ln491">	status_t result = fMetaCache.GetStat(st);</a>
+<a name="ln492">	if (result != B_OK) {</a>
+<a name="ln493">		struct stat temp;</a>
+<a name="ln494">		result = GetStat(&amp;temp);</a>
+<a name="ln495">		if (result != B_OK)</a>
+<a name="ln496">			return result;</a>
+<a name="ln497">		fMetaCache.SetStat(temp);</a>
+<a name="ln498">		fMetaCache.GetStat(st);</a>
+<a name="ln499">	}</a>
+<a name="ln500"> </a>
+<a name="ln501">	return B_OK;</a>
+<a name="ln502">}</a>
+<a name="ln503"> </a>
+<a name="ln504"> </a>
+<a name="ln505">status_t</a>
+<a name="ln506">Inode::GetStat(struct stat* st, OpenAttrCookie* attr)</a>
+<a name="ln507">{</a>
+<a name="ln508">	ASSERT(st != NULL);</a>
+<a name="ln509"> </a>
+<a name="ln510">	AttrValue* values;</a>
+<a name="ln511">	uint32 count;</a>
+<a name="ln512">	status_t result = NFS4Inode::GetStat(&amp;values, &amp;count, attr);</a>
+<a name="ln513">	if (result != B_OK)</a>
+<a name="ln514">		return result;</a>
+<a name="ln515"> </a>
+<a name="ln516">	// FATTR4_SIZE is mandatory</a>
+<a name="ln517">	if (count &lt; 1 || values[0].fAttribute != FATTR4_SIZE) {</a>
+<a name="ln518">		delete[] values;</a>
+<a name="ln519">		return B_BAD_VALUE;</a>
+<a name="ln520">	}</a>
+<a name="ln521">	st-&gt;st_size = values[0].fData.fValue64;</a>
+<a name="ln522"> </a>
+<a name="ln523">	uint32 next = 1;</a>
+<a name="ln524">	st-&gt;st_mode = Type();</a>
+<a name="ln525">	if (count &gt;= next &amp;&amp; values[next].fAttribute == FATTR4_MODE) {</a>
+<a name="ln526">		st-&gt;st_mode |= values[next].fData.fValue32;</a>
+<a name="ln527">		next++;</a>
+<a name="ln528">	} else</a>
+<a name="ln529">		st-&gt;st_mode = 777;</a>
+<a name="ln530"> </a>
+<a name="ln531">	if (count &gt;= next &amp;&amp; values[next].fAttribute == FATTR4_NUMLINKS) {</a>
+<a name="ln532">		st-&gt;st_nlink = values[next].fData.fValue32;</a>
+<a name="ln533">		next++;</a>
+<a name="ln534">	} else</a>
+<a name="ln535">		st-&gt;st_nlink = 1;</a>
+<a name="ln536"> </a>
+<a name="ln537">	if (count &gt;= next &amp;&amp; values[next].fAttribute == FATTR4_OWNER) {</a>
+<a name="ln538">		char* owner = reinterpret_cast&lt;char*&gt;(values[next].fData.fPointer);</a>
+<a name="ln539">		if (owner != NULL &amp;&amp; isdigit(owner[0]))</a>
+<a name="ln540">			st-&gt;st_uid = atoi(owner);</a>
+<a name="ln541">		else</a>
+<a name="ln542">			st-&gt;st_uid = gIdMapper-&gt;GetUserId(owner);</a>
+<a name="ln543">		next++;</a>
+<a name="ln544">	} else</a>
+<a name="ln545">		st-&gt;st_uid = 0;</a>
+<a name="ln546"> </a>
+<a name="ln547">	if (count &gt;= next &amp;&amp; values[next].fAttribute == FATTR4_OWNER_GROUP) {</a>
+<a name="ln548">		char* group = reinterpret_cast&lt;char*&gt;(values[next].fData.fPointer);</a>
+<a name="ln549">		if (group != NULL &amp;&amp; isdigit(group[0]))</a>
+<a name="ln550">			st-&gt;st_gid = atoi(group);</a>
+<a name="ln551">		else</a>
+<a name="ln552">			st-&gt;st_gid = gIdMapper-&gt;GetGroupId(group);</a>
+<a name="ln553">		next++;</a>
+<a name="ln554">	} else</a>
+<a name="ln555">		st-&gt;st_gid = 0;</a>
+<a name="ln556"> </a>
+<a name="ln557">	if (count &gt;= next &amp;&amp; values[next].fAttribute == FATTR4_TIME_ACCESS) {</a>
+<a name="ln558">		memcpy(&amp;st-&gt;st_atim, values[next].fData.fPointer,</a>
+<a name="ln559">			sizeof(timespec));</a>
+<a name="ln560">		next++;</a>
+<a name="ln561">	} else</a>
+<a name="ln562">		memset(&amp;st-&gt;st_atim, 0, sizeof(timespec));</a>
+<a name="ln563"> </a>
+<a name="ln564">	if (count &gt;= next &amp;&amp; values[next].fAttribute == FATTR4_TIME_CREATE) {</a>
+<a name="ln565">		memcpy(&amp;st-&gt;st_crtim, values[next].fData.fPointer,</a>
+<a name="ln566">			sizeof(timespec));</a>
+<a name="ln567">		next++;</a>
+<a name="ln568">	} else</a>
+<a name="ln569">		memset(&amp;st-&gt;st_crtim, 0, sizeof(timespec));</a>
+<a name="ln570"> </a>
+<a name="ln571">	if (count &gt;= next &amp;&amp; values[next].fAttribute == FATTR4_TIME_METADATA) {</a>
+<a name="ln572">		memcpy(&amp;st-&gt;st_ctim, values[next].fData.fPointer,</a>
+<a name="ln573">			sizeof(timespec));</a>
+<a name="ln574">		next++;</a>
+<a name="ln575">	} else</a>
+<a name="ln576">		memset(&amp;st-&gt;st_ctim, 0, sizeof(timespec));</a>
+<a name="ln577"> </a>
+<a name="ln578">	if (count &gt;= next &amp;&amp; values[next].fAttribute == FATTR4_TIME_MODIFY) {</a>
+<a name="ln579">		memcpy(&amp;st-&gt;st_mtim, values[next].fData.fPointer,</a>
+<a name="ln580">			sizeof(timespec));</a>
+<a name="ln581">		next++;</a>
+<a name="ln582">	} else</a>
+<a name="ln583">		memset(&amp;st-&gt;st_mtim, 0, sizeof(timespec));</a>
+<a name="ln584">	delete[] values;</a>
+<a name="ln585"> </a>
+<a name="ln586">	st-&gt;st_blksize = fFileSystem-&gt;Root()-&gt;IOSize();</a>
+<a name="ln587">	st-&gt;st_blocks = st-&gt;st_size / st-&gt;st_blksize;</a>
+<a name="ln588">	st-&gt;st_blocks += st-&gt;st_size % st-&gt;st_blksize == 0 ? 0 : 1;</a>
+<a name="ln589"> </a>
+<a name="ln590">	return B_OK;</a>
+<a name="ln591">}</a>
+<a name="ln592"> </a>
+<a name="ln593"> </a>
+<a name="ln594">status_t</a>
+<a name="ln595">Inode::WriteStat(const struct stat* st, uint32 mask, OpenAttrCookie* cookie)</a>
+<a name="ln596">{</a>
+<a name="ln597">	ASSERT(st != NULL);</a>
+<a name="ln598"> </a>
+<a name="ln599">	status_t result;</a>
+<a name="ln600">	AttrValue attr[6];</a>
+<a name="ln601">	uint32 i = 0;</a>
+<a name="ln602"> </a>
+<a name="ln603">	if ((mask &amp; B_STAT_SIZE) != 0) {</a>
+<a name="ln604">		fMaxFileSize = st-&gt;st_size;</a>
+<a name="ln605">		file_cache_set_size(fFileCache, st-&gt;st_size);</a>
+<a name="ln606"> </a>
+<a name="ln607">		attr[i].fAttribute = FATTR4_SIZE;</a>
+<a name="ln608">		attr[i].fFreePointer = false;</a>
+<a name="ln609">		attr[i].fData.fValue64 = st-&gt;st_size;</a>
+<a name="ln610">		i++;</a>
+<a name="ln611">	}</a>
+<a name="ln612"> </a>
+<a name="ln613">	if ((mask &amp; B_STAT_MODE) != 0) {</a>
+<a name="ln614">		attr[i].fAttribute = FATTR4_MODE;</a>
+<a name="ln615">		attr[i].fFreePointer = false;</a>
+<a name="ln616">		attr[i].fData.fValue32 = st-&gt;st_mode;</a>
+<a name="ln617">		i++;</a>
+<a name="ln618">	}</a>
+<a name="ln619"> </a>
+<a name="ln620">	if ((mask &amp; B_STAT_UID) != 0) {</a>
+<a name="ln621">		attr[i].fAttribute = FATTR4_OWNER;</a>
+<a name="ln622">		attr[i].fFreePointer = true;</a>
+<a name="ln623">		attr[i].fData.fPointer = gIdMapper-&gt;GetOwner(st-&gt;st_uid);</a>
+<a name="ln624">		i++;</a>
+<a name="ln625">	}</a>
+<a name="ln626"> </a>
+<a name="ln627">	if ((mask &amp; B_STAT_GID) != 0) {</a>
+<a name="ln628">		attr[i].fAttribute = FATTR4_OWNER_GROUP;</a>
+<a name="ln629">		attr[i].fFreePointer = true;</a>
+<a name="ln630">		attr[i].fData.fPointer = gIdMapper-&gt;GetOwnerGroup(st-&gt;st_gid);</a>
+<a name="ln631">		i++;</a>
+<a name="ln632">	}</a>
+<a name="ln633"> </a>
+<a name="ln634">	if ((mask &amp; B_STAT_ACCESS_TIME) != 0) {</a>
+<a name="ln635">		attr[i].fAttribute = FATTR4_TIME_ACCESS_SET;</a>
+<a name="ln636">		attr[i].fFreePointer = true;</a>
+<a name="ln637">		attr[i].fData.fPointer = malloc(sizeof(st-&gt;st_atim));</a>
+<a name="ln638">		memcpy(attr[i].fData.fPointer, &amp;st-&gt;st_atim, sizeof(st-&gt;st_atim));</a>
+<a name="ln639">		i++;</a>
+<a name="ln640">	}</a>
+<a name="ln641"> </a>
+<a name="ln642">	if ((mask &amp; B_STAT_MODIFICATION_TIME) != 0) {</a>
+<a name="ln643">		attr[i].fAttribute = FATTR4_TIME_MODIFY_SET;</a>
+<a name="ln644">		attr[i].fFreePointer = true;</a>
+<a name="ln645">		attr[i].fData.fPointer = malloc(sizeof(st-&gt;st_mtim));</a>
+<a name="ln646">		memcpy(attr[i].fData.fPointer, &amp;st-&gt;st_mtim, sizeof(st-&gt;st_mtim));</a>
+<a name="ln647">		i++;</a>
+<a name="ln648">	}</a>
+<a name="ln649"> </a>
+<a name="ln650">	if (cookie == NULL) {</a>
+<a name="ln651">		MutexLocker stateLocker(fStateLock);</a>
+<a name="ln652">		ASSERT(fOpenState != NULL || !(mask &amp; B_STAT_SIZE));</a>
+<a name="ln653">		result = NFS4Inode::WriteStat(fOpenState, attr, i);</a>
+<a name="ln654">	} else</a>
+<a name="ln655">		result = NFS4Inode::WriteStat(cookie-&gt;fOpenState, attr, i);</a>
+<a name="ln656"> </a>
+<a name="ln657">	fMetaCache.InvalidateStat();</a>
+<a name="ln658"> </a>
+<a name="ln659">	const uint32 kAccessMask = B_STAT_MODE | B_STAT_UID | B_STAT_GID;</a>
+<a name="ln660">	if ((mask &amp; kAccessMask) != 0)</a>
+<a name="ln661">		fMetaCache.InvalidateAccess();</a>
+<a name="ln662"> </a>
+<a name="ln663">	return result;</a>
+<a name="ln664">}</a>
+<a name="ln665"> </a>
+<a name="ln666"> </a>
+<a name="ln667">inline status_t</a>
+<a name="ln668">Inode::CheckLockType(short ltype, uint32 mode)</a>
+<a name="ln669">{</a>
+<a name="ln670">	switch (ltype) {</a>
+<a name="ln671">		case F_UNLCK:</a>
+<a name="ln672">			return B_OK;</a>
+<a name="ln673"> </a>
+<a name="ln674">		case F_RDLCK:</a>
+<a name="ln675">			if ((mode &amp; O_RDONLY) == 0 &amp;&amp; (mode &amp; O_RDWR) == 0)</a>
+<a name="ln676">				return EBADF;</a>
+<a name="ln677">			return B_OK;</a>
+<a name="ln678"> </a>
+<a name="ln679">		case F_WRLCK:</a>
+<a name="ln680">			if ((mode &amp; O_WRONLY) == 0 &amp;&amp; (mode &amp; O_RDWR) == 0)</a>
+<a name="ln681">				return EBADF;</a>
+<a name="ln682">			return B_OK;</a>
+<a name="ln683"> </a>
+<a name="ln684">		default:</a>
+<a name="ln685">			return B_BAD_VALUE;</a>
+<a name="ln686">	}</a>
+<a name="ln687">}</a>
+<a name="ln688"> </a>
+<a name="ln689"> </a>
+<a name="ln690">status_t</a>
+<a name="ln691">Inode::TestLock(OpenFileCookie* cookie, struct flock* lock)</a>
+<a name="ln692">{</a>
+<a name="ln693">	ASSERT(cookie != NULL);</a>
+<a name="ln694">	ASSERT(lock != NULL);</a>
+<a name="ln695"> </a>
+<a name="ln696">	if (lock-&gt;l_type == F_UNLCK)</a>
+<a name="ln697">		return B_OK;</a>
+<a name="ln698"> </a>
+<a name="ln699">	status_t result = CheckLockType(lock-&gt;l_type, cookie-&gt;fMode);</a>
+<a name="ln700">	if (result != B_OK)</a>
+<a name="ln701">		return result;</a>
+<a name="ln702"> </a>
+<a name="ln703">	LockType ltype = sGetLockType(lock-&gt;l_type, false);</a>
+<a name="ln704">	uint64 position = lock-&gt;l_start;</a>
+<a name="ln705">	uint64 length;</a>
+<a name="ln706">	if (lock-&gt;l_len + lock-&gt;l_start == OFF_MAX)</a>
+<a name="ln707">		length = UINT64_MAX;</a>
+<a name="ln708">	else</a>
+<a name="ln709">		length = lock-&gt;l_len;</a>
+<a name="ln710"> </a>
+<a name="ln711">	bool conflict;</a>
+<a name="ln712">	result = NFS4Inode::TestLock(cookie, &amp;ltype, &amp;position, &amp;length, conflict);</a>
+<a name="ln713">	if (result != B_OK)</a>
+<a name="ln714">		return result;</a>
+<a name="ln715"> </a>
+<a name="ln716">	if (conflict) {</a>
+<a name="ln717">		lock-&gt;l_type = sLockTypeToHaiku(ltype);</a>
+<a name="ln718">		lock-&gt;l_start = static_cast&lt;off_t&gt;(position);</a>
+<a name="ln719">		if (length &gt;= OFF_MAX)</a>
+<a name="ln720">			lock-&gt;l_len = OFF_MAX;</a>
+<a name="ln721">		else</a>
+<a name="ln722">			lock-&gt;l_len = static_cast&lt;off_t&gt;(length);</a>
+<a name="ln723">	} else</a>
+<a name="ln724">		lock-&gt;l_type = F_UNLCK;</a>
+<a name="ln725"> </a>
+<a name="ln726">	return B_OK;</a>
+<a name="ln727">}</a>
+<a name="ln728"> </a>
+<a name="ln729"> </a>
+<a name="ln730">status_t</a>
+<a name="ln731">Inode::AcquireLock(OpenFileCookie* cookie, const struct flock* lock,</a>
+<a name="ln732">	bool wait)</a>
+<a name="ln733">{</a>
+<a name="ln734">	ASSERT(cookie != NULL);</a>
+<a name="ln735">	ASSERT(lock != NULL);</a>
+<a name="ln736"> </a>
+<a name="ln737">	OpenState* state = cookie-&gt;fOpenState;</a>
+<a name="ln738"> </a>
+<a name="ln739">	status_t result = CheckLockType(lock-&gt;l_type, cookie-&gt;fMode);</a>
+<a name="ln740">	if (result != B_OK)</a>
+<a name="ln741">		return result;</a>
+<a name="ln742"> </a>
+<a name="ln743">	thread_info info;</a>
+<a name="ln744">	get_thread_info(find_thread(NULL), &amp;info);</a>
+<a name="ln745"> </a>
+<a name="ln746">	MutexLocker locker(state-&gt;fOwnerLock);</a>
+<a name="ln747">	LockOwner* owner = state-&gt;GetLockOwner(info.team);</a>
+<a name="ln748">	if (owner == NULL)</a>
+<a name="ln749">		return B_NO_MEMORY;</a>
+<a name="ln750"> </a>
+<a name="ln751">	LockInfo* linfo = new(std::nothrow) LockInfo(owner);</a>
+<a name="ln752">	if (linfo == NULL)</a>
+<a name="ln753">		return B_NO_MEMORY;</a>
+<a name="ln754">	locker.Unlock();</a>
+<a name="ln755"> </a>
+<a name="ln756">	linfo-&gt;fStart = lock-&gt;l_start;</a>
+<a name="ln757">	if (lock-&gt;l_len + lock-&gt;l_start == OFF_MAX)</a>
+<a name="ln758">		linfo-&gt;fLength = UINT64_MAX;</a>
+<a name="ln759">	else</a>
+<a name="ln760">		linfo-&gt;fLength = lock-&gt;l_len;</a>
+<a name="ln761">	linfo-&gt;fType = sGetLockType(lock-&gt;l_type, wait);</a>
+<a name="ln762"> </a>
+<a name="ln763">	result = NFS4Inode::AcquireLock(cookie, linfo, wait);</a>
+<a name="ln764">	if (result != B_OK) {</a>
+<a name="ln765">		delete linfo;</a>
+<a name="ln766">		return result;</a>
+<a name="ln767">	}</a>
+<a name="ln768"> </a>
+<a name="ln769">	MutexLocker _(state-&gt;fLocksLock);</a>
+<a name="ln770">	state-&gt;AddLock(linfo);</a>
+<a name="ln771">	cookie-&gt;AddLock(linfo);</a>
+<a name="ln772"> </a>
+<a name="ln773">	return B_OK;</a>
+<a name="ln774">}</a>
+<a name="ln775"> </a>
+<a name="ln776"> </a>
+<a name="ln777">status_t</a>
+<a name="ln778">Inode::ReleaseLock(OpenFileCookie* cookie, const struct flock* lock)</a>
+<a name="ln779">{</a>
+<a name="ln780">	ASSERT(cookie != NULL);</a>
+<a name="ln781">	ASSERT(lock != NULL);</a>
+<a name="ln782"> </a>
+<a name="ln783">	SyncAndCommit();</a>
+<a name="ln784"> </a>
+<a name="ln785">	LockInfo* prev = NULL;</a>
+<a name="ln786"> </a>
+<a name="ln787">	thread_info info;</a>
+<a name="ln788">	get_thread_info(find_thread(NULL), &amp;info);</a>
+<a name="ln789">	uint32 owner = info.team;</a>
+<a name="ln790"> </a>
+<a name="ln791">	OpenState* state = cookie-&gt;fOpenState;</a>
+<a name="ln792">	MutexLocker locker(state-&gt;fLocksLock);</a>
+<a name="ln793">	LockInfo* linfo = state-&gt;fLocks;</a>
+<a name="ln794">	while (linfo != NULL) {</a>
+<a name="ln795">		if (linfo-&gt;fOwner-&gt;fOwner == owner &amp;&amp; *linfo == *lock) {</a>
+<a name="ln796">			state-&gt;RemoveLock(linfo, prev);</a>
+<a name="ln797">			break;</a>
+<a name="ln798">		}</a>
+<a name="ln799"> </a>
+<a name="ln800">		prev = linfo;</a>
+<a name="ln801">		linfo = linfo-&gt;fNext;</a>
+<a name="ln802">	}</a>
+<a name="ln803"> </a>
+<a name="ln804">	prev = NULL;</a>
+<a name="ln805">	linfo = cookie-&gt;fLocks;</a>
+<a name="ln806">	while (linfo != NULL) {</a>
+<a name="ln807">		if (linfo-&gt;fOwner-&gt;fOwner == owner &amp;&amp; *linfo == *lock) {</a>
+<a name="ln808">			cookie-&gt;RemoveLock(linfo, prev);</a>
+<a name="ln809">			break;</a>
+<a name="ln810">		}</a>
+<a name="ln811"> </a>
+<a name="ln812">		prev = linfo;</a>
+<a name="ln813">		linfo = linfo-&gt;fCookieNext;</a>
+<a name="ln814">	}</a>
+<a name="ln815">	locker.Unlock();</a>
+<a name="ln816"> </a>
+<a name="ln817">	if (linfo == NULL)</a>
+<a name="ln818">		return B_BAD_VALUE;</a>
+<a name="ln819"> </a>
+<a name="ln820">	status_t result = NFS4Inode::ReleaseLock(cookie, linfo);</a>
+<a name="ln821">	if (result != B_OK)</a>
+<a name="ln822">		return result;</a>
+<a name="ln823"> </a>
+<a name="ln824">	state-&gt;DeleteLock(linfo);</a>
+<a name="ln825"> </a>
+<a name="ln826">	return B_OK;</a>
+<a name="ln827">}</a>
+<a name="ln828"> </a>
+<a name="ln829"> </a>
+<a name="ln830">status_t</a>
+<a name="ln831">Inode::ReleaseAllLocks(OpenFileCookie* cookie)</a>
+<a name="ln832">{</a>
+<a name="ln833">	ASSERT(cookie != NULL);</a>
+<a name="ln834"> </a>
+<a name="ln835">	if (cookie-&gt;fLocks)</a>
+<a name="ln836">		SyncAndCommit();</a>
+<a name="ln837"> </a>
+<a name="ln838">	OpenState* state = cookie-&gt;fOpenState;</a>
+<a name="ln839">	MutexLocker _(state-&gt;fLocksLock);</a>
+<a name="ln840">	LockInfo* linfo = cookie-&gt;fLocks;</a>
+<a name="ln841">	while (linfo != NULL) {</a>
+<a name="ln842">		cookie-&gt;RemoveLock(linfo, NULL);</a>
+<a name="ln843"> </a>
+<a name="ln844">		LockInfo* prev = NULL;</a>
+<a name="ln845">		LockInfo* stateLock = state-&gt;fLocks;</a>
+<a name="ln846">		while (stateLock != NULL) {</a>
+<a name="ln847">			if (*linfo == *stateLock) {</a>
+<a name="ln848">				state-&gt;RemoveLock(stateLock, prev);</a>
+<a name="ln849">				break;</a>
+<a name="ln850">			}</a>
+<a name="ln851"> </a>
+<a name="ln852">			prev = stateLock;</a>
+<a name="ln853">			stateLock = stateLock-&gt;fNext;</a>
+<a name="ln854">		}</a>
+<a name="ln855"> </a>
+<a name="ln856">		NFS4Inode::ReleaseLock(cookie, linfo);</a>
+<a name="ln857">		state-&gt;DeleteLock(linfo);</a>
+<a name="ln858"> </a>
+<a name="ln859">		linfo = cookie-&gt;fLocks;</a>
+<a name="ln860">	}</a>
+<a name="ln861"> </a>
+<a name="ln862">	return B_OK;</a>
+<a name="ln863">}</a>
+<a name="ln864"> </a>
+<a name="ln865"> </a>
+<a name="ln866">status_t</a>
+<a name="ln867">Inode::ChildAdded(const char* name, uint64 fileID,</a>
+<a name="ln868">	const FileHandle&amp; fileHandle)</a>
+<a name="ln869">{</a>
+<a name="ln870">	ASSERT(name != NULL);</a>
+<a name="ln871"> </a>
+<a name="ln872">	fFileSystem-&gt;Root()-&gt;MakeInfoInvalid();</a>
+<a name="ln873"> </a>
+<a name="ln874">	FileInfo fi;</a>
+<a name="ln875">	fi.fFileId = fileID;</a>
+<a name="ln876">	fi.fHandle = fileHandle;</a>
+<a name="ln877"> </a>
+<a name="ln878">	return fFileSystem-&gt;InoIdMap()-&gt;AddName(fi, fInfo.fNames, name,</a>
+<a name="ln879">		FileIdToInoT(fileID));</a>
+<a name="ln880">}</a>
+<a name="ln881"> </a>
+<a name="ln882"> </a>
+<a name="ln883">const char*</a>
+<a name="ln884">Inode::Name() const</a>
+<a name="ln885">{</a>
+<a name="ln886">	ASSERT(fInfo.fNames-&gt;fNames.Head() != NULL);</a>
+<a name="ln887">	return fInfo.fNames-&gt;fNames.Head()-&gt;fName;</a>
+<a name="ln888">}</a>
+<a name="ln889"> </a>
+<a name="ln890"> </a>
+<a name="ln891">void</a>
+<a name="ln892">Inode::SetDelegation(Delegation* delegation)</a>
+<a name="ln893">{</a>
+<a name="ln894">	ASSERT(delegation != NULL);</a>
+<a name="ln895"> </a>
+<a name="ln896">	WriteLocker _(fDelegationLock);</a>
+<a name="ln897"> </a>
+<a name="ln898">	fMetaCache.InvalidateStat();</a>
+<a name="ln899">	struct stat st;</a>
+<a name="ln900">	Stat(&amp;st);</a>
+<a name="ln901">	fMetaCache.LockValid();</a>
+<a name="ln902"> </a>
+<a name="ln903">	fDelegation = delegation;</a>
+<a name="ln904">	fOpenState-&gt;AcquireReference();</a>
+<a name="ln905">	fOpenState-&gt;fDelegation = delegation;</a>
+<a name="ln906">	fFileSystem-&gt;AddDelegation(delegation);</a>
+<a name="ln907">}</a>
+<a name="ln908"> </a>
+<a name="ln909"> </a>
+<a name="ln910">void</a>
+<a name="ln911">Inode::RecallDelegation(bool truncate)</a>
+<a name="ln912">{</a>
+<a name="ln913">	WriteLocker _(fDelegationLock);</a>
+<a name="ln914">	if (fDelegation == NULL)</a>
+<a name="ln915">		return;</a>
+<a name="ln916">	ReturnDelegation(truncate);</a>
+<a name="ln917">}</a>
+<a name="ln918"> </a>
+<a name="ln919"> </a>
+<a name="ln920">void</a>
+<a name="ln921">Inode::RecallReadDelegation()</a>
+<a name="ln922">{</a>
+<a name="ln923">	WriteLocker _(fDelegationLock);</a>
+<a name="ln924">	if (fDelegation == NULL || fDelegation-&gt;Type() != OPEN_DELEGATE_READ)</a>
+<a name="ln925">		return;</a>
+<a name="ln926">	ReturnDelegation(false);</a>
+<a name="ln927">}</a>
+<a name="ln928"> </a>
+<a name="ln929"> </a>
+<a name="ln930">void</a>
+<a name="ln931">Inode::ReturnDelegation(bool truncate)</a>
+<a name="ln932">{</a>
+<a name="ln933">	ASSERT(fDelegation != NULL);</a>
+<a name="ln934"> </a>
+<a name="ln935">	fDelegation-&gt;GiveUp(truncate);</a>
+<a name="ln936"> </a>
+<a name="ln937">	fMetaCache.UnlockValid();</a>
+<a name="ln938">	fFileSystem-&gt;RemoveDelegation(fDelegation);</a>
+<a name="ln939"> </a>
+<a name="ln940">	MutexLocker stateLocker(fStateLock);</a>
+<a name="ln941">	fOpenState-&gt;fDelegation = NULL;</a>
+<a name="ln942">	ReleaseOpenState();</a>
+<a name="ln943"> </a>
+<a name="ln944">	delete fDelegation;</a>
+<a name="ln945">	fDelegation = NULL;</a>
+<a name="ln946">}</a>
+<a name="ln947"> </a>
+<a name="ln948"> </a>
+<a name="ln949">void</a>
+<a name="ln950">Inode::ReleaseOpenState()</a>
+<a name="ln951">{</a>
+<a name="ln952">	ASSERT(fOpenState != NULL);</a>
+<a name="ln953"> </a>
+<a name="ln954">	if (fOpenState-&gt;ReleaseReference() == 1) {</a>
+<a name="ln955">		ASSERT(fAIOCount == 0);</a>
+<a name="ln956">		fOpenState = NULL;</a>
+<a name="ln957">	}</a>
+<a name="ln958">}</a>
+<a name="ln959"> </a>
+<a name="ln960"> </a>
+<a name="ln961">status_t</a>
+<a name="ln962">Inode::SyncAndCommit(bool force)</a>
+<a name="ln963">{</a>
+<a name="ln964">	if (!force &amp;&amp; fDelegation != NULL)</a>
+<a name="ln965">		return B_OK;</a>
+<a name="ln966"> </a>
+<a name="ln967">	file_cache_sync(fFileCache);</a>
+<a name="ln968">	WaitAIOComplete();</a>
+<a name="ln969">	return Commit();</a>
+<a name="ln970">}</a>
+<a name="ln971"> </a>
+<a name="ln972"> </a>
+<a name="ln973">void</a>
+<a name="ln974">Inode::BeginAIOOp()</a>
+<a name="ln975">{</a>
+<a name="ln976">	MutexLocker _(fAIOLock);</a>
+<a name="ln977">	fAIOCount++;</a>
+<a name="ln978">	if (fAIOCount == 1)</a>
+<a name="ln979">		acquire_sem(fAIOWait);</a>
+<a name="ln980">}</a>
+<a name="ln981"> </a>
+<a name="ln982"> </a>
+<a name="ln983">void</a>
+<a name="ln984">Inode::EndAIOOp()</a>
+<a name="ln985">{</a>
+<a name="ln986">	MutexLocker _(fAIOLock);</a>
+<a name="ln987">	ASSERT(fAIOCount &gt; 0);</a>
+<a name="ln988">	fAIOCount--;</a>
+<a name="ln989">	if (fAIOCount == 0)</a>
+<a name="ln990">		release_sem(fAIOWait);</a>
+<a name="ln991">}</a>
+<a name="ln992"> </a>
+
+</code></pre>
+<div class="balloon" rel="78"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v773/" target="_blank">V773</a> The function was exited without releasing the 'inode' pointer. A memory leak is possible.</p></div>
+<div class="balloon" rel="24"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fType, fChange.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

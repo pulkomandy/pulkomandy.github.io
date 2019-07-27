@@ -1,0 +1,1095 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>Producer.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2004-2008, François Revol, &lt;revol@free.fr&gt;.</a>
+<a name="ln3"> * Distributed under the terms of the MIT License.</a>
+<a name="ln4"> */</a>
+<a name="ln5"> </a>
+<a name="ln6">#include &lt;fcntl.h&gt;</a>
+<a name="ln7">#include &lt;malloc.h&gt;</a>
+<a name="ln8">#include &lt;math.h&gt;</a>
+<a name="ln9">#include &lt;stdio.h&gt;</a>
+<a name="ln10">#include &lt;string.h&gt;</a>
+<a name="ln11">#include &lt;sys/uio.h&gt;</a>
+<a name="ln12">#include &lt;unistd.h&gt;</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &lt;media/Buffer.h&gt;</a>
+<a name="ln15">#include &lt;media/BufferGroup.h&gt;</a>
+<a name="ln16">#include &lt;media/ParameterWeb.h&gt;</a>
+<a name="ln17">#include &lt;media/TimeSource.h&gt;</a>
+<a name="ln18"> </a>
+<a name="ln19">#include &lt;support/Autolock.h&gt;</a>
+<a name="ln20">#include &lt;support/Debug.h&gt;</a>
+<a name="ln21"> </a>
+<a name="ln22">//XXX: change interface</a>
+<a name="ln23">#include &lt;interface/Bitmap.h&gt;</a>
+<a name="ln24"> </a>
+<a name="ln25">#include &quot;CamDevice.h&quot;</a>
+<a name="ln26">#include &quot;CamSensor.h&quot;</a>
+<a name="ln27"> </a>
+<a name="ln28">// don't separate parameters from addon, device and sensor</a>
+<a name="ln29">#define SINGLE_PARAMETER_GROUP 1</a>
+<a name="ln30"> </a>
+<a name="ln31">// CodyCam and eXposer prefer 320x240</a>
+<a name="ln32">#define FORCE_320_240 1</a>
+<a name="ln33">//#define FORCE_160_120 1</a>
+<a name="ln34">//#define FORCE_MAX_FRAME 1</a>
+<a name="ln35"> </a>
+<a name="ln36">#define TOUCH(x) ((void)(x))</a>
+<a name="ln37"> </a>
+<a name="ln38">#define PRINTF(a,b) \</a>
+<a name="ln39">		do { \</a>
+<a name="ln40">			if (a &lt; 2) { \</a>
+<a name="ln41">				printf(&quot;VideoProducer::&quot;); \</a>
+<a name="ln42">				printf b; \</a>
+<a name="ln43">			} \</a>
+<a name="ln44">		} while (0)</a>
+<a name="ln45"> </a>
+<a name="ln46">#include &quot;Producer.h&quot;</a>
+<a name="ln47"> </a>
+<a name="ln48">//#define FIELD_RATE 30.f</a>
+<a name="ln49">//#define FIELD_RATE 29.97f</a>
+<a name="ln50">#define FIELD_RATE 5.f</a>
+<a name="ln51"> </a>
+<a name="ln52"> </a>
+<a name="ln53">int32 VideoProducer::fInstances = 0;</a>
+<a name="ln54"> </a>
+<a name="ln55"> </a>
+<a name="ln56">VideoProducer::VideoProducer(</a>
+<a name="ln57">		BMediaAddOn *addon, CamDevice *dev, const char *name, int32 internal_id)</a>
+<a name="ln58">	: BMediaNode(name),</a>
+<a name="ln59">	BMediaEventLooper(),</a>
+<a name="ln60">	BBufferProducer(B_MEDIA_RAW_VIDEO),</a>
+<a name="ln61">	BControllable()</a>
+<a name="ln62">{</a>
+<a name="ln63">//	status_t err;</a>
+<a name="ln64"> </a>
+<a name="ln65">	fInitStatus = B_NO_INIT;</a>
+<a name="ln66"> </a>
+<a name="ln67">	/* Only allow one instance of the node to exist at any time */</a>
+<a name="ln68">	if (atomic_add(&amp;fInstances, 1) != 0)</a>
+<a name="ln69">		return;</a>
+<a name="ln70"> </a>
+<a name="ln71">	fInternalID = internal_id;</a>
+<a name="ln72">	fAddOn = addon;</a>
+<a name="ln73">	fCamDevice = dev;</a>
+<a name="ln74"> </a>
+<a name="ln75">	fBufferGroup = NULL;</a>
+<a name="ln76"> </a>
+<a name="ln77">	fThread = -1;</a>
+<a name="ln78">	fFrameSync = -1;</a>
+<a name="ln79">	fProcessingLatency = 0LL;</a>
+<a name="ln80"> </a>
+<a name="ln81">	fRunning = false;</a>
+<a name="ln82">	fConnected = false;</a>
+<a name="ln83">	fEnabled = false;</a>
+<a name="ln84"> </a>
+<a name="ln85">	fOutput.destination = media_destination::null;</a>
+<a name="ln86"> </a>
+<a name="ln87">	AddNodeKind(B_PHYSICAL_INPUT);</a>
+<a name="ln88"> </a>
+<a name="ln89">	fInitStatus = B_OK;</a>
+<a name="ln90">	return;</a>
+<a name="ln91">}</a>
+<a name="ln92"> </a>
+<a name="ln93"> </a>
+<a name="ln94">VideoProducer::~VideoProducer()</a>
+<a name="ln95">{</a>
+<a name="ln96">	if (fInitStatus == B_OK) {</a>
+<a name="ln97">		/* Clean up after ourselves, in case the application didn't make us</a>
+<a name="ln98">		 * do so. */</a>
+<a name="ln99">		if (fConnected)</a>
+<a name="ln100">			Disconnect(fOutput.source, fOutput.destination);</a>
+<a name="ln101">		if (fRunning)</a>
+<a name="ln102">			HandleStop();</a>
+<a name="ln103">	}</a>
+<a name="ln104"> </a>
+<a name="ln105">	atomic_add(&amp;fInstances, -1);</a>
+<a name="ln106">}</a>
+<a name="ln107"> </a>
+<a name="ln108"> </a>
+<a name="ln109">/* BMediaNode */</a>
+<a name="ln110">port_id</a>
+<a name="ln111">VideoProducer::ControlPort() const</a>
+<a name="ln112">{</a>
+<a name="ln113">	return BMediaNode::ControlPort();</a>
+<a name="ln114">}</a>
+<a name="ln115"> </a>
+<a name="ln116"> </a>
+<a name="ln117">BMediaAddOn *</a>
+<a name="ln118">VideoProducer::AddOn(int32 *internal_id) const</a>
+<a name="ln119">{</a>
+<a name="ln120">	if (internal_id)</a>
+<a name="ln121">		*internal_id = fInternalID;</a>
+<a name="ln122">	return fAddOn;</a>
+<a name="ln123">}</a>
+<a name="ln124"> </a>
+<a name="ln125"> </a>
+<a name="ln126">status_t</a>
+<a name="ln127">VideoProducer::HandleMessage(int32 /*message*/, const void* /*data*/, size_t /*size*/)</a>
+<a name="ln128">{</a>
+<a name="ln129">	return B_ERROR;</a>
+<a name="ln130">}</a>
+<a name="ln131"> </a>
+<a name="ln132"> </a>
+<a name="ln133">void</a>
+<a name="ln134">VideoProducer::Preroll()</a>
+<a name="ln135">{</a>
+<a name="ln136">	/* This hook may be called before the node is started to give the hardware</a>
+<a name="ln137">	 * a chance to start. */</a>
+<a name="ln138">}</a>
+<a name="ln139"> </a>
+<a name="ln140"> </a>
+<a name="ln141">void</a>
+<a name="ln142">VideoProducer::SetTimeSource(BTimeSource* /*time_source*/)</a>
+<a name="ln143">{</a>
+<a name="ln144">	/* Tell frame generation thread to recalculate delay value */</a>
+<a name="ln145">	release_sem(fFrameSync);</a>
+<a name="ln146">}</a>
+<a name="ln147"> </a>
+<a name="ln148"> </a>
+<a name="ln149">status_t</a>
+<a name="ln150">VideoProducer::RequestCompleted(const media_request_info &amp;info)</a>
+<a name="ln151">{</a>
+<a name="ln152">	return BMediaNode::RequestCompleted(info);</a>
+<a name="ln153">}</a>
+<a name="ln154"> </a>
+<a name="ln155"> </a>
+<a name="ln156">/* BMediaEventLooper */</a>
+<a name="ln157"> </a>
+<a name="ln158"> </a>
+<a name="ln159">void</a>
+<a name="ln160">VideoProducer::NodeRegistered()</a>
+<a name="ln161">{</a>
+<a name="ln162">	if (fInitStatus != B_OK) {</a>
+<a name="ln163">		ReportError(B_NODE_IN_DISTRESS);</a>
+<a name="ln164">		return;</a>
+<a name="ln165">	}</a>
+<a name="ln166"> </a>
+<a name="ln167">	/* Set up the parameter web */</a>
+<a name="ln168"> </a>
+<a name="ln169">	//TODO: remove and put sensible stuff there</a>
+<a name="ln170">	BParameterWeb *web = new BParameterWeb();</a>
+<a name="ln171">	BParameterGroup *main = web-&gt;MakeGroup(Name());</a>
+<a name="ln172">	BParameterGroup *g;</a>
+<a name="ln173"> </a>
+<a name="ln174">	/*</a>
+<a name="ln175">	g = main-&gt;MakeGroup(&quot;Color&quot;);</a>
+<a name="ln176">	BDiscreteParameter *state = g-&gt;MakeDiscreteParameter(</a>
+<a name="ln177">			P_COLOR, B_MEDIA_RAW_VIDEO, &quot;Color&quot;, &quot;Color&quot;);</a>
+<a name="ln178">	state-&gt;AddItem(B_HOST_TO_LENDIAN_INT32(0x00ff0000), &quot;Red&quot;);</a>
+<a name="ln179">	state-&gt;AddItem(B_HOST_TO_LENDIAN_INT32(0x0000ff00), &quot;Green&quot;);</a>
+<a name="ln180">	state-&gt;AddItem(B_HOST_TO_LENDIAN_INT32(0x000000ff), &quot;Blue&quot;);</a>
+<a name="ln181">	*/</a>
+<a name="ln182"> </a>
+<a name="ln183">	BParameter *p;</a>
+<a name="ln184">	g = main-&gt;MakeGroup(&quot;Info&quot;);</a>
+<a name="ln185">	p = g-&gt;MakeTextParameter(</a>
+<a name="ln186">		P_INFO, B_MEDIA_RAW_VIDEO, &quot;&quot;, &quot;Info&quot;, 256);</a>
+<a name="ln187"> </a>
+<a name="ln188">	int32 id = P_LAST;</a>
+<a name="ln189">	if (fCamDevice) {</a>
+<a name="ln190">#ifndef SINGLE_PARAMETER_GROUP</a>
+<a name="ln191">		main = web-&gt;MakeGroup(&quot;Device&quot;);</a>
+<a name="ln192">#endif</a>
+<a name="ln193">		fCamDevice-&gt;AddParameters(main, id);</a>
+<a name="ln194">		if (fCamDevice-&gt;Sensor()) {</a>
+<a name="ln195">#ifndef SINGLE_PARAMETER_GROUP</a>
+<a name="ln196">			main = web-&gt;MakeGroup(&quot;Sensor&quot;);</a>
+<a name="ln197">#endif</a>
+<a name="ln198">			fCamDevice-&gt;Sensor()-&gt;AddParameters(main, id);</a>
+<a name="ln199">		}</a>
+<a name="ln200">	}</a>
+<a name="ln201"> </a>
+<a name="ln202">	fColor = B_HOST_TO_LENDIAN_INT32(0x00ff0000);</a>
+<a name="ln203">	fLastColorChange = system_time();</a>
+<a name="ln204"> </a>
+<a name="ln205">	/* After this call, the BControllable owns the BParameterWeb object and</a>
+<a name="ln206">	 * will delete it for you */</a>
+<a name="ln207">	SetParameterWeb(web);</a>
+<a name="ln208"> </a>
+<a name="ln209">	fOutput.node = Node();</a>
+<a name="ln210">	fOutput.source.port = ControlPort();</a>
+<a name="ln211">	fOutput.source.id = 0;</a>
+<a name="ln212">	fOutput.destination = media_destination::null;</a>
+<a name="ln213">	strcpy(fOutput.name, Name());</a>
+<a name="ln214"> </a>
+<a name="ln215">	/* Tailor these for the output of your device */</a>
+<a name="ln216">	fOutput.format.type = B_MEDIA_RAW_VIDEO;</a>
+<a name="ln217">	fOutput.format.u.raw_video = media_raw_video_format::wildcard;</a>
+<a name="ln218">	fOutput.format.u.raw_video.interlace = 1;</a>
+<a name="ln219">	fOutput.format.u.raw_video.display.format = B_RGB32;</a>
+<a name="ln220">	fOutput.format.u.raw_video.field_rate = FIELD_RATE; // XXX: mmu</a>
+<a name="ln221"> </a>
+<a name="ln222">	/* Start the BMediaEventLooper control loop running */</a>
+<a name="ln223">	Run();</a>
+<a name="ln224">}</a>
+<a name="ln225"> </a>
+<a name="ln226"> </a>
+<a name="ln227">void</a>
+<a name="ln228">VideoProducer::Start(bigtime_t performance_time)</a>
+<a name="ln229">{</a>
+<a name="ln230">	BMediaEventLooper::Start(performance_time);</a>
+<a name="ln231">}</a>
+<a name="ln232"> </a>
+<a name="ln233"> </a>
+<a name="ln234">void</a>
+<a name="ln235">VideoProducer::Stop(bigtime_t performance_time, bool immediate)</a>
+<a name="ln236">{</a>
+<a name="ln237">	BMediaEventLooper::Stop(performance_time, immediate);</a>
+<a name="ln238">}</a>
+<a name="ln239"> </a>
+<a name="ln240"> </a>
+<a name="ln241">void</a>
+<a name="ln242">VideoProducer::Seek(bigtime_t media_time, bigtime_t performance_time)</a>
+<a name="ln243">{</a>
+<a name="ln244">	BMediaEventLooper::Seek(media_time, performance_time);</a>
+<a name="ln245">}</a>
+<a name="ln246"> </a>
+<a name="ln247"> </a>
+<a name="ln248">void</a>
+<a name="ln249">VideoProducer::TimeWarp(bigtime_t at_real_time, bigtime_t to_performance_time)</a>
+<a name="ln250">{</a>
+<a name="ln251">	BMediaEventLooper::TimeWarp(at_real_time, to_performance_time);</a>
+<a name="ln252">}</a>
+<a name="ln253"> </a>
+<a name="ln254"> </a>
+<a name="ln255">status_t</a>
+<a name="ln256">VideoProducer::AddTimer(bigtime_t at_performance_time, int32 cookie)</a>
+<a name="ln257">{</a>
+<a name="ln258">	return BMediaEventLooper::AddTimer(at_performance_time, cookie);</a>
+<a name="ln259">}</a>
+<a name="ln260"> </a>
+<a name="ln261"> </a>
+<a name="ln262">void</a>
+<a name="ln263">VideoProducer::SetRunMode(run_mode mode)</a>
+<a name="ln264">{</a>
+<a name="ln265">	BMediaEventLooper::SetRunMode(mode);</a>
+<a name="ln266">}</a>
+<a name="ln267"> </a>
+<a name="ln268"> </a>
+<a name="ln269">void</a>
+<a name="ln270">VideoProducer::HandleEvent(const media_timed_event *event,</a>
+<a name="ln271">		bigtime_t lateness, bool realTimeEvent)</a>
+<a name="ln272">{</a>
+<a name="ln273">	TOUCH(lateness); TOUCH(realTimeEvent);</a>
+<a name="ln274"> </a>
+<a name="ln275">	switch(event-&gt;type) {</a>
+<a name="ln276">		case BTimedEventQueue::B_START:</a>
+<a name="ln277">			HandleStart(event-&gt;event_time);</a>
+<a name="ln278">			break;</a>
+<a name="ln279">		case BTimedEventQueue::B_STOP:</a>
+<a name="ln280">			HandleStop();</a>
+<a name="ln281">			break;</a>
+<a name="ln282">		case BTimedEventQueue::B_WARP:</a>
+<a name="ln283">			HandleTimeWarp(event-&gt;bigdata);</a>
+<a name="ln284">			break;</a>
+<a name="ln285">		case BTimedEventQueue::B_SEEK:</a>
+<a name="ln286">			HandleSeek(event-&gt;bigdata);</a>
+<a name="ln287">			break;</a>
+<a name="ln288">		case BTimedEventQueue::B_HANDLE_BUFFER:</a>
+<a name="ln289">		case BTimedEventQueue::B_DATA_STATUS:</a>
+<a name="ln290">		case BTimedEventQueue::B_PARAMETER:</a>
+<a name="ln291">		default:</a>
+<a name="ln292">			PRINTF(-1, (&quot;HandleEvent: Unhandled event -- %lx\n&quot;, event-&gt;type));</a>
+<a name="ln293">			break;</a>
+<a name="ln294">	}</a>
+<a name="ln295">}</a>
+<a name="ln296"> </a>
+<a name="ln297"> </a>
+<a name="ln298">void</a>
+<a name="ln299">VideoProducer::CleanUpEvent(const media_timed_event *event)</a>
+<a name="ln300">{</a>
+<a name="ln301">	BMediaEventLooper::CleanUpEvent(event);</a>
+<a name="ln302">}</a>
+<a name="ln303"> </a>
+<a name="ln304"> </a>
+<a name="ln305">bigtime_t</a>
+<a name="ln306">VideoProducer::OfflineTime()</a>
+<a name="ln307">{</a>
+<a name="ln308">	return BMediaEventLooper::OfflineTime();</a>
+<a name="ln309">}</a>
+<a name="ln310"> </a>
+<a name="ln311"> </a>
+<a name="ln312">void</a>
+<a name="ln313">VideoProducer::ControlLoop()</a>
+<a name="ln314">{</a>
+<a name="ln315">	BMediaEventLooper::ControlLoop();</a>
+<a name="ln316">}</a>
+<a name="ln317"> </a>
+<a name="ln318"> </a>
+<a name="ln319">status_t</a>
+<a name="ln320">VideoProducer::DeleteHook(BMediaNode * node)</a>
+<a name="ln321">{</a>
+<a name="ln322">	return BMediaEventLooper::DeleteHook(node);</a>
+<a name="ln323">}</a>
+<a name="ln324"> </a>
+<a name="ln325"> </a>
+<a name="ln326">/* BBufferProducer */</a>
+<a name="ln327"> </a>
+<a name="ln328"> </a>
+<a name="ln329">status_t</a>
+<a name="ln330">VideoProducer::FormatSuggestionRequested(</a>
+<a name="ln331">		media_type type, int32 quality, media_format *format)</a>
+<a name="ln332">{</a>
+<a name="ln333">	if (type != B_MEDIA_ENCODED_VIDEO)</a>
+<a name="ln334">		return B_MEDIA_BAD_FORMAT;</a>
+<a name="ln335"> </a>
+<a name="ln336">	TOUCH(quality);</a>
+<a name="ln337"> </a>
+<a name="ln338">	PRINTF(1, (&quot;FormatSuggestionRequested() %ldx%ld\n&quot;, \</a>
+<a name="ln339">			format-&gt;u.raw_video.display.line_width, \</a>
+<a name="ln340">			format-&gt;u.raw_video.display.line_count));</a>
+<a name="ln341"> </a>
+<a name="ln342">	*format = fOutput.format;</a>
+<a name="ln343">	uint32 width, height;</a>
+<a name="ln344">	if (fCamDevice &amp;&amp; fCamDevice-&gt;SuggestVideoFrame(width, height) == B_OK) {</a>
+<a name="ln345">		format-&gt;u.raw_video.display.line_width = width;</a>
+<a name="ln346">		format-&gt;u.raw_video.display.line_count = height;</a>
+<a name="ln347">	}</a>
+<a name="ln348">	format-&gt;u.raw_video.field_rate = FIELD_RATE;</a>
+<a name="ln349">	return B_OK;</a>
+<a name="ln350">}</a>
+<a name="ln351"> </a>
+<a name="ln352"> </a>
+<a name="ln353">status_t</a>
+<a name="ln354">VideoProducer::FormatProposal(const media_source &amp;output, media_format *format)</a>
+<a name="ln355">{</a>
+<a name="ln356">	status_t err;</a>
+<a name="ln357"> </a>
+<a name="ln358">	if (!format)</a>
+<a name="ln359">		return B_BAD_VALUE;</a>
+<a name="ln360"> </a>
+<a name="ln361">	if (output != fOutput.source)</a>
+<a name="ln362">		return B_MEDIA_BAD_SOURCE;</a>
+<a name="ln363"> </a>
+<a name="ln364">	PRINTF(1, (&quot;FormatProposal() %ldx%ld\n&quot;, \</a>
+<a name="ln365">			format-&gt;u.raw_video.display.line_width, \</a>
+<a name="ln366">			format-&gt;u.raw_video.display.line_count));</a>
+<a name="ln367"> </a>
+<a name="ln368">	err = format_is_compatible(*format, fOutput.format) ?</a>
+<a name="ln369">			B_OK : B_MEDIA_BAD_FORMAT;</a>
+<a name="ln370"> </a>
+<a name="ln371">	uint32 width = format-&gt;u.raw_video.display.line_width;</a>
+<a name="ln372">	uint32 height = format-&gt;u.raw_video.display.line_count;</a>
+<a name="ln373"> </a>
+<a name="ln374">	*format = fOutput.format;</a>
+<a name="ln375"> </a>
+<a name="ln376">	if (err == B_OK &amp;&amp; fCamDevice) {</a>
+<a name="ln377">		err = fCamDevice-&gt;AcceptVideoFrame(width, height);</a>
+<a name="ln378">		if (err &gt;= B_OK) {</a>
+<a name="ln379">			format-&gt;u.raw_video.display.line_width = width;</a>
+<a name="ln380">			format-&gt;u.raw_video.display.line_count = height;</a>
+<a name="ln381">		}</a>
+<a name="ln382">	}</a>
+<a name="ln383"> </a>
+<a name="ln384">	PRINTF(1, (&quot;FormatProposal: %ldx%ld\n&quot;, \</a>
+<a name="ln385">			format-&gt;u.raw_video.display.line_width, \</a>
+<a name="ln386">			format-&gt;u.raw_video.display.line_count));</a>
+<a name="ln387"> </a>
+<a name="ln388">	return err;</a>
+<a name="ln389"> </a>
+<a name="ln390">}</a>
+<a name="ln391"> </a>
+<a name="ln392"> </a>
+<a name="ln393">status_t</a>
+<a name="ln394">VideoProducer::FormatChangeRequested(const media_source &amp;source,</a>
+<a name="ln395">		const media_destination &amp;destination, media_format *io_format,</a>
+<a name="ln396">		int32 *_deprecated_)</a>
+<a name="ln397">{</a>
+<a name="ln398">	TOUCH(destination); TOUCH(io_format); TOUCH(_deprecated_);</a>
+<a name="ln399">	if (source != fOutput.source)</a>
+<a name="ln400">		return B_MEDIA_BAD_SOURCE;</a>
+<a name="ln401"> </a>
+<a name="ln402">	return B_ERROR;</a>
+<a name="ln403">}</a>
+<a name="ln404"> </a>
+<a name="ln405"> </a>
+<a name="ln406">status_t</a>
+<a name="ln407">VideoProducer::GetNextOutput(int32 *cookie, media_output *out_output)</a>
+<a name="ln408">{</a>
+<a name="ln409">	if (!out_output)</a>
+<a name="ln410">		return B_BAD_VALUE;</a>
+<a name="ln411"> </a>
+<a name="ln412">	if ((*cookie) != 0)</a>
+<a name="ln413">		return B_BAD_INDEX;</a>
+<a name="ln414"> </a>
+<a name="ln415">	*out_output = fOutput;</a>
+<a name="ln416">	(*cookie)++;</a>
+<a name="ln417">	return B_OK;</a>
+<a name="ln418">}</a>
+<a name="ln419"> </a>
+<a name="ln420"> </a>
+<a name="ln421">status_t</a>
+<a name="ln422">VideoProducer::DisposeOutputCookie(int32 cookie)</a>
+<a name="ln423">{</a>
+<a name="ln424">	TOUCH(cookie);</a>
+<a name="ln425"> </a>
+<a name="ln426">	return B_OK;</a>
+<a name="ln427">}</a>
+<a name="ln428"> </a>
+<a name="ln429"> </a>
+<a name="ln430">status_t</a>
+<a name="ln431">VideoProducer::SetBufferGroup(const media_source &amp;for_source,</a>
+<a name="ln432">		BBufferGroup *group)</a>
+<a name="ln433">{</a>
+<a name="ln434">	TOUCH(for_source); TOUCH(group);</a>
+<a name="ln435"> </a>
+<a name="ln436">	return B_ERROR;</a>
+<a name="ln437">}</a>
+<a name="ln438"> </a>
+<a name="ln439"> </a>
+<a name="ln440">status_t</a>
+<a name="ln441">VideoProducer::VideoClippingChanged(const media_source &amp;for_source,</a>
+<a name="ln442">		int16 num_shorts, int16 *clip_data,</a>
+<a name="ln443">		const media_video_display_info &amp;display, int32 *_deprecated_)</a>
+<a name="ln444">{</a>
+<a name="ln445">	TOUCH(for_source); TOUCH(num_shorts); TOUCH(clip_data);</a>
+<a name="ln446">	TOUCH(display); TOUCH(_deprecated_);</a>
+<a name="ln447"> </a>
+<a name="ln448">	return B_ERROR;</a>
+<a name="ln449">}</a>
+<a name="ln450"> </a>
+<a name="ln451"> </a>
+<a name="ln452">status_t</a>
+<a name="ln453">VideoProducer::GetLatency(bigtime_t *out_latency)</a>
+<a name="ln454">{</a>
+<a name="ln455">	*out_latency = EventLatency() + SchedulingLatency();</a>
+<a name="ln456">	return B_OK;</a>
+<a name="ln457">}</a>
+<a name="ln458"> </a>
+<a name="ln459"> </a>
+<a name="ln460">status_t</a>
+<a name="ln461">VideoProducer::PrepareToConnect(const media_source &amp;source,</a>
+<a name="ln462">		const media_destination &amp;destination, media_format *format,</a>
+<a name="ln463">		media_source *out_source, char *out_name)</a>
+<a name="ln464">{</a>
+<a name="ln465">	status_t err;</a>
+<a name="ln466"> </a>
+<a name="ln467">	PRINTF(1, (&quot;PrepareToConnect() %ldx%ld\n&quot;, \</a>
+<a name="ln468">			format-&gt;u.raw_video.display.line_width, \</a>
+<a name="ln469">			format-&gt;u.raw_video.display.line_count));</a>
+<a name="ln470"> </a>
+<a name="ln471">	if (fConnected) {</a>
+<a name="ln472">		PRINTF(0, (&quot;PrepareToConnect: Already connected\n&quot;));</a>
+<a name="ln473">		return EALREADY;</a>
+<a name="ln474">	}</a>
+<a name="ln475"> </a>
+<a name="ln476">	if (source != fOutput.source)</a>
+<a name="ln477">		return B_MEDIA_BAD_SOURCE;</a>
+<a name="ln478"> </a>
+<a name="ln479">	if (fOutput.destination != media_destination::null)</a>
+<a name="ln480">		return B_MEDIA_ALREADY_CONNECTED;</a>
+<a name="ln481"> </a>
+<a name="ln482">	/* The format parameter comes in with the suggested format, and may be</a>
+<a name="ln483">	 * specialized as desired by the node */</a>
+<a name="ln484">	if (!format_is_compatible(*format, fOutput.format)) {</a>
+<a name="ln485">		*format = fOutput.format;</a>
+<a name="ln486">		return B_MEDIA_BAD_FORMAT;</a>
+<a name="ln487">	}</a>
+<a name="ln488"> </a>
+<a name="ln489">//XXX:FIXME</a>
+<a name="ln490">#if 0</a>
+<a name="ln491">//	if (format-&gt;u.raw_video.display.line_width == 0)</a>
+<a name="ln492">		format-&gt;u.raw_video.display.line_width = 352;//320;</a>
+<a name="ln493">		format-&gt;u.raw_video.display.line_width = 320;</a>
+<a name="ln494">//	if (format-&gt;u.raw_video.display.line_count == 0)</a>
+<a name="ln495">		format-&gt;u.raw_video.display.line_count = 288;//240;</a>
+<a name="ln496">		format-&gt;u.raw_video.display.line_count = 240;</a>
+<a name="ln497">#endif</a>
+<a name="ln498"> </a>
+<a name="ln499">#ifdef FORCE_320_240</a>
+<a name="ln500">	{</a>
+<a name="ln501">		format-&gt;u.raw_video.display.line_width = 320;</a>
+<a name="ln502">		format-&gt;u.raw_video.display.line_count = 240;</a>
+<a name="ln503">	}</a>
+<a name="ln504">#endif</a>
+<a name="ln505">#ifdef FORCE_160_120</a>
+<a name="ln506">	{</a>
+<a name="ln507">		format-&gt;u.raw_video.display.line_width = 160;</a>
+<a name="ln508">		format-&gt;u.raw_video.display.line_count = 120;</a>
+<a name="ln509">	}</a>
+<a name="ln510">#endif</a>
+<a name="ln511">#ifdef FORCE_MAX_FRAME</a>
+<a name="ln512">	{</a>
+<a name="ln513">		format-&gt;u.raw_video.display.line_width = 0;</a>
+<a name="ln514">		format-&gt;u.raw_video.display.line_count = 0;</a>
+<a name="ln515">	}</a>
+<a name="ln516">#endif</a>
+<a name="ln517">	if (fCamDevice) {</a>
+<a name="ln518">		err = fCamDevice-&gt;AcceptVideoFrame(</a>
+<a name="ln519">			format-&gt;u.raw_video.display.line_width,</a>
+<a name="ln520">			format-&gt;u.raw_video.display.line_count);</a>
+<a name="ln521">		if (err &lt; B_OK)</a>
+<a name="ln522">			return err;</a>
+<a name="ln523">	}</a>
+<a name="ln524"> </a>
+<a name="ln525">	if (format-&gt;u.raw_video.field_rate == 0)</a>
+<a name="ln526">		format-&gt;u.raw_video.field_rate = FIELD_RATE;</a>
+<a name="ln527"> </a>
+<a name="ln528">	*out_source = fOutput.source;</a>
+<a name="ln529">	strcpy(out_name, fOutput.name);</a>
+<a name="ln530"> </a>
+<a name="ln531">	fOutput.destination = destination;</a>
+<a name="ln532"> </a>
+<a name="ln533">	return B_OK;</a>
+<a name="ln534">}</a>
+<a name="ln535"> </a>
+<a name="ln536"> </a>
+<a name="ln537">void</a>
+<a name="ln538">VideoProducer::Connect(status_t error, const media_source &amp;source,</a>
+<a name="ln539">		const media_destination &amp;destination, const media_format &amp;format,</a>
+<a name="ln540">		char *io_name)</a>
+<a name="ln541">{</a>
+<a name="ln542">	PRINTF(1, (&quot;Connect() %ldx%ld\n&quot;, \</a>
+<a name="ln543">			format.u.raw_video.display.line_width, \</a>
+<a name="ln544">			format.u.raw_video.display.line_count));</a>
+<a name="ln545"> </a>
+<a name="ln546">	if (fConnected) {</a>
+<a name="ln547">		PRINTF(0, (&quot;Connect: Already connected\n&quot;));</a>
+<a name="ln548">		return;</a>
+<a name="ln549">	}</a>
+<a name="ln550"> </a>
+<a name="ln551">	BAutolock lock(fCamDevice-&gt;Locker());</a>
+<a name="ln552">	if (!fCamDevice-&gt;IsPlugged()) {</a>
+<a name="ln553">		PRINTF(0, (&quot;Connect: Device unplugged\n&quot;));</a>
+<a name="ln554">		return;</a>
+<a name="ln555">	}</a>
+<a name="ln556"> </a>
+<a name="ln557">	if (source != fOutput.source || error &lt; B_OK</a>
+<a name="ln558">		|| !const_cast&lt;media_format *&gt;(&amp;format)-&gt;Matches(&amp;fOutput.format)) {</a>
+<a name="ln559">		PRINTF(1, (&quot;Connect: Connect error\n&quot;));</a>
+<a name="ln560">		return;</a>
+<a name="ln561">	}</a>
+<a name="ln562"> </a>
+<a name="ln563">	fOutput.destination = destination;</a>
+<a name="ln564">	strcpy(io_name, fOutput.name);</a>
+<a name="ln565"> </a>
+<a name="ln566">	if (fOutput.format.u.raw_video.field_rate != 0.0f) {</a>
+<a name="ln567">		fPerformanceTimeBase = fPerformanceTimeBase +</a>
+<a name="ln568">				(bigtime_t)</a>
+<a name="ln569">					((fFrame - fFrameBase) *</a>
+<a name="ln570">					(1000000 / fOutput.format.u.raw_video.field_rate));</a>
+<a name="ln571">		fFrameBase = fFrame;</a>
+<a name="ln572">	}</a>
+<a name="ln573"> </a>
+<a name="ln574">	fConnectedFormat = format.u.raw_video;</a>
+<a name="ln575"> </a>
+<a name="ln576">	/* get the latency */</a>
+<a name="ln577">	bigtime_t latency = 0;</a>
+<a name="ln578">	media_node_id tsID = 0;</a>
+<a name="ln579">	FindLatencyFor(fOutput.destination, &amp;latency, &amp;tsID);</a>
+<a name="ln580">	#define NODE_LATENCY 1000</a>
+<a name="ln581">	SetEventLatency(latency + NODE_LATENCY);</a>
+<a name="ln582"> </a>
+<a name="ln583">	uint32 *buffer, *p, f = 3;</a>
+<a name="ln584">	p = buffer = (uint32 *)malloc(4 * fConnectedFormat.display.line_count *</a>
+<a name="ln585">			fConnectedFormat.display.line_width);</a>
+<a name="ln586">	if (!buffer) {</a>
+<a name="ln587">		PRINTF(0, (&quot;Connect: Out of memory\n&quot;));</a>
+<a name="ln588">		return;</a>
+<a name="ln589">	}</a>
+<a name="ln590">	bigtime_t now = system_time();</a>
+<a name="ln591">	for (uint32 y=0;y&lt;fConnectedFormat.display.line_count;y++)</a>
+<a name="ln592">		for (uint32 x=0;x&lt;fConnectedFormat.display.line_width;x++)</a>
+<a name="ln593">			*(p++) = ((((x+y)^0^x)+f) &amp; 0xff) * (0x01010101 &amp; fColor);</a>
+<a name="ln594">	fProcessingLatency = system_time() - now;</a>
+<a name="ln595">	free(buffer);</a>
+<a name="ln596"> </a>
+<a name="ln597">	/* Create the buffer group */</a>
+<a name="ln598">	fBufferGroup = new BBufferGroup(4 * fConnectedFormat.display.line_width *</a>
+<a name="ln599">			fConnectedFormat.display.line_count, 8);</a>
+<a name="ln600">	if (fBufferGroup-&gt;InitCheck() &lt; B_OK) {</a>
+<a name="ln601">		delete fBufferGroup;</a>
+<a name="ln602">		fBufferGroup = NULL;</a>
+<a name="ln603">		return;</a>
+<a name="ln604">	}</a>
+<a name="ln605"> </a>
+<a name="ln606">	fConnected = true;</a>
+<a name="ln607">	fEnabled = true;</a>
+<a name="ln608"> </a>
+<a name="ln609">	/* Tell frame generation thread to recalculate delay value */</a>
+<a name="ln610">	release_sem(fFrameSync);</a>
+<a name="ln611">}</a>
+<a name="ln612"> </a>
+<a name="ln613">void</a>
+<a name="ln614">VideoProducer::Disconnect(const media_source &amp;source,</a>
+<a name="ln615">		const media_destination &amp;destination)</a>
+<a name="ln616">{</a>
+<a name="ln617">	PRINTF(1, (&quot;Disconnect()\n&quot;));</a>
+<a name="ln618"> </a>
+<a name="ln619">	if (!fConnected) {</a>
+<a name="ln620">		PRINTF(0, (&quot;Disconnect: Not connected\n&quot;));</a>
+<a name="ln621">		return;</a>
+<a name="ln622">	}</a>
+<a name="ln623"> </a>
+<a name="ln624">	if ((source != fOutput.source) || (destination != fOutput.destination)) {</a>
+<a name="ln625">		PRINTF(0, (&quot;Disconnect: Bad source and/or destination\n&quot;));</a>
+<a name="ln626">		return;</a>
+<a name="ln627">	}</a>
+<a name="ln628"> </a>
+<a name="ln629">#if 1</a>
+<a name="ln630">	/* Some dumb apps don't stop nodes before disconnecting... */</a>
+<a name="ln631">	if (fRunning)</a>
+<a name="ln632">		HandleStop();</a>
+<a name="ln633">#endif</a>
+<a name="ln634"> </a>
+<a name="ln635">	fEnabled = false;</a>
+<a name="ln636">	fOutput.destination = media_destination::null;</a>
+<a name="ln637"> </a>
+<a name="ln638">	fLock.Lock();</a>
+<a name="ln639">		delete fBufferGroup;</a>
+<a name="ln640">		fBufferGroup = NULL;</a>
+<a name="ln641">	fLock.Unlock();</a>
+<a name="ln642"> </a>
+<a name="ln643">	fConnected = false;</a>
+<a name="ln644">}</a>
+<a name="ln645"> </a>
+<a name="ln646"> </a>
+<a name="ln647">void</a>
+<a name="ln648">VideoProducer::LateNoticeReceived(const media_source &amp;source,</a>
+<a name="ln649">		bigtime_t how_much, bigtime_t performance_time)</a>
+<a name="ln650">{</a>
+<a name="ln651">	TOUCH(source); TOUCH(how_much); TOUCH(performance_time);</a>
+<a name="ln652">}</a>
+<a name="ln653"> </a>
+<a name="ln654"> </a>
+<a name="ln655">void</a>
+<a name="ln656">VideoProducer::EnableOutput(const media_source &amp;source, bool enabled,</a>
+<a name="ln657">		int32 *_deprecated_)</a>
+<a name="ln658">{</a>
+<a name="ln659">	TOUCH(_deprecated_);</a>
+<a name="ln660"> </a>
+<a name="ln661">	if (source != fOutput.source)</a>
+<a name="ln662">		return;</a>
+<a name="ln663"> </a>
+<a name="ln664">	fEnabled = enabled;</a>
+<a name="ln665">}</a>
+<a name="ln666"> </a>
+<a name="ln667"> </a>
+<a name="ln668">status_t</a>
+<a name="ln669">VideoProducer::SetPlayRate(int32 numer, int32 denom)</a>
+<a name="ln670">{</a>
+<a name="ln671">	TOUCH(numer); TOUCH(denom);</a>
+<a name="ln672"> </a>
+<a name="ln673">	return B_ERROR;</a>
+<a name="ln674">}</a>
+<a name="ln675"> </a>
+<a name="ln676"> </a>
+<a name="ln677">void</a>
+<a name="ln678">VideoProducer::AdditionalBufferRequested(const media_source &amp;source,</a>
+<a name="ln679">		media_buffer_id prev_buffer, bigtime_t prev_time,</a>
+<a name="ln680">		const media_seek_tag *prev_tag)</a>
+<a name="ln681">{</a>
+<a name="ln682">	TOUCH(source); TOUCH(prev_buffer); TOUCH(prev_time); TOUCH(prev_tag);</a>
+<a name="ln683">}</a>
+<a name="ln684"> </a>
+<a name="ln685"> </a>
+<a name="ln686">void</a>
+<a name="ln687">VideoProducer::LatencyChanged(const media_source &amp;source,</a>
+<a name="ln688">		const media_destination &amp;destination, bigtime_t new_latency,</a>
+<a name="ln689">		uint32 flags)</a>
+<a name="ln690">{</a>
+<a name="ln691">	TOUCH(source); TOUCH(destination); TOUCH(new_latency); TOUCH(flags);</a>
+<a name="ln692">}</a>
+<a name="ln693"> </a>
+<a name="ln694"> </a>
+<a name="ln695">/* BControllable */</a>
+<a name="ln696"> </a>
+<a name="ln697"> </a>
+<a name="ln698">status_t</a>
+<a name="ln699">VideoProducer::GetParameterValue(</a>
+<a name="ln700">	int32 id, bigtime_t *last_change, void *value, size_t *size)</a>
+<a name="ln701">{</a>
+<a name="ln702">	status_t err;</a>
+<a name="ln703"> </a>
+<a name="ln704">	switch (id) {</a>
+<a name="ln705">		case P_COLOR:</a>
+<a name="ln706">			//return B_BAD_VALUE;</a>
+<a name="ln707"> </a>
+<a name="ln708">			*last_change = fLastColorChange;</a>
+<a name="ln709">			*size = sizeof(uint32);</a>
+<a name="ln710">			*((uint32 *)value) = fColor;</a>
+<a name="ln711">			return B_OK;</a>
+<a name="ln712">		case P_INFO:</a>
+<a name="ln713">			if (*size &lt; fInfoString.Length() + 1)</a>
+<a name="ln714">				return EINVAL;</a>
+<a name="ln715">			*last_change = fLastColorChange;</a>
+<a name="ln716">			*size = fInfoString.Length() + 1;</a>
+<a name="ln717">			memcpy(value, fInfoString.String(), *size);</a>
+<a name="ln718">			return B_OK;</a>
+<a name="ln719">	}</a>
+<a name="ln720"> </a>
+<a name="ln721">	if (fCamDevice) {</a>
+<a name="ln722">		BAutolock lock(fCamDevice-&gt;Locker());</a>
+<a name="ln723">		err = fCamDevice-&gt;GetParameterValue(id, last_change, value, size);</a>
+<a name="ln724">		if (err &gt;= B_OK)</a>
+<a name="ln725">			return err;</a>
+<a name="ln726">		if (fCamDevice-&gt;Sensor()) {</a>
+<a name="ln727">			err = fCamDevice-&gt;Sensor()-&gt;GetParameterValue(id, last_change, value, size);</a>
+<a name="ln728">			if (err &gt;= B_OK)</a>
+<a name="ln729">				return err;</a>
+<a name="ln730">		}</a>
+<a name="ln731">	}</a>
+<a name="ln732"> </a>
+<a name="ln733">	return B_BAD_VALUE;</a>
+<a name="ln734">}</a>
+<a name="ln735"> </a>
+<a name="ln736"> </a>
+<a name="ln737">void</a>
+<a name="ln738">VideoProducer::SetParameterValue(</a>
+<a name="ln739">	int32 id, bigtime_t when, const void *value, size_t size)</a>
+<a name="ln740">{</a>
+<a name="ln741">	status_t err = B_OK;</a>
+<a name="ln742"> </a>
+<a name="ln743">	switch (id) {</a>
+<a name="ln744">		case P_COLOR:</a>
+<a name="ln745">			if (!value || (size != sizeof(uint32)))</a>
+<a name="ln746">				return;</a>
+<a name="ln747"> </a>
+<a name="ln748">			if (*(uint32 *)value == fColor)</a>
+<a name="ln749">				return;</a>
+<a name="ln750"> </a>
+<a name="ln751">			fColor = *(uint32 *)value;</a>
+<a name="ln752">			fLastColorChange = when;</a>
+<a name="ln753">			break;</a>
+<a name="ln754">		case P_INFO:</a>
+<a name="ln755">			// forbidden</a>
+<a name="ln756">			return;</a>
+<a name="ln757">		default:</a>
+<a name="ln758">			if (fCamDevice == NULL)</a>
+<a name="ln759">				return;</a>
+<a name="ln760"> </a>
+<a name="ln761">			BAutolock lock(fCamDevice-&gt;Locker());</a>
+<a name="ln762">			err = fCamDevice-&gt;SetParameterValue(id, when, value, size);</a>
+<a name="ln763">			if ((err &lt; B_OK) &amp;&amp; (fCamDevice-&gt;Sensor())) {</a>
+<a name="ln764">				err = fCamDevice-&gt;Sensor()-&gt;SetParameterValue(id, when, value, size);</a>
+<a name="ln765">			}</a>
+<a name="ln766">	}</a>
+<a name="ln767"> </a>
+<a name="ln768">	if (err &gt;= B_OK)</a>
+<a name="ln769">		BroadcastNewParameterValue(when, id, (void *)value, size);</a>
+<a name="ln770">}</a>
+<a name="ln771"> </a>
+<a name="ln772"> </a>
+<a name="ln773">status_t</a>
+<a name="ln774">VideoProducer::StartControlPanel(BMessenger *out_messenger)</a>
+<a name="ln775">{</a>
+<a name="ln776">	return BControllable::StartControlPanel(out_messenger);</a>
+<a name="ln777">}</a>
+<a name="ln778"> </a>
+<a name="ln779"> </a>
+<a name="ln780">/* VideoProducer */</a>
+<a name="ln781"> </a>
+<a name="ln782"> </a>
+<a name="ln783">void</a>
+<a name="ln784">VideoProducer::HandleStart(bigtime_t performance_time)</a>
+<a name="ln785">{</a>
+<a name="ln786">	/* Start producing frames, even if the output hasn't been connected yet. */</a>
+<a name="ln787"> </a>
+<a name="ln788">	PRINTF(1, (&quot;HandleStart(%Ld)\n&quot;, performance_time));</a>
+<a name="ln789"> </a>
+<a name="ln790">	if (fRunning) {</a>
+<a name="ln791">		PRINTF(-1, (&quot;HandleStart: Node already started\n&quot;));</a>
+<a name="ln792">		return;</a>
+<a name="ln793">	}</a>
+<a name="ln794"> </a>
+<a name="ln795">	fFrame = 0;</a>
+<a name="ln796">	fFrameBase = 0;</a>
+<a name="ln797">	fPerformanceTimeBase = performance_time;</a>
+<a name="ln798"> </a>
+<a name="ln799">	fFrameSync = create_sem(0, &quot;frame synchronization&quot;);</a>
+<a name="ln800">	if (fFrameSync &lt; B_OK)</a>
+<a name="ln801">		goto err1;</a>
+<a name="ln802"> </a>
+<a name="ln803">	fThread = spawn_thread(_frame_generator_, &quot;frame generator&quot;,</a>
+<a name="ln804">			B_NORMAL_PRIORITY, this);</a>
+<a name="ln805">	if (fThread &lt; B_OK)</a>
+<a name="ln806">		goto err2;</a>
+<a name="ln807"> </a>
+<a name="ln808">	resume_thread(fThread);</a>
+<a name="ln809"> </a>
+<a name="ln810">	{</a>
+<a name="ln811">		BAutolock lock(fCamDevice-&gt;Locker());</a>
+<a name="ln812">		fCamDevice-&gt;StartTransfer();</a>
+<a name="ln813">	}</a>
+<a name="ln814"> </a>
+<a name="ln815">	fRunning = true;</a>
+<a name="ln816">	return;</a>
+<a name="ln817"> </a>
+<a name="ln818">err2:</a>
+<a name="ln819">	delete_sem(fFrameSync);</a>
+<a name="ln820">err1:</a>
+<a name="ln821">	return;</a>
+<a name="ln822">}</a>
+<a name="ln823"> </a>
+<a name="ln824"> </a>
+<a name="ln825">void</a>
+<a name="ln826">VideoProducer::HandleStop(void)</a>
+<a name="ln827">{</a>
+<a name="ln828">	PRINTF(1, (&quot;HandleStop()\n&quot;));</a>
+<a name="ln829"> </a>
+<a name="ln830">	if (!fRunning) {</a>
+<a name="ln831">		PRINTF(-1, (&quot;HandleStop: Node isn't running\n&quot;));</a>
+<a name="ln832">		return;</a>
+<a name="ln833">	}</a>
+<a name="ln834"> </a>
+<a name="ln835">	delete_sem(fFrameSync);</a>
+<a name="ln836">	wait_for_thread(fThread, &amp;fThread);</a>
+<a name="ln837"> </a>
+<a name="ln838">	BAutolock lock(fCamDevice-&gt;Locker());</a>
+<a name="ln839">	fCamDevice-&gt;StopTransfer();</a>
+<a name="ln840"> </a>
+<a name="ln841">	fRunning = false;</a>
+<a name="ln842">}</a>
+<a name="ln843"> </a>
+<a name="ln844"> </a>
+<a name="ln845">void</a>
+<a name="ln846">VideoProducer::HandleTimeWarp(bigtime_t performance_time)</a>
+<a name="ln847">{</a>
+<a name="ln848">	fPerformanceTimeBase = performance_time;</a>
+<a name="ln849">	fFrameBase = fFrame;</a>
+<a name="ln850"> </a>
+<a name="ln851">	/* Tell frame generation thread to recalculate delay value */</a>
+<a name="ln852">	release_sem(fFrameSync);</a>
+<a name="ln853">}</a>
+<a name="ln854"> </a>
+<a name="ln855"> </a>
+<a name="ln856">void</a>
+<a name="ln857">VideoProducer::HandleSeek(bigtime_t performance_time)</a>
+<a name="ln858">{</a>
+<a name="ln859">	fPerformanceTimeBase = performance_time;</a>
+<a name="ln860">	fFrameBase = fFrame;</a>
+<a name="ln861"> </a>
+<a name="ln862">	/* Tell frame generation thread to recalculate delay value */</a>
+<a name="ln863">	release_sem(fFrameSync);</a>
+<a name="ln864">}</a>
+<a name="ln865"> </a>
+<a name="ln866"> </a>
+<a name="ln867">void</a>
+<a name="ln868">VideoProducer::_UpdateStats()</a>
+<a name="ln869">{</a>
+<a name="ln870">	float fps = (fStats[0].frames - fStats[1].frames) * 1000000LL</a>
+<a name="ln871">				/ (double)(fStats[0].stamp - fStats[1].stamp);</a>
+<a name="ln872">	float rfps = (fStats[0].actual - fStats[1].actual) * 1000000LL</a>
+<a name="ln873">				/ (double)(fStats[0].stamp - fStats[1].stamp);</a>
+<a name="ln874">	fInfoString = &quot;FPS: &quot;;</a>
+<a name="ln875">	fInfoString &lt;&lt; fps &lt;&lt; &quot; virt, &quot;</a>
+<a name="ln876">		&lt;&lt; rfps &lt;&lt; &quot; real, missed: &quot; &lt;&lt; fStats[0].missed;</a>
+<a name="ln877">	memcpy(&amp;fStats[1], &amp;fStats[0], sizeof(fStats[0]));</a>
+<a name="ln878">	fLastColorChange = system_time();</a>
+<a name="ln879">	BroadcastNewParameterValue(fLastColorChange, P_INFO,</a>
+<a name="ln880">		(void *)fInfoString.String(), fInfoString.Length()+1);</a>
+<a name="ln881">}</a>
+<a name="ln882"> </a>
+<a name="ln883"> </a>
+<a name="ln884">/* The following functions form the thread that generates frames. You should</a>
+<a name="ln885"> * replace this with the code that interfaces to your hardware. */</a>
+<a name="ln886">int32</a>
+<a name="ln887">VideoProducer::FrameGenerator()</a>
+<a name="ln888">{</a>
+<a name="ln889">	bigtime_t wait_until = system_time();</a>
+<a name="ln890"> </a>
+<a name="ln891">	while (1) {</a>
+<a name="ln892">		PRINTF(1, (&quot;FrameGenerator: acquire_sem_etc() until %Ldµs (in %Ldµs)\n&quot;, wait_until, wait_until - system_time()));</a>
+<a name="ln893">		status_t err = acquire_sem_etc(fFrameSync, 1, B_ABSOLUTE_TIMEOUT,</a>
+<a name="ln894">				wait_until);</a>
+<a name="ln895"> </a>
+<a name="ln896">		/* The only acceptable responses are B_OK and B_TIMED_OUT. Everything</a>
+<a name="ln897">		 * else means the thread should quit. Deleting the semaphore, as in</a>
+<a name="ln898">		 * VideoProducer::HandleStop(), will trigger this behavior. */</a>
+<a name="ln899">		if ((err != B_OK) &amp;&amp; (err != B_TIMED_OUT))</a>
+<a name="ln900">			break;</a>
+<a name="ln901"> </a>
+<a name="ln902">		fFrame++;</a>
+<a name="ln903"> </a>
+<a name="ln904">		/* Recalculate the time until the thread should wake up to begin</a>
+<a name="ln905">		 * processing the next frame. Subtract fProcessingLatency so that</a>
+<a name="ln906">		 * the frame is sent in time. */</a>
+<a name="ln907">		wait_until = TimeSource()-&gt;RealTimeFor(fPerformanceTimeBase, 0) +</a>
+<a name="ln908">				(bigtime_t)</a>
+<a name="ln909">						((fFrame - fFrameBase) *</a>
+<a name="ln910">						(1000000 / fConnectedFormat.field_rate)) -</a>
+<a name="ln911">				fProcessingLatency;</a>
+<a name="ln912">PRINT((&quot;PS: %Ld\n&quot;, fProcessingLatency));</a>
+<a name="ln913"> </a>
+<a name="ln914">		/* Drop frame if it's at least a frame late */</a>
+<a name="ln915">		if (wait_until &lt; system_time())</a>
+<a name="ln916">			continue;</a>
+<a name="ln917"> </a>
+<a name="ln918">		PRINTF(1, (&quot;FrameGenerator: wait until %Ld, %ctimed out, %crunning, %cenabled.\n&quot;,</a>
+<a name="ln919">					wait_until,</a>
+<a name="ln920">					(err == B_OK)?'!':' ',</a>
+<a name="ln921">					(fRunning)?' ':'!',</a>
+<a name="ln922">					(fEnabled)?' ':'!'));</a>
+<a name="ln923"> </a>
+<a name="ln924">		/* If the semaphore was acquired successfully, it means something</a>
+<a name="ln925">		 * changed the timing information (see VideoProducer::Connect()) and</a>
+<a name="ln926">		 * so the thread should go back to sleep until the newly-calculated</a>
+<a name="ln927">		 * wait_until time. */</a>
+<a name="ln928">		if (err == B_OK)</a>
+<a name="ln929">			continue;</a>
+<a name="ln930"> </a>
+<a name="ln931">		/* Send buffers only if the node is running and the output has been</a>
+<a name="ln932">		 * enabled */</a>
+<a name="ln933">		if (!fRunning || !fEnabled)</a>
+<a name="ln934">			continue;</a>
+<a name="ln935"> </a>
+<a name="ln936">		BAutolock _(fLock);</a>
+<a name="ln937"> </a>
+<a name="ln938">		/* Fetch a buffer from the buffer group */</a>
+<a name="ln939">		BBuffer *buffer = fBufferGroup-&gt;RequestBuffer(</a>
+<a name="ln940">						4 * fConnectedFormat.display.line_width *</a>
+<a name="ln941">						fConnectedFormat.display.line_count, 0LL);</a>
+<a name="ln942">		if (!buffer)</a>
+<a name="ln943">			continue;</a>
+<a name="ln944"> </a>
+<a name="ln945">		/* Fill out the details about this buffer. */</a>
+<a name="ln946">		media_header *h = buffer-&gt;Header();</a>
+<a name="ln947">		h-&gt;type = B_MEDIA_RAW_VIDEO;</a>
+<a name="ln948">		h-&gt;time_source = TimeSource()-&gt;ID();</a>
+<a name="ln949">		h-&gt;size_used = 4 * fConnectedFormat.display.line_width *</a>
+<a name="ln950">						fConnectedFormat.display.line_count;</a>
+<a name="ln951">		/* For a buffer originating from a device, you might want to calculate</a>
+<a name="ln952">		 * this based on the PerformanceTimeFor the time your buffer arrived at</a>
+<a name="ln953">		 * the hardware (plus any applicable adjustments). */</a>
+<a name="ln954">		/*</a>
+<a name="ln955">		h-&gt;start_time = fPerformanceTimeBase +</a>
+<a name="ln956">						(bigtime_t)</a>
+<a name="ln957">							((fFrame - fFrameBase) *</a>
+<a name="ln958">							(1000000 / fConnectedFormat.field_rate));</a>
+<a name="ln959">		*/</a>
+<a name="ln960">		h-&gt;file_pos = 0;</a>
+<a name="ln961">		h-&gt;orig_size = 0;</a>
+<a name="ln962">		h-&gt;data_offset = 0;</a>
+<a name="ln963">		h-&gt;u.raw_video.field_gamma = 1.0;</a>
+<a name="ln964">		h-&gt;u.raw_video.field_sequence = fFrame;</a>
+<a name="ln965">		h-&gt;u.raw_video.field_number = 0;</a>
+<a name="ln966">		h-&gt;u.raw_video.pulldown_number = 0;</a>
+<a name="ln967">		h-&gt;u.raw_video.first_active_line = 1;</a>
+<a name="ln968">		h-&gt;u.raw_video.line_count = fConnectedFormat.display.line_count;</a>
+<a name="ln969"> </a>
+<a name="ln970">		// This is where we fill the video buffer.</a>
+<a name="ln971"> </a>
+<a name="ln972">#if 0</a>
+<a name="ln973">		uint32 *p = (uint32 *)buffer-&gt;Data();</a>
+<a name="ln974">		/* Fill in a pattern */</a>
+<a name="ln975">		for (uint32 y=0;y&lt;fConnectedFormat.display.line_count;y++)</a>
+<a name="ln976">			for (uint32 x=0;x&lt;fConnectedFormat.display.line_width;x++)</a>
+<a name="ln977">				*(p++) = ((((x+y)^0^x)+fFrame) &amp; 0xff) * (0x01010101 &amp; fColor);</a>
+<a name="ln978">#endif</a>
+<a name="ln979"> </a>
+<a name="ln980">		//NO! must be called without lock!</a>
+<a name="ln981">		//BAutolock lock(fCamDevice-&gt;Locker());</a>
+<a name="ln982"> </a>
+<a name="ln983">		bigtime_t now = system_time();</a>
+<a name="ln984">		bigtime_t stamp;</a>
+<a name="ln985">//#ifdef UseFillFrameBuffer</a>
+<a name="ln986">		err = fCamDevice-&gt;FillFrameBuffer(buffer, &amp;stamp);</a>
+<a name="ln987">		if (err &lt; B_OK) {</a>
+<a name="ln988">			;//XXX handle error</a>
+<a name="ln989">			fStats[0].missed++;</a>
+<a name="ln990">		}</a>
+<a name="ln991">//#endif</a>
+<a name="ln992">#ifdef UseGetFrameBitmap</a>
+<a name="ln993">		BBitmap *bm;</a>
+<a name="ln994">		err = fCamDevice-&gt;GetFrameBitmap(&amp;bm, &amp;stamp);</a>
+<a name="ln995">		if (err &gt;= B_OK) {</a>
+<a name="ln996">			;//XXX handle error</a>
+<a name="ln997">			fStats[0].missed++;</a>
+<a name="ln998">		}</a>
+<a name="ln999">#endif</a>
+<a name="ln1000">		fStats[0].frames = fFrame;</a>
+<a name="ln1001">		fStats[0].actual++;;</a>
+<a name="ln1002">		fStats[0].stamp = system_time();</a>
+<a name="ln1003"> </a>
+<a name="ln1004">		//PRINTF(1, (&quot;FrameGenerator: stamp %Ld vs %Ld\n&quot;, stamp, h-&gt;start_time));</a>
+<a name="ln1005">		//XXX: that's what we should be doing, but CodyCam drops all frames as they are late. (maybe add latency ??)</a>
+<a name="ln1006">		//h-&gt;start_time = TimeSource()-&gt;PerformanceTimeFor(stamp);</a>
+<a name="ln1007">		h-&gt;start_time = TimeSource()-&gt;PerformanceTimeFor(system_time());</a>
+<a name="ln1008"> </a>
+<a name="ln1009"> </a>
+<a name="ln1010">		// update processing latency</a>
+<a name="ln1011">		// XXX: should I ??</a>
+<a name="ln1012">		fProcessingLatency = system_time() - now;</a>
+<a name="ln1013">		fProcessingLatency /= 10;</a>
+<a name="ln1014"> </a>
+<a name="ln1015">		PRINTF(1, (&quot;FrameGenerator: SendBuffer...\n&quot;));</a>
+<a name="ln1016">		/* Send the buffer on down to the consumer */</a>
+<a name="ln1017">		if (SendBuffer(buffer, fOutput.source, fOutput.destination) &lt; B_OK) {</a>
+<a name="ln1018">			PRINTF(-1, (&quot;FrameGenerator: Error sending buffer\n&quot;));</a>
+<a name="ln1019">			/* If there is a problem sending the buffer, return it to its</a>
+<a name="ln1020">			 * buffer group. */</a>
+<a name="ln1021">			buffer-&gt;Recycle();</a>
+<a name="ln1022">		}</a>
+<a name="ln1023"> </a>
+<a name="ln1024">		_UpdateStats();</a>
+<a name="ln1025">	}</a>
+<a name="ln1026"> </a>
+<a name="ln1027">	PRINTF(1, (&quot;FrameGenerator: thread existed.\n&quot;));</a>
+<a name="ln1028">	return B_OK;</a>
+<a name="ln1029">}</a>
+<a name="ln1030"> </a>
+<a name="ln1031"> </a>
+<a name="ln1032">int32</a>
+<a name="ln1033">VideoProducer::_frame_generator_(void *data)</a>
+<a name="ln1034">{</a>
+<a name="ln1035">	return ((VideoProducer *)data)-&gt;FrameGenerator();</a>
+<a name="ln1036">}</a>
+
+</code></pre>
+<div class="balloon" rel="467"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'printf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="384"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the third actual argument of the 'printf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="918"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Potentially incorrect format string is passed to the 'printf' function. Prefix 'L' is not applicable to conversion specifier 'd'.</p></div>
+<div class="balloon" rel="892"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Potentially incorrect format string is passed to the 'printf' function. Prefix 'L' is not applicable to conversion specifier 'd'.</p></div>
+<div class="balloon" rel="364"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'printf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="364"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the third actual argument of the 'printf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="338"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the third actual argument of the 'printf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="292"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'printf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="384"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'printf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="338"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'printf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="467"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the third actual argument of the 'printf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="788"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Potentially incorrect format string is passed to the 'printf' function. Prefix 'L' is not applicable to conversion specifier 'd'.</p></div>
+<div class="balloon" rel="542"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the third actual argument of the 'printf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="542"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'printf' function. The memsize type argument is expected.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

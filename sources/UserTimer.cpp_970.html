@@ -1,0 +1,1879 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>UserTimer.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2014, Paweł Dziepak, pdziepak@quarnos.org.</a>
+<a name="ln3"> * Copyright 2011, Ingo Weinhold, ingo_weinhold@gmx.de.</a>
+<a name="ln4"> * Distributed under the terms of the MIT License.</a>
+<a name="ln5"> */</a>
+<a name="ln6"> </a>
+<a name="ln7"> </a>
+<a name="ln8">#include &lt;UserTimer.h&gt;</a>
+<a name="ln9"> </a>
+<a name="ln10">#include &lt;algorithm&gt;</a>
+<a name="ln11"> </a>
+<a name="ln12">#include &lt;AutoDeleter.h&gt;</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &lt;debug.h&gt;</a>
+<a name="ln15">#include &lt;kernel.h&gt;</a>
+<a name="ln16">#include &lt;real_time_clock.h&gt;</a>
+<a name="ln17">#include &lt;team.h&gt;</a>
+<a name="ln18">#include &lt;thread_types.h&gt;</a>
+<a name="ln19">#include &lt;UserEvent.h&gt;</a>
+<a name="ln20">#include &lt;util/AutoLock.h&gt;</a>
+<a name="ln21"> </a>
+<a name="ln22"> </a>
+<a name="ln23">// Minimum interval length in microseconds for a periodic timer. This is not a</a>
+<a name="ln24">// restriction on the user timer interval length itself, but the minimum time</a>
+<a name="ln25">// span by which we advance the start time for kernel timers. A shorted user</a>
+<a name="ln26">// timer interval will result in the overrun count to be increased every time</a>
+<a name="ln27">// the kernel timer is rescheduled.</a>
+<a name="ln28">static const bigtime_t kMinPeriodicTimerInterval = 100;</a>
+<a name="ln29"> </a>
+<a name="ln30">static RealTimeUserTimerList sAbsoluteRealTimeTimers;</a>
+<a name="ln31">static spinlock sAbsoluteRealTimeTimersLock = B_SPINLOCK_INITIALIZER;</a>
+<a name="ln32"> </a>
+<a name="ln33">static seqlock sUserTimerLock = B_SEQLOCK_INITIALIZER;</a>
+<a name="ln34"> </a>
+<a name="ln35"> </a>
+<a name="ln36">// #pragma mark - TimerLocker</a>
+<a name="ln37"> </a>
+<a name="ln38"> </a>
+<a name="ln39">namespace {</a>
+<a name="ln40"> </a>
+<a name="ln41">struct TimerLocker {</a>
+<a name="ln42">	Team*	team;</a>
+<a name="ln43">	Thread*	thread;</a>
+<a name="ln44"> </a>
+<a name="ln45">	TimerLocker()</a>
+<a name="ln46">		:</a>
+<a name="ln47">		team(NULL),</a>
+<a name="ln48">		thread(NULL)</a>
+<a name="ln49">	{</a>
+<a name="ln50">	}</a>
+<a name="ln51"> </a>
+<a name="ln52">	~TimerLocker()</a>
+<a name="ln53">	{</a>
+<a name="ln54">		Unlock();</a>
+<a name="ln55">	}</a>
+<a name="ln56"> </a>
+<a name="ln57">	void Lock(Team* team, Thread* thread)</a>
+<a name="ln58">	{</a>
+<a name="ln59">		this-&gt;team = team;</a>
+<a name="ln60">		team-&gt;Lock();</a>
+<a name="ln61"> </a>
+<a name="ln62">		this-&gt;thread = thread;</a>
+<a name="ln63"> </a>
+<a name="ln64">		if (thread != NULL) {</a>
+<a name="ln65">			thread-&gt;AcquireReference();</a>
+<a name="ln66">			thread-&gt;Lock();</a>
+<a name="ln67">		}</a>
+<a name="ln68"> </a>
+<a name="ln69">		// We don't check thread-&gt;team != team here, since this method can be</a>
+<a name="ln70">		// called for new threads not added to the team yet.</a>
+<a name="ln71">	}</a>
+<a name="ln72"> </a>
+<a name="ln73">	status_t LockAndGetTimer(thread_id threadID, int32 timerID,</a>
+<a name="ln74">		UserTimer*&amp; _timer)</a>
+<a name="ln75">	{</a>
+<a name="ln76">		team = thread_get_current_thread()-&gt;team;</a>
+<a name="ln77">		team-&gt;Lock();</a>
+<a name="ln78"> </a>
+<a name="ln79">		if (threadID &gt;= 0) {</a>
+<a name="ln80">			thread = Thread::GetAndLock(threadID);</a>
+<a name="ln81">			if (thread == NULL)</a>
+<a name="ln82">				return B_BAD_THREAD_ID;</a>
+<a name="ln83">			if (thread-&gt;team != team)</a>
+<a name="ln84">				return B_NOT_ALLOWED;</a>
+<a name="ln85">		}</a>
+<a name="ln86"> </a>
+<a name="ln87">		UserTimer* timer = thread != NULL</a>
+<a name="ln88">			? thread-&gt;UserTimerFor(timerID) : team-&gt;UserTimerFor(timerID);</a>
+<a name="ln89">		if (timer == NULL)</a>
+<a name="ln90">			return B_BAD_VALUE;</a>
+<a name="ln91"> </a>
+<a name="ln92">		_timer = timer;</a>
+<a name="ln93">		return B_OK;</a>
+<a name="ln94">	}</a>
+<a name="ln95"> </a>
+<a name="ln96">	void Unlock()</a>
+<a name="ln97">	{</a>
+<a name="ln98">		if (thread != NULL) {</a>
+<a name="ln99">			thread-&gt;UnlockAndReleaseReference();</a>
+<a name="ln100">			thread = NULL;</a>
+<a name="ln101">		}</a>
+<a name="ln102">		if (team != NULL) {</a>
+<a name="ln103">			team-&gt;Unlock();</a>
+<a name="ln104">			team = NULL;</a>
+<a name="ln105">		}</a>
+<a name="ln106">	}</a>
+<a name="ln107">};</a>
+<a name="ln108"> </a>
+<a name="ln109">}	// unnamed namespace</a>
+<a name="ln110"> </a>
+<a name="ln111"> </a>
+<a name="ln112">// #pragma mark - UserTimer</a>
+<a name="ln113"> </a>
+<a name="ln114"> </a>
+<a name="ln115">UserTimer::UserTimer()</a>
+<a name="ln116">	:</a>
+<a name="ln117">	fID(-1),</a>
+<a name="ln118">	fEvent(NULL),</a>
+<a name="ln119">	fNextTime(0),</a>
+<a name="ln120">	fInterval(0),</a>
+<a name="ln121">	fOverrunCount(0),</a>
+<a name="ln122">	fScheduled(false),</a>
+<a name="ln123">	fSkip(0)</a>
+<a name="ln124">{</a>
+<a name="ln125">	// mark the timer unused</a>
+<a name="ln126">	fTimer.user_data = this;</a>
+<a name="ln127">}</a>
+<a name="ln128"> </a>
+<a name="ln129"> </a>
+<a name="ln130">UserTimer::~UserTimer()</a>
+<a name="ln131">{</a>
+<a name="ln132">	if (fEvent != NULL)</a>
+<a name="ln133">		fEvent-&gt;ReleaseReference();</a>
+<a name="ln134">}</a>
+<a name="ln135"> </a>
+<a name="ln136"> </a>
+<a name="ln137">/*!	\fn UserTimer::Schedule(bigtime_t nextTime, bigtime_t interval,</a>
+<a name="ln138">		bigtime_t&amp; _oldRemainingTime, bigtime_t&amp; _oldInterval)</a>
+<a name="ln139">	Cancels the timer, if it is already scheduled, and optionally schedules it</a>
+<a name="ln140">	with new parameters.</a>
+<a name="ln141"> </a>
+<a name="ln142">	\param nextTime The time at which the timer should go off the next time. If</a>
+<a name="ln143">		\c B_INFINITE_TIMEOUT, the timer will not be scheduled. Whether the</a>
+<a name="ln144">		value is interpreted as absolute or relative time, depends on \c flags.</a>
+<a name="ln145">	\param interval If &lt;tt&gt; &gt;0 &lt;/tt&gt;, the timer will be scheduled to fire</a>
+<a name="ln146">		periodically every \a interval microseconds. Otherwise it will fire</a>
+<a name="ln147">		only once at \a nextTime. If \a nextTime is \c B_INFINITE_TIMEOUT, it</a>
+<a name="ln148">		will fire never in either case.</a>
+<a name="ln149">	\param flags Bitwise OR of flags. Currently \c B_ABSOLUTE_TIMEOUT and</a>
+<a name="ln150">		\c B_RELATIVE_TIMEOUT are supported, indicating whether \a nextTime is</a>
+<a name="ln151">		an absolute or relative time.</a>
+<a name="ln152">	\param _oldRemainingTime Return variable that will be set to the</a>
+<a name="ln153">		microseconds remaining to the time for which the timer was scheduled</a>
+<a name="ln154">		next before the call. If it wasn't scheduled, the variable is set to</a>
+<a name="ln155">		\c B_INFINITE_TIMEOUT.</a>
+<a name="ln156">	\param _oldInterval Return variable that will be set to the interval in</a>
+<a name="ln157">		microseconds the timer was to be scheduled periodically. If the timer</a>
+<a name="ln158">		wasn't periodic, the variable is set to \c 0.</a>
+<a name="ln159">*/</a>
+<a name="ln160"> </a>
+<a name="ln161"> </a>
+<a name="ln162">/*!	Cancels the timer, if it is scheduled.</a>
+<a name="ln163">*/</a>
+<a name="ln164">void</a>
+<a name="ln165">UserTimer::Cancel()</a>
+<a name="ln166">{</a>
+<a name="ln167">	bigtime_t oldNextTime;</a>
+<a name="ln168">	bigtime_t oldInterval;</a>
+<a name="ln169">	return Schedule(B_INFINITE_TIMEOUT, 0, 0, oldNextTime, oldInterval);</a>
+<a name="ln170">}</a>
+<a name="ln171"> </a>
+<a name="ln172"> </a>
+<a name="ln173">/*!	\fn UserTimer::GetInfo(bigtime_t&amp; _remainingTime, bigtime_t&amp; _interval,</a>
+<a name="ln174">		uint32&amp; _overrunCount)</a>
+<a name="ln175">	Return information on the current timer.</a>
+<a name="ln176"> </a>
+<a name="ln177">	\param _remainingTime Return variable that will be set to the microseconds</a>
+<a name="ln178">		remaining to the time for which the timer was scheduled next before the</a>
+<a name="ln179">		call. If it wasn't scheduled, the variable is set to</a>
+<a name="ln180">		\c B_INFINITE_TIMEOUT.</a>
+<a name="ln181">	\param _interval Return variable that will be set to the interval in</a>
+<a name="ln182">		microseconds the timer is to be scheduled periodically. If the timer</a>
+<a name="ln183">		isn't periodic, the variable is set to \c 0.</a>
+<a name="ln184">	\param _overrunCount Return variable that will be set to the number of times</a>
+<a name="ln185">		the timer went off, but its event couldn't be delivered, since it's</a>
+<a name="ln186">		previous delivery hasn't been handled yet.</a>
+<a name="ln187">*/</a>
+<a name="ln188"> </a>
+<a name="ln189"> </a>
+<a name="ln190">/*static*/ int32</a>
+<a name="ln191">UserTimer::HandleTimerHook(struct timer* timer)</a>
+<a name="ln192">{</a>
+<a name="ln193">	UserTimer* userTimer = reinterpret_cast&lt;UserTimer*&gt;(timer-&gt;user_data);</a>
+<a name="ln194"> </a>
+<a name="ln195">	InterruptsLocker _;</a>
+<a name="ln196"> </a>
+<a name="ln197">	bool locked = false;</a>
+<a name="ln198">	while (!locked &amp;&amp; atomic_get(&amp;userTimer-&gt;fSkip) == 0) {</a>
+<a name="ln199">		locked = try_acquire_write_seqlock(&amp;sUserTimerLock);</a>
+<a name="ln200">		if (!locked)</a>
+<a name="ln201">			cpu_pause();</a>
+<a name="ln202">	}</a>
+<a name="ln203"> </a>
+<a name="ln204">	if (locked) {</a>
+<a name="ln205">		userTimer-&gt;HandleTimer();</a>
+<a name="ln206">		release_write_seqlock(&amp;sUserTimerLock);</a>
+<a name="ln207">	}</a>
+<a name="ln208"> </a>
+<a name="ln209">	return B_HANDLED_INTERRUPT;</a>
+<a name="ln210">}</a>
+<a name="ln211"> </a>
+<a name="ln212"> </a>
+<a name="ln213">void</a>
+<a name="ln214">UserTimer::HandleTimer()</a>
+<a name="ln215">{</a>
+<a name="ln216">	if (fEvent != NULL) {</a>
+<a name="ln217">		// fire the event and update the overrun count, if necessary</a>
+<a name="ln218">		status_t error = fEvent-&gt;Fire();</a>
+<a name="ln219">		if (error == B_BUSY) {</a>
+<a name="ln220">			if (fOverrunCount &lt; MAX_USER_TIMER_OVERRUN_COUNT)</a>
+<a name="ln221">				fOverrunCount++;</a>
+<a name="ln222">		}</a>
+<a name="ln223">	}</a>
+<a name="ln224"> </a>
+<a name="ln225">	// Since we don't use periodic kernel timers, it isn't scheduled anymore.</a>
+<a name="ln226">	// If the timer is periodic, the derived class' version will schedule it</a>
+<a name="ln227">	// again.</a>
+<a name="ln228">	fScheduled = false;</a>
+<a name="ln229">}</a>
+<a name="ln230"> </a>
+<a name="ln231"> </a>
+<a name="ln232">/*!	Updates the start time for a periodic timer after it expired, enforcing</a>
+<a name="ln233">	sanity limits and updating \c fOverrunCount, if necessary.</a>
+<a name="ln234"> </a>
+<a name="ln235">	The caller must not hold \c sUserTimerLock.</a>
+<a name="ln236">*/</a>
+<a name="ln237">void</a>
+<a name="ln238">UserTimer::UpdatePeriodicStartTime()</a>
+<a name="ln239">{</a>
+<a name="ln240">	if (fInterval &lt; kMinPeriodicTimerInterval) {</a>
+<a name="ln241">		bigtime_t skip = (kMinPeriodicTimerInterval + fInterval - 1) / fInterval;</a>
+<a name="ln242">		fNextTime += skip * fInterval;</a>
+<a name="ln243"> </a>
+<a name="ln244">		// One interval is the normal advance, so don't consider it skipped.</a>
+<a name="ln245">		skip--;</a>
+<a name="ln246"> </a>
+<a name="ln247">		if (skip + fOverrunCount &gt; MAX_USER_TIMER_OVERRUN_COUNT)</a>
+<a name="ln248">			fOverrunCount = MAX_USER_TIMER_OVERRUN_COUNT;</a>
+<a name="ln249">		else</a>
+<a name="ln250">			fOverrunCount += skip;</a>
+<a name="ln251">	} else</a>
+<a name="ln252">		fNextTime += fInterval;</a>
+<a name="ln253">}</a>
+<a name="ln254"> </a>
+<a name="ln255"> </a>
+<a name="ln256">/*!	Checks whether the timer start time lies too much in the past and, if so,</a>
+<a name="ln257">	adjusts it and updates \c fOverrunCount.</a>
+<a name="ln258"> </a>
+<a name="ln259">	The caller must not hold \c sUserTimerLock.</a>
+<a name="ln260"> </a>
+<a name="ln261">	\param now The current time.</a>
+<a name="ln262">*/</a>
+<a name="ln263">void</a>
+<a name="ln264">UserTimer::CheckPeriodicOverrun(bigtime_t now)</a>
+<a name="ln265">{</a>
+<a name="ln266">	if (fNextTime + fInterval &gt; now)</a>
+<a name="ln267">		return;</a>
+<a name="ln268"> </a>
+<a name="ln269">	// The start time is a full interval or more in the past. Skip those</a>
+<a name="ln270">	// intervals.</a>
+<a name="ln271">	bigtime_t skip = (now - fNextTime) / fInterval;</a>
+<a name="ln272">	fNextTime += skip * fInterval;</a>
+<a name="ln273"> </a>
+<a name="ln274">	if (skip + fOverrunCount &gt; MAX_USER_TIMER_OVERRUN_COUNT)</a>
+<a name="ln275">		fOverrunCount = MAX_USER_TIMER_OVERRUN_COUNT;</a>
+<a name="ln276">	else</a>
+<a name="ln277">		fOverrunCount += skip;</a>
+<a name="ln278">}</a>
+<a name="ln279"> </a>
+<a name="ln280"> </a>
+<a name="ln281">void</a>
+<a name="ln282">UserTimer::CancelTimer()</a>
+<a name="ln283">{</a>
+<a name="ln284">	ASSERT(fScheduled);</a>
+<a name="ln285"> </a>
+<a name="ln286">	atomic_set(&amp;fSkip, 1);</a>
+<a name="ln287">	cancel_timer(&amp;fTimer);</a>
+<a name="ln288">	atomic_set(&amp;fSkip, 0);</a>
+<a name="ln289">}</a>
+<a name="ln290"> </a>
+<a name="ln291"> </a>
+<a name="ln292">// #pragma mark - SystemTimeUserTimer</a>
+<a name="ln293"> </a>
+<a name="ln294"> </a>
+<a name="ln295">void</a>
+<a name="ln296">SystemTimeUserTimer::Schedule(bigtime_t nextTime, bigtime_t interval,</a>
+<a name="ln297">	uint32 flags, bigtime_t&amp; _oldRemainingTime, bigtime_t&amp; _oldInterval)</a>
+<a name="ln298">{</a>
+<a name="ln299">	InterruptsWriteSequentialLocker locker(sUserTimerLock);</a>
+<a name="ln300"> </a>
+<a name="ln301">	// get the current time</a>
+<a name="ln302">	bigtime_t now = system_time();</a>
+<a name="ln303"> </a>
+<a name="ln304">	// Cancel the old timer, if still scheduled, and get the previous values.</a>
+<a name="ln305">	if (fScheduled) {</a>
+<a name="ln306">		CancelTimer();</a>
+<a name="ln307"> </a>
+<a name="ln308">		_oldRemainingTime = fNextTime - now;</a>
+<a name="ln309">		_oldInterval = fInterval;</a>
+<a name="ln310"> </a>
+<a name="ln311">		fScheduled = false;</a>
+<a name="ln312">	} else {</a>
+<a name="ln313">		_oldRemainingTime = B_INFINITE_TIMEOUT;</a>
+<a name="ln314">		_oldInterval = 0;</a>
+<a name="ln315">	}</a>
+<a name="ln316"> </a>
+<a name="ln317">	// schedule the new timer</a>
+<a name="ln318">	fNextTime = nextTime;</a>
+<a name="ln319">	fInterval = interval;</a>
+<a name="ln320">	fOverrunCount = 0;</a>
+<a name="ln321"> </a>
+<a name="ln322">	if (nextTime == B_INFINITE_TIMEOUT)</a>
+<a name="ln323">		return;</a>
+<a name="ln324"> </a>
+<a name="ln325">	if ((flags &amp; B_RELATIVE_TIMEOUT) != 0)</a>
+<a name="ln326">		fNextTime += now;</a>
+<a name="ln327"> </a>
+<a name="ln328">	ScheduleKernelTimer(now, fInterval &gt; 0);</a>
+<a name="ln329">}</a>
+<a name="ln330"> </a>
+<a name="ln331"> </a>
+<a name="ln332">void</a>
+<a name="ln333">SystemTimeUserTimer::GetInfo(bigtime_t&amp; _remainingTime, bigtime_t&amp; _interval,</a>
+<a name="ln334">	uint32&amp; _overrunCount)</a>
+<a name="ln335">{</a>
+<a name="ln336">	uint32 count;</a>
+<a name="ln337">	do {</a>
+<a name="ln338">		count = acquire_read_seqlock(&amp;sUserTimerLock);</a>
+<a name="ln339"> </a>
+<a name="ln340">		if (fScheduled) {</a>
+<a name="ln341">			_remainingTime = fNextTime - system_time();</a>
+<a name="ln342">			_interval = fInterval;</a>
+<a name="ln343">		} else {</a>
+<a name="ln344">			_remainingTime = B_INFINITE_TIMEOUT;</a>
+<a name="ln345">			_interval = 0;</a>
+<a name="ln346">		}</a>
+<a name="ln347"> </a>
+<a name="ln348">		_overrunCount = fOverrunCount;</a>
+<a name="ln349">	} while (!release_read_seqlock(&amp;sUserTimerLock, count));</a>
+<a name="ln350">}</a>
+<a name="ln351"> </a>
+<a name="ln352"> </a>
+<a name="ln353">void</a>
+<a name="ln354">SystemTimeUserTimer::HandleTimer()</a>
+<a name="ln355">{</a>
+<a name="ln356">	UserTimer::HandleTimer();</a>
+<a name="ln357"> </a>
+<a name="ln358">	// if periodic, reschedule the kernel timer</a>
+<a name="ln359">	if (fInterval &gt; 0) {</a>
+<a name="ln360">		UpdatePeriodicStartTime();</a>
+<a name="ln361">		ScheduleKernelTimer(system_time(), true);</a>
+<a name="ln362">	}</a>
+<a name="ln363">}</a>
+<a name="ln364"> </a>
+<a name="ln365"> </a>
+<a name="ln366">/*!	Schedules the kernel timer.</a>
+<a name="ln367"> </a>
+<a name="ln368">	The caller must hold \c sUserTimerLock.</a>
+<a name="ln369"> </a>
+<a name="ln370">	\param now The current system time to be used.</a>
+<a name="ln371">	\param checkPeriodicOverrun If \c true, calls CheckPeriodicOverrun() first,</a>
+<a name="ln372">		i.e. the start time will be adjusted to not lie too much in the past.</a>
+<a name="ln373">*/</a>
+<a name="ln374">void</a>
+<a name="ln375">SystemTimeUserTimer::ScheduleKernelTimer(bigtime_t now,</a>
+<a name="ln376">	bool checkPeriodicOverrun)</a>
+<a name="ln377">{</a>
+<a name="ln378">	// If periodic, check whether the start time is too far in the past.</a>
+<a name="ln379">	if (checkPeriodicOverrun)</a>
+<a name="ln380">		CheckPeriodicOverrun(now);</a>
+<a name="ln381"> </a>
+<a name="ln382">	uint32 timerFlags = B_ONE_SHOT_ABSOLUTE_TIMER</a>
+<a name="ln383">			| B_TIMER_USE_TIMER_STRUCT_TIMES;</a>
+<a name="ln384"> </a>
+<a name="ln385">	fTimer.schedule_time = std::max(fNextTime, (bigtime_t)0);</a>
+<a name="ln386">	fTimer.period = 0;</a>
+<a name="ln387"> </a>
+<a name="ln388">	add_timer(&amp;fTimer, &amp;HandleTimerHook, fTimer.schedule_time, timerFlags);</a>
+<a name="ln389"> </a>
+<a name="ln390">	fScheduled = true;</a>
+<a name="ln391">}</a>
+<a name="ln392"> </a>
+<a name="ln393"> </a>
+<a name="ln394">// #pragma mark - RealTimeUserTimer</a>
+<a name="ln395"> </a>
+<a name="ln396"> </a>
+<a name="ln397">void</a>
+<a name="ln398">RealTimeUserTimer::Schedule(bigtime_t nextTime, bigtime_t interval,</a>
+<a name="ln399">	uint32 flags, bigtime_t&amp; _oldRemainingTime, bigtime_t&amp; _oldInterval)</a>
+<a name="ln400">{</a>
+<a name="ln401">	InterruptsWriteSequentialLocker locker(sUserTimerLock);</a>
+<a name="ln402"> </a>
+<a name="ln403">	// get the current time</a>
+<a name="ln404">	bigtime_t now = system_time();</a>
+<a name="ln405"> </a>
+<a name="ln406">	// Cancel the old timer, if still scheduled, and get the previous values.</a>
+<a name="ln407">	if (fScheduled) {</a>
+<a name="ln408">		CancelTimer();</a>
+<a name="ln409"> </a>
+<a name="ln410">		_oldRemainingTime = fNextTime - now;</a>
+<a name="ln411">		_oldInterval = fInterval;</a>
+<a name="ln412"> </a>
+<a name="ln413">		if (fAbsolute) {</a>
+<a name="ln414">			SpinLocker globalListLocker(sAbsoluteRealTimeTimersLock);</a>
+<a name="ln415">			sAbsoluteRealTimeTimers.Remove(this);</a>
+<a name="ln416">		}</a>
+<a name="ln417"> </a>
+<a name="ln418">		fScheduled = false;</a>
+<a name="ln419">	} else {</a>
+<a name="ln420">		_oldRemainingTime = B_INFINITE_TIMEOUT;</a>
+<a name="ln421">		_oldInterval = 0;</a>
+<a name="ln422">	}</a>
+<a name="ln423"> </a>
+<a name="ln424">	// schedule the new timer</a>
+<a name="ln425">	fNextTime = nextTime;</a>
+<a name="ln426">	fInterval = interval;</a>
+<a name="ln427">	fOverrunCount = 0;</a>
+<a name="ln428"> </a>
+<a name="ln429">	if (nextTime == B_INFINITE_TIMEOUT)</a>
+<a name="ln430">		return;</a>
+<a name="ln431"> </a>
+<a name="ln432">	fAbsolute = (flags &amp; B_RELATIVE_TIMEOUT) == 0;</a>
+<a name="ln433"> </a>
+<a name="ln434">	if (fAbsolute) {</a>
+<a name="ln435">		fRealTimeOffset = rtc_boot_time();</a>
+<a name="ln436">		fNextTime -= fRealTimeOffset;</a>
+<a name="ln437"> </a>
+<a name="ln438">		// If periodic, check whether the start time is too far in the past.</a>
+<a name="ln439">		if (fInterval &gt; 0)</a>
+<a name="ln440">			CheckPeriodicOverrun(now);</a>
+<a name="ln441"> </a>
+<a name="ln442">		// add the absolute timer to the global list</a>
+<a name="ln443">		SpinLocker globalListLocker(sAbsoluteRealTimeTimersLock);</a>
+<a name="ln444">		sAbsoluteRealTimeTimers.Insert(this);</a>
+<a name="ln445">	} else</a>
+<a name="ln446">		fNextTime += now;</a>
+<a name="ln447"> </a>
+<a name="ln448">	ScheduleKernelTimer(now, false);</a>
+<a name="ln449">}</a>
+<a name="ln450"> </a>
+<a name="ln451"> </a>
+<a name="ln452">/*!	Called when the real-time clock has been changed.</a>
+<a name="ln453"> </a>
+<a name="ln454">	The caller must hold \c sUserTimerLock. Optionally the caller may also</a>
+<a name="ln455">	hold \c sAbsoluteRealTimeTimersLock.</a>
+<a name="ln456">*/</a>
+<a name="ln457">void</a>
+<a name="ln458">RealTimeUserTimer::TimeWarped()</a>
+<a name="ln459">{</a>
+<a name="ln460">	ASSERT(fScheduled &amp;&amp; fAbsolute);</a>
+<a name="ln461"> </a>
+<a name="ln462">	// get the new real-time offset</a>
+<a name="ln463">	bigtime_t oldRealTimeOffset = fRealTimeOffset;</a>
+<a name="ln464">	fRealTimeOffset = rtc_boot_time();</a>
+<a name="ln465">	if (fRealTimeOffset == oldRealTimeOffset)</a>
+<a name="ln466">		return;</a>
+<a name="ln467"> </a>
+<a name="ln468">	// cancel the kernel timer and reschedule it</a>
+<a name="ln469">	CancelTimer();</a>
+<a name="ln470"> </a>
+<a name="ln471">	fNextTime += oldRealTimeOffset - fRealTimeOffset;</a>
+<a name="ln472"> </a>
+<a name="ln473">	ScheduleKernelTimer(system_time(), fInterval &gt; 0);</a>
+<a name="ln474">}</a>
+<a name="ln475"> </a>
+<a name="ln476"> </a>
+<a name="ln477">void</a>
+<a name="ln478">RealTimeUserTimer::HandleTimer()</a>
+<a name="ln479">{</a>
+<a name="ln480">	SystemTimeUserTimer::HandleTimer();</a>
+<a name="ln481"> </a>
+<a name="ln482">	// remove from global list, if no longer scheduled</a>
+<a name="ln483">	if (!fScheduled &amp;&amp; fAbsolute) {</a>
+<a name="ln484">		SpinLocker globalListLocker(sAbsoluteRealTimeTimersLock);</a>
+<a name="ln485">		sAbsoluteRealTimeTimers.Remove(this);</a>
+<a name="ln486">	}</a>
+<a name="ln487">}</a>
+<a name="ln488"> </a>
+<a name="ln489"> </a>
+<a name="ln490">// #pragma mark - TeamTimeUserTimer</a>
+<a name="ln491"> </a>
+<a name="ln492"> </a>
+<a name="ln493">TeamTimeUserTimer::TeamTimeUserTimer(team_id teamID)</a>
+<a name="ln494">	:</a>
+<a name="ln495">	fTeamID(teamID),</a>
+<a name="ln496">	fTeam(NULL)</a>
+<a name="ln497">{</a>
+<a name="ln498">}</a>
+<a name="ln499"> </a>
+<a name="ln500"> </a>
+<a name="ln501">TeamTimeUserTimer::~TeamTimeUserTimer()</a>
+<a name="ln502">{</a>
+<a name="ln503">	ASSERT(fTeam == NULL);</a>
+<a name="ln504">}</a>
+<a name="ln505"> </a>
+<a name="ln506"> </a>
+<a name="ln507">void</a>
+<a name="ln508">TeamTimeUserTimer::Schedule(bigtime_t nextTime, bigtime_t interval,</a>
+<a name="ln509">	uint32 flags, bigtime_t&amp; _oldRemainingTime, bigtime_t&amp; _oldInterval)</a>
+<a name="ln510">{</a>
+<a name="ln511">	InterruptsWriteSequentialLocker locker(sUserTimerLock);</a>
+<a name="ln512">	SpinLocker timeLocker(fTeam != NULL ? &amp;fTeam-&gt;time_lock : NULL);</a>
+<a name="ln513"> </a>
+<a name="ln514">	// get the current time, but only if needed</a>
+<a name="ln515">	bool nowValid = fTeam != NULL;</a>
+<a name="ln516">	bigtime_t now = nowValid ? fTeam-&gt;CPUTime(false) : 0;</a>
+<a name="ln517"> </a>
+<a name="ln518">	// Cancel the old timer, if still scheduled, and get the previous values.</a>
+<a name="ln519">	if (fTeam != NULL) {</a>
+<a name="ln520">		if (fScheduled) {</a>
+<a name="ln521">			CancelTimer();</a>
+<a name="ln522">			fScheduled = false;</a>
+<a name="ln523">		}</a>
+<a name="ln524"> </a>
+<a name="ln525">		_oldRemainingTime = fNextTime - now;</a>
+<a name="ln526">		_oldInterval = fInterval;</a>
+<a name="ln527"> </a>
+<a name="ln528">		fTeam-&gt;UserTimerDeactivated(this);</a>
+<a name="ln529">		fTeam-&gt;ReleaseReference();</a>
+<a name="ln530">		fTeam = NULL;</a>
+<a name="ln531">	} else {</a>
+<a name="ln532">		_oldRemainingTime = B_INFINITE_TIMEOUT;</a>
+<a name="ln533">		_oldInterval = 0;</a>
+<a name="ln534">	}</a>
+<a name="ln535"> </a>
+<a name="ln536">	// schedule the new timer</a>
+<a name="ln537">	fNextTime = nextTime;</a>
+<a name="ln538">	fInterval = interval;</a>
+<a name="ln539">	fOverrunCount = 0;</a>
+<a name="ln540"> </a>
+<a name="ln541">	if (fNextTime == B_INFINITE_TIMEOUT)</a>
+<a name="ln542">		return;</a>
+<a name="ln543"> </a>
+<a name="ln544">	// Get the team. If it doesn't exist anymore, just don't schedule the</a>
+<a name="ln545">	// timer anymore.</a>
+<a name="ln546">	Team* newTeam = Team::Get(fTeamID);</a>
+<a name="ln547">	if (newTeam == NULL) {</a>
+<a name="ln548">		fTeam = NULL;</a>
+<a name="ln549">		return;</a>
+<a name="ln550">	} else if (fTeam == NULL)</a>
+<a name="ln551">		timeLocker.SetTo(newTeam-&gt;time_lock, false);</a>
+<a name="ln552">	fTeam = newTeam;</a>
+<a name="ln553"> </a>
+<a name="ln554">	fAbsolute = (flags &amp; B_RELATIVE_TIMEOUT) == 0;</a>
+<a name="ln555"> </a>
+<a name="ln556">	// convert relative to absolute timeouts</a>
+<a name="ln557">	if (!fAbsolute) {</a>
+<a name="ln558">		if (!nowValid)</a>
+<a name="ln559">			now = fTeam-&gt;CPUTime(false);</a>
+<a name="ln560">		fNextTime += now;</a>
+<a name="ln561">	}</a>
+<a name="ln562"> </a>
+<a name="ln563">	fTeam-&gt;UserTimerActivated(this);</a>
+<a name="ln564"> </a>
+<a name="ln565">	// schedule/udpate the kernel timer</a>
+<a name="ln566">	Update(NULL);</a>
+<a name="ln567">}</a>
+<a name="ln568"> </a>
+<a name="ln569"> </a>
+<a name="ln570">void</a>
+<a name="ln571">TeamTimeUserTimer::GetInfo(bigtime_t&amp; _remainingTime, bigtime_t&amp; _interval,</a>
+<a name="ln572">	uint32&amp; _overrunCount)</a>
+<a name="ln573">{</a>
+<a name="ln574">	uint32 count;</a>
+<a name="ln575">	do {</a>
+<a name="ln576">		count = acquire_read_seqlock(&amp;sUserTimerLock);</a>
+<a name="ln577"> </a>
+<a name="ln578">		if (fTeam != NULL) {</a>
+<a name="ln579">			InterruptsSpinLocker timeLocker(fTeam-&gt;time_lock);</a>
+<a name="ln580">			_remainingTime = fNextTime - fTeam-&gt;CPUTime(false);</a>
+<a name="ln581">			_interval = fInterval;</a>
+<a name="ln582">		} else {</a>
+<a name="ln583">			_remainingTime = B_INFINITE_TIMEOUT;</a>
+<a name="ln584">			_interval = 0;</a>
+<a name="ln585">		}</a>
+<a name="ln586"> </a>
+<a name="ln587">		_overrunCount = fOverrunCount;</a>
+<a name="ln588">	} while (!release_read_seqlock(&amp;sUserTimerLock, count));</a>
+<a name="ln589">}</a>
+<a name="ln590"> </a>
+<a name="ln591"> </a>
+<a name="ln592">/*!	Deactivates the timer, if it is activated.</a>
+<a name="ln593"> </a>
+<a name="ln594">	The caller must hold \c time_lock and \c sUserTimerLock.</a>
+<a name="ln595">*/</a>
+<a name="ln596">void</a>
+<a name="ln597">TeamTimeUserTimer::Deactivate()</a>
+<a name="ln598">{</a>
+<a name="ln599">	if (fTeam == NULL)</a>
+<a name="ln600">		return;</a>
+<a name="ln601"> </a>
+<a name="ln602">	// unschedule, if scheduled</a>
+<a name="ln603">	if (fScheduled) {</a>
+<a name="ln604">		CancelTimer();</a>
+<a name="ln605">		fScheduled = false;</a>
+<a name="ln606">	}</a>
+<a name="ln607"> </a>
+<a name="ln608">	// deactivate</a>
+<a name="ln609">	fTeam-&gt;UserTimerDeactivated(this);</a>
+<a name="ln610">	fTeam-&gt;ReleaseReference();</a>
+<a name="ln611">	fTeam = NULL;</a>
+<a name="ln612">}</a>
+<a name="ln613"> </a>
+<a name="ln614"> </a>
+<a name="ln615">/*!	Starts/stops the timer as necessary, if it is active.</a>
+<a name="ln616"> </a>
+<a name="ln617">	Called whenever threads of the team whose CPU time is referred to by the</a>
+<a name="ln618">	timer are scheduled or unscheduled (or leave the team), or when the timer</a>
+<a name="ln619">	was just set. Schedules a kernel timer for the remaining time, respectively</a>
+<a name="ln620">	cancels it.</a>
+<a name="ln621"> </a>
+<a name="ln622">	The caller must hold \c time_lock and \c sUserTimerLock.</a>
+<a name="ln623"> </a>
+<a name="ln624">	\param unscheduledThread If not \c NULL, this is the thread that is</a>
+<a name="ln625">		currently running and which is in the process of being unscheduled.</a>
+<a name="ln626">*/</a>
+<a name="ln627">void</a>
+<a name="ln628">TeamTimeUserTimer::Update(Thread* unscheduledThread, Thread* lockedThread)</a>
+<a name="ln629">{</a>
+<a name="ln630">	if (fTeam == NULL)</a>
+<a name="ln631">		return;</a>
+<a name="ln632"> </a>
+<a name="ln633">	// determine how many of the team's threads are currently running</a>
+<a name="ln634">	fRunningThreads = 0;</a>
+<a name="ln635">	int32 cpuCount = smp_get_num_cpus();</a>
+<a name="ln636">	for (int32 i = 0; i &lt; cpuCount; i++) {</a>
+<a name="ln637">		Thread* thread = gCPU[i].running_thread;</a>
+<a name="ln638">		if (thread != unscheduledThread &amp;&amp; thread-&gt;team == fTeam)</a>
+<a name="ln639">			fRunningThreads++;</a>
+<a name="ln640">	}</a>
+<a name="ln641"> </a>
+<a name="ln642">	_Update(unscheduledThread != NULL, lockedThread);</a>
+<a name="ln643">}</a>
+<a name="ln644"> </a>
+<a name="ln645"> </a>
+<a name="ln646">/*!	Called when the team's CPU time clock which this timer refers to has been</a>
+<a name="ln647">	set.</a>
+<a name="ln648"> </a>
+<a name="ln649">	The caller must hold \c time_lock and \c sUserTimerLock.</a>
+<a name="ln650"> </a>
+<a name="ln651">	\param changedBy The value by which the clock has changed.</a>
+<a name="ln652">*/</a>
+<a name="ln653">void</a>
+<a name="ln654">TeamTimeUserTimer::TimeWarped(bigtime_t changedBy)</a>
+<a name="ln655">{</a>
+<a name="ln656">	if (fTeam == NULL || changedBy == 0)</a>
+<a name="ln657">		return;</a>
+<a name="ln658"> </a>
+<a name="ln659">	// If this is a relative timer, adjust fNextTime by the value the clock has</a>
+<a name="ln660">	// changed.</a>
+<a name="ln661">	if (!fAbsolute)</a>
+<a name="ln662">		fNextTime += changedBy;</a>
+<a name="ln663"> </a>
+<a name="ln664">	// reschedule the kernel timer</a>
+<a name="ln665">	_Update(false);</a>
+<a name="ln666">}</a>
+<a name="ln667"> </a>
+<a name="ln668"> </a>
+<a name="ln669">void</a>
+<a name="ln670">TeamTimeUserTimer::HandleTimer()</a>
+<a name="ln671">{</a>
+<a name="ln672">	UserTimer::HandleTimer();</a>
+<a name="ln673"> </a>
+<a name="ln674">	// If the timer is not periodic, it is no longer active. Otherwise</a>
+<a name="ln675">	// reschedule the kernel timer.</a>
+<a name="ln676">	if (fTeam != NULL) {</a>
+<a name="ln677">		if (fInterval == 0) {</a>
+<a name="ln678">			fTeam-&gt;UserTimerDeactivated(this);</a>
+<a name="ln679">			fTeam-&gt;ReleaseReference();</a>
+<a name="ln680">			fTeam = NULL;</a>
+<a name="ln681">		} else {</a>
+<a name="ln682">			UpdatePeriodicStartTime();</a>
+<a name="ln683">			_Update(false);</a>
+<a name="ln684">		}</a>
+<a name="ln685">	}</a>
+<a name="ln686">}</a>
+<a name="ln687"> </a>
+<a name="ln688"> </a>
+<a name="ln689">/*!	Schedules/cancels the kernel timer as necessary.</a>
+<a name="ln690"> </a>
+<a name="ln691">	\c fRunningThreads must be up-to-date.</a>
+<a name="ln692">	The caller must hold \c time_lock and \c sUserTimerLock.</a>
+<a name="ln693"> </a>
+<a name="ln694">	\param unscheduling \c true, when the current thread is in the process of</a>
+<a name="ln695">		being unscheduled.</a>
+<a name="ln696">*/</a>
+<a name="ln697">void</a>
+<a name="ln698">TeamTimeUserTimer::_Update(bool unscheduling, Thread* lockedThread)</a>
+<a name="ln699">{</a>
+<a name="ln700">	// unschedule the kernel timer, if scheduled</a>
+<a name="ln701">	if (fScheduled)</a>
+<a name="ln702">		CancelTimer();</a>
+<a name="ln703"> </a>
+<a name="ln704">	// if no more threads are running, we're done</a>
+<a name="ln705">	if (fRunningThreads == 0) {</a>
+<a name="ln706">		fScheduled = false;</a>
+<a name="ln707">		return;</a>
+<a name="ln708">	}</a>
+<a name="ln709"> </a>
+<a name="ln710">	// There are still threads running. Reschedule the kernel timer.</a>
+<a name="ln711">	bigtime_t now = fTeam-&gt;CPUTime(unscheduling, lockedThread);</a>
+<a name="ln712"> </a>
+<a name="ln713">	// If periodic, check whether the start time is too far in the past.</a>
+<a name="ln714">	if (fInterval &gt; 0)</a>
+<a name="ln715">		CheckPeriodicOverrun(now);</a>
+<a name="ln716"> </a>
+<a name="ln717">	if (fNextTime &gt; now) {</a>
+<a name="ln718">		fTimer.schedule_time = system_time()</a>
+<a name="ln719">			+ (fNextTime - now + fRunningThreads - 1) / fRunningThreads;</a>
+<a name="ln720">		// check for overflow</a>
+<a name="ln721">		if (fTimer.schedule_time &lt; 0)</a>
+<a name="ln722">			fTimer.schedule_time = B_INFINITE_TIMEOUT;</a>
+<a name="ln723">	} else</a>
+<a name="ln724">		fTimer.schedule_time = 0;</a>
+<a name="ln725">	fTimer.period = 0;</a>
+<a name="ln726">		// We reschedule periodic timers manually in HandleTimer() to avoid</a>
+<a name="ln727">		// rounding errors.</a>
+<a name="ln728"> </a>
+<a name="ln729">	add_timer(&amp;fTimer, &amp;HandleTimerHook, fTimer.schedule_time,</a>
+<a name="ln730">		B_ONE_SHOT_ABSOLUTE_TIMER | B_TIMER_USE_TIMER_STRUCT_TIMES);</a>
+<a name="ln731">		// We use B_TIMER_USE_TIMER_STRUCT_TIMES, so period remains 0, which</a>
+<a name="ln732">		// our base class expects.</a>
+<a name="ln733"> </a>
+<a name="ln734">	fScheduled = true;</a>
+<a name="ln735">}</a>
+<a name="ln736"> </a>
+<a name="ln737"> </a>
+<a name="ln738">// #pragma mark - TeamUserTimeUserTimer</a>
+<a name="ln739"> </a>
+<a name="ln740"> </a>
+<a name="ln741">TeamUserTimeUserTimer::TeamUserTimeUserTimer(team_id teamID)</a>
+<a name="ln742">	:</a>
+<a name="ln743">	fTeamID(teamID),</a>
+<a name="ln744">	fTeam(NULL)</a>
+<a name="ln745">{</a>
+<a name="ln746">}</a>
+<a name="ln747"> </a>
+<a name="ln748"> </a>
+<a name="ln749">TeamUserTimeUserTimer::~TeamUserTimeUserTimer()</a>
+<a name="ln750">{</a>
+<a name="ln751">	ASSERT(fTeam == NULL);</a>
+<a name="ln752">}</a>
+<a name="ln753"> </a>
+<a name="ln754"> </a>
+<a name="ln755">void</a>
+<a name="ln756">TeamUserTimeUserTimer::Schedule(bigtime_t nextTime, bigtime_t interval,</a>
+<a name="ln757">	uint32 flags, bigtime_t&amp; _oldRemainingTime, bigtime_t&amp; _oldInterval)</a>
+<a name="ln758">{</a>
+<a name="ln759">	InterruptsWriteSequentialLocker locker(sUserTimerLock);</a>
+<a name="ln760">	SpinLocker timeLocker(fTeam != NULL ? &amp;fTeam-&gt;time_lock : NULL);</a>
+<a name="ln761"> </a>
+<a name="ln762">	// get the current time, but only if needed</a>
+<a name="ln763">	bool nowValid = fTeam != NULL;</a>
+<a name="ln764">	bigtime_t now = nowValid ? fTeam-&gt;UserCPUTime() : 0;</a>
+<a name="ln765"> </a>
+<a name="ln766">	// Cancel the old timer, if still active, and get the previous values.</a>
+<a name="ln767">	if (fTeam != NULL) {</a>
+<a name="ln768">		_oldRemainingTime = fNextTime - now;</a>
+<a name="ln769">		_oldInterval = fInterval;</a>
+<a name="ln770"> </a>
+<a name="ln771">		fTeam-&gt;UserTimerDeactivated(this);</a>
+<a name="ln772">		fTeam-&gt;ReleaseReference();</a>
+<a name="ln773">		fTeam = NULL;</a>
+<a name="ln774">	} else {</a>
+<a name="ln775">		_oldRemainingTime = B_INFINITE_TIMEOUT;</a>
+<a name="ln776">		_oldInterval = 0;</a>
+<a name="ln777">	}</a>
+<a name="ln778"> </a>
+<a name="ln779">	// schedule the new timer</a>
+<a name="ln780">	fNextTime = nextTime;</a>
+<a name="ln781">	fInterval = interval;</a>
+<a name="ln782">	fOverrunCount = 0;</a>
+<a name="ln783"> </a>
+<a name="ln784">	if (fNextTime == B_INFINITE_TIMEOUT)</a>
+<a name="ln785">		return;</a>
+<a name="ln786"> </a>
+<a name="ln787">	// Get the team. If it doesn't exist anymore, just don't schedule the</a>
+<a name="ln788">	// timer anymore.</a>
+<a name="ln789">	Team* newTeam = Team::Get(fTeamID);</a>
+<a name="ln790">	if (newTeam == NULL) {</a>
+<a name="ln791">		fTeam = NULL;</a>
+<a name="ln792">		return;</a>
+<a name="ln793">	} else if (fTeam == NULL)</a>
+<a name="ln794">		timeLocker.SetTo(newTeam-&gt;time_lock, false);</a>
+<a name="ln795">	fTeam = newTeam;</a>
+<a name="ln796"> </a>
+<a name="ln797">	// convert relative to absolute timeouts</a>
+<a name="ln798">	if ((flags &amp; B_RELATIVE_TIMEOUT) != 0) {</a>
+<a name="ln799">		if (!nowValid)</a>
+<a name="ln800">			now = fTeam-&gt;CPUTime(false);</a>
+<a name="ln801">		fNextTime += now;</a>
+<a name="ln802">	}</a>
+<a name="ln803"> </a>
+<a name="ln804">	fTeam-&gt;UserTimerActivated(this);</a>
+<a name="ln805"> </a>
+<a name="ln806">	// fire the event, if already timed out</a>
+<a name="ln807">	Check();</a>
+<a name="ln808">}</a>
+<a name="ln809"> </a>
+<a name="ln810"> </a>
+<a name="ln811">void</a>
+<a name="ln812">TeamUserTimeUserTimer::GetInfo(bigtime_t&amp; _remainingTime, bigtime_t&amp; _interval,</a>
+<a name="ln813">	uint32&amp; _overrunCount)</a>
+<a name="ln814">{</a>
+<a name="ln815">	uint32 count;</a>
+<a name="ln816">	do {</a>
+<a name="ln817">		count = acquire_read_seqlock(&amp;sUserTimerLock);</a>
+<a name="ln818"> </a>
+<a name="ln819">		if (fTeam != NULL) {</a>
+<a name="ln820">			InterruptsSpinLocker timeLocker(fTeam-&gt;time_lock);</a>
+<a name="ln821">			_remainingTime = fNextTime - fTeam-&gt;UserCPUTime();</a>
+<a name="ln822">			_interval = fInterval;</a>
+<a name="ln823">		} else {</a>
+<a name="ln824">			_remainingTime = B_INFINITE_TIMEOUT;</a>
+<a name="ln825">			_interval = 0;</a>
+<a name="ln826">		}</a>
+<a name="ln827"> </a>
+<a name="ln828">		_overrunCount = fOverrunCount;</a>
+<a name="ln829">	} while (!release_read_seqlock(&amp;sUserTimerLock, count));</a>
+<a name="ln830">}</a>
+<a name="ln831"> </a>
+<a name="ln832"> </a>
+<a name="ln833">/*!	Deactivates the timer, if it is activated.</a>
+<a name="ln834"> </a>
+<a name="ln835">	The caller must hold \c time_lock and \c sUserTimerLock.</a>
+<a name="ln836">*/</a>
+<a name="ln837">void</a>
+<a name="ln838">TeamUserTimeUserTimer::Deactivate()</a>
+<a name="ln839">{</a>
+<a name="ln840">	if (fTeam == NULL)</a>
+<a name="ln841">		return;</a>
+<a name="ln842"> </a>
+<a name="ln843">	// deactivate</a>
+<a name="ln844">	fTeam-&gt;UserTimerDeactivated(this);</a>
+<a name="ln845">	fTeam-&gt;ReleaseReference();</a>
+<a name="ln846">	fTeam = NULL;</a>
+<a name="ln847">}</a>
+<a name="ln848"> </a>
+<a name="ln849"> </a>
+<a name="ln850">/*!	Checks whether the timer is up, firing an event, if so.</a>
+<a name="ln851"> </a>
+<a name="ln852">	The caller must hold \c time_lock and \c sUserTimerLock.</a>
+<a name="ln853">*/</a>
+<a name="ln854">void</a>
+<a name="ln855">TeamUserTimeUserTimer::Check()</a>
+<a name="ln856">{</a>
+<a name="ln857">	if (fTeam == NULL)</a>
+<a name="ln858">		return;</a>
+<a name="ln859"> </a>
+<a name="ln860">	// check whether we need to fire the event yet</a>
+<a name="ln861">	bigtime_t now = fTeam-&gt;UserCPUTime();</a>
+<a name="ln862">	if (now &lt; fNextTime)</a>
+<a name="ln863">		return;</a>
+<a name="ln864"> </a>
+<a name="ln865">	HandleTimer();</a>
+<a name="ln866"> </a>
+<a name="ln867">	// If the timer is not periodic, it is no longer active. Otherwise compute</a>
+<a name="ln868">	// the event time.</a>
+<a name="ln869">	if (fInterval == 0) {</a>
+<a name="ln870">		fTeam-&gt;UserTimerDeactivated(this);</a>
+<a name="ln871">		fTeam-&gt;ReleaseReference();</a>
+<a name="ln872">		fTeam = NULL;</a>
+<a name="ln873">		return;</a>
+<a name="ln874">	}</a>
+<a name="ln875"> </a>
+<a name="ln876">	// First validate fNextTime, then increment it, so that fNextTime is &gt; now</a>
+<a name="ln877">	// (CheckPeriodicOverrun() only makes it &gt; now - fInterval).</a>
+<a name="ln878">	CheckPeriodicOverrun(now);</a>
+<a name="ln879">	fNextTime += fInterval;</a>
+<a name="ln880">	fScheduled = true;</a>
+<a name="ln881">}</a>
+<a name="ln882"> </a>
+<a name="ln883"> </a>
+<a name="ln884">// #pragma mark - ThreadTimeUserTimer</a>
+<a name="ln885"> </a>
+<a name="ln886"> </a>
+<a name="ln887">ThreadTimeUserTimer::ThreadTimeUserTimer(thread_id threadID)</a>
+<a name="ln888">	:</a>
+<a name="ln889">	fThreadID(threadID),</a>
+<a name="ln890">	fThread(NULL)</a>
+<a name="ln891">{</a>
+<a name="ln892">}</a>
+<a name="ln893"> </a>
+<a name="ln894"> </a>
+<a name="ln895">ThreadTimeUserTimer::~ThreadTimeUserTimer()</a>
+<a name="ln896">{</a>
+<a name="ln897">	ASSERT(fThread == NULL);</a>
+<a name="ln898">}</a>
+<a name="ln899"> </a>
+<a name="ln900"> </a>
+<a name="ln901">void</a>
+<a name="ln902">ThreadTimeUserTimer::Schedule(bigtime_t nextTime, bigtime_t interval,</a>
+<a name="ln903">	uint32 flags, bigtime_t&amp; _oldRemainingTime, bigtime_t&amp; _oldInterval)</a>
+<a name="ln904">{</a>
+<a name="ln905">	InterruptsWriteSequentialLocker locker(sUserTimerLock);</a>
+<a name="ln906">	SpinLocker timeLocker(fThread != NULL ? &amp;fThread-&gt;time_lock : NULL);</a>
+<a name="ln907"> </a>
+<a name="ln908">	// get the current time, but only if needed</a>
+<a name="ln909">	bool nowValid = fThread != NULL;</a>
+<a name="ln910">	bigtime_t now = nowValid ? fThread-&gt;CPUTime(false) : 0;</a>
+<a name="ln911"> </a>
+<a name="ln912">	// Cancel the old timer, if still scheduled, and get the previous values.</a>
+<a name="ln913">	if (fThread != NULL) {</a>
+<a name="ln914">		if (fScheduled) {</a>
+<a name="ln915">			CancelTimer();</a>
+<a name="ln916">			fScheduled = false;</a>
+<a name="ln917">		}</a>
+<a name="ln918"> </a>
+<a name="ln919">		_oldRemainingTime = fNextTime - now;</a>
+<a name="ln920">		_oldInterval = fInterval;</a>
+<a name="ln921"> </a>
+<a name="ln922">		fThread-&gt;UserTimerDeactivated(this);</a>
+<a name="ln923">		fThread-&gt;ReleaseReference();</a>
+<a name="ln924">		fThread = NULL;</a>
+<a name="ln925">	} else {</a>
+<a name="ln926">		_oldRemainingTime = B_INFINITE_TIMEOUT;</a>
+<a name="ln927">		_oldInterval = 0;</a>
+<a name="ln928">	}</a>
+<a name="ln929"> </a>
+<a name="ln930">	// schedule the new timer</a>
+<a name="ln931">	fNextTime = nextTime;</a>
+<a name="ln932">	fInterval = interval;</a>
+<a name="ln933">	fOverrunCount = 0;</a>
+<a name="ln934"> </a>
+<a name="ln935">	if (fNextTime == B_INFINITE_TIMEOUT)</a>
+<a name="ln936">		return;</a>
+<a name="ln937"> </a>
+<a name="ln938">	// Get the thread. If it doesn't exist anymore, just don't schedule the</a>
+<a name="ln939">	// timer anymore.</a>
+<a name="ln940">	Thread* newThread = Thread::Get(fThreadID);</a>
+<a name="ln941">	if (newThread == NULL) {</a>
+<a name="ln942">		fThread = NULL;</a>
+<a name="ln943">		return;</a>
+<a name="ln944">	} else if (fThread == NULL)</a>
+<a name="ln945">		timeLocker.SetTo(newThread-&gt;time_lock, false);</a>
+<a name="ln946">	fThread = newThread;</a>
+<a name="ln947"> </a>
+<a name="ln948">	fAbsolute = (flags &amp; B_RELATIVE_TIMEOUT) == 0;</a>
+<a name="ln949"> </a>
+<a name="ln950">	// convert relative to absolute timeouts</a>
+<a name="ln951">	if (!fAbsolute) {</a>
+<a name="ln952">		if (!nowValid)</a>
+<a name="ln953">			now = fThread-&gt;CPUTime(false);</a>
+<a name="ln954">		fNextTime += now;</a>
+<a name="ln955">	}</a>
+<a name="ln956"> </a>
+<a name="ln957">	fThread-&gt;UserTimerActivated(this);</a>
+<a name="ln958"> </a>
+<a name="ln959">	// If the thread is currently running, also schedule a kernel timer.</a>
+<a name="ln960">	if (fThread-&gt;cpu != NULL)</a>
+<a name="ln961">		Start();</a>
+<a name="ln962">}</a>
+<a name="ln963"> </a>
+<a name="ln964"> </a>
+<a name="ln965">void</a>
+<a name="ln966">ThreadTimeUserTimer::GetInfo(bigtime_t&amp; _remainingTime, bigtime_t&amp; _interval,</a>
+<a name="ln967">	uint32&amp; _overrunCount)</a>
+<a name="ln968">{</a>
+<a name="ln969">	uint32 count;</a>
+<a name="ln970">	do {</a>
+<a name="ln971">		count = acquire_read_seqlock(&amp;sUserTimerLock);</a>
+<a name="ln972"> </a>
+<a name="ln973">		if (fThread != NULL) {</a>
+<a name="ln974">			SpinLocker timeLocker(fThread-&gt;time_lock);</a>
+<a name="ln975">			_remainingTime = fNextTime - fThread-&gt;CPUTime(false);</a>
+<a name="ln976">			_interval = fInterval;</a>
+<a name="ln977">		} else {</a>
+<a name="ln978">			_remainingTime = B_INFINITE_TIMEOUT;</a>
+<a name="ln979">			_interval = 0;</a>
+<a name="ln980">		}</a>
+<a name="ln981"> </a>
+<a name="ln982">		_overrunCount = fOverrunCount;</a>
+<a name="ln983">	} while (!release_read_seqlock(&amp;sUserTimerLock, count));</a>
+<a name="ln984">}</a>
+<a name="ln985"> </a>
+<a name="ln986"> </a>
+<a name="ln987">/*!	Deactivates the timer, if it is activated.</a>
+<a name="ln988"> </a>
+<a name="ln989">	The caller must hold \c time_lock and \c sUserTimerLock.</a>
+<a name="ln990">*/</a>
+<a name="ln991">void</a>
+<a name="ln992">ThreadTimeUserTimer::Deactivate()</a>
+<a name="ln993">{</a>
+<a name="ln994">	if (fThread == NULL)</a>
+<a name="ln995">		return;</a>
+<a name="ln996"> </a>
+<a name="ln997">	// unschedule, if scheduled</a>
+<a name="ln998">	if (fScheduled) {</a>
+<a name="ln999">		CancelTimer();</a>
+<a name="ln1000">		fScheduled = false;</a>
+<a name="ln1001">	}</a>
+<a name="ln1002"> </a>
+<a name="ln1003">	// deactivate</a>
+<a name="ln1004">	fThread-&gt;UserTimerDeactivated(this);</a>
+<a name="ln1005">	fThread-&gt;ReleaseReference();</a>
+<a name="ln1006">	fThread = NULL;</a>
+<a name="ln1007">}</a>
+<a name="ln1008"> </a>
+<a name="ln1009"> </a>
+<a name="ln1010">/*!	Starts the timer, if it is active.</a>
+<a name="ln1011"> </a>
+<a name="ln1012">	Called when the thread whose CPU time is referred to by the timer is</a>
+<a name="ln1013">	scheduled, or, when the timer was just set and the thread is already</a>
+<a name="ln1014">	running. Schedules a kernel timer for the remaining time.</a>
+<a name="ln1015"> </a>
+<a name="ln1016">	The caller must hold \c time_lock and \c sUserTimerLock.</a>
+<a name="ln1017">*/</a>
+<a name="ln1018">void</a>
+<a name="ln1019">ThreadTimeUserTimer::Start()</a>
+<a name="ln1020">{</a>
+<a name="ln1021">	if (fThread == NULL)</a>
+<a name="ln1022">		return;</a>
+<a name="ln1023"> </a>
+<a name="ln1024">	ASSERT(!fScheduled);</a>
+<a name="ln1025"> </a>
+<a name="ln1026">	// add the kernel timer</a>
+<a name="ln1027">	bigtime_t now = fThread-&gt;CPUTime(false);</a>
+<a name="ln1028"> </a>
+<a name="ln1029">	// If periodic, check whether the start time is too far in the past.</a>
+<a name="ln1030">	if (fInterval &gt; 0)</a>
+<a name="ln1031">		CheckPeriodicOverrun(now);</a>
+<a name="ln1032"> </a>
+<a name="ln1033">	if (fNextTime &gt; now) {</a>
+<a name="ln1034">		fTimer.schedule_time = system_time() + fNextTime - now;</a>
+<a name="ln1035">		// check for overflow</a>
+<a name="ln1036">		if (fTimer.schedule_time &lt; 0)</a>
+<a name="ln1037">			fTimer.schedule_time = B_INFINITE_TIMEOUT;</a>
+<a name="ln1038">	} else</a>
+<a name="ln1039">		fTimer.schedule_time = 0;</a>
+<a name="ln1040">	fTimer.period = 0;</a>
+<a name="ln1041"> </a>
+<a name="ln1042">	uint32 flags = B_ONE_SHOT_ABSOLUTE_TIMER | B_TIMER_USE_TIMER_STRUCT_TIMES;</a>
+<a name="ln1043">	add_timer(&amp;fTimer, &amp;HandleTimerHook, fTimer.schedule_time, flags);</a>
+<a name="ln1044"> </a>
+<a name="ln1045">	fScheduled = true;</a>
+<a name="ln1046">}</a>
+<a name="ln1047"> </a>
+<a name="ln1048"> </a>
+<a name="ln1049">/*!	Stops the timer, if it is active.</a>
+<a name="ln1050"> </a>
+<a name="ln1051">	Called when the thread whose CPU time is referred to by the timer is</a>
+<a name="ln1052">	unscheduled, or, when the timer is canceled.</a>
+<a name="ln1053"> </a>
+<a name="ln1054">	The caller must hold \c sUserTimerLock.</a>
+<a name="ln1055">*/</a>
+<a name="ln1056">void</a>
+<a name="ln1057">ThreadTimeUserTimer::Stop()</a>
+<a name="ln1058">{</a>
+<a name="ln1059">	if (fThread == NULL)</a>
+<a name="ln1060">		return;</a>
+<a name="ln1061"> </a>
+<a name="ln1062">	ASSERT(fScheduled);</a>
+<a name="ln1063"> </a>
+<a name="ln1064">	// cancel the kernel timer</a>
+<a name="ln1065">	CancelTimer();</a>
+<a name="ln1066">	fScheduled = false;</a>
+<a name="ln1067"> </a>
+<a name="ln1068">	// TODO: To avoid odd race conditions, we should check the current time of</a>
+<a name="ln1069">	// the thread (ignoring the time since last_time) and manually fire the</a>
+<a name="ln1070">	// user event, if necessary.</a>
+<a name="ln1071">}</a>
+<a name="ln1072"> </a>
+<a name="ln1073"> </a>
+<a name="ln1074">/*!	Called when the team's CPU time clock which this timer refers to has been</a>
+<a name="ln1075">	set.</a>
+<a name="ln1076"> </a>
+<a name="ln1077">	The caller must hold \c time_lock and \c sUserTimerLock.</a>
+<a name="ln1078"> </a>
+<a name="ln1079">	\param changedBy The value by which the clock has changed.</a>
+<a name="ln1080">*/</a>
+<a name="ln1081">void</a>
+<a name="ln1082">ThreadTimeUserTimer::TimeWarped(bigtime_t changedBy)</a>
+<a name="ln1083">{</a>
+<a name="ln1084">	if (fThread == NULL || changedBy == 0)</a>
+<a name="ln1085">		return;</a>
+<a name="ln1086"> </a>
+<a name="ln1087">	// If this is a relative timer, adjust fNextTime by the value the clock has</a>
+<a name="ln1088">	// changed.</a>
+<a name="ln1089">	if (!fAbsolute)</a>
+<a name="ln1090">		fNextTime += changedBy;</a>
+<a name="ln1091"> </a>
+<a name="ln1092">	// reschedule the kernel timer</a>
+<a name="ln1093">	if (fScheduled) {</a>
+<a name="ln1094">		Stop();</a>
+<a name="ln1095">		Start();</a>
+<a name="ln1096">	}</a>
+<a name="ln1097">}</a>
+<a name="ln1098"> </a>
+<a name="ln1099"> </a>
+<a name="ln1100">void</a>
+<a name="ln1101">ThreadTimeUserTimer::HandleTimer()</a>
+<a name="ln1102">{</a>
+<a name="ln1103">	UserTimer::HandleTimer();</a>
+<a name="ln1104"> </a>
+<a name="ln1105">	if (fThread != NULL) {</a>
+<a name="ln1106">		// If the timer is periodic, reschedule the kernel timer. Otherwise it</a>
+<a name="ln1107">		// is no longer active.</a>
+<a name="ln1108">		if (fInterval &gt; 0) {</a>
+<a name="ln1109">			UpdatePeriodicStartTime();</a>
+<a name="ln1110">			Start();</a>
+<a name="ln1111">		} else {</a>
+<a name="ln1112">			fThread-&gt;UserTimerDeactivated(this);</a>
+<a name="ln1113">			fThread-&gt;ReleaseReference();</a>
+<a name="ln1114">			fThread = NULL;</a>
+<a name="ln1115">		}</a>
+<a name="ln1116">	}</a>
+<a name="ln1117">}</a>
+<a name="ln1118"> </a>
+<a name="ln1119"> </a>
+<a name="ln1120">// #pragma mark - UserTimerList</a>
+<a name="ln1121"> </a>
+<a name="ln1122"> </a>
+<a name="ln1123">UserTimerList::UserTimerList()</a>
+<a name="ln1124">{</a>
+<a name="ln1125">}</a>
+<a name="ln1126"> </a>
+<a name="ln1127"> </a>
+<a name="ln1128">UserTimerList::~UserTimerList()</a>
+<a name="ln1129">{</a>
+<a name="ln1130">	ASSERT(fTimers.IsEmpty());</a>
+<a name="ln1131">}</a>
+<a name="ln1132"> </a>
+<a name="ln1133"> </a>
+<a name="ln1134">/*!	Returns the user timer with the given ID.</a>
+<a name="ln1135"> </a>
+<a name="ln1136">	\param id The timer's ID</a>
+<a name="ln1137">	\return The user timer with the given ID or \c NULL, if there is no such</a>
+<a name="ln1138">		timer.</a>
+<a name="ln1139">*/</a>
+<a name="ln1140">UserTimer*</a>
+<a name="ln1141">UserTimerList::TimerFor(int32 id) const</a>
+<a name="ln1142">{</a>
+<a name="ln1143">	// TODO: Use a more efficient data structure. E.g. a sorted array.</a>
+<a name="ln1144">	for (TimerList::ConstIterator it = fTimers.GetIterator();</a>
+<a name="ln1145">			UserTimer* timer = it.Next();) {</a>
+<a name="ln1146">		if (timer-&gt;ID() == id)</a>
+<a name="ln1147">			return timer;</a>
+<a name="ln1148">	}</a>
+<a name="ln1149"> </a>
+<a name="ln1150">	return NULL;</a>
+<a name="ln1151">}</a>
+<a name="ln1152"> </a>
+<a name="ln1153"> </a>
+<a name="ln1154">/*!	Adds the given user timer and assigns it an ID.</a>
+<a name="ln1155"> </a>
+<a name="ln1156">	\param timer The timer to be added.</a>
+<a name="ln1157">*/</a>
+<a name="ln1158">void</a>
+<a name="ln1159">UserTimerList::AddTimer(UserTimer* timer)</a>
+<a name="ln1160">{</a>
+<a name="ln1161">	int32 id = timer-&gt;ID();</a>
+<a name="ln1162">	if (id &lt; 0) {</a>
+<a name="ln1163">		// user-defined timer -- find an usused ID</a>
+<a name="ln1164">		id = USER_TIMER_FIRST_USER_DEFINED_ID;</a>
+<a name="ln1165">		UserTimer* insertAfter = NULL;</a>
+<a name="ln1166">		for (TimerList::Iterator it = fTimers.GetIterator();</a>
+<a name="ln1167">				UserTimer* other = it.Next();) {</a>
+<a name="ln1168">			if (other-&gt;ID() &gt; id)</a>
+<a name="ln1169">				break;</a>
+<a name="ln1170">			if (other-&gt;ID() == id)</a>
+<a name="ln1171">				id++;</a>
+<a name="ln1172">			insertAfter = other;</a>
+<a name="ln1173">		}</a>
+<a name="ln1174"> </a>
+<a name="ln1175">		// insert the timer</a>
+<a name="ln1176">		timer-&gt;SetID(id);</a>
+<a name="ln1177">		fTimers.InsertAfter(insertAfter, timer);</a>
+<a name="ln1178">	} else {</a>
+<a name="ln1179">		// default timer -- find the insertion point</a>
+<a name="ln1180">		UserTimer* insertAfter = NULL;</a>
+<a name="ln1181">		for (TimerList::Iterator it = fTimers.GetIterator();</a>
+<a name="ln1182">				UserTimer* other = it.Next();) {</a>
+<a name="ln1183">			if (other-&gt;ID() &gt; id)</a>
+<a name="ln1184">				break;</a>
+<a name="ln1185">			if (other-&gt;ID() == id) {</a>
+<a name="ln1186">				panic(&quot;UserTimerList::AddTimer(): timer with ID %&quot; B_PRId32</a>
+<a name="ln1187">					&quot; already exists!&quot;, id);</a>
+<a name="ln1188">			}</a>
+<a name="ln1189">			insertAfter = other;</a>
+<a name="ln1190">		}</a>
+<a name="ln1191"> </a>
+<a name="ln1192">		// insert the timer</a>
+<a name="ln1193">		fTimers.InsertAfter(insertAfter, timer);</a>
+<a name="ln1194">	}</a>
+<a name="ln1195">}</a>
+<a name="ln1196"> </a>
+<a name="ln1197"> </a>
+<a name="ln1198">/*!	Deletes all (or all user-defined) user timers.</a>
+<a name="ln1199"> </a>
+<a name="ln1200">	\param userDefinedOnly If \c true, only the user-defined timers are deleted,</a>
+<a name="ln1201">		otherwise all timers are deleted.</a>
+<a name="ln1202">	\return The number of user-defined timers that were removed and deleted.</a>
+<a name="ln1203">*/</a>
+<a name="ln1204">int32</a>
+<a name="ln1205">UserTimerList::DeleteTimers(bool userDefinedOnly)</a>
+<a name="ln1206">{</a>
+<a name="ln1207">	int32 userDefinedCount = 0;</a>
+<a name="ln1208"> </a>
+<a name="ln1209">	for (TimerList::Iterator it = fTimers.GetIterator();</a>
+<a name="ln1210">			UserTimer* timer = it.Next();) {</a>
+<a name="ln1211">		if (timer-&gt;ID() &lt; USER_TIMER_FIRST_USER_DEFINED_ID) {</a>
+<a name="ln1212">			if (userDefinedOnly)</a>
+<a name="ln1213">				continue;</a>
+<a name="ln1214">		} else</a>
+<a name="ln1215">			userDefinedCount++;</a>
+<a name="ln1216"> </a>
+<a name="ln1217">		// remove, cancel, and delete the timer</a>
+<a name="ln1218">		it.Remove();</a>
+<a name="ln1219">		timer-&gt;Cancel();</a>
+<a name="ln1220">		delete timer;</a>
+<a name="ln1221">	}</a>
+<a name="ln1222"> </a>
+<a name="ln1223">	return userDefinedCount;</a>
+<a name="ln1224">}</a>
+<a name="ln1225"> </a>
+<a name="ln1226"> </a>
+<a name="ln1227">// #pragma mark - private</a>
+<a name="ln1228"> </a>
+<a name="ln1229"> </a>
+<a name="ln1230">static int32</a>
+<a name="ln1231">create_timer(clockid_t clockID, int32 timerID, Team* team, Thread* thread,</a>
+<a name="ln1232">	uint32 flags, const struct sigevent&amp; event,</a>
+<a name="ln1233">	ThreadCreationAttributes* threadAttributes, bool isDefaultEvent)</a>
+<a name="ln1234">{</a>
+<a name="ln1235">	// create the timer object</a>
+<a name="ln1236">	UserTimer* timer;</a>
+<a name="ln1237">	switch (clockID) {</a>
+<a name="ln1238">		case CLOCK_MONOTONIC:</a>
+<a name="ln1239">			timer = new(std::nothrow) SystemTimeUserTimer;</a>
+<a name="ln1240">			break;</a>
+<a name="ln1241"> </a>
+<a name="ln1242">		case CLOCK_REALTIME:</a>
+<a name="ln1243">			timer = new(std::nothrow) RealTimeUserTimer;</a>
+<a name="ln1244">			break;</a>
+<a name="ln1245"> </a>
+<a name="ln1246">		case CLOCK_THREAD_CPUTIME_ID:</a>
+<a name="ln1247">			timer = new(std::nothrow) ThreadTimeUserTimer(</a>
+<a name="ln1248">				thread_get_current_thread()-&gt;id);</a>
+<a name="ln1249">			break;</a>
+<a name="ln1250"> </a>
+<a name="ln1251">		case CLOCK_PROCESS_CPUTIME_ID:</a>
+<a name="ln1252">			if (team == NULL)</a>
+<a name="ln1253">				return B_BAD_VALUE;</a>
+<a name="ln1254">			timer = new(std::nothrow) TeamTimeUserTimer(team-&gt;id);</a>
+<a name="ln1255">			break;</a>
+<a name="ln1256"> </a>
+<a name="ln1257">		case CLOCK_PROCESS_USER_CPUTIME_ID:</a>
+<a name="ln1258">			if (team == NULL)</a>
+<a name="ln1259">				return B_BAD_VALUE;</a>
+<a name="ln1260">			timer = new(std::nothrow) TeamUserTimeUserTimer(team-&gt;id);</a>
+<a name="ln1261">			break;</a>
+<a name="ln1262"> </a>
+<a name="ln1263">		default:</a>
+<a name="ln1264">		{</a>
+<a name="ln1265">			// The clock ID is a ID of the team whose CPU time the clock refers</a>
+<a name="ln1266">			// to. Check whether the team exists and we have permission to</a>
+<a name="ln1267">			// access its clock.</a>
+<a name="ln1268">			if (clockID &lt;= 0)</a>
+<a name="ln1269">				return B_BAD_VALUE;</a>
+<a name="ln1270">			if (clockID == team_get_kernel_team_id())</a>
+<a name="ln1271">				return B_NOT_ALLOWED;</a>
+<a name="ln1272"> </a>
+<a name="ln1273">			Team* timedTeam = Team::GetAndLock(clockID);</a>
+<a name="ln1274">			if (timedTeam == NULL)</a>
+<a name="ln1275">				return B_BAD_VALUE;</a>
+<a name="ln1276"> </a>
+<a name="ln1277">			uid_t uid = geteuid();</a>
+<a name="ln1278">			uid_t teamUID = timedTeam-&gt;effective_uid;</a>
+<a name="ln1279"> </a>
+<a name="ln1280">			timedTeam-&gt;UnlockAndReleaseReference();</a>
+<a name="ln1281"> </a>
+<a name="ln1282">			if (uid != 0 &amp;&amp; uid != teamUID)</a>
+<a name="ln1283">				return B_NOT_ALLOWED;</a>
+<a name="ln1284"> </a>
+<a name="ln1285">			timer = new(std::nothrow) TeamTimeUserTimer(clockID);</a>
+<a name="ln1286">			break;</a>
+<a name="ln1287">		}</a>
+<a name="ln1288">	}</a>
+<a name="ln1289"> </a>
+<a name="ln1290">	if (timer == NULL)</a>
+<a name="ln1291">		return B_NO_MEMORY;</a>
+<a name="ln1292">	ObjectDeleter&lt;UserTimer&gt; timerDeleter(timer);</a>
+<a name="ln1293"> </a>
+<a name="ln1294">	if (timerID &gt;= 0)</a>
+<a name="ln1295">		timer-&gt;SetID(timerID);</a>
+<a name="ln1296"> </a>
+<a name="ln1297">	SignalEvent* signalEvent = NULL;</a>
+<a name="ln1298"> </a>
+<a name="ln1299">	switch (event.sigev_notify) {</a>
+<a name="ln1300">		case SIGEV_NONE:</a>
+<a name="ln1301">			// the timer's event remains NULL</a>
+<a name="ln1302">			break;</a>
+<a name="ln1303"> </a>
+<a name="ln1304">		case SIGEV_SIGNAL:</a>
+<a name="ln1305">		{</a>
+<a name="ln1306">			if (event.sigev_signo &lt;= 0 || event.sigev_signo &gt; MAX_SIGNAL_NUMBER)</a>
+<a name="ln1307">				return B_BAD_VALUE;</a>
+<a name="ln1308"> </a>
+<a name="ln1309">			if (thread != NULL &amp;&amp; (flags &amp; USER_TIMER_SIGNAL_THREAD) != 0) {</a>
+<a name="ln1310">				// The signal shall be sent to the thread.</a>
+<a name="ln1311">				signalEvent = ThreadSignalEvent::Create(thread,</a>
+<a name="ln1312">					event.sigev_signo, SI_TIMER, 0, team-&gt;id);</a>
+<a name="ln1313">			} else {</a>
+<a name="ln1314">				// The signal shall be sent to the team.</a>
+<a name="ln1315">				signalEvent = TeamSignalEvent::Create(team, event.sigev_signo,</a>
+<a name="ln1316">					SI_TIMER, 0);</a>
+<a name="ln1317">			}</a>
+<a name="ln1318"> </a>
+<a name="ln1319">			if (signalEvent == NULL)</a>
+<a name="ln1320">				return B_NO_MEMORY;</a>
+<a name="ln1321"> </a>
+<a name="ln1322">			timer-&gt;SetEvent(signalEvent);</a>
+<a name="ln1323">			break;</a>
+<a name="ln1324">		}</a>
+<a name="ln1325"> </a>
+<a name="ln1326">		case SIGEV_THREAD:</a>
+<a name="ln1327">		{</a>
+<a name="ln1328">			if (threadAttributes == NULL)</a>
+<a name="ln1329">				return B_BAD_VALUE;</a>
+<a name="ln1330"> </a>
+<a name="ln1331">			CreateThreadEvent* event</a>
+<a name="ln1332">				= CreateThreadEvent::Create(*threadAttributes);</a>
+<a name="ln1333">			if (event == NULL)</a>
+<a name="ln1334">				return B_NO_MEMORY;</a>
+<a name="ln1335"> </a>
+<a name="ln1336">			timer-&gt;SetEvent(event);</a>
+<a name="ln1337">			break;</a>
+<a name="ln1338">		}</a>
+<a name="ln1339"> </a>
+<a name="ln1340">		default:</a>
+<a name="ln1341">			return B_BAD_VALUE;</a>
+<a name="ln1342">	}</a>
+<a name="ln1343"> </a>
+<a name="ln1344">	// add it to the team/thread</a>
+<a name="ln1345">	TimerLocker timerLocker;</a>
+<a name="ln1346">	timerLocker.Lock(team, thread);</a>
+<a name="ln1347"> </a>
+<a name="ln1348">	status_t error = thread != NULL</a>
+<a name="ln1349">		? thread-&gt;AddUserTimer(timer) : team-&gt;AddUserTimer(timer);</a>
+<a name="ln1350">	if (error != B_OK)</a>
+<a name="ln1351">		return error;</a>
+<a name="ln1352"> </a>
+<a name="ln1353">	// set a signal event's user value</a>
+<a name="ln1354">	if (signalEvent != NULL) {</a>
+<a name="ln1355">		// If no sigevent structure was given, use the timer ID.</a>
+<a name="ln1356">		union sigval signalValue = event.sigev_value;</a>
+<a name="ln1357">		if (isDefaultEvent)</a>
+<a name="ln1358">			signalValue.sival_int = timer-&gt;ID();</a>
+<a name="ln1359"> </a>
+<a name="ln1360">		signalEvent-&gt;SetUserValue(signalValue);</a>
+<a name="ln1361">	}</a>
+<a name="ln1362"> </a>
+<a name="ln1363">	return timerDeleter.Detach()-&gt;ID();</a>
+<a name="ln1364">}</a>
+<a name="ln1365"> </a>
+<a name="ln1366"> </a>
+<a name="ln1367">/*!	Called when the CPU time clock of the given thread has been set.</a>
+<a name="ln1368"> </a>
+<a name="ln1369">	The caller must hold \c time_lock.</a>
+<a name="ln1370"> </a>
+<a name="ln1371">	\param thread The thread whose CPU time clock has been set.</a>
+<a name="ln1372">	\param changedBy The value by which the CPU time clock has changed</a>
+<a name="ln1373">		(new = old + changedBy).</a>
+<a name="ln1374">*/</a>
+<a name="ln1375">static void</a>
+<a name="ln1376">thread_clock_changed(Thread* thread, bigtime_t changedBy)</a>
+<a name="ln1377">{</a>
+<a name="ln1378">	for (ThreadTimeUserTimerList::ConstIterator it</a>
+<a name="ln1379">				= thread-&gt;CPUTimeUserTimerIterator();</a>
+<a name="ln1380">			ThreadTimeUserTimer* timer = it.Next();) {</a>
+<a name="ln1381">		timer-&gt;TimeWarped(changedBy);</a>
+<a name="ln1382">	}</a>
+<a name="ln1383">}</a>
+<a name="ln1384"> </a>
+<a name="ln1385"> </a>
+<a name="ln1386">/*!	Called when the CPU time clock of the given team has been set.</a>
+<a name="ln1387"> </a>
+<a name="ln1388">	The caller must hold \c time_lock.</a>
+<a name="ln1389"> </a>
+<a name="ln1390">	\param team The team whose CPU time clock has been set.</a>
+<a name="ln1391">	\param changedBy The value by which the CPU time clock has changed</a>
+<a name="ln1392">		(new = old + changedBy).</a>
+<a name="ln1393">*/</a>
+<a name="ln1394">static void</a>
+<a name="ln1395">team_clock_changed(Team* team, bigtime_t changedBy)</a>
+<a name="ln1396">{</a>
+<a name="ln1397">	for (TeamTimeUserTimerList::ConstIterator it</a>
+<a name="ln1398">				= team-&gt;CPUTimeUserTimerIterator();</a>
+<a name="ln1399">			TeamTimeUserTimer* timer = it.Next();) {</a>
+<a name="ln1400">		timer-&gt;TimeWarped(changedBy);</a>
+<a name="ln1401">	}</a>
+<a name="ln1402">}</a>
+<a name="ln1403"> </a>
+<a name="ln1404"> </a>
+<a name="ln1405">// #pragma mark - kernel private</a>
+<a name="ln1406"> </a>
+<a name="ln1407"> </a>
+<a name="ln1408">/*!	Creates the pre-defined user timers for the given thread.</a>
+<a name="ln1409">	The thread may not have been added to its team yet, hence the team must be</a>
+<a name="ln1410">	passed</a>
+<a name="ln1411"> </a>
+<a name="ln1412">	\param team The thread's (future) team.</a>
+<a name="ln1413">	\param thread The thread whose pre-defined timers shall be created.</a>
+<a name="ln1414">	\return \c B_OK, when everything when fine, another error code otherwise.</a>
+<a name="ln1415">*/</a>
+<a name="ln1416">status_t</a>
+<a name="ln1417">user_timer_create_thread_timers(Team* team, Thread* thread)</a>
+<a name="ln1418">{</a>
+<a name="ln1419">	// create a real time user timer</a>
+<a name="ln1420">	struct sigevent event = {0};</a>
+<a name="ln1421">	event.sigev_notify = SIGEV_SIGNAL;</a>
+<a name="ln1422">	event.sigev_signo = SIGALRM;</a>
+<a name="ln1423"> </a>
+<a name="ln1424">	int32 timerID = create_timer(CLOCK_MONOTONIC, USER_TIMER_REAL_TIME_ID,</a>
+<a name="ln1425">		team, thread, USER_TIMER_SIGNAL_THREAD, event, NULL, true);</a>
+<a name="ln1426">	if (timerID &lt; 0)</a>
+<a name="ln1427">		return timerID;</a>
+<a name="ln1428"> </a>
+<a name="ln1429">	return B_OK;</a>
+<a name="ln1430">}</a>
+<a name="ln1431"> </a>
+<a name="ln1432"> </a>
+<a name="ln1433">/*!	Creates the pre-defined user timers for the given team.</a>
+<a name="ln1434"> </a>
+<a name="ln1435">	\param team The team whose pre-defined timers shall be created.</a>
+<a name="ln1436">	\return \c B_OK, when everything when fine, another error code otherwise.</a>
+<a name="ln1437">*/</a>
+<a name="ln1438">status_t</a>
+<a name="ln1439">user_timer_create_team_timers(Team* team)</a>
+<a name="ln1440">{</a>
+<a name="ln1441">	// create a real time user timer</a>
+<a name="ln1442">	struct sigevent event = {0};</a>
+<a name="ln1443">	event.sigev_notify = SIGEV_SIGNAL;</a>
+<a name="ln1444">	event.sigev_signo = SIGALRM;</a>
+<a name="ln1445"> </a>
+<a name="ln1446">	int32 timerID = create_timer(CLOCK_MONOTONIC, USER_TIMER_REAL_TIME_ID,</a>
+<a name="ln1447">		team, NULL, 0, event, NULL, true);</a>
+<a name="ln1448">	if (timerID &lt; 0)</a>
+<a name="ln1449">		return timerID;</a>
+<a name="ln1450"> </a>
+<a name="ln1451">	// create a total CPU time user timer</a>
+<a name="ln1452">	event.sigev_notify = SIGEV_SIGNAL;</a>
+<a name="ln1453">	event.sigev_signo = SIGPROF;</a>
+<a name="ln1454"> </a>
+<a name="ln1455">	timerID = create_timer(CLOCK_PROCESS_CPUTIME_ID,</a>
+<a name="ln1456">		USER_TIMER_TEAM_TOTAL_TIME_ID, team, NULL, 0, event, NULL, true);</a>
+<a name="ln1457">	if (timerID &lt; 0)</a>
+<a name="ln1458">		return timerID;</a>
+<a name="ln1459"> </a>
+<a name="ln1460">	// create a user CPU time user timer</a>
+<a name="ln1461">	event.sigev_notify = SIGEV_SIGNAL;</a>
+<a name="ln1462">	event.sigev_signo = SIGVTALRM;</a>
+<a name="ln1463"> </a>
+<a name="ln1464">	timerID = create_timer(CLOCK_PROCESS_USER_CPUTIME_ID,</a>
+<a name="ln1465">		USER_TIMER_TEAM_USER_TIME_ID, team, NULL, 0, event, NULL, true);</a>
+<a name="ln1466">	if (timerID &lt; 0)</a>
+<a name="ln1467">		return timerID;</a>
+<a name="ln1468"> </a>
+<a name="ln1469">	return B_OK;</a>
+<a name="ln1470">}</a>
+<a name="ln1471"> </a>
+<a name="ln1472"> </a>
+<a name="ln1473">status_t</a>
+<a name="ln1474">user_timer_get_clock(clockid_t clockID, bigtime_t&amp; _time)</a>
+<a name="ln1475">{</a>
+<a name="ln1476">	switch (clockID) {</a>
+<a name="ln1477">		case CLOCK_MONOTONIC:</a>
+<a name="ln1478">			_time = system_time();</a>
+<a name="ln1479">			return B_OK;</a>
+<a name="ln1480"> </a>
+<a name="ln1481">		case CLOCK_REALTIME:</a>
+<a name="ln1482">			_time = real_time_clock_usecs();</a>
+<a name="ln1483">			return B_OK;</a>
+<a name="ln1484"> </a>
+<a name="ln1485">		case CLOCK_THREAD_CPUTIME_ID:</a>
+<a name="ln1486">		{</a>
+<a name="ln1487">			Thread* thread = thread_get_current_thread();</a>
+<a name="ln1488">			InterruptsSpinLocker timeLocker(thread-&gt;time_lock);</a>
+<a name="ln1489">			_time = thread-&gt;CPUTime(false);</a>
+<a name="ln1490">			return B_OK;</a>
+<a name="ln1491">		}</a>
+<a name="ln1492"> </a>
+<a name="ln1493">		case CLOCK_PROCESS_USER_CPUTIME_ID:</a>
+<a name="ln1494">		{</a>
+<a name="ln1495">			Team* team = thread_get_current_thread()-&gt;team;</a>
+<a name="ln1496">			InterruptsSpinLocker timeLocker(team-&gt;time_lock);</a>
+<a name="ln1497">			_time = team-&gt;UserCPUTime();</a>
+<a name="ln1498">			return B_OK;</a>
+<a name="ln1499">		}</a>
+<a name="ln1500"> </a>
+<a name="ln1501">		case CLOCK_PROCESS_CPUTIME_ID:</a>
+<a name="ln1502">		default:</a>
+<a name="ln1503">		{</a>
+<a name="ln1504">			// get the ID of the target team (or the respective placeholder)</a>
+<a name="ln1505">			team_id teamID;</a>
+<a name="ln1506">			if (clockID == CLOCK_PROCESS_CPUTIME_ID) {</a>
+<a name="ln1507">				teamID = B_CURRENT_TEAM;</a>
+<a name="ln1508">			} else {</a>
+<a name="ln1509">				if (clockID &lt; 0)</a>
+<a name="ln1510">					return B_BAD_VALUE;</a>
+<a name="ln1511">				if (clockID == team_get_kernel_team_id())</a>
+<a name="ln1512">					return B_NOT_ALLOWED;</a>
+<a name="ln1513"> </a>
+<a name="ln1514">				teamID = clockID;</a>
+<a name="ln1515">			}</a>
+<a name="ln1516"> </a>
+<a name="ln1517">			// get the team</a>
+<a name="ln1518">			Team* team = Team::Get(teamID);</a>
+<a name="ln1519">			if (team == NULL)</a>
+<a name="ln1520">				return B_BAD_VALUE;</a>
+<a name="ln1521">			BReference&lt;Team&gt; teamReference(team, true);</a>
+<a name="ln1522"> </a>
+<a name="ln1523">			// get the time</a>
+<a name="ln1524">			InterruptsSpinLocker timeLocker(team-&gt;time_lock);</a>
+<a name="ln1525">			_time = team-&gt;CPUTime(false);</a>
+<a name="ln1526"> </a>
+<a name="ln1527">			return B_OK;</a>
+<a name="ln1528">		}</a>
+<a name="ln1529">	}</a>
+<a name="ln1530">}</a>
+<a name="ln1531"> </a>
+<a name="ln1532"> </a>
+<a name="ln1533">void</a>
+<a name="ln1534">user_timer_real_time_clock_changed()</a>
+<a name="ln1535">{</a>
+<a name="ln1536">	// we need to update all absolute real-time timers</a>
+<a name="ln1537">	InterruptsWriteSequentialLocker locker(sUserTimerLock);</a>
+<a name="ln1538">	SpinLocker globalListLocker(sAbsoluteRealTimeTimersLock);</a>
+<a name="ln1539"> </a>
+<a name="ln1540">	for (RealTimeUserTimerList::Iterator it</a>
+<a name="ln1541">				= sAbsoluteRealTimeTimers.GetIterator();</a>
+<a name="ln1542">			RealTimeUserTimer* timer = it.Next();) {</a>
+<a name="ln1543">		timer-&gt;TimeWarped();</a>
+<a name="ln1544">	}</a>
+<a name="ln1545">}</a>
+<a name="ln1546"> </a>
+<a name="ln1547"> </a>
+<a name="ln1548">void</a>
+<a name="ln1549">user_timer_stop_cpu_timers(Thread* thread, Thread* nextThread)</a>
+<a name="ln1550">{</a>
+<a name="ln1551">	// stop thread timers</a>
+<a name="ln1552">	for (ThreadTimeUserTimerList::ConstIterator it</a>
+<a name="ln1553">				= thread-&gt;CPUTimeUserTimerIterator();</a>
+<a name="ln1554">			ThreadTimeUserTimer* timer = it.Next();) {</a>
+<a name="ln1555">		timer-&gt;Stop();</a>
+<a name="ln1556">	}</a>
+<a name="ln1557"> </a>
+<a name="ln1558">	// update team timers</a>
+<a name="ln1559">	if (nextThread == NULL || nextThread-&gt;team != thread-&gt;team) {</a>
+<a name="ln1560">		for (TeamTimeUserTimerList::ConstIterator it</a>
+<a name="ln1561">					= thread-&gt;team-&gt;CPUTimeUserTimerIterator();</a>
+<a name="ln1562">				TeamTimeUserTimer* timer = it.Next();) {</a>
+<a name="ln1563">			timer-&gt;Update(thread, thread);</a>
+<a name="ln1564">		}</a>
+<a name="ln1565">	}</a>
+<a name="ln1566">}</a>
+<a name="ln1567"> </a>
+<a name="ln1568"> </a>
+<a name="ln1569">void</a>
+<a name="ln1570">user_timer_continue_cpu_timers(Thread* thread, Thread* previousThread)</a>
+<a name="ln1571">{</a>
+<a name="ln1572">	// update team timers</a>
+<a name="ln1573">	if (previousThread == NULL || previousThread-&gt;team != thread-&gt;team) {</a>
+<a name="ln1574">		for (TeamTimeUserTimerList::ConstIterator it</a>
+<a name="ln1575">					= thread-&gt;team-&gt;CPUTimeUserTimerIterator();</a>
+<a name="ln1576">				TeamTimeUserTimer* timer = it.Next();) {</a>
+<a name="ln1577">			timer-&gt;Update(NULL, thread);</a>
+<a name="ln1578">		}</a>
+<a name="ln1579">	}</a>
+<a name="ln1580"> </a>
+<a name="ln1581">	// start thread timers</a>
+<a name="ln1582">	for (ThreadTimeUserTimerList::ConstIterator it</a>
+<a name="ln1583">				= thread-&gt;CPUTimeUserTimerIterator();</a>
+<a name="ln1584">			ThreadTimeUserTimer* timer = it.Next();) {</a>
+<a name="ln1585">		timer-&gt;Start();</a>
+<a name="ln1586">	}</a>
+<a name="ln1587">}</a>
+<a name="ln1588"> </a>
+<a name="ln1589"> </a>
+<a name="ln1590">void</a>
+<a name="ln1591">user_timer_check_team_user_timers(Team* team)</a>
+<a name="ln1592">{</a>
+<a name="ln1593">	for (TeamUserTimeUserTimerList::ConstIterator it</a>
+<a name="ln1594">				= team-&gt;UserTimeUserTimerIterator();</a>
+<a name="ln1595">			TeamUserTimeUserTimer* timer = it.Next();) {</a>
+<a name="ln1596">		timer-&gt;Check();</a>
+<a name="ln1597">	}</a>
+<a name="ln1598">}</a>
+<a name="ln1599"> </a>
+<a name="ln1600"> </a>
+<a name="ln1601">// #pragma mark - syscalls</a>
+<a name="ln1602"> </a>
+<a name="ln1603"> </a>
+<a name="ln1604">status_t</a>
+<a name="ln1605">_user_get_clock(clockid_t clockID, bigtime_t* userTime)</a>
+<a name="ln1606">{</a>
+<a name="ln1607">	// get the time</a>
+<a name="ln1608">	bigtime_t time;</a>
+<a name="ln1609">	status_t error = user_timer_get_clock(clockID, time);</a>
+<a name="ln1610">	if (error != B_OK)</a>
+<a name="ln1611">		return error;</a>
+<a name="ln1612"> </a>
+<a name="ln1613">	// copy the value back to userland</a>
+<a name="ln1614">	if (userTime == NULL || !IS_USER_ADDRESS(userTime)</a>
+<a name="ln1615">		|| user_memcpy(userTime, &amp;time, sizeof(time)) != B_OK) {</a>
+<a name="ln1616">		return B_BAD_ADDRESS;</a>
+<a name="ln1617">	}</a>
+<a name="ln1618"> </a>
+<a name="ln1619">	return B_OK;</a>
+<a name="ln1620">}</a>
+<a name="ln1621"> </a>
+<a name="ln1622"> </a>
+<a name="ln1623">status_t</a>
+<a name="ln1624">_user_set_clock(clockid_t clockID, bigtime_t time)</a>
+<a name="ln1625">{</a>
+<a name="ln1626">	switch (clockID) {</a>
+<a name="ln1627">		case CLOCK_MONOTONIC:</a>
+<a name="ln1628">			return B_BAD_VALUE;</a>
+<a name="ln1629"> </a>
+<a name="ln1630">		case CLOCK_REALTIME:</a>
+<a name="ln1631">			// only root may set the time</a>
+<a name="ln1632">			if (geteuid() != 0)</a>
+<a name="ln1633">				return B_NOT_ALLOWED;</a>
+<a name="ln1634"> </a>
+<a name="ln1635">			set_real_time_clock_usecs(time);</a>
+<a name="ln1636">			return B_OK;</a>
+<a name="ln1637"> </a>
+<a name="ln1638">		case CLOCK_THREAD_CPUTIME_ID:</a>
+<a name="ln1639">		{</a>
+<a name="ln1640">			Thread* thread = thread_get_current_thread();</a>
+<a name="ln1641">			InterruptsSpinLocker timeLocker(thread-&gt;time_lock);</a>
+<a name="ln1642">			bigtime_t diff = time - thread-&gt;CPUTime(false);</a>
+<a name="ln1643">			thread-&gt;cpu_clock_offset += diff;</a>
+<a name="ln1644"> </a>
+<a name="ln1645">			thread_clock_changed(thread, diff);</a>
+<a name="ln1646">			return B_OK;</a>
+<a name="ln1647">		}</a>
+<a name="ln1648"> </a>
+<a name="ln1649">		case CLOCK_PROCESS_USER_CPUTIME_ID:</a>
+<a name="ln1650">			// not supported -- this clock is an Haiku-internal extension</a>
+<a name="ln1651">			return B_BAD_VALUE;</a>
+<a name="ln1652"> </a>
+<a name="ln1653">		case CLOCK_PROCESS_CPUTIME_ID:</a>
+<a name="ln1654">		default:</a>
+<a name="ln1655">		{</a>
+<a name="ln1656">			// get the ID of the target team (or the respective placeholder)</a>
+<a name="ln1657">			team_id teamID;</a>
+<a name="ln1658">			if (clockID == CLOCK_PROCESS_CPUTIME_ID) {</a>
+<a name="ln1659">				teamID = B_CURRENT_TEAM;</a>
+<a name="ln1660">			} else {</a>
+<a name="ln1661">				if (clockID &lt; 0)</a>
+<a name="ln1662">					return B_BAD_VALUE;</a>
+<a name="ln1663">				if (clockID == team_get_kernel_team_id())</a>
+<a name="ln1664">					return B_NOT_ALLOWED;</a>
+<a name="ln1665"> </a>
+<a name="ln1666">				teamID = clockID;</a>
+<a name="ln1667">			}</a>
+<a name="ln1668"> </a>
+<a name="ln1669">			// get the team</a>
+<a name="ln1670">			Team* team = Team::Get(teamID);</a>
+<a name="ln1671">			if (team == NULL)</a>
+<a name="ln1672">				return B_BAD_VALUE;</a>
+<a name="ln1673">			BReference&lt;Team&gt; teamReference(team, true);</a>
+<a name="ln1674"> </a>
+<a name="ln1675">			// set the time offset</a>
+<a name="ln1676">			InterruptsSpinLocker timeLocker(team-&gt;time_lock);</a>
+<a name="ln1677">			bigtime_t diff = time - team-&gt;CPUTime(false);</a>
+<a name="ln1678">			team-&gt;cpu_clock_offset += diff;</a>
+<a name="ln1679"> </a>
+<a name="ln1680">			team_clock_changed(team, diff);</a>
+<a name="ln1681">			return B_OK;</a>
+<a name="ln1682">		}</a>
+<a name="ln1683">	}</a>
+<a name="ln1684"> </a>
+<a name="ln1685">	return B_OK;</a>
+<a name="ln1686">}</a>
+<a name="ln1687"> </a>
+<a name="ln1688"> </a>
+<a name="ln1689">int32</a>
+<a name="ln1690">_user_create_timer(clockid_t clockID, thread_id threadID, uint32 flags,</a>
+<a name="ln1691">	const struct sigevent* userEvent,</a>
+<a name="ln1692">	const thread_creation_attributes* userThreadAttributes)</a>
+<a name="ln1693">{</a>
+<a name="ln1694">	// copy the sigevent structure from userland</a>
+<a name="ln1695">	struct sigevent event = {0};</a>
+<a name="ln1696">	if (userEvent != NULL) {</a>
+<a name="ln1697">		if (!IS_USER_ADDRESS(userEvent)</a>
+<a name="ln1698">			|| user_memcpy(&amp;event, userEvent, sizeof(event)) != B_OK) {</a>
+<a name="ln1699">			return B_BAD_ADDRESS;</a>
+<a name="ln1700">		}</a>
+<a name="ln1701">	} else {</a>
+<a name="ln1702">		// none given -- use defaults</a>
+<a name="ln1703">		event.sigev_notify = SIGEV_SIGNAL;</a>
+<a name="ln1704">		event.sigev_signo = SIGALRM;</a>
+<a name="ln1705">	}</a>
+<a name="ln1706"> </a>
+<a name="ln1707">	// copy thread creation attributes from userland, if specified</a>
+<a name="ln1708">	char nameBuffer[B_OS_NAME_LENGTH];</a>
+<a name="ln1709">	ThreadCreationAttributes threadAttributes;</a>
+<a name="ln1710">	if (event.sigev_notify == SIGEV_THREAD) {</a>
+<a name="ln1711">		status_t error = threadAttributes.InitFromUserAttributes(</a>
+<a name="ln1712">			userThreadAttributes, nameBuffer);</a>
+<a name="ln1713">		if (error != B_OK)</a>
+<a name="ln1714">			return error;</a>
+<a name="ln1715">	}</a>
+<a name="ln1716"> </a>
+<a name="ln1717">	// get team and thread</a>
+<a name="ln1718">	Team* team = thread_get_current_thread()-&gt;team;</a>
+<a name="ln1719">	Thread* thread = NULL;</a>
+<a name="ln1720">	if (threadID &gt;= 0) {</a>
+<a name="ln1721">		thread = Thread::GetAndLock(threadID);</a>
+<a name="ln1722">		if (thread == NULL)</a>
+<a name="ln1723">			return B_BAD_THREAD_ID;</a>
+<a name="ln1724"> </a>
+<a name="ln1725">		thread-&gt;Unlock();</a>
+<a name="ln1726">	}</a>
+<a name="ln1727">	BReference&lt;Thread&gt; threadReference(thread, true);</a>
+<a name="ln1728"> </a>
+<a name="ln1729">	// create the timer</a>
+<a name="ln1730">	return create_timer(clockID, -1, team, thread, flags, event,</a>
+<a name="ln1731">		userThreadAttributes != NULL ? &amp;threadAttributes : NULL,</a>
+<a name="ln1732">		userEvent == NULL);</a>
+<a name="ln1733">}</a>
+<a name="ln1734"> </a>
+<a name="ln1735"> </a>
+<a name="ln1736">status_t</a>
+<a name="ln1737">_user_delete_timer(int32 timerID, thread_id threadID)</a>
+<a name="ln1738">{</a>
+<a name="ln1739">	// can only delete user-defined timers</a>
+<a name="ln1740">	if (timerID &lt; USER_TIMER_FIRST_USER_DEFINED_ID)</a>
+<a name="ln1741">		return B_BAD_VALUE;</a>
+<a name="ln1742"> </a>
+<a name="ln1743">	// get the timer</a>
+<a name="ln1744">	TimerLocker timerLocker;</a>
+<a name="ln1745">	UserTimer* timer;</a>
+<a name="ln1746">	status_t error = timerLocker.LockAndGetTimer(threadID, timerID, timer);</a>
+<a name="ln1747">	if (error != B_OK)</a>
+<a name="ln1748">		return error;</a>
+<a name="ln1749"> </a>
+<a name="ln1750">	// cancel, remove, and delete it</a>
+<a name="ln1751">	timer-&gt;Cancel();</a>
+<a name="ln1752"> </a>
+<a name="ln1753">	if (threadID &gt;= 0)</a>
+<a name="ln1754">		timerLocker.thread-&gt;RemoveUserTimer(timer);</a>
+<a name="ln1755">	else</a>
+<a name="ln1756">		timerLocker.team-&gt;RemoveUserTimer(timer);</a>
+<a name="ln1757"> </a>
+<a name="ln1758">	delete timer;</a>
+<a name="ln1759"> </a>
+<a name="ln1760">	return B_OK;</a>
+<a name="ln1761">}</a>
+<a name="ln1762"> </a>
+<a name="ln1763"> </a>
+<a name="ln1764">status_t</a>
+<a name="ln1765">_user_get_timer(int32 timerID, thread_id threadID,</a>
+<a name="ln1766">	struct user_timer_info* userInfo)</a>
+<a name="ln1767">{</a>
+<a name="ln1768">	// get the timer</a>
+<a name="ln1769">	TimerLocker timerLocker;</a>
+<a name="ln1770">	UserTimer* timer;</a>
+<a name="ln1771">	status_t error = timerLocker.LockAndGetTimer(threadID, timerID, timer);</a>
+<a name="ln1772">	if (error != B_OK)</a>
+<a name="ln1773">		return error;</a>
+<a name="ln1774"> </a>
+<a name="ln1775">	// get the info</a>
+<a name="ln1776">	user_timer_info info;</a>
+<a name="ln1777">	timer-&gt;GetInfo(info.remaining_time, info.interval, info.overrun_count);</a>
+<a name="ln1778"> </a>
+<a name="ln1779">	// Sanitize remaining_time. If it's &lt;= 0, we set it to 1, the least valid</a>
+<a name="ln1780">	// value.</a>
+<a name="ln1781">	if (info.remaining_time &lt;= 0)</a>
+<a name="ln1782">		info.remaining_time = 1;</a>
+<a name="ln1783"> </a>
+<a name="ln1784">	timerLocker.Unlock();</a>
+<a name="ln1785"> </a>
+<a name="ln1786">	// copy it back to userland</a>
+<a name="ln1787">	if (userInfo != NULL</a>
+<a name="ln1788">		&amp;&amp; (!IS_USER_ADDRESS(userInfo)</a>
+<a name="ln1789">			|| user_memcpy(userInfo, &amp;info, sizeof(info)) != B_OK)) {</a>
+<a name="ln1790">		return B_BAD_ADDRESS;</a>
+<a name="ln1791">	}</a>
+<a name="ln1792"> </a>
+<a name="ln1793">	return B_OK;</a>
+<a name="ln1794">}</a>
+<a name="ln1795"> </a>
+<a name="ln1796"> </a>
+<a name="ln1797">status_t</a>
+<a name="ln1798">_user_set_timer(int32 timerID, thread_id threadID, bigtime_t startTime,</a>
+<a name="ln1799">	bigtime_t interval, uint32 flags, struct user_timer_info* userOldInfo)</a>
+<a name="ln1800">{</a>
+<a name="ln1801">	// check the values</a>
+<a name="ln1802">	if (startTime &lt; 0 || interval &lt; 0)</a>
+<a name="ln1803">		return B_BAD_VALUE;</a>
+<a name="ln1804"> </a>
+<a name="ln1805">	// get the timer</a>
+<a name="ln1806">	TimerLocker timerLocker;</a>
+<a name="ln1807">	UserTimer* timer;</a>
+<a name="ln1808">	status_t error = timerLocker.LockAndGetTimer(threadID, timerID, timer);</a>
+<a name="ln1809">	if (error != B_OK)</a>
+<a name="ln1810">		return error;</a>
+<a name="ln1811"> </a>
+<a name="ln1812">	// schedule the timer</a>
+<a name="ln1813">	user_timer_info oldInfo;</a>
+<a name="ln1814">	timer-&gt;Schedule(startTime, interval, flags, oldInfo.remaining_time,</a>
+<a name="ln1815">		oldInfo.interval);</a>
+<a name="ln1816"> </a>
+<a name="ln1817">	// Sanitize remaining_time. If it's &lt;= 0, we set it to 1, the least valid</a>
+<a name="ln1818">	// value.</a>
+<a name="ln1819">	if (oldInfo.remaining_time &lt;= 0)</a>
+<a name="ln1820">		oldInfo.remaining_time = 1;</a>
+<a name="ln1821"> </a>
+<a name="ln1822">	timerLocker.Unlock();</a>
+<a name="ln1823"> </a>
+<a name="ln1824">	// copy back the old info</a>
+<a name="ln1825">	if (userOldInfo != NULL</a>
+<a name="ln1826">		&amp;&amp; (!IS_USER_ADDRESS(userOldInfo)</a>
+<a name="ln1827">			|| user_memcpy(userOldInfo, &amp;oldInfo, sizeof(oldInfo)) != B_OK)) {</a>
+<a name="ln1828">		return B_BAD_ADDRESS;</a>
+<a name="ln1829">	}</a>
+<a name="ln1830"> </a>
+<a name="ln1831">	return B_OK;</a>
+<a name="ln1832">}</a>
+
+</code></pre>
+<div class="balloon" rel="493"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fRunningThreads, fAbsolute.</p></div>
+<div class="balloon" rel="887"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fAbsolute.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

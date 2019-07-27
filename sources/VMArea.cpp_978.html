@@ -1,0 +1,323 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>VMArea.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2009-2010, Ingo Weinhold, ingo_weinhold@gmx.de.</a>
+<a name="ln3"> * Copyright 2002-2009, Axel Dörfler, axeld@pinc-software.de.</a>
+<a name="ln4"> * Distributed under the terms of the MIT License.</a>
+<a name="ln5"> *</a>
+<a name="ln6"> * Copyright 2001-2002, Travis Geiselbrecht. All rights reserved.</a>
+<a name="ln7"> * Distributed under the terms of the NewOS License.</a>
+<a name="ln8"> */</a>
+<a name="ln9"> </a>
+<a name="ln10"> </a>
+<a name="ln11">#include &lt;vm/VMArea.h&gt;</a>
+<a name="ln12"> </a>
+<a name="ln13">#include &lt;new&gt;</a>
+<a name="ln14"> </a>
+<a name="ln15">#include &lt;heap.h&gt;</a>
+<a name="ln16">#include &lt;vm/VMAddressSpace.h&gt;</a>
+<a name="ln17"> </a>
+<a name="ln18"> </a>
+<a name="ln19">#define AREA_HASH_TABLE_SIZE 1024</a>
+<a name="ln20"> </a>
+<a name="ln21"> </a>
+<a name="ln22">rw_lock VMAreaHash::sLock = RW_LOCK_INITIALIZER(&quot;area hash&quot;);</a>
+<a name="ln23">VMAreaHashTable VMAreaHash::sTable;</a>
+<a name="ln24">static area_id sNextAreaID = 1;</a>
+<a name="ln25"> </a>
+<a name="ln26"> </a>
+<a name="ln27">// #pragma mark - VMArea</a>
+<a name="ln28"> </a>
+<a name="ln29">VMArea::VMArea(VMAddressSpace* addressSpace, uint32 wiring, uint32 protection)</a>
+<a name="ln30">	:</a>
+<a name="ln31">	name(NULL),</a>
+<a name="ln32">	protection(protection),</a>
+<a name="ln33">	wiring(wiring),</a>
+<a name="ln34">	memory_type(0),</a>
+<a name="ln35">	cache(NULL),</a>
+<a name="ln36">	no_cache_change(0),</a>
+<a name="ln37">	cache_offset(0),</a>
+<a name="ln38">	cache_type(0),</a>
+<a name="ln39">	page_protections(NULL),</a>
+<a name="ln40">	address_space(addressSpace),</a>
+<a name="ln41">	cache_next(NULL),</a>
+<a name="ln42">	cache_prev(NULL),</a>
+<a name="ln43">	hash_next(NULL)</a>
+<a name="ln44">{</a>
+<a name="ln45">	new (&amp;mappings) VMAreaMappings;</a>
+<a name="ln46">}</a>
+<a name="ln47"> </a>
+<a name="ln48"> </a>
+<a name="ln49">VMArea::~VMArea()</a>
+<a name="ln50">{</a>
+<a name="ln51">	const uint32 flags = HEAP_DONT_WAIT_FOR_MEMORY</a>
+<a name="ln52">		| HEAP_DONT_LOCK_KERNEL_SPACE;</a>
+<a name="ln53">		// TODO: This might be stricter than necessary.</a>
+<a name="ln54"> </a>
+<a name="ln55">	free_etc(page_protections, flags);</a>
+<a name="ln56">	free_etc(name, flags);</a>
+<a name="ln57">}</a>
+<a name="ln58"> </a>
+<a name="ln59"> </a>
+<a name="ln60">status_t</a>
+<a name="ln61">VMArea::Init(const char* name, uint32 allocationFlags)</a>
+<a name="ln62">{</a>
+<a name="ln63">	// restrict the area name to B_OS_NAME_LENGTH</a>
+<a name="ln64">	size_t length = strlen(name) + 1;</a>
+<a name="ln65">	if (length &gt; B_OS_NAME_LENGTH)</a>
+<a name="ln66">		length = B_OS_NAME_LENGTH;</a>
+<a name="ln67"> </a>
+<a name="ln68">	// clone the name</a>
+<a name="ln69">	this-&gt;name = (char*)malloc_etc(length, allocationFlags);</a>
+<a name="ln70">	if (this-&gt;name == NULL)</a>
+<a name="ln71">		return B_NO_MEMORY;</a>
+<a name="ln72">	strlcpy(this-&gt;name, name, length);</a>
+<a name="ln73"> </a>
+<a name="ln74">	id = atomic_add(&amp;sNextAreaID, 1);</a>
+<a name="ln75">	return B_OK;</a>
+<a name="ln76">}</a>
+<a name="ln77"> </a>
+<a name="ln78"> </a>
+<a name="ln79">/*!	Returns whether any part of the given address range intersects with a wired</a>
+<a name="ln80">	range of this area.</a>
+<a name="ln81">	The area's top cache must be locked.</a>
+<a name="ln82">*/</a>
+<a name="ln83">bool</a>
+<a name="ln84">VMArea::IsWired(addr_t base, size_t size) const</a>
+<a name="ln85">{</a>
+<a name="ln86">	for (VMAreaWiredRangeList::Iterator it = fWiredRanges.GetIterator();</a>
+<a name="ln87">			VMAreaWiredRange* range = it.Next();) {</a>
+<a name="ln88">		if (range-&gt;IntersectsWith(base, size))</a>
+<a name="ln89">			return true;</a>
+<a name="ln90">	}</a>
+<a name="ln91"> </a>
+<a name="ln92">	return false;</a>
+<a name="ln93">}</a>
+<a name="ln94"> </a>
+<a name="ln95"> </a>
+<a name="ln96">/*!	Adds the given wired range to this area.</a>
+<a name="ln97">	The area's top cache must be locked.</a>
+<a name="ln98">*/</a>
+<a name="ln99">void</a>
+<a name="ln100">VMArea::Wire(VMAreaWiredRange* range)</a>
+<a name="ln101">{</a>
+<a name="ln102">	ASSERT(range-&gt;area == NULL);</a>
+<a name="ln103"> </a>
+<a name="ln104">	range-&gt;area = this;</a>
+<a name="ln105">	fWiredRanges.Add(range);</a>
+<a name="ln106">}</a>
+<a name="ln107"> </a>
+<a name="ln108"> </a>
+<a name="ln109">/*!	Removes the given wired range from this area.</a>
+<a name="ln110">	Must balance a previous Wire() call.</a>
+<a name="ln111">	The area's top cache must be locked.</a>
+<a name="ln112">*/</a>
+<a name="ln113">void</a>
+<a name="ln114">VMArea::Unwire(VMAreaWiredRange* range)</a>
+<a name="ln115">{</a>
+<a name="ln116">	ASSERT(range-&gt;area == this);</a>
+<a name="ln117"> </a>
+<a name="ln118">	// remove the range</a>
+<a name="ln119">	range-&gt;area = NULL;</a>
+<a name="ln120">	fWiredRanges.Remove(range);</a>
+<a name="ln121"> </a>
+<a name="ln122">	// wake up waiters</a>
+<a name="ln123">	for (VMAreaUnwiredWaiterList::Iterator it = range-&gt;waiters.GetIterator();</a>
+<a name="ln124">			VMAreaUnwiredWaiter* waiter = it.Next();) {</a>
+<a name="ln125">		waiter-&gt;condition.NotifyAll();</a>
+<a name="ln126">	}</a>
+<a name="ln127"> </a>
+<a name="ln128">	range-&gt;waiters.MakeEmpty();</a>
+<a name="ln129">}</a>
+<a name="ln130"> </a>
+<a name="ln131"> </a>
+<a name="ln132">/*!	Removes a wired range from this area.</a>
+<a name="ln133"> </a>
+<a name="ln134">	Must balance a previous Wire() call. The first implicit range with matching</a>
+<a name="ln135">	\a base, \a size, and \a writable attributes is removed and returned. It's</a>
+<a name="ln136">	waiters are woken up as well.</a>
+<a name="ln137">	The area's top cache must be locked.</a>
+<a name="ln138">*/</a>
+<a name="ln139">VMAreaWiredRange*</a>
+<a name="ln140">VMArea::Unwire(addr_t base, size_t size, bool writable)</a>
+<a name="ln141">{</a>
+<a name="ln142">	for (VMAreaWiredRangeList::Iterator it = fWiredRanges.GetIterator();</a>
+<a name="ln143">			VMAreaWiredRange* range = it.Next();) {</a>
+<a name="ln144">		if (range-&gt;implicit &amp;&amp; range-&gt;base == base &amp;&amp; range-&gt;size == size</a>
+<a name="ln145">				&amp;&amp; range-&gt;writable == writable) {</a>
+<a name="ln146">			Unwire(range);</a>
+<a name="ln147">			return range;</a>
+<a name="ln148">		}</a>
+<a name="ln149">	}</a>
+<a name="ln150"> </a>
+<a name="ln151">	panic(&quot;VMArea::Unwire(%#&quot; B_PRIxADDR &quot;, %#&quot; B_PRIxADDR &quot;, %d): no such &quot;</a>
+<a name="ln152">		&quot;range&quot;, base, size, writable);</a>
+<a name="ln153">	return NULL;</a>
+<a name="ln154">}</a>
+<a name="ln155"> </a>
+<a name="ln156"> </a>
+<a name="ln157">/*!	If the area has any wired range, the given waiter is added to the range and</a>
+<a name="ln158">	prepared for waiting.</a>
+<a name="ln159"> </a>
+<a name="ln160">	\return \c true, if the waiter has been added, \c false otherwise.</a>
+<a name="ln161">*/</a>
+<a name="ln162">bool</a>
+<a name="ln163">VMArea::AddWaiterIfWired(VMAreaUnwiredWaiter* waiter)</a>
+<a name="ln164">{</a>
+<a name="ln165">	VMAreaWiredRange* range = fWiredRanges.Head();</a>
+<a name="ln166">	if (range == NULL)</a>
+<a name="ln167">		return false;</a>
+<a name="ln168"> </a>
+<a name="ln169">	waiter-&gt;area = this;</a>
+<a name="ln170">	waiter-&gt;base = fBase;</a>
+<a name="ln171">	waiter-&gt;size = fSize;</a>
+<a name="ln172">	waiter-&gt;condition.Init(this, &quot;area unwired&quot;);</a>
+<a name="ln173">	waiter-&gt;condition.Add(&amp;waiter-&gt;waitEntry);</a>
+<a name="ln174"> </a>
+<a name="ln175">	range-&gt;waiters.Add(waiter);</a>
+<a name="ln176"> </a>
+<a name="ln177">	return true;</a>
+<a name="ln178">}</a>
+<a name="ln179"> </a>
+<a name="ln180"> </a>
+<a name="ln181">/*!	If the given address range intersect with a wired range of this area, the</a>
+<a name="ln182">	given waiter is added to the range and prepared for waiting.</a>
+<a name="ln183"> </a>
+<a name="ln184">	\param waiter The waiter structure that will be added to the wired range</a>
+<a name="ln185">		that intersects with the given address range.</a>
+<a name="ln186">	\param base The base of the address range to check.</a>
+<a name="ln187">	\param size The size of the address range to check.</a>
+<a name="ln188">	\param flags</a>
+<a name="ln189">		- \c IGNORE_WRITE_WIRED_RANGES: Ignore ranges wired for writing.</a>
+<a name="ln190">	\return \c true, if the waiter has been added, \c false otherwise.</a>
+<a name="ln191">*/</a>
+<a name="ln192">bool</a>
+<a name="ln193">VMArea::AddWaiterIfWired(VMAreaUnwiredWaiter* waiter, addr_t base, size_t size,</a>
+<a name="ln194">	uint32 flags)</a>
+<a name="ln195">{</a>
+<a name="ln196">	for (VMAreaWiredRangeList::Iterator it = fWiredRanges.GetIterator();</a>
+<a name="ln197">			VMAreaWiredRange* range = it.Next();) {</a>
+<a name="ln198">		if ((flags &amp; IGNORE_WRITE_WIRED_RANGES) != 0 &amp;&amp; range-&gt;writable)</a>
+<a name="ln199">			continue;</a>
+<a name="ln200"> </a>
+<a name="ln201">		if (range-&gt;IntersectsWith(base, size)) {</a>
+<a name="ln202">			waiter-&gt;area = this;</a>
+<a name="ln203">			waiter-&gt;base = base;</a>
+<a name="ln204">			waiter-&gt;size = size;</a>
+<a name="ln205">			waiter-&gt;condition.Init(this, &quot;area unwired&quot;);</a>
+<a name="ln206">			waiter-&gt;condition.Add(&amp;waiter-&gt;waitEntry);</a>
+<a name="ln207"> </a>
+<a name="ln208">			range-&gt;waiters.Add(waiter);</a>
+<a name="ln209"> </a>
+<a name="ln210">			return true;</a>
+<a name="ln211">		}</a>
+<a name="ln212">	}</a>
+<a name="ln213"> </a>
+<a name="ln214">	return false;</a>
+<a name="ln215">}</a>
+<a name="ln216"> </a>
+<a name="ln217"> </a>
+<a name="ln218">// #pragma mark - VMAreaHash</a>
+<a name="ln219"> </a>
+<a name="ln220"> </a>
+<a name="ln221">/*static*/ status_t</a>
+<a name="ln222">VMAreaHash::Init()</a>
+<a name="ln223">{</a>
+<a name="ln224">	return sTable.Init(AREA_HASH_TABLE_SIZE);</a>
+<a name="ln225">}</a>
+<a name="ln226"> </a>
+<a name="ln227"> </a>
+<a name="ln228">/*static*/ VMArea*</a>
+<a name="ln229">VMAreaHash::Lookup(area_id id)</a>
+<a name="ln230">{</a>
+<a name="ln231">	ReadLock();</a>
+<a name="ln232">	VMArea* area = LookupLocked(id);</a>
+<a name="ln233">	ReadUnlock();</a>
+<a name="ln234">	return area;</a>
+<a name="ln235">}</a>
+<a name="ln236"> </a>
+<a name="ln237"> </a>
+<a name="ln238">/*static*/ area_id</a>
+<a name="ln239">VMAreaHash::Find(const char* name)</a>
+<a name="ln240">{</a>
+<a name="ln241">	ReadLock();</a>
+<a name="ln242"> </a>
+<a name="ln243">	area_id id = B_NAME_NOT_FOUND;</a>
+<a name="ln244"> </a>
+<a name="ln245">	// TODO: Iterating through the whole table can be very slow and the whole</a>
+<a name="ln246">	// time we're holding the lock! Use a second hash table!</a>
+<a name="ln247"> </a>
+<a name="ln248">	for (VMAreaHashTable::Iterator it = sTable.GetIterator();</a>
+<a name="ln249">			VMArea* area = it.Next();) {</a>
+<a name="ln250">		if (strcmp(area-&gt;name, name) == 0) {</a>
+<a name="ln251">			id = area-&gt;id;</a>
+<a name="ln252">			break;</a>
+<a name="ln253">		}</a>
+<a name="ln254">	}</a>
+<a name="ln255"> </a>
+<a name="ln256">	ReadUnlock();</a>
+<a name="ln257"> </a>
+<a name="ln258">	return id;</a>
+<a name="ln259">}</a>
+<a name="ln260"> </a>
+<a name="ln261"> </a>
+<a name="ln262">/*static*/ void</a>
+<a name="ln263">VMAreaHash::Insert(VMArea* area)</a>
+<a name="ln264">{</a>
+<a name="ln265">	WriteLock();</a>
+<a name="ln266">	sTable.InsertUnchecked(area);</a>
+<a name="ln267">	WriteUnlock();</a>
+<a name="ln268">}</a>
+<a name="ln269"> </a>
+<a name="ln270"> </a>
+<a name="ln271">/*static*/ void</a>
+<a name="ln272">VMAreaHash::Remove(VMArea* area)</a>
+<a name="ln273">{</a>
+<a name="ln274">	WriteLock();</a>
+<a name="ln275">	sTable.RemoveUnchecked(area);</a>
+<a name="ln276">	WriteUnlock();</a>
+<a name="ln277">}</a>
+
+</code></pre>
+<div class="balloon" rel="29"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: id, fBase, fSize.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

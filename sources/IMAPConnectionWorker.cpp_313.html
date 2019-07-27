@@ -1,0 +1,949 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>IMAPConnectionWorker.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2011-2016, Axel Dörfler, axeld@pinc-software.de.</a>
+<a name="ln3"> * Distributed under the terms of the MIT License.</a>
+<a name="ln4"> */</a>
+<a name="ln5"> </a>
+<a name="ln6"> </a>
+<a name="ln7">#include &quot;IMAPConnectionWorker.h&quot;</a>
+<a name="ln8"> </a>
+<a name="ln9">#include &lt;Autolock.h&gt;</a>
+<a name="ln10">#include &lt;Messenger.h&gt;</a>
+<a name="ln11"> </a>
+<a name="ln12">#include &lt;AutoDeleter.h&gt;</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &quot;IMAPFolder.h&quot;</a>
+<a name="ln15">#include &quot;IMAPMailbox.h&quot;</a>
+<a name="ln16">#include &quot;IMAPProtocol.h&quot;</a>
+<a name="ln17"> </a>
+<a name="ln18"> </a>
+<a name="ln19">using IMAP::MessageUIDList;</a>
+<a name="ln20"> </a>
+<a name="ln21"> </a>
+<a name="ln22">static const uint32 kMaxFetchEntries = 500;</a>
+<a name="ln23">static const uint32 kMaxDirectDownloadSize = 4096;</a>
+<a name="ln24"> </a>
+<a name="ln25"> </a>
+<a name="ln26">class WorkerPrivate {</a>
+<a name="ln27">public:</a>
+<a name="ln28">	WorkerPrivate(IMAPConnectionWorker&amp; worker)</a>
+<a name="ln29">		:</a>
+<a name="ln30">		fWorker(worker)</a>
+<a name="ln31">	{</a>
+<a name="ln32">	}</a>
+<a name="ln33"> </a>
+<a name="ln34">	IMAP::Protocol&amp; Protocol()</a>
+<a name="ln35">	{</a>
+<a name="ln36">		return fWorker.fProtocol;</a>
+<a name="ln37">	}</a>
+<a name="ln38"> </a>
+<a name="ln39">	status_t AddFolders(BObjectList&lt;IMAPFolder&gt;&amp; folders)</a>
+<a name="ln40">	{</a>
+<a name="ln41">		IMAPConnectionWorker::MailboxMap::iterator iterator</a>
+<a name="ln42">			= fWorker.fMailboxes.begin();</a>
+<a name="ln43">		for (; iterator != fWorker.fMailboxes.end(); iterator++) {</a>
+<a name="ln44">			IMAPFolder* folder = iterator-&gt;first;</a>
+<a name="ln45">			if (!folders.AddItem(folder))</a>
+<a name="ln46">				return B_NO_MEMORY;</a>
+<a name="ln47">		}</a>
+<a name="ln48">		return B_OK;</a>
+<a name="ln49">	}</a>
+<a name="ln50"> </a>
+<a name="ln51">	status_t SelectMailbox(IMAPFolder&amp; folder)</a>
+<a name="ln52">	{</a>
+<a name="ln53">		return fWorker._SelectMailbox(folder, NULL);</a>
+<a name="ln54">	}</a>
+<a name="ln55"> </a>
+<a name="ln56">	status_t SelectMailbox(IMAPFolder&amp; folder, uint32&amp; nextUID)</a>
+<a name="ln57">	{</a>
+<a name="ln58">		return fWorker._SelectMailbox(folder, &amp;nextUID);</a>
+<a name="ln59">	}</a>
+<a name="ln60"> </a>
+<a name="ln61">	IMAPMailbox* MailboxFor(IMAPFolder&amp; folder)</a>
+<a name="ln62">	{</a>
+<a name="ln63">		return fWorker._MailboxFor(folder);</a>
+<a name="ln64">	}</a>
+<a name="ln65"> </a>
+<a name="ln66">	int32 BodyFetchLimit() const</a>
+<a name="ln67">	{</a>
+<a name="ln68">		return fWorker.fSettings.BodyFetchLimit();</a>
+<a name="ln69">	}</a>
+<a name="ln70"> </a>
+<a name="ln71">	uint32 MessagesExist() const</a>
+<a name="ln72">	{</a>
+<a name="ln73">		return fWorker._MessagesExist();</a>
+<a name="ln74">	}</a>
+<a name="ln75"> </a>
+<a name="ln76">	status_t EnqueueCommand(WorkerCommand* command)</a>
+<a name="ln77">	{</a>
+<a name="ln78">		return fWorker._EnqueueCommand(command);</a>
+<a name="ln79">	}</a>
+<a name="ln80"> </a>
+<a name="ln81">	void SyncCommandDone()</a>
+<a name="ln82">	{</a>
+<a name="ln83">		fWorker._SyncCommandDone();</a>
+<a name="ln84">	}</a>
+<a name="ln85"> </a>
+<a name="ln86">	void Quit()</a>
+<a name="ln87">	{</a>
+<a name="ln88">		fWorker.fStopped = true;</a>
+<a name="ln89">	}</a>
+<a name="ln90"> </a>
+<a name="ln91">private:</a>
+<a name="ln92">	IMAPConnectionWorker&amp;	fWorker;</a>
+<a name="ln93">};</a>
+<a name="ln94"> </a>
+<a name="ln95"> </a>
+<a name="ln96">class WorkerCommand {</a>
+<a name="ln97">public:</a>
+<a name="ln98">	WorkerCommand()</a>
+<a name="ln99">		:</a>
+<a name="ln100">		fContinuation(false)</a>
+<a name="ln101">	{</a>
+<a name="ln102">	}</a>
+<a name="ln103"> </a>
+<a name="ln104">	virtual ~WorkerCommand()</a>
+<a name="ln105">	{</a>
+<a name="ln106">	}</a>
+<a name="ln107"> </a>
+<a name="ln108">	virtual	status_t Process(IMAPConnectionWorker&amp; worker) = 0;</a>
+<a name="ln109"> </a>
+<a name="ln110">	virtual bool IsDone() const</a>
+<a name="ln111">	{</a>
+<a name="ln112">		return true;</a>
+<a name="ln113">	}</a>
+<a name="ln114"> </a>
+<a name="ln115">	bool IsContinuation() const</a>
+<a name="ln116">	{</a>
+<a name="ln117">		return fContinuation;</a>
+<a name="ln118">	}</a>
+<a name="ln119"> </a>
+<a name="ln120">	void SetContinuation()</a>
+<a name="ln121">	{</a>
+<a name="ln122">		fContinuation = true;</a>
+<a name="ln123">	}</a>
+<a name="ln124"> </a>
+<a name="ln125">private:</a>
+<a name="ln126">			bool				fContinuation;</a>
+<a name="ln127">};</a>
+<a name="ln128"> </a>
+<a name="ln129"> </a>
+<a name="ln130">/*!	All commands that inherit from this class will automatically maintain the</a>
+<a name="ln131">	worker's fSyncPending member, and will thus prevent syncing more than once</a>
+<a name="ln132">	concurrently.</a>
+<a name="ln133">*/</a>
+<a name="ln134">class SyncCommand : public WorkerCommand {</a>
+<a name="ln135">};</a>
+<a name="ln136"> </a>
+<a name="ln137"> </a>
+<a name="ln138">class QuitCommand : public WorkerCommand {</a>
+<a name="ln139">public:</a>
+<a name="ln140">	QuitCommand()</a>
+<a name="ln141">	{</a>
+<a name="ln142">	}</a>
+<a name="ln143"> </a>
+<a name="ln144">	virtual status_t Process(IMAPConnectionWorker&amp; worker)</a>
+<a name="ln145">	{</a>
+<a name="ln146">		WorkerPrivate(worker).Quit();</a>
+<a name="ln147">		return B_OK;</a>
+<a name="ln148">	}</a>
+<a name="ln149">};</a>
+<a name="ln150"> </a>
+<a name="ln151"> </a>
+<a name="ln152">class CheckSubscribedFoldersCommand : public WorkerCommand {</a>
+<a name="ln153">public:</a>
+<a name="ln154">	virtual status_t Process(IMAPConnectionWorker&amp; worker)</a>
+<a name="ln155">	{</a>
+<a name="ln156">		IMAP::Protocol&amp; protocol = WorkerPrivate(worker).Protocol();</a>
+<a name="ln157"> </a>
+<a name="ln158">		// The main worker checks the subscribed folders, and creates</a>
+<a name="ln159">		// other workers as needed</a>
+<a name="ln160">		return worker.Owner().CheckSubscribedFolders(protocol,</a>
+<a name="ln161">			worker.UsesIdle());</a>
+<a name="ln162">	}</a>
+<a name="ln163">};</a>
+<a name="ln164"> </a>
+<a name="ln165"> </a>
+<a name="ln166">class FetchBodiesCommand : public SyncCommand, public IMAP::FetchListener {</a>
+<a name="ln167">public:</a>
+<a name="ln168">	FetchBodiesCommand(IMAPFolder&amp; folder, IMAPMailbox&amp; mailbox,</a>
+<a name="ln169">		MessageUIDList&amp; entries, const BMessenger* replyTo = NULL)</a>
+<a name="ln170">		:</a>
+<a name="ln171">		fFolder(folder),</a>
+<a name="ln172">		fMailbox(mailbox),</a>
+<a name="ln173">		fEntries(entries)</a>
+<a name="ln174">	{</a>
+<a name="ln175">		folder.RegisterPendingBodies(entries, replyTo);</a>
+<a name="ln176">	}</a>
+<a name="ln177"> </a>
+<a name="ln178">	virtual status_t Process(IMAPConnectionWorker&amp; worker)</a>
+<a name="ln179">	{</a>
+<a name="ln180">		IMAP::Protocol&amp; protocol = WorkerPrivate(worker).Protocol();</a>
+<a name="ln181"> </a>
+<a name="ln182">		if (fEntries.empty())</a>
+<a name="ln183">			return B_OK;</a>
+<a name="ln184"> </a>
+<a name="ln185">		fUID = *fEntries.begin();</a>
+<a name="ln186">		fEntries.erase(fEntries.begin());</a>
+<a name="ln187"> </a>
+<a name="ln188">		status_t status = WorkerPrivate(worker).SelectMailbox(fFolder);</a>
+<a name="ln189">		if (status == B_OK) {</a>
+<a name="ln190">			printf(&quot;IMAP: fetch body for %&quot; B_PRIu32 &quot;\n&quot;, fUID);</a>
+<a name="ln191">			// Since RFC3501 does not specify whether the FETCH response may</a>
+<a name="ln192">			// alter the order of the message data items we request, we cannot</a>
+<a name="ln193">			// request more than a single UID at a time, or else we may not be</a>
+<a name="ln194">			// able to assign the data to the correct message beforehand.</a>
+<a name="ln195">			IMAP::FetchCommand fetch(fUID, fUID, IMAP::kFetchBody);</a>
+<a name="ln196">			fetch.SetListener(this);</a>
+<a name="ln197"> </a>
+<a name="ln198">			status = protocol.ProcessCommand(fetch);</a>
+<a name="ln199">		}</a>
+<a name="ln200">		if (status == B_OK)</a>
+<a name="ln201">			status = fFetchStatus;</a>
+<a name="ln202">		if (status != B_OK)</a>
+<a name="ln203">			fFolder.StoringBodyFailed(fRef, fUID, status);</a>
+<a name="ln204"> </a>
+<a name="ln205">		return status;</a>
+<a name="ln206">	}</a>
+<a name="ln207"> </a>
+<a name="ln208">	virtual bool IsDone() const</a>
+<a name="ln209">	{</a>
+<a name="ln210">		return fEntries.empty();</a>
+<a name="ln211">	}</a>
+<a name="ln212"> </a>
+<a name="ln213">	virtual bool FetchData(uint32 fetchFlags, BDataIO&amp; stream, size_t&amp; length)</a>
+<a name="ln214">	{</a>
+<a name="ln215">		fFetchStatus = fFolder.StoreBody(fUID, stream, length, fRef, fFile);</a>
+<a name="ln216">		return true;</a>
+<a name="ln217">	}</a>
+<a name="ln218"> </a>
+<a name="ln219">	virtual void FetchedData(uint32 fetchFlags, uint32 uid, uint32 flags)</a>
+<a name="ln220">	{</a>
+<a name="ln221">		if (fFetchStatus == B_OK)</a>
+<a name="ln222">			fFolder.BodyStored(fRef, fFile, uid);</a>
+<a name="ln223">	}</a>
+<a name="ln224"> </a>
+<a name="ln225">private:</a>
+<a name="ln226">	IMAPFolder&amp;				fFolder;</a>
+<a name="ln227">	IMAPMailbox&amp;			fMailbox;</a>
+<a name="ln228">	MessageUIDList			fEntries;</a>
+<a name="ln229">	uint32					fUID;</a>
+<a name="ln230">	entry_ref				fRef;</a>
+<a name="ln231">	BFile					fFile;</a>
+<a name="ln232">	status_t				fFetchStatus;</a>
+<a name="ln233">};</a>
+<a name="ln234"> </a>
+<a name="ln235"> </a>
+<a name="ln236">class FetchHeadersCommand : public SyncCommand, public IMAP::FetchListener {</a>
+<a name="ln237">public:</a>
+<a name="ln238">	FetchHeadersCommand(IMAPFolder&amp; folder, IMAPMailbox&amp; mailbox,</a>
+<a name="ln239">		MessageUIDList&amp; uids, int32 bodyFetchLimit)</a>
+<a name="ln240">		:</a>
+<a name="ln241">		fFolder(folder),</a>
+<a name="ln242">		fMailbox(mailbox),</a>
+<a name="ln243">		fUIDs(uids),</a>
+<a name="ln244">		fBodyFetchLimit(bodyFetchLimit)</a>
+<a name="ln245">	{</a>
+<a name="ln246">	}</a>
+<a name="ln247"> </a>
+<a name="ln248">	virtual status_t Process(IMAPConnectionWorker&amp; worker)</a>
+<a name="ln249">	{</a>
+<a name="ln250">		IMAP::Protocol&amp; protocol = WorkerPrivate(worker).Protocol();</a>
+<a name="ln251"> </a>
+<a name="ln252">		status_t status = WorkerPrivate(worker).SelectMailbox(fFolder);</a>
+<a name="ln253">		if (status != B_OK)</a>
+<a name="ln254">			return status;</a>
+<a name="ln255"> </a>
+<a name="ln256">		printf(&quot;IMAP: fetch %&quot; B_PRIuSIZE &quot;u headers\n&quot;, fUIDs.size());</a>
+<a name="ln257"> </a>
+<a name="ln258">		IMAP::FetchCommand fetch(fUIDs, kMaxFetchEntries,</a>
+<a name="ln259">			IMAP::kFetchHeader | IMAP::kFetchFlags);</a>
+<a name="ln260">		fetch.SetListener(this);</a>
+<a name="ln261"> </a>
+<a name="ln262">		status = protocol.ProcessCommand(fetch);</a>
+<a name="ln263">		if (status != B_OK)</a>
+<a name="ln264">			return status;</a>
+<a name="ln265"> </a>
+<a name="ln266">		if (IsDone() &amp;&amp; !fFetchBodies.empty()) {</a>
+<a name="ln267">			// Enqueue command to fetch the message bodies</a>
+<a name="ln268">			WorkerPrivate(worker).EnqueueCommand(new FetchBodiesCommand(fFolder,</a>
+<a name="ln269">				fMailbox, fFetchBodies));</a>
+<a name="ln270">		}</a>
+<a name="ln271"> </a>
+<a name="ln272">		return B_OK;</a>
+<a name="ln273">	}</a>
+<a name="ln274"> </a>
+<a name="ln275">	virtual bool IsDone() const</a>
+<a name="ln276">	{</a>
+<a name="ln277">		return fUIDs.empty();</a>
+<a name="ln278">	}</a>
+<a name="ln279"> </a>
+<a name="ln280">	virtual bool FetchData(uint32 fetchFlags, BDataIO&amp; stream, size_t&amp; length)</a>
+<a name="ln281">	{</a>
+<a name="ln282">		fFetchStatus = fFolder.StoreMessage(fetchFlags, stream, length,</a>
+<a name="ln283">			fRef, fFile);</a>
+<a name="ln284">		return true;</a>
+<a name="ln285">	}</a>
+<a name="ln286"> </a>
+<a name="ln287">	virtual void FetchedData(uint32 fetchFlags, uint32 uid, uint32 flags)</a>
+<a name="ln288">	{</a>
+<a name="ln289">		if (fFetchStatus == B_OK) {</a>
+<a name="ln290">			fFolder.MessageStored(fRef, fFile, fetchFlags, uid, flags);</a>
+<a name="ln291"> </a>
+<a name="ln292">			uint32 size = fMailbox.MessageSize(uid);</a>
+<a name="ln293">			if (fBodyFetchLimit &lt; 0 || size &lt; fBodyFetchLimit)</a>
+<a name="ln294">				fFetchBodies.push_back(uid);</a>
+<a name="ln295">		}</a>
+<a name="ln296">	}</a>
+<a name="ln297"> </a>
+<a name="ln298">private:</a>
+<a name="ln299">	IMAPFolder&amp;				fFolder;</a>
+<a name="ln300">	IMAPMailbox&amp;			fMailbox;</a>
+<a name="ln301">	MessageUIDList			fUIDs;</a>
+<a name="ln302">	MessageUIDList			fFetchBodies;</a>
+<a name="ln303">	uint32					fBodyFetchLimit;</a>
+<a name="ln304">	entry_ref				fRef;</a>
+<a name="ln305">	BFile					fFile;</a>
+<a name="ln306">	status_t				fFetchStatus;</a>
+<a name="ln307">};</a>
+<a name="ln308"> </a>
+<a name="ln309"> </a>
+<a name="ln310">class CheckMailboxesCommand : public SyncCommand {</a>
+<a name="ln311">public:</a>
+<a name="ln312">	CheckMailboxesCommand(IMAPConnectionWorker&amp; worker)</a>
+<a name="ln313">		:</a>
+<a name="ln314">		fWorker(worker),</a>
+<a name="ln315">		fFolders(5, false),</a>
+<a name="ln316">		fState(INIT),</a>
+<a name="ln317">		fFolder(NULL),</a>
+<a name="ln318">		fMailbox(NULL)</a>
+<a name="ln319">	{</a>
+<a name="ln320">	}</a>
+<a name="ln321"> </a>
+<a name="ln322">	virtual status_t Process(IMAPConnectionWorker&amp; worker)</a>
+<a name="ln323">	{</a>
+<a name="ln324">		IMAP::Protocol&amp; protocol = WorkerPrivate(worker).Protocol();</a>
+<a name="ln325"> </a>
+<a name="ln326">		if (fState == INIT) {</a>
+<a name="ln327">			// Collect folders</a>
+<a name="ln328">			status_t status = WorkerPrivate(worker).AddFolders(fFolders);</a>
+<a name="ln329">			if (status != B_OK || fFolders.IsEmpty()) {</a>
+<a name="ln330">				fState = DONE;</a>
+<a name="ln331">				return status;</a>
+<a name="ln332">			}</a>
+<a name="ln333"> </a>
+<a name="ln334">			fState = SELECT;</a>
+<a name="ln335">		}</a>
+<a name="ln336"> </a>
+<a name="ln337">		if (fState == SELECT) {</a>
+<a name="ln338">			// Get next mailbox from list, and select it</a>
+<a name="ln339">			fFolder = fFolders.RemoveItemAt(fFolders.CountItems() - 1);</a>
+<a name="ln340">			if (fFolder == NULL) {</a>
+<a name="ln341">				for (int32 i = 0; i &lt; fFetchCommands.CountItems(); i++) {</a>
+<a name="ln342">					WorkerPrivate(worker).EnqueueCommand(</a>
+<a name="ln343">						fFetchCommands.ItemAt(i));</a>
+<a name="ln344">				}</a>
+<a name="ln345"> </a>
+<a name="ln346">				fState = DONE;</a>
+<a name="ln347">				return B_OK;</a>
+<a name="ln348">			}</a>
+<a name="ln349"> </a>
+<a name="ln350">			fMailbox = WorkerPrivate(worker).MailboxFor(*fFolder);</a>
+<a name="ln351"> </a>
+<a name="ln352">			status_t status = WorkerPrivate(worker).SelectMailbox(*fFolder);</a>
+<a name="ln353">			if (status != B_OK)</a>
+<a name="ln354">				return status;</a>
+<a name="ln355"> </a>
+<a name="ln356">			fLastIndex = WorkerPrivate(worker).MessagesExist();</a>
+<a name="ln357">			fFirstIndex = fMailbox-&gt;CountMessages() + 1;</a>
+<a name="ln358">			if (fLastIndex &gt; 0)</a>
+<a name="ln359">				fState = FETCH_ENTRIES;</a>
+<a name="ln360">		}</a>
+<a name="ln361"> </a>
+<a name="ln362">		if (fState == FETCH_ENTRIES) {</a>
+<a name="ln363">			status_t status = WorkerPrivate(worker).SelectMailbox(*fFolder);</a>
+<a name="ln364">			if (status != B_OK)</a>
+<a name="ln365">				return status;</a>
+<a name="ln366"> </a>
+<a name="ln367">			uint32 to = fLastIndex;</a>
+<a name="ln368">			uint32 from = fFirstIndex + kMaxFetchEntries &lt; to</a>
+<a name="ln369">				? fLastIndex - kMaxFetchEntries : fFirstIndex;</a>
+<a name="ln370"> </a>
+<a name="ln371">			printf(&quot;IMAP: get entries from %&quot; B_PRIu32 &quot; to %&quot; B_PRIu32 &quot;\n&quot;,</a>
+<a name="ln372">				from, to);</a>
+<a name="ln373"> </a>
+<a name="ln374">			IMAP::MessageEntryList entries;</a>
+<a name="ln375">			IMAP::FetchMessageEntriesCommand fetch(entries, from, to, false);</a>
+<a name="ln376">			status = protocol.ProcessCommand(fetch);</a>
+<a name="ln377">			if (status != B_OK)</a>
+<a name="ln378">				return status;</a>
+<a name="ln379"> </a>
+<a name="ln380">			// Determine how much we need to download</a>
+<a name="ln381">			// TODO: also retrieve the header size, and only take the body</a>
+<a name="ln382">			// size into account if it's below the limit -- that does not</a>
+<a name="ln383">			// seem to be possible, though</a>
+<a name="ln384">			for (size_t i = 0; i &lt; entries.size(); i++) {</a>
+<a name="ln385">				printf(&quot;%10&quot; B_PRIu32 &quot; %8&quot; B_PRIu32 &quot; bytes, flags: %#&quot;</a>
+<a name="ln386">					B_PRIx32 &quot;\n&quot;, entries[i].uid, entries[i].size,</a>
+<a name="ln387">					entries[i].flags);</a>
+<a name="ln388">				fMailbox-&gt;AddMessageEntry(from + i, entries[i].uid,</a>
+<a name="ln389">					entries[i].flags, entries[i].size);</a>
+<a name="ln390"> </a>
+<a name="ln391">				if (entries[i].uid &gt; fFolder-&gt;LastUID()) {</a>
+<a name="ln392">					fTotalBytes += entries[i].size;</a>
+<a name="ln393">					fUIDsToFetch.push_back(entries[i].uid);</a>
+<a name="ln394">				} else {</a>
+<a name="ln395">					fFolder-&gt;SyncMessageFlags(entries[i].uid, entries[i].flags);</a>
+<a name="ln396">				}</a>
+<a name="ln397">			}</a>
+<a name="ln398"> </a>
+<a name="ln399">			fTotalEntries += fUIDsToFetch.size();</a>
+<a name="ln400">			fLastIndex = from - 1;</a>
+<a name="ln401"> </a>
+<a name="ln402">			if (from == 1) {</a>
+<a name="ln403">				fFolder-&gt;MessageEntriesFetched();</a>
+<a name="ln404"> </a>
+<a name="ln405">				if (fUIDsToFetch.size() &gt; 0) {</a>
+<a name="ln406">					// Add pending command to fetch the message headers</a>
+<a name="ln407">					WorkerCommand* command = new FetchHeadersCommand(*fFolder,</a>
+<a name="ln408">						*fMailbox, fUIDsToFetch,</a>
+<a name="ln409">						WorkerPrivate(worker).BodyFetchLimit());</a>
+<a name="ln410">					if (!fFetchCommands.AddItem(command))</a>
+<a name="ln411">						delete command;</a>
+<a name="ln412"> </a>
+<a name="ln413">					fUIDsToFetch.clear();</a>
+<a name="ln414">				}</a>
+<a name="ln415">				fState = SELECT;</a>
+<a name="ln416">			}</a>
+<a name="ln417">		}</a>
+<a name="ln418"> </a>
+<a name="ln419">		return B_OK;</a>
+<a name="ln420">	}</a>
+<a name="ln421"> </a>
+<a name="ln422">	virtual bool IsDone() const</a>
+<a name="ln423">	{</a>
+<a name="ln424">		return fState == DONE;</a>
+<a name="ln425">	}</a>
+<a name="ln426"> </a>
+<a name="ln427">private:</a>
+<a name="ln428">	enum State {</a>
+<a name="ln429">		INIT,</a>
+<a name="ln430">		SELECT,</a>
+<a name="ln431">		FETCH_ENTRIES,</a>
+<a name="ln432">		DONE</a>
+<a name="ln433">	};</a>
+<a name="ln434"> </a>
+<a name="ln435">	IMAPConnectionWorker&amp;	fWorker;</a>
+<a name="ln436">	BObjectList&lt;IMAPFolder&gt;	fFolders;</a>
+<a name="ln437">	State					fState;</a>
+<a name="ln438">	IMAPFolder*				fFolder;</a>
+<a name="ln439">	IMAPMailbox*			fMailbox;</a>
+<a name="ln440">	uint32					fFirstIndex;</a>
+<a name="ln441">	uint32					fLastIndex;</a>
+<a name="ln442">	uint64					fTotalEntries;</a>
+<a name="ln443">	uint64					fTotalBytes;</a>
+<a name="ln444">	WorkerCommandList		fFetchCommands;</a>
+<a name="ln445">	MessageUIDList			fUIDsToFetch;</a>
+<a name="ln446">};</a>
+<a name="ln447"> </a>
+<a name="ln448"> </a>
+<a name="ln449">class UpdateFlagsCommand : public WorkerCommand {</a>
+<a name="ln450">public:</a>
+<a name="ln451">	UpdateFlagsCommand(IMAPFolder&amp; folder, IMAPMailbox&amp; mailbox,</a>
+<a name="ln452">		MessageUIDList&amp; entries, uint32 flags)</a>
+<a name="ln453">		:</a>
+<a name="ln454">		fFolder(folder),</a>
+<a name="ln455">		fMailbox(mailbox),</a>
+<a name="ln456">		fEntries(entries),</a>
+<a name="ln457">		fFlags(flags)</a>
+<a name="ln458">	{</a>
+<a name="ln459">	}</a>
+<a name="ln460"> </a>
+<a name="ln461">	virtual status_t Process(IMAPConnectionWorker&amp; worker)</a>
+<a name="ln462">	{</a>
+<a name="ln463">		if (fEntries.empty())</a>
+<a name="ln464">			return B_OK;</a>
+<a name="ln465"> </a>
+<a name="ln466">		fUID = *fEntries.begin();</a>
+<a name="ln467">		fEntries.erase(fEntries.begin());</a>
+<a name="ln468"> </a>
+<a name="ln469">		status_t status = WorkerPrivate(worker).SelectMailbox(fFolder);</a>
+<a name="ln470">		if (status == B_OK) {</a>
+<a name="ln471">			IMAP::Protocol&amp; protocol = WorkerPrivate(worker).Protocol();</a>
+<a name="ln472">			IMAP::SetFlagsCommand set(fUID, fFlags);</a>
+<a name="ln473">			status = protocol.ProcessCommand(set);</a>
+<a name="ln474">		}</a>
+<a name="ln475"> </a>
+<a name="ln476">		return status;</a>
+<a name="ln477">	}</a>
+<a name="ln478"> </a>
+<a name="ln479">	virtual bool IsDone() const</a>
+<a name="ln480">	{</a>
+<a name="ln481">		return fEntries.empty();</a>
+<a name="ln482">	}</a>
+<a name="ln483"> </a>
+<a name="ln484">private:</a>
+<a name="ln485">	IMAPFolder&amp;				fFolder;</a>
+<a name="ln486">	IMAPMailbox&amp;			fMailbox;</a>
+<a name="ln487">	MessageUIDList			fEntries;</a>
+<a name="ln488">	uint32					fUID;</a>
+<a name="ln489">	uint32					fFlags;</a>
+<a name="ln490">};</a>
+<a name="ln491"> </a>
+<a name="ln492"> </a>
+<a name="ln493">struct CommandDelete</a>
+<a name="ln494">{</a>
+<a name="ln495">	inline void operator()(WorkerCommand* command)</a>
+<a name="ln496">	{</a>
+<a name="ln497">		delete command;</a>
+<a name="ln498">	}</a>
+<a name="ln499">};</a>
+<a name="ln500"> </a>
+<a name="ln501"> </a>
+<a name="ln502">/*!	An auto deleter similar to ObjectDeleter that calls SyncCommandDone()</a>
+<a name="ln503">	for all SyncCommands.</a>
+<a name="ln504">*/</a>
+<a name="ln505">struct CommandDeleter : BPrivate::AutoDeleter&lt;WorkerCommand, CommandDelete&gt;</a>
+<a name="ln506">{</a>
+<a name="ln507">	CommandDeleter(IMAPConnectionWorker&amp; worker, WorkerCommand* command)</a>
+<a name="ln508">		:</a>
+<a name="ln509">		BPrivate::AutoDeleter&lt;WorkerCommand, CommandDelete&gt;(command),</a>
+<a name="ln510">		fWorker(worker)</a>
+<a name="ln511">	{</a>
+<a name="ln512">	}</a>
+<a name="ln513"> </a>
+<a name="ln514">	~CommandDeleter()</a>
+<a name="ln515">	{</a>
+<a name="ln516">		if (dynamic_cast&lt;SyncCommand*&gt;(fObject) != NULL)</a>
+<a name="ln517">			WorkerPrivate(fWorker).SyncCommandDone();</a>
+<a name="ln518">	}</a>
+<a name="ln519"> </a>
+<a name="ln520">private:</a>
+<a name="ln521">	IMAPConnectionWorker&amp;	fWorker;</a>
+<a name="ln522">};</a>
+<a name="ln523"> </a>
+<a name="ln524"> </a>
+<a name="ln525">// #pragma mark -</a>
+<a name="ln526"> </a>
+<a name="ln527"> </a>
+<a name="ln528">IMAPConnectionWorker::IMAPConnectionWorker(IMAPProtocol&amp; owner,</a>
+<a name="ln529">	const Settings&amp; settings, bool main)</a>
+<a name="ln530">	:</a>
+<a name="ln531">	fOwner(owner),</a>
+<a name="ln532">	fSettings(settings),</a>
+<a name="ln533">	fPendingCommandsSemaphore(-1),</a>
+<a name="ln534">	fIdleBox(NULL),</a>
+<a name="ln535">	fMain(main),</a>
+<a name="ln536">	fStopped(false)</a>
+<a name="ln537">{</a>
+<a name="ln538">	fExistsHandler.SetListener(this);</a>
+<a name="ln539">	fProtocol.AddHandler(fExistsHandler);</a>
+<a name="ln540"> </a>
+<a name="ln541">	fExpungeHandler.SetListener(this);</a>
+<a name="ln542">	fProtocol.AddHandler(fExpungeHandler);</a>
+<a name="ln543">}</a>
+<a name="ln544"> </a>
+<a name="ln545"> </a>
+<a name="ln546">IMAPConnectionWorker::~IMAPConnectionWorker()</a>
+<a name="ln547">{</a>
+<a name="ln548">	puts(&quot;worker quit&quot;);</a>
+<a name="ln549">	delete_sem(fPendingCommandsSemaphore);</a>
+<a name="ln550">	_Disconnect();</a>
+<a name="ln551">}</a>
+<a name="ln552"> </a>
+<a name="ln553"> </a>
+<a name="ln554">bool</a>
+<a name="ln555">IMAPConnectionWorker::HasMailboxes() const</a>
+<a name="ln556">{</a>
+<a name="ln557">	BAutolock locker(const_cast&lt;IMAPConnectionWorker*&gt;(this)-&gt;fLocker);</a>
+<a name="ln558">	return !fMailboxes.empty();</a>
+<a name="ln559">}</a>
+<a name="ln560"> </a>
+<a name="ln561"> </a>
+<a name="ln562">uint32</a>
+<a name="ln563">IMAPConnectionWorker::CountMailboxes() const</a>
+<a name="ln564">{</a>
+<a name="ln565">	BAutolock locker(const_cast&lt;IMAPConnectionWorker*&gt;(this)-&gt;fLocker);</a>
+<a name="ln566">	return fMailboxes.size();</a>
+<a name="ln567">}</a>
+<a name="ln568"> </a>
+<a name="ln569"> </a>
+<a name="ln570">void</a>
+<a name="ln571">IMAPConnectionWorker::AddMailbox(IMAPFolder* folder)</a>
+<a name="ln572">{</a>
+<a name="ln573">	BAutolock locker(fLocker);</a>
+<a name="ln574"> </a>
+<a name="ln575">	fMailboxes.insert(std::make_pair(folder, (IMAPMailbox*)NULL));</a>
+<a name="ln576"> </a>
+<a name="ln577">	// Prefer to have the INBOX in idle mode over other mail boxes</a>
+<a name="ln578">	if (fIdleBox == NULL || folder-&gt;MailboxName().ICompare(&quot;INBOX&quot;) == 0)</a>
+<a name="ln579">		fIdleBox = folder;</a>
+<a name="ln580">}</a>
+<a name="ln581"> </a>
+<a name="ln582"> </a>
+<a name="ln583">void</a>
+<a name="ln584">IMAPConnectionWorker::RemoveAllMailboxes()</a>
+<a name="ln585">{</a>
+<a name="ln586">	BAutolock locker(fLocker);</a>
+<a name="ln587"> </a>
+<a name="ln588">	// Reset listeners, and delete the mailboxes</a>
+<a name="ln589">	MailboxMap::iterator iterator = fMailboxes.begin();</a>
+<a name="ln590">	for (; iterator != fMailboxes.end(); iterator++) {</a>
+<a name="ln591">		iterator-&gt;first-&gt;SetListener(NULL);</a>
+<a name="ln592">		delete iterator-&gt;second;</a>
+<a name="ln593">	}</a>
+<a name="ln594"> </a>
+<a name="ln595">	fIdleBox = NULL;</a>
+<a name="ln596">	fMailboxes.clear();</a>
+<a name="ln597">}</a>
+<a name="ln598"> </a>
+<a name="ln599"> </a>
+<a name="ln600">status_t</a>
+<a name="ln601">IMAPConnectionWorker::Run()</a>
+<a name="ln602">{</a>
+<a name="ln603">	fPendingCommandsSemaphore = create_sem(0, &quot;imap pending commands&quot;);</a>
+<a name="ln604">	if (fPendingCommandsSemaphore &lt; 0)</a>
+<a name="ln605">		return fPendingCommandsSemaphore;</a>
+<a name="ln606"> </a>
+<a name="ln607">	fThread = spawn_thread(&amp;_Worker, &quot;imap connection worker&quot;,</a>
+<a name="ln608">		B_NORMAL_PRIORITY, this);</a>
+<a name="ln609">	if (fThread &lt; 0)</a>
+<a name="ln610">		return fThread;</a>
+<a name="ln611"> </a>
+<a name="ln612">	resume_thread(fThread);</a>
+<a name="ln613">	return B_OK;</a>
+<a name="ln614">}</a>
+<a name="ln615"> </a>
+<a name="ln616"> </a>
+<a name="ln617">void</a>
+<a name="ln618">IMAPConnectionWorker::Quit()</a>
+<a name="ln619">{</a>
+<a name="ln620">	printf(&quot;IMAP: worker %p: enqueue quit\n&quot;, this);</a>
+<a name="ln621">	BAutolock qlocker(fQueueLocker);</a>
+<a name="ln622">	while (!fPendingCommands.IsEmpty())</a>
+<a name="ln623">		delete(fPendingCommands.RemoveItemAt(0));</a>
+<a name="ln624">	_EnqueueCommand(new QuitCommand());</a>
+<a name="ln625">}</a>
+<a name="ln626"> </a>
+<a name="ln627"> </a>
+<a name="ln628">status_t</a>
+<a name="ln629">IMAPConnectionWorker::EnqueueCheckSubscribedFolders()</a>
+<a name="ln630">{</a>
+<a name="ln631">	printf(&quot;IMAP: worker %p: enqueue check subscribed folders\n&quot;, this);</a>
+<a name="ln632">	return _EnqueueCommand(new CheckSubscribedFoldersCommand());</a>
+<a name="ln633">}</a>
+<a name="ln634"> </a>
+<a name="ln635"> </a>
+<a name="ln636">status_t</a>
+<a name="ln637">IMAPConnectionWorker::EnqueueCheckMailboxes()</a>
+<a name="ln638">{</a>
+<a name="ln639">	// Do not schedule checking mailboxes again if we're still working on</a>
+<a name="ln640">	// those.</a>
+<a name="ln641">	if (fSyncPending &gt; 0)</a>
+<a name="ln642">		return B_OK;</a>
+<a name="ln643"> </a>
+<a name="ln644">	printf(&quot;IMAP: worker %p: enqueue check mailboxes\n&quot;, this);</a>
+<a name="ln645">	return _EnqueueCommand(new CheckMailboxesCommand(*this));</a>
+<a name="ln646">}</a>
+<a name="ln647"> </a>
+<a name="ln648"> </a>
+<a name="ln649">status_t</a>
+<a name="ln650">IMAPConnectionWorker::EnqueueFetchBody(IMAPFolder&amp; folder, uint32 uid,</a>
+<a name="ln651">	const BMessenger&amp; replyTo)</a>
+<a name="ln652">{</a>
+<a name="ln653">	IMAPMailbox* mailbox = _MailboxFor(folder);</a>
+<a name="ln654">	if (mailbox == NULL)</a>
+<a name="ln655">		return B_ENTRY_NOT_FOUND;</a>
+<a name="ln656"> </a>
+<a name="ln657">	std::vector&lt;uint32&gt; uids;</a>
+<a name="ln658">	uids.push_back(uid);</a>
+<a name="ln659"> </a>
+<a name="ln660">	return _EnqueueCommand(new FetchBodiesCommand(folder, *mailbox, uids,</a>
+<a name="ln661">		&amp;replyTo));</a>
+<a name="ln662">}</a>
+<a name="ln663"> </a>
+<a name="ln664"> </a>
+<a name="ln665">status_t</a>
+<a name="ln666">IMAPConnectionWorker::EnqueueUpdateFlags(IMAPFolder&amp; folder, uint32 uid,</a>
+<a name="ln667">	uint32 flags)</a>
+<a name="ln668">{</a>
+<a name="ln669">	IMAPMailbox* mailbox = _MailboxFor(folder);</a>
+<a name="ln670">	if (mailbox == NULL)</a>
+<a name="ln671">		return B_ENTRY_NOT_FOUND;</a>
+<a name="ln672"> </a>
+<a name="ln673">	std::vector&lt;uint32&gt; uids;</a>
+<a name="ln674">	uids.push_back(uid);</a>
+<a name="ln675"> </a>
+<a name="ln676">	return _EnqueueCommand(new UpdateFlagsCommand(folder, *mailbox, uids,</a>
+<a name="ln677">		flags));</a>
+<a name="ln678">}</a>
+<a name="ln679"> </a>
+<a name="ln680"> </a>
+<a name="ln681">// #pragma mark - Handler listener</a>
+<a name="ln682"> </a>
+<a name="ln683"> </a>
+<a name="ln684">void</a>
+<a name="ln685">IMAPConnectionWorker::MessageExistsReceived(uint32 count)</a>
+<a name="ln686">{</a>
+<a name="ln687">	printf(&quot;Message exists: %&quot; B_PRIu32 &quot;\n&quot;, count);</a>
+<a name="ln688">	fMessagesExist = count;</a>
+<a name="ln689"> </a>
+<a name="ln690">	// TODO: We might want to trigger another check even during sync</a>
+<a name="ln691">	// (but only one), if this isn't the result of a SELECT</a>
+<a name="ln692">	EnqueueCheckMailboxes();</a>
+<a name="ln693">}</a>
+<a name="ln694"> </a>
+<a name="ln695"> </a>
+<a name="ln696">void</a>
+<a name="ln697">IMAPConnectionWorker::MessageExpungeReceived(uint32 index)</a>
+<a name="ln698">{</a>
+<a name="ln699">	printf(&quot;Message expunge: %&quot; B_PRIu32 &quot;\n&quot;, index);</a>
+<a name="ln700">	if (fSelectedBox == NULL)</a>
+<a name="ln701">		return;</a>
+<a name="ln702"> </a>
+<a name="ln703">	BAutolock locker(fLocker);</a>
+<a name="ln704"> </a>
+<a name="ln705">	IMAPMailbox* mailbox = _MailboxFor(*fSelectedBox);</a>
+<a name="ln706">	if (mailbox != NULL) {</a>
+<a name="ln707">		mailbox-&gt;RemoveMessageEntry(index);</a>
+<a name="ln708">		// TODO: remove message from folder</a>
+<a name="ln709">	}</a>
+<a name="ln710">}</a>
+<a name="ln711"> </a>
+<a name="ln712"> </a>
+<a name="ln713">// #pragma mark - private</a>
+<a name="ln714"> </a>
+<a name="ln715"> </a>
+<a name="ln716">status_t</a>
+<a name="ln717">IMAPConnectionWorker::_Worker()</a>
+<a name="ln718">{</a>
+<a name="ln719">	status_t status = B_OK;</a>
+<a name="ln720"> </a>
+<a name="ln721">	while (!fStopped) {</a>
+<a name="ln722">		BAutolock qlocker(fQueueLocker);</a>
+<a name="ln723"> </a>
+<a name="ln724">		if (fPendingCommands.IsEmpty()) {</a>
+<a name="ln725">			if (!fIdle)</a>
+<a name="ln726">				_Disconnect();</a>
+<a name="ln727">			qlocker.Unlock();</a>
+<a name="ln728"> </a>
+<a name="ln729">			// TODO: in idle mode, we'd need to parse any incoming message here</a>
+<a name="ln730">			_WaitForCommands();</a>
+<a name="ln731">			continue;</a>
+<a name="ln732">		}</a>
+<a name="ln733"> </a>
+<a name="ln734">		WorkerCommand* command = fPendingCommands.RemoveItemAt(0);</a>
+<a name="ln735">		if (command == NULL)</a>
+<a name="ln736">			continue;</a>
+<a name="ln737"> </a>
+<a name="ln738">		qlocker.Unlock();</a>
+<a name="ln739">		BAutolock locker(fLocker);</a>
+<a name="ln740">		CommandDeleter deleter(*this, command);</a>
+<a name="ln741"> </a>
+<a name="ln742">		if (dynamic_cast&lt;QuitCommand*&gt;(command) == NULL) { // do not connect on QuitCommand</a>
+<a name="ln743">			status = _Connect();</a>
+<a name="ln744">			if (status != B_OK)</a>
+<a name="ln745">				break;</a>
+<a name="ln746">		}</a>
+<a name="ln747"> </a>
+<a name="ln748">		status = command-&gt;Process(*this);</a>
+<a name="ln749">		if (status != B_OK)</a>
+<a name="ln750">			break;</a>
+<a name="ln751"> </a>
+<a name="ln752">		if (!command-&gt;IsDone()) {</a>
+<a name="ln753">			deleter.Detach();</a>
+<a name="ln754">			command-&gt;SetContinuation();</a>
+<a name="ln755">			locker.Unlock();</a>
+<a name="ln756">			_EnqueueCommand(command);</a>
+<a name="ln757">		}</a>
+<a name="ln758">	}</a>
+<a name="ln759"> </a>
+<a name="ln760">	fOwner.WorkerQuit(this);</a>
+<a name="ln761">	return status;</a>
+<a name="ln762">}</a>
+<a name="ln763"> </a>
+<a name="ln764"> </a>
+<a name="ln765">/*!	Enqueues the given command to the worker queue. This method will take</a>
+<a name="ln766">	over ownership of the given command even in the error case.</a>
+<a name="ln767">*/</a>
+<a name="ln768">status_t</a>
+<a name="ln769">IMAPConnectionWorker::_EnqueueCommand(WorkerCommand* command)</a>
+<a name="ln770">{</a>
+<a name="ln771">	BAutolock qlocker(fQueueLocker);</a>
+<a name="ln772"> </a>
+<a name="ln773">	if (!fPendingCommands.AddItem(command)) {</a>
+<a name="ln774">		delete command;</a>
+<a name="ln775">		return B_NO_MEMORY;</a>
+<a name="ln776">	}</a>
+<a name="ln777"> </a>
+<a name="ln778">	if (dynamic_cast&lt;SyncCommand*&gt;(command) != NULL</a>
+<a name="ln779">		&amp;&amp; !command-&gt;IsContinuation())</a>
+<a name="ln780">		fSyncPending++;</a>
+<a name="ln781"> </a>
+<a name="ln782">	qlocker.Unlock();</a>
+<a name="ln783">	release_sem(fPendingCommandsSemaphore);</a>
+<a name="ln784">	return B_OK;</a>
+<a name="ln785">}</a>
+<a name="ln786"> </a>
+<a name="ln787"> </a>
+<a name="ln788">void</a>
+<a name="ln789">IMAPConnectionWorker::_WaitForCommands()</a>
+<a name="ln790">{</a>
+<a name="ln791">	int32 count = 1;</a>
+<a name="ln792">	get_sem_count(fPendingCommandsSemaphore, &amp;count);</a>
+<a name="ln793">	if (count &lt; 1)</a>
+<a name="ln794">		count = 1;</a>
+<a name="ln795"> </a>
+<a name="ln796">	while (acquire_sem_etc(fPendingCommandsSemaphore, count, 0,</a>
+<a name="ln797">			B_INFINITE_TIMEOUT) == B_INTERRUPTED);</a>
+<a name="ln798">}</a>
+<a name="ln799"> </a>
+<a name="ln800"> </a>
+<a name="ln801">status_t</a>
+<a name="ln802">IMAPConnectionWorker::_SelectMailbox(IMAPFolder&amp; folder, uint32* _nextUID)</a>
+<a name="ln803">{</a>
+<a name="ln804">	if (fSelectedBox == &amp;folder &amp;&amp; _nextUID == NULL)</a>
+<a name="ln805">		return B_OK;</a>
+<a name="ln806"> </a>
+<a name="ln807">	IMAP::SelectCommand select(folder.MailboxName().String());</a>
+<a name="ln808"> </a>
+<a name="ln809">	status_t status = fProtocol.ProcessCommand(select);</a>
+<a name="ln810">	if (status == B_OK) {</a>
+<a name="ln811">		folder.SetUIDValidity(select.UIDValidity());</a>
+<a name="ln812">		if (_nextUID != NULL)</a>
+<a name="ln813">			*_nextUID = select.NextUID();</a>
+<a name="ln814">		fSelectedBox = &amp;folder;</a>
+<a name="ln815">	}</a>
+<a name="ln816"> </a>
+<a name="ln817">	return status;</a>
+<a name="ln818">}</a>
+<a name="ln819"> </a>
+<a name="ln820"> </a>
+<a name="ln821">IMAPMailbox*</a>
+<a name="ln822">IMAPConnectionWorker::_MailboxFor(IMAPFolder&amp; folder)</a>
+<a name="ln823">{</a>
+<a name="ln824">	MailboxMap::iterator found = fMailboxes.find(&amp;folder);</a>
+<a name="ln825">	if (found == fMailboxes.end())</a>
+<a name="ln826">		return NULL;</a>
+<a name="ln827"> </a>
+<a name="ln828">	IMAPMailbox* mailbox = found-&gt;second;</a>
+<a name="ln829">	if (mailbox == NULL) {</a>
+<a name="ln830">		mailbox = new IMAPMailbox(fProtocol, folder.MailboxName());</a>
+<a name="ln831">		folder.SetListener(mailbox);</a>
+<a name="ln832">		found-&gt;second = mailbox;</a>
+<a name="ln833">	}</a>
+<a name="ln834">	return mailbox;</a>
+<a name="ln835">}</a>
+<a name="ln836"> </a>
+<a name="ln837"> </a>
+<a name="ln838">void</a>
+<a name="ln839">IMAPConnectionWorker::_SyncCommandDone()</a>
+<a name="ln840">{</a>
+<a name="ln841">	fSyncPending--;</a>
+<a name="ln842">}</a>
+<a name="ln843"> </a>
+<a name="ln844"> </a>
+<a name="ln845">bool</a>
+<a name="ln846">IMAPConnectionWorker::_IsQuitPending()</a>
+<a name="ln847">{</a>
+<a name="ln848">	BAutolock locker(fQueueLocker);</a>
+<a name="ln849">	WorkerCommand* nextCommand = fPendingCommands.ItemAt(0);</a>
+<a name="ln850">	return dynamic_cast&lt;QuitCommand*&gt;(nextCommand) != NULL;</a>
+<a name="ln851">}</a>
+<a name="ln852"> </a>
+<a name="ln853"> </a>
+<a name="ln854">status_t</a>
+<a name="ln855">IMAPConnectionWorker::_Connect()</a>
+<a name="ln856">{</a>
+<a name="ln857">	if (fProtocol.IsConnected())</a>
+<a name="ln858">		return B_OK;</a>
+<a name="ln859"> </a>
+<a name="ln860">	status_t status = B_INTERRUPTED;</a>
+<a name="ln861">	int tries = 10;</a>
+<a name="ln862">	while (tries-- &gt; 0) {</a>
+<a name="ln863">		if (_IsQuitPending())</a>
+<a name="ln864">			break;</a>
+<a name="ln865">		status = fProtocol.Connect(fSettings.ServerAddress(),</a>
+<a name="ln866">			fSettings.Username(), fSettings.Password(), fSettings.UseSSL());</a>
+<a name="ln867">		if (status == B_OK)</a>
+<a name="ln868">			break;</a>
+<a name="ln869"> </a>
+<a name="ln870">		// Wait for 1 second, and try again</a>
+<a name="ln871">		snooze(1000000);</a>
+<a name="ln872">	}</a>
+<a name="ln873">	// TODO: if other workers are connected, but it fails for us, we need to</a>
+<a name="ln874">	// remove this worker, and reduce the number of concurrent connections</a>
+<a name="ln875">	if (status != B_OK)</a>
+<a name="ln876">		return status;</a>
+<a name="ln877"> </a>
+<a name="ln878">	//fIdle = fSettings.IdleMode() &amp;&amp; fProtocol.Capabilities().Contains(&quot;IDLE&quot;);</a>
+<a name="ln879">	// TODO: Idle mode is not yet implemented!</a>
+<a name="ln880">	fIdle = false;</a>
+<a name="ln881">	return B_OK;</a>
+<a name="ln882">}</a>
+<a name="ln883"> </a>
+<a name="ln884"> </a>
+<a name="ln885">void</a>
+<a name="ln886">IMAPConnectionWorker::_Disconnect()</a>
+<a name="ln887">{</a>
+<a name="ln888">	fProtocol.Disconnect();</a>
+<a name="ln889">	fSelectedBox = NULL;</a>
+<a name="ln890">}</a>
+<a name="ln891"> </a>
+<a name="ln892"> </a>
+<a name="ln893">/*static*/ status_t</a>
+<a name="ln894">IMAPConnectionWorker::_Worker(void* _self)</a>
+<a name="ln895">{</a>
+<a name="ln896">	IMAPConnectionWorker* self = (IMAPConnectionWorker*)_self;</a>
+<a name="ln897">	status_t status = self-&gt;_Worker();</a>
+<a name="ln898"> </a>
+<a name="ln899">	delete self;</a>
+<a name="ln900">	return status;</a>
+<a name="ln901">}</a>
+
+</code></pre>
+<div class="balloon" rel="312"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fFirstIndex, fLastIndex, fTotalEntries, fTotalBytes.</p></div>
+<div class="balloon" rel="451"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fUID.</p></div>
+<div class="balloon" rel="238"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fFetchStatus.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

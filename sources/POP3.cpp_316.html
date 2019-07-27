@@ -1,0 +1,992 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>POP3.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2007-2016, Haiku, Inc. All rights reserved.</a>
+<a name="ln3"> * Copyright 2001-2002 Dr. Zoidberg Enterprises. All rights reserved.</a>
+<a name="ln4"> * Copyright 2011, Clemens Zeidler &lt;haiku@clemens-zeidler.de&gt;</a>
+<a name="ln5"> *</a>
+<a name="ln6"> * Distributed under the terms of the MIT License.</a>
+<a name="ln7"> */</a>
+<a name="ln8"> </a>
+<a name="ln9"> </a>
+<a name="ln10">//! POP3Protocol - implementation of the POP3 protocol</a>
+<a name="ln11"> </a>
+<a name="ln12"> </a>
+<a name="ln13">#include &quot;POP3.h&quot;</a>
+<a name="ln14"> </a>
+<a name="ln15">#include &lt;errno.h&gt;</a>
+<a name="ln16">#include &lt;netdb.h&gt;</a>
+<a name="ln17">#include &lt;stdio.h&gt;</a>
+<a name="ln18">#include &lt;stdlib.h&gt;</a>
+<a name="ln19">#include &lt;sys/socket.h&gt;</a>
+<a name="ln20">#include &lt;sys/time.h&gt;</a>
+<a name="ln21">#include &lt;unistd.h&gt;</a>
+<a name="ln22"> </a>
+<a name="ln23">#include &lt;arpa/inet.h&gt;</a>
+<a name="ln24"> </a>
+<a name="ln25">#include &quot;md5.h&quot;</a>
+<a name="ln26"> </a>
+<a name="ln27">#include &lt;Alert.h&gt;</a>
+<a name="ln28">#include &lt;Catalog.h&gt;</a>
+<a name="ln29">#include &lt;Debug.h&gt;</a>
+<a name="ln30">#include &lt;Directory.h&gt;</a>
+<a name="ln31">#include &lt;fs_attr.h&gt;</a>
+<a name="ln32">#include &lt;Path.h&gt;</a>
+<a name="ln33">#include &lt;SecureSocket.h&gt;</a>
+<a name="ln34">#include &lt;String.h&gt;</a>
+<a name="ln35">#include &lt;VolumeRoster.h&gt;</a>
+<a name="ln36">#include &lt;Query.h&gt;</a>
+<a name="ln37"> </a>
+<a name="ln38">#include &lt;mail_util.h&gt;</a>
+<a name="ln39"> </a>
+<a name="ln40">#include &quot;crypt.h&quot;</a>
+<a name="ln41">#include &quot;MailSettings.h&quot;</a>
+<a name="ln42">#include &quot;MessageIO.h&quot;</a>
+<a name="ln43"> </a>
+<a name="ln44"> </a>
+<a name="ln45">#undef B_TRANSLATION_CONTEXT</a>
+<a name="ln46">#define B_TRANSLATION_CONTEXT &quot;pop3&quot;</a>
+<a name="ln47"> </a>
+<a name="ln48"> </a>
+<a name="ln49">#define POP3_RETRIEVAL_TIMEOUT 60000000</a>
+<a name="ln50">#define CRLF	&quot;\r\n&quot;</a>
+<a name="ln51"> </a>
+<a name="ln52"> </a>
+<a name="ln53">static void</a>
+<a name="ln54">NotHere(BStringList&amp; that, BStringList&amp; otherList, BStringList* results)</a>
+<a name="ln55">{</a>
+<a name="ln56">	for (int32 i = 0; i &lt; otherList.CountStrings(); i++) {</a>
+<a name="ln57">		if (!that.HasString(otherList.StringAt(i)))</a>
+<a name="ln58">			results-&gt;Add(otherList.StringAt(i));</a>
+<a name="ln59">	}</a>
+<a name="ln60">}</a>
+<a name="ln61"> </a>
+<a name="ln62"> </a>
+<a name="ln63">// #pragma mark -</a>
+<a name="ln64"> </a>
+<a name="ln65"> </a>
+<a name="ln66">POP3Protocol::POP3Protocol(const BMailAccountSettings&amp; settings)</a>
+<a name="ln67">	:</a>
+<a name="ln68">	BInboundMailProtocol(&quot;POP3&quot;, settings),</a>
+<a name="ln69">	fNumMessages(-1),</a>
+<a name="ln70">	fMailDropSize(0),</a>
+<a name="ln71">	fServerConnection(NULL)</a>
+<a name="ln72">{</a>
+<a name="ln73">	printf(&quot;POP3Protocol::POP3Protocol(BMailAccountSettings* settings)\n&quot;);</a>
+<a name="ln74">	fSettings = fAccountSettings.InboundSettings();</a>
+<a name="ln75"> </a>
+<a name="ln76">	fUseSSL = fSettings.FindInt32(&quot;flavor&quot;) == 1 ? true : false;</a>
+<a name="ln77"> </a>
+<a name="ln78">	if (fSettings.FindString(&quot;destination&quot;, &amp;fDestinationDir) != B_OK)</a>
+<a name="ln79">		fDestinationDir = &quot;/boot/home/mail/in&quot;;</a>
+<a name="ln80"> </a>
+<a name="ln81">	create_directory(fDestinationDir, 0777);</a>
+<a name="ln82"> </a>
+<a name="ln83">	fFetchBodyLimit = -1;</a>
+<a name="ln84">	if (fSettings.HasInt32(&quot;partial_download_limit&quot;))</a>
+<a name="ln85">		fFetchBodyLimit = fSettings.FindInt32(&quot;partial_download_limit&quot;);</a>
+<a name="ln86">}</a>
+<a name="ln87"> </a>
+<a name="ln88"> </a>
+<a name="ln89">POP3Protocol::~POP3Protocol()</a>
+<a name="ln90">{</a>
+<a name="ln91">	Disconnect();</a>
+<a name="ln92">}</a>
+<a name="ln93"> </a>
+<a name="ln94"> </a>
+<a name="ln95">status_t</a>
+<a name="ln96">POP3Protocol::Connect()</a>
+<a name="ln97">{</a>
+<a name="ln98">	status_t error = Open(fSettings.FindString(&quot;server&quot;),</a>
+<a name="ln99">		fSettings.FindInt32(&quot;port&quot;), fSettings.FindInt32(&quot;flavor&quot;));</a>
+<a name="ln100">	if (error != B_OK)</a>
+<a name="ln101">		return error;</a>
+<a name="ln102"> </a>
+<a name="ln103">	char* password = get_passwd(&amp;fSettings, &quot;cpasswd&quot;);</a>
+<a name="ln104"> </a>
+<a name="ln105">	error = Login(fSettings.FindString(&quot;username&quot;), password,</a>
+<a name="ln106">		fSettings.FindInt32(&quot;auth_method&quot;));</a>
+<a name="ln107">	delete[] password;</a>
+<a name="ln108"> </a>
+<a name="ln109">	if (error != B_OK)</a>
+<a name="ln110">		fServerConnection-&gt;Disconnect();</a>
+<a name="ln111">	return error;</a>
+<a name="ln112">}</a>
+<a name="ln113"> </a>
+<a name="ln114"> </a>
+<a name="ln115">status_t</a>
+<a name="ln116">POP3Protocol::Disconnect()</a>
+<a name="ln117">{</a>
+<a name="ln118">	if (fServerConnection == NULL)</a>
+<a name="ln119">		return B_OK;</a>
+<a name="ln120"> </a>
+<a name="ln121">	SendCommand(&quot;QUIT&quot; CRLF);</a>
+<a name="ln122"> </a>
+<a name="ln123">	fServerConnection-&gt;Disconnect();</a>
+<a name="ln124">	delete fServerConnection;</a>
+<a name="ln125">	fServerConnection = NULL;</a>
+<a name="ln126"> </a>
+<a name="ln127">	return B_OK;</a>
+<a name="ln128">}</a>
+<a name="ln129"> </a>
+<a name="ln130"> </a>
+<a name="ln131">status_t</a>
+<a name="ln132">POP3Protocol::SyncMessages()</a>
+<a name="ln133">{</a>
+<a name="ln134">	bool leaveOnServer;</a>
+<a name="ln135">	if (fSettings.FindBool(&quot;leave_mail_on_server&quot;, &amp;leaveOnServer) != B_OK)</a>
+<a name="ln136">		leaveOnServer = true;</a>
+<a name="ln137"> </a>
+<a name="ln138">	// create directory if not exist</a>
+<a name="ln139">	create_directory(fDestinationDir, 0777);</a>
+<a name="ln140"> </a>
+<a name="ln141">	printf(&quot;POP3Protocol::SyncMessages()\n&quot;);</a>
+<a name="ln142">	_ReadManifest();</a>
+<a name="ln143"> </a>
+<a name="ln144">	SetTotalItems(2);</a>
+<a name="ln145">	ReportProgress(1, 0, B_TRANSLATE(&quot;Connect to server&quot; B_UTF8_ELLIPSIS));</a>
+<a name="ln146"> </a>
+<a name="ln147">	status_t error = Connect();</a>
+<a name="ln148">	if (error != B_OK) {</a>
+<a name="ln149">		printf(&quot;POP3 could not connect: %s\n&quot;, strerror(error));</a>
+<a name="ln150">		ResetProgress();</a>
+<a name="ln151">		return error;</a>
+<a name="ln152">	}</a>
+<a name="ln153"> </a>
+<a name="ln154">	ReportProgress(1, 0, B_TRANSLATE(&quot;Getting UniqueIDs&quot; B_UTF8_ELLIPSIS));</a>
+<a name="ln155"> </a>
+<a name="ln156">	error = _RetrieveUniqueIDs();</a>
+<a name="ln157">	if (error &lt; B_OK) {</a>
+<a name="ln158">		ResetProgress();</a>
+<a name="ln159">		Disconnect();</a>
+<a name="ln160">		return error;</a>
+<a name="ln161">	}</a>
+<a name="ln162"> </a>
+<a name="ln163">	BStringList toDownload;</a>
+<a name="ln164">	NotHere(fManifest, fUniqueIDs, &amp;toDownload);</a>
+<a name="ln165"> </a>
+<a name="ln166">	int32 numMessages = toDownload.CountStrings();</a>
+<a name="ln167">	if (numMessages == 0) {</a>
+<a name="ln168">		CheckForDeletedMessages();</a>
+<a name="ln169">		ResetProgress();</a>
+<a name="ln170">		Disconnect();</a>
+<a name="ln171">		return B_OK;</a>
+<a name="ln172">	}</a>
+<a name="ln173"> </a>
+<a name="ln174">	ResetProgress();</a>
+<a name="ln175">	SetTotalItems(toDownload.CountStrings());</a>
+<a name="ln176">	SetTotalItemsSize(fTotalSize);</a>
+<a name="ln177"> </a>
+<a name="ln178">	printf(&quot;POP3: Messages to download: %i\n&quot;, (int)toDownload.CountStrings());</a>
+<a name="ln179">	for (int32 i = 0; i &lt; toDownload.CountStrings(); i++) {</a>
+<a name="ln180">		const char* uid = toDownload.StringAt(i);</a>
+<a name="ln181">		int32 toRetrieve = fUniqueIDs.IndexOf(uid);</a>
+<a name="ln182"> </a>
+<a name="ln183">		if (toRetrieve &lt; 0) {</a>
+<a name="ln184">			// should not happen!</a>
+<a name="ln185">			error = B_NAME_NOT_FOUND;</a>
+<a name="ln186">			printf(&quot;POP3: uid %s index %i not found in fUniqueIDs!\n&quot;, uid,</a>
+<a name="ln187">				(int)toRetrieve);</a>
+<a name="ln188">			continue;</a>
+<a name="ln189">		}</a>
+<a name="ln190"> </a>
+<a name="ln191">		BPath path(fDestinationDir);</a>
+<a name="ln192">		BString fileName = &quot;Downloading file... uid: &quot;;</a>
+<a name="ln193">		fileName += uid;</a>
+<a name="ln194">		fileName.ReplaceAll(&quot;/&quot;, &quot;_SLASH_&quot;);</a>
+<a name="ln195">		path.Append(fileName);</a>
+<a name="ln196">		BEntry entry(path.Path());</a>
+<a name="ln197">		BFile file(&amp;entry, B_READ_WRITE | B_CREATE_FILE | B_ERASE_FILE);</a>
+<a name="ln198">		error = file.InitCheck();</a>
+<a name="ln199">		if (error != B_OK) {</a>
+<a name="ln200">			printf(&quot;POP3: Can't create file %s\n &quot;, path.Path());</a>
+<a name="ln201">			break;</a>
+<a name="ln202">		}</a>
+<a name="ln203">		BMailMessageIO mailIO(this, &amp;file, toRetrieve);</a>
+<a name="ln204">		BMessage attributes;</a>
+<a name="ln205"> </a>
+<a name="ln206">		entry_ref ref;</a>
+<a name="ln207">		entry.GetRef(&amp;ref);</a>
+<a name="ln208"> </a>
+<a name="ln209">		int32 size = MessageSize(toRetrieve);</a>
+<a name="ln210">		if (fFetchBodyLimit &lt; 0 || size &lt;= fFetchBodyLimit) {</a>
+<a name="ln211">			error = mailIO.Seek(0, SEEK_END);</a>
+<a name="ln212">			if (error &lt; 0) {</a>
+<a name="ln213">				printf(&quot;POP3: Failed to download body %s\n &quot;, uid);</a>
+<a name="ln214">				break;</a>
+<a name="ln215">			}</a>
+<a name="ln216">			ProcessMessageFetched(ref, file, attributes);</a>
+<a name="ln217"> </a>
+<a name="ln218">			if (!leaveOnServer)</a>
+<a name="ln219">				Delete(toRetrieve);</a>
+<a name="ln220">		} else {</a>
+<a name="ln221">			int32 dummy;</a>
+<a name="ln222">			error = mailIO.ReadAt(0, &amp;dummy, 1);</a>
+<a name="ln223">			if (error &lt; 0) {</a>
+<a name="ln224">				printf(&quot;POP3: Failed to download header %s\n &quot;, uid);</a>
+<a name="ln225">				break;</a>
+<a name="ln226">			}</a>
+<a name="ln227">			ProcessHeaderFetched(ref, file, attributes);</a>
+<a name="ln228">		}</a>
+<a name="ln229">		ReportProgress(1, 0);</a>
+<a name="ln230"> </a>
+<a name="ln231">		const BString uidStr(uid);</a>
+<a name="ln232">		if (file.WriteAttrString(&quot;MAIL:unique_id&quot;, &amp;uidStr) &lt; 0)</a>
+<a name="ln233">			error = B_ERROR;</a>
+<a name="ln234"> </a>
+<a name="ln235">		file.WriteAttr(&quot;MAIL:size&quot;, B_INT32_TYPE, 0, &amp;size, sizeof(int32));</a>
+<a name="ln236">		write_read_attr(file, B_UNREAD);</a>
+<a name="ln237"> </a>
+<a name="ln238">		// save manifest in case we get disturbed</a>
+<a name="ln239">		fManifest.Add(uid);</a>
+<a name="ln240">		_WriteManifest();</a>
+<a name="ln241">	}</a>
+<a name="ln242"> </a>
+<a name="ln243">	ResetProgress();</a>
+<a name="ln244"> </a>
+<a name="ln245">	CheckForDeletedMessages();</a>
+<a name="ln246">	Disconnect();</a>
+<a name="ln247">	return error;</a>
+<a name="ln248">}</a>
+<a name="ln249"> </a>
+<a name="ln250"> </a>
+<a name="ln251">status_t</a>
+<a name="ln252">POP3Protocol::HandleFetchBody(const entry_ref&amp; ref, const BMessenger&amp; replyTo)</a>
+<a name="ln253">{</a>
+<a name="ln254">	ResetProgress(&quot;Fetch body&quot;);</a>
+<a name="ln255">	SetTotalItems(1);</a>
+<a name="ln256"> </a>
+<a name="ln257">	status_t error = Connect();</a>
+<a name="ln258">	if (error != B_OK)</a>
+<a name="ln259">		return error;</a>
+<a name="ln260"> </a>
+<a name="ln261">	error = _RetrieveUniqueIDs();</a>
+<a name="ln262">	if (error != B_OK) {</a>
+<a name="ln263">		Disconnect();</a>
+<a name="ln264">		return error;</a>
+<a name="ln265">	}</a>
+<a name="ln266"> </a>
+<a name="ln267">	BFile file(&amp;ref, B_READ_WRITE);</a>
+<a name="ln268">	status_t status = file.InitCheck();</a>
+<a name="ln269">	if (status != B_OK) {</a>
+<a name="ln270">		Disconnect();</a>
+<a name="ln271">		return status;</a>
+<a name="ln272">	}</a>
+<a name="ln273"> </a>
+<a name="ln274">	char uidString[256];</a>
+<a name="ln275">	BNode node(&amp;ref);</a>
+<a name="ln276">	if (node.ReadAttr(&quot;MAIL:unique_id&quot;, B_STRING_TYPE, 0, uidString, 256) &lt; 0) {</a>
+<a name="ln277">		Disconnect();</a>
+<a name="ln278">		return B_ERROR;</a>
+<a name="ln279">	}</a>
+<a name="ln280"> </a>
+<a name="ln281">	int32 toRetrieve = fUniqueIDs.IndexOf(uidString);</a>
+<a name="ln282">	if (toRetrieve &lt; 0) {</a>
+<a name="ln283">		Disconnect();</a>
+<a name="ln284">		return B_NAME_NOT_FOUND;</a>
+<a name="ln285">	}</a>
+<a name="ln286"> </a>
+<a name="ln287">	bool leaveOnServer;</a>
+<a name="ln288">	if (fSettings.FindBool(&quot;leave_mail_on_server&quot;, &amp;leaveOnServer) != B_OK)</a>
+<a name="ln289">		leaveOnServer = true;</a>
+<a name="ln290"> </a>
+<a name="ln291">	// TODO: get rid of this BMailMessageIO!</a>
+<a name="ln292">	BMailMessageIO io(this, &amp;file, toRetrieve);</a>
+<a name="ln293">	// read body</a>
+<a name="ln294">	status = io.Seek(0, SEEK_END);</a>
+<a name="ln295">	if (status &lt; 0) {</a>
+<a name="ln296">		Disconnect();</a>
+<a name="ln297">		return status;</a>
+<a name="ln298">	}</a>
+<a name="ln299"> </a>
+<a name="ln300">	BMessage attributes;</a>
+<a name="ln301">	NotifyBodyFetched(ref, file, attributes);</a>
+<a name="ln302">	ReplyBodyFetched(replyTo, ref, B_OK);</a>
+<a name="ln303"> </a>
+<a name="ln304">	if (!leaveOnServer)</a>
+<a name="ln305">		Delete(toRetrieve);</a>
+<a name="ln306"> </a>
+<a name="ln307">	ReportProgress(1, 0);</a>
+<a name="ln308">	ResetProgress();</a>
+<a name="ln309"> </a>
+<a name="ln310">	Disconnect();</a>
+<a name="ln311">	return B_OK;</a>
+<a name="ln312">}</a>
+<a name="ln313"> </a>
+<a name="ln314"> </a>
+<a name="ln315">status_t</a>
+<a name="ln316">POP3Protocol::Open(const char* server, int port, int)</a>
+<a name="ln317">{</a>
+<a name="ln318">	ReportProgress(0, 0, B_TRANSLATE(&quot;Connecting to POP3 server&quot;</a>
+<a name="ln319">		B_UTF8_ELLIPSIS));</a>
+<a name="ln320"> </a>
+<a name="ln321">	if (port &lt;= 0)</a>
+<a name="ln322">		port = fUseSSL ? 995 : 110;</a>
+<a name="ln323"> </a>
+<a name="ln324">	fLog = &quot;&quot;;</a>
+<a name="ln325"> </a>
+<a name="ln326">	// Prime the error message</a>
+<a name="ln327">	BString errorMessage(B_TRANSLATE(&quot;Error while connecting to server %serv&quot;));</a>
+<a name="ln328">	errorMessage.ReplaceFirst(&quot;%serv&quot;, server);</a>
+<a name="ln329">	if (port != 110)</a>
+<a name="ln330">		errorMessage &lt;&lt; &quot;:&quot; &lt;&lt; port;</a>
+<a name="ln331"> </a>
+<a name="ln332">	delete fServerConnection;</a>
+<a name="ln333">	fServerConnection = NULL;</a>
+<a name="ln334"> </a>
+<a name="ln335">	BNetworkAddress address(server, port);</a>
+<a name="ln336">	if (fUseSSL)</a>
+<a name="ln337">		fServerConnection = new(std::nothrow) BSecureSocket(address);</a>
+<a name="ln338">	else</a>
+<a name="ln339">		fServerConnection = new(std::nothrow) BSocket(address);</a>
+<a name="ln340"> </a>
+<a name="ln341">	status_t status = B_NO_MEMORY;</a>
+<a name="ln342">	if (fServerConnection != NULL)</a>
+<a name="ln343">		status = fServerConnection-&gt;InitCheck();</a>
+<a name="ln344"> </a>
+<a name="ln345">	BString line;</a>
+<a name="ln346">	if (status == B_OK) {</a>
+<a name="ln347">		ssize_t length = ReceiveLine(line);</a>
+<a name="ln348">		if (length &lt; 0)</a>
+<a name="ln349">			status = length;</a>
+<a name="ln350">	}</a>
+<a name="ln351"> </a>
+<a name="ln352">	if (status != B_OK) {</a>
+<a name="ln353">		fServerConnection-&gt;Disconnect();</a>
+<a name="ln354">		errorMessage &lt;&lt; &quot;: &quot; &lt;&lt; strerror(status);</a>
+<a name="ln355">		ShowError(errorMessage.String());</a>
+<a name="ln356">		return status;</a>
+<a name="ln357">	}</a>
+<a name="ln358"> </a>
+<a name="ln359">	if (strncmp(line.String(), &quot;+OK&quot;, 3) != 0) {</a>
+<a name="ln360">		if (line.Length() &gt; 0) {</a>
+<a name="ln361">			errorMessage &lt;&lt; B_TRANSLATE(&quot;. The server said:\n&quot;)</a>
+<a name="ln362">				&lt;&lt; line.String();</a>
+<a name="ln363">		} else</a>
+<a name="ln364">			errorMessage &lt;&lt; B_TRANSLATE(&quot;: No reply.\n&quot;);</a>
+<a name="ln365"> </a>
+<a name="ln366">		ShowError(errorMessage.String());</a>
+<a name="ln367">		fServerConnection-&gt;Disconnect();</a>
+<a name="ln368">		return B_ERROR;</a>
+<a name="ln369">	}</a>
+<a name="ln370"> </a>
+<a name="ln371">	fLog = line;</a>
+<a name="ln372">	return B_OK;</a>
+<a name="ln373">}</a>
+<a name="ln374"> </a>
+<a name="ln375"> </a>
+<a name="ln376">status_t</a>
+<a name="ln377">POP3Protocol::Login(const char* uid, const char* password, int method)</a>
+<a name="ln378">{</a>
+<a name="ln379">	status_t err;</a>
+<a name="ln380"> </a>
+<a name="ln381">	BString errorMessage(B_TRANSLATE(&quot;Error while authenticating user %user&quot;));</a>
+<a name="ln382">	errorMessage.ReplaceFirst(&quot;%user&quot;, uid);</a>
+<a name="ln383"> </a>
+<a name="ln384">	if (method == 1) {	//APOP</a>
+<a name="ln385">		int32 index = fLog.FindFirst(&quot;&lt;&quot;);</a>
+<a name="ln386">		if(index != B_ERROR) {</a>
+<a name="ln387">			ReportProgress(0, 0, B_TRANSLATE(&quot;Sending APOP authentication&quot;</a>
+<a name="ln388">				B_UTF8_ELLIPSIS));</a>
+<a name="ln389">			int32 end = fLog.FindFirst(&quot;&gt;&quot;, index);</a>
+<a name="ln390">			BString timestamp(&quot;&quot;);</a>
+<a name="ln391">			fLog.CopyInto(timestamp, index, end - index + 1);</a>
+<a name="ln392">			timestamp += password;</a>
+<a name="ln393">			char md5sum[33];</a>
+<a name="ln394">			MD5Digest((unsigned char*)timestamp.String(), md5sum);</a>
+<a name="ln395">			BString cmd = &quot;APOP &quot;;</a>
+<a name="ln396">			cmd += uid;</a>
+<a name="ln397">			cmd += &quot; &quot;;</a>
+<a name="ln398">			cmd += md5sum;</a>
+<a name="ln399">			cmd += CRLF;</a>
+<a name="ln400"> </a>
+<a name="ln401">			err = SendCommand(cmd.String());</a>
+<a name="ln402">			if (err != B_OK) {</a>
+<a name="ln403">				errorMessage &lt;&lt; B_TRANSLATE(&quot;. The server said:\n&quot;) &lt;&lt; fLog;</a>
+<a name="ln404">				ShowError(errorMessage.String());</a>
+<a name="ln405">				return err;</a>
+<a name="ln406">			}</a>
+<a name="ln407"> </a>
+<a name="ln408">			return B_OK;</a>
+<a name="ln409">		} else {</a>
+<a name="ln410">			errorMessage &lt;&lt; B_TRANSLATE(&quot;: The server does not support APOP.&quot;);</a>
+<a name="ln411">			ShowError(errorMessage.String());</a>
+<a name="ln412">			return B_NOT_ALLOWED;</a>
+<a name="ln413">		}</a>
+<a name="ln414">	}</a>
+<a name="ln415">	ReportProgress(0, 0, B_TRANSLATE(&quot;Sending username&quot; B_UTF8_ELLIPSIS));</a>
+<a name="ln416"> </a>
+<a name="ln417">	BString cmd = &quot;USER &quot;;</a>
+<a name="ln418">	cmd += uid;</a>
+<a name="ln419">	cmd += CRLF;</a>
+<a name="ln420"> </a>
+<a name="ln421">	err = SendCommand(cmd.String());</a>
+<a name="ln422">	if (err != B_OK) {</a>
+<a name="ln423">		errorMessage &lt;&lt; B_TRANSLATE(&quot;. The server said:\n&quot;) &lt;&lt; fLog;</a>
+<a name="ln424">		ShowError(errorMessage.String());</a>
+<a name="ln425">		return err;</a>
+<a name="ln426">	}</a>
+<a name="ln427"> </a>
+<a name="ln428">	ReportProgress(0, 0, B_TRANSLATE(&quot;Sending password&quot; B_UTF8_ELLIPSIS));</a>
+<a name="ln429">	cmd = &quot;PASS &quot;;</a>
+<a name="ln430">	cmd += password;</a>
+<a name="ln431">	cmd += CRLF;</a>
+<a name="ln432"> </a>
+<a name="ln433">	err = SendCommand(cmd.String());</a>
+<a name="ln434">	if (err != B_OK) {</a>
+<a name="ln435">		errorMessage &lt;&lt; B_TRANSLATE(&quot;. The server said:\n&quot;) &lt;&lt; fLog;</a>
+<a name="ln436">		ShowError(errorMessage.String());</a>
+<a name="ln437">		return err;</a>
+<a name="ln438">	}</a>
+<a name="ln439"> </a>
+<a name="ln440">	return B_OK;</a>
+<a name="ln441">}</a>
+<a name="ln442"> </a>
+<a name="ln443"> </a>
+<a name="ln444">status_t</a>
+<a name="ln445">POP3Protocol::Stat()</a>
+<a name="ln446">{</a>
+<a name="ln447">	ReportProgress(0, 0, B_TRANSLATE(&quot;Getting mailbox size&quot; B_UTF8_ELLIPSIS));</a>
+<a name="ln448"> </a>
+<a name="ln449">	if (SendCommand(&quot;STAT&quot; CRLF) &lt; B_OK)</a>
+<a name="ln450">		return B_ERROR;</a>
+<a name="ln451"> </a>
+<a name="ln452">	int32 messages;</a>
+<a name="ln453">	int32 dropSize;</a>
+<a name="ln454">	if (sscanf(fLog.String(), &quot;+OK %&quot; B_SCNd32&quot; %&quot; B_SCNd32, &amp;messages,</a>
+<a name="ln455">			&amp;dropSize) &lt; 2)</a>
+<a name="ln456">		return B_ERROR;</a>
+<a name="ln457"> </a>
+<a name="ln458">	fNumMessages = messages;</a>
+<a name="ln459">	fMailDropSize = dropSize;</a>
+<a name="ln460"> </a>
+<a name="ln461">	return B_OK;</a>
+<a name="ln462">}</a>
+<a name="ln463"> </a>
+<a name="ln464"> </a>
+<a name="ln465">int32</a>
+<a name="ln466">POP3Protocol::Messages()</a>
+<a name="ln467">{</a>
+<a name="ln468">	if (fNumMessages &lt; 0)</a>
+<a name="ln469">		Stat();</a>
+<a name="ln470"> </a>
+<a name="ln471">	return fNumMessages;</a>
+<a name="ln472">}</a>
+<a name="ln473"> </a>
+<a name="ln474"> </a>
+<a name="ln475">size_t</a>
+<a name="ln476">POP3Protocol::MailDropSize()</a>
+<a name="ln477">{</a>
+<a name="ln478">	if (fNumMessages &lt; 0)</a>
+<a name="ln479">		Stat();</a>
+<a name="ln480"> </a>
+<a name="ln481">	return fMailDropSize;</a>
+<a name="ln482">}</a>
+<a name="ln483"> </a>
+<a name="ln484"> </a>
+<a name="ln485">void</a>
+<a name="ln486">POP3Protocol::CheckForDeletedMessages()</a>
+<a name="ln487">{</a>
+<a name="ln488">	{</a>
+<a name="ln489">		// Delete things from the manifest no longer on the server</a>
+<a name="ln490">		BStringList list;</a>
+<a name="ln491">		NotHere(fUniqueIDs, fManifest, &amp;list);</a>
+<a name="ln492">		fManifest.Remove(list);</a>
+<a name="ln493">	}</a>
+<a name="ln494"> </a>
+<a name="ln495">	if (!fSettings.FindBool(&quot;delete_remote_when_local&quot;)</a>
+<a name="ln496">		|| fManifest.CountStrings() == 0)</a>
+<a name="ln497">		return;</a>
+<a name="ln498"> </a>
+<a name="ln499">	BStringList toDelete;</a>
+<a name="ln500"> </a>
+<a name="ln501">	BStringList queryContents;</a>
+<a name="ln502">	BVolumeRoster volumes;</a>
+<a name="ln503">	BVolume volume;</a>
+<a name="ln504"> </a>
+<a name="ln505">	while (volumes.GetNextVolume(&amp;volume) == B_OK) {</a>
+<a name="ln506">		BQuery fido;</a>
+<a name="ln507">		entry_ref entry;</a>
+<a name="ln508"> </a>
+<a name="ln509">		fido.SetVolume(&amp;volume);</a>
+<a name="ln510">		fido.PushAttr(B_MAIL_ATTR_ACCOUNT_ID);</a>
+<a name="ln511">		fido.PushInt32(fAccountSettings.AccountID());</a>
+<a name="ln512">		fido.PushOp(B_EQ);</a>
+<a name="ln513"> </a>
+<a name="ln514">		fido.Fetch();</a>
+<a name="ln515"> </a>
+<a name="ln516">		BString uid;</a>
+<a name="ln517">		while (fido.GetNextRef(&amp;entry) == B_OK) {</a>
+<a name="ln518">			BNode(&amp;entry).ReadAttrString(&quot;MAIL:unique_id&quot;, &amp;uid);</a>
+<a name="ln519">			queryContents.Add(uid);</a>
+<a name="ln520">		}</a>
+<a name="ln521">	}</a>
+<a name="ln522">	NotHere(queryContents, fManifest, &amp;toDelete);</a>
+<a name="ln523"> </a>
+<a name="ln524">	for (int32 i = 0; i &lt; toDelete.CountStrings(); i++) {</a>
+<a name="ln525">		printf(&quot;delete mail on server uid %s\n&quot;, toDelete.StringAt(i).String());</a>
+<a name="ln526">		Delete(fUniqueIDs.IndexOf(toDelete.StringAt(i)));</a>
+<a name="ln527">	}</a>
+<a name="ln528"> </a>
+<a name="ln529">	// Don't remove ids from fUniqueIDs, the indices have to stay the same when</a>
+<a name="ln530">	// retrieving new messages.</a>
+<a name="ln531">	fManifest.Remove(toDelete);</a>
+<a name="ln532"> </a>
+<a name="ln533">	// TODO: at some point the purged manifest should be written to disk</a>
+<a name="ln534">	// otherwise it will grow forever</a>
+<a name="ln535">}</a>
+<a name="ln536"> </a>
+<a name="ln537"> </a>
+<a name="ln538">status_t</a>
+<a name="ln539">POP3Protocol::Retrieve(int32 message, BPositionIO* to)</a>
+<a name="ln540">{</a>
+<a name="ln541">	BString cmd;</a>
+<a name="ln542">	cmd &lt;&lt; &quot;RETR &quot; &lt;&lt; message + 1 &lt;&lt; CRLF;</a>
+<a name="ln543">	status_t status = RetrieveInternal(cmd.String(), message, to, true);</a>
+<a name="ln544">	ReportProgress(1, 0);</a>
+<a name="ln545"> </a>
+<a name="ln546">	if (status == B_OK) {</a>
+<a name="ln547">		// Check if the actual message size matches the expected one</a>
+<a name="ln548">		int32 size = MessageSize(message);</a>
+<a name="ln549"> 		to-&gt;Seek(0, SEEK_END);</a>
+<a name="ln550">		if (to-&gt;Position() != size) {</a>
+<a name="ln551">			printf(&quot;POP3Protocol::Retrieve Note: message size is %&quot; B_PRIdOFF</a>
+<a name="ln552">				&quot;, was expecting %&quot; B_PRId32 &quot;, for message #%&quot; B_PRId32</a>
+<a name="ln553">				&quot;.  Could be a transmission error or a bad POP server &quot;</a>
+<a name="ln554">				&quot;implementation (does it remove escape codes when it counts &quot;</a>
+<a name="ln555">				&quot;size?).\n&quot;, to-&gt;Position(), size, message);</a>
+<a name="ln556">		}</a>
+<a name="ln557">	}</a>
+<a name="ln558"> </a>
+<a name="ln559">	return status;</a>
+<a name="ln560">}</a>
+<a name="ln561"> </a>
+<a name="ln562"> </a>
+<a name="ln563">status_t</a>
+<a name="ln564">POP3Protocol::GetHeader(int32 message, BPositionIO* to)</a>
+<a name="ln565">{</a>
+<a name="ln566">	BString cmd;</a>
+<a name="ln567">	cmd &lt;&lt; &quot;TOP &quot; &lt;&lt; message + 1 &lt;&lt; &quot; 0&quot; &lt;&lt; CRLF;</a>
+<a name="ln568">	return RetrieveInternal(cmd.String(), message, to, false);</a>
+<a name="ln569">}</a>
+<a name="ln570"> </a>
+<a name="ln571"> </a>
+<a name="ln572">status_t</a>
+<a name="ln573">POP3Protocol::RetrieveInternal(const char* command, int32 message,</a>
+<a name="ln574">	BPositionIO* to, bool postProgress)</a>
+<a name="ln575">{</a>
+<a name="ln576">	const int bufSize = 1024 * 30;</a>
+<a name="ln577"> </a>
+<a name="ln578">	// To avoid waiting for the non-arrival of the next data packet, try to</a>
+<a name="ln579">	// receive only the message size, plus the 3 extra bytes for the &quot;.\r\n&quot;</a>
+<a name="ln580">	// after the message.  Of course, if we get it wrong (or it is a huge</a>
+<a name="ln581">	// message or has lines starting with escaped periods), it will then switch</a>
+<a name="ln582">	// back to receiving full buffers until the message is done.</a>
+<a name="ln583">	int amountToReceive = MessageSize(message) + 3;</a>
+<a name="ln584">	if (amountToReceive &gt;= bufSize || amountToReceive &lt;= 0)</a>
+<a name="ln585">		amountToReceive = bufSize - 1;</a>
+<a name="ln586"> </a>
+<a name="ln587">	BString bufBString; // Used for auto-dealloc on return feature.</a>
+<a name="ln588">	char* buf = bufBString.LockBuffer(bufSize);</a>
+<a name="ln589">	int amountInBuffer = 0;</a>
+<a name="ln590">	int amountReceived;</a>
+<a name="ln591">	int testIndex;</a>
+<a name="ln592">	char* testStr;</a>
+<a name="ln593">	bool cont = true;</a>
+<a name="ln594">	bool flushWholeBuffer = false;</a>
+<a name="ln595">	to-&gt;Seek(0, SEEK_SET);</a>
+<a name="ln596"> </a>
+<a name="ln597">	if (SendCommand(command) != B_OK)</a>
+<a name="ln598">		return B_ERROR;</a>
+<a name="ln599"> </a>
+<a name="ln600">	while (cont) {</a>
+<a name="ln601">		status_t result = fServerConnection-&gt;WaitForReadable(</a>
+<a name="ln602">			POP3_RETRIEVAL_TIMEOUT);</a>
+<a name="ln603">		if (result == B_TIMED_OUT) {</a>
+<a name="ln604">			// No data available, even after waiting a minute.</a>
+<a name="ln605">			fLog = &quot;POP3 timeout - no data received after a long wait.&quot;;</a>
+<a name="ln606">			return B_TIMED_OUT;</a>
+<a name="ln607">		}</a>
+<a name="ln608">		if (amountToReceive &gt; bufSize - 1 - amountInBuffer)</a>
+<a name="ln609">			amountToReceive = bufSize - 1 - amountInBuffer;</a>
+<a name="ln610"> </a>
+<a name="ln611">		amountReceived = fServerConnection-&gt;Read(buf + amountInBuffer,</a>
+<a name="ln612">			amountToReceive);</a>
+<a name="ln613"> </a>
+<a name="ln614">		if (amountReceived &lt; 0) {</a>
+<a name="ln615">			fLog = strerror(amountReceived);</a>
+<a name="ln616">			return amountReceived;</a>
+<a name="ln617">		}</a>
+<a name="ln618">		if (amountReceived == 0) {</a>
+<a name="ln619">			fLog = &quot;POP3 data supposedly ready to receive but not received!&quot;;</a>
+<a name="ln620">			return B_ERROR;</a>
+<a name="ln621">		}</a>
+<a name="ln622"> </a>
+<a name="ln623">		amountToReceive = bufSize - 1; // For next time, read a full buffer.</a>
+<a name="ln624">		amountInBuffer += amountReceived;</a>
+<a name="ln625">		buf[amountInBuffer] = 0; // NUL stops tests past the end of buffer.</a>
+<a name="ln626"> </a>
+<a name="ln627">		// Look for lines starting with a period.  A single period by itself on</a>
+<a name="ln628">		// a line &quot;\r\n.\r\n&quot; marks the end of the message (thus the need for</a>
+<a name="ln629">		// at least five characters in the buffer for testing).  A period</a>
+<a name="ln630">		// &quot;\r\n.Stuff&quot; at the start of a line get deleted &quot;\r\nStuff&quot;, since</a>
+<a name="ln631">		// POP adds one as an escape code to let you have message text with</a>
+<a name="ln632">		// lines starting with a period.  For convenience, assume that no</a>
+<a name="ln633">		// messages start with a period on the very first line, so we can</a>
+<a name="ln634">		// search for the previous line's &quot;\r\n&quot;.</a>
+<a name="ln635"> </a>
+<a name="ln636">		for (testIndex = 0; testIndex &lt;= amountInBuffer - 5; testIndex++) {</a>
+<a name="ln637">			testStr = buf + testIndex;</a>
+<a name="ln638">			if (testStr[0] == '\r' &amp;&amp; testStr[1] == '\n' &amp;&amp; testStr[2] == '.') {</a>
+<a name="ln639">				if (testStr[3] == '\r' &amp;&amp; testStr[4] == '\n') {</a>
+<a name="ln640">					// Found the end of the message marker.</a>
+<a name="ln641">					// Ignore remaining data.</a>
+<a name="ln642">					if (amountInBuffer &gt; testIndex + 5) {</a>
+<a name="ln643">						printf(&quot;POP3Protocol::RetrieveInternal Ignoring %d &quot;</a>
+<a name="ln644">							&quot;bytes of extra data past message end.\n&quot;,</a>
+<a name="ln645">							amountInBuffer - (testIndex + 5));</a>
+<a name="ln646">					}</a>
+<a name="ln647">					amountInBuffer = testIndex + 2; // Don't include &quot;.\r\n&quot;.</a>
+<a name="ln648">					buf[amountInBuffer] = 0;</a>
+<a name="ln649">					cont = false;</a>
+<a name="ln650">				} else {</a>
+<a name="ln651">					// Remove an extra period at the start of a line.</a>
+<a name="ln652">					// Inefficient, but it doesn't happen often that you have a</a>
+<a name="ln653">					// dot starting a line of text.  Of course, a file with a</a>
+<a name="ln654">					// lot of double period lines will get processed very</a>
+<a name="ln655">					// slowly.</a>
+<a name="ln656">					memmove(buf + testIndex + 2, buf + testIndex + 3,</a>
+<a name="ln657">						amountInBuffer - (testIndex + 3) + 1);</a>
+<a name="ln658">					amountInBuffer--;</a>
+<a name="ln659">					// Watch out for the end of buffer case, when the POP text</a>
+<a name="ln660">					// is &quot;\r\n..X&quot;.  Don't want to leave the resulting</a>
+<a name="ln661">					// &quot;\r\n.X&quot; in the buffer (flush out the whole buffer),</a>
+<a name="ln662">					// since that will get mistakenly evaluated again in the</a>
+<a name="ln663">					// next loop and delete a character by mistake.</a>
+<a name="ln664">					if (testIndex &gt;= amountInBuffer - 4 &amp;&amp; testStr[2] == '.') {</a>
+<a name="ln665">						printf(&quot;POP3Protocol::RetrieveInternal: Jackpot!  &quot;</a>
+<a name="ln666">							&quot;You have hit the rare situation with an escaped &quot;</a>
+<a name="ln667">							&quot;period at the end of the buffer.  Aren't you happy&quot;</a>
+<a name="ln668">							&quot;it decodes it correctly?\n&quot;);</a>
+<a name="ln669">						flushWholeBuffer = true;</a>
+<a name="ln670">					}</a>
+<a name="ln671">				}</a>
+<a name="ln672">			}</a>
+<a name="ln673">		}</a>
+<a name="ln674"> </a>
+<a name="ln675">		if (cont &amp;&amp; !flushWholeBuffer) {</a>
+<a name="ln676">			// Dump out most of the buffer, but leave the last 4 characters for</a>
+<a name="ln677">			// comparison continuity, in case the line starting with a period</a>
+<a name="ln678">			// crosses a buffer boundary.</a>
+<a name="ln679">			if (amountInBuffer &gt; 4) {</a>
+<a name="ln680">				to-&gt;Write(buf, amountInBuffer - 4);</a>
+<a name="ln681">				if (postProgress)</a>
+<a name="ln682">					ReportProgress(0, amountInBuffer - 4);</a>
+<a name="ln683">				memmove(buf, buf + amountInBuffer - 4, 4);</a>
+<a name="ln684">				amountInBuffer = 4;</a>
+<a name="ln685">			}</a>
+<a name="ln686">		} else {</a>
+<a name="ln687">			// Dump everything - end of message or flushing the whole buffer.</a>
+<a name="ln688">			to-&gt;Write(buf, amountInBuffer);</a>
+<a name="ln689">			if (postProgress)</a>
+<a name="ln690">				ReportProgress(0, amountInBuffer);</a>
+<a name="ln691">			amountInBuffer = 0;</a>
+<a name="ln692">		}</a>
+<a name="ln693">	}</a>
+<a name="ln694">	return B_OK;</a>
+<a name="ln695">}</a>
+<a name="ln696"> </a>
+<a name="ln697"> </a>
+<a name="ln698">void</a>
+<a name="ln699">POP3Protocol::Delete(int32 index)</a>
+<a name="ln700">{</a>
+<a name="ln701">	BString cmd = &quot;DELE &quot;;</a>
+<a name="ln702">	cmd &lt;&lt; (index + 1) &lt;&lt; CRLF;</a>
+<a name="ln703">	if (SendCommand(cmd.String()) != B_OK) {</a>
+<a name="ln704">		// Error</a>
+<a name="ln705">	}</a>
+<a name="ln706">#if DEBUG</a>
+<a name="ln707">	puts(fLog.String());</a>
+<a name="ln708">#endif</a>
+<a name="ln709">	// The mail is just marked as deleted and removed from the server when</a>
+<a name="ln710">	// sending the QUIT command. Because of that the message number stays</a>
+<a name="ln711">	// the same and we keep the uid in the uid list.</a>
+<a name="ln712">}</a>
+<a name="ln713"> </a>
+<a name="ln714"> </a>
+<a name="ln715">size_t</a>
+<a name="ln716">POP3Protocol::MessageSize(int32 index)</a>
+<a name="ln717">{</a>
+<a name="ln718">	return fSizes[index];</a>
+<a name="ln719">}</a>
+<a name="ln720"> </a>
+<a name="ln721"> </a>
+<a name="ln722">ssize_t</a>
+<a name="ln723">POP3Protocol::ReceiveLine(BString&amp; line)</a>
+<a name="ln724">{</a>
+<a name="ln725">	int32 length = 0;</a>
+<a name="ln726">	bool flag = false;</a>
+<a name="ln727"> </a>
+<a name="ln728">	line = &quot;&quot;;</a>
+<a name="ln729"> </a>
+<a name="ln730">	status_t result = fServerConnection-&gt;WaitForReadable(</a>
+<a name="ln731">		POP3_RETRIEVAL_TIMEOUT);</a>
+<a name="ln732">	if (result == B_TIMED_OUT)</a>
+<a name="ln733">		return errno;</a>
+<a name="ln734"> </a>
+<a name="ln735">	while (true) {</a>
+<a name="ln736">		// Hope there's an end of line out there else this gets stuck.</a>
+<a name="ln737">		int32 bytesReceived;</a>
+<a name="ln738">		uint8 c = 0;</a>
+<a name="ln739"> </a>
+<a name="ln740">		bytesReceived = fServerConnection-&gt;Read((char*)&amp;c, 1);</a>
+<a name="ln741">		if (bytesReceived &lt; 0)</a>
+<a name="ln742">			return bytesReceived;</a>
+<a name="ln743"> </a>
+<a name="ln744">		if (c == '\n' || bytesReceived == 0)</a>
+<a name="ln745">			break;</a>
+<a name="ln746"> </a>
+<a name="ln747">		if (c == '\r') {</a>
+<a name="ln748">			flag = true;</a>
+<a name="ln749">		} else {</a>
+<a name="ln750">			if (flag) {</a>
+<a name="ln751">				length++;</a>
+<a name="ln752">				line += '\r';</a>
+<a name="ln753">				flag = false;</a>
+<a name="ln754">			}</a>
+<a name="ln755">			length++;</a>
+<a name="ln756">			line += (char)c;</a>
+<a name="ln757">		}</a>
+<a name="ln758">	}</a>
+<a name="ln759"> </a>
+<a name="ln760">	return length;</a>
+<a name="ln761">}</a>
+<a name="ln762"> </a>
+<a name="ln763"> </a>
+<a name="ln764">status_t</a>
+<a name="ln765">POP3Protocol::SendCommand(const char* cmd)</a>
+<a name="ln766">{</a>
+<a name="ln767">	// Flush any accumulated garbage data before we send our command, so we</a>
+<a name="ln768">	// don't misinterrpret responses from previous commands (that got left over</a>
+<a name="ln769">	// due to bugs) as being from this command.</a>
+<a name="ln770">	while (fServerConnection-&gt;WaitForReadable(1000) == B_OK) {</a>
+<a name="ln771">		char buffer[4096];</a>
+<a name="ln772">		ssize_t amountReceived = fServerConnection-&gt;Read(buffer,</a>
+<a name="ln773">			sizeof(buffer) - 1);</a>
+<a name="ln774">		if (amountReceived &lt; 0)</a>
+<a name="ln775">			return amountReceived;</a>
+<a name="ln776"> </a>
+<a name="ln777">		buffer[amountReceived] = 0;</a>
+<a name="ln778">		printf(&quot;POP3Protocol::SendCommand Bug! Had to flush %&quot; B_PRIdSSIZE</a>
+<a name="ln779">			&quot; bytes: %s\n&quot;, amountReceived, buffer);</a>
+<a name="ln780">	}</a>
+<a name="ln781"> </a>
+<a name="ln782">	if (fServerConnection-&gt;Write(cmd, ::strlen(cmd)) &lt; 0) {</a>
+<a name="ln783">		fLog = strerror(errno);</a>
+<a name="ln784">		printf(&quot;POP3Protocol::SendCommand Send \&quot;%s\&quot; failed, code %d: %s\n&quot;,</a>
+<a name="ln785">			cmd, errno, fLog.String());</a>
+<a name="ln786">		return errno;</a>
+<a name="ln787">	}</a>
+<a name="ln788"> </a>
+<a name="ln789">	fLog = &quot;&quot;;</a>
+<a name="ln790">	int32 length = ReceiveLine(fLog);</a>
+<a name="ln791">	if (length &lt;= 0 || fLog.ICompare(&quot;+OK&quot;, 3) == 0)</a>
+<a name="ln792">		return B_OK;</a>
+<a name="ln793"> </a>
+<a name="ln794">	if (fLog.ICompare(&quot;-ERR&quot;, 4) == 0) {</a>
+<a name="ln795">		printf(&quot;POP3Protocol::SendCommand \&quot;%s\&quot; got error message &quot;</a>
+<a name="ln796">			&quot;from server: %s\n&quot;, cmd, fLog.String());</a>
+<a name="ln797">		return B_ERROR;</a>
+<a name="ln798">	}</a>
+<a name="ln799"> </a>
+<a name="ln800">	printf(&quot;POP3Protocol::SendCommand \&quot;%s\&quot; got nonsense message &quot;</a>
+<a name="ln801">		&quot;from server: %s\n&quot;, cmd, fLog.String());</a>
+<a name="ln802">	return B_BAD_DATA;</a>
+<a name="ln803">		// If it's not +OK, and it's not -ERR, then what the heck</a>
+<a name="ln804">		// is it? Presume an error</a>
+<a name="ln805">}</a>
+<a name="ln806"> </a>
+<a name="ln807"> </a>
+<a name="ln808">void</a>
+<a name="ln809">POP3Protocol::MD5Digest(unsigned char* in, char* asciiDigest)</a>
+<a name="ln810">{</a>
+<a name="ln811">	unsigned char digest[16];</a>
+<a name="ln812"> </a>
+<a name="ln813">	MD5_CTX context;</a>
+<a name="ln814"> </a>
+<a name="ln815">	MD5Init(&amp;context);</a>
+<a name="ln816">	MD5Update(&amp;context, in, ::strlen((char*)in));</a>
+<a name="ln817">	MD5Final(digest, &amp;context);</a>
+<a name="ln818"> </a>
+<a name="ln819">	for (int i = 0;  i &lt; 16;  i++) {</a>
+<a name="ln820">		sprintf(asciiDigest + 2 * i, &quot;%02x&quot;, digest[i]);</a>
+<a name="ln821">	}</a>
+<a name="ln822"> </a>
+<a name="ln823">	return;</a>
+<a name="ln824">}</a>
+<a name="ln825"> </a>
+<a name="ln826"> </a>
+<a name="ln827">status_t</a>
+<a name="ln828">POP3Protocol::_RetrieveUniqueIDs()</a>
+<a name="ln829">{</a>
+<a name="ln830">	fUniqueIDs.MakeEmpty();</a>
+<a name="ln831">	fSizes.clear();</a>
+<a name="ln832">	fTotalSize = 0;</a>
+<a name="ln833"> </a>
+<a name="ln834">	status_t status = SendCommand(&quot;UIDL&quot; CRLF);</a>
+<a name="ln835">	if (status != B_OK)</a>
+<a name="ln836">		return status;</a>
+<a name="ln837"> </a>
+<a name="ln838">	BString result;</a>
+<a name="ln839">	int32 uidOffset;</a>
+<a name="ln840">	while (ReceiveLine(result) &gt; 0) {</a>
+<a name="ln841">		if (result.ByteAt(0) == '.')</a>
+<a name="ln842">			break;</a>
+<a name="ln843"> </a>
+<a name="ln844">		uidOffset = result.FindFirst(' ') + 1;</a>
+<a name="ln845">		result.Remove(0, uidOffset);</a>
+<a name="ln846">		fUniqueIDs.Add(result);</a>
+<a name="ln847">	}</a>
+<a name="ln848"> </a>
+<a name="ln849">	if (SendCommand(&quot;LIST&quot; CRLF) != B_OK)</a>
+<a name="ln850">		return B_ERROR;</a>
+<a name="ln851"> </a>
+<a name="ln852">	while (ReceiveLine(result) &gt; 0) {</a>
+<a name="ln853">		if (result.ByteAt(0) == '.')</a>
+<a name="ln854">			break;</a>
+<a name="ln855"> </a>
+<a name="ln856">		int32 index = result.FindLast(&quot; &quot;);</a>
+<a name="ln857">		int32 size;</a>
+<a name="ln858">		if (index &gt;= 0)</a>
+<a name="ln859">			size = atol(&amp;result.String()[index]);</a>
+<a name="ln860">		else</a>
+<a name="ln861">			size = 0;</a>
+<a name="ln862"> </a>
+<a name="ln863">		fTotalSize += size;</a>
+<a name="ln864">		fSizes.push_back(size);</a>
+<a name="ln865">	}</a>
+<a name="ln866"> </a>
+<a name="ln867">	return B_OK;</a>
+<a name="ln868">}</a>
+<a name="ln869"> </a>
+<a name="ln870"> </a>
+<a name="ln871">void</a>
+<a name="ln872">POP3Protocol::_ReadManifest()</a>
+<a name="ln873">{</a>
+<a name="ln874">	fManifest.MakeEmpty();</a>
+<a name="ln875">	BString attribute = &quot;MAIL:&quot;;</a>
+<a name="ln876">	attribute &lt;&lt; fAccountSettings.AccountID() &lt;&lt; &quot;:manifest&quot;;</a>
+<a name="ln877">		// In case someone puts multiple accounts in the same directory</a>
+<a name="ln878"> </a>
+<a name="ln879">	BNode node(fDestinationDir);</a>
+<a name="ln880">	if (node.InitCheck() != B_OK)</a>
+<a name="ln881">		return;</a>
+<a name="ln882"> </a>
+<a name="ln883">	// We already have a directory so we can try to read metadata</a>
+<a name="ln884">	// from it. Note that it is normal for this directory not to</a>
+<a name="ln885">	// be found on the first run as it will be later created by</a>
+<a name="ln886">	// the INBOX system filter.</a>
+<a name="ln887">	attr_info info;</a>
+<a name="ln888">	if (node.GetAttrInfo(attribute.String(), &amp;info) != B_OK || info.size == 0)</a>
+<a name="ln889">		return;</a>
+<a name="ln890"> </a>
+<a name="ln891">	void* flatmanifest = malloc(info.size);</a>
+<a name="ln892">	node.ReadAttr(attribute.String(), fManifest.TypeCode(), 0,</a>
+<a name="ln893">		flatmanifest, info.size);</a>
+<a name="ln894">	fManifest.Unflatten(fManifest.TypeCode(), flatmanifest, info.size);</a>
+<a name="ln895">	free(flatmanifest);</a>
+<a name="ln896">}</a>
+<a name="ln897"> </a>
+<a name="ln898"> </a>
+<a name="ln899">void</a>
+<a name="ln900">POP3Protocol::_WriteManifest()</a>
+<a name="ln901">{</a>
+<a name="ln902">	BString attribute = &quot;MAIL:&quot;;</a>
+<a name="ln903">	attribute &lt;&lt; fAccountSettings.AccountID() &lt;&lt; &quot;:manifest&quot;;</a>
+<a name="ln904">		// In case someone puts multiple accounts in the same directory</a>
+<a name="ln905">	BNode node(fDestinationDir);</a>
+<a name="ln906">	if (node.InitCheck() != B_OK) {</a>
+<a name="ln907">		ShowError(&quot;Error while saving account manifest: cannot use &quot;</a>
+<a name="ln908">			&quot;destination directory.&quot;);</a>
+<a name="ln909">		return;</a>
+<a name="ln910">	}</a>
+<a name="ln911"> </a>
+<a name="ln912">	node.RemoveAttr(attribute.String());</a>
+<a name="ln913">	ssize_t manifestsize = fManifest.FlattenedSize();</a>
+<a name="ln914">	void* flatmanifest = malloc(manifestsize);</a>
+<a name="ln915">	fManifest.Flatten(flatmanifest, manifestsize);</a>
+<a name="ln916">	status_t err = node.WriteAttr(attribute.String(),</a>
+<a name="ln917">		fManifest.TypeCode(), 0, flatmanifest, manifestsize);</a>
+<a name="ln918">	if (err &lt; 0) {</a>
+<a name="ln919">		BString error = &quot;Error while saving account manifest: &quot;;</a>
+<a name="ln920">		error &lt;&lt; strerror(err);</a>
+<a name="ln921">			printf(&quot;moep error\n&quot;);</a>
+<a name="ln922">		ShowError(error.String());</a>
+<a name="ln923">	}</a>
+<a name="ln924"> </a>
+<a name="ln925">	free(flatmanifest);</a>
+<a name="ln926">}</a>
+<a name="ln927"> </a>
+<a name="ln928"> </a>
+<a name="ln929">//	#pragma mark -</a>
+<a name="ln930"> </a>
+<a name="ln931"> </a>
+<a name="ln932">BInboundMailProtocol*</a>
+<a name="ln933">instantiate_inbound_protocol(const BMailAccountSettings&amp; settings)</a>
+<a name="ln934">{</a>
+<a name="ln935">	return new POP3Protocol(settings);</a>
+<a name="ln936">}</a>
+<a name="ln937"> </a>
+<a name="ln938"> </a>
+<a name="ln939">status_t</a>
+<a name="ln940">pop3_smtp_auth(const BMailAccountSettings&amp; settings)</a>
+<a name="ln941">{</a>
+<a name="ln942">	POP3Protocol protocol(settings);</a>
+<a name="ln943">	protocol.Connect();</a>
+<a name="ln944">	protocol.Disconnect();</a>
+<a name="ln945">	return B_OK;</a>
+<a name="ln946">}</a>
+
+</code></pre>
+<div class="balloon" rel="66"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fTotalSize.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,833 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>ctl_srvr.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright (C) 2004-2006, 2008  Internet Systems Consortium, Inc. (&quot;ISC&quot;)</a>
+<a name="ln3"> * Copyright (C) 1998-2003  Internet Software Consortium.</a>
+<a name="ln4"> *</a>
+<a name="ln5"> * Permission to use, copy, modify, and/or distribute this software for any</a>
+<a name="ln6"> * purpose with or without fee is hereby granted, provided that the above</a>
+<a name="ln7"> * copyright notice and this permission notice appear in all copies.</a>
+<a name="ln8"> *</a>
+<a name="ln9"> * THE SOFTWARE IS PROVIDED &quot;AS IS&quot; AND ISC DISCLAIMS ALL WARRANTIES WITH</a>
+<a name="ln10"> * REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY</a>
+<a name="ln11"> * AND FITNESS.  IN NO EVENT SHALL ISC BE LIABLE FOR ANY SPECIAL, DIRECT,</a>
+<a name="ln12"> * INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM</a>
+<a name="ln13"> * LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE</a>
+<a name="ln14"> * OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR</a>
+<a name="ln15"> * PERFORMANCE OF THIS SOFTWARE.</a>
+<a name="ln16"> */</a>
+<a name="ln17"> </a>
+<a name="ln18">#if !defined(lint) &amp;&amp; !defined(SABER)</a>
+<a name="ln19">static const char rcsid[] = &quot;$Id: ctl_srvr.c,v 1.10 2008/11/14 02:36:51 marka Exp $&quot;;</a>
+<a name="ln20">#endif /* not lint */</a>
+<a name="ln21"> </a>
+<a name="ln22">/* Extern. */</a>
+<a name="ln23"> </a>
+<a name="ln24">#include &quot;port_before.h&quot;</a>
+<a name="ln25"> </a>
+<a name="ln26">#include &lt;sys/param.h&gt;</a>
+<a name="ln27">#include &lt;sys/file.h&gt;</a>
+<a name="ln28">#include &lt;sys/socket.h&gt;</a>
+<a name="ln29">#include &lt;sys/un.h&gt;</a>
+<a name="ln30"> </a>
+<a name="ln31">#include &lt;netinet/in.h&gt;</a>
+<a name="ln32">#include &lt;arpa/nameser.h&gt;</a>
+<a name="ln33">#include &lt;arpa/inet.h&gt;</a>
+<a name="ln34"> </a>
+<a name="ln35">#include &lt;ctype.h&gt;</a>
+<a name="ln36">#include &lt;errno.h&gt;</a>
+<a name="ln37">#include &lt;stdio.h&gt;</a>
+<a name="ln38">#include &lt;stdlib.h&gt;</a>
+<a name="ln39">#include &lt;string.h&gt;</a>
+<a name="ln40">#include &lt;time.h&gt;</a>
+<a name="ln41">#include &lt;unistd.h&gt;</a>
+<a name="ln42">#include &lt;fcntl.h&gt;</a>
+<a name="ln43">#ifdef HAVE_MEMORY_H</a>
+<a name="ln44">#include &lt;memory.h&gt;</a>
+<a name="ln45">#endif</a>
+<a name="ln46"> </a>
+<a name="ln47">#include &lt;isc/assertions.h&gt;</a>
+<a name="ln48">#include &lt;isc/ctl.h&gt;</a>
+<a name="ln49">#include &lt;isc/eventlib.h&gt;</a>
+<a name="ln50">#include &lt;isc/list.h&gt;</a>
+<a name="ln51">#include &lt;isc/logging.h&gt;</a>
+<a name="ln52">#include &lt;isc/memcluster.h&gt;</a>
+<a name="ln53"> </a>
+<a name="ln54">#include &quot;ctl_p.h&quot;</a>
+<a name="ln55"> </a>
+<a name="ln56">#include &quot;port_after.h&quot;</a>
+<a name="ln57"> </a>
+<a name="ln58">#ifdef SPRINTF_CHAR</a>
+<a name="ln59"># define SPRINTF(x) strlen(sprintf/**/x)</a>
+<a name="ln60">#else</a>
+<a name="ln61"># define SPRINTF(x) ((size_t)sprintf x)</a>
+<a name="ln62">#endif</a>
+<a name="ln63"> </a>
+<a name="ln64">/* Macros. */</a>
+<a name="ln65"> </a>
+<a name="ln66">#define	lastverb_p(verb)	(verb-&gt;name == NULL || verb-&gt;func == NULL)</a>
+<a name="ln67">#define	address_expr		ctl_sa_ntop((struct sockaddr *)&amp;sess-&gt;sa, \</a>
+<a name="ln68">					    tmp, sizeof tmp, ctx-&gt;logger)</a>
+<a name="ln69"> </a>
+<a name="ln70">/* Types. */</a>
+<a name="ln71"> </a>
+<a name="ln72">enum state {</a>
+<a name="ln73">	available = 0, initializing, writing, reading, reading_data,</a>
+<a name="ln74">	processing, idling, quitting, closing</a>
+<a name="ln75">};</a>
+<a name="ln76"> </a>
+<a name="ln77">union sa_un {</a>
+<a name="ln78">	struct sockaddr_in in;</a>
+<a name="ln79">#ifndef NO_SOCKADDR_UN</a>
+<a name="ln80">	struct sockaddr_un un;</a>
+<a name="ln81">#endif</a>
+<a name="ln82">};</a>
+<a name="ln83"> </a>
+<a name="ln84">struct ctl_sess {</a>
+<a name="ln85">	LINK(struct ctl_sess)	link;</a>
+<a name="ln86">	struct ctl_sctx *	ctx;</a>
+<a name="ln87">	enum state		state;</a>
+<a name="ln88">	int			sock;</a>
+<a name="ln89">	union sa_un		sa;</a>
+<a name="ln90">	evFileID		rdID;</a>
+<a name="ln91">	evStreamID		wrID;</a>
+<a name="ln92">	evTimerID		rdtiID;</a>
+<a name="ln93">	evTimerID		wrtiID;</a>
+<a name="ln94">	struct ctl_buf		inbuf;</a>
+<a name="ln95">	struct ctl_buf		outbuf;</a>
+<a name="ln96">	const struct ctl_verb *	verb;</a>
+<a name="ln97">	u_int			helpcode;</a>
+<a name="ln98">	const void *		respctx;</a>
+<a name="ln99">	u_int			respflags;</a>
+<a name="ln100">	ctl_srvrdone		donefunc;</a>
+<a name="ln101">	void *			uap;</a>
+<a name="ln102">	void *			csctx;</a>
+<a name="ln103">};</a>
+<a name="ln104"> </a>
+<a name="ln105">struct ctl_sctx {</a>
+<a name="ln106">	evContext		ev;</a>
+<a name="ln107">	void *			uctx;</a>
+<a name="ln108">	u_int			unkncode;</a>
+<a name="ln109">	u_int			timeoutcode;</a>
+<a name="ln110">	const struct ctl_verb *	verbs;</a>
+<a name="ln111">	const struct ctl_verb *	connverb;</a>
+<a name="ln112">	int			sock;</a>
+<a name="ln113">	int			max_sess;</a>
+<a name="ln114">	int			cur_sess;</a>
+<a name="ln115">	struct timespec		timeout;</a>
+<a name="ln116">	ctl_logfunc		logger;</a>
+<a name="ln117">	evConnID		acID;</a>
+<a name="ln118">	LIST(struct ctl_sess)	sess;</a>
+<a name="ln119">};</a>
+<a name="ln120"> </a>
+<a name="ln121">/* Forward. */</a>
+<a name="ln122"> </a>
+<a name="ln123">static void			ctl_accept(evContext, void *, int,</a>
+<a name="ln124">					   const void *, int,</a>
+<a name="ln125">					   const void *, int);</a>
+<a name="ln126">static void			ctl_close(struct ctl_sess *);</a>
+<a name="ln127">static void			ctl_new_state(struct ctl_sess *,</a>
+<a name="ln128">					      enum state,</a>
+<a name="ln129">					      const char *);</a>
+<a name="ln130">static void			ctl_start_read(struct ctl_sess *);</a>
+<a name="ln131">static void			ctl_stop_read(struct ctl_sess *);</a>
+<a name="ln132">static void			ctl_readable(evContext, void *, int, int);</a>
+<a name="ln133">static void			ctl_rdtimeout(evContext, void *,</a>
+<a name="ln134">					      struct timespec,</a>
+<a name="ln135">					      struct timespec);</a>
+<a name="ln136">static void			ctl_wrtimeout(evContext, void *,</a>
+<a name="ln137">					      struct timespec,</a>
+<a name="ln138">					      struct timespec);</a>
+<a name="ln139">static void			ctl_docommand(struct ctl_sess *);</a>
+<a name="ln140">static void			ctl_writedone(evContext, void *, int, int);</a>
+<a name="ln141">static void			ctl_morehelp(struct ctl_sctx *,</a>
+<a name="ln142">					     struct ctl_sess *,</a>
+<a name="ln143">					     const struct ctl_verb *,</a>
+<a name="ln144">					     const char *,</a>
+<a name="ln145">					     u_int, const void *, void *);</a>
+<a name="ln146">static void			ctl_signal_done(struct ctl_sctx *,</a>
+<a name="ln147">						struct ctl_sess *);</a>
+<a name="ln148"> </a>
+<a name="ln149">/* Private data. */</a>
+<a name="ln150"> </a>
+<a name="ln151">static const char *		state_names[] = {</a>
+<a name="ln152">	&quot;available&quot;, &quot;initializing&quot;, &quot;writing&quot;, &quot;reading&quot;,</a>
+<a name="ln153">	&quot;reading_data&quot;, &quot;processing&quot;, &quot;idling&quot;, &quot;quitting&quot;, &quot;closing&quot;</a>
+<a name="ln154">};</a>
+<a name="ln155"> </a>
+<a name="ln156">static const char		space[] = &quot; &quot;;</a>
+<a name="ln157"> </a>
+<a name="ln158">static const struct ctl_verb	fakehelpverb = {</a>
+<a name="ln159">	&quot;fakehelp&quot;, ctl_morehelp , NULL</a>
+<a name="ln160">};</a>
+<a name="ln161"> </a>
+<a name="ln162">/* Public. */</a>
+<a name="ln163"> </a>
+<a name="ln164">/*%</a>
+<a name="ln165"> * void</a>
+<a name="ln166"> * ctl_server()</a>
+<a name="ln167"> *	create, condition, and start a listener on the control port.</a>
+<a name="ln168"> */</a>
+<a name="ln169">struct ctl_sctx *</a>
+<a name="ln170">ctl_server(evContext lev, const struct sockaddr *sap, size_t sap_len,</a>
+<a name="ln171">	   const struct ctl_verb *verbs,</a>
+<a name="ln172">	   u_int unkncode, u_int timeoutcode,</a>
+<a name="ln173">	   u_int timeout, int backlog, int max_sess,</a>
+<a name="ln174">	   ctl_logfunc logger, void *uctx)</a>
+<a name="ln175">{</a>
+<a name="ln176">	static const char me[] = &quot;ctl_server&quot;;</a>
+<a name="ln177">	static const int on = 1;</a>
+<a name="ln178">	const struct ctl_verb *connverb;</a>
+<a name="ln179">	struct ctl_sctx *ctx;</a>
+<a name="ln180">	int save_errno;</a>
+<a name="ln181"> </a>
+<a name="ln182">	if (logger == NULL)</a>
+<a name="ln183">		logger = ctl_logger;</a>
+<a name="ln184">	for (connverb = verbs;</a>
+<a name="ln185">	     connverb-&gt;name != NULL &amp;&amp; connverb-&gt;func != NULL;</a>
+<a name="ln186">	     connverb++)</a>
+<a name="ln187">		if (connverb-&gt;name[0] == '\0')</a>
+<a name="ln188">			break;</a>
+<a name="ln189">	if (connverb-&gt;func == NULL) {</a>
+<a name="ln190">		(*logger)(ctl_error, &quot;%s: no connection verb found&quot;, me);</a>
+<a name="ln191">		return (NULL);</a>
+<a name="ln192">	}</a>
+<a name="ln193">	ctx = memget(sizeof *ctx);</a>
+<a name="ln194">	if (ctx == NULL) {</a>
+<a name="ln195">		(*logger)(ctl_error, &quot;%s: getmem: %s&quot;, me, strerror(errno));</a>
+<a name="ln196">		return (NULL);</a>
+<a name="ln197">	}</a>
+<a name="ln198">	ctx-&gt;ev = lev;</a>
+<a name="ln199">	ctx-&gt;uctx = uctx;</a>
+<a name="ln200">	ctx-&gt;unkncode = unkncode;</a>
+<a name="ln201">	ctx-&gt;timeoutcode = timeoutcode;</a>
+<a name="ln202">	ctx-&gt;verbs = verbs;</a>
+<a name="ln203">	ctx-&gt;timeout = evConsTime(timeout, 0);</a>
+<a name="ln204">	ctx-&gt;logger = logger;</a>
+<a name="ln205">	ctx-&gt;connverb = connverb;</a>
+<a name="ln206">	ctx-&gt;max_sess = max_sess;</a>
+<a name="ln207">	ctx-&gt;cur_sess = 0;</a>
+<a name="ln208">	INIT_LIST(ctx-&gt;sess);</a>
+<a name="ln209">	ctx-&gt;sock = socket(sap-&gt;sa_family, SOCK_STREAM, PF_UNSPEC);</a>
+<a name="ln210">	if (ctx-&gt;sock &gt; evHighestFD(ctx-&gt;ev)) {</a>
+<a name="ln211">		ctx-&gt;sock = -1;</a>
+<a name="ln212">		errno = ENOTSOCK;</a>
+<a name="ln213">	}</a>
+<a name="ln214">	if (ctx-&gt;sock &lt; 0) {</a>
+<a name="ln215">		save_errno = errno;</a>
+<a name="ln216">		(*ctx-&gt;logger)(ctl_error, &quot;%s: socket: %s&quot;,</a>
+<a name="ln217">			       me, strerror(errno));</a>
+<a name="ln218">		memput(ctx, sizeof *ctx);</a>
+<a name="ln219">		errno = save_errno;</a>
+<a name="ln220">		return (NULL);</a>
+<a name="ln221">	}</a>
+<a name="ln222">	if (ctx-&gt;sock &gt; evHighestFD(lev)) {</a>
+<a name="ln223">		close(ctx-&gt;sock);</a>
+<a name="ln224">		(*ctx-&gt;logger)(ctl_error, &quot;%s: file descriptor &gt; evHighestFD&quot;);</a>
+<a name="ln225">		errno = ENFILE;</a>
+<a name="ln226">		memput(ctx, sizeof *ctx);</a>
+<a name="ln227">		return (NULL);</a>
+<a name="ln228">	}</a>
+<a name="ln229">#ifdef NO_UNIX_REUSEADDR</a>
+<a name="ln230">	if (sap-&gt;sa_family != AF_UNIX)</a>
+<a name="ln231">#endif</a>
+<a name="ln232">		if (setsockopt(ctx-&gt;sock, SOL_SOCKET, SO_REUSEADDR,</a>
+<a name="ln233">			       (const char *)&amp;on, sizeof on) != 0) {</a>
+<a name="ln234">			(*ctx-&gt;logger)(ctl_warning,</a>
+<a name="ln235">				       &quot;%s: setsockopt(REUSEADDR): %s&quot;,</a>
+<a name="ln236">				       me, strerror(errno));</a>
+<a name="ln237">		}</a>
+<a name="ln238">	if (bind(ctx-&gt;sock, sap, sap_len) &lt; 0) {</a>
+<a name="ln239">		char tmp[MAX_NTOP];</a>
+<a name="ln240">		save_errno = errno;</a>
+<a name="ln241">		(*ctx-&gt;logger)(ctl_error, &quot;%s: bind: %s: %s&quot;,</a>
+<a name="ln242">			       me, ctl_sa_ntop((const struct sockaddr *)sap,</a>
+<a name="ln243">			       tmp, sizeof tmp, ctx-&gt;logger),</a>
+<a name="ln244">			       strerror(save_errno));</a>
+<a name="ln245">		close(ctx-&gt;sock);</a>
+<a name="ln246">		memput(ctx, sizeof *ctx);</a>
+<a name="ln247">		errno = save_errno;</a>
+<a name="ln248">		return (NULL);</a>
+<a name="ln249">	}</a>
+<a name="ln250">	if (fcntl(ctx-&gt;sock, F_SETFD, 1) &lt; 0) {</a>
+<a name="ln251">		(*ctx-&gt;logger)(ctl_warning, &quot;%s: fcntl: %s&quot;, me,</a>
+<a name="ln252">			       strerror(errno));</a>
+<a name="ln253">	}</a>
+<a name="ln254">	if (evListen(lev, ctx-&gt;sock, backlog, ctl_accept, ctx,</a>
+<a name="ln255">		     &amp;ctx-&gt;acID) &lt; 0) {</a>
+<a name="ln256">		save_errno = errno;</a>
+<a name="ln257">		(*ctx-&gt;logger)(ctl_error, &quot;%s: evListen(fd %d): %s&quot;,</a>
+<a name="ln258">			       me, ctx-&gt;sock, strerror(errno));</a>
+<a name="ln259">		close(ctx-&gt;sock);</a>
+<a name="ln260">		memput(ctx, sizeof *ctx);</a>
+<a name="ln261">		errno = save_errno;</a>
+<a name="ln262">		return (NULL);</a>
+<a name="ln263">	}</a>
+<a name="ln264">	(*ctx-&gt;logger)(ctl_debug, &quot;%s: new ctx %p, sock %d&quot;,</a>
+<a name="ln265">		       me, ctx, ctx-&gt;sock);</a>
+<a name="ln266">	return (ctx);</a>
+<a name="ln267">}</a>
+<a name="ln268"> </a>
+<a name="ln269">/*%</a>
+<a name="ln270"> * void</a>
+<a name="ln271"> * ctl_endserver(ctx)</a>
+<a name="ln272"> *	if the control listener is open, close it.  clean out all eventlib</a>
+<a name="ln273"> *	stuff.  close all active sessions.</a>
+<a name="ln274"> */</a>
+<a name="ln275">void</a>
+<a name="ln276">ctl_endserver(struct ctl_sctx *ctx) {</a>
+<a name="ln277">	static const char me[] = &quot;ctl_endserver&quot;;</a>
+<a name="ln278">	struct ctl_sess *this, *next;</a>
+<a name="ln279"> </a>
+<a name="ln280">	(*ctx-&gt;logger)(ctl_debug, &quot;%s: ctx %p, sock %d, acID %p, sess %p&quot;,</a>
+<a name="ln281">		       me, ctx, ctx-&gt;sock, ctx-&gt;acID.opaque, ctx-&gt;sess);</a>
+<a name="ln282">	if (ctx-&gt;acID.opaque != NULL) {</a>
+<a name="ln283">		(void)evCancelConn(ctx-&gt;ev, ctx-&gt;acID);</a>
+<a name="ln284">		ctx-&gt;acID.opaque = NULL;</a>
+<a name="ln285">	}</a>
+<a name="ln286">	if (ctx-&gt;sock != -1) {</a>
+<a name="ln287">		(void) close(ctx-&gt;sock);</a>
+<a name="ln288">		ctx-&gt;sock = -1;</a>
+<a name="ln289">	}</a>
+<a name="ln290">	for (this = HEAD(ctx-&gt;sess); this != NULL; this = next) {</a>
+<a name="ln291">		next = NEXT(this, link);</a>
+<a name="ln292">		ctl_close(this);</a>
+<a name="ln293">	}</a>
+<a name="ln294">	memput(ctx, sizeof *ctx);</a>
+<a name="ln295">}</a>
+<a name="ln296"> </a>
+<a name="ln297">/*%</a>
+<a name="ln298"> * If body is non-NULL then it we add a &quot;.&quot; line after it.</a>
+<a name="ln299"> * Caller must have  escaped lines with leading &quot;.&quot;.</a>
+<a name="ln300"> */</a>
+<a name="ln301">void</a>
+<a name="ln302">ctl_response(struct ctl_sess *sess, u_int code, const char *text,</a>
+<a name="ln303">	     u_int flags, const void *respctx, ctl_srvrdone donefunc,</a>
+<a name="ln304">	     void *uap, const char *body, size_t bodylen)</a>
+<a name="ln305">{</a>
+<a name="ln306">	static const char me[] = &quot;ctl_response&quot;;</a>
+<a name="ln307">	struct iovec iov[3], *iovp = iov;</a>
+<a name="ln308">	struct ctl_sctx *ctx = sess-&gt;ctx;</a>
+<a name="ln309">	char tmp[MAX_NTOP], *pc;</a>
+<a name="ln310">	int n;</a>
+<a name="ln311"> </a>
+<a name="ln312">	REQUIRE(sess-&gt;state == initializing ||</a>
+<a name="ln313">		sess-&gt;state == processing ||</a>
+<a name="ln314">		sess-&gt;state == reading_data ||</a>
+<a name="ln315">		sess-&gt;state == writing);</a>
+<a name="ln316">	REQUIRE(sess-&gt;wrtiID.opaque == NULL);</a>
+<a name="ln317">	REQUIRE(sess-&gt;wrID.opaque == NULL);</a>
+<a name="ln318">	ctl_new_state(sess, writing, me);</a>
+<a name="ln319">	sess-&gt;donefunc = donefunc;</a>
+<a name="ln320">	sess-&gt;uap = uap;</a>
+<a name="ln321">	if (!allocated_p(sess-&gt;outbuf) &amp;&amp;</a>
+<a name="ln322">	    ctl_bufget(&amp;sess-&gt;outbuf, ctx-&gt;logger) &lt; 0) {</a>
+<a name="ln323">		(*ctx-&gt;logger)(ctl_error, &quot;%s: %s: cant get an output buffer&quot;,</a>
+<a name="ln324">			       me, address_expr);</a>
+<a name="ln325">		goto untimely;</a>
+<a name="ln326">	}</a>
+<a name="ln327">	if (sizeof &quot;000-\r\n&quot; + strlen(text) &gt; (size_t)MAX_LINELEN) {</a>
+<a name="ln328">		(*ctx-&gt;logger)(ctl_error, &quot;%s: %s: output buffer ovf, closing&quot;,</a>
+<a name="ln329">			       me, address_expr);</a>
+<a name="ln330">		goto untimely;</a>
+<a name="ln331">	}</a>
+<a name="ln332">	sess-&gt;outbuf.used = SPRINTF((sess-&gt;outbuf.text, &quot;%03d%c%s\r\n&quot;,</a>
+<a name="ln333">				     code, (flags &amp; CTL_MORE) != 0 ? '-' : ' ',</a>
+<a name="ln334">				     text));</a>
+<a name="ln335">	for (pc = sess-&gt;outbuf.text, n = 0;</a>
+<a name="ln336">	     n &lt; (int)sess-&gt;outbuf.used-2; pc++, n++)</a>
+<a name="ln337">		if (!isascii((unsigned char)*pc) ||</a>
+<a name="ln338">		    !isprint((unsigned char)*pc))</a>
+<a name="ln339">			*pc = '\040';</a>
+<a name="ln340">	*iovp++ = evConsIovec(sess-&gt;outbuf.text, sess-&gt;outbuf.used);</a>
+<a name="ln341">	if (body != NULL) {</a>
+<a name="ln342">		char *tmp;</a>
+<a name="ln343">		DE_CONST(body, tmp);</a>
+<a name="ln344">		*iovp++ = evConsIovec(tmp, bodylen);</a>
+<a name="ln345">		DE_CONST(&quot;.\r\n&quot;, tmp);</a>
+<a name="ln346">		*iovp++ = evConsIovec(tmp, 3);</a>
+<a name="ln347">	}</a>
+<a name="ln348">	(*ctx-&gt;logger)(ctl_debug, &quot;%s: [%d] %s&quot;, me,</a>
+<a name="ln349">		       sess-&gt;outbuf.used, sess-&gt;outbuf.text);</a>
+<a name="ln350">	if (evWrite(ctx-&gt;ev, sess-&gt;sock, iov, iovp - iov,</a>
+<a name="ln351">		    ctl_writedone, sess, &amp;sess-&gt;wrID) &lt; 0) {</a>
+<a name="ln352">		(*ctx-&gt;logger)(ctl_error, &quot;%s: %s: evWrite: %s&quot;, me,</a>
+<a name="ln353">			       address_expr, strerror(errno));</a>
+<a name="ln354">		goto untimely;</a>
+<a name="ln355">	}</a>
+<a name="ln356">	if (evSetIdleTimer(ctx-&gt;ev, ctl_wrtimeout, sess, ctx-&gt;timeout,</a>
+<a name="ln357">			   &amp;sess-&gt;wrtiID) &lt; 0)</a>
+<a name="ln358">	{</a>
+<a name="ln359">		(*ctx-&gt;logger)(ctl_error, &quot;%s: %s: evSetIdleTimer: %s&quot;, me,</a>
+<a name="ln360">			       address_expr, strerror(errno));</a>
+<a name="ln361">		goto untimely;</a>
+<a name="ln362">	}</a>
+<a name="ln363">	if (evTimeRW(ctx-&gt;ev, sess-&gt;wrID, sess-&gt;wrtiID) &lt; 0) {</a>
+<a name="ln364">		(*ctx-&gt;logger)(ctl_error, &quot;%s: %s: evTimeRW: %s&quot;, me,</a>
+<a name="ln365">			       address_expr, strerror(errno));</a>
+<a name="ln366"> untimely:</a>
+<a name="ln367">		ctl_signal_done(ctx, sess);</a>
+<a name="ln368">		ctl_close(sess);</a>
+<a name="ln369">		return;</a>
+<a name="ln370">	}</a>
+<a name="ln371">	sess-&gt;respctx = respctx;</a>
+<a name="ln372">	sess-&gt;respflags = flags;</a>
+<a name="ln373">}</a>
+<a name="ln374"> </a>
+<a name="ln375">void</a>
+<a name="ln376">ctl_sendhelp(struct ctl_sess *sess, u_int code) {</a>
+<a name="ln377">	static const char me[] = &quot;ctl_sendhelp&quot;;</a>
+<a name="ln378">	struct ctl_sctx *ctx = sess-&gt;ctx;</a>
+<a name="ln379"> </a>
+<a name="ln380">	sess-&gt;helpcode = code;</a>
+<a name="ln381">	sess-&gt;verb = &amp;fakehelpverb;</a>
+<a name="ln382">	ctl_morehelp(ctx, sess, NULL, me, CTL_MORE,</a>
+<a name="ln383">		     (const void *)ctx-&gt;verbs, NULL);</a>
+<a name="ln384">}</a>
+<a name="ln385"> </a>
+<a name="ln386">void *</a>
+<a name="ln387">ctl_getcsctx(struct ctl_sess *sess) {</a>
+<a name="ln388">	return (sess-&gt;csctx);</a>
+<a name="ln389">}</a>
+<a name="ln390"> </a>
+<a name="ln391">void *</a>
+<a name="ln392">ctl_setcsctx(struct ctl_sess *sess, void *csctx) {</a>
+<a name="ln393">	void *old = sess-&gt;csctx;</a>
+<a name="ln394"> </a>
+<a name="ln395">	sess-&gt;csctx = csctx;</a>
+<a name="ln396">	return (old);</a>
+<a name="ln397">}</a>
+<a name="ln398"> </a>
+<a name="ln399">/* Private functions. */</a>
+<a name="ln400"> </a>
+<a name="ln401">static void</a>
+<a name="ln402">ctl_accept(evContext lev, void *uap, int fd,</a>
+<a name="ln403">	   const void *lav, int lalen,</a>
+<a name="ln404">	   const void *rav, int ralen)</a>
+<a name="ln405">{</a>
+<a name="ln406">	static const char me[] = &quot;ctl_accept&quot;;</a>
+<a name="ln407">	struct ctl_sctx *ctx = uap;</a>
+<a name="ln408">	struct ctl_sess *sess = NULL;</a>
+<a name="ln409">	char tmp[MAX_NTOP];</a>
+<a name="ln410"> </a>
+<a name="ln411">	UNUSED(lev);</a>
+<a name="ln412">	UNUSED(lalen);</a>
+<a name="ln413">	UNUSED(ralen);</a>
+<a name="ln414"> </a>
+<a name="ln415">	if (fd &lt; 0) {</a>
+<a name="ln416">		(*ctx-&gt;logger)(ctl_error, &quot;%s: accept: %s&quot;,</a>
+<a name="ln417">			       me, strerror(errno));</a>
+<a name="ln418">		return;</a>
+<a name="ln419">	}</a>
+<a name="ln420">	if (ctx-&gt;cur_sess == ctx-&gt;max_sess) {</a>
+<a name="ln421">		(*ctx-&gt;logger)(ctl_error, &quot;%s: %s: too many control sessions&quot;,</a>
+<a name="ln422">			       me, ctl_sa_ntop((const struct sockaddr *)rav,</a>
+<a name="ln423">					       tmp, sizeof tmp,</a>
+<a name="ln424">					       ctx-&gt;logger));</a>
+<a name="ln425">		(void) close(fd);</a>
+<a name="ln426">		return;</a>
+<a name="ln427">	}</a>
+<a name="ln428">	sess = memget(sizeof *sess);</a>
+<a name="ln429">	if (sess == NULL) {</a>
+<a name="ln430">		(*ctx-&gt;logger)(ctl_error, &quot;%s: memget: %s&quot;, me,</a>
+<a name="ln431">			       strerror(errno));</a>
+<a name="ln432">		(void) close(fd);</a>
+<a name="ln433">		return;</a>
+<a name="ln434">	}</a>
+<a name="ln435">	if (fcntl(fd, F_SETFD, 1) &lt; 0) {</a>
+<a name="ln436">		(*ctx-&gt;logger)(ctl_warning, &quot;%s: fcntl: %s&quot;, me,</a>
+<a name="ln437">			       strerror(errno));</a>
+<a name="ln438">	}</a>
+<a name="ln439">	ctx-&gt;cur_sess++;</a>
+<a name="ln440">	INIT_LINK(sess, link);</a>
+<a name="ln441">	APPEND(ctx-&gt;sess, sess, link);</a>
+<a name="ln442">	sess-&gt;ctx = ctx;</a>
+<a name="ln443">	sess-&gt;sock = fd;</a>
+<a name="ln444">	sess-&gt;wrID.opaque = NULL;</a>
+<a name="ln445">	sess-&gt;rdID.opaque = NULL;</a>
+<a name="ln446">	sess-&gt;wrtiID.opaque = NULL;</a>
+<a name="ln447">	sess-&gt;rdtiID.opaque = NULL;</a>
+<a name="ln448">	sess-&gt;respctx = NULL;</a>
+<a name="ln449">	sess-&gt;csctx = NULL;</a>
+<a name="ln450">	if (((const struct sockaddr *)rav)-&gt;sa_family == AF_UNIX)</a>
+<a name="ln451">		ctl_sa_copy((const struct sockaddr *)lav,</a>
+<a name="ln452">			    (struct sockaddr *)&amp;sess-&gt;sa);</a>
+<a name="ln453">	else</a>
+<a name="ln454">		ctl_sa_copy((const struct sockaddr *)rav,</a>
+<a name="ln455">			    (struct sockaddr *)&amp;sess-&gt;sa);</a>
+<a name="ln456">	sess-&gt;donefunc = NULL;</a>
+<a name="ln457">	buffer_init(sess-&gt;inbuf);</a>
+<a name="ln458">	buffer_init(sess-&gt;outbuf);</a>
+<a name="ln459">	sess-&gt;state = available;</a>
+<a name="ln460">	ctl_new_state(sess, initializing, me);</a>
+<a name="ln461">	sess-&gt;verb = ctx-&gt;connverb;</a>
+<a name="ln462">	(*ctx-&gt;logger)(ctl_debug, &quot;%s: %s: accepting (fd %d)&quot;,</a>
+<a name="ln463">		       me, address_expr, sess-&gt;sock);</a>
+<a name="ln464">	(*ctx-&gt;connverb-&gt;func)(ctx, sess, ctx-&gt;connverb, &quot;&quot;, 0,</a>
+<a name="ln465">			       (const struct sockaddr *)rav, ctx-&gt;uctx);</a>
+<a name="ln466">}</a>
+<a name="ln467"> </a>
+<a name="ln468">static void</a>
+<a name="ln469">ctl_new_state(struct ctl_sess *sess, enum state new_state, const char *reason)</a>
+<a name="ln470">{</a>
+<a name="ln471">	static const char me[] = &quot;ctl_new_state&quot;;</a>
+<a name="ln472">	struct ctl_sctx *ctx = sess-&gt;ctx;</a>
+<a name="ln473">	char tmp[MAX_NTOP];</a>
+<a name="ln474"> </a>
+<a name="ln475">	(*ctx-&gt;logger)(ctl_debug, &quot;%s: %s: %s -&gt; %s (%s)&quot;,</a>
+<a name="ln476">		       me, address_expr,</a>
+<a name="ln477">		       state_names[sess-&gt;state],</a>
+<a name="ln478">		       state_names[new_state], reason);</a>
+<a name="ln479">	sess-&gt;state = new_state;</a>
+<a name="ln480">}</a>
+<a name="ln481"> </a>
+<a name="ln482">static void</a>
+<a name="ln483">ctl_close(struct ctl_sess *sess) {</a>
+<a name="ln484">	static const char me[] = &quot;ctl_close&quot;;</a>
+<a name="ln485">	struct ctl_sctx *ctx = sess-&gt;ctx;</a>
+<a name="ln486">	char tmp[MAX_NTOP];</a>
+<a name="ln487"> </a>
+<a name="ln488">	REQUIRE(sess-&gt;state == initializing ||</a>
+<a name="ln489">		sess-&gt;state == writing ||</a>
+<a name="ln490">		sess-&gt;state == reading ||</a>
+<a name="ln491">		sess-&gt;state == processing ||</a>
+<a name="ln492">		sess-&gt;state == reading_data ||</a>
+<a name="ln493">		sess-&gt;state == idling);</a>
+<a name="ln494">	REQUIRE(sess-&gt;sock != -1);</a>
+<a name="ln495">	if (sess-&gt;state == reading || sess-&gt;state == reading_data)</a>
+<a name="ln496">		ctl_stop_read(sess);</a>
+<a name="ln497">	else if (sess-&gt;state == writing) {</a>
+<a name="ln498">		if (sess-&gt;wrID.opaque != NULL) {</a>
+<a name="ln499">			(void) evCancelRW(ctx-&gt;ev, sess-&gt;wrID);</a>
+<a name="ln500">			sess-&gt;wrID.opaque = NULL;</a>
+<a name="ln501">		}</a>
+<a name="ln502">		if (sess-&gt;wrtiID.opaque != NULL) {</a>
+<a name="ln503">			(void) evClearIdleTimer(ctx-&gt;ev, sess-&gt;wrtiID);</a>
+<a name="ln504">			sess-&gt;wrtiID.opaque = NULL;</a>
+<a name="ln505">		}</a>
+<a name="ln506">	}</a>
+<a name="ln507">	ctl_new_state(sess, closing, me);</a>
+<a name="ln508">	(void) close(sess-&gt;sock);</a>
+<a name="ln509">	if (allocated_p(sess-&gt;inbuf))</a>
+<a name="ln510">		ctl_bufput(&amp;sess-&gt;inbuf);</a>
+<a name="ln511">	if (allocated_p(sess-&gt;outbuf))</a>
+<a name="ln512">		ctl_bufput(&amp;sess-&gt;outbuf);</a>
+<a name="ln513">	(*ctx-&gt;logger)(ctl_debug, &quot;%s: %s: closed (fd %d)&quot;,</a>
+<a name="ln514">		       me, address_expr, sess-&gt;sock);</a>
+<a name="ln515">	UNLINK(ctx-&gt;sess, sess, link);</a>
+<a name="ln516">	memput(sess, sizeof *sess);</a>
+<a name="ln517">	ctx-&gt;cur_sess--;</a>
+<a name="ln518">}</a>
+<a name="ln519"> </a>
+<a name="ln520">static void</a>
+<a name="ln521">ctl_start_read(struct ctl_sess *sess) {</a>
+<a name="ln522">	static const char me[] = &quot;ctl_start_read&quot;;</a>
+<a name="ln523">	struct ctl_sctx *ctx = sess-&gt;ctx;</a>
+<a name="ln524">	char tmp[MAX_NTOP];</a>
+<a name="ln525"> </a>
+<a name="ln526">	REQUIRE(sess-&gt;state == initializing ||</a>
+<a name="ln527">		sess-&gt;state == writing ||</a>
+<a name="ln528">		sess-&gt;state == processing ||</a>
+<a name="ln529">		sess-&gt;state == idling);</a>
+<a name="ln530">	REQUIRE(sess-&gt;rdtiID.opaque == NULL);</a>
+<a name="ln531">	REQUIRE(sess-&gt;rdID.opaque == NULL);</a>
+<a name="ln532">	sess-&gt;inbuf.used = 0;</a>
+<a name="ln533">	if (evSetIdleTimer(ctx-&gt;ev, ctl_rdtimeout, sess, ctx-&gt;timeout,</a>
+<a name="ln534">			   &amp;sess-&gt;rdtiID) &lt; 0)</a>
+<a name="ln535">	{</a>
+<a name="ln536">		(*ctx-&gt;logger)(ctl_error, &quot;%s: %s: evSetIdleTimer: %s&quot;, me,</a>
+<a name="ln537">			       address_expr, strerror(errno));</a>
+<a name="ln538">		ctl_close(sess);</a>
+<a name="ln539">		return;</a>
+<a name="ln540">	}</a>
+<a name="ln541">	if (evSelectFD(ctx-&gt;ev, sess-&gt;sock, EV_READ,</a>
+<a name="ln542">		       ctl_readable, sess, &amp;sess-&gt;rdID) &lt; 0) {</a>
+<a name="ln543">		(*ctx-&gt;logger)(ctl_error, &quot;%s: %s: evSelectFD: %s&quot;, me,</a>
+<a name="ln544">			       address_expr, strerror(errno));</a>
+<a name="ln545">		return;</a>
+<a name="ln546">	}</a>
+<a name="ln547">	ctl_new_state(sess, reading, me);</a>
+<a name="ln548">}</a>
+<a name="ln549"> </a>
+<a name="ln550">static void</a>
+<a name="ln551">ctl_stop_read(struct ctl_sess *sess) {</a>
+<a name="ln552">	static const char me[] = &quot;ctl_stop_read&quot;;</a>
+<a name="ln553">	struct ctl_sctx *ctx = sess-&gt;ctx;</a>
+<a name="ln554"> </a>
+<a name="ln555">	REQUIRE(sess-&gt;state == reading || sess-&gt;state == reading_data);</a>
+<a name="ln556">	REQUIRE(sess-&gt;rdID.opaque != NULL);</a>
+<a name="ln557">	(void) evDeselectFD(ctx-&gt;ev, sess-&gt;rdID);</a>
+<a name="ln558">	sess-&gt;rdID.opaque = NULL;</a>
+<a name="ln559">	if (sess-&gt;rdtiID.opaque != NULL) {</a>
+<a name="ln560">		(void) evClearIdleTimer(ctx-&gt;ev, sess-&gt;rdtiID);</a>
+<a name="ln561">		sess-&gt;rdtiID.opaque = NULL;</a>
+<a name="ln562">	}</a>
+<a name="ln563">	ctl_new_state(sess, idling, me);</a>
+<a name="ln564">}</a>
+<a name="ln565"> </a>
+<a name="ln566">static void</a>
+<a name="ln567">ctl_readable(evContext lev, void *uap, int fd, int evmask) {</a>
+<a name="ln568">	static const char me[] = &quot;ctl_readable&quot;;</a>
+<a name="ln569">	struct ctl_sess *sess = uap;</a>
+<a name="ln570">	struct ctl_sctx *ctx;</a>
+<a name="ln571">	char *eos, tmp[MAX_NTOP];</a>
+<a name="ln572">	ssize_t n;</a>
+<a name="ln573"> </a>
+<a name="ln574">	REQUIRE(sess != NULL);</a>
+<a name="ln575">	REQUIRE(fd &gt;= 0);</a>
+<a name="ln576">	REQUIRE(evmask == EV_READ);</a>
+<a name="ln577">	REQUIRE(sess-&gt;state == reading || sess-&gt;state == reading_data);</a>
+<a name="ln578"> </a>
+<a name="ln579">	ctx = sess-&gt;ctx;</a>
+<a name="ln580">	evTouchIdleTimer(lev, sess-&gt;rdtiID);</a>
+<a name="ln581">	if (!allocated_p(sess-&gt;inbuf) &amp;&amp;</a>
+<a name="ln582">	    ctl_bufget(&amp;sess-&gt;inbuf, ctx-&gt;logger) &lt; 0) {</a>
+<a name="ln583">		(*ctx-&gt;logger)(ctl_error, &quot;%s: %s: cant get an input buffer&quot;,</a>
+<a name="ln584">			       me, address_expr);</a>
+<a name="ln585">		ctl_close(sess);</a>
+<a name="ln586">		return;</a>
+<a name="ln587">	}</a>
+<a name="ln588">	n = read(sess-&gt;sock, sess-&gt;inbuf.text + sess-&gt;inbuf.used,</a>
+<a name="ln589">		 MAX_LINELEN - sess-&gt;inbuf.used);</a>
+<a name="ln590">	if (n &lt;= 0) {</a>
+<a name="ln591">		(*ctx-&gt;logger)(ctl_debug, &quot;%s: %s: read: %s&quot;,</a>
+<a name="ln592">			       me, address_expr,</a>
+<a name="ln593">			       (n == 0) ? &quot;Unexpected EOF&quot; : strerror(errno));</a>
+<a name="ln594">		ctl_close(sess);</a>
+<a name="ln595">		return;</a>
+<a name="ln596">	}</a>
+<a name="ln597">	sess-&gt;inbuf.used += n;</a>
+<a name="ln598">	eos = memchr(sess-&gt;inbuf.text, '\n', sess-&gt;inbuf.used);</a>
+<a name="ln599">	if (eos != NULL &amp;&amp; eos != sess-&gt;inbuf.text &amp;&amp; eos[-1] == '\r') {</a>
+<a name="ln600">		eos[-1] = '\0';</a>
+<a name="ln601">		if ((sess-&gt;respflags &amp; CTL_DATA) != 0) {</a>
+<a name="ln602">			INSIST(sess-&gt;verb != NULL);</a>
+<a name="ln603">			(*sess-&gt;verb-&gt;func)(sess-&gt;ctx, sess, sess-&gt;verb,</a>
+<a name="ln604">					    sess-&gt;inbuf.text,</a>
+<a name="ln605">					    CTL_DATA, sess-&gt;respctx,</a>
+<a name="ln606">					    sess-&gt;ctx-&gt;uctx);</a>
+<a name="ln607">		} else {</a>
+<a name="ln608">			ctl_stop_read(sess);</a>
+<a name="ln609">			ctl_docommand(sess);</a>
+<a name="ln610">		}</a>
+<a name="ln611">		sess-&gt;inbuf.used -= ((eos - sess-&gt;inbuf.text) + 1);</a>
+<a name="ln612">		if (sess-&gt;inbuf.used == 0U)</a>
+<a name="ln613">			ctl_bufput(&amp;sess-&gt;inbuf);</a>
+<a name="ln614">		else</a>
+<a name="ln615">			memmove(sess-&gt;inbuf.text, eos + 1, sess-&gt;inbuf.used);</a>
+<a name="ln616">		return;</a>
+<a name="ln617">	}</a>
+<a name="ln618">	if (sess-&gt;inbuf.used == (size_t)MAX_LINELEN) {</a>
+<a name="ln619">		(*ctx-&gt;logger)(ctl_error, &quot;%s: %s: line too long, closing&quot;,</a>
+<a name="ln620">			       me, address_expr);</a>
+<a name="ln621">		ctl_close(sess);</a>
+<a name="ln622">	}</a>
+<a name="ln623">}</a>
+<a name="ln624"> </a>
+<a name="ln625">static void</a>
+<a name="ln626">ctl_wrtimeout(evContext lev, void *uap,</a>
+<a name="ln627">	      struct timespec due,</a>
+<a name="ln628">	      struct timespec itv)</a>
+<a name="ln629">{</a>
+<a name="ln630">	static const char me[] = &quot;ctl_wrtimeout&quot;;</a>
+<a name="ln631">	struct ctl_sess *sess = uap;</a>
+<a name="ln632">	struct ctl_sctx *ctx = sess-&gt;ctx;</a>
+<a name="ln633">	char tmp[MAX_NTOP];</a>
+<a name="ln634"> </a>
+<a name="ln635">	UNUSED(lev);</a>
+<a name="ln636">	UNUSED(due);</a>
+<a name="ln637">	UNUSED(itv);</a>
+<a name="ln638"> </a>
+<a name="ln639">	REQUIRE(sess-&gt;state == writing);</a>
+<a name="ln640">	sess-&gt;wrtiID.opaque = NULL;</a>
+<a name="ln641">	(*ctx-&gt;logger)(ctl_warning, &quot;%s: %s: write timeout, closing&quot;,</a>
+<a name="ln642">		       me, address_expr);</a>
+<a name="ln643">	if (sess-&gt;wrID.opaque != NULL) {</a>
+<a name="ln644">		(void) evCancelRW(ctx-&gt;ev, sess-&gt;wrID);</a>
+<a name="ln645">		sess-&gt;wrID.opaque = NULL;</a>
+<a name="ln646">	}</a>
+<a name="ln647">	ctl_signal_done(ctx, sess);</a>
+<a name="ln648">	ctl_new_state(sess, processing, me);</a>
+<a name="ln649">	ctl_close(sess);</a>
+<a name="ln650">}</a>
+<a name="ln651"> </a>
+<a name="ln652">static void</a>
+<a name="ln653">ctl_rdtimeout(evContext lev, void *uap,</a>
+<a name="ln654">	      struct timespec due,</a>
+<a name="ln655">	      struct timespec itv)</a>
+<a name="ln656">{</a>
+<a name="ln657">	static const char me[] = &quot;ctl_rdtimeout&quot;;</a>
+<a name="ln658">	struct ctl_sess *sess = uap;</a>
+<a name="ln659">	struct ctl_sctx *ctx = sess-&gt;ctx;</a>
+<a name="ln660">	char tmp[MAX_NTOP];</a>
+<a name="ln661"> </a>
+<a name="ln662">	UNUSED(lev);</a>
+<a name="ln663">	UNUSED(due);</a>
+<a name="ln664">	UNUSED(itv);</a>
+<a name="ln665"> </a>
+<a name="ln666">	REQUIRE(sess-&gt;state == reading);</a>
+<a name="ln667">	sess-&gt;rdtiID.opaque = NULL;</a>
+<a name="ln668">	(*ctx-&gt;logger)(ctl_warning, &quot;%s: %s: timeout, closing&quot;,</a>
+<a name="ln669">		       me, address_expr);</a>
+<a name="ln670">	if (sess-&gt;state == reading || sess-&gt;state == reading_data)</a>
+<a name="ln671">		ctl_stop_read(sess);</a>
+<a name="ln672">	ctl_signal_done(ctx, sess);</a>
+<a name="ln673">	ctl_new_state(sess, processing, me);</a>
+<a name="ln674">	ctl_response(sess, ctx-&gt;timeoutcode, &quot;Timeout.&quot;, CTL_EXIT, NULL,</a>
+<a name="ln675">		     NULL, NULL, NULL, 0);</a>
+<a name="ln676">}</a>
+<a name="ln677"> </a>
+<a name="ln678">static void</a>
+<a name="ln679">ctl_docommand(struct ctl_sess *sess) {</a>
+<a name="ln680">	static const char me[] = &quot;ctl_docommand&quot;;</a>
+<a name="ln681">	char *name, *rest, tmp[MAX_NTOP];</a>
+<a name="ln682">	struct ctl_sctx *ctx = sess-&gt;ctx;</a>
+<a name="ln683">	const struct ctl_verb *verb;</a>
+<a name="ln684"> </a>
+<a name="ln685">	REQUIRE(allocated_p(sess-&gt;inbuf));</a>
+<a name="ln686">	(*ctx-&gt;logger)(ctl_debug, &quot;%s: %s: \&quot;%s\&quot; [%u]&quot;,</a>
+<a name="ln687">		       me, address_expr,</a>
+<a name="ln688">		       sess-&gt;inbuf.text, (u_int)sess-&gt;inbuf.used);</a>
+<a name="ln689">	ctl_new_state(sess, processing, me);</a>
+<a name="ln690">	name = sess-&gt;inbuf.text + strspn(sess-&gt;inbuf.text, space);</a>
+<a name="ln691">	rest = name + strcspn(name, space);</a>
+<a name="ln692">	if (*rest != '\0') {</a>
+<a name="ln693">		*rest++ = '\0';</a>
+<a name="ln694">		rest += strspn(rest, space);</a>
+<a name="ln695">	}</a>
+<a name="ln696">	for (verb = ctx-&gt;verbs;</a>
+<a name="ln697">	     verb != NULL &amp;&amp; verb-&gt;name != NULL &amp;&amp; verb-&gt;func != NULL;</a>
+<a name="ln698">	     verb++)</a>
+<a name="ln699">		if (verb-&gt;name[0] != '\0' &amp;&amp; strcasecmp(name, verb-&gt;name) == 0)</a>
+<a name="ln700">			break;</a>
+<a name="ln701">	if (verb != NULL &amp;&amp; verb-&gt;name != NULL &amp;&amp; verb-&gt;func != NULL) {</a>
+<a name="ln702">		sess-&gt;verb = verb;</a>
+<a name="ln703">		(*verb-&gt;func)(ctx, sess, verb, rest, 0, NULL, ctx-&gt;uctx);</a>
+<a name="ln704">	} else {</a>
+<a name="ln705">		char buf[1100];</a>
+<a name="ln706"> </a>
+<a name="ln707">		if (sizeof &quot;Unrecognized command \&quot;\&quot; (args \&quot;\&quot;)&quot; +</a>
+<a name="ln708">		    strlen(name) + strlen(rest) &gt; sizeof buf)</a>
+<a name="ln709">			strcpy(buf, &quot;Unrecognized command (buf ovf)&quot;);</a>
+<a name="ln710">		else</a>
+<a name="ln711">			sprintf(buf,</a>
+<a name="ln712">				&quot;Unrecognized command \&quot;%s\&quot; (args \&quot;%s\&quot;)&quot;,</a>
+<a name="ln713">				name, rest);</a>
+<a name="ln714">		ctl_response(sess, ctx-&gt;unkncode, buf, 0, NULL, NULL, NULL,</a>
+<a name="ln715">			     NULL, 0);</a>
+<a name="ln716">	}</a>
+<a name="ln717">}</a>
+<a name="ln718"> </a>
+<a name="ln719">static void</a>
+<a name="ln720">ctl_writedone(evContext lev, void *uap, int fd, int bytes) {</a>
+<a name="ln721">	static const char me[] = &quot;ctl_writedone&quot;;</a>
+<a name="ln722">	struct ctl_sess *sess = uap;</a>
+<a name="ln723">	struct ctl_sctx *ctx = sess-&gt;ctx;</a>
+<a name="ln724">	char tmp[MAX_NTOP];</a>
+<a name="ln725">	int save_errno = errno;</a>
+<a name="ln726"> </a>
+<a name="ln727">	UNUSED(lev);</a>
+<a name="ln728">	UNUSED(uap);</a>
+<a name="ln729"> </a>
+<a name="ln730">	REQUIRE(sess-&gt;state == writing);</a>
+<a name="ln731">	REQUIRE(fd == sess-&gt;sock);</a>
+<a name="ln732">	REQUIRE(sess-&gt;wrtiID.opaque != NULL);</a>
+<a name="ln733">	sess-&gt;wrID.opaque = NULL;</a>
+<a name="ln734">	(void) evClearIdleTimer(ctx-&gt;ev, sess-&gt;wrtiID);</a>
+<a name="ln735">	sess-&gt;wrtiID.opaque = NULL;</a>
+<a name="ln736">	if (bytes &lt; 0) {</a>
+<a name="ln737">		(*ctx-&gt;logger)(ctl_error, &quot;%s: %s: %s&quot;,</a>
+<a name="ln738">			       me, address_expr, strerror(save_errno));</a>
+<a name="ln739">		ctl_close(sess);</a>
+<a name="ln740">		return;</a>
+<a name="ln741">	}</a>
+<a name="ln742"> </a>
+<a name="ln743">	INSIST(allocated_p(sess-&gt;outbuf));</a>
+<a name="ln744">	ctl_bufput(&amp;sess-&gt;outbuf);</a>
+<a name="ln745">	if ((sess-&gt;respflags &amp; CTL_EXIT) != 0) {</a>
+<a name="ln746">		ctl_signal_done(ctx, sess);</a>
+<a name="ln747">		ctl_close(sess);</a>
+<a name="ln748">		return;</a>
+<a name="ln749">	} else if ((sess-&gt;respflags &amp; CTL_MORE) != 0) {</a>
+<a name="ln750">		INSIST(sess-&gt;verb != NULL);</a>
+<a name="ln751">		(*sess-&gt;verb-&gt;func)(sess-&gt;ctx, sess, sess-&gt;verb, &quot;&quot;,</a>
+<a name="ln752">				    CTL_MORE, sess-&gt;respctx, sess-&gt;ctx-&gt;uctx);</a>
+<a name="ln753">	} else {</a>
+<a name="ln754">		ctl_signal_done(ctx, sess);</a>
+<a name="ln755">		ctl_start_read(sess);</a>
+<a name="ln756">	}</a>
+<a name="ln757">}</a>
+<a name="ln758"> </a>
+<a name="ln759">static void</a>
+<a name="ln760">ctl_morehelp(struct ctl_sctx *ctx, struct ctl_sess *sess,</a>
+<a name="ln761">	     const struct ctl_verb *verb, const char *text,</a>
+<a name="ln762">	     u_int respflags, const void *respctx, void *uctx)</a>
+<a name="ln763">{</a>
+<a name="ln764">	const struct ctl_verb *this = respctx, *next = this + 1;</a>
+<a name="ln765"> </a>
+<a name="ln766">	UNUSED(ctx);</a>
+<a name="ln767">	UNUSED(verb);</a>
+<a name="ln768">	UNUSED(text);</a>
+<a name="ln769">	UNUSED(uctx);</a>
+<a name="ln770"> </a>
+<a name="ln771">	REQUIRE(!lastverb_p(this));</a>
+<a name="ln772">	REQUIRE((respflags &amp; CTL_MORE) != 0);</a>
+<a name="ln773">	if (lastverb_p(next))</a>
+<a name="ln774">		respflags &amp;= ~CTL_MORE;</a>
+<a name="ln775">	ctl_response(sess, sess-&gt;helpcode, this-&gt;help, respflags, next,</a>
+<a name="ln776">		     NULL, NULL, NULL, 0);</a>
+<a name="ln777">}</a>
+<a name="ln778"> </a>
+<a name="ln779">static void</a>
+<a name="ln780">ctl_signal_done(struct ctl_sctx *ctx, struct ctl_sess *sess) {</a>
+<a name="ln781">	if (sess-&gt;donefunc != NULL) {</a>
+<a name="ln782">		(*sess-&gt;donefunc)(ctx, sess, sess-&gt;uap);</a>
+<a name="ln783">		sess-&gt;donefunc = NULL;</a>
+<a name="ln784">	}</a>
+<a name="ln785">}</a>
+<a name="ln786"> </a>
+<a name="ln787">/*! \file */</a>
+
+</code></pre>
+<div class="balloon" rel="280"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v510/" target="_blank">V510</a> The '(* ctx->logger)' function is not expected to receive class-type variable as seventh actual argument.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,3396 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>ClientConnection.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// ClientConnection.cpp</a>
+<a name="ln2"> </a>
+<a name="ln3">#include &quot;ClientConnection.h&quot;</a>
+<a name="ln4"> </a>
+<a name="ln5">#include &lt;new&gt;</a>
+<a name="ln6">#include &lt;typeinfo&gt;</a>
+<a name="ln7"> </a>
+<a name="ln8">#include &lt;dirent.h&gt;</a>
+<a name="ln9">#include &lt;fcntl.h&gt;</a>
+<a name="ln10">#include &lt;errno.h&gt;</a>
+<a name="ln11">#include &lt;stdlib.h&gt;</a>
+<a name="ln12">#include &lt;unistd.h&gt;</a>
+<a name="ln13">#include &lt;utime.h&gt;</a>
+<a name="ln14"> </a>
+<a name="ln15">#include &lt;AutoDeleter.h&gt;</a>
+<a name="ln16">#include &lt;AutoLocker.h&gt;</a>
+<a name="ln17">#include &lt;Entry.h&gt;</a>
+<a name="ln18">#include &lt;fs_query.h&gt;</a>
+<a name="ln19">#include &lt;GraphicsDefs.h&gt;</a>
+<a name="ln20">#include &lt;HashMap.h&gt;</a>
+<a name="ln21">#include &lt;NodeMonitor.h&gt;</a>
+<a name="ln22">#include &lt;Path.h&gt;</a>
+<a name="ln23">#include &lt;Rect.h&gt;</a>
+<a name="ln24">#include &lt;Mime.h&gt;</a>
+<a name="ln25"> </a>
+<a name="ln26">#include &lt;fsproto.h&gt;</a>
+<a name="ln27"> </a>
+<a name="ln28">#include &quot;Compatibility.h&quot;</a>
+<a name="ln29">#include &quot;Connection.h&quot;</a>
+<a name="ln30">#include &quot;DebugSupport.h&quot;</a>
+<a name="ln31">#include &quot;Directory.h&quot;</a>
+<a name="ln32">#include &quot;Entry.h&quot;</a>
+<a name="ln33">#include &quot;FDManager.h&quot;</a>
+<a name="ln34">#include &quot;NodeHandle.h&quot;</a>
+<a name="ln35">#include &quot;NodeHandleMap.h&quot;</a>
+<a name="ln36">#include &quot;NodeMonitoringEvent.h&quot;</a>
+<a name="ln37">#include &quot;Path.h&quot;</a>
+<a name="ln38">#include &quot;RequestBufferReplacer.h&quot;</a>
+<a name="ln39">#include &quot;RequestChannel.h&quot;</a>
+<a name="ln40">#include &quot;RequestConnection.h&quot;</a>
+<a name="ln41">#include &quot;RequestDumper.h&quot;</a>
+<a name="ln42">#include &quot;RequestFlattener.h&quot;</a>
+<a name="ln43">#include &quot;Requests.h&quot;</a>
+<a name="ln44">#include &quot;SecurityContext.h&quot;</a>
+<a name="ln45">#include &quot;ServerNodeID.h&quot;</a>
+<a name="ln46">#include &quot;UserSecurityContext.h&quot;</a>
+<a name="ln47">#include &quot;Utils.h&quot;</a>
+<a name="ln48">#include &quot;Volume.h&quot;</a>
+<a name="ln49">#include &quot;VolumeManager.h&quot;</a>
+<a name="ln50"> </a>
+<a name="ln51">static const int32 kMaxSaneReadLinkSize		= 10240;	// 10 KB</a>
+<a name="ln52">static const int32 kMaxReadBufferSize		= 10240;	// 10 KB</a>
+<a name="ln53">static const int32 kMaxReadDirBufferSize	= 10240;</a>
+<a name="ln54"> </a>
+<a name="ln55">// Locking:</a>
+<a name="ln56">//</a>
+<a name="ln57">// fLock: Guards fReferenceCount and fClosed.</a>
+<a name="ln58">// fSecurityContextLock: Guards fSecurityContext.</a>
+<a name="ln59">// fVolumes: Guards the map itself.</a>
+<a name="ln60"> </a>
+<a name="ln61"> </a>
+<a name="ln62">// #pragma mark -</a>
+<a name="ln63">// #pragma mark ----- ClientConnection -----</a>
+<a name="ln64"> </a>
+<a name="ln65">// ConnectionReference</a>
+<a name="ln66">class ClientConnection::ConnectionReference {</a>
+<a name="ln67">public:</a>
+<a name="ln68">	ConnectionReference(ClientConnection* connection)</a>
+<a name="ln69">		: fConnection(connection)</a>
+<a name="ln70">	{</a>
+<a name="ln71">		if (!fConnection || !fConnection-&gt;GetReference())</a>
+<a name="ln72">			fConnection = NULL;</a>
+<a name="ln73">	}</a>
+<a name="ln74"> </a>
+<a name="ln75">	~ConnectionReference()</a>
+<a name="ln76">	{</a>
+<a name="ln77">		if (fConnection)</a>
+<a name="ln78">			fConnection-&gt;PutReference();</a>
+<a name="ln79">	}</a>
+<a name="ln80"> </a>
+<a name="ln81">	bool IsValid() const</a>
+<a name="ln82">	{</a>
+<a name="ln83">		return fConnection;</a>
+<a name="ln84">	}</a>
+<a name="ln85"> </a>
+<a name="ln86">private:</a>
+<a name="ln87">	ClientConnection*	fConnection;</a>
+<a name="ln88">};</a>
+<a name="ln89"> </a>
+<a name="ln90">// VolumeMap</a>
+<a name="ln91">struct ClientConnection::VolumeMap</a>
+<a name="ln92">	: public SynchronizedHashMap&lt;HashKey32&lt;int32&gt;, ClientVolume*&gt; {</a>
+<a name="ln93">};</a>
+<a name="ln94"> </a>
+<a name="ln95">// ClientVolumePutter</a>
+<a name="ln96">class ClientConnection::ClientVolumePutter {</a>
+<a name="ln97">public:</a>
+<a name="ln98">	ClientVolumePutter(ClientConnection* connection, ClientVolume* volume)</a>
+<a name="ln99">		: fConnection(connection),</a>
+<a name="ln100">		  fVolume(volume)</a>
+<a name="ln101">	{</a>
+<a name="ln102">	}</a>
+<a name="ln103"> </a>
+<a name="ln104">	~ClientVolumePutter()</a>
+<a name="ln105">	{</a>
+<a name="ln106">		if (fConnection &amp;&amp; fVolume)</a>
+<a name="ln107">			fConnection-&gt;_PutVolume(fVolume);</a>
+<a name="ln108">	}</a>
+<a name="ln109"> </a>
+<a name="ln110">	void Detach()</a>
+<a name="ln111">	{</a>
+<a name="ln112">		fConnection = NULL;</a>
+<a name="ln113">		fVolume = NULL;</a>
+<a name="ln114">	}</a>
+<a name="ln115"> </a>
+<a name="ln116">private:</a>
+<a name="ln117">	ClientConnection*	fConnection;</a>
+<a name="ln118">	ClientVolume*		fVolume;</a>
+<a name="ln119">};</a>
+<a name="ln120"> </a>
+<a name="ln121">// VolumeNodeMonitoringEvent</a>
+<a name="ln122">struct ClientConnection::VolumeNodeMonitoringEvent {</a>
+<a name="ln123">	VolumeNodeMonitoringEvent(int32 volumeID, NodeMonitoringEvent* event)</a>
+<a name="ln124">		: volumeID(volumeID),</a>
+<a name="ln125">		  event(event)</a>
+<a name="ln126">	{</a>
+<a name="ln127">		if (event)</a>
+<a name="ln128">			event-&gt;AcquireReference();</a>
+<a name="ln129">	}</a>
+<a name="ln130"> </a>
+<a name="ln131">	~VolumeNodeMonitoringEvent()</a>
+<a name="ln132">	{</a>
+<a name="ln133">		if (event)</a>
+<a name="ln134">			event-&gt;ReleaseReference();</a>
+<a name="ln135">	}</a>
+<a name="ln136"> </a>
+<a name="ln137">	int32					volumeID;</a>
+<a name="ln138">	NodeMonitoringEvent*	event;</a>
+<a name="ln139">};</a>
+<a name="ln140"> </a>
+<a name="ln141">// NodeMonitoringEventQueue</a>
+<a name="ln142">struct ClientConnection::NodeMonitoringEventQueue</a>
+<a name="ln143">	: BlockingQueue&lt;NodeMonitoringRequest&gt; {</a>
+<a name="ln144">	NodeMonitoringEventQueue()</a>
+<a name="ln145">		: BlockingQueue&lt;NodeMonitoringRequest&gt;(&quot;client NM requests&quot;)</a>
+<a name="ln146">	{</a>
+<a name="ln147">	}</a>
+<a name="ln148">};</a>
+<a name="ln149"> </a>
+<a name="ln150">// QueryHandleUnlocker</a>
+<a name="ln151">struct ClientConnection::QueryHandleUnlocker {</a>
+<a name="ln152">	QueryHandleUnlocker(ClientConnection* connection, NodeHandle* nodeHandle)</a>
+<a name="ln153">		: fConnection(connection),</a>
+<a name="ln154">		  fHandle(nodeHandle)</a>
+<a name="ln155">	{</a>
+<a name="ln156">	}</a>
+<a name="ln157"> </a>
+<a name="ln158">	~QueryHandleUnlocker()</a>
+<a name="ln159">	{</a>
+<a name="ln160">		if (fConnection &amp;&amp; fHandle) {</a>
+<a name="ln161">			fConnection-&gt;_UnlockQueryHandle(fHandle);</a>
+<a name="ln162">			fConnection = NULL;</a>
+<a name="ln163">			fHandle = NULL;</a>
+<a name="ln164">		}</a>
+<a name="ln165">	}</a>
+<a name="ln166"> </a>
+<a name="ln167">private:</a>
+<a name="ln168">	ClientConnection*	fConnection;</a>
+<a name="ln169">	NodeHandle*			fHandle;</a>
+<a name="ln170">};</a>
+<a name="ln171"> </a>
+<a name="ln172">// ClientVolumeFilter</a>
+<a name="ln173">struct ClientConnection::ClientVolumeFilter {</a>
+<a name="ln174">	virtual ~ClientVolumeFilter() {}</a>
+<a name="ln175"> </a>
+<a name="ln176">	virtual bool FilterVolume(ClientConnection* connection,</a>
+<a name="ln177">		ClientVolume* volume) = 0;</a>
+<a name="ln178">};</a>
+<a name="ln179"> </a>
+<a name="ln180">// HasQueryPermissionClientVolumeFilter</a>
+<a name="ln181">struct ClientConnection::HasQueryPermissionClientVolumeFilter</a>
+<a name="ln182">	: ClientConnection::ClientVolumeFilter {</a>
+<a name="ln183">	virtual bool FilterVolume(ClientConnection* connection,</a>
+<a name="ln184">		ClientVolume* volume)</a>
+<a name="ln185">	{</a>
+<a name="ln186">		return volume-&gt;GetSharePermissions().ImpliesQuerySharePermission();</a>
+<a name="ln187">	}</a>
+<a name="ln188">};</a>
+<a name="ln189"> </a>
+<a name="ln190"> </a>
+<a name="ln191">// #pragma mark -</a>
+<a name="ln192"> </a>
+<a name="ln193">// constructor</a>
+<a name="ln194">ClientConnection::ClientConnection(Connection* connection,</a>
+<a name="ln195">	SecurityContext* securityContext, User* user,</a>
+<a name="ln196">	ClientConnectionListener* listener)</a>
+<a name="ln197">	: RequestHandler(),</a>
+<a name="ln198">	  ClientVolume::NodeMonitoringProcessor(),</a>
+<a name="ln199">	  fConnection(NULL),</a>
+<a name="ln200">	  fSecurityContext(securityContext),</a>
+<a name="ln201">	  fSecurityContextLock(&quot;security context lock&quot;),</a>
+<a name="ln202">	  fUser(user),</a>
+<a name="ln203">	  fVolumes(NULL),</a>
+<a name="ln204">	  fQueryHandles(NULL),</a>
+<a name="ln205">	  fListener(listener),</a>
+<a name="ln206">	  fNodeMonitoringEvents(NULL),</a>
+<a name="ln207">	  fNodeMonitoringProcessor(-1),</a>
+<a name="ln208">	  fLock(&quot;client connection locker&quot;),</a>
+<a name="ln209">	  fReferenceCount(0),</a>
+<a name="ln210">	  fInitialized(0),</a>
+<a name="ln211">	  fClosed(false),</a>
+<a name="ln212">	  fError(false),</a>
+<a name="ln213">	  fInverseClientEndianess(false)</a>
+<a name="ln214">{</a>
+<a name="ln215">	fConnection = new(std::nothrow) RequestConnection(connection, this);</a>
+<a name="ln216">	if (!fConnection)</a>
+<a name="ln217">		delete connection;</a>
+<a name="ln218">}</a>
+<a name="ln219"> </a>
+<a name="ln220">// destructor</a>
+<a name="ln221">ClientConnection::~ClientConnection()</a>
+<a name="ln222">{</a>
+<a name="ln223">	_Close();</a>
+<a name="ln224">	delete fConnection;</a>
+<a name="ln225"> </a>
+<a name="ln226">	// delete all volumes</a>
+<a name="ln227">	for (VolumeMap::Iterator it = fVolumes-&gt;GetIterator(); it.HasNext();)</a>
+<a name="ln228">		delete it.Next().value;</a>
+<a name="ln229">	delete fVolumes;</a>
+<a name="ln230"> </a>
+<a name="ln231">	delete fQueryHandles;</a>
+<a name="ln232">	delete fNodeMonitoringEvents;</a>
+<a name="ln233">}</a>
+<a name="ln234"> </a>
+<a name="ln235">// Init</a>
+<a name="ln236">status_t</a>
+<a name="ln237">ClientConnection::Init()</a>
+<a name="ln238">{</a>
+<a name="ln239">	// create a client volume map</a>
+<a name="ln240">	fVolumes = new(std::nothrow) VolumeMap;</a>
+<a name="ln241">	if (!fVolumes)</a>
+<a name="ln242">		return B_NO_MEMORY;</a>
+<a name="ln243">	status_t error = fVolumes-&gt;InitCheck();</a>
+<a name="ln244">	if (error != B_OK)</a>
+<a name="ln245">		return error;</a>
+<a name="ln246"> </a>
+<a name="ln247">	// create the query handle map</a>
+<a name="ln248">	fQueryHandles = new(std::nothrow) NodeHandleMap(&quot;query handles&quot;);</a>
+<a name="ln249">	if (!fQueryHandles)</a>
+<a name="ln250">		return B_NO_MEMORY;</a>
+<a name="ln251">	error = fQueryHandles-&gt;Init();</a>
+<a name="ln252">	if (error != B_OK)</a>
+<a name="ln253">		return error;</a>
+<a name="ln254"> </a>
+<a name="ln255">	// create the node monitoring event queue</a>
+<a name="ln256">	fNodeMonitoringEvents = new(std::nothrow) NodeMonitoringEventQueue;</a>
+<a name="ln257">	if (!fNodeMonitoringEvents)</a>
+<a name="ln258">		return B_NO_MEMORY;</a>
+<a name="ln259">	error = fNodeMonitoringEvents-&gt;InitCheck();</a>
+<a name="ln260">	if (error != B_OK)</a>
+<a name="ln261">		return error;</a>
+<a name="ln262"> </a>
+<a name="ln263">	// initialize the connection</a>
+<a name="ln264">	error = fConnection-&gt;Init();</a>
+<a name="ln265">	if (error != B_OK)</a>
+<a name="ln266">		return error;</a>
+<a name="ln267"> </a>
+<a name="ln268">	// start the node monitoring processor</a>
+<a name="ln269">	fNodeMonitoringProcessor = spawn_thread(_NodeMonitoringProcessorEntry,</a>
+<a name="ln270">		&quot;client connection NM processor&quot;, B_NORMAL_PRIORITY, this);</a>
+<a name="ln271">	if (fNodeMonitoringProcessor &lt; 0) {</a>
+<a name="ln272">		_Close();</a>
+<a name="ln273">		return fNodeMonitoringProcessor;</a>
+<a name="ln274">	}</a>
+<a name="ln275">	resume_thread(fNodeMonitoringProcessor);</a>
+<a name="ln276">	return B_OK;</a>
+<a name="ln277">}</a>
+<a name="ln278"> </a>
+<a name="ln279">// Close</a>
+<a name="ln280">/*!</a>
+<a name="ln281">	Called by the NetFSServer. Not for internal use. Waits for the connection</a>
+<a name="ln282">	to be closed (at least for the node monitoring thread to be gone).</a>
+<a name="ln283">*/</a>
+<a name="ln284">void</a>
+<a name="ln285">ClientConnection::Close()</a>
+<a name="ln286">{</a>
+<a name="ln287">	{</a>
+<a name="ln288">		ConnectionReference connectionReference(this);</a>
+<a name="ln289">		if (connectionReference.IsValid())</a>
+<a name="ln290">			_MarkClosed(false);</a>
+<a name="ln291">		fListener = NULL;</a>
+<a name="ln292">	}</a>
+<a name="ln293"> </a>
+<a name="ln294">	// Wait at least for the node monitoring processor; this is not perfect,</a>
+<a name="ln295">	// but not too bad either.</a>
+<a name="ln296">	if (fNodeMonitoringProcessor &gt;= 0</a>
+<a name="ln297">		&amp;&amp; find_thread(NULL) != fNodeMonitoringProcessor) {</a>
+<a name="ln298">		int32 result;</a>
+<a name="ln299">		wait_for_thread(fNodeMonitoringProcessor, &amp;result);</a>
+<a name="ln300">	}</a>
+<a name="ln301">}</a>
+<a name="ln302"> </a>
+<a name="ln303">// GetReference</a>
+<a name="ln304">bool</a>
+<a name="ln305">ClientConnection::GetReference()</a>
+<a name="ln306">{</a>
+<a name="ln307">	AutoLocker&lt;Locker&gt; _(fLock);</a>
+<a name="ln308">	if (fClosed || !atomic_or(&amp;fInitialized, 0))</a>
+<a name="ln309">		return false;</a>
+<a name="ln310">	fReferenceCount++;</a>
+<a name="ln311">	return true;</a>
+<a name="ln312">}</a>
+<a name="ln313"> </a>
+<a name="ln314">// PutReference</a>
+<a name="ln315">void</a>
+<a name="ln316">ClientConnection::PutReference()</a>
+<a name="ln317">{</a>
+<a name="ln318">	bool close = false;</a>
+<a name="ln319">	{</a>
+<a name="ln320">		AutoLocker&lt;Locker&gt; _(fLock);</a>
+<a name="ln321">		--fReferenceCount;</a>
+<a name="ln322">		if (fClosed)</a>
+<a name="ln323">			close = (fReferenceCount == 0);</a>
+<a name="ln324">	}</a>
+<a name="ln325">	if (close)</a>
+<a name="ln326">		_Close();</a>
+<a name="ln327">}</a>
+<a name="ln328"> </a>
+<a name="ln329">// UserRemoved</a>
+<a name="ln330">void</a>
+<a name="ln331">ClientConnection::UserRemoved(User* user)</a>
+<a name="ln332">{</a>
+<a name="ln333">	// get all volumes</a>
+<a name="ln334">	ClientVolume** volumes = NULL;</a>
+<a name="ln335">	int32 volumeCount = 0;</a>
+<a name="ln336">	AutoLocker&lt;VolumeMap&gt; volumesLocker(fVolumes);</a>
+<a name="ln337">	volumes = new(std::nothrow) ClientVolume*[fVolumes-&gt;Size()];</a>
+<a name="ln338">	if (!volumes) {</a>
+<a name="ln339">		ERROR((&quot;ClientConnection::UserRemoved(): ERROR: Failed to &quot;</a>
+<a name="ln340">			&quot;allocate memory for volume array.\n&quot;));</a>
+<a name="ln341">		volumesLocker.Unlock();</a>
+<a name="ln342">		_UnmountAllVolumes();</a>
+<a name="ln343">		return;</a>
+<a name="ln344">	}</a>
+<a name="ln345">	for (VolumeMap::Iterator it = fVolumes-&gt;GetIterator(); it.HasNext();) {</a>
+<a name="ln346">		if (ClientVolume* volume = _GetVolume(it.Next().value-&gt;GetID()))</a>
+<a name="ln347">			volumes[volumeCount++] = volume;</a>
+<a name="ln348">	}</a>
+<a name="ln349">	volumesLocker.Unlock();</a>
+<a name="ln350"> </a>
+<a name="ln351">	// unmount the concerned volumes</a>
+<a name="ln352">	for (int32 i = 0; i &lt; volumeCount; i++) {</a>
+<a name="ln353">		ClientVolume* volume = volumes[i];</a>
+<a name="ln354"> </a>
+<a name="ln355">		fSecurityContextLock.Lock();</a>
+<a name="ln356">		bool unmount = (volume-&gt;GetSecurityContext()-&gt;GetUser() == user);</a>
+<a name="ln357">		fSecurityContextLock.Unlock();</a>
+<a name="ln358"> </a>
+<a name="ln359">		if (unmount)</a>
+<a name="ln360">			_UnmountVolume(volume);</a>
+<a name="ln361">	}</a>
+<a name="ln362"> </a>
+<a name="ln363">	// put the volumes</a>
+<a name="ln364">	for (int32 i = 0; i &lt; volumeCount; i++)</a>
+<a name="ln365">		_PutVolume(volumes[i]);</a>
+<a name="ln366">	delete[] volumes;</a>
+<a name="ln367">}</a>
+<a name="ln368"> </a>
+<a name="ln369">// ShareRemoved</a>
+<a name="ln370">void</a>
+<a name="ln371">ClientConnection::ShareRemoved(Share* share)</a>
+<a name="ln372">{</a>
+<a name="ln373">	// get all volumes</a>
+<a name="ln374">	ClientVolume** volumes = NULL;</a>
+<a name="ln375">	int32 volumeCount = 0;</a>
+<a name="ln376">	AutoLocker&lt;VolumeMap&gt; volumesLocker(fVolumes);</a>
+<a name="ln377">	volumes = new(std::nothrow) ClientVolume*[fVolumes-&gt;Size()];</a>
+<a name="ln378">	if (!volumes) {</a>
+<a name="ln379">		ERROR((&quot;ClientConnection::ShareRemoved(): ERROR: Failed to &quot;</a>
+<a name="ln380">			&quot;allocate memory for volume array.\n&quot;));</a>
+<a name="ln381">		volumesLocker.Unlock();</a>
+<a name="ln382">		_UnmountAllVolumes();</a>
+<a name="ln383">		return;</a>
+<a name="ln384">	}</a>
+<a name="ln385">	for (VolumeMap::Iterator it = fVolumes-&gt;GetIterator(); it.HasNext();) {</a>
+<a name="ln386">		if (ClientVolume* volume = _GetVolume(it.Next().value-&gt;GetID()))</a>
+<a name="ln387">			volumes[volumeCount++] = volume;</a>
+<a name="ln388">	}</a>
+<a name="ln389">	volumesLocker.Unlock();</a>
+<a name="ln390"> </a>
+<a name="ln391">	// unmount the concerned volumes</a>
+<a name="ln392">	for (int32 i = 0; i &lt; volumeCount; i++) {</a>
+<a name="ln393">		ClientVolume* volume = volumes[i];</a>
+<a name="ln394"> </a>
+<a name="ln395">		fSecurityContextLock.Lock();</a>
+<a name="ln396">		bool unmount = (volume-&gt;GetShare() == share);</a>
+<a name="ln397">		fSecurityContextLock.Unlock();</a>
+<a name="ln398"> </a>
+<a name="ln399">		if (unmount)</a>
+<a name="ln400">			_UnmountVolume(volume);</a>
+<a name="ln401">	}</a>
+<a name="ln402"> </a>
+<a name="ln403">	// put the volumes</a>
+<a name="ln404">	for (int32 i = 0; i &lt; volumeCount; i++)</a>
+<a name="ln405">		_PutVolume(volumes[i]);</a>
+<a name="ln406">	delete[] volumes;</a>
+<a name="ln407">}</a>
+<a name="ln408"> </a>
+<a name="ln409">// UserPermissionsChanged</a>
+<a name="ln410">void</a>
+<a name="ln411">ClientConnection::UserPermissionsChanged(Share* share, User* user,</a>
+<a name="ln412">	Permissions permissions)</a>
+<a name="ln413">{</a>
+<a name="ln414">	bool unmountAll = (!permissions.ImpliesMountSharePermission());</a>
+<a name="ln415"> </a>
+<a name="ln416">	// get all volumes</a>
+<a name="ln417">	ClientVolume** volumes = NULL;</a>
+<a name="ln418">	int32 volumeCount = 0;</a>
+<a name="ln419">	AutoLocker&lt;VolumeMap&gt; volumesLocker(fVolumes);</a>
+<a name="ln420">	volumes = new(std::nothrow) ClientVolume*[fVolumes-&gt;Size()];</a>
+<a name="ln421">	if (!volumes) {</a>
+<a name="ln422">		ERROR((&quot;ClientConnection::ShareRemoved(): ERROR: Failed to &quot;</a>
+<a name="ln423">			&quot;allocate memory for volume array.\n&quot;));</a>
+<a name="ln424">		volumesLocker.Unlock();</a>
+<a name="ln425">		_UnmountAllVolumes();</a>
+<a name="ln426">		return;</a>
+<a name="ln427">	}</a>
+<a name="ln428">	for (VolumeMap::Iterator it = fVolumes-&gt;GetIterator(); it.HasNext();) {</a>
+<a name="ln429">		if (ClientVolume* volume = _GetVolume(it.Next().value-&gt;GetID()))</a>
+<a name="ln430">			volumes[volumeCount++] = volume;</a>
+<a name="ln431">	}</a>
+<a name="ln432">	volumesLocker.Unlock();</a>
+<a name="ln433"> </a>
+<a name="ln434">	// update the concerned volumes</a>
+<a name="ln435">	for (int32 i = 0; i &lt; volumeCount; i++) {</a>
+<a name="ln436">		ClientVolume* volume = volumes[i];</a>
+<a name="ln437"> </a>
+<a name="ln438">		fSecurityContextLock.Lock();</a>
+<a name="ln439">		bool concerned = (volume-&gt;GetShare() == share</a>
+<a name="ln440">			&amp;&amp; volume-&gt;GetSecurityContext()-&gt;GetUser() == user);</a>
+<a name="ln441">		fSecurityContextLock.Unlock();</a>
+<a name="ln442"> </a>
+<a name="ln443">		if (concerned) {</a>
+<a name="ln444">			// create a new user security context for the volume</a>
+<a name="ln445">			status_t error = B_OK;</a>
+<a name="ln446"> </a>
+<a name="ln447">			if (unmountAll) {</a>
+<a name="ln448">				_UnmountVolume(volume);</a>
+<a name="ln449">			} else {</a>
+<a name="ln450">				// create a new user security context</a>
+<a name="ln451">				AutoLocker&lt;Locker&gt; securityContextLocker(fSecurityContextLock);</a>
+<a name="ln452">				UserSecurityContext* userSecurityContext</a>
+<a name="ln453">					= new(std::nothrow) UserSecurityContext;</a>
+<a name="ln454"> </a>
+<a name="ln455">				// init it</a>
+<a name="ln456">				if (userSecurityContext) {</a>
+<a name="ln457">					error = fSecurityContext-&gt;GetUserSecurityContext(user,</a>
+<a name="ln458">						userSecurityContext);</a>
+<a name="ln459">				} else</a>
+<a name="ln460">					error = B_NO_MEMORY;</a>
+<a name="ln461">				if (error != B_OK) {</a>
+<a name="ln462">					delete userSecurityContext;</a>
+<a name="ln463">					securityContextLocker.Unlock();</a>
+<a name="ln464">					_UnmountVolume(volume);</a>
+<a name="ln465">					continue;</a>
+<a name="ln466">				}</a>
+<a name="ln467"> </a>
+<a name="ln468">				// set the volume's new user security context</a>
+<a name="ln469">				securityContextLocker.Unlock();</a>
+<a name="ln470">				volume-&gt;SetSecurityContext(userSecurityContext);</a>
+<a name="ln471">			}</a>
+<a name="ln472">		}</a>
+<a name="ln473">	}</a>
+<a name="ln474"> </a>
+<a name="ln475">	// put the volumes</a>
+<a name="ln476">	for (int32 i = 0; i &lt; volumeCount; i++)</a>
+<a name="ln477">		_PutVolume(volumes[i]);</a>
+<a name="ln478">	delete[] volumes;</a>
+<a name="ln479">}</a>
+<a name="ln480"> </a>
+<a name="ln481"> </a>
+<a name="ln482">// #pragma mark -</a>
+<a name="ln483"> </a>
+<a name="ln484">// VisitConnectionBrokenRequest</a>
+<a name="ln485">status_t</a>
+<a name="ln486">ClientConnection::VisitConnectionBrokenRequest(ConnectionBrokenRequest* request)</a>
+<a name="ln487">{</a>
+<a name="ln488">	ConnectionReference connectionReference(this);</a>
+<a name="ln489">	if (!connectionReference.IsValid())</a>
+<a name="ln490">		return B_OK;</a>
+<a name="ln491"> </a>
+<a name="ln492">	_MarkClosed(true);</a>
+<a name="ln493">	return B_OK;</a>
+<a name="ln494">}</a>
+<a name="ln495"> </a>
+<a name="ln496">// VisitInitConnectionRequest</a>
+<a name="ln497">status_t</a>
+<a name="ln498">ClientConnection::VisitInitConnectionRequest(InitConnectionRequest* request)</a>
+<a name="ln499">{</a>
+<a name="ln500">	bool alreadyInitialized = atomic_or(&amp;fInitialized, ~0);</a>
+<a name="ln501"> </a>
+<a name="ln502">	ConnectionReference connectionReference(this);</a>
+<a name="ln503">	if (!connectionReference.IsValid())</a>
+<a name="ln504">		return B_OK;</a>
+<a name="ln505"> </a>
+<a name="ln506">	if (!alreadyInitialized)</a>
+<a name="ln507">		fInverseClientEndianess = (request-&gt;bigEndian != B_HOST_IS_BENDIAN);</a>
+<a name="ln508"> </a>
+<a name="ln509">	// prepare the reply</a>
+<a name="ln510">	InitConnectionReply reply;</a>
+<a name="ln511"> </a>
+<a name="ln512">	// send the reply</a>
+<a name="ln513">	reply.error = (alreadyInitialized ? B_BAD_VALUE : B_OK);</a>
+<a name="ln514">	status_t error = GetChannel()-&gt;SendRequest(&amp;reply);</a>
+<a name="ln515"> </a>
+<a name="ln516">	// on error just close</a>
+<a name="ln517">	if (error != B_OK)</a>
+<a name="ln518">		_MarkClosed(true);</a>
+<a name="ln519">	return B_OK;</a>
+<a name="ln520">}</a>
+<a name="ln521"> </a>
+<a name="ln522">// VisitMountRequest</a>
+<a name="ln523">status_t</a>
+<a name="ln524">ClientConnection::VisitMountRequest(MountRequest* request)</a>
+<a name="ln525">{</a>
+<a name="ln526">	ConnectionReference connectionReference(this);</a>
+<a name="ln527">	if (!connectionReference.IsValid())</a>
+<a name="ln528">		return B_OK;</a>
+<a name="ln529"> </a>
+<a name="ln530">	status_t result = B_OK;</a>
+<a name="ln531">	const char* shareName = request-&gt;share.GetString();</a>
+<a name="ln532">	if (!shareName)</a>
+<a name="ln533">		SET_ERROR(result, B_BAD_DATA);</a>
+<a name="ln534"> </a>
+<a name="ln535">	// create a volume</a>
+<a name="ln536">	ClientVolume* volume = NULL;</a>
+<a name="ln537">	if (result == B_OK)</a>
+<a name="ln538">		result = _CreateVolume(&amp;volume);</a>
+<a name="ln539">	ClientVolumePutter volumePutter(this, volume);</a>
+<a name="ln540"> </a>
+<a name="ln541">	// if we haven't been supplied with a user yet, use the info from the</a>
+<a name="ln542">	// mount request for authentication</a>
+<a name="ln543">	VolumeManagerLocker managerLocker;</a>
+<a name="ln544">	AutoLocker&lt;Locker&gt; securityContextLocker(fSecurityContextLock);</a>
+<a name="ln545">	const char* userName = request-&gt;user.GetString();</a>
+<a name="ln546">	User* user = fUser;</a>
+<a name="ln547">	BReference&lt;User&gt; userReference(user);</a>
+<a name="ln548">	bool noPermission = false;</a>
+<a name="ln549">	if (result == B_OK &amp;&amp; !user) {</a>
+<a name="ln550">		if (userName) {</a>
+<a name="ln551">			SET_ERROR(result, fSecurityContext-&gt;AuthenticateUser(userName,</a>
+<a name="ln552">				request-&gt;password.GetString(), &amp;user));</a>
+<a name="ln553">			if (result == B_OK)</a>
+<a name="ln554">				userReference.SetTo(user, true);</a>
+<a name="ln555">		} else</a>
+<a name="ln556">			result = B_PERMISSION_DENIED;</a>
+<a name="ln557">		if (result == B_PERMISSION_DENIED)</a>
+<a name="ln558">			noPermission = true;</a>
+<a name="ln559">	}</a>
+<a name="ln560"> </a>
+<a name="ln561">	// create a user security context</a>
+<a name="ln562">	UserSecurityContext* securityContext = NULL;</a>
+<a name="ln563">	if (result == B_OK) {</a>
+<a name="ln564">		securityContext = new(std::nothrow) UserSecurityContext;</a>
+<a name="ln565">		if (securityContext) {</a>
+<a name="ln566">			SET_ERROR(result, fSecurityContext-&gt;GetUserSecurityContext(user,</a>
+<a name="ln567">				securityContext));</a>
+<a name="ln568">		} else</a>
+<a name="ln569">			SET_ERROR(result, B_NO_MEMORY);</a>
+<a name="ln570">	}</a>
+<a name="ln571">	ObjectDeleter&lt;UserSecurityContext&gt; securityContextDeleter(securityContext);</a>
+<a name="ln572"> </a>
+<a name="ln573">	// get the share</a>
+<a name="ln574">	Share* share = NULL;</a>
+<a name="ln575">	Permissions sharePermissions;</a>
+<a name="ln576">	node_ref mountPoint;</a>
+<a name="ln577">	if (result == B_OK) {</a>
+<a name="ln578">		AutoLocker&lt;SecurityContext&gt; _(fSecurityContext);</a>
+<a name="ln579">		share = fSecurityContext-&gt;FindShare(shareName);</a>
+<a name="ln580">		if (share) {</a>
+<a name="ln581">			mountPoint = share-&gt;GetNodeRef();</a>
+<a name="ln582">			sharePermissions = securityContext-&gt;GetNodePermissions(</a>
+<a name="ln583">				mountPoint);</a>
+<a name="ln584">			if (!sharePermissions.ImpliesMountSharePermission()) {</a>
+<a name="ln585">				SET_ERROR(result, B_PERMISSION_DENIED);</a>
+<a name="ln586">				noPermission = true;</a>
+<a name="ln587">			}</a>
+<a name="ln588">		} else</a>
+<a name="ln589">			SET_ERROR(result, B_ENTRY_NOT_FOUND);</a>
+<a name="ln590">	}</a>
+<a name="ln591">	BReference&lt;Share&gt; shareReference(share, true);</a>
+<a name="ln592"> </a>
+<a name="ln593">	// mount the volume</a>
+<a name="ln594">	MountReply reply;</a>
+<a name="ln595">	if (result == B_OK) {</a>
+<a name="ln596">		SET_ERROR(result, volume-&gt;Mount(securityContext, share));</a>
+<a name="ln597">		securityContextDeleter.Detach();</a>
+<a name="ln598">	}</a>
+<a name="ln599">	if (result == B_OK) {</a>
+<a name="ln600">		_GetNodeInfo(volume-&gt;GetRootDirectory(), &amp;reply.nodeInfo);</a>
+<a name="ln601">		reply.sharePermissions = sharePermissions.GetPermissions();</a>
+<a name="ln602">		reply.volumeID = volume-&gt;GetID();</a>
+<a name="ln603">	}</a>
+<a name="ln604"> </a>
+<a name="ln605">	// make sure, the volume is removed on error</a>
+<a name="ln606">	if (result != B_OK &amp;&amp; volume) {</a>
+<a name="ln607">		AutoLocker&lt;VolumeMap&gt; volumeMapLocker(fVolumes);</a>
+<a name="ln608">		volume-&gt;MarkRemoved();</a>
+<a name="ln609">	}</a>
+<a name="ln610"> </a>
+<a name="ln611">	securityContextLocker.Unlock();</a>
+<a name="ln612">	managerLocker.Unlock();</a>
+<a name="ln613"> </a>
+<a name="ln614">	// send the reply</a>
+<a name="ln615">	reply.error = result;</a>
+<a name="ln616">	reply.noPermission = noPermission;</a>
+<a name="ln617">	return GetChannel()-&gt;SendRequest(&amp;reply);</a>
+<a name="ln618">}</a>
+<a name="ln619"> </a>
+<a name="ln620">// VisitUnmountRequest</a>
+<a name="ln621">status_t</a>
+<a name="ln622">ClientConnection::VisitUnmountRequest(UnmountRequest* request)</a>
+<a name="ln623">{</a>
+<a name="ln624">	ConnectionReference connectionReference(this);</a>
+<a name="ln625">	if (!connectionReference.IsValid())</a>
+<a name="ln626">		return B_OK;</a>
+<a name="ln627"> </a>
+<a name="ln628">	if (ClientVolume* volume = _GetVolume(request-&gt;volumeID)) {</a>
+<a name="ln629">		_UnmountVolume(volume);</a>
+<a name="ln630">		_PutVolume(volume);</a>
+<a name="ln631">	}</a>
+<a name="ln632"> </a>
+<a name="ln633">	return B_OK;</a>
+<a name="ln634">}</a>
+<a name="ln635"> </a>
+<a name="ln636">// VisitReadVNodeRequest</a>
+<a name="ln637">status_t</a>
+<a name="ln638">ClientConnection::VisitReadVNodeRequest(ReadVNodeRequest* request)</a>
+<a name="ln639">{</a>
+<a name="ln640">	ConnectionReference connectionReference(this);</a>
+<a name="ln641">	if (!connectionReference.IsValid())</a>
+<a name="ln642">		return B_OK;</a>
+<a name="ln643"> </a>
+<a name="ln644">	// get the volume</a>
+<a name="ln645">	status_t result = B_OK;</a>
+<a name="ln646">	ClientVolume* volume = _GetVolume(request-&gt;volumeID);</a>
+<a name="ln647">	if (!volume)</a>
+<a name="ln648">		result = B_BAD_VALUE;</a>
+<a name="ln649">	ClientVolumePutter volumePutter(this, volume);</a>
+<a name="ln650"> </a>
+<a name="ln651">	VolumeManagerLocker managerLocker;</a>
+<a name="ln652"> </a>
+<a name="ln653">	// get the node</a>
+<a name="ln654">	Node* node = NULL;</a>
+<a name="ln655">	if (result == B_OK) {</a>
+<a name="ln656">		node = volume-&gt;GetNode(request-&gt;nodeID);</a>
+<a name="ln657">		if (!node)</a>
+<a name="ln658">			result = B_ENTRY_NOT_FOUND;</a>
+<a name="ln659">	}</a>
+<a name="ln660"> </a>
+<a name="ln661">	// prepare the reply</a>
+<a name="ln662">	ReadVNodeReply reply;</a>
+<a name="ln663">	if (result == B_OK)</a>
+<a name="ln664">		_GetNodeInfo(node, &amp;reply.nodeInfo);</a>
+<a name="ln665"> </a>
+<a name="ln666">	managerLocker.Unlock();</a>
+<a name="ln667"> </a>
+<a name="ln668">	// send the reply</a>
+<a name="ln669">	reply.error = result;</a>
+<a name="ln670">	return GetChannel()-&gt;SendRequest(&amp;reply);</a>
+<a name="ln671">}</a>
+<a name="ln672"> </a>
+<a name="ln673">// VisitWriteStatRequest</a>
+<a name="ln674">status_t</a>
+<a name="ln675">ClientConnection::VisitWriteStatRequest(WriteStatRequest* request)</a>
+<a name="ln676">{</a>
+<a name="ln677">	ConnectionReference connectionReference(this);</a>
+<a name="ln678">	if (!connectionReference.IsValid())</a>
+<a name="ln679">		return B_OK;</a>
+<a name="ln680"> </a>
+<a name="ln681">	// get the volume</a>
+<a name="ln682">	status_t result = B_OK;</a>
+<a name="ln683">	ClientVolume* volume = _GetVolume(request-&gt;volumeID);</a>
+<a name="ln684">	if (!volume)</a>
+<a name="ln685">		result = B_BAD_VALUE;</a>
+<a name="ln686">	ClientVolumePutter volumePutter(this, volume);</a>
+<a name="ln687"> </a>
+<a name="ln688">	VolumeManagerLocker managerLocker;</a>
+<a name="ln689"> </a>
+<a name="ln690">	// get the node</a>
+<a name="ln691">	Node* node = NULL;</a>
+<a name="ln692">	if (result == B_OK) {</a>
+<a name="ln693">		node = volume-&gt;GetNode(request-&gt;nodeID);</a>
+<a name="ln694">		if (!node)</a>
+<a name="ln695">			result = B_ENTRY_NOT_FOUND;</a>
+<a name="ln696">	}</a>
+<a name="ln697"> </a>
+<a name="ln698">	// check permissions</a>
+<a name="ln699">	if (result == B_OK) {</a>
+<a name="ln700">		if (!volume-&gt;GetNodePermissions(node).ImpliesWritePermission())</a>
+<a name="ln701">			result = B_PERMISSION_DENIED;</a>
+<a name="ln702">	}</a>
+<a name="ln703"> </a>
+<a name="ln704">	// get the path</a>
+<a name="ln705">	Path path;</a>
+<a name="ln706">	if (result == B_OK)</a>
+<a name="ln707">		result = node-&gt;GetPath(&amp;path);</a>
+<a name="ln708"> </a>
+<a name="ln709">	// write the stat</a>
+<a name="ln710">	uint32 mask = request-&gt;mask;</a>
+<a name="ln711">	// size</a>
+<a name="ln712">	if (result == B_OK &amp;&amp; (mask &amp; WSTAT_SIZE)) {</a>
+<a name="ln713">		if (truncate(path.GetPath(), request-&gt;nodeInfo.st.st_size) &lt; 0)</a>
+<a name="ln714">			result = errno;</a>
+<a name="ln715">	}</a>
+<a name="ln716">	// mode</a>
+<a name="ln717">	if (result == B_OK &amp;&amp; (mask &amp; WSTAT_MODE)) {</a>
+<a name="ln718">		if (chmod(path.GetPath(), request-&gt;nodeInfo.st.st_mode) &lt; 0)</a>
+<a name="ln719">			result = errno;</a>
+<a name="ln720">	}</a>
+<a name="ln721">	// mtime</a>
+<a name="ln722">	if (result == B_OK &amp;&amp; (mask &amp; (WSTAT_ATIME | WSTAT_MTIME))) {</a>
+<a name="ln723">		utimbuf buffer;</a>
+<a name="ln724">		buffer.actime = (mask &amp; WSTAT_ATIME)</a>
+<a name="ln725">			? request-&gt;nodeInfo.st.st_atime</a>
+<a name="ln726">			: node-&gt;GetStat().st_atime;</a>
+<a name="ln727">		buffer.modtime = (mask &amp; WSTAT_MTIME)</a>
+<a name="ln728">			? request-&gt;nodeInfo.st.st_mtime</a>
+<a name="ln729">			: node-&gt;GetStat().st_mtime;</a>
+<a name="ln730">		if (utime(path.GetPath(), &amp;buffer) &lt; 0)</a>
+<a name="ln731">			result = errno;</a>
+<a name="ln732">	}</a>
+<a name="ln733">	// ignore WSTAT_CRTIME, WSTAT_UID, WSTAT_GID for the time being</a>
+<a name="ln734"> </a>
+<a name="ln735">	// prepare the reply</a>
+<a name="ln736">	WriteStatReply reply;</a>
+<a name="ln737">	// update the node stat</a>
+<a name="ln738">	reply.nodeInfoValid = false;</a>
+<a name="ln739">	if (node) {</a>
+<a name="ln740">		if (node-&gt;UpdateStat() == B_OK) {</a>
+<a name="ln741">			_GetNodeInfo(node, &amp;reply.nodeInfo);</a>
+<a name="ln742">			reply.nodeInfoValid = true;</a>
+<a name="ln743">		}</a>
+<a name="ln744">	}</a>
+<a name="ln745"> </a>
+<a name="ln746">	managerLocker.Unlock();</a>
+<a name="ln747"> </a>
+<a name="ln748">	// send the reply</a>
+<a name="ln749">	reply.error = result;</a>
+<a name="ln750">	return GetChannel()-&gt;SendRequest(&amp;reply);</a>
+<a name="ln751">}</a>
+<a name="ln752"> </a>
+<a name="ln753">// VisitCreateFileRequest</a>
+<a name="ln754">status_t</a>
+<a name="ln755">ClientConnection::VisitCreateFileRequest(CreateFileRequest* request)</a>
+<a name="ln756">{</a>
+<a name="ln757">	ConnectionReference connectionReference(this);</a>
+<a name="ln758">	if (!connectionReference.IsValid())</a>
+<a name="ln759">		return B_OK;</a>
+<a name="ln760"> </a>
+<a name="ln761">	// get the volume</a>
+<a name="ln762">	status_t result = B_OK;</a>
+<a name="ln763">	ClientVolume* volume = _GetVolume(request-&gt;volumeID);</a>
+<a name="ln764">	if (!volume)</a>
+<a name="ln765">		result = B_BAD_VALUE;</a>
+<a name="ln766">	ClientVolumePutter volumePutter(this, volume);</a>
+<a name="ln767"> </a>
+<a name="ln768">	VolumeManagerLocker managerLocker;</a>
+<a name="ln769"> </a>
+<a name="ln770">	// get the directory</a>
+<a name="ln771">	Directory* directory = NULL;</a>
+<a name="ln772">	if (result == B_OK) {</a>
+<a name="ln773">		Node* node = volume-&gt;GetNode(request-&gt;directoryID);</a>
+<a name="ln774">		if (node) {</a>
+<a name="ln775">			directory = dynamic_cast&lt;Directory*&gt;(node);</a>
+<a name="ln776">			if (!directory)</a>
+<a name="ln777">				result = B_NOT_A_DIRECTORY;</a>
+<a name="ln778">		} else</a>
+<a name="ln779">			result = B_ENTRY_NOT_FOUND;</a>
+<a name="ln780">	}</a>
+<a name="ln781"> </a>
+<a name="ln782">	// check permissions</a>
+<a name="ln783">	int openMode = request-&gt;openMode;</a>
+<a name="ln784">	if (result == B_OK) {</a>
+<a name="ln785">		if (!volume-&gt;GetNodePermissions(directory).ImpliesWritePermission())</a>
+<a name="ln786">			result = B_PERMISSION_DENIED;</a>
+<a name="ln787">	}</a>
+<a name="ln788"> </a>
+<a name="ln789">	// get the path</a>
+<a name="ln790">	Path path;</a>
+<a name="ln791">	if (result == B_OK) {</a>
+<a name="ln792">		result = directory-&gt;GetPath(&amp;path);</a>
+<a name="ln793">		if (result == B_OK)</a>
+<a name="ln794">			result = path.Append(request-&gt;name.GetString());</a>
+<a name="ln795">	}</a>
+<a name="ln796"> </a>
+<a name="ln797">	// create the file</a>
+<a name="ln798">	if (result == B_OK) {</a>
+<a name="ln799">		int fd = -1;</a>
+<a name="ln800">		result = FDManager::Open(path.GetPath(),</a>
+<a name="ln801">			openMode | O_CREAT | O_NOTRAVERSE, request-&gt;mode, fd);</a>
+<a name="ln802">		if (result == B_OK)</a>
+<a name="ln803">			close(fd);</a>
+<a name="ln804">	}</a>
+<a name="ln805"> </a>
+<a name="ln806">	// load the new entry</a>
+<a name="ln807">	Entry* entry = NULL;</a>
+<a name="ln808">	if (result == B_OK) {</a>
+<a name="ln809">		VolumeManager* volumeManager = VolumeManager::GetDefault();</a>
+<a name="ln810"> </a>
+<a name="ln811">		// if there existed an entry before, we need to delete it, to avoid that</a>
+<a name="ln812">		// we open the wrong node</a>
+<a name="ln813">		entry = volumeManager-&gt;GetEntry(directory-&gt;GetVolumeID(),</a>
+<a name="ln814">			directory-&gt;GetID(), request-&gt;name.GetString());</a>
+<a name="ln815">		if (entry)</a>
+<a name="ln816">			volumeManager-&gt;DeleteEntry(entry, false);</a>
+<a name="ln817"> </a>
+<a name="ln818">		// load the new entry</a>
+<a name="ln819">		entry = NULL;</a>
+<a name="ln820">		result = volume-&gt;LoadEntry(directory, request-&gt;name.GetString(),</a>
+<a name="ln821">			&amp;entry);</a>
+<a name="ln822">	}</a>
+<a name="ln823"> </a>
+<a name="ln824">	// open the node</a>
+<a name="ln825">	FileHandle* handle = NULL;</a>
+<a name="ln826">	if (result == B_OK) {</a>
+<a name="ln827">		openMode &amp;= ~(O_CREAT | O_EXCL | O_TRUNC);</a>
+<a name="ln828">		result = volume-&gt;Open(entry-&gt;GetNode(), openMode, &amp;handle);</a>
+<a name="ln829">	}</a>
+<a name="ln830">	NodeHandleUnlocker handleUnlocker(volume, handle);</a>
+<a name="ln831"> </a>
+<a name="ln832">	// prepare the reply</a>
+<a name="ln833">	CreateFileReply reply;</a>
+<a name="ln834">	if (result == B_OK) {</a>
+<a name="ln835">		_GetEntryInfo(entry, &amp;reply.entryInfo);</a>
+<a name="ln836">		reply.cookie = handle-&gt;GetCookie();</a>
+<a name="ln837">	}</a>
+<a name="ln838"> </a>
+<a name="ln839">	managerLocker.Unlock();</a>
+<a name="ln840"> </a>
+<a name="ln841">	// send the reply</a>
+<a name="ln842">	reply.error = result;</a>
+<a name="ln843">	status_t error = GetChannel()-&gt;SendRequest(&amp;reply);</a>
+<a name="ln844"> </a>
+<a name="ln845">	// close the handle, if a send error occurred</a>
+<a name="ln846">	if (error != B_OK &amp;&amp; result == B_OK)</a>
+<a name="ln847">		volume-&gt;Close(handle);</a>
+<a name="ln848"> </a>
+<a name="ln849">	return error;</a>
+<a name="ln850">}</a>
+<a name="ln851"> </a>
+<a name="ln852">// VisitOpenRequest</a>
+<a name="ln853">status_t</a>
+<a name="ln854">ClientConnection::VisitOpenRequest(OpenRequest* request)</a>
+<a name="ln855">{</a>
+<a name="ln856">	ConnectionReference connectionReference(this);</a>
+<a name="ln857">	if (!connectionReference.IsValid())</a>
+<a name="ln858">		return B_OK;</a>
+<a name="ln859"> </a>
+<a name="ln860">	// get the volume</a>
+<a name="ln861">	status_t result = B_OK;</a>
+<a name="ln862">	ClientVolume* volume = _GetVolume(request-&gt;volumeID);</a>
+<a name="ln863">	if (!volume)</a>
+<a name="ln864">		result = B_BAD_VALUE;</a>
+<a name="ln865">	ClientVolumePutter volumePutter(this, volume);</a>
+<a name="ln866"> </a>
+<a name="ln867">	VolumeManagerLocker managerLocker;</a>
+<a name="ln868"> </a>
+<a name="ln869">	// get the node</a>
+<a name="ln870">	Node* node = NULL;</a>
+<a name="ln871">	if (result == B_OK) {</a>
+<a name="ln872">		node = volume-&gt;GetNode(request-&gt;nodeID);</a>
+<a name="ln873">		if (!node)</a>
+<a name="ln874">			result = B_ENTRY_NOT_FOUND;</a>
+<a name="ln875">	}</a>
+<a name="ln876"> </a>
+<a name="ln877">	// check permissions</a>
+<a name="ln878">	int openMode = request-&gt;openMode;</a>
+<a name="ln879">	if (result == B_OK) {</a>
+<a name="ln880">		Permissions permissions = volume-&gt;GetNodePermissions(node);</a>
+<a name="ln881">		if ((openMode &amp; O_RWMASK) == O_RDWR) {</a>
+<a name="ln882">			// read+write: fall back to read/write only, if the other permission</a>
+<a name="ln883">			// is missing</a>
+<a name="ln884">			if (!permissions.ImpliesReadPermission())</a>
+<a name="ln885">				openMode = (openMode &amp; ~O_RWMASK) | O_WRONLY;</a>
+<a name="ln886">			else if (!permissions.ImpliesWritePermission())</a>
+<a name="ln887">				openMode = (openMode &amp; ~O_RWMASK) | O_RDONLY;</a>
+<a name="ln888">		}</a>
+<a name="ln889">		if ((openMode &amp; O_RWMASK) == O_RDONLY) {</a>
+<a name="ln890">			if (!permissions.ImpliesReadPermission())</a>
+<a name="ln891">				result = B_PERMISSION_DENIED;</a>
+<a name="ln892">		} else if ((openMode &amp; O_RWMASK) == O_WRONLY) {</a>
+<a name="ln893">			if (!permissions.ImpliesWritePermission())</a>
+<a name="ln894">				result = B_PERMISSION_DENIED;</a>
+<a name="ln895">		}</a>
+<a name="ln896">	}</a>
+<a name="ln897"> </a>
+<a name="ln898">	// open the node</a>
+<a name="ln899">	FileHandle* handle = NULL;</a>
+<a name="ln900">	if (result == B_OK)</a>
+<a name="ln901">		result = volume-&gt;Open(node, openMode, &amp;handle);</a>
+<a name="ln902">	NodeHandleUnlocker handleUnlocker(volume, handle);</a>
+<a name="ln903"> </a>
+<a name="ln904">	// prepare the reply</a>
+<a name="ln905">	OpenReply reply;</a>
+<a name="ln906">	if (result == B_OK) {</a>
+<a name="ln907">		_GetNodeInfo(node, &amp;reply.nodeInfo);</a>
+<a name="ln908">		reply.cookie = handle-&gt;GetCookie();</a>
+<a name="ln909">	}</a>
+<a name="ln910"> </a>
+<a name="ln911">	managerLocker.Unlock();</a>
+<a name="ln912"> </a>
+<a name="ln913">	// send the reply</a>
+<a name="ln914">	reply.error = result;</a>
+<a name="ln915">	status_t error = GetChannel()-&gt;SendRequest(&amp;reply);</a>
+<a name="ln916"> </a>
+<a name="ln917">	// close the handle, if a send error occurred</a>
+<a name="ln918">	if (error != B_OK &amp;&amp; result == B_OK)</a>
+<a name="ln919">		volume-&gt;Close(handle);</a>
+<a name="ln920"> </a>
+<a name="ln921">	return error;</a>
+<a name="ln922">}</a>
+<a name="ln923"> </a>
+<a name="ln924">// VisitCloseRequest</a>
+<a name="ln925">status_t</a>
+<a name="ln926">ClientConnection::VisitCloseRequest(CloseRequest* request)</a>
+<a name="ln927">{</a>
+<a name="ln928">	ConnectionReference connectionReference(this);</a>
+<a name="ln929">	if (!connectionReference.IsValid())</a>
+<a name="ln930">		return B_OK;</a>
+<a name="ln931"> </a>
+<a name="ln932">	status_t result = B_OK;</a>
+<a name="ln933"> </a>
+<a name="ln934">	if (request-&gt;volumeID &gt;= 0) {</a>
+<a name="ln935">		// get the volume</a>
+<a name="ln936">		ClientVolume* volume = _GetVolume(request-&gt;volumeID);</a>
+<a name="ln937">		if (!volume)</a>
+<a name="ln938">			SET_ERROR(result, B_BAD_VALUE);</a>
+<a name="ln939">		ClientVolumePutter volumePutter(this, volume);</a>
+<a name="ln940"> </a>
+<a name="ln941">		// get the node handle</a>
+<a name="ln942">		NodeHandle* handle = NULL;</a>
+<a name="ln943">		if (result == B_OK)</a>
+<a name="ln944">			SET_ERROR(result, volume-&gt;LockNodeHandle(request-&gt;cookie, &amp;handle));</a>
+<a name="ln945">		NodeHandleUnlocker handleUnlocker(volume, handle);</a>
+<a name="ln946"> </a>
+<a name="ln947">		VolumeManagerLocker managerLocker;</a>
+<a name="ln948"> </a>
+<a name="ln949">		// close it</a>
+<a name="ln950">		if (result == B_OK)</a>
+<a name="ln951">			SET_ERROR(result, volume-&gt;Close(handle));</a>
+<a name="ln952"> </a>
+<a name="ln953">		managerLocker.Unlock();</a>
+<a name="ln954">	} else {</a>
+<a name="ln955">		// no volume ID given, so this is a query handle</a>
+<a name="ln956">		// lock the handle</a>
+<a name="ln957">		QueryHandle* handle = NULL;</a>
+<a name="ln958">		if (result == B_OK)</a>
+<a name="ln959">			SET_ERROR(result, _LockQueryHandle(request-&gt;cookie, &amp;handle));</a>
+<a name="ln960">		QueryHandleUnlocker handleUnlocker(this, handle);</a>
+<a name="ln961"> </a>
+<a name="ln962">		// close it</a>
+<a name="ln963">		if (result == B_OK)</a>
+<a name="ln964">			SET_ERROR(result, _CloseQuery(handle));</a>
+<a name="ln965">	}</a>
+<a name="ln966"> </a>
+<a name="ln967">	// send the reply</a>
+<a name="ln968">	CloseReply reply;</a>
+<a name="ln969">	reply.error = result;</a>
+<a name="ln970">	return GetChannel()-&gt;SendRequest(&amp;reply);</a>
+<a name="ln971">}</a>
+<a name="ln972"> </a>
+<a name="ln973">// VisitReadRequest</a>
+<a name="ln974">status_t</a>
+<a name="ln975">ClientConnection::VisitReadRequest(ReadRequest* request)</a>
+<a name="ln976">{</a>
+<a name="ln977">	ConnectionReference connectionReference(this);</a>
+<a name="ln978">	if (!connectionReference.IsValid())</a>
+<a name="ln979">		return B_OK;</a>
+<a name="ln980"> </a>
+<a name="ln981">	// get the volume</a>
+<a name="ln982">	status_t result = B_OK;</a>
+<a name="ln983">	ClientVolume* volume = _GetVolume(request-&gt;volumeID);</a>
+<a name="ln984">	if (!volume)</a>
+<a name="ln985">		result = B_BAD_VALUE;</a>
+<a name="ln986">	ClientVolumePutter volumePutter(this, volume);</a>
+<a name="ln987"> </a>
+<a name="ln988">	// get the node handle</a>
+<a name="ln989">	NodeHandle* handle = NULL;</a>
+<a name="ln990">	if (result == B_OK)</a>
+<a name="ln991">		result = volume-&gt;LockNodeHandle(request-&gt;cookie, &amp;handle);</a>
+<a name="ln992">	NodeHandleUnlocker handleUnlocker(volume, handle);</a>
+<a name="ln993"> </a>
+<a name="ln994">	// check if it is a file handle</a>
+<a name="ln995">	FileHandle* fileHandle = NULL;</a>
+<a name="ln996">	if (result == B_OK) {</a>
+<a name="ln997">		fileHandle = dynamic_cast&lt;FileHandle*&gt;(handle);</a>
+<a name="ln998">		if (!fileHandle)</a>
+<a name="ln999">			result = B_BAD_VALUE;</a>
+<a name="ln1000">	}</a>
+<a name="ln1001"> </a>
+<a name="ln1002">	VolumeManagerLocker managerLocker;</a>
+<a name="ln1003"> </a>
+<a name="ln1004">	// check read permission</a>
+<a name="ln1005">	if (result == B_OK) {</a>
+<a name="ln1006">		Node* node = volume-&gt;GetNode(fileHandle-&gt;GetNodeRef());</a>
+<a name="ln1007">		if (!node || !volume-&gt;GetNodePermissions(node).ImpliesReadPermission())</a>
+<a name="ln1008">			result = B_PERMISSION_DENIED;</a>
+<a name="ln1009">	}</a>
+<a name="ln1010"> </a>
+<a name="ln1011">	managerLocker.Unlock();</a>
+<a name="ln1012"> </a>
+<a name="ln1013">	off_t pos = request-&gt;pos;</a>
+<a name="ln1014">	int32 size = request-&gt;size;</a>
+<a name="ln1015">	int32 bufferSize = min(size, kMaxReadBufferSize);</a>
+<a name="ln1016">	// allocate a buffer</a>
+<a name="ln1017">	uint8* buffer = NULL;</a>
+<a name="ln1018">	if (result == B_OK) {</a>
+<a name="ln1019">		buffer = (uint8*)malloc(bufferSize);</a>
+<a name="ln1020">		if (!buffer)</a>
+<a name="ln1021">			result = B_NO_MEMORY;</a>
+<a name="ln1022">	}</a>
+<a name="ln1023">	MemoryDeleter bufferDeleter(buffer);</a>
+<a name="ln1024"> </a>
+<a name="ln1025">	// read as long as there are bytes left to read or an error occurs</a>
+<a name="ln1026">	bool moreToRead = true;</a>
+<a name="ln1027">	do {</a>
+<a name="ln1028">		int32 bytesToRead = min(size, bufferSize);</a>
+<a name="ln1029">		size_t bytesRead = 0;</a>
+<a name="ln1030">		if (result == B_OK)</a>
+<a name="ln1031">			result = fileHandle-&gt;Read(pos, buffer, bytesToRead, &amp;bytesRead);</a>
+<a name="ln1032">		moreToRead = (result == B_OK &amp;&amp; bytesRead &gt; 0</a>
+<a name="ln1033">			&amp;&amp; (int32)bytesRead &lt; size);</a>
+<a name="ln1034"> </a>
+<a name="ln1035">		// prepare the reply</a>
+<a name="ln1036">		ReadReply reply;</a>
+<a name="ln1037">		if (result == B_OK) {</a>
+<a name="ln1038">			reply.pos = pos;</a>
+<a name="ln1039">			reply.data.SetTo(buffer, bytesRead);</a>
+<a name="ln1040">			reply.moreToCome = moreToRead;</a>
+<a name="ln1041">			pos += bytesRead;</a>
+<a name="ln1042">			size -= bytesRead;</a>
+<a name="ln1043">		}</a>
+<a name="ln1044"> </a>
+<a name="ln1045">		// send the reply</a>
+<a name="ln1046">		reply.error = result;</a>
+<a name="ln1047">		status_t error = GetChannel()-&gt;SendRequest(&amp;reply);</a>
+<a name="ln1048">		if (error != B_OK)</a>
+<a name="ln1049">			return error;</a>
+<a name="ln1050">	} while (moreToRead);</a>
+<a name="ln1051"> </a>
+<a name="ln1052">	return B_OK;</a>
+<a name="ln1053">}</a>
+<a name="ln1054"> </a>
+<a name="ln1055">// VisitWriteRequest</a>
+<a name="ln1056">status_t</a>
+<a name="ln1057">ClientConnection::VisitWriteRequest(WriteRequest* request)</a>
+<a name="ln1058">{</a>
+<a name="ln1059">	ConnectionReference connectionReference(this);</a>
+<a name="ln1060">	if (!connectionReference.IsValid())</a>
+<a name="ln1061">		return B_OK;</a>
+<a name="ln1062"> </a>
+<a name="ln1063">	// get the volume</a>
+<a name="ln1064">	status_t result = B_OK;</a>
+<a name="ln1065">	ClientVolume* volume = _GetVolume(request-&gt;volumeID);</a>
+<a name="ln1066">	if (!volume)</a>
+<a name="ln1067">		result = B_BAD_VALUE;</a>
+<a name="ln1068">	ClientVolumePutter volumePutter(this, volume);</a>
+<a name="ln1069"> </a>
+<a name="ln1070">	// get the node handle</a>
+<a name="ln1071">	NodeHandle* handle = NULL;</a>
+<a name="ln1072">	if (result == B_OK)</a>
+<a name="ln1073">		result = volume-&gt;LockNodeHandle(request-&gt;cookie, &amp;handle);</a>
+<a name="ln1074">	NodeHandleUnlocker handleUnlocker(volume, handle);</a>
+<a name="ln1075"> </a>
+<a name="ln1076">	// check if it is a file handle</a>
+<a name="ln1077">	FileHandle* fileHandle = NULL;</a>
+<a name="ln1078">	if (result == B_OK) {</a>
+<a name="ln1079">		fileHandle = dynamic_cast&lt;FileHandle*&gt;(handle);</a>
+<a name="ln1080">		if (!fileHandle)</a>
+<a name="ln1081">			result = B_BAD_VALUE;</a>
+<a name="ln1082">	}</a>
+<a name="ln1083"> </a>
+<a name="ln1084">	VolumeManagerLocker managerLocker;</a>
+<a name="ln1085"> </a>
+<a name="ln1086">	// check read permission</a>
+<a name="ln1087">	if (result == B_OK) {</a>
+<a name="ln1088">		Node* node = volume-&gt;GetNode(fileHandle-&gt;GetNodeRef());</a>
+<a name="ln1089">		if (!node || !volume-&gt;GetNodePermissions(node).ImpliesWritePermission())</a>
+<a name="ln1090">			result = B_PERMISSION_DENIED;</a>
+<a name="ln1091">	}</a>
+<a name="ln1092"> </a>
+<a name="ln1093">	managerLocker.Unlock();</a>
+<a name="ln1094"> </a>
+<a name="ln1095">	// write until all has been written or an error occurs</a>
+<a name="ln1096">	off_t pos = request-&gt;pos;</a>
+<a name="ln1097">	int32 size = request-&gt;data.GetSize();</a>
+<a name="ln1098">	const char* buffer = (const char*)request-&gt;data.GetData();</a>
+<a name="ln1099">	while (result == B_OK &amp;&amp; size &gt; 0) {</a>
+<a name="ln1100">		size_t bytesWritten;</a>
+<a name="ln1101">		result = fileHandle-&gt;Write(pos, buffer, size, &amp;bytesWritten);</a>
+<a name="ln1102">		if (result == B_OK) {</a>
+<a name="ln1103">			pos += bytesWritten;</a>
+<a name="ln1104">			buffer += bytesWritten;</a>
+<a name="ln1105">			size -= bytesWritten;</a>
+<a name="ln1106">		}</a>
+<a name="ln1107">	}</a>
+<a name="ln1108"> </a>
+<a name="ln1109">	// prepare the reply</a>
+<a name="ln1110">	WriteReply reply;</a>
+<a name="ln1111">	// send the reply</a>
+<a name="ln1112">	reply.error = result;</a>
+<a name="ln1113">	return GetChannel()-&gt;SendRequest(&amp;reply);</a>
+<a name="ln1114">}</a>
+<a name="ln1115"> </a>
+<a name="ln1116">// VisitCreateLinkRequest</a>
+<a name="ln1117">status_t</a>
+<a name="ln1118">ClientConnection::VisitCreateLinkRequest(CreateLinkRequest* request)</a>
+<a name="ln1119">{</a>
+<a name="ln1120">	ConnectionReference connectionReference(this);</a>
+<a name="ln1121">	if (!connectionReference.IsValid())</a>
+<a name="ln1122">		return B_OK;</a>
+<a name="ln1123"> </a>
+<a name="ln1124">	// get the volume</a>
+<a name="ln1125">	status_t result = B_OK;</a>
+<a name="ln1126">	ClientVolume* volume = _GetVolume(request-&gt;volumeID);</a>
+<a name="ln1127">	if (!volume)</a>
+<a name="ln1128">		result = B_BAD_VALUE;</a>
+<a name="ln1129">	ClientVolumePutter volumePutter(this, volume);</a>
+<a name="ln1130"> </a>
+<a name="ln1131">	VolumeManagerLocker managerLocker;</a>
+<a name="ln1132"> </a>
+<a name="ln1133">	// get the target node</a>
+<a name="ln1134">	Node* node = NULL;</a>
+<a name="ln1135">	if (result == B_OK) {</a>
+<a name="ln1136">		node = volume-&gt;GetNode(request-&gt;nodeID);</a>
+<a name="ln1137">		if (!node)</a>
+<a name="ln1138">			result = B_ENTRY_NOT_FOUND;</a>
+<a name="ln1139">	}</a>
+<a name="ln1140"> </a>
+<a name="ln1141">	// get the target node path</a>
+<a name="ln1142">	Path targetPath;</a>
+<a name="ln1143">	if (result == B_OK)</a>
+<a name="ln1144">		result = node-&gt;GetPath(&amp;targetPath);</a>
+<a name="ln1145"> </a>
+<a name="ln1146">	// get the directory</a>
+<a name="ln1147">	Directory* directory = NULL;</a>
+<a name="ln1148">	if (result == B_OK) {</a>
+<a name="ln1149">		Node* node = volume-&gt;GetNode(request-&gt;directoryID);</a>
+<a name="ln1150">		if (node) {</a>
+<a name="ln1151">			directory = dynamic_cast&lt;Directory*&gt;(node);</a>
+<a name="ln1152">			if (!directory)</a>
+<a name="ln1153">				result = B_NOT_A_DIRECTORY;</a>
+<a name="ln1154">		} else</a>
+<a name="ln1155">			result = B_ENTRY_NOT_FOUND;</a>
+<a name="ln1156">	}</a>
+<a name="ln1157"> </a>
+<a name="ln1158">	// check permissions</a>
+<a name="ln1159">	if (result == B_OK) {</a>
+<a name="ln1160">		if (!volume-&gt;GetNodePermissions(directory).ImpliesWritePermission())</a>
+<a name="ln1161">			result = B_PERMISSION_DENIED;</a>
+<a name="ln1162">	}</a>
+<a name="ln1163"> </a>
+<a name="ln1164">	// get the new entry's path</a>
+<a name="ln1165">	Path path;</a>
+<a name="ln1166">	if (result == B_OK) {</a>
+<a name="ln1167">		result = directory-&gt;GetPath(&amp;path);</a>
+<a name="ln1168">		if (result == B_OK)</a>
+<a name="ln1169">			result = path.Append(request-&gt;name.GetString());</a>
+<a name="ln1170">	}</a>
+<a name="ln1171"> </a>
+<a name="ln1172">	managerLocker.Unlock();</a>
+<a name="ln1173"> </a>
+<a name="ln1174">	// create the link</a>
+<a name="ln1175">	if (result == B_OK) {</a>
+<a name="ln1176">		if (link(targetPath.GetPath(), path.GetPath()) &lt; 0)</a>
+<a name="ln1177">			result = errno;</a>
+<a name="ln1178">	}</a>
+<a name="ln1179"> </a>
+<a name="ln1180">	// prepare the reply</a>
+<a name="ln1181">	CreateSymlinkReply reply;</a>
+<a name="ln1182">	// send the reply</a>
+<a name="ln1183">	reply.error = result;</a>
+<a name="ln1184">	return GetChannel()-&gt;SendRequest(&amp;reply);</a>
+<a name="ln1185">}</a>
+<a name="ln1186"> </a>
+<a name="ln1187">// VisitUnlinkRequest</a>
+<a name="ln1188">status_t</a>
+<a name="ln1189">ClientConnection::VisitUnlinkRequest(UnlinkRequest* request)</a>
+<a name="ln1190">{</a>
+<a name="ln1191">	ConnectionReference connectionReference(this);</a>
+<a name="ln1192">	if (!connectionReference.IsValid())</a>
+<a name="ln1193">		return B_OK;</a>
+<a name="ln1194"> </a>
+<a name="ln1195">	// get the volume</a>
+<a name="ln1196">	status_t result = B_OK;</a>
+<a name="ln1197">	ClientVolume* volume = _GetVolume(request-&gt;volumeID);</a>
+<a name="ln1198">	if (!volume)</a>
+<a name="ln1199">		result = B_BAD_VALUE;</a>
+<a name="ln1200">	ClientVolumePutter volumePutter(this, volume);</a>
+<a name="ln1201"> </a>
+<a name="ln1202">	VolumeManagerLocker managerLocker;</a>
+<a name="ln1203"> </a>
+<a name="ln1204">	// get the directory</a>
+<a name="ln1205">	Directory* directory = NULL;</a>
+<a name="ln1206">	if (result == B_OK) {</a>
+<a name="ln1207">		Node* node = volume-&gt;GetNode(request-&gt;directoryID);</a>
+<a name="ln1208">		if (node) {</a>
+<a name="ln1209">			directory = dynamic_cast&lt;Directory*&gt;(node);</a>
+<a name="ln1210">			if (!directory)</a>
+<a name="ln1211">				result = B_NOT_A_DIRECTORY;</a>
+<a name="ln1212">		} else</a>
+<a name="ln1213">			result = B_ENTRY_NOT_FOUND;</a>
+<a name="ln1214">	}</a>
+<a name="ln1215"> </a>
+<a name="ln1216">	// check permissions</a>
+<a name="ln1217">	if (result == B_OK) {</a>
+<a name="ln1218">		if (!volume-&gt;GetNodePermissions(directory).ImpliesWritePermission())</a>
+<a name="ln1219">			result = B_PERMISSION_DENIED;</a>
+<a name="ln1220">	}</a>
+<a name="ln1221"> </a>
+<a name="ln1222">	// get the entry's path</a>
+<a name="ln1223">	Path path;</a>
+<a name="ln1224">	if (result == B_OK) {</a>
+<a name="ln1225">		result = directory-&gt;GetPath(&amp;path);</a>
+<a name="ln1226">		if (result == B_OK)</a>
+<a name="ln1227">			result = path.Append(request-&gt;name.GetString());</a>
+<a name="ln1228">	}</a>
+<a name="ln1229"> </a>
+<a name="ln1230">	managerLocker.Unlock();</a>
+<a name="ln1231"> </a>
+<a name="ln1232">	// remove the entry</a>
+<a name="ln1233">	if (result == B_OK) {</a>
+<a name="ln1234">		if (unlink(path.GetPath()) &lt; 0)</a>
+<a name="ln1235">			result = errno;</a>
+<a name="ln1236">	}</a>
+<a name="ln1237"> </a>
+<a name="ln1238">	// prepare the reply</a>
+<a name="ln1239">	UnlinkReply reply;</a>
+<a name="ln1240">	// send the reply</a>
+<a name="ln1241">	reply.error = result;</a>
+<a name="ln1242">	return GetChannel()-&gt;SendRequest(&amp;reply);</a>
+<a name="ln1243">}</a>
+<a name="ln1244"> </a>
+<a name="ln1245">// VisitCreateSymlinkRequest</a>
+<a name="ln1246">status_t</a>
+<a name="ln1247">ClientConnection::VisitCreateSymlinkRequest(CreateSymlinkRequest* request)</a>
+<a name="ln1248">{</a>
+<a name="ln1249">	ConnectionReference connectionReference(this);</a>
+<a name="ln1250">	if (!connectionReference.IsValid())</a>
+<a name="ln1251">		return B_OK;</a>
+<a name="ln1252"> </a>
+<a name="ln1253">	// get the volume</a>
+<a name="ln1254">	status_t result = B_OK;</a>
+<a name="ln1255">	ClientVolume* volume = _GetVolume(request-&gt;volumeID);</a>
+<a name="ln1256">	if (!volume)</a>
+<a name="ln1257">		result = B_BAD_VALUE;</a>
+<a name="ln1258">	ClientVolumePutter volumePutter(this, volume);</a>
+<a name="ln1259"> </a>
+<a name="ln1260">	VolumeManagerLocker managerLocker;</a>
+<a name="ln1261"> </a>
+<a name="ln1262">	// get the directory</a>
+<a name="ln1263">	Directory* directory = NULL;</a>
+<a name="ln1264">	if (result == B_OK) {</a>
+<a name="ln1265">		Node* node = volume-&gt;GetNode(request-&gt;directoryID);</a>
+<a name="ln1266">		if (node) {</a>
+<a name="ln1267">			directory = dynamic_cast&lt;Directory*&gt;(node);</a>
+<a name="ln1268">			if (!directory)</a>
+<a name="ln1269">				result = B_NOT_A_DIRECTORY;</a>
+<a name="ln1270">		} else</a>
+<a name="ln1271">			result = B_ENTRY_NOT_FOUND;</a>
+<a name="ln1272">	}</a>
+<a name="ln1273"> </a>
+<a name="ln1274">	// check permissions</a>
+<a name="ln1275">	if (result == B_OK) {</a>
+<a name="ln1276">		if (!volume-&gt;GetNodePermissions(directory).ImpliesWritePermission())</a>
+<a name="ln1277">			result = B_PERMISSION_DENIED;</a>
+<a name="ln1278">	}</a>
+<a name="ln1279"> </a>
+<a name="ln1280">	// get the new entry's path</a>
+<a name="ln1281">	Path path;</a>
+<a name="ln1282">	if (result == B_OK) {</a>
+<a name="ln1283">		result = directory-&gt;GetPath(&amp;path);</a>
+<a name="ln1284">		if (result == B_OK)</a>
+<a name="ln1285">			result = path.Append(request-&gt;name.GetString());</a>
+<a name="ln1286">	}</a>
+<a name="ln1287"> </a>
+<a name="ln1288">	managerLocker.Unlock();</a>
+<a name="ln1289"> </a>
+<a name="ln1290">	// create the symlink</a>
+<a name="ln1291">	if (result == B_OK) {</a>
+<a name="ln1292">		if (symlink(request-&gt;target.GetString(), path.GetPath()) &lt; 0)</a>
+<a name="ln1293">			result = errno;</a>
+<a name="ln1294">	}</a>
+<a name="ln1295"> </a>
+<a name="ln1296">	// prepare the reply</a>
+<a name="ln1297">	CreateSymlinkReply reply;</a>
+<a name="ln1298">	// send the reply</a>
+<a name="ln1299">	reply.error = result;</a>
+<a name="ln1300">	return GetChannel()-&gt;SendRequest(&amp;reply);</a>
+<a name="ln1301">}</a>
+<a name="ln1302"> </a>
+<a name="ln1303">// VisitReadLinkRequest</a>
+<a name="ln1304">status_t</a>
+<a name="ln1305">ClientConnection::VisitReadLinkRequest(ReadLinkRequest* request)</a>
+<a name="ln1306">{</a>
+<a name="ln1307">	ConnectionReference connectionReference(this);</a>
+<a name="ln1308">	if (!connectionReference.IsValid())</a>
+<a name="ln1309">		return B_OK;</a>
+<a name="ln1310"> </a>
+<a name="ln1311">	// get the volume</a>
+<a name="ln1312">	status_t result = B_OK;</a>
+<a name="ln1313">	ClientVolume* volume = _GetVolume(request-&gt;volumeID);</a>
+<a name="ln1314">	if (!volume)</a>
+<a name="ln1315">		result = B_BAD_VALUE;</a>
+<a name="ln1316">	ClientVolumePutter volumePutter(this, volume);</a>
+<a name="ln1317"> </a>
+<a name="ln1318">	VolumeManagerLocker managerLocker;</a>
+<a name="ln1319"> </a>
+<a name="ln1320">	// get the node</a>
+<a name="ln1321">	Node* node = NULL;</a>
+<a name="ln1322">	if (result == B_OK) {</a>
+<a name="ln1323">		node = volume-&gt;GetNode(request-&gt;nodeID);</a>
+<a name="ln1324">		if (!node)</a>
+<a name="ln1325">			result = B_ENTRY_NOT_FOUND;</a>
+<a name="ln1326">	}</a>
+<a name="ln1327"> </a>
+<a name="ln1328">	int32 bufferSize = request-&gt;maxSize;</a>
+<a name="ln1329"> </a>
+<a name="ln1330">	// check read permission</a>
+<a name="ln1331">	if (result == B_OK) {</a>
+<a name="ln1332">		if (!volume-&gt;GetNodePermissions(node).ImpliesReadPermission())</a>
+<a name="ln1333">			result = B_PERMISSION_DENIED;</a>
+<a name="ln1334">	}</a>
+<a name="ln1335"> </a>
+<a name="ln1336">	// allocate a buffer</a>
+<a name="ln1337">	void* buffer = NULL;</a>
+<a name="ln1338">	if (result == B_OK) {</a>
+<a name="ln1339">		if (bufferSize &lt; 0 || bufferSize &gt; kMaxSaneReadLinkSize)</a>
+<a name="ln1340">			result = B_BAD_DATA;</a>
+<a name="ln1341">	}</a>
+<a name="ln1342">	if (result == B_OK) {</a>
+<a name="ln1343">		buffer = malloc(bufferSize);</a>
+<a name="ln1344">		if (!buffer)</a>
+<a name="ln1345">			result = B_NO_MEMORY;</a>
+<a name="ln1346">	}</a>
+<a name="ln1347">	MemoryDeleter bufferDeleter(buffer);</a>
+<a name="ln1348"> </a>
+<a name="ln1349">	// read the link and prepare the reply</a>
+<a name="ln1350">	ReadLinkReply reply;</a>
+<a name="ln1351">	int32 bytesRead = 0;</a>
+<a name="ln1352">	if (result == B_OK)</a>
+<a name="ln1353">		result = node-&gt;ReadSymlink((char*)buffer, bufferSize, &amp;bytesRead);</a>
+<a name="ln1354">	if (result == B_OK) {</a>
+<a name="ln1355">		reply.data.SetTo(buffer, bytesRead);</a>
+<a name="ln1356">		_GetNodeInfo(node, &amp;reply.nodeInfo);</a>
+<a name="ln1357">	}</a>
+<a name="ln1358"> </a>
+<a name="ln1359">	managerLocker.Unlock();</a>
+<a name="ln1360"> </a>
+<a name="ln1361">	// send the reply</a>
+<a name="ln1362">	reply.error = result;</a>
+<a name="ln1363">	return GetChannel()-&gt;SendRequest(&amp;reply);</a>
+<a name="ln1364">}</a>
+<a name="ln1365"> </a>
+<a name="ln1366">// VisitRenameRequest</a>
+<a name="ln1367">status_t</a>
+<a name="ln1368">ClientConnection::VisitRenameRequest(RenameRequest* request)</a>
+<a name="ln1369">{</a>
+<a name="ln1370">	ConnectionReference connectionReference(this);</a>
+<a name="ln1371">	if (!connectionReference.IsValid())</a>
+<a name="ln1372">		return B_OK;</a>
+<a name="ln1373"> </a>
+<a name="ln1374">	// get the volume</a>
+<a name="ln1375">	status_t result = B_OK;</a>
+<a name="ln1376">	ClientVolume* volume = _GetVolume(request-&gt;volumeID);</a>
+<a name="ln1377">	if (!volume)</a>
+<a name="ln1378">		result = B_BAD_VALUE;</a>
+<a name="ln1379">	ClientVolumePutter volumePutter(this, volume);</a>
+<a name="ln1380"> </a>
+<a name="ln1381">	VolumeManagerLocker managerLocker;</a>
+<a name="ln1382"> </a>
+<a name="ln1383">	// get the new directory</a>
+<a name="ln1384">	Directory* newDirectory = NULL;</a>
+<a name="ln1385">	if (result == B_OK) {</a>
+<a name="ln1386">		Node* node = volume-&gt;GetNode(request-&gt;newDirectoryID);</a>
+<a name="ln1387">		if (node) {</a>
+<a name="ln1388">			newDirectory = dynamic_cast&lt;Directory*&gt;(node);</a>
+<a name="ln1389">			if (!newDirectory)</a>
+<a name="ln1390">				result = B_NOT_A_DIRECTORY;</a>
+<a name="ln1391">		} else</a>
+<a name="ln1392">			result = B_ENTRY_NOT_FOUND;</a>
+<a name="ln1393">	}</a>
+<a name="ln1394"> </a>
+<a name="ln1395">	// check permissions</a>
+<a name="ln1396">	if (result == B_OK) {</a>
+<a name="ln1397">		if (!volume-&gt;GetNodePermissions(newDirectory).ImpliesWritePermission())</a>
+<a name="ln1398">			result = B_PERMISSION_DENIED;</a>
+<a name="ln1399">	}</a>
+<a name="ln1400"> </a>
+<a name="ln1401">	// get the new path</a>
+<a name="ln1402">	Path newPath;</a>
+<a name="ln1403">	if (result == B_OK) {</a>
+<a name="ln1404">		result = newDirectory-&gt;GetPath(&amp;newPath);</a>
+<a name="ln1405">		if (result == B_OK)</a>
+<a name="ln1406">			result = newPath.Append(request-&gt;newName.GetString());</a>
+<a name="ln1407">	}</a>
+<a name="ln1408"> </a>
+<a name="ln1409">	// get the old directory</a>
+<a name="ln1410">	Directory* oldDirectory = NULL;</a>
+<a name="ln1411">	if (result == B_OK) {</a>
+<a name="ln1412">		Node* node = volume-&gt;GetNode(request-&gt;oldDirectoryID);</a>
+<a name="ln1413">		if (node) {</a>
+<a name="ln1414">			oldDirectory = dynamic_cast&lt;Directory*&gt;(node);</a>
+<a name="ln1415">			if (!oldDirectory)</a>
+<a name="ln1416">				result = B_NOT_A_DIRECTORY;</a>
+<a name="ln1417">		} else</a>
+<a name="ln1418">			result = B_ENTRY_NOT_FOUND;</a>
+<a name="ln1419">	}</a>
+<a name="ln1420"> </a>
+<a name="ln1421">	// check permissions</a>
+<a name="ln1422">	if (result == B_OK) {</a>
+<a name="ln1423">		if (!volume-&gt;GetNodePermissions(oldDirectory).ImpliesWritePermission())</a>
+<a name="ln1424">			result = B_PERMISSION_DENIED;</a>
+<a name="ln1425">	}</a>
+<a name="ln1426"> </a>
+<a name="ln1427">	// get the new path</a>
+<a name="ln1428">	Path oldPath;</a>
+<a name="ln1429">	if (result == B_OK) {</a>
+<a name="ln1430">		result = oldDirectory-&gt;GetPath(&amp;oldPath);</a>
+<a name="ln1431">		if (result == B_OK)</a>
+<a name="ln1432">			result = oldPath.Append(request-&gt;oldName.GetString());</a>
+<a name="ln1433">	}</a>
+<a name="ln1434"> </a>
+<a name="ln1435">	managerLocker.Unlock();</a>
+<a name="ln1436"> </a>
+<a name="ln1437">	// rename the entry</a>
+<a name="ln1438">	if (result == B_OK) {</a>
+<a name="ln1439">		if (rename(oldPath.GetPath(), newPath.GetPath()) &lt; 0)</a>
+<a name="ln1440">			result = errno;</a>
+<a name="ln1441">	}</a>
+<a name="ln1442"> </a>
+<a name="ln1443">	// prepare the reply</a>
+<a name="ln1444">	RenameReply reply;</a>
+<a name="ln1445">	// send the reply</a>
+<a name="ln1446">	reply.error = result;</a>
+<a name="ln1447">	return GetChannel()-&gt;SendRequest(&amp;reply);</a>
+<a name="ln1448">}</a>
+<a name="ln1449"> </a>
+<a name="ln1450">// VisitMakeDirRequest</a>
+<a name="ln1451">status_t</a>
+<a name="ln1452">ClientConnection::VisitMakeDirRequest(MakeDirRequest* request)</a>
+<a name="ln1453">{</a>
+<a name="ln1454">	ConnectionReference connectionReference(this);</a>
+<a name="ln1455">	if (!connectionReference.IsValid())</a>
+<a name="ln1456">		return B_OK;</a>
+<a name="ln1457"> </a>
+<a name="ln1458">	// get the volume</a>
+<a name="ln1459">	status_t result = B_OK;</a>
+<a name="ln1460">	ClientVolume* volume = _GetVolume(request-&gt;volumeID);</a>
+<a name="ln1461">	if (!volume)</a>
+<a name="ln1462">		result = B_BAD_VALUE;</a>
+<a name="ln1463">	ClientVolumePutter volumePutter(this, volume);</a>
+<a name="ln1464"> </a>
+<a name="ln1465">	VolumeManagerLocker managerLocker;</a>
+<a name="ln1466"> </a>
+<a name="ln1467">	// get the directory</a>
+<a name="ln1468">	Directory* directory = NULL;</a>
+<a name="ln1469">	if (result == B_OK) {</a>
+<a name="ln1470">		Node* node = volume-&gt;GetNode(request-&gt;directoryID);</a>
+<a name="ln1471">		if (node) {</a>
+<a name="ln1472">			directory = dynamic_cast&lt;Directory*&gt;(node);</a>
+<a name="ln1473">			if (!directory)</a>
+<a name="ln1474">				result = B_NOT_A_DIRECTORY;</a>
+<a name="ln1475">		} else</a>
+<a name="ln1476">			result = B_ENTRY_NOT_FOUND;</a>
+<a name="ln1477">	}</a>
+<a name="ln1478"> </a>
+<a name="ln1479">	// check permissions</a>
+<a name="ln1480">	if (result == B_OK) {</a>
+<a name="ln1481">		if (!volume-&gt;GetNodePermissions(directory).ImpliesWritePermission())</a>
+<a name="ln1482">			result = B_PERMISSION_DENIED;</a>
+<a name="ln1483">	}</a>
+<a name="ln1484"> </a>
+<a name="ln1485">	// get the path</a>
+<a name="ln1486">	Path path;</a>
+<a name="ln1487">	if (result == B_OK) {</a>
+<a name="ln1488">		result = directory-&gt;GetPath(&amp;path);</a>
+<a name="ln1489">		if (result == B_OK)</a>
+<a name="ln1490">			result = path.Append(request-&gt;name.GetString());</a>
+<a name="ln1491">	}</a>
+<a name="ln1492"> </a>
+<a name="ln1493">	managerLocker.Unlock();</a>
+<a name="ln1494"> </a>
+<a name="ln1495">	// create the directory</a>
+<a name="ln1496">	if (result == B_OK) {</a>
+<a name="ln1497">		if (mkdir(path.GetPath(), request-&gt;mode) &lt; 0)</a>
+<a name="ln1498">			result = errno;</a>
+<a name="ln1499">	}</a>
+<a name="ln1500"> </a>
+<a name="ln1501">	// prepare the reply</a>
+<a name="ln1502">	MakeDirReply reply;</a>
+<a name="ln1503">	// send the reply</a>
+<a name="ln1504">	reply.error = result;</a>
+<a name="ln1505">	return GetChannel()-&gt;SendRequest(&amp;reply);</a>
+<a name="ln1506">}</a>
+<a name="ln1507"> </a>
+<a name="ln1508">// VisitRemoveDirRequest</a>
+<a name="ln1509">status_t</a>
+<a name="ln1510">ClientConnection::VisitRemoveDirRequest(RemoveDirRequest* request)</a>
+<a name="ln1511">{</a>
+<a name="ln1512">	ConnectionReference connectionReference(this);</a>
+<a name="ln1513">	if (!connectionReference.IsValid())</a>
+<a name="ln1514">		return B_OK;</a>
+<a name="ln1515"> </a>
+<a name="ln1516">	// get the volume</a>
+<a name="ln1517">	status_t result = B_OK;</a>
+<a name="ln1518">	ClientVolume* volume = _GetVolume(request-&gt;volumeID);</a>
+<a name="ln1519">	if (!volume)</a>
+<a name="ln1520">		result = B_BAD_VALUE;</a>
+<a name="ln1521">	ClientVolumePutter volumePutter(this, volume);</a>
+<a name="ln1522"> </a>
+<a name="ln1523">	VolumeManagerLocker managerLocker;</a>
+<a name="ln1524"> </a>
+<a name="ln1525">	// get the directory</a>
+<a name="ln1526">	Directory* directory = NULL;</a>
+<a name="ln1527">	if (result == B_OK) {</a>
+<a name="ln1528">		Node* node = volume-&gt;GetNode(request-&gt;directoryID);</a>
+<a name="ln1529">		if (node) {</a>
+<a name="ln1530">			directory = dynamic_cast&lt;Directory*&gt;(node);</a>
+<a name="ln1531">			if (!directory)</a>
+<a name="ln1532">				result = B_NOT_A_DIRECTORY;</a>
+<a name="ln1533">		} else</a>
+<a name="ln1534">			result = B_ENTRY_NOT_FOUND;</a>
+<a name="ln1535">	}</a>
+<a name="ln1536"> </a>
+<a name="ln1537">	// check permissions</a>
+<a name="ln1538">	if (result == B_OK) {</a>
+<a name="ln1539">		if (!volume-&gt;GetNodePermissions(directory).ImpliesWritePermission())</a>
+<a name="ln1540">			result = B_PERMISSION_DENIED;</a>
+<a name="ln1541">	}</a>
+<a name="ln1542"> </a>
+<a name="ln1543">	// get the path</a>
+<a name="ln1544">	Path path;</a>
+<a name="ln1545">	if (result == B_OK) {</a>
+<a name="ln1546">		result = directory-&gt;GetPath(&amp;path);</a>
+<a name="ln1547">		if (result == B_OK)</a>
+<a name="ln1548">			result = path.Append(request-&gt;name.GetString());</a>
+<a name="ln1549">	}</a>
+<a name="ln1550"> </a>
+<a name="ln1551">	managerLocker.Unlock();</a>
+<a name="ln1552"> </a>
+<a name="ln1553">	// remove the directory</a>
+<a name="ln1554">	if (result == B_OK) {</a>
+<a name="ln1555">		if (rmdir(path.GetPath()) &lt; 0)</a>
+<a name="ln1556">			result = errno;</a>
+<a name="ln1557">	}</a>
+<a name="ln1558"> </a>
+<a name="ln1559">	// prepare the reply</a>
+<a name="ln1560">	RemoveDirReply reply;</a>
+<a name="ln1561">	// send the reply</a>
+<a name="ln1562">	reply.error = result;</a>
+<a name="ln1563">	return GetChannel()-&gt;SendRequest(&amp;reply);</a>
+<a name="ln1564">}</a>
+<a name="ln1565"> </a>
+<a name="ln1566">// VisitOpenDirRequest</a>
+<a name="ln1567">status_t</a>
+<a name="ln1568">ClientConnection::VisitOpenDirRequest(OpenDirRequest* request)</a>
+<a name="ln1569">{</a>
+<a name="ln1570">	ConnectionReference connectionReference(this);</a>
+<a name="ln1571">	if (!connectionReference.IsValid())</a>
+<a name="ln1572">		return B_OK;</a>
+<a name="ln1573"> </a>
+<a name="ln1574">	// get the volume</a>
+<a name="ln1575">	status_t result = B_OK;</a>
+<a name="ln1576">	ClientVolume* volume = _GetVolume(request-&gt;volumeID);</a>
+<a name="ln1577">	if (!volume)</a>
+<a name="ln1578">		result = B_BAD_VALUE;</a>
+<a name="ln1579">	ClientVolumePutter volumePutter(this, volume);</a>
+<a name="ln1580"> </a>
+<a name="ln1581">	VolumeManagerLocker managerLocker;</a>
+<a name="ln1582"> </a>
+<a name="ln1583">	// get the directory</a>
+<a name="ln1584">	Directory* directory = NULL;</a>
+<a name="ln1585">	if (result == B_OK) {</a>
+<a name="ln1586">		Node* node = volume-&gt;GetNode(request-&gt;nodeID);</a>
+<a name="ln1587">		if (node) {</a>
+<a name="ln1588">			directory = dynamic_cast&lt;Directory*&gt;(node);</a>
+<a name="ln1589">			if (!directory)</a>
+<a name="ln1590">				result = B_NOT_A_DIRECTORY;</a>
+<a name="ln1591">		} else</a>
+<a name="ln1592">			result = B_ENTRY_NOT_FOUND;</a>
+<a name="ln1593">	}</a>
+<a name="ln1594"> </a>
+<a name="ln1595">	// check permission</a>
+<a name="ln1596">	if (result == B_OK) {</a>
+<a name="ln1597">		if (!volume-&gt;GetNodePermissions(directory).ImpliesReadDirPermission())</a>
+<a name="ln1598">			result = B_PERMISSION_DENIED;</a>
+<a name="ln1599">	}</a>
+<a name="ln1600"> </a>
+<a name="ln1601">	// open the directory</a>
+<a name="ln1602">	DirIterator* handle = NULL;</a>
+<a name="ln1603">	if (result == B_OK)</a>
+<a name="ln1604">		result = volume-&gt;OpenDir(directory, &amp;handle);</a>
+<a name="ln1605">	NodeHandleUnlocker handleUnlocker(volume, handle);</a>
+<a name="ln1606"> </a>
+<a name="ln1607">	// prepare the reply</a>
+<a name="ln1608">	OpenDirReply reply;</a>
+<a name="ln1609">	if (result == B_OK) {</a>
+<a name="ln1610">		_GetNodeInfo(directory, &amp;reply.nodeInfo);</a>
+<a name="ln1611">		reply.cookie = handle-&gt;GetCookie();</a>
+<a name="ln1612">	}</a>
+<a name="ln1613">else {</a>
+<a name="ln1614">if (directory)</a>
+<a name="ln1615">PRINT(&quot;OpenDir() failed: client volume: %ld, node: (%ld, %lld)\n&quot;,</a>
+<a name="ln1616">volume-&gt;GetID(), directory-&gt;GetVolumeID(), directory-&gt;GetID());</a>
+<a name="ln1617">}</a>
+<a name="ln1618"> </a>
+<a name="ln1619">	managerLocker.Unlock();</a>
+<a name="ln1620"> </a>
+<a name="ln1621">	// send the reply</a>
+<a name="ln1622">	reply.error = result;</a>
+<a name="ln1623">	status_t error = GetChannel()-&gt;SendRequest(&amp;reply);</a>
+<a name="ln1624"> </a>
+<a name="ln1625">	// close the handle, if a send error occurred</a>
+<a name="ln1626">	if (error != B_OK &amp;&amp; result == B_OK)</a>
+<a name="ln1627">		volume-&gt;Close(handle);</a>
+<a name="ln1628"> </a>
+<a name="ln1629">	return error;</a>
+<a name="ln1630">}</a>
+<a name="ln1631"> </a>
+<a name="ln1632">// VisitReadDirRequest</a>
+<a name="ln1633">status_t</a>
+<a name="ln1634">ClientConnection::VisitReadDirRequest(ReadDirRequest* request)</a>
+<a name="ln1635">{</a>
+<a name="ln1636">	ConnectionReference connectionReference(this);</a>
+<a name="ln1637">	if (!connectionReference.IsValid())</a>
+<a name="ln1638">		return B_OK;</a>
+<a name="ln1639"> </a>
+<a name="ln1640">	// get the volume</a>
+<a name="ln1641">	status_t result = B_OK;</a>
+<a name="ln1642">	ClientVolume* volume = _GetVolume(request-&gt;volumeID);</a>
+<a name="ln1643">	if (!volume)</a>
+<a name="ln1644">		result = B_BAD_VALUE;</a>
+<a name="ln1645">	ClientVolumePutter volumePutter(this, volume);</a>
+<a name="ln1646"> </a>
+<a name="ln1647">	// get the node handle</a>
+<a name="ln1648">	NodeHandle* handle = NULL;</a>
+<a name="ln1649">	if (result == B_OK)</a>
+<a name="ln1650">		result = volume-&gt;LockNodeHandle(request-&gt;cookie, &amp;handle);</a>
+<a name="ln1651">	NodeHandleUnlocker handleUnlocker(volume, handle);</a>
+<a name="ln1652"> </a>
+<a name="ln1653">	// check if it is a directory iterator</a>
+<a name="ln1654">	DirIterator* iterator = NULL;</a>
+<a name="ln1655">	if (result == B_OK) {</a>
+<a name="ln1656">		iterator = dynamic_cast&lt;DirIterator*&gt;(handle);</a>
+<a name="ln1657">		if (!iterator)</a>
+<a name="ln1658">			result = B_BAD_VALUE;</a>
+<a name="ln1659">	}</a>
+<a name="ln1660"> </a>
+<a name="ln1661">	VolumeManagerLocker managerLocker;</a>
+<a name="ln1662"> </a>
+<a name="ln1663">	// get the directory</a>
+<a name="ln1664">	Directory* directory = NULL;</a>
+<a name="ln1665">	if (result == B_OK) {</a>
+<a name="ln1666">		Node* node = volume-&gt;GetNode(iterator-&gt;GetNodeRef());</a>
+<a name="ln1667">		if (node) {</a>
+<a name="ln1668">			directory = dynamic_cast&lt;Directory*&gt;(node);</a>
+<a name="ln1669">			if (!directory)</a>
+<a name="ln1670">				result = B_NOT_A_DIRECTORY;</a>
+<a name="ln1671">		} else</a>
+<a name="ln1672">			result = B_ENTRY_NOT_FOUND;</a>
+<a name="ln1673">	}</a>
+<a name="ln1674"> </a>
+<a name="ln1675">	// check read permission</a>
+<a name="ln1676">	if (result == B_OK) {</a>
+<a name="ln1677">		if (!volume-&gt;GetNodePermissions(directory).ImpliesReadDirPermission())</a>
+<a name="ln1678">			result = B_PERMISSION_DENIED;</a>
+<a name="ln1679">	}</a>
+<a name="ln1680"> </a>
+<a name="ln1681">if (result == B_OK) {</a>
+<a name="ln1682">	PRINT(&quot;ReadDir: (%ld, %lld)\n&quot;, request-&gt;volumeID, directory-&gt;GetID());</a>
+<a name="ln1683">}</a>
+<a name="ln1684"> </a>
+<a name="ln1685">	// rewind, if requested</a>
+<a name="ln1686">	if (result == B_OK &amp;&amp; request-&gt;rewind)</a>
+<a name="ln1687">		iterator-&gt;Rewind();</a>
+<a name="ln1688"> </a>
+<a name="ln1689">	// read the directory</a>
+<a name="ln1690">	bool done = false;</a>
+<a name="ln1691">	ReadDirReply reply;</a>
+<a name="ln1692">	int32 toRead = request-&gt;count;</a>
+<a name="ln1693">	while (result == B_OK &amp;&amp; toRead &gt; 0) {</a>
+<a name="ln1694">		// get the next entry</a>
+<a name="ln1695">		Entry* entry = iterator-&gt;NextEntry();</a>
+<a name="ln1696">		if (!entry) {</a>
+<a name="ln1697">			done = true;</a>
+<a name="ln1698">			break;</a>
+<a name="ln1699">		}</a>
+<a name="ln1700"> </a>
+<a name="ln1701">		// get and add an entry info</a>
+<a name="ln1702">		EntryInfo entryInfo;</a>
+<a name="ln1703">		_GetEntryInfo(entry, &amp;entryInfo);</a>
+<a name="ln1704">		result = reply.entryInfos.Append(entryInfo);</a>
+<a name="ln1705"> </a>
+<a name="ln1706">		toRead--;</a>
+<a name="ln1707">	}</a>
+<a name="ln1708"> </a>
+<a name="ln1709">	reply.revision = VolumeManager::GetDefault()-&gt;GetRevision();</a>
+<a name="ln1710"> </a>
+<a name="ln1711">//PRINT((&quot;ReadDir: (%lld) -&gt; (%lx, %ld, dir: %lld, node: %lld, `%s')\n&quot;,</a>
+<a name="ln1712">//directoryID, reply.error, reply.entryInfos.CountElements(),</a>
+<a name="ln1713">//reply.entryInfo.directoryID,</a>
+<a name="ln1714">//reply.entryInfo.nodeID, reply.entryInfo.name.GetString()));</a>
+<a name="ln1715">if (directory) {</a>
+<a name="ln1716">PRINT(&quot;ReadDir done: volume: %ld, (%ld, %lld) -&gt; (%lx, %ld)\n&quot;,</a>
+<a name="ln1717">volume-&gt;GetID(), directory-&gt;GetVolumeID(), directory-&gt;GetID(), result,</a>
+<a name="ln1718">reply.entryInfos.CountElements());</a>
+<a name="ln1719">}</a>
+<a name="ln1720"> </a>
+<a name="ln1721">	managerLocker.Unlock();</a>
+<a name="ln1722"> </a>
+<a name="ln1723">	// send the reply</a>
+<a name="ln1724">	reply.error = result;</a>
+<a name="ln1725">	reply.done = (result != B_OK || done);</a>
+<a name="ln1726">	return GetChannel()-&gt;SendRequest(&amp;reply);</a>
+<a name="ln1727">}</a>
+<a name="ln1728"> </a>
+<a name="ln1729">// VisitWalkRequest</a>
+<a name="ln1730">status_t</a>
+<a name="ln1731">ClientConnection::VisitWalkRequest(WalkRequest* request)</a>
+<a name="ln1732">{</a>
+<a name="ln1733">	ConnectionReference connectionReference(this);</a>
+<a name="ln1734">	if (!connectionReference.IsValid())</a>
+<a name="ln1735">		return B_OK;</a>
+<a name="ln1736"> </a>
+<a name="ln1737">	// get the volume</a>
+<a name="ln1738">	status_t result = B_OK;</a>
+<a name="ln1739">	ClientVolume* volume = _GetVolume(request-&gt;volumeID);</a>
+<a name="ln1740">	if (!volume)</a>
+<a name="ln1741">		result = B_BAD_VALUE;</a>
+<a name="ln1742">	ClientVolumePutter volumePutter(this, volume);</a>
+<a name="ln1743"> </a>
+<a name="ln1744">	VolumeManagerLocker managerLocker;</a>
+<a name="ln1745"> </a>
+<a name="ln1746">	// get the directory</a>
+<a name="ln1747">	Directory* directory = NULL;</a>
+<a name="ln1748">	if (result == B_OK) {</a>
+<a name="ln1749">		Node* node = volume-&gt;GetNode(request-&gt;nodeID);</a>
+<a name="ln1750">		if (node) {</a>
+<a name="ln1751">			directory = dynamic_cast&lt;Directory*&gt;(node);</a>
+<a name="ln1752">			if (!directory)</a>
+<a name="ln1753">				result = B_NOT_A_DIRECTORY;</a>
+<a name="ln1754">		} else</a>
+<a name="ln1755">			result = B_ENTRY_NOT_FOUND;</a>
+<a name="ln1756">	}</a>
+<a name="ln1757"> </a>
+<a name="ln1758">	// check permission</a>
+<a name="ln1759">	if (result == B_OK) {</a>
+<a name="ln1760">		if (!volume-&gt;GetNodePermissions(directory)</a>
+<a name="ln1761">				.ImpliesResolveDirEntryPermission()) {</a>
+<a name="ln1762">			result = B_PERMISSION_DENIED;</a>
+<a name="ln1763">		}</a>
+<a name="ln1764">	}</a>
+<a name="ln1765"> </a>
+<a name="ln1766">	WalkReply reply;</a>
+<a name="ln1767">	char linkPath[B_PATH_NAME_LENGTH];</a>
+<a name="ln1768">	if (result == B_OK) {</a>
+<a name="ln1769">		// load the entry</a>
+<a name="ln1770">		Entry* entry;</a>
+<a name="ln1771">		result = volume-&gt;LoadEntry(directory, request-&gt;name.GetString(),</a>
+<a name="ln1772">			&amp;entry);</a>
+<a name="ln1773"> </a>
+<a name="ln1774">		// fill in the reply</a>
+<a name="ln1775">		if (result == B_OK) {</a>
+<a name="ln1776">			_GetEntryInfo(entry, &amp;reply.entryInfo);</a>
+<a name="ln1777"> </a>
+<a name="ln1778">			// resolve a symlink, if desired</a>
+<a name="ln1779">			Node* node = entry-&gt;GetNode();</a>
+<a name="ln1780">			if (request-&gt;resolveLink &amp;&amp; node-&gt;IsSymlink()) {</a>
+<a name="ln1781">				result = node-&gt;ReadSymlink(linkPath, B_PATH_NAME_LENGTH);</a>
+<a name="ln1782">				if (result == B_OK)</a>
+<a name="ln1783">					reply.linkPath.SetTo(linkPath);</a>
+<a name="ln1784">			}</a>
+<a name="ln1785">		}</a>
+<a name="ln1786">	}</a>
+<a name="ln1787"> </a>
+<a name="ln1788">	managerLocker.Unlock();</a>
+<a name="ln1789"> </a>
+<a name="ln1790">	// send the reply</a>
+<a name="ln1791">	reply.error = result;</a>
+<a name="ln1792">	PRINT(&quot;Walk: (%ld, %lld, `%s') -&gt; (%lx, (%ld, %lld), `%s')\n&quot;,</a>
+<a name="ln1793">		request-&gt;nodeID.volumeID, request-&gt;nodeID.nodeID,</a>
+<a name="ln1794">		request-&gt;name.GetString(), result,</a>
+<a name="ln1795">		reply.entryInfo.nodeInfo.st.st_dev,</a>
+<a name="ln1796">		reply.entryInfo.nodeInfo.st.st_ino, reply.linkPath.GetString());</a>
+<a name="ln1797">	return GetChannel()-&gt;SendRequest(&amp;reply);</a>
+<a name="ln1798">}</a>
+<a name="ln1799"> </a>
+<a name="ln1800">// VisitMultiWalkRequest</a>
+<a name="ln1801">status_t</a>
+<a name="ln1802">ClientConnection::VisitMultiWalkRequest(MultiWalkRequest* request)</a>
+<a name="ln1803">{</a>
+<a name="ln1804">	ConnectionReference connectionReference(this);</a>
+<a name="ln1805">	if (!connectionReference.IsValid())</a>
+<a name="ln1806">		return B_OK;</a>
+<a name="ln1807"> </a>
+<a name="ln1808">	// get the volume</a>
+<a name="ln1809">	status_t result = B_OK;</a>
+<a name="ln1810">	ClientVolume* volume = _GetVolume(request-&gt;volumeID);</a>
+<a name="ln1811">	if (!volume)</a>
+<a name="ln1812">		result = B_BAD_VALUE;</a>
+<a name="ln1813">	ClientVolumePutter volumePutter(this, volume);</a>
+<a name="ln1814"> </a>
+<a name="ln1815">	VolumeManagerLocker managerLocker;</a>
+<a name="ln1816"> </a>
+<a name="ln1817">	// get the directory</a>
+<a name="ln1818">	Directory* directory = NULL;</a>
+<a name="ln1819">	if (result == B_OK) {</a>
+<a name="ln1820">		Node* node = volume-&gt;GetNode(request-&gt;nodeID);</a>
+<a name="ln1821">		if (node) {</a>
+<a name="ln1822">			directory = dynamic_cast&lt;Directory*&gt;(node);</a>
+<a name="ln1823">			if (!directory)</a>
+<a name="ln1824">				result = B_NOT_A_DIRECTORY;</a>
+<a name="ln1825">		} else</a>
+<a name="ln1826">			result = B_ENTRY_NOT_FOUND;</a>
+<a name="ln1827">	}</a>
+<a name="ln1828"> </a>
+<a name="ln1829">	// check permission</a>
+<a name="ln1830">	if (result == B_OK) {</a>
+<a name="ln1831">		if (!volume-&gt;GetNodePermissions(directory)</a>
+<a name="ln1832">				.ImpliesResolveDirEntryPermission()) {</a>
+<a name="ln1833">			result = B_PERMISSION_DENIED;</a>
+<a name="ln1834">		}</a>
+<a name="ln1835">	}</a>
+<a name="ln1836"> </a>
+<a name="ln1837">	MultiWalkReply reply;</a>
+<a name="ln1838">	StringData* names = request-&gt;names.GetElements();</a>
+<a name="ln1839">	int32 count = request-&gt;names.CountElements();</a>
+<a name="ln1840">	for (int32 i = 0; result == B_OK &amp;&amp; i &lt; count; i++) {</a>
+<a name="ln1841">		// load the entry</a>
+<a name="ln1842">		Entry* entry;</a>
+<a name="ln1843">		if (volume-&gt;LoadEntry(directory, names[i].GetString(), &amp;entry)</a>
+<a name="ln1844">				== B_OK) {</a>
+<a name="ln1845">			// add an entry info</a>
+<a name="ln1846">			EntryInfo entryInfo;</a>
+<a name="ln1847">			_GetEntryInfo(entry, &amp;entryInfo);</a>
+<a name="ln1848"> </a>
+<a name="ln1849">			// append the info</a>
+<a name="ln1850">			result = reply.entryInfos.Append(entryInfo);</a>
+<a name="ln1851">		}</a>
+<a name="ln1852">	}</a>
+<a name="ln1853"> </a>
+<a name="ln1854">	managerLocker.Unlock();</a>
+<a name="ln1855"> </a>
+<a name="ln1856">	// send the reply</a>
+<a name="ln1857">	reply.error = result;</a>
+<a name="ln1858">	PRINT(&quot;MultiWalk: (%ld, %lld, %ld) -&gt; (%lx, %ld)\n&quot;,</a>
+<a name="ln1859">		request-&gt;nodeID.volumeID, request-&gt;nodeID.nodeID, count,</a>
+<a name="ln1860">		result, reply.entryInfos.CountElements());</a>
+<a name="ln1861">	return GetChannel()-&gt;SendRequest(&amp;reply);</a>
+<a name="ln1862">}</a>
+<a name="ln1863"> </a>
+<a name="ln1864">// VisitOpenAttrDirRequest</a>
+<a name="ln1865">status_t</a>
+<a name="ln1866">ClientConnection::VisitOpenAttrDirRequest(OpenAttrDirRequest* request)</a>
+<a name="ln1867">{</a>
+<a name="ln1868">	ConnectionReference connectionReference(this);</a>
+<a name="ln1869">	if (!connectionReference.IsValid())</a>
+<a name="ln1870">		return B_OK;</a>
+<a name="ln1871"> </a>
+<a name="ln1872">	// get the volume</a>
+<a name="ln1873">	status_t result = B_OK;</a>
+<a name="ln1874">	ClientVolume* volume = _GetVolume(request-&gt;volumeID);</a>
+<a name="ln1875">	if (!volume)</a>
+<a name="ln1876">		result = B_BAD_VALUE;</a>
+<a name="ln1877">	ClientVolumePutter volumePutter(this, volume);</a>
+<a name="ln1878"> </a>
+<a name="ln1879">	VolumeManagerLocker managerLocker;</a>
+<a name="ln1880"> </a>
+<a name="ln1881">	// get the node</a>
+<a name="ln1882">	Node* node = NULL;</a>
+<a name="ln1883">	if (result == B_OK) {</a>
+<a name="ln1884">		node = volume-&gt;GetNode(request-&gt;nodeID);</a>
+<a name="ln1885">		if (!node)</a>
+<a name="ln1886">			result = B_ENTRY_NOT_FOUND;</a>
+<a name="ln1887">	}</a>
+<a name="ln1888"> </a>
+<a name="ln1889">	// check permission</a>
+<a name="ln1890">	if (result == B_OK) {</a>
+<a name="ln1891">		if (!volume-&gt;GetNodePermissions(node).ImpliesReadPermission())</a>
+<a name="ln1892">			result = B_PERMISSION_DENIED;</a>
+<a name="ln1893">	}</a>
+<a name="ln1894"> </a>
+<a name="ln1895">	// load/cache the attribute directory</a>
+<a name="ln1896">	bool attrDirCached = (node-&gt;LoadAttrDir() == B_OK);</a>
+<a name="ln1897"> </a>
+<a name="ln1898">	// open the attribute directory, if caching it failed</a>
+<a name="ln1899">	AttrDirIterator* handle = NULL;</a>
+<a name="ln1900">	if (result == B_OK &amp;&amp; !attrDirCached)</a>
+<a name="ln1901">		result = volume-&gt;OpenAttrDir(node, &amp;handle);</a>
+<a name="ln1902">	NodeHandleUnlocker handleUnlocker(volume, handle);</a>
+<a name="ln1903"> </a>
+<a name="ln1904">	// prepare the reply</a>
+<a name="ln1905">	OpenAttrDirReply reply;</a>
+<a name="ln1906">	if (result == B_OK) {</a>
+<a name="ln1907">		if (handle) {</a>
+<a name="ln1908">			reply.cookie = handle-&gt;GetCookie();</a>
+<a name="ln1909">		} else {</a>
+<a name="ln1910">			// the attribute directory is cached</a>
+<a name="ln1911">			reply.cookie = -1;</a>
+<a name="ln1912">			result = _GetAttrDirInfo(request, node, &amp;reply.attrDirInfo);</a>
+<a name="ln1913">		}</a>
+<a name="ln1914">	}</a>
+<a name="ln1915"> </a>
+<a name="ln1916">	managerLocker.Unlock();</a>
+<a name="ln1917"> </a>
+<a name="ln1918">	// send the reply</a>
+<a name="ln1919">	reply.error = result;</a>
+<a name="ln1920">	status_t error = GetChannel()-&gt;SendRequest(&amp;reply);</a>
+<a name="ln1921"> </a>
+<a name="ln1922">	// close the handle, if a send error occurred</a>
+<a name="ln1923">	if (error != B_OK &amp;&amp; result == B_OK &amp;&amp; handle)</a>
+<a name="ln1924">		volume-&gt;Close(handle);</a>
+<a name="ln1925"> </a>
+<a name="ln1926">	return error;</a>
+<a name="ln1927">}</a>
+<a name="ln1928"> </a>
+<a name="ln1929">// VisitReadAttrDirRequest</a>
+<a name="ln1930">status_t</a>
+<a name="ln1931">ClientConnection::VisitReadAttrDirRequest(ReadAttrDirRequest* request)</a>
+<a name="ln1932">{</a>
+<a name="ln1933">	ConnectionReference connectionReference(this);</a>
+<a name="ln1934">	if (!connectionReference.IsValid())</a>
+<a name="ln1935">		return B_OK;</a>
+<a name="ln1936"> </a>
+<a name="ln1937">	// get the volume</a>
+<a name="ln1938">	status_t result = B_OK;</a>
+<a name="ln1939">	ClientVolume* volume = _GetVolume(request-&gt;volumeID);</a>
+<a name="ln1940">	if (!volume)</a>
+<a name="ln1941">		result = B_BAD_VALUE;</a>
+<a name="ln1942">	ClientVolumePutter volumePutter(this, volume);</a>
+<a name="ln1943"> </a>
+<a name="ln1944">	// get the node handle</a>
+<a name="ln1945">	NodeHandle* handle = NULL;</a>
+<a name="ln1946">	if (result == B_OK)</a>
+<a name="ln1947">		result = volume-&gt;LockNodeHandle(request-&gt;cookie, &amp;handle);</a>
+<a name="ln1948">	NodeHandleUnlocker handleUnlocker(volume, handle);</a>
+<a name="ln1949"> </a>
+<a name="ln1950">	// check if it is a attribute directory iterator</a>
+<a name="ln1951">	AttrDirIterator* iterator = NULL;</a>
+<a name="ln1952">	if (result == B_OK) {</a>
+<a name="ln1953">		iterator = dynamic_cast&lt;AttrDirIterator*&gt;(handle);</a>
+<a name="ln1954">		if (!iterator)</a>
+<a name="ln1955">			result = B_BAD_VALUE;</a>
+<a name="ln1956">	}</a>
+<a name="ln1957"> </a>
+<a name="ln1958">	VolumeManagerLocker managerLocker;</a>
+<a name="ln1959"> </a>
+<a name="ln1960">	// get the node</a>
+<a name="ln1961">	Node* node = NULL;</a>
+<a name="ln1962">	if (result == B_OK) {</a>
+<a name="ln1963">		node = volume-&gt;GetNode(iterator-&gt;GetNodeRef());</a>
+<a name="ln1964">		if (!node)</a>
+<a name="ln1965">			result = B_ENTRY_NOT_FOUND;</a>
+<a name="ln1966">	}</a>
+<a name="ln1967"> </a>
+<a name="ln1968">	// check read permission (we already checked when opening, but anyway...)</a>
+<a name="ln1969">	if (result == B_OK) {</a>
+<a name="ln1970">		if (!volume-&gt;GetNodePermissions(node).ImpliesReadPermission())</a>
+<a name="ln1971">			result = B_PERMISSION_DENIED;</a>
+<a name="ln1972">	}</a>
+<a name="ln1973"> </a>
+<a name="ln1974">	managerLocker.Unlock();</a>
+<a name="ln1975"> </a>
+<a name="ln1976">	// read the attribute directory</a>
+<a name="ln1977">	uint8 buffer[sizeof(struct dirent) + B_FILE_NAME_LENGTH];</a>
+<a name="ln1978">	struct dirent* dirEntry = (struct dirent*)buffer;</a>
+<a name="ln1979">	int32 countRead = 0;</a>
+<a name="ln1980">	bool done = true;</a>
+<a name="ln1981">	if (result == B_OK) {</a>
+<a name="ln1982">		if (request-&gt;rewind)</a>
+<a name="ln1983">			result = iterator-&gt;RewindDir();</a>
+<a name="ln1984">		if (result == B_OK) {</a>
+<a name="ln1985">			result = iterator-&gt;ReadDir(dirEntry, sizeof(buffer), 1,</a>
+<a name="ln1986">				&amp;countRead, &amp;done);</a>
+<a name="ln1987">		}</a>
+<a name="ln1988">	}</a>
+<a name="ln1989"> </a>
+<a name="ln1990">	// prepare the reply</a>
+<a name="ln1991">	ReadAttrDirReply reply;</a>
+<a name="ln1992">	reply.name.SetTo(dirEntry-&gt;d_name);</a>
+<a name="ln1993"> </a>
+<a name="ln1994">	// send the reply</a>
+<a name="ln1995">	reply.error = result;</a>
+<a name="ln1996">	reply.count = countRead;</a>
+<a name="ln1997">	return GetChannel()-&gt;SendRequest(&amp;reply);</a>
+<a name="ln1998">}</a>
+<a name="ln1999"> </a>
+<a name="ln2000">// VisitReadAttrRequest</a>
+<a name="ln2001">status_t</a>
+<a name="ln2002">ClientConnection::VisitReadAttrRequest(ReadAttrRequest* request)</a>
+<a name="ln2003">{</a>
+<a name="ln2004">	ConnectionReference connectionReference(this);</a>
+<a name="ln2005">	if (!connectionReference.IsValid())</a>
+<a name="ln2006">		return B_OK;</a>
+<a name="ln2007"> </a>
+<a name="ln2008">	// get the volume</a>
+<a name="ln2009">	status_t result = B_OK;</a>
+<a name="ln2010">	ClientVolume* volume = _GetVolume(request-&gt;volumeID);</a>
+<a name="ln2011">	if (!volume)</a>
+<a name="ln2012">		result = B_BAD_VALUE;</a>
+<a name="ln2013">	ClientVolumePutter volumePutter(this, volume);</a>
+<a name="ln2014"> </a>
+<a name="ln2015">	VolumeManagerLocker managerLocker;</a>
+<a name="ln2016"> </a>
+<a name="ln2017">	// get the node</a>
+<a name="ln2018">	Node* node = NULL;</a>
+<a name="ln2019">	if (result == B_OK) {</a>
+<a name="ln2020">		node = volume-&gt;GetNode(request-&gt;nodeID);</a>
+<a name="ln2021">		if (!node)</a>
+<a name="ln2022">			result = B_ENTRY_NOT_FOUND;</a>
+<a name="ln2023">	}</a>
+<a name="ln2024"> </a>
+<a name="ln2025">	// check read permission</a>
+<a name="ln2026">	if (result == B_OK) {</a>
+<a name="ln2027">		if (!volume-&gt;GetNodePermissions(node).ImpliesReadPermission())</a>
+<a name="ln2028">			result = B_PERMISSION_DENIED;</a>
+<a name="ln2029">	}</a>
+<a name="ln2030"> </a>
+<a name="ln2031">	// open the node</a>
+<a name="ln2032">	FileHandle* handle = NULL;</a>
+<a name="ln2033">	if (result == B_OK)</a>
+<a name="ln2034">		result = volume-&gt;Open(node, O_RDONLY, &amp;handle);</a>
+<a name="ln2035">	NodeHandleUnlocker handleUnlocker(volume, handle);</a>
+<a name="ln2036"> </a>
+<a name="ln2037">	managerLocker.Unlock();</a>
+<a name="ln2038"> </a>
+<a name="ln2039">	// read the attribute</a>
+<a name="ln2040">	if (result == B_OK) {</a>
+<a name="ln2041">		// Due to a bug in BFS the `pos' is ignored. This means that the loop</a>
+<a name="ln2042">		// below won't work if the attribute is non-empty and the buffer is</a>
+<a name="ln2043">		// larger than the attribute, because the we would again and again</a>
+<a name="ln2044">		// read the beginning of the attribute until the buffer is full.</a>
+<a name="ln2045">		// Hence we first get an attr_info and don't try to read more than</a>
+<a name="ln2046">		// the size of the attribute.</a>
+<a name="ln2047">		attr_info info;</a>
+<a name="ln2048">		result = handle-&gt;StatAttr(request-&gt;name.GetString(), &amp;info);</a>
+<a name="ln2049">		off_t originalPos = max(request-&gt;pos, (off_t)0);</a>
+<a name="ln2050">		int32 originalSize = max(request-&gt;size, (int32)0);</a>
+<a name="ln2051">		off_t pos = originalPos;</a>
+<a name="ln2052">		int32 size = originalSize;</a>
+<a name="ln2053">		type_code type = B_SWAP_INT32(request-&gt;type);</a>
+<a name="ln2054">		bool convert = false;</a>
+<a name="ln2055"> </a>
+<a name="ln2056">		if (result == B_OK) {</a>
+<a name="ln2057">			originalSize = min((off_t)originalSize, max((off_t)0, info.size - pos));</a>
+<a name="ln2058">			size = originalSize;</a>
+<a name="ln2059"> </a>
+<a name="ln2060">			// deal with inverse endianess clients</a>
+<a name="ln2061">			if (fInverseClientEndianess) {</a>
+<a name="ln2062">				convert = _KnownAttributeType(info.type);</a>
+<a name="ln2063">				if (convert) {</a>
+<a name="ln2064">					// read the whole attribute</a>
+<a name="ln2065">					pos = 0;</a>
+<a name="ln2066">					size = info.size;</a>
+<a name="ln2067">				} else</a>
+<a name="ln2068">					type = B_SWAP_INT32(request-&gt;type);</a>
+<a name="ln2069">			}</a>
+<a name="ln2070">		}</a>
+<a name="ln2071">		int32 bufferSize = min(size, kMaxReadBufferSize);</a>
+<a name="ln2072"> </a>
+<a name="ln2073">		// allocate a buffer</a>
+<a name="ln2074">		uint8* buffer = NULL;</a>
+<a name="ln2075">		if (result == B_OK) {</a>
+<a name="ln2076">			buffer = (uint8*)malloc(bufferSize);</a>
+<a name="ln2077">			if (!buffer)</a>
+<a name="ln2078">				result = B_NO_MEMORY;</a>
+<a name="ln2079">		}</a>
+<a name="ln2080">		MemoryDeleter bufferDeleter(buffer);</a>
+<a name="ln2081"> </a>
+<a name="ln2082">		if (convert) {</a>
+<a name="ln2083">			// read the whole attribute and convert it</a>
+<a name="ln2084">			if (result == B_OK) {</a>
+<a name="ln2085">				// read</a>
+<a name="ln2086">				size_t bytesRead = 0;</a>
+<a name="ln2087">				result = handle-&gt;ReadAttr(request-&gt;name.GetString(),</a>
+<a name="ln2088">					type, 0, buffer, size, &amp;bytesRead);</a>
+<a name="ln2089">				if (result == B_OK &amp;&amp; (int32)bytesRead != size)</a>
+<a name="ln2090">					result = B_ERROR;</a>
+<a name="ln2091"> </a>
+<a name="ln2092">				// convert</a>
+<a name="ln2093">				if (result == B_OK)</a>
+<a name="ln2094">					_ConvertAttribute(info, buffer);</a>
+<a name="ln2095">			}</a>
+<a name="ln2096"> </a>
+<a name="ln2097">			// prepare the reply</a>
+<a name="ln2098">			ReadAttrReply reply;</a>
+<a name="ln2099">			if (result == B_OK) {</a>
+<a name="ln2100">				reply.pos = originalPos;</a>
+<a name="ln2101">				reply.data.SetTo(buffer + originalPos, originalSize);</a>
+<a name="ln2102">				reply.moreToCome = false;</a>
+<a name="ln2103">			}</a>
+<a name="ln2104"> </a>
+<a name="ln2105">			// send the reply</a>
+<a name="ln2106">			reply.error = result;</a>
+<a name="ln2107">			status_t error = GetChannel()-&gt;SendRequest(&amp;reply);</a>
+<a name="ln2108">			if (error != B_OK)</a>
+<a name="ln2109">				return error;</a>
+<a name="ln2110">		} else {</a>
+<a name="ln2111">			// read as long as there are bytes left to read or an error occurs</a>
+<a name="ln2112">			bool moreToRead = true;</a>
+<a name="ln2113">			do {</a>
+<a name="ln2114">				int32 bytesToRead = min(size, bufferSize);</a>
+<a name="ln2115">				size_t bytesRead = 0;</a>
+<a name="ln2116">				if (result == B_OK) {</a>
+<a name="ln2117">					result = handle-&gt;ReadAttr(request-&gt;name.GetString(),</a>
+<a name="ln2118">						request-&gt;type, pos, buffer, bytesToRead, &amp;bytesRead);</a>
+<a name="ln2119">				}</a>
+<a name="ln2120">				moreToRead = (result == B_OK &amp;&amp; bytesRead &gt; 0</a>
+<a name="ln2121">					&amp;&amp; (int32)bytesRead &lt; size);</a>
+<a name="ln2122"> </a>
+<a name="ln2123">				// prepare the reply</a>
+<a name="ln2124">				ReadAttrReply reply;</a>
+<a name="ln2125">				if (result == B_OK) {</a>
+<a name="ln2126">					reply.pos = pos;</a>
+<a name="ln2127">					reply.data.SetTo(buffer, bytesRead);</a>
+<a name="ln2128">					reply.moreToCome = moreToRead;</a>
+<a name="ln2129">					pos += bytesRead;</a>
+<a name="ln2130">					size -= bytesRead;</a>
+<a name="ln2131">				}</a>
+<a name="ln2132"> </a>
+<a name="ln2133">				// send the reply</a>
+<a name="ln2134">				reply.error = result;</a>
+<a name="ln2135">				status_t error = GetChannel()-&gt;SendRequest(&amp;reply);</a>
+<a name="ln2136">				if (error != B_OK)</a>
+<a name="ln2137">					return error;</a>
+<a name="ln2138">			} while (moreToRead);</a>
+<a name="ln2139">		}</a>
+<a name="ln2140"> </a>
+<a name="ln2141">		// close the handle</a>
+<a name="ln2142">		volume-&gt;Close(handle);</a>
+<a name="ln2143">	} else {</a>
+<a name="ln2144">		// opening the node failed (or something even earlier): send an error</a>
+<a name="ln2145">		// reply</a>
+<a name="ln2146">		ReadAttrReply reply;</a>
+<a name="ln2147">		reply.error = result;</a>
+<a name="ln2148">		status_t error = GetChannel()-&gt;SendRequest(&amp;reply);</a>
+<a name="ln2149">		if (error != B_OK)</a>
+<a name="ln2150">			return error;</a>
+<a name="ln2151">	}</a>
+<a name="ln2152"> </a>
+<a name="ln2153">	return B_OK;</a>
+<a name="ln2154">}</a>
+<a name="ln2155"> </a>
+<a name="ln2156">// VisitWriteAttrRequest</a>
+<a name="ln2157">status_t</a>
+<a name="ln2158">ClientConnection::VisitWriteAttrRequest(WriteAttrRequest* request)</a>
+<a name="ln2159">{</a>
+<a name="ln2160">	ConnectionReference connectionReference(this);</a>
+<a name="ln2161">	if (!connectionReference.IsValid())</a>
+<a name="ln2162">		return B_OK;</a>
+<a name="ln2163"> </a>
+<a name="ln2164">	// get the volume</a>
+<a name="ln2165">	status_t result = B_OK;</a>
+<a name="ln2166">	ClientVolume* volume = _GetVolume(request-&gt;volumeID);</a>
+<a name="ln2167">	if (!volume)</a>
+<a name="ln2168">		result = B_BAD_VALUE;</a>
+<a name="ln2169">	ClientVolumePutter volumePutter(this, volume);</a>
+<a name="ln2170"> </a>
+<a name="ln2171">	VolumeManagerLocker managerLocker;</a>
+<a name="ln2172"> </a>
+<a name="ln2173">	// get the node</a>
+<a name="ln2174">	Node* node = NULL;</a>
+<a name="ln2175">	if (result == B_OK) {</a>
+<a name="ln2176">		node = volume-&gt;GetNode(request-&gt;nodeID);</a>
+<a name="ln2177">		if (!node)</a>
+<a name="ln2178">			result = B_ENTRY_NOT_FOUND;</a>
+<a name="ln2179">	}</a>
+<a name="ln2180"> </a>
+<a name="ln2181">	// check read permission</a>
+<a name="ln2182">	if (result == B_OK) {</a>
+<a name="ln2183">		if (!volume-&gt;GetNodePermissions(node).ImpliesWritePermission())</a>
+<a name="ln2184">			result = B_PERMISSION_DENIED;</a>
+<a name="ln2185">	}</a>
+<a name="ln2186"> </a>
+<a name="ln2187">	// open the node</a>
+<a name="ln2188">	FileHandle* handle = NULL;</a>
+<a name="ln2189">	if (result == B_OK)</a>
+<a name="ln2190">		result = volume-&gt;Open(node, O_RDWR, &amp;handle);</a>
+<a name="ln2191">	NodeHandleUnlocker handleUnlocker(volume, handle);</a>
+<a name="ln2192"> </a>
+<a name="ln2193">	managerLocker.Unlock();</a>
+<a name="ln2194"> </a>
+<a name="ln2195">	if (result == B_OK) {</a>
+<a name="ln2196">		off_t pos = max(request-&gt;pos, (off_t)0);</a>
+<a name="ln2197">		int32 size = request-&gt;data.GetSize();</a>
+<a name="ln2198">		type_code type = request-&gt;type;</a>
+<a name="ln2199">		char* buffer = (char*)request-&gt;data.GetData();</a>
+<a name="ln2200"> </a>
+<a name="ln2201">		// convert the data, if necessary</a>
+<a name="ln2202">		if (fInverseClientEndianess) {</a>
+<a name="ln2203">			if (_KnownAttributeType(type)) {</a>
+<a name="ln2204">				if (pos != 0) {</a>
+<a name="ln2205">					WARN(&quot;WriteAttr(): WARNING: Need to convert attribute &quot;</a>
+<a name="ln2206">						&quot;endianess, but position is not 0: attribute: %s, &quot;</a>
+<a name="ln2207">						&quot;pos: %&quot; B_PRIdOFF &quot;, size: %&quot; B_PRId32 &quot;\n&quot;,</a>
+<a name="ln2208">						request-&gt;name.GetString(), pos, size);</a>
+<a name="ln2209">				}</a>
+<a name="ln2210">				swap_data(type, buffer, size, B_SWAP_ALWAYS);</a>
+<a name="ln2211">			} else</a>
+<a name="ln2212">				type = B_SWAP_INT32(type);</a>
+<a name="ln2213">		}</a>
+<a name="ln2214"> </a>
+<a name="ln2215">		// write the data</a>
+<a name="ln2216">		while (result == B_OK &amp;&amp; size &gt; 0) {</a>
+<a name="ln2217">			size_t bytesWritten;</a>
+<a name="ln2218">			result = handle-&gt;WriteAttr(request-&gt;name.GetString(),</a>
+<a name="ln2219">				type, pos, buffer, size, &amp;bytesWritten);</a>
+<a name="ln2220">			if (result == B_OK) {</a>
+<a name="ln2221">				pos += bytesWritten;</a>
+<a name="ln2222">				buffer += bytesWritten;</a>
+<a name="ln2223">				size -= bytesWritten;</a>
+<a name="ln2224">			}</a>
+<a name="ln2225">		}</a>
+<a name="ln2226"> </a>
+<a name="ln2227">		// close the handle</a>
+<a name="ln2228">		volume-&gt;Close(handle);</a>
+<a name="ln2229">	}</a>
+<a name="ln2230"> </a>
+<a name="ln2231">	// prepare the reply</a>
+<a name="ln2232">	WriteAttrReply reply;</a>
+<a name="ln2233">	// send the reply</a>
+<a name="ln2234">	reply.error = result;</a>
+<a name="ln2235">	return GetChannel()-&gt;SendRequest(&amp;reply);</a>
+<a name="ln2236">}</a>
+<a name="ln2237"> </a>
+<a name="ln2238">// VisitRemoveAttrRequest</a>
+<a name="ln2239">status_t</a>
+<a name="ln2240">ClientConnection::VisitRemoveAttrRequest(RemoveAttrRequest* request)</a>
+<a name="ln2241">{</a>
+<a name="ln2242">	ConnectionReference connectionReference(this);</a>
+<a name="ln2243">	if (!connectionReference.IsValid())</a>
+<a name="ln2244">		return B_OK;</a>
+<a name="ln2245"> </a>
+<a name="ln2246">	// get the volume</a>
+<a name="ln2247">	status_t result = B_OK;</a>
+<a name="ln2248">	ClientVolume* volume = _GetVolume(request-&gt;volumeID);</a>
+<a name="ln2249">	if (!volume)</a>
+<a name="ln2250">		result = B_BAD_VALUE;</a>
+<a name="ln2251">	ClientVolumePutter volumePutter(this, volume);</a>
+<a name="ln2252"> </a>
+<a name="ln2253">	VolumeManagerLocker managerLocker;</a>
+<a name="ln2254"> </a>
+<a name="ln2255">	// get the node</a>
+<a name="ln2256">	Node* node = NULL;</a>
+<a name="ln2257">	if (result == B_OK) {</a>
+<a name="ln2258">		node = volume-&gt;GetNode(request-&gt;nodeID);</a>
+<a name="ln2259">		if (!node)</a>
+<a name="ln2260">			result = B_ENTRY_NOT_FOUND;</a>
+<a name="ln2261">	}</a>
+<a name="ln2262"> </a>
+<a name="ln2263">	// check read permission</a>
+<a name="ln2264">	if (result == B_OK) {</a>
+<a name="ln2265">		if (!volume-&gt;GetNodePermissions(node).ImpliesWritePermission())</a>
+<a name="ln2266">			result = B_PERMISSION_DENIED;</a>
+<a name="ln2267">	}</a>
+<a name="ln2268"> </a>
+<a name="ln2269">	// open the node</a>
+<a name="ln2270">	FileHandle* handle = NULL;</a>
+<a name="ln2271">	if (result == B_OK)</a>
+<a name="ln2272">		result = volume-&gt;Open(node, O_RDWR, &amp;handle);</a>
+<a name="ln2273">	NodeHandleUnlocker handleUnlocker(volume, handle);</a>
+<a name="ln2274"> </a>
+<a name="ln2275">	managerLocker.Unlock();</a>
+<a name="ln2276"> </a>
+<a name="ln2277">	// remove the attribute and close the node</a>
+<a name="ln2278">	if (result == B_OK) {</a>
+<a name="ln2279">		result = handle-&gt;RemoveAttr(request-&gt;name.GetString());</a>
+<a name="ln2280">		volume-&gt;Close(handle);</a>
+<a name="ln2281">	}</a>
+<a name="ln2282"> </a>
+<a name="ln2283">	// send the reply</a>
+<a name="ln2284">	RemoveAttrReply reply;</a>
+<a name="ln2285">	reply.error = result;</a>
+<a name="ln2286">	return GetChannel()-&gt;SendRequest(&amp;reply);</a>
+<a name="ln2287">}</a>
+<a name="ln2288"> </a>
+<a name="ln2289">// VisitRenameAttrRequest</a>
+<a name="ln2290">status_t</a>
+<a name="ln2291">ClientConnection::VisitRenameAttrRequest(RenameAttrRequest* request)</a>
+<a name="ln2292">{</a>
+<a name="ln2293">	// Not supported, since there's no API function to rename an attribute.</a>
+<a name="ln2294">	// send the reply</a>
+<a name="ln2295">	RemoveAttrReply reply;</a>
+<a name="ln2296">	reply.error = B_UNSUPPORTED;</a>
+<a name="ln2297">	return GetChannel()-&gt;SendRequest(&amp;reply);</a>
+<a name="ln2298">}</a>
+<a name="ln2299"> </a>
+<a name="ln2300">// VisitStatAttrRequest</a>
+<a name="ln2301">status_t</a>
+<a name="ln2302">ClientConnection::VisitStatAttrRequest(StatAttrRequest* request)</a>
+<a name="ln2303">{</a>
+<a name="ln2304">	ConnectionReference connectionReference(this);</a>
+<a name="ln2305">	if (!connectionReference.IsValid())</a>
+<a name="ln2306">		return B_OK;</a>
+<a name="ln2307"> </a>
+<a name="ln2308">	// get the volume</a>
+<a name="ln2309">	status_t result = B_OK;</a>
+<a name="ln2310">	ClientVolume* volume = _GetVolume(request-&gt;volumeID);</a>
+<a name="ln2311">	if (!volume)</a>
+<a name="ln2312">		result = B_BAD_VALUE;</a>
+<a name="ln2313">	ClientVolumePutter volumePutter(this, volume);</a>
+<a name="ln2314"> </a>
+<a name="ln2315">	VolumeManagerLocker managerLocker;</a>
+<a name="ln2316"> </a>
+<a name="ln2317">	// get the node</a>
+<a name="ln2318">	Node* node = NULL;</a>
+<a name="ln2319">	if (result == B_OK) {</a>
+<a name="ln2320">		node = volume-&gt;GetNode(request-&gt;nodeID);</a>
+<a name="ln2321">		if (!node)</a>
+<a name="ln2322">			result = B_ENTRY_NOT_FOUND;</a>
+<a name="ln2323">	}</a>
+<a name="ln2324"> </a>
+<a name="ln2325">	// check read permission</a>
+<a name="ln2326">	if (result == B_OK) {</a>
+<a name="ln2327">		if (!volume-&gt;GetNodePermissions(node).ImpliesReadPermission())</a>
+<a name="ln2328">			result = B_PERMISSION_DENIED;</a>
+<a name="ln2329">	}</a>
+<a name="ln2330"> </a>
+<a name="ln2331">	// open the node</a>
+<a name="ln2332">	FileHandle* handle = NULL;</a>
+<a name="ln2333">	if (result == B_OK)</a>
+<a name="ln2334">		result = volume-&gt;Open(node, O_RDONLY, &amp;handle);</a>
+<a name="ln2335">	NodeHandleUnlocker handleUnlocker(volume, handle);</a>
+<a name="ln2336"> </a>
+<a name="ln2337">	managerLocker.Unlock();</a>
+<a name="ln2338"> </a>
+<a name="ln2339">	// stat the attribute and close the node</a>
+<a name="ln2340">	attr_info attrInfo;</a>
+<a name="ln2341">	StatAttrReply reply;</a>
+<a name="ln2342">	if (result == B_OK) {</a>
+<a name="ln2343">		result = handle-&gt;StatAttr(request-&gt;name.GetString(), &amp;attrInfo);</a>
+<a name="ln2344">		volume-&gt;Close(handle);</a>
+<a name="ln2345">	}</a>
+<a name="ln2346"> </a>
+<a name="ln2347">	// set the attribute info</a>
+<a name="ln2348">	if (result == B_OK) {</a>
+<a name="ln2349">		result = _GetAttrInfo(request, request-&gt;name.GetString(), attrInfo,</a>
+<a name="ln2350">			NULL, &amp;reply.attrInfo);</a>
+<a name="ln2351">	}</a>
+<a name="ln2352"> </a>
+<a name="ln2353">	// send the reply</a>
+<a name="ln2354">	reply.error = result;</a>
+<a name="ln2355">	return GetChannel()-&gt;SendRequest(&amp;reply);</a>
+<a name="ln2356">}</a>
+<a name="ln2357"> </a>
+<a name="ln2358">// VisitOpenQueryRequest</a>
+<a name="ln2359">status_t</a>
+<a name="ln2360">ClientConnection::VisitOpenQueryRequest(OpenQueryRequest* request)</a>
+<a name="ln2361">{</a>
+<a name="ln2362">	ConnectionReference connectionReference(this);</a>
+<a name="ln2363">	if (!connectionReference.IsValid())</a>
+<a name="ln2364">		return B_OK;</a>
+<a name="ln2365"> </a>
+<a name="ln2366">	VolumeManagerLocker managerLocker;</a>
+<a name="ln2367"> </a>
+<a name="ln2368">	// open the query</a>
+<a name="ln2369">	status_t result = B_OK;</a>
+<a name="ln2370">	QueryHandle* handle = NULL;</a>
+<a name="ln2371">	if (result == B_OK) {</a>
+<a name="ln2372">		result = _OpenQuery(request-&gt;queryString.GetString(),</a>
+<a name="ln2373">			request-&gt;flags, request-&gt;port, request-&gt;token, &amp;handle);</a>
+<a name="ln2374">	}</a>
+<a name="ln2375">	QueryHandleUnlocker handleUnlocker(this, handle);</a>
+<a name="ln2376"> </a>
+<a name="ln2377">	// prepare the reply</a>
+<a name="ln2378">	OpenQueryReply reply;</a>
+<a name="ln2379">	if (result == B_OK)</a>
+<a name="ln2380">		reply.cookie = handle-&gt;GetCookie();</a>
+<a name="ln2381"> </a>
+<a name="ln2382">	managerLocker.Unlock();</a>
+<a name="ln2383"> </a>
+<a name="ln2384">	// send the reply</a>
+<a name="ln2385">	reply.error = result;</a>
+<a name="ln2386">	status_t error = GetChannel()-&gt;SendRequest(&amp;reply);</a>
+<a name="ln2387"> </a>
+<a name="ln2388">	// close the handle, if a send error occurred</a>
+<a name="ln2389">	if (error != B_OK &amp;&amp; result == B_OK)</a>
+<a name="ln2390">		_CloseQuery(handle);</a>
+<a name="ln2391"> </a>
+<a name="ln2392">	return error;</a>
+<a name="ln2393">}</a>
+<a name="ln2394"> </a>
+<a name="ln2395">// VisitReadQueryRequest</a>
+<a name="ln2396">status_t</a>
+<a name="ln2397">ClientConnection::VisitReadQueryRequest(ReadQueryRequest* request)</a>
+<a name="ln2398">{</a>
+<a name="ln2399">	ConnectionReference connectionReference(this);</a>
+<a name="ln2400">	if (!connectionReference.IsValid())</a>
+<a name="ln2401">		return B_OK;</a>
+<a name="ln2402"> </a>
+<a name="ln2403">	// create an array for the IDs of the client volumes a found entry may</a>
+<a name="ln2404">	// reside on</a>
+<a name="ln2405">	status_t result = B_OK;</a>
+<a name="ln2406">	int32 volumeCount = fVolumes-&gt;Size();</a>
+<a name="ln2407">	int32* volumeIDs = new(std::nothrow) int32[volumeCount];</a>
+<a name="ln2408">	if (!volumeIDs)</a>
+<a name="ln2409">		result = B_NO_MEMORY;</a>
+<a name="ln2410">	ArrayDeleter&lt;int32&gt; volumeIDsDeleter(volumeIDs);</a>
+<a name="ln2411"> </a>
+<a name="ln2412">	// get the query handle</a>
+<a name="ln2413">	QueryHandle* handle = NULL;</a>
+<a name="ln2414">	if (result == B_OK)</a>
+<a name="ln2415">		result = _LockQueryHandle(request-&gt;cookie, &amp;handle);</a>
+<a name="ln2416">	QueryHandleUnlocker handleUnlocker(this, handle);</a>
+<a name="ln2417"> </a>
+<a name="ln2418">	// check if it is a query handle</a>
+<a name="ln2419">	QueryHandle* queryHandle = NULL;</a>
+<a name="ln2420">	if (result == B_OK) {</a>
+<a name="ln2421">		queryHandle = dynamic_cast&lt;QueryHandle*&gt;(handle);</a>
+<a name="ln2422">		if (!queryHandle)</a>
+<a name="ln2423">			result = B_BAD_VALUE;</a>
+<a name="ln2424">	}</a>
+<a name="ln2425"> </a>
+<a name="ln2426">	// read the query</a>
+<a name="ln2427">	ReadQueryReply reply;</a>
+<a name="ln2428">	int32 countRead = 0;</a>
+<a name="ln2429">	while (result == B_OK) {</a>
+<a name="ln2430">		uint8 buffer[sizeof(struct dirent) + B_FILE_NAME_LENGTH];</a>
+<a name="ln2431">		struct dirent* dirEntry = (struct dirent*)buffer;</a>
+<a name="ln2432"> </a>
+<a name="ln2433">		result = queryHandle-&gt;ReadDir(dirEntry, 1, &amp;countRead);</a>
+<a name="ln2434">		if (result != B_OK)</a>
+<a name="ln2435">			break;</a>
+<a name="ln2436">		if (countRead == 0)</a>
+<a name="ln2437">			break;</a>
+<a name="ln2438">		PRINT(&quot;  query entry: %ld, %lld, \&quot;%s\&quot;\n&quot;,</a>
+<a name="ln2439">			dirEntry-&gt;d_pdev, dirEntry-&gt;d_pino, dirEntry-&gt;d_name);</a>
+<a name="ln2440"> </a>
+<a name="ln2441">		VolumeManagerLocker managerLocker;</a>
+<a name="ln2442">		VolumeManager* volumeManager = VolumeManager::GetDefault();</a>
+<a name="ln2443"> </a>
+<a name="ln2444">		// load the entry</a>
+<a name="ln2445">		Entry* entry = NULL;</a>
+<a name="ln2446">		result = volumeManager-&gt;LoadEntry(dirEntry-&gt;d_pdev,</a>
+<a name="ln2447">			dirEntry-&gt;d_pino, dirEntry-&gt;d_name, true, &amp;entry);</a>
+<a name="ln2448"> </a>
+<a name="ln2449">		// if at least one client volume contains the entry, get an entry info</a>
+<a name="ln2450">		if (result == B_OK) {</a>
+<a name="ln2451">			HasQueryPermissionClientVolumeFilter filter;</a>
+<a name="ln2452">			int32 entryVolumeCount = _GetContainingClientVolumes(</a>
+<a name="ln2453">				entry-&gt;GetDirectory(), volumeIDs, volumeCount, &amp;filter);</a>
+<a name="ln2454">			if (entryVolumeCount &gt; 0) {</a>
+<a name="ln2455">				// store all the client volume IDs in the reply</a>
+<a name="ln2456">				for (int32 i = 0; i &lt; entryVolumeCount; i++) {</a>
+<a name="ln2457">					result = reply.clientVolumeIDs.Append(volumeIDs[i]);</a>
+<a name="ln2458">					if (result != B_OK)</a>
+<a name="ln2459">						break;</a>
+<a name="ln2460">				}</a>
+<a name="ln2461"> </a>
+<a name="ln2462">				// get an entry info</a>
+<a name="ln2463">				_GetNodeInfo(entry-&gt;GetDirectory(), &amp;reply.dirInfo);</a>
+<a name="ln2464">				_GetEntryInfo(entry, &amp;reply.entryInfo);</a>
+<a name="ln2465">				break;</a>
+<a name="ln2466">			}</a>
+<a name="ln2467">else</a>
+<a name="ln2468">PRINT((&quot;  -&gt; no client volumes\n&quot;));</a>
+<a name="ln2469">		}</a>
+<a name="ln2470"> </a>
+<a name="ln2471">		// entry is not in the volume: next round...</a>
+<a name="ln2472">		result = B_OK;</a>
+<a name="ln2473">	}</a>
+<a name="ln2474"> </a>
+<a name="ln2475">	// send the reply</a>
+<a name="ln2476">	reply.error = result;</a>
+<a name="ln2477">	reply.count = countRead;</a>
+<a name="ln2478">	PRINT(&quot;ReadQuery: (%lx, %ld, dir: (%ld, %lld), node: (%ld, %lld, `%s')&quot;</a>
+<a name="ln2479">		&quot;\n&quot;, reply.error, reply.count,</a>
+<a name="ln2480">		reply.entryInfo.directoryID.volumeID,</a>
+<a name="ln2481">		reply.entryInfo.directoryID.nodeID,</a>
+<a name="ln2482">		reply.entryInfo.nodeInfo.st.st_dev,</a>
+<a name="ln2483">		reply.entryInfo.nodeInfo.st.st_ino,</a>
+<a name="ln2484">		reply.entryInfo.name.GetString());</a>
+<a name="ln2485">	return GetChannel()-&gt;SendRequest(&amp;reply);</a>
+<a name="ln2486">}</a>
+<a name="ln2487"> </a>
+<a name="ln2488"> </a>
+<a name="ln2489">// #pragma mark -</a>
+<a name="ln2490"> </a>
+<a name="ln2491">// ProcessNodeMonitoringEvent</a>
+<a name="ln2492">void</a>
+<a name="ln2493">ClientConnection::ProcessNodeMonitoringEvent(int32 volumeID,</a>
+<a name="ln2494">	NodeMonitoringEvent* event)</a>
+<a name="ln2495">{</a>
+<a name="ln2496">	// get a connection reference</a>
+<a name="ln2497">	ConnectionReference connectionReference(this);</a>
+<a name="ln2498">	if (!connectionReference.IsValid())</a>
+<a name="ln2499">		return;</a>
+<a name="ln2500"> </a>
+<a name="ln2501">	_PushNodeMonitoringEvent(volumeID, event);</a>
+<a name="ln2502">}</a>
+<a name="ln2503"> </a>
+<a name="ln2504">// CloseNodeMonitoringEventQueue</a>
+<a name="ln2505">void</a>
+<a name="ln2506">ClientConnection::CloseNodeMonitoringEventQueue()</a>
+<a name="ln2507">{</a>
+<a name="ln2508">	typedef Vector&lt;NodeMonitoringRequest*&gt; RequestVector;</a>
+<a name="ln2509">	const RequestVector* requests = NULL;</a>
+<a name="ln2510">	if (fNodeMonitoringEvents-&gt;Close(false, &amp;requests) == B_OK) {</a>
+<a name="ln2511">		for (RequestVector::ConstIterator it = requests-&gt;Begin();</a>
+<a name="ln2512">			 it != requests-&gt;End();</a>
+<a name="ln2513">			 it++) {</a>
+<a name="ln2514">			delete *it;</a>
+<a name="ln2515">		}</a>
+<a name="ln2516">	}</a>
+<a name="ln2517">}</a>
+<a name="ln2518"> </a>
+<a name="ln2519"> </a>
+<a name="ln2520">// #pragma mark -</a>
+<a name="ln2521"> </a>
+<a name="ln2522">// QueryDomainIntersectsWith</a>
+<a name="ln2523">bool</a>
+<a name="ln2524">ClientConnection::QueryDomainIntersectsWith(Volume* volume)</a>
+<a name="ln2525">{</a>
+<a name="ln2526">	// Iterate through the the client volumes and check whether any one contains</a>
+<a name="ln2527">	// the supplied volume or its root dir is on the volume. We don't check</a>
+<a name="ln2528">	// directory inclusion for the latter, since we don't need to query the</a>
+<a name="ln2529">	// volume, if the client volume is located on a volume mounted somewhere</a>
+<a name="ln2530">	// under the supplied volume (e.g. the root FS contains everything, but does</a>
+<a name="ln2531">	// seldomly need to be queried).</a>
+<a name="ln2532">	VolumeManager* volumeManager = VolumeManager::GetDefault();</a>
+<a name="ln2533">	AutoLocker&lt;VolumeMap&gt; volumesLocker(fVolumes);</a>
+<a name="ln2534">	for (VolumeMap::Iterator it = fVolumes-&gt;GetIterator(); it.HasNext();) {</a>
+<a name="ln2535">		ClientVolume* clientVolume = it.Next().value;</a>
+<a name="ln2536">		Directory* volumeRoot = volume-&gt;GetRootDirectory();</a>
+<a name="ln2537">		Directory* clientVolumeRoot = clientVolume-&gt;GetRootDirectory();</a>
+<a name="ln2538">		if (volumeManager-&gt;DirectoryContains(clientVolumeRoot, volumeRoot, true)</a>
+<a name="ln2539">			|| volumeRoot-&gt;GetVolumeID() == clientVolumeRoot-&gt;GetVolumeID()) {</a>
+<a name="ln2540">			return true;</a>
+<a name="ln2541">		}</a>
+<a name="ln2542">	}</a>
+<a name="ln2543"> </a>
+<a name="ln2544">	return false;</a>
+<a name="ln2545">}</a>
+<a name="ln2546"> </a>
+<a name="ln2547">// ProcessQueryEvent</a>
+<a name="ln2548">void</a>
+<a name="ln2549">ClientConnection::ProcessQueryEvent(NodeMonitoringEvent* event)</a>
+<a name="ln2550">{</a>
+<a name="ln2551">	dev_t volumeID;</a>
+<a name="ln2552">	ino_t directoryID;</a>
+<a name="ln2553">	if (event-&gt;opcode == B_ENTRY_CREATED) {</a>
+<a name="ln2554">		// &quot;entry created&quot; event</a>
+<a name="ln2555">		EntryCreatedEvent* createdEvent</a>
+<a name="ln2556">			= dynamic_cast&lt;EntryCreatedEvent*&gt;(event);</a>
+<a name="ln2557">		if (!createdEvent)</a>
+<a name="ln2558">			return;</a>
+<a name="ln2559">		volumeID = createdEvent-&gt;volumeID;</a>
+<a name="ln2560">		directoryID = createdEvent-&gt;directoryID;</a>
+<a name="ln2561"> </a>
+<a name="ln2562">	} else if (event-&gt;opcode == B_ENTRY_REMOVED) {</a>
+<a name="ln2563">		// &quot;entry removed&quot; event</a>
+<a name="ln2564">		EntryRemovedEvent* removedEvent</a>
+<a name="ln2565">			= dynamic_cast&lt;EntryRemovedEvent*&gt;(event);</a>
+<a name="ln2566">		if (!removedEvent)</a>
+<a name="ln2567">			return;</a>
+<a name="ln2568">		volumeID = removedEvent-&gt;volumeID;</a>
+<a name="ln2569">		directoryID = removedEvent-&gt;directoryID;</a>
+<a name="ln2570"> </a>
+<a name="ln2571">	} else {</a>
+<a name="ln2572">		// We only support &quot;entry created&quot; and &quot;entry removed&quot; query events.</a>
+<a name="ln2573">		// &quot;entry moved&quot; is split by the volume manager into those.</a>
+<a name="ln2574">		ERROR(&quot;Ignoring unexpected query event: opcode: 0x%&quot; B_PRIx32 &quot;\n&quot;,</a>
+<a name="ln2575">			event-&gt;opcode);</a>
+<a name="ln2576">		return;</a>
+<a name="ln2577">	}</a>
+<a name="ln2578">	PRINT(&quot;ClientConnection::ProcessQueryEvent(): event: %p, type: %s:&quot;</a>
+<a name="ln2579">		&quot; directory: (%ld, %lld)\n&quot;, event, typeid(event).name(),</a>
+<a name="ln2580">		volumeID, directoryID);</a>
+<a name="ln2581"> </a>
+<a name="ln2582">	// create an array for the IDs of the client volumes a found entry may</a>
+<a name="ln2583">	// reside on</a>
+<a name="ln2584">	status_t result = B_OK;</a>
+<a name="ln2585">	int32 volumeCount = fVolumes-&gt;Size();</a>
+<a name="ln2586">	int32* volumeIDs = new(std::nothrow) int32[volumeCount];</a>
+<a name="ln2587">	if (!volumeIDs)</a>
+<a name="ln2588">		result = B_NO_MEMORY;</a>
+<a name="ln2589">	ArrayDeleter&lt;int32&gt; volumeIDsDeleter(volumeIDs);</a>
+<a name="ln2590"> </a>
+<a name="ln2591">	HasQueryPermissionClientVolumeFilter filter;</a>
+<a name="ln2592"> </a>
+<a name="ln2593">	// load the directory the concerned entry belongs/belonged to</a>
+<a name="ln2594">	Directory* directory;</a>
+<a name="ln2595">	int32 concernedVolumes = 0;</a>
+<a name="ln2596">	if (VolumeManager::GetDefault()-&gt;LoadDirectory(volumeID, directoryID,</a>
+<a name="ln2597">			&amp;directory) == B_OK) {</a>
+<a name="ln2598">		// find out, which client volumes the directory is located in</a>
+<a name="ln2599">		concernedVolumes = _GetContainingClientVolumes(directory, volumeIDs,</a>
+<a name="ln2600">			volumeCount, &amp;filter);</a>
+<a name="ln2601">	} else {</a>
+<a name="ln2602">		// Failed to load the directory, so maybe it has already been</a>
+<a name="ln2603">		// deleted. For &quot;entry removed&quot; events, we consider all client</a>
+<a name="ln2604">		// volumes to be notified -- those that don't know the entry will</a>
+<a name="ln2605">		// ignore the event.</a>
+<a name="ln2606">		if (event-&gt;opcode == B_ENTRY_REMOVED) {</a>
+<a name="ln2607">			concernedVolumes = _GetAllClientVolumeIDs(volumeIDs, volumeCount,</a>
+<a name="ln2608">				&amp;filter);</a>
+<a name="ln2609">		}</a>
+<a name="ln2610">	}</a>
+<a name="ln2611"> </a>
+<a name="ln2612">	// now push the event for each concerned client volume</a>
+<a name="ln2613">	for (int32 i = 0; i &lt; concernedVolumes; i++)</a>
+<a name="ln2614">		_PushNodeMonitoringEvent(volumeIDs[i], event);</a>
+<a name="ln2615">	// TODO: More than one volume will usually only be concerned in case of</a>
+<a name="ln2616">	// nested client volumes. We could optimize the case by having an array of</a>
+<a name="ln2617">	// volume IDs in the respective requests sent over the net (just as in the</a>
+<a name="ln2618">	// ReadQueryReply).</a>
+<a name="ln2619">}</a>
+<a name="ln2620"> </a>
+<a name="ln2621"> </a>
+<a name="ln2622">// #pragma mark -</a>
+<a name="ln2623"> </a>
+<a name="ln2624">// _Close</a>
+<a name="ln2625">void</a>
+<a name="ln2626">ClientConnection::_Close()</a>
+<a name="ln2627">{</a>
+<a name="ln2628">	// terminate node monitoring processor</a>
+<a name="ln2629">	CloseNodeMonitoringEventQueue();</a>
+<a name="ln2630">	if (fNodeMonitoringProcessor &gt;= 0</a>
+<a name="ln2631">		&amp;&amp; find_thread(NULL) != fNodeMonitoringProcessor) {</a>
+<a name="ln2632">		int32 result;</a>
+<a name="ln2633">		wait_for_thread(fNodeMonitoringProcessor, &amp;result);</a>
+<a name="ln2634">		// The variable is not unset, when this is the node monitoring</a>
+<a name="ln2635">		// processor thread -- which is good, since the destructor will</a>
+<a name="ln2636">		// wait for the thread in this case.</a>
+<a name="ln2637">		fNodeMonitoringProcessor = -1;</a>
+<a name="ln2638">	}</a>
+<a name="ln2639">	if (fConnection)</a>
+<a name="ln2640">		fConnection-&gt;Close();</a>
+<a name="ln2641">	// notify the listener</a>
+<a name="ln2642">	ClientConnectionListener* listener = fListener;</a>
+<a name="ln2643">	fListener = NULL;</a>
+<a name="ln2644">	if (listener)</a>
+<a name="ln2645">		listener-&gt;ClientConnectionClosed(this, fError);</a>
+<a name="ln2646">}</a>
+<a name="ln2647"> </a>
+<a name="ln2648">// _MarkClosed</a>
+<a name="ln2649">void</a>
+<a name="ln2650">ClientConnection::_MarkClosed(bool error)</a>
+<a name="ln2651">{</a>
+<a name="ln2652">	AutoLocker&lt;Locker&gt; _(fLock);</a>
+<a name="ln2653">	if (!fClosed) {</a>
+<a name="ln2654">		fClosed = true;</a>
+<a name="ln2655">		fError = error;</a>
+<a name="ln2656">	}</a>
+<a name="ln2657">}</a>
+<a name="ln2658"> </a>
+<a name="ln2659">// _GetNodeInfo</a>
+<a name="ln2660">void</a>
+<a name="ln2661">ClientConnection::_GetNodeInfo(Node* node, NodeInfo* info)</a>
+<a name="ln2662">{</a>
+<a name="ln2663">	if (node &amp;&amp; info) {</a>
+<a name="ln2664">		info-&gt;st = node-&gt;GetStat();</a>
+<a name="ln2665">		info-&gt;revision = VolumeManager::GetDefault()-&gt;GetRevision();</a>
+<a name="ln2666">	}</a>
+<a name="ln2667">}</a>
+<a name="ln2668"> </a>
+<a name="ln2669">// _GetEntryInfo</a>
+<a name="ln2670">void</a>
+<a name="ln2671">ClientConnection::_GetEntryInfo(Entry* entry, EntryInfo* info)</a>
+<a name="ln2672">{</a>
+<a name="ln2673">	if (entry &amp;&amp; info) {</a>
+<a name="ln2674">		info-&gt;directoryID.volumeID = entry-&gt;GetVolumeID();</a>
+<a name="ln2675">		info-&gt;directoryID.nodeID = entry-&gt;GetDirectoryID();</a>
+<a name="ln2676">		info-&gt;name.SetTo(entry-&gt;GetName());</a>
+<a name="ln2677">		_GetNodeInfo(entry-&gt;GetNode(), &amp;info-&gt;nodeInfo);</a>
+<a name="ln2678">	}</a>
+<a name="ln2679">}</a>
+<a name="ln2680"> </a>
+<a name="ln2681">// _GetAttrInfo</a>
+<a name="ln2682">status_t</a>
+<a name="ln2683">ClientConnection::_GetAttrInfo(Request* request, const char* name,</a>
+<a name="ln2684">	const attr_info&amp; attrInfo, const void* data, AttributeInfo* info)</a>
+<a name="ln2685">{</a>
+<a name="ln2686">	if (!request || !name || !info)</a>
+<a name="ln2687">		return B_BAD_VALUE;</a>
+<a name="ln2688"> </a>
+<a name="ln2689">	info-&gt;name.SetTo(name);</a>
+<a name="ln2690">	info-&gt;info = attrInfo;</a>
+<a name="ln2691">	data = (attrInfo.size &gt; 0 ? data : NULL);</a>
+<a name="ln2692">	int32 dataSize = (data ? attrInfo.size : 0);</a>
+<a name="ln2693">	info-&gt;data.SetTo(data, dataSize);</a>
+<a name="ln2694"> </a>
+<a name="ln2695">	// if the client has inverse endianess, swap the type, if we don't know it</a>
+<a name="ln2696">	if (fInverseClientEndianess) {</a>
+<a name="ln2697">		if (_KnownAttributeType(info-&gt;info.type)) {</a>
+<a name="ln2698">			// we need to convert the data, if supplied</a>
+<a name="ln2699">			if (data) {</a>
+<a name="ln2700">				// allocate a buffer</a>
+<a name="ln2701">				RequestBuffer* requestBuffer = RequestBuffer::Create(dataSize);</a>
+<a name="ln2702">				if (!requestBuffer)</a>
+<a name="ln2703">					return B_NO_MEMORY;</a>
+<a name="ln2704"> </a>
+<a name="ln2705">				// convert the data</a>
+<a name="ln2706">				memcpy(requestBuffer-&gt;GetData(), data, dataSize);</a>
+<a name="ln2707">				_ConvertAttribute(info-&gt;info, requestBuffer-&gt;GetData());</a>
+<a name="ln2708">			}</a>
+<a name="ln2709">		} else</a>
+<a name="ln2710">			info-&gt;info.type = B_SWAP_INT32(info-&gt;info.type);</a>
+<a name="ln2711">	}</a>
+<a name="ln2712"> </a>
+<a name="ln2713">	return B_OK;</a>
+<a name="ln2714">}</a>
+<a name="ln2715"> </a>
+<a name="ln2716">// _GetAttrDirInfo</a>
+<a name="ln2717">status_t</a>
+<a name="ln2718">ClientConnection::_GetAttrDirInfo(Request* request, AttributeDirectory* attrDir,</a>
+<a name="ln2719">	AttrDirInfo* info)</a>
+<a name="ln2720">{</a>
+<a name="ln2721">	if (!request || !attrDir || !info || !attrDir-&gt;IsAttrDirValid())</a>
+<a name="ln2722">		return B_BAD_VALUE;</a>
+<a name="ln2723"> </a>
+<a name="ln2724">	// add the attribute infos</a>
+<a name="ln2725">	for (Attribute* attribute = attrDir-&gt;GetFirstAttribute();</a>
+<a name="ln2726">		 attribute;</a>
+<a name="ln2727">		 attribute = attrDir-&gt;GetNextAttribute(attribute)) {</a>
+<a name="ln2728">		// get the attribute info</a>
+<a name="ln2729">		AttributeInfo attrInfo;</a>
+<a name="ln2730">		attr_info bAttrInfo;</a>
+<a name="ln2731">		attribute-&gt;GetInfo(&amp;bAttrInfo);</a>
+<a name="ln2732">		status_t error = _GetAttrInfo(request, attribute-&gt;GetName(), bAttrInfo,</a>
+<a name="ln2733">			attribute-&gt;GetData(), &amp;attrInfo);</a>
+<a name="ln2734"> </a>
+<a name="ln2735">		// append it</a>
+<a name="ln2736">		if (error == B_OK)</a>
+<a name="ln2737">			error = info-&gt;attributeInfos.Append(attrInfo);</a>
+<a name="ln2738">		if (error != B_OK)</a>
+<a name="ln2739">			return error;</a>
+<a name="ln2740">	}</a>
+<a name="ln2741"> </a>
+<a name="ln2742">	info-&gt;revision = VolumeManager::GetDefault()-&gt;GetRevision();</a>
+<a name="ln2743">	info-&gt;isValid = true;</a>
+<a name="ln2744"> </a>
+<a name="ln2745">	return B_OK;</a>
+<a name="ln2746">}</a>
+<a name="ln2747"> </a>
+<a name="ln2748">// _CreateVolume</a>
+<a name="ln2749">status_t</a>
+<a name="ln2750">ClientConnection::_CreateVolume(ClientVolume** _volume)</a>
+<a name="ln2751">{</a>
+<a name="ln2752">	// create and init the volume</a>
+<a name="ln2753">	ClientVolume* volume = new(std::nothrow) ClientVolume(fSecurityContextLock,</a>
+<a name="ln2754">		this);</a>
+<a name="ln2755">	if (!volume)</a>
+<a name="ln2756">		return B_NO_MEMORY;</a>
+<a name="ln2757">	status_t error = volume-&gt;Init();</a>
+<a name="ln2758">	if (error != B_OK) {</a>
+<a name="ln2759">		delete volume;</a>
+<a name="ln2760">		return error;</a>
+<a name="ln2761">	}</a>
+<a name="ln2762"> </a>
+<a name="ln2763">	// add it to the volume map</a>
+<a name="ln2764">	AutoLocker&lt;VolumeMap&gt; locker(fVolumes);</a>
+<a name="ln2765">	error = fVolumes-&gt;Put(volume-&gt;GetID(), volume);</a>
+<a name="ln2766">	locker.Unlock();</a>
+<a name="ln2767"> </a>
+<a name="ln2768">	if (error == B_OK)</a>
+<a name="ln2769">		*_volume = volume;</a>
+<a name="ln2770">	else</a>
+<a name="ln2771">		delete volume;</a>
+<a name="ln2772"> </a>
+<a name="ln2773">	return error;</a>
+<a name="ln2774">}</a>
+<a name="ln2775"> </a>
+<a name="ln2776">// _GetVolume</a>
+<a name="ln2777">ClientVolume*</a>
+<a name="ln2778">ClientConnection::_GetVolume(int32 id)</a>
+<a name="ln2779">{</a>
+<a name="ln2780">	AutoLocker&lt;VolumeMap&gt; _(fVolumes);</a>
+<a name="ln2781">	ClientVolume* volume = fVolumes-&gt;Get(id);</a>
+<a name="ln2782">	if (!volume || volume-&gt;IsRemoved())</a>
+<a name="ln2783">		return NULL;</a>
+<a name="ln2784">	volume-&gt;AcquireReference();</a>
+<a name="ln2785">	return volume;</a>
+<a name="ln2786">}</a>
+<a name="ln2787"> </a>
+<a name="ln2788">// _PutVolume</a>
+<a name="ln2789">//</a>
+<a name="ln2790">// The VolumeManager may be locked, but no other lock must be held.</a>
+<a name="ln2791">void</a>
+<a name="ln2792">ClientConnection::_PutVolume(ClientVolume* volume)</a>
+<a name="ln2793">{</a>
+<a name="ln2794">	if (!volume)</a>
+<a name="ln2795">		return;</a>
+<a name="ln2796"> </a>
+<a name="ln2797">	// decrement reference counter and remove the volume, if 0</a>
+<a name="ln2798">	AutoLocker&lt;VolumeMap&gt; locker(fVolumes);</a>
+<a name="ln2799">	bool removed = (volume-&gt;ReleaseReference() == 1 &amp;&amp; volume-&gt;IsRemoved());</a>
+<a name="ln2800">	if (removed)</a>
+<a name="ln2801">		fVolumes-&gt;Remove(volume-&gt;GetID());</a>
+<a name="ln2802">	locker.Unlock();</a>
+<a name="ln2803"> </a>
+<a name="ln2804">	if (removed) {</a>
+<a name="ln2805">		VolumeManagerLocker managerLocker;</a>
+<a name="ln2806">		delete volume;</a>
+<a name="ln2807">	}</a>
+<a name="ln2808">}</a>
+<a name="ln2809"> </a>
+<a name="ln2810">// _UnmountVolume</a>
+<a name="ln2811">//</a>
+<a name="ln2812">// The caller must have a reference to the volume.</a>
+<a name="ln2813">void</a>
+<a name="ln2814">ClientConnection::_UnmountVolume(ClientVolume* volume)</a>
+<a name="ln2815">{</a>
+<a name="ln2816">	if (!volume)</a>
+<a name="ln2817">		return;</a>
+<a name="ln2818">	AutoLocker&lt;VolumeMap&gt; locker(fVolumes);</a>
+<a name="ln2819">	volume-&gt;MarkRemoved();</a>
+<a name="ln2820">	locker.Unlock();</a>
+<a name="ln2821"> </a>
+<a name="ln2822">	// push a notification event</a>
+<a name="ln2823">	if (VolumeUnmountedEvent* event = new(std::nothrow) VolumeUnmountedEvent) {</a>
+<a name="ln2824">		VolumeManagerLocker managerLocker;</a>
+<a name="ln2825"> </a>
+<a name="ln2826">		event-&gt;opcode = B_DEVICE_UNMOUNTED;</a>
+<a name="ln2827">		_PushNodeMonitoringEvent(volume-&gt;GetID(), event);</a>
+<a name="ln2828">		event-&gt;ReleaseReference();</a>
+<a name="ln2829">	}</a>
+<a name="ln2830">}</a>
+<a name="ln2831"> </a>
+<a name="ln2832">// _UnmountAllVolumes</a>
+<a name="ln2833">void</a>
+<a name="ln2834">ClientConnection::_UnmountAllVolumes()</a>
+<a name="ln2835">{</a>
+<a name="ln2836">	while (true) {</a>
+<a name="ln2837">		// To avoid heap allocation (which can fail) we unmount the volumes</a>
+<a name="ln2838">		// chunkwise.</a>
+<a name="ln2839">		// get the volumes</a>
+<a name="ln2840">		const int32 volumeChunkSize = 32;</a>
+<a name="ln2841">		ClientVolume* volumes[volumeChunkSize];</a>
+<a name="ln2842">		int32 volumeCount = 0;</a>
+<a name="ln2843">		AutoLocker&lt;VolumeMap&gt; volumesLocker(fVolumes);</a>
+<a name="ln2844">		for (VolumeMap::Iterator it = fVolumes-&gt;GetIterator(); it.HasNext();) {</a>
+<a name="ln2845">			if (ClientVolume* volume = _GetVolume(it.Next().value-&gt;GetID())) {</a>
+<a name="ln2846">				volumes[volumeCount++] = volume;</a>
+<a name="ln2847">			}</a>
+<a name="ln2848">			if (volumeCount == volumeChunkSize)</a>
+<a name="ln2849">				break;</a>
+<a name="ln2850">		}</a>
+<a name="ln2851">		volumesLocker.Unlock();</a>
+<a name="ln2852"> </a>
+<a name="ln2853">		// unmount and put the volumes</a>
+<a name="ln2854">		for (int32 i = 0; i &lt; volumeCount; i++) {</a>
+<a name="ln2855">			ClientVolume* volume = volumes[i];</a>
+<a name="ln2856">			_UnmountVolume(volume);</a>
+<a name="ln2857">			_PutVolume(volume);</a>
+<a name="ln2858">		}</a>
+<a name="ln2859"> </a>
+<a name="ln2860">		if (volumeCount &lt; volumeChunkSize)</a>
+<a name="ln2861">			break;</a>
+<a name="ln2862">	}</a>
+<a name="ln2863">}</a>
+<a name="ln2864"> </a>
+<a name="ln2865">// _NodeMonitoringProcessorEntry</a>
+<a name="ln2866">int32</a>
+<a name="ln2867">ClientConnection::_NodeMonitoringProcessorEntry(void* data)</a>
+<a name="ln2868">{</a>
+<a name="ln2869">	return ((ClientConnection*)data)-&gt;_NodeMonitoringProcessor();</a>
+<a name="ln2870">}</a>
+<a name="ln2871"> </a>
+<a name="ln2872"> </a>
+<a name="ln2873">// _NodeMonitoringProcessor</a>
+<a name="ln2874">int32</a>
+<a name="ln2875">ClientConnection::_NodeMonitoringProcessor()</a>
+<a name="ln2876">{</a>
+<a name="ln2877">	while (!fClosed) {</a>
+<a name="ln2878">		// get the next request</a>
+<a name="ln2879">		NodeMonitoringRequest* request = NULL;</a>
+<a name="ln2880">		status_t error = fNodeMonitoringEvents-&gt;Pop(&amp;request);</a>
+<a name="ln2881"> </a>
+<a name="ln2882">		// get a client connection reference</a>
+<a name="ln2883">		ConnectionReference connectionReference(this);</a>
+<a name="ln2884">		if (!connectionReference.IsValid())</a>
+<a name="ln2885">			return B_OK;</a>
+<a name="ln2886"> </a>
+<a name="ln2887">		// No request? Next round...</a>
+<a name="ln2888">		if (error != B_OK)</a>
+<a name="ln2889">			continue;</a>
+<a name="ln2890">		ObjectDeleter&lt;NodeMonitoringRequest&gt; requestDeleter(request);</a>
+<a name="ln2891"> </a>
+<a name="ln2892">		// send the request</a>
+<a name="ln2893">		if (error == B_OK) {</a>
+<a name="ln2894">			error = fConnection-&gt;SendRequest(request);</a>
+<a name="ln2895">			if (error != B_OK) {</a>
+<a name="ln2896">				ERROR((&quot;ClientConnection::_NodeMonitoringProcessor(): &quot;</a>
+<a name="ln2897">					&quot;Failed to send request.\n&quot;));</a>
+<a name="ln2898">			}</a>
+<a name="ln2899">		}</a>
+<a name="ln2900">	}</a>
+<a name="ln2901">	return 0;</a>
+<a name="ln2902">}</a>
+<a name="ln2903"> </a>
+<a name="ln2904"> </a>
+<a name="ln2905">// _PushNodeMonitoringEvent</a>
+<a name="ln2906">//</a>
+<a name="ln2907">// The caller must have a connection reference. Moreover the VolumeManager</a>
+<a name="ln2908">// must be locked.</a>
+<a name="ln2909">status_t</a>
+<a name="ln2910">ClientConnection::_PushNodeMonitoringEvent(int32 volumeID,</a>
+<a name="ln2911">	NodeMonitoringEvent* event)</a>
+<a name="ln2912">{</a>
+<a name="ln2913">	if (!event)</a>
+<a name="ln2914">		return B_BAD_VALUE;</a>
+<a name="ln2915"> </a>
+<a name="ln2916">	// get the volume</a>
+<a name="ln2917">	ClientVolume* volume = _GetVolume(volumeID);</a>
+<a name="ln2918">	if (!volume &amp;&amp; event-&gt;opcode != B_DEVICE_UNMOUNTED)</a>
+<a name="ln2919">		return B_BAD_VALUE;</a>
+<a name="ln2920">	ClientVolumePutter volumePutter(this, volume);</a>
+<a name="ln2921"> </a>
+<a name="ln2922">	// create a node monitoring request</a>
+<a name="ln2923">	NodeMonitoringRequest* request = NULL;</a>
+<a name="ln2924">	status_t error = B_ERROR;</a>
+<a name="ln2925">	switch (event-&gt;opcode) {</a>
+<a name="ln2926">		case B_ENTRY_CREATED:</a>
+<a name="ln2927">			error = _EntryCreated(volume,</a>
+<a name="ln2928">				dynamic_cast&lt;EntryCreatedEvent*&gt;(event), request);</a>
+<a name="ln2929">			break;</a>
+<a name="ln2930">		case B_ENTRY_REMOVED:</a>
+<a name="ln2931">			error = _EntryRemoved(volume,</a>
+<a name="ln2932">				dynamic_cast&lt;EntryRemovedEvent*&gt;(event), request);</a>
+<a name="ln2933">			break;</a>
+<a name="ln2934">		case B_ENTRY_MOVED:</a>
+<a name="ln2935">			error = _EntryMoved(volume,</a>
+<a name="ln2936">				dynamic_cast&lt;EntryMovedEvent*&gt;(event), request);</a>
+<a name="ln2937">			break;</a>
+<a name="ln2938">		case B_STAT_CHANGED:</a>
+<a name="ln2939">			error = _NodeStatChanged(volume,</a>
+<a name="ln2940">				dynamic_cast&lt;StatChangedEvent*&gt;(event), request);</a>
+<a name="ln2941">			break;</a>
+<a name="ln2942">		case B_ATTR_CHANGED:</a>
+<a name="ln2943">			error = _NodeAttributeChanged(volume,</a>
+<a name="ln2944">				dynamic_cast&lt;AttributeChangedEvent*&gt;(event), request);</a>
+<a name="ln2945">			break;</a>
+<a name="ln2946">		case B_DEVICE_UNMOUNTED:</a>
+<a name="ln2947">			error = B_OK;</a>
+<a name="ln2948">			break;</a>
+<a name="ln2949">	}</a>
+<a name="ln2950"> </a>
+<a name="ln2951">	// replace all data buffers -- when the request is actually sent, they</a>
+<a name="ln2952">	// might no longer exist</a>
+<a name="ln2953">	if (error == B_OK)</a>
+<a name="ln2954">		error = RequestBufferReplacer().ReplaceBuffer(request);</a>
+<a name="ln2955"> </a>
+<a name="ln2956">	if (error == B_OK) {</a>
+<a name="ln2957">		// common initialization</a>
+<a name="ln2958">		request-&gt;volumeID = volumeID;</a>
+<a name="ln2959">		request-&gt;opcode = event-&gt;opcode;</a>
+<a name="ln2960">		request-&gt;revision = VolumeManager::GetDefault()-&gt;GetRevision();</a>
+<a name="ln2961"> </a>
+<a name="ln2962">		// push the request</a>
+<a name="ln2963">		error = fNodeMonitoringEvents-&gt;Push(request);</a>
+<a name="ln2964">		if (error != B_OK)</a>
+<a name="ln2965">			delete request;</a>
+<a name="ln2966">	}</a>
+<a name="ln2967"> </a>
+<a name="ln2968">	return error;</a>
+<a name="ln2969">}</a>
+<a name="ln2970"> </a>
+<a name="ln2971">// _EntryCreated</a>
+<a name="ln2972">status_t</a>
+<a name="ln2973">ClientConnection::_EntryCreated(ClientVolume* volume, EntryCreatedEvent* event,</a>
+<a name="ln2974">	NodeMonitoringRequest*&amp; _request)</a>
+<a name="ln2975">{</a>
+<a name="ln2976">	// allocate the request</a>
+<a name="ln2977">	EntryCreatedRequest* request = new(std::nothrow) EntryCreatedRequest;</a>
+<a name="ln2978">	if (!request)</a>
+<a name="ln2979">		return B_NO_MEMORY;</a>
+<a name="ln2980">	ObjectDeleter&lt;NodeMonitoringRequest&gt; requestDeleter(request);</a>
+<a name="ln2981"> </a>
+<a name="ln2982">	// get the name</a>
+<a name="ln2983">	const char* name = event-&gt;name.GetString();</a>
+<a name="ln2984"> </a>
+<a name="ln2985">	// set the request fields</a>
+<a name="ln2986">	request-&gt;directoryID = NodeID(event-&gt;volumeID, event-&gt;directoryID);</a>
+<a name="ln2987">	request-&gt;nodeID = NodeID(event-&gt;volumeID, event-&gt;nodeID);</a>
+<a name="ln2988">	request-&gt;name.SetTo(name);</a>
+<a name="ln2989">	if (event-&gt;queryHandler) {</a>
+<a name="ln2990">		request-&gt;port = event-&gt;remotePort;</a>
+<a name="ln2991">		request-&gt;token = event-&gt;remoteToken;</a>
+<a name="ln2992">		request-&gt;queryUpdate = true;</a>
+<a name="ln2993">	} else</a>
+<a name="ln2994">		request-&gt;queryUpdate = false;</a>
+<a name="ln2995"> </a>
+<a name="ln2996">	// try to get an entry info</a>
+<a name="ln2997">	Entry* entry;</a>
+<a name="ln2998">	if (VolumeManager::GetDefault()-&gt;LoadEntry(event-&gt;volumeID,</a>
+<a name="ln2999">			event-&gt;directoryID, name, true, &amp;entry) == B_OK</a>
+<a name="ln3000">		&amp;&amp; entry-&gt;GetNode()-&gt;GetVolumeID() == event-&gt;volumeID</a>
+<a name="ln3001">		&amp;&amp; entry-&gt;GetNode()-&gt;GetID() == event-&gt;nodeID) {</a>
+<a name="ln3002">		_GetEntryInfo(entry, &amp;request-&gt;entryInfo);</a>
+<a name="ln3003">		request-&gt;entryInfoValid = true;</a>
+<a name="ln3004">	} else</a>
+<a name="ln3005">		request-&gt;entryInfoValid = false;</a>
+<a name="ln3006"> </a>
+<a name="ln3007">	requestDeleter.Detach();</a>
+<a name="ln3008">	_request = request;</a>
+<a name="ln3009">	return B_OK;</a>
+<a name="ln3010">}</a>
+<a name="ln3011"> </a>
+<a name="ln3012">// _EntryRemoved</a>
+<a name="ln3013">status_t</a>
+<a name="ln3014">ClientConnection::_EntryRemoved(ClientVolume* volume, EntryRemovedEvent* event,</a>
+<a name="ln3015">	NodeMonitoringRequest*&amp; _request)</a>
+<a name="ln3016">{</a>
+<a name="ln3017">	// special handling, if it is the root node of the client volume that has</a>
+<a name="ln3018">	// been removed</a>
+<a name="ln3019">	if (!event-&gt;queryHandler</a>
+<a name="ln3020">		&amp;&amp; NodeRef(event-&gt;nodeVolumeID, event-&gt;nodeID)</a>
+<a name="ln3021">			== volume-&gt;GetRootNodeRef()) {</a>
+<a name="ln3022">		NoAllocEntryRef ref(event-&gt;nodeVolumeID, event-&gt;nodeID, &quot;.&quot;);</a>
+<a name="ln3023">		BEntry entry;</a>
+<a name="ln3024">		if (FDManager::SetEntry(&amp;entry, &amp;ref) != B_OK || !entry.Exists())</a>
+<a name="ln3025">			_UnmountVolume(volume);</a>
+<a name="ln3026"> </a>
+<a name="ln3027">		// don't send the &quot;entry removed&quot; event</a>
+<a name="ln3028">		return B_ERROR;</a>
+<a name="ln3029">	}</a>
+<a name="ln3030"> </a>
+<a name="ln3031">	// allocate the request</a>
+<a name="ln3032">	EntryRemovedRequest* request = new(std::nothrow) EntryRemovedRequest;</a>
+<a name="ln3033">	if (!request)</a>
+<a name="ln3034">		return B_NO_MEMORY;</a>
+<a name="ln3035">	ObjectDeleter&lt;NodeMonitoringRequest&gt; requestDeleter(request);</a>
+<a name="ln3036"> </a>
+<a name="ln3037">	// get the name</a>
+<a name="ln3038">	const char* name = event-&gt;name.GetString();</a>
+<a name="ln3039"> </a>
+<a name="ln3040">	// set the request fields</a>
+<a name="ln3041">	request-&gt;directoryID = NodeID(event-&gt;volumeID, event-&gt;directoryID);</a>
+<a name="ln3042">	request-&gt;nodeID = NodeID(event-&gt;nodeVolumeID, event-&gt;nodeID);</a>
+<a name="ln3043">	request-&gt;name.SetTo(name);</a>
+<a name="ln3044">	if (event-&gt;queryHandler) {</a>
+<a name="ln3045">		request-&gt;port = event-&gt;remotePort;</a>
+<a name="ln3046">		request-&gt;token = event-&gt;remoteToken;</a>
+<a name="ln3047">		request-&gt;queryUpdate = true;</a>
+<a name="ln3048">	} else</a>
+<a name="ln3049">		request-&gt;queryUpdate = false;</a>
+<a name="ln3050"> </a>
+<a name="ln3051">	requestDeleter.Detach();</a>
+<a name="ln3052">	_request = request;</a>
+<a name="ln3053">	return B_OK;</a>
+<a name="ln3054">}</a>
+<a name="ln3055"> </a>
+<a name="ln3056">// _EntryMoved</a>
+<a name="ln3057">status_t</a>
+<a name="ln3058">ClientConnection::_EntryMoved(ClientVolume* volume, EntryMovedEvent* event,</a>
+<a name="ln3059">	NodeMonitoringRequest*&amp; _request)</a>
+<a name="ln3060">{</a>
+<a name="ln3061">	// allocate the request</a>
+<a name="ln3062">	EntryMovedRequest* request = new(std::nothrow) EntryMovedRequest;</a>
+<a name="ln3063">	if (!request)</a>
+<a name="ln3064">		return B_NO_MEMORY;</a>
+<a name="ln3065">	ObjectDeleter&lt;NodeMonitoringRequest&gt; requestDeleter(request);</a>
+<a name="ln3066"> </a>
+<a name="ln3067">	// allocate memory for the names</a>
+<a name="ln3068">	int32 fromNameLen = event-&gt;fromName.GetLength();</a>
+<a name="ln3069">	const char* fromName</a>
+<a name="ln3070">		= (fromNameLen &gt; 0 ? event-&gt;fromName.GetString() : NULL);</a>
+<a name="ln3071">	const char* toName = event-&gt;toName.GetString();</a>
+<a name="ln3072"> </a>
+<a name="ln3073">	// set the request fields</a>
+<a name="ln3074">	request-&gt;fromDirectoryID = NodeID(event-&gt;volumeID, event-&gt;fromDirectoryID);</a>
+<a name="ln3075">	request-&gt;toDirectoryID = NodeID(event-&gt;volumeID, event-&gt;toDirectoryID);</a>
+<a name="ln3076">	request-&gt;nodeID = NodeID(event-&gt;nodeVolumeID, event-&gt;nodeID);</a>
+<a name="ln3077">	request-&gt;fromName.SetTo(fromName);</a>
+<a name="ln3078">	request-&gt;toName.SetTo(toName);</a>
+<a name="ln3079">	request-&gt;queryUpdate = false;</a>
+<a name="ln3080"> </a>
+<a name="ln3081">	// try to get an entry info</a>
+<a name="ln3082">	Entry* entry;</a>
+<a name="ln3083">	if (VolumeManager::GetDefault()-&gt;LoadEntry(event-&gt;volumeID,</a>
+<a name="ln3084">			event-&gt;toDirectoryID, toName, true, &amp;entry) == B_OK</a>
+<a name="ln3085">		&amp;&amp; entry-&gt;GetNode()-&gt;GetVolumeID() == event-&gt;nodeVolumeID</a>
+<a name="ln3086">		&amp;&amp; entry-&gt;GetNode()-&gt;GetID() == event-&gt;nodeID) {</a>
+<a name="ln3087">		_GetEntryInfo(entry, &amp;request-&gt;entryInfo);</a>
+<a name="ln3088">		request-&gt;entryInfoValid = true;</a>
+<a name="ln3089">	} else</a>
+<a name="ln3090">		request-&gt;entryInfoValid = false;</a>
+<a name="ln3091"> </a>
+<a name="ln3092">	requestDeleter.Detach();</a>
+<a name="ln3093">	_request = request;</a>
+<a name="ln3094">	return B_OK;</a>
+<a name="ln3095">}</a>
+<a name="ln3096"> </a>
+<a name="ln3097">// _NodeStatChanged</a>
+<a name="ln3098">status_t</a>
+<a name="ln3099">ClientConnection::_NodeStatChanged(ClientVolume* volume,</a>
+<a name="ln3100">	StatChangedEvent* event, NodeMonitoringRequest*&amp; _request)</a>
+<a name="ln3101">{</a>
+<a name="ln3102">	// get the node</a>
+<a name="ln3103">	Node* node = volume-&gt;GetNode(event-&gt;volumeID, event-&gt;nodeID);</a>
+<a name="ln3104">	if (!node)</a>
+<a name="ln3105">		return B_ENTRY_NOT_FOUND;</a>
+<a name="ln3106"> </a>
+<a name="ln3107">	// allocate the request</a>
+<a name="ln3108">	StatChangedRequest* request = new(std::nothrow) StatChangedRequest;</a>
+<a name="ln3109">	if (!request)</a>
+<a name="ln3110">		return B_NO_MEMORY;</a>
+<a name="ln3111">	ObjectDeleter&lt;NodeMonitoringRequest&gt; requestDeleter(request);</a>
+<a name="ln3112"> </a>
+<a name="ln3113">	// set the request fields</a>
+<a name="ln3114">	request-&gt;nodeID = NodeID(event-&gt;volumeID, event-&gt;nodeID);</a>
+<a name="ln3115">	_GetNodeInfo(node, &amp;request-&gt;nodeInfo);</a>
+<a name="ln3116">	request-&gt;queryUpdate = false;</a>
+<a name="ln3117"> </a>
+<a name="ln3118">	requestDeleter.Detach();</a>
+<a name="ln3119">	_request = request;</a>
+<a name="ln3120">	return B_OK;</a>
+<a name="ln3121">}</a>
+<a name="ln3122"> </a>
+<a name="ln3123">// _NodeAttributeChanged</a>
+<a name="ln3124">status_t</a>
+<a name="ln3125">ClientConnection::_NodeAttributeChanged(ClientVolume* volume,</a>
+<a name="ln3126">	AttributeChangedEvent* event, NodeMonitoringRequest*&amp; _request)</a>
+<a name="ln3127">{</a>
+<a name="ln3128">	// get the node</a>
+<a name="ln3129">	Node* node = volume-&gt;GetNode(event-&gt;volumeID, event-&gt;nodeID);</a>
+<a name="ln3130">	if (!node)</a>
+<a name="ln3131">		return B_ENTRY_NOT_FOUND;</a>
+<a name="ln3132"> </a>
+<a name="ln3133">	// update the attribute directory</a>
+<a name="ln3134">	bool removed = false;</a>
+<a name="ln3135">	bool valid = false;</a>
+<a name="ln3136">	attr_info info;</a>
+<a name="ln3137">	const void* data = NULL;</a>
+<a name="ln3138">	status_t error = node-&gt;UpdateAttribute(event-&gt;attribute.GetString(),</a>
+<a name="ln3139">		&amp;removed, &amp;info, &amp;data);</a>
+<a name="ln3140">	valid = (error == B_OK);</a>
+<a name="ln3141"> </a>
+<a name="ln3142">	// allocate the request</a>
+<a name="ln3143">	AttributeChangedRequest* request = new(std::nothrow) AttributeChangedRequest;</a>
+<a name="ln3144">	if (!request)</a>
+<a name="ln3145">		return B_NO_MEMORY;</a>
+<a name="ln3146">	ObjectDeleter&lt;NodeMonitoringRequest&gt; requestDeleter(request);</a>
+<a name="ln3147"> </a>
+<a name="ln3148">	// get an attr dir info, if the directory is valid</a>
+<a name="ln3149">	if (node-&gt;IsAttrDirValid()) {</a>
+<a name="ln3150">		status_t error = _GetAttrDirInfo(request, node, &amp;request-&gt;attrDirInfo);</a>
+<a name="ln3151">		if (error != B_OK)</a>
+<a name="ln3152">			return error;</a>
+<a name="ln3153">	}</a>
+<a name="ln3154"> </a>
+<a name="ln3155">	// get name and the data size</a>
+<a name="ln3156">	int32 dataSize = (data ? info.size : 0);</a>
+<a name="ln3157">	const char* name = event-&gt;attribute.GetString();</a>
+<a name="ln3158"> </a>
+<a name="ln3159">	// set the request fields</a>
+<a name="ln3160">	request-&gt;nodeID = NodeID(event-&gt;volumeID, event-&gt;nodeID);</a>
+<a name="ln3161">	request-&gt;attrInfo.name.SetTo(name);</a>
+<a name="ln3162">	request-&gt;valid = valid;</a>
+<a name="ln3163">	request-&gt;removed = removed;</a>
+<a name="ln3164">	if (!removed &amp;&amp; valid) {</a>
+<a name="ln3165">		request-&gt;attrInfo.info = info;</a>
+<a name="ln3166">		request-&gt;attrInfo.data.SetTo(data, dataSize);</a>
+<a name="ln3167">	}</a>
+<a name="ln3168">	request-&gt;queryUpdate = false;</a>
+<a name="ln3169"> </a>
+<a name="ln3170">	requestDeleter.Detach();</a>
+<a name="ln3171">	_request = request;</a>
+<a name="ln3172">	return B_OK;</a>
+<a name="ln3173">}</a>
+<a name="ln3174"> </a>
+<a name="ln3175">// _KnownAttributeType</a>
+<a name="ln3176">bool</a>
+<a name="ln3177">ClientConnection::_KnownAttributeType(type_code type)</a>
+<a name="ln3178">{</a>
+<a name="ln3179">	if (!fInverseClientEndianess)</a>
+<a name="ln3180">		return false;</a>
+<a name="ln3181"> </a>
+<a name="ln3182">	switch (type) {</a>
+<a name="ln3183">		case B_BOOL_TYPE:</a>
+<a name="ln3184">		case B_CHAR_TYPE:</a>
+<a name="ln3185">		case B_COLOR_8_BIT_TYPE:</a>
+<a name="ln3186">		case B_DOUBLE_TYPE:</a>
+<a name="ln3187">		case B_FLOAT_TYPE:</a>
+<a name="ln3188">		case B_GRAYSCALE_8_BIT_TYPE:</a>
+<a name="ln3189">		case B_INT64_TYPE:</a>
+<a name="ln3190">		case B_INT32_TYPE:</a>
+<a name="ln3191">		case B_INT16_TYPE:</a>
+<a name="ln3192">		case B_INT8_TYPE:</a>
+<a name="ln3193">		case B_MESSAGE_TYPE:</a>
+<a name="ln3194">		case B_MESSENGER_TYPE:</a>
+<a name="ln3195">		case B_MIME_TYPE:</a>
+<a name="ln3196">		case B_MONOCHROME_1_BIT_TYPE:</a>
+<a name="ln3197">		case B_OFF_T_TYPE:</a>
+<a name="ln3198">		case B_POINTER_TYPE:</a>
+<a name="ln3199">		case B_POINT_TYPE:</a>
+<a name="ln3200">		case B_RECT_TYPE:</a>
+<a name="ln3201">		case B_REF_TYPE:</a>
+<a name="ln3202">		case B_RGB_COLOR_TYPE:</a>
+<a name="ln3203">		case B_SIZE_T_TYPE:</a>
+<a name="ln3204">		case B_SSIZE_T_TYPE:</a>
+<a name="ln3205">		case B_STRING_TYPE:</a>
+<a name="ln3206">		case B_TIME_TYPE:</a>
+<a name="ln3207">		case B_UINT64_TYPE:</a>
+<a name="ln3208">		case B_UINT32_TYPE:</a>
+<a name="ln3209">		case B_UINT16_TYPE:</a>
+<a name="ln3210">		case B_UINT8_TYPE:</a>
+<a name="ln3211">		case B_ASCII_TYPE:</a>
+<a name="ln3212">		case B_MIME_STRING_TYPE:</a>
+<a name="ln3213">			return true;</a>
+<a name="ln3214"> </a>
+<a name="ln3215">		//B_RGB_32_BIT_TYPE: We could translate it, but it's heavy...</a>
+<a name="ln3216">	}</a>
+<a name="ln3217"> </a>
+<a name="ln3218">	return false;</a>
+<a name="ln3219">}</a>
+<a name="ln3220"> </a>
+<a name="ln3221">// _ConvertAttribute</a>
+<a name="ln3222">void</a>
+<a name="ln3223">ClientConnection::_ConvertAttribute(const attr_info&amp; info, void* buffer)</a>
+<a name="ln3224">{</a>
+<a name="ln3225">	swap_data(info.type, buffer, info.size, B_SWAP_ALWAYS);</a>
+<a name="ln3226">}</a>
+<a name="ln3227"> </a>
+<a name="ln3228"> </a>
+<a name="ln3229">// #pragma mark -</a>
+<a name="ln3230"> </a>
+<a name="ln3231">// _OpenQuery</a>
+<a name="ln3232">status_t</a>
+<a name="ln3233">ClientConnection::_OpenQuery(const char* queryString, uint32 flags,</a>
+<a name="ln3234">	port_id remotePort, int32 remoteToken, QueryHandle** _handle)</a>
+<a name="ln3235">{</a>
+<a name="ln3236">	if (!queryString || !_handle)</a>
+<a name="ln3237">		return B_BAD_VALUE;</a>
+<a name="ln3238"> </a>
+<a name="ln3239">	// open query</a>
+<a name="ln3240">	QueryHandle* queryHandle;</a>
+<a name="ln3241">	status_t error = VolumeManager::GetDefault()-&gt;OpenQuery(this, queryString,</a>
+<a name="ln3242">		flags, remotePort, remoteToken, &amp;queryHandle);</a>
+<a name="ln3243">	if (error != B_OK)</a>
+<a name="ln3244">		return error;</a>
+<a name="ln3245">	BReference&lt;QueryHandle&gt; handleReference(queryHandle, true);</a>
+<a name="ln3246"> </a>
+<a name="ln3247">	// lock the handle</a>
+<a name="ln3248">	queryHandle-&gt;Lock();</a>
+<a name="ln3249"> </a>
+<a name="ln3250">	// add the handle</a>
+<a name="ln3251">	error = fQueryHandles-&gt;AddNodeHandle(queryHandle);</a>
+<a name="ln3252">	if (error != B_OK)</a>
+<a name="ln3253">		return error;</a>
+<a name="ln3254"> </a>
+<a name="ln3255">	handleReference.Detach();</a>
+<a name="ln3256">	*_handle = queryHandle;</a>
+<a name="ln3257">	return B_OK;</a>
+<a name="ln3258">}</a>
+<a name="ln3259"> </a>
+<a name="ln3260">// _CloseQuery</a>
+<a name="ln3261">status_t</a>
+<a name="ln3262">ClientConnection::_CloseQuery(QueryHandle* handle)</a>
+<a name="ln3263">{</a>
+<a name="ln3264">	if (!handle || !fQueryHandles-&gt;RemoveNodeHandle(handle))</a>
+<a name="ln3265">		return B_BAD_VALUE;</a>
+<a name="ln3266"> </a>
+<a name="ln3267">	return B_OK;</a>
+<a name="ln3268">}</a>
+<a name="ln3269"> </a>
+<a name="ln3270">// _LockQueryHandle</a>
+<a name="ln3271">//</a>
+<a name="ln3272">// VolumeManager must NOT be locked.</a>
+<a name="ln3273">status_t</a>
+<a name="ln3274">ClientConnection::_LockQueryHandle(int32 cookie, QueryHandle** _handle)</a>
+<a name="ln3275">{</a>
+<a name="ln3276">	NodeHandle* handle;</a>
+<a name="ln3277">	status_t error = fQueryHandles-&gt;LockNodeHandle(cookie, &amp;handle);</a>
+<a name="ln3278">	if (error == B_OK)</a>
+<a name="ln3279">		*_handle = static_cast&lt;QueryHandle*&gt;(handle);</a>
+<a name="ln3280">	return error;</a>
+<a name="ln3281">}</a>
+<a name="ln3282"> </a>
+<a name="ln3283">// _UnlockQueryHandle</a>
+<a name="ln3284">//</a>
+<a name="ln3285">// VolumeManager may or may not be locked.</a>
+<a name="ln3286">void</a>
+<a name="ln3287">ClientConnection::_UnlockQueryHandle(NodeHandle* nodeHandle)</a>
+<a name="ln3288">{</a>
+<a name="ln3289">	fQueryHandles-&gt;UnlockNodeHandle(nodeHandle);</a>
+<a name="ln3290">}</a>
+<a name="ln3291"> </a>
+<a name="ln3292"> </a>
+<a name="ln3293">// #pragma mark -</a>
+<a name="ln3294"> </a>
+<a name="ln3295">// _GetAllClientVolumeIDs</a>
+<a name="ln3296">int32</a>
+<a name="ln3297">ClientConnection::_GetAllClientVolumeIDs(int32* volumeIDs, int32 arraySize,</a>
+<a name="ln3298">	ClientVolumeFilter* filter)</a>
+<a name="ln3299">{</a>
+<a name="ln3300">	int32 count = 0;</a>
+<a name="ln3301">	AutoLocker&lt;VolumeMap&gt; volumesLocker(fVolumes);</a>
+<a name="ln3302">	for (VolumeMap::Iterator it = fVolumes-&gt;GetIterator();</a>
+<a name="ln3303">		 it.HasNext() &amp;&amp; arraySize &gt; count;) {</a>
+<a name="ln3304">		ClientVolume* clientVolume = it.Next().value;</a>
+<a name="ln3305">		if (!filter || filter-&gt;FilterVolume(this, clientVolume))</a>
+<a name="ln3306">			volumeIDs[count++] = clientVolume-&gt;GetID();</a>
+<a name="ln3307">	}</a>
+<a name="ln3308"> </a>
+<a name="ln3309">	return count;</a>
+<a name="ln3310">}</a>
+<a name="ln3311"> </a>
+<a name="ln3312">// _GetContainingClientVolumes</a>
+<a name="ln3313">int32</a>
+<a name="ln3314">ClientConnection::_GetContainingClientVolumes(Directory* directory,</a>
+<a name="ln3315">	int32* volumeIDs, int32 arraySize, ClientVolumeFilter* filter)</a>
+<a name="ln3316">{</a>
+<a name="ln3317">	int32 count = 0;</a>
+<a name="ln3318">	VolumeManager* volumeManager = VolumeManager::GetDefault();</a>
+<a name="ln3319">	AutoLocker&lt;VolumeMap&gt; volumesLocker(fVolumes);</a>
+<a name="ln3320">	for (VolumeMap::Iterator it = fVolumes-&gt;GetIterator();</a>
+<a name="ln3321">		 it.HasNext() &amp;&amp; arraySize &gt; count;) {</a>
+<a name="ln3322">		ClientVolume* clientVolume = it.Next().value;</a>
+<a name="ln3323">		Directory* clientVolumeRoot = clientVolume-&gt;GetRootDirectory();</a>
+<a name="ln3324">		if (volumeManager-&gt;DirectoryContains(clientVolumeRoot, directory, true)</a>
+<a name="ln3325">			&amp;&amp; (!filter || filter-&gt;FilterVolume(this, clientVolume))) {</a>
+<a name="ln3326">			volumeIDs[count++] = clientVolume-&gt;GetID();</a>
+<a name="ln3327">		}</a>
+<a name="ln3328">	}</a>
+<a name="ln3329"> </a>
+<a name="ln3330">	return count;</a>
+<a name="ln3331">}</a>
+<a name="ln3332"> </a>
+<a name="ln3333"> </a>
+<a name="ln3334">// #pragma mark -</a>
+<a name="ln3335">// #pragma mark ----- ClientConnectionListener -----</a>
+<a name="ln3336"> </a>
+<a name="ln3337">// constructor</a>
+<a name="ln3338">ClientConnectionListener::ClientConnectionListener()</a>
+<a name="ln3339">{</a>
+<a name="ln3340">}</a>
+<a name="ln3341"> </a>
+<a name="ln3342">// destructor</a>
+<a name="ln3343">ClientConnectionListener::~ClientConnectionListener()</a>
+<a name="ln3344">{</a>
+<a name="ln3345">}</a>
+<a name="ln3346"> </a>
+
+</code></pre>
+<div class="balloon" rel="2893"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v547/" target="_blank">V547</a> Expression 'error == ((int) 0)' is always true.</p></div>
+<div class="balloon" rel="2371"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v547/" target="_blank">V547</a> Expression 'result == ((int) 0)' is always true.</p></div>
+<div class="balloon" rel="958"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v547/" target="_blank">V547</a> Expression 'result == ((int) 0)' is always true.</p></div>
+<div class="balloon" rel="596"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v595/" target="_blank">V595</a> The 'volume' pointer was utilized before it was verified against nullptr. Check lines: 596, 606.</p></div>
+<div class="balloon" rel="729"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v595/" target="_blank">V595</a> The 'node' pointer was utilized before it was verified against nullptr. Check lines: 729, 739.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

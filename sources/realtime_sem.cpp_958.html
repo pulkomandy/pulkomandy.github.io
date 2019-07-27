@@ -1,0 +1,870 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>realtime_sem.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2008-2011, Ingo Weinhold, ingo_weinhold@gmx.de.</a>
+<a name="ln3"> * Distributed under the terms of the MIT License.</a>
+<a name="ln4"> */</a>
+<a name="ln5"> </a>
+<a name="ln6">#include &lt;posix/realtime_sem.h&gt;</a>
+<a name="ln7"> </a>
+<a name="ln8">#include &lt;string.h&gt;</a>
+<a name="ln9"> </a>
+<a name="ln10">#include &lt;new&gt;</a>
+<a name="ln11"> </a>
+<a name="ln12">#include &lt;OS.h&gt;</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &lt;AutoDeleter.h&gt;</a>
+<a name="ln15">#include &lt;fs/KPath.h&gt;</a>
+<a name="ln16">#include &lt;kernel.h&gt;</a>
+<a name="ln17">#include &lt;lock.h&gt;</a>
+<a name="ln18">#include &lt;syscall_restart.h&gt;</a>
+<a name="ln19">#include &lt;team.h&gt;</a>
+<a name="ln20">#include &lt;thread.h&gt;</a>
+<a name="ln21">#include &lt;util/atomic.h&gt;</a>
+<a name="ln22">#include &lt;util/AutoLock.h&gt;</a>
+<a name="ln23">#include &lt;util/OpenHashTable.h&gt;</a>
+<a name="ln24">#include &lt;util/StringHash.h&gt;</a>
+<a name="ln25"> </a>
+<a name="ln26"> </a>
+<a name="ln27">namespace {</a>
+<a name="ln28"> </a>
+<a name="ln29">class SemInfo {</a>
+<a name="ln30">public:</a>
+<a name="ln31">	SemInfo()</a>
+<a name="ln32">		:</a>
+<a name="ln33">		fSemaphoreID(-1)</a>
+<a name="ln34">	{</a>
+<a name="ln35">	}</a>
+<a name="ln36"> </a>
+<a name="ln37">	virtual ~SemInfo()</a>
+<a name="ln38">	{</a>
+<a name="ln39">		if (fSemaphoreID &gt;= 0)</a>
+<a name="ln40">			delete_sem(fSemaphoreID);</a>
+<a name="ln41">	}</a>
+<a name="ln42"> </a>
+<a name="ln43">	sem_id SemaphoreID() const			{ return fSemaphoreID; }</a>
+<a name="ln44"> </a>
+<a name="ln45">	status_t Init(int32 semCount, const char* name)</a>
+<a name="ln46">	{</a>
+<a name="ln47">		fSemaphoreID = create_sem(semCount, name);</a>
+<a name="ln48">		if (fSemaphoreID &lt; 0)</a>
+<a name="ln49">			return fSemaphoreID;</a>
+<a name="ln50"> </a>
+<a name="ln51">		return B_OK;</a>
+<a name="ln52">	}</a>
+<a name="ln53"> </a>
+<a name="ln54">	virtual sem_id ID() const = 0;</a>
+<a name="ln55">	virtual SemInfo* Clone() = 0;</a>
+<a name="ln56">	virtual void Delete() = 0;</a>
+<a name="ln57"> </a>
+<a name="ln58">private:</a>
+<a name="ln59">	sem_id	fSemaphoreID;</a>
+<a name="ln60">};</a>
+<a name="ln61"> </a>
+<a name="ln62"> </a>
+<a name="ln63">class NamedSem : public SemInfo {</a>
+<a name="ln64">public:</a>
+<a name="ln65">	NamedSem()</a>
+<a name="ln66">		:</a>
+<a name="ln67">		fName(NULL),</a>
+<a name="ln68">		fRefCount(1)</a>
+<a name="ln69">	{</a>
+<a name="ln70">	}</a>
+<a name="ln71"> </a>
+<a name="ln72">	virtual ~NamedSem()</a>
+<a name="ln73">	{</a>
+<a name="ln74">		free(fName);</a>
+<a name="ln75">	}</a>
+<a name="ln76"> </a>
+<a name="ln77">	const char* Name() const		{ return fName; }</a>
+<a name="ln78"> </a>
+<a name="ln79">	status_t Init(const char* name, mode_t mode, int32 semCount)</a>
+<a name="ln80">	{</a>
+<a name="ln81">		status_t error = SemInfo::Init(semCount, name);</a>
+<a name="ln82">		if (error != B_OK)</a>
+<a name="ln83">			return error;</a>
+<a name="ln84"> </a>
+<a name="ln85">		fName = strdup(name);</a>
+<a name="ln86">		if (fName == NULL)</a>
+<a name="ln87">			return B_NO_MEMORY;</a>
+<a name="ln88"> </a>
+<a name="ln89">		fUID = geteuid();</a>
+<a name="ln90">		fGID = getegid();</a>
+<a name="ln91">		fPermissions = mode;</a>
+<a name="ln92"> </a>
+<a name="ln93">		return B_OK;</a>
+<a name="ln94">	}</a>
+<a name="ln95"> </a>
+<a name="ln96">	void AcquireReference()</a>
+<a name="ln97">	{</a>
+<a name="ln98">		atomic_add(&amp;fRefCount, 1);</a>
+<a name="ln99">	}</a>
+<a name="ln100"> </a>
+<a name="ln101">	void ReleaseReference()</a>
+<a name="ln102">	{</a>
+<a name="ln103">		if (atomic_add(&amp;fRefCount, -1) == 1)</a>
+<a name="ln104">			delete this;</a>
+<a name="ln105">	}</a>
+<a name="ln106"> </a>
+<a name="ln107">	bool HasPermissions() const</a>
+<a name="ln108">	{</a>
+<a name="ln109">		if ((fPermissions &amp; S_IWOTH) != 0)</a>
+<a name="ln110">			return true;</a>
+<a name="ln111"> </a>
+<a name="ln112">		uid_t uid = geteuid();</a>
+<a name="ln113">		if (uid == 0 || (uid == fUID &amp;&amp; (fPermissions &amp; S_IWUSR) != 0))</a>
+<a name="ln114">			return true;</a>
+<a name="ln115"> </a>
+<a name="ln116">		gid_t gid = getegid();</a>
+<a name="ln117">		if (gid == fGID &amp;&amp; (fPermissions &amp; S_IWGRP) != 0)</a>
+<a name="ln118">			return true;</a>
+<a name="ln119"> </a>
+<a name="ln120">		return false;</a>
+<a name="ln121">	}</a>
+<a name="ln122"> </a>
+<a name="ln123">	virtual sem_id ID() const</a>
+<a name="ln124">	{</a>
+<a name="ln125">		return SemaphoreID();</a>
+<a name="ln126">	}</a>
+<a name="ln127"> </a>
+<a name="ln128">	virtual SemInfo* Clone()</a>
+<a name="ln129">	{</a>
+<a name="ln130">		AcquireReference();</a>
+<a name="ln131">		return this;</a>
+<a name="ln132">	}</a>
+<a name="ln133"> </a>
+<a name="ln134">	virtual void Delete()</a>
+<a name="ln135">	{</a>
+<a name="ln136">		ReleaseReference();</a>
+<a name="ln137">	}</a>
+<a name="ln138"> </a>
+<a name="ln139">	NamedSem*&amp; HashLink()</a>
+<a name="ln140">	{</a>
+<a name="ln141">		return fHashLink;</a>
+<a name="ln142">	}</a>
+<a name="ln143"> </a>
+<a name="ln144">private:</a>
+<a name="ln145">	char*		fName;</a>
+<a name="ln146">	int32		fRefCount;</a>
+<a name="ln147">	uid_t		fUID;</a>
+<a name="ln148">	gid_t		fGID;</a>
+<a name="ln149">	mode_t		fPermissions;</a>
+<a name="ln150"> </a>
+<a name="ln151">	NamedSem*	fHashLink;</a>
+<a name="ln152">};</a>
+<a name="ln153"> </a>
+<a name="ln154"> </a>
+<a name="ln155">struct NamedSemHashDefinition {</a>
+<a name="ln156">	typedef const char*	KeyType;</a>
+<a name="ln157">	typedef NamedSem	ValueType;</a>
+<a name="ln158"> </a>
+<a name="ln159">	size_t HashKey(const KeyType&amp; key) const</a>
+<a name="ln160">	{</a>
+<a name="ln161">		return hash_hash_string(key);</a>
+<a name="ln162">	}</a>
+<a name="ln163"> </a>
+<a name="ln164">	size_t Hash(NamedSem* semaphore) const</a>
+<a name="ln165">	{</a>
+<a name="ln166">		return HashKey(semaphore-&gt;Name());</a>
+<a name="ln167">	}</a>
+<a name="ln168"> </a>
+<a name="ln169">	bool Compare(const KeyType&amp; key, NamedSem* semaphore) const</a>
+<a name="ln170">	{</a>
+<a name="ln171">		return strcmp(key, semaphore-&gt;Name()) == 0;</a>
+<a name="ln172">	}</a>
+<a name="ln173"> </a>
+<a name="ln174">	NamedSem*&amp; GetLink(NamedSem* semaphore) const</a>
+<a name="ln175">	{</a>
+<a name="ln176">		return semaphore-&gt;HashLink();</a>
+<a name="ln177">	}</a>
+<a name="ln178">};</a>
+<a name="ln179"> </a>
+<a name="ln180"> </a>
+<a name="ln181">class GlobalSemTable {</a>
+<a name="ln182">public:</a>
+<a name="ln183">	GlobalSemTable()</a>
+<a name="ln184">		:</a>
+<a name="ln185">		fSemaphoreCount(0)</a>
+<a name="ln186">	{</a>
+<a name="ln187">		mutex_init(&amp;fLock, &quot;global named sem table&quot;);</a>
+<a name="ln188">	}</a>
+<a name="ln189"> </a>
+<a name="ln190">	~GlobalSemTable()</a>
+<a name="ln191">	{</a>
+<a name="ln192">		mutex_destroy(&amp;fLock);</a>
+<a name="ln193">	}</a>
+<a name="ln194"> </a>
+<a name="ln195">	status_t Init()</a>
+<a name="ln196">	{</a>
+<a name="ln197">		return fNamedSemaphores.Init();</a>
+<a name="ln198">	}</a>
+<a name="ln199"> </a>
+<a name="ln200">	status_t OpenNamedSem(const char* name, int openFlags, mode_t mode,</a>
+<a name="ln201">		uint32 semCount, NamedSem*&amp; _sem, bool&amp; _created)</a>
+<a name="ln202">	{</a>
+<a name="ln203">		MutexLocker _(fLock);</a>
+<a name="ln204"> </a>
+<a name="ln205">		NamedSem* sem = fNamedSemaphores.Lookup(name);</a>
+<a name="ln206">		if (sem != NULL) {</a>
+<a name="ln207">			if ((openFlags &amp; O_EXCL) != 0)</a>
+<a name="ln208">				return EEXIST;</a>
+<a name="ln209"> </a>
+<a name="ln210">			if (!sem-&gt;HasPermissions())</a>
+<a name="ln211">				return EACCES;</a>
+<a name="ln212"> </a>
+<a name="ln213">			sem-&gt;AcquireReference();</a>
+<a name="ln214">			_sem = sem;</a>
+<a name="ln215">			_created = false;</a>
+<a name="ln216">			return B_OK;</a>
+<a name="ln217">		}</a>
+<a name="ln218"> </a>
+<a name="ln219">		if ((openFlags &amp; O_CREAT) == 0)</a>
+<a name="ln220">			return ENOENT;</a>
+<a name="ln221"> </a>
+<a name="ln222">		// does not exist yet -- create</a>
+<a name="ln223">		if (fSemaphoreCount &gt;= MAX_POSIX_SEMS)</a>
+<a name="ln224">			return ENOSPC;</a>
+<a name="ln225"> </a>
+<a name="ln226">		sem = new(std::nothrow) NamedSem;</a>
+<a name="ln227">		if (sem == NULL)</a>
+<a name="ln228">			return B_NO_MEMORY;</a>
+<a name="ln229"> </a>
+<a name="ln230">		status_t error = sem-&gt;Init(name, mode, semCount);</a>
+<a name="ln231">		if (error != B_OK) {</a>
+<a name="ln232">			delete sem;</a>
+<a name="ln233">			return error;</a>
+<a name="ln234">		}</a>
+<a name="ln235"> </a>
+<a name="ln236">		error = fNamedSemaphores.Insert(sem);</a>
+<a name="ln237">		if (error != B_OK) {</a>
+<a name="ln238">			delete sem;</a>
+<a name="ln239">			return error;</a>
+<a name="ln240">		}</a>
+<a name="ln241"> </a>
+<a name="ln242">		// add one reference for the table</a>
+<a name="ln243">		sem-&gt;AcquireReference();</a>
+<a name="ln244"> </a>
+<a name="ln245">		fSemaphoreCount++;</a>
+<a name="ln246"> </a>
+<a name="ln247">		_sem = sem;</a>
+<a name="ln248">		_created = true;</a>
+<a name="ln249">		return B_OK;</a>
+<a name="ln250">	}</a>
+<a name="ln251"> </a>
+<a name="ln252">	status_t UnlinkNamedSem(const char* name)</a>
+<a name="ln253">	{</a>
+<a name="ln254">		MutexLocker _(fLock);</a>
+<a name="ln255"> </a>
+<a name="ln256">		NamedSem* sem = fNamedSemaphores.Lookup(name);</a>
+<a name="ln257">		if (sem == NULL)</a>
+<a name="ln258">			return ENOENT;</a>
+<a name="ln259"> </a>
+<a name="ln260">		if (!sem-&gt;HasPermissions())</a>
+<a name="ln261">			return EACCES;</a>
+<a name="ln262"> </a>
+<a name="ln263">		fNamedSemaphores.Remove(sem);</a>
+<a name="ln264">		sem-&gt;ReleaseReference();</a>
+<a name="ln265">			// release the table reference</a>
+<a name="ln266">		fSemaphoreCount--;</a>
+<a name="ln267"> </a>
+<a name="ln268">		return B_OK;</a>
+<a name="ln269">	}</a>
+<a name="ln270"> </a>
+<a name="ln271">private:</a>
+<a name="ln272">	typedef BOpenHashTable&lt;NamedSemHashDefinition, true&gt; NamedSemTable;</a>
+<a name="ln273"> </a>
+<a name="ln274">	mutex			fLock;</a>
+<a name="ln275">	NamedSemTable	fNamedSemaphores;</a>
+<a name="ln276">	int32			fSemaphoreCount;</a>
+<a name="ln277">};</a>
+<a name="ln278"> </a>
+<a name="ln279"> </a>
+<a name="ln280">static GlobalSemTable sSemTable;</a>
+<a name="ln281"> </a>
+<a name="ln282"> </a>
+<a name="ln283">class TeamSemInfo {</a>
+<a name="ln284">public:</a>
+<a name="ln285">	TeamSemInfo(SemInfo* semaphore, sem_t* userSem)</a>
+<a name="ln286">		:</a>
+<a name="ln287">		fSemaphore(semaphore),</a>
+<a name="ln288">		fUserSemaphore(userSem),</a>
+<a name="ln289">		fOpenCount(1)</a>
+<a name="ln290">	{</a>
+<a name="ln291">	}</a>
+<a name="ln292"> </a>
+<a name="ln293">	~TeamSemInfo()</a>
+<a name="ln294">	{</a>
+<a name="ln295">		if (fSemaphore != NULL)</a>
+<a name="ln296">			fSemaphore-&gt;Delete();</a>
+<a name="ln297">	}</a>
+<a name="ln298"> </a>
+<a name="ln299">	sem_id ID() const				{ return fSemaphore-&gt;ID(); }</a>
+<a name="ln300">	sem_id SemaphoreID() const		{ return fSemaphore-&gt;SemaphoreID(); }</a>
+<a name="ln301">	sem_t* UserSemaphore() const	{ return fUserSemaphore; }</a>
+<a name="ln302"> </a>
+<a name="ln303">	void Open()</a>
+<a name="ln304">	{</a>
+<a name="ln305">		fOpenCount++;</a>
+<a name="ln306">	}</a>
+<a name="ln307"> </a>
+<a name="ln308">	bool Close()</a>
+<a name="ln309">	{</a>
+<a name="ln310">		return --fOpenCount == 0;</a>
+<a name="ln311">	}</a>
+<a name="ln312"> </a>
+<a name="ln313">	TeamSemInfo* Clone() const</a>
+<a name="ln314">	{</a>
+<a name="ln315">		SemInfo* sem = fSemaphore-&gt;Clone();</a>
+<a name="ln316">		if (sem == NULL)</a>
+<a name="ln317">			return NULL;</a>
+<a name="ln318"> </a>
+<a name="ln319">		TeamSemInfo* clone = new(std::nothrow) TeamSemInfo(sem, fUserSemaphore);</a>
+<a name="ln320">		if (clone == NULL) {</a>
+<a name="ln321">			sem-&gt;Delete();</a>
+<a name="ln322">			return NULL;</a>
+<a name="ln323">		}</a>
+<a name="ln324"> </a>
+<a name="ln325">		clone-&gt;fOpenCount = fOpenCount;</a>
+<a name="ln326"> </a>
+<a name="ln327">		return clone;</a>
+<a name="ln328">	}</a>
+<a name="ln329"> </a>
+<a name="ln330">	TeamSemInfo*&amp; HashLink()</a>
+<a name="ln331">	{</a>
+<a name="ln332">		return fHashLink;</a>
+<a name="ln333">	}</a>
+<a name="ln334"> </a>
+<a name="ln335">private:</a>
+<a name="ln336">	SemInfo*		fSemaphore;</a>
+<a name="ln337">	sem_t*			fUserSemaphore;</a>
+<a name="ln338">	int32			fOpenCount;</a>
+<a name="ln339"> </a>
+<a name="ln340">	TeamSemInfo*	fHashLink;</a>
+<a name="ln341">};</a>
+<a name="ln342"> </a>
+<a name="ln343"> </a>
+<a name="ln344">struct TeamSemHashDefinition {</a>
+<a name="ln345">	typedef sem_id		KeyType;</a>
+<a name="ln346">	typedef TeamSemInfo	ValueType;</a>
+<a name="ln347"> </a>
+<a name="ln348">	size_t HashKey(const KeyType&amp; key) const</a>
+<a name="ln349">	{</a>
+<a name="ln350">		return (size_t)key;</a>
+<a name="ln351">	}</a>
+<a name="ln352"> </a>
+<a name="ln353">	size_t Hash(TeamSemInfo* semaphore) const</a>
+<a name="ln354">	{</a>
+<a name="ln355">		return HashKey(semaphore-&gt;ID());</a>
+<a name="ln356">	}</a>
+<a name="ln357"> </a>
+<a name="ln358">	bool Compare(const KeyType&amp; key, TeamSemInfo* semaphore) const</a>
+<a name="ln359">	{</a>
+<a name="ln360">		return key == semaphore-&gt;ID();</a>
+<a name="ln361">	}</a>
+<a name="ln362"> </a>
+<a name="ln363">	TeamSemInfo*&amp; GetLink(TeamSemInfo* semaphore) const</a>
+<a name="ln364">	{</a>
+<a name="ln365">		return semaphore-&gt;HashLink();</a>
+<a name="ln366">	}</a>
+<a name="ln367">};</a>
+<a name="ln368"> </a>
+<a name="ln369">} // namespace</a>
+<a name="ln370"> </a>
+<a name="ln371"> </a>
+<a name="ln372">struct realtime_sem_context {</a>
+<a name="ln373">	realtime_sem_context()</a>
+<a name="ln374">		:</a>
+<a name="ln375">		fSemaphoreCount(0)</a>
+<a name="ln376">	{</a>
+<a name="ln377">		mutex_init(&amp;fLock, &quot;realtime sem context&quot;);</a>
+<a name="ln378">	}</a>
+<a name="ln379"> </a>
+<a name="ln380">	~realtime_sem_context()</a>
+<a name="ln381">	{</a>
+<a name="ln382">		mutex_lock(&amp;fLock);</a>
+<a name="ln383"> </a>
+<a name="ln384">		// delete all semaphores.</a>
+<a name="ln385">		SemTable::Iterator it = fSemaphores.GetIterator();</a>
+<a name="ln386">		while (TeamSemInfo* sem = it.Next()) {</a>
+<a name="ln387">			// Note, this uses internal knowledge about how the iterator works.</a>
+<a name="ln388">			// Ugly, but there's no good alternative.</a>
+<a name="ln389">			fSemaphores.RemoveUnchecked(sem);</a>
+<a name="ln390">			delete sem;</a>
+<a name="ln391">		}</a>
+<a name="ln392"> </a>
+<a name="ln393">		mutex_destroy(&amp;fLock);</a>
+<a name="ln394">	}</a>
+<a name="ln395"> </a>
+<a name="ln396">	status_t Init()</a>
+<a name="ln397">	{</a>
+<a name="ln398">		fNextPrivateSemID = -1;</a>
+<a name="ln399">		return fSemaphores.Init();</a>
+<a name="ln400">	}</a>
+<a name="ln401"> </a>
+<a name="ln402">	realtime_sem_context* Clone()</a>
+<a name="ln403">	{</a>
+<a name="ln404">		// create new context</a>
+<a name="ln405">		realtime_sem_context* context = new(std::nothrow) realtime_sem_context;</a>
+<a name="ln406">		if (context == NULL)</a>
+<a name="ln407">			return NULL;</a>
+<a name="ln408">		ObjectDeleter&lt;realtime_sem_context&gt; contextDeleter(context);</a>
+<a name="ln409"> </a>
+<a name="ln410">		MutexLocker _(fLock);</a>
+<a name="ln411"> </a>
+<a name="ln412">		context-&gt;fNextPrivateSemID = fNextPrivateSemID;</a>
+<a name="ln413"> </a>
+<a name="ln414">		// clone all semaphores</a>
+<a name="ln415">		SemTable::Iterator it = fSemaphores.GetIterator();</a>
+<a name="ln416">		while (TeamSemInfo* sem = it.Next()) {</a>
+<a name="ln417">			TeamSemInfo* clonedSem = sem-&gt;Clone();</a>
+<a name="ln418">			if (clonedSem == NULL)</a>
+<a name="ln419">				return NULL;</a>
+<a name="ln420"> </a>
+<a name="ln421">			if (context-&gt;fSemaphores.Insert(clonedSem) != B_OK) {</a>
+<a name="ln422">				delete clonedSem;</a>
+<a name="ln423">				return NULL;</a>
+<a name="ln424">			}</a>
+<a name="ln425">			context-&gt;fSemaphoreCount++;</a>
+<a name="ln426">		}</a>
+<a name="ln427"> </a>
+<a name="ln428">		contextDeleter.Detach();</a>
+<a name="ln429">		return context;</a>
+<a name="ln430">	}</a>
+<a name="ln431"> </a>
+<a name="ln432">	status_t OpenSem(const char* name, int openFlags, mode_t mode,</a>
+<a name="ln433">		uint32 semCount, sem_t* userSem, sem_t*&amp; _usedUserSem, int32_t&amp; _id,</a>
+<a name="ln434">		bool&amp; _created)</a>
+<a name="ln435">	{</a>
+<a name="ln436">		NamedSem* sem = NULL;</a>
+<a name="ln437">		status_t error = sSemTable.OpenNamedSem(name, openFlags, mode, semCount,</a>
+<a name="ln438">			sem, _created);</a>
+<a name="ln439">		if (error != B_OK)</a>
+<a name="ln440">			return error;</a>
+<a name="ln441"> </a>
+<a name="ln442">		MutexLocker _(fLock);</a>
+<a name="ln443"> </a>
+<a name="ln444">		TeamSemInfo* teamSem = fSemaphores.Lookup(sem-&gt;ID());</a>
+<a name="ln445">		if (teamSem != NULL) {</a>
+<a name="ln446">			// already open -- just increment the open count</a>
+<a name="ln447">			teamSem-&gt;Open();</a>
+<a name="ln448">			sem-&gt;ReleaseReference();</a>
+<a name="ln449">			_usedUserSem = teamSem-&gt;UserSemaphore();</a>
+<a name="ln450">			_id = teamSem-&gt;ID();</a>
+<a name="ln451">			return B_OK;</a>
+<a name="ln452">		}</a>
+<a name="ln453"> </a>
+<a name="ln454">		// not open yet -- create a new team sem</a>
+<a name="ln455"> </a>
+<a name="ln456">		// first check the semaphore limit, though</a>
+<a name="ln457">		if (fSemaphoreCount &gt;= MAX_POSIX_SEMS_PER_TEAM) {</a>
+<a name="ln458">			sem-&gt;ReleaseReference();</a>
+<a name="ln459">			if (_created)</a>
+<a name="ln460">				sSemTable.UnlinkNamedSem(name);</a>
+<a name="ln461">			return ENOSPC;</a>
+<a name="ln462">		}</a>
+<a name="ln463"> </a>
+<a name="ln464">		teamSem = new(std::nothrow) TeamSemInfo(sem, userSem);</a>
+<a name="ln465">		if (teamSem == NULL) {</a>
+<a name="ln466">			sem-&gt;ReleaseReference();</a>
+<a name="ln467">			if (_created)</a>
+<a name="ln468">				sSemTable.UnlinkNamedSem(name);</a>
+<a name="ln469">			return B_NO_MEMORY;</a>
+<a name="ln470">		}</a>
+<a name="ln471"> </a>
+<a name="ln472">		error = fSemaphores.Insert(teamSem);</a>
+<a name="ln473">		if (error != B_OK) {</a>
+<a name="ln474">			delete teamSem;</a>
+<a name="ln475">			if (_created)</a>
+<a name="ln476">				sSemTable.UnlinkNamedSem(name);</a>
+<a name="ln477">			return error;</a>
+<a name="ln478">		}</a>
+<a name="ln479"> </a>
+<a name="ln480">		fSemaphoreCount++;</a>
+<a name="ln481"> </a>
+<a name="ln482">		_usedUserSem = teamSem-&gt;UserSemaphore();</a>
+<a name="ln483">		_id = teamSem-&gt;ID();</a>
+<a name="ln484"> </a>
+<a name="ln485">		return B_OK;</a>
+<a name="ln486">	}</a>
+<a name="ln487"> </a>
+<a name="ln488">	status_t CloseSem(sem_id id, sem_t*&amp; deleteUserSem)</a>
+<a name="ln489">	{</a>
+<a name="ln490">		deleteUserSem = NULL;</a>
+<a name="ln491"> </a>
+<a name="ln492">		MutexLocker _(fLock);</a>
+<a name="ln493"> </a>
+<a name="ln494">		TeamSemInfo* sem = fSemaphores.Lookup(id);</a>
+<a name="ln495">		if (sem == NULL)</a>
+<a name="ln496">			return B_BAD_VALUE;</a>
+<a name="ln497"> </a>
+<a name="ln498">		if (sem-&gt;Close()) {</a>
+<a name="ln499">			// last reference closed</a>
+<a name="ln500">			fSemaphores.Remove(sem);</a>
+<a name="ln501">			fSemaphoreCount--;</a>
+<a name="ln502">			deleteUserSem = sem-&gt;UserSemaphore();</a>
+<a name="ln503">			delete sem;</a>
+<a name="ln504">		}</a>
+<a name="ln505"> </a>
+<a name="ln506">		return B_OK;</a>
+<a name="ln507">	}</a>
+<a name="ln508"> </a>
+<a name="ln509">	status_t AcquireSem(sem_id id, bigtime_t timeout)</a>
+<a name="ln510">	{</a>
+<a name="ln511">		MutexLocker locker(fLock);</a>
+<a name="ln512"> </a>
+<a name="ln513">		TeamSemInfo* sem = fSemaphores.Lookup(id);</a>
+<a name="ln514">		if (sem == NULL)</a>
+<a name="ln515">			return B_BAD_VALUE;</a>
+<a name="ln516">		else</a>
+<a name="ln517">			id = sem-&gt;SemaphoreID();</a>
+<a name="ln518"> </a>
+<a name="ln519">		locker.Unlock();</a>
+<a name="ln520"> </a>
+<a name="ln521">		status_t error;</a>
+<a name="ln522">		if (timeout == 0) {</a>
+<a name="ln523">			error = acquire_sem_etc(id, 1, B_CAN_INTERRUPT | B_RELATIVE_TIMEOUT,</a>
+<a name="ln524">				0);</a>
+<a name="ln525">		} else if (timeout == B_INFINITE_TIMEOUT) {</a>
+<a name="ln526">			error = acquire_sem_etc(id, 1, B_CAN_INTERRUPT, 0);</a>
+<a name="ln527">		} else {</a>
+<a name="ln528">			error = acquire_sem_etc(id, 1,</a>
+<a name="ln529">				B_CAN_INTERRUPT | B_ABSOLUTE_REAL_TIME_TIMEOUT, timeout);</a>
+<a name="ln530">		}</a>
+<a name="ln531"> </a>
+<a name="ln532">		return error == B_BAD_SEM_ID ? B_BAD_VALUE : error;</a>
+<a name="ln533">	}</a>
+<a name="ln534"> </a>
+<a name="ln535">	status_t ReleaseSem(sem_id id)</a>
+<a name="ln536">	{</a>
+<a name="ln537">		MutexLocker locker(fLock);</a>
+<a name="ln538"> </a>
+<a name="ln539">		TeamSemInfo* sem = fSemaphores.Lookup(id);</a>
+<a name="ln540">		if (sem == NULL)</a>
+<a name="ln541">			return B_BAD_VALUE;</a>
+<a name="ln542">		else</a>
+<a name="ln543">			id = sem-&gt;SemaphoreID();</a>
+<a name="ln544"> </a>
+<a name="ln545">		locker.Unlock();</a>
+<a name="ln546"> </a>
+<a name="ln547">		status_t error = release_sem(id);</a>
+<a name="ln548">		return error == B_BAD_SEM_ID ? B_BAD_VALUE : error;</a>
+<a name="ln549">	}</a>
+<a name="ln550"> </a>
+<a name="ln551">	status_t GetSemCount(sem_id id, int&amp; _count)</a>
+<a name="ln552">	{</a>
+<a name="ln553">		MutexLocker locker(fLock);</a>
+<a name="ln554"> </a>
+<a name="ln555">		TeamSemInfo* sem = fSemaphores.Lookup(id);</a>
+<a name="ln556">		if (sem == NULL)</a>
+<a name="ln557">				return B_BAD_VALUE;</a>
+<a name="ln558">		else</a>
+<a name="ln559">			id = sem-&gt;SemaphoreID();</a>
+<a name="ln560"> </a>
+<a name="ln561">		locker.Unlock();</a>
+<a name="ln562"> </a>
+<a name="ln563">		int32 count;</a>
+<a name="ln564">		status_t error = get_sem_count(id, &amp;count);</a>
+<a name="ln565">		if (error != B_OK)</a>
+<a name="ln566">			return error;</a>
+<a name="ln567"> </a>
+<a name="ln568">		_count = count;</a>
+<a name="ln569">		return B_OK;</a>
+<a name="ln570">	}</a>
+<a name="ln571"> </a>
+<a name="ln572">private:</a>
+<a name="ln573">	sem_id _NextPrivateSemID()</a>
+<a name="ln574">	{</a>
+<a name="ln575">		while (true) {</a>
+<a name="ln576">			if (fNextPrivateSemID &gt;= 0)</a>
+<a name="ln577">				fNextPrivateSemID = -1;</a>
+<a name="ln578"> </a>
+<a name="ln579">			sem_id id = fNextPrivateSemID--;</a>
+<a name="ln580">			if (fSemaphores.Lookup(id) == NULL)</a>
+<a name="ln581">				return id;</a>
+<a name="ln582">		}</a>
+<a name="ln583">	}</a>
+<a name="ln584"> </a>
+<a name="ln585">private:</a>
+<a name="ln586">	typedef BOpenHashTable&lt;TeamSemHashDefinition, true&gt; SemTable;</a>
+<a name="ln587"> </a>
+<a name="ln588">	mutex		fLock;</a>
+<a name="ln589">	SemTable	fSemaphores;</a>
+<a name="ln590">	int32		fSemaphoreCount;</a>
+<a name="ln591">	sem_id		fNextPrivateSemID;</a>
+<a name="ln592">};</a>
+<a name="ln593"> </a>
+<a name="ln594"> </a>
+<a name="ln595">// #pragma mark - implementation private</a>
+<a name="ln596"> </a>
+<a name="ln597"> </a>
+<a name="ln598">static realtime_sem_context*</a>
+<a name="ln599">get_current_team_context()</a>
+<a name="ln600">{</a>
+<a name="ln601">	Team* team = thread_get_current_thread()-&gt;team;</a>
+<a name="ln602"> </a>
+<a name="ln603">	// get context</a>
+<a name="ln604">	realtime_sem_context* context = atomic_pointer_get(</a>
+<a name="ln605">		&amp;team-&gt;realtime_sem_context);</a>
+<a name="ln606">	if (context != NULL)</a>
+<a name="ln607">		return context;</a>
+<a name="ln608"> </a>
+<a name="ln609">	// no context yet -- create a new one</a>
+<a name="ln610">	context = new(std::nothrow) realtime_sem_context;</a>
+<a name="ln611">	if (context == NULL || context-&gt;Init() != B_OK) {</a>
+<a name="ln612">		delete context;</a>
+<a name="ln613">		return NULL;</a>
+<a name="ln614">	}</a>
+<a name="ln615"> </a>
+<a name="ln616">	// set the allocated context</a>
+<a name="ln617">	realtime_sem_context* oldContext = atomic_pointer_test_and_set(</a>
+<a name="ln618">		&amp;team-&gt;realtime_sem_context, context, (realtime_sem_context*)NULL);</a>
+<a name="ln619">	if (oldContext == NULL)</a>
+<a name="ln620">		return context;</a>
+<a name="ln621"> </a>
+<a name="ln622">	// someone else was quicker</a>
+<a name="ln623">	delete context;</a>
+<a name="ln624">	return oldContext;</a>
+<a name="ln625">}</a>
+<a name="ln626"> </a>
+<a name="ln627"> </a>
+<a name="ln628">static status_t</a>
+<a name="ln629">copy_sem_name_to_kernel(const char* userName, KPath&amp; buffer, char*&amp; name)</a>
+<a name="ln630">{</a>
+<a name="ln631">	if (userName == NULL)</a>
+<a name="ln632">		return B_BAD_VALUE;</a>
+<a name="ln633">	if (!IS_USER_ADDRESS(userName))</a>
+<a name="ln634">		return B_BAD_ADDRESS;</a>
+<a name="ln635"> </a>
+<a name="ln636">	if (buffer.InitCheck() != B_OK)</a>
+<a name="ln637">		return B_NO_MEMORY;</a>
+<a name="ln638"> </a>
+<a name="ln639">	// copy userland path to kernel</a>
+<a name="ln640">	name = buffer.LockBuffer();</a>
+<a name="ln641">	ssize_t actualLength = user_strlcpy(name, userName, buffer.BufferSize());</a>
+<a name="ln642"> </a>
+<a name="ln643">	if (actualLength &lt; 0)</a>
+<a name="ln644">		return B_BAD_ADDRESS;</a>
+<a name="ln645">	if ((size_t)actualLength &gt;= buffer.BufferSize())</a>
+<a name="ln646">		return ENAMETOOLONG;</a>
+<a name="ln647"> </a>
+<a name="ln648">	return B_OK;</a>
+<a name="ln649">}</a>
+<a name="ln650"> </a>
+<a name="ln651"> </a>
+<a name="ln652">// #pragma mark - kernel internal</a>
+<a name="ln653"> </a>
+<a name="ln654"> </a>
+<a name="ln655">void</a>
+<a name="ln656">realtime_sem_init()</a>
+<a name="ln657">{</a>
+<a name="ln658">	new(&amp;sSemTable) GlobalSemTable;</a>
+<a name="ln659">	if (sSemTable.Init() != B_OK)</a>
+<a name="ln660">		panic(&quot;realtime_sem_init() failed to init global sem table&quot;);</a>
+<a name="ln661">}</a>
+<a name="ln662"> </a>
+<a name="ln663"> </a>
+<a name="ln664">void</a>
+<a name="ln665">delete_realtime_sem_context(realtime_sem_context* context)</a>
+<a name="ln666">{</a>
+<a name="ln667">	delete context;</a>
+<a name="ln668">}</a>
+<a name="ln669"> </a>
+<a name="ln670"> </a>
+<a name="ln671">realtime_sem_context*</a>
+<a name="ln672">clone_realtime_sem_context(realtime_sem_context* context)</a>
+<a name="ln673">{</a>
+<a name="ln674">	if (context == NULL)</a>
+<a name="ln675">		return NULL;</a>
+<a name="ln676"> </a>
+<a name="ln677">	return context-&gt;Clone();</a>
+<a name="ln678">}</a>
+<a name="ln679"> </a>
+<a name="ln680"> </a>
+<a name="ln681">// #pragma mark - syscalls</a>
+<a name="ln682"> </a>
+<a name="ln683"> </a>
+<a name="ln684">status_t</a>
+<a name="ln685">_user_realtime_sem_open(const char* userName, int openFlagsOrShared,</a>
+<a name="ln686">	mode_t mode, uint32 semCount, sem_t* userSem, sem_t** _usedUserSem)</a>
+<a name="ln687">{</a>
+<a name="ln688">	realtime_sem_context* context = get_current_team_context();</a>
+<a name="ln689">	if (context == NULL)</a>
+<a name="ln690">		return B_NO_MEMORY;</a>
+<a name="ln691"> </a>
+<a name="ln692">	if (semCount &gt; MAX_POSIX_SEM_VALUE)</a>
+<a name="ln693">		return B_BAD_VALUE;</a>
+<a name="ln694"> </a>
+<a name="ln695">	// userSem must always be given</a>
+<a name="ln696">	if (userSem == NULL)</a>
+<a name="ln697">		return B_BAD_VALUE;</a>
+<a name="ln698">	if (!IS_USER_ADDRESS(userSem))</a>
+<a name="ln699">		return B_BAD_ADDRESS;</a>
+<a name="ln700"> </a>
+<a name="ln701">	// check user pointers</a>
+<a name="ln702">	if (_usedUserSem == NULL)</a>
+<a name="ln703">		return B_BAD_VALUE;</a>
+<a name="ln704">	if (!IS_USER_ADDRESS(_usedUserSem) || !IS_USER_ADDRESS(userName))</a>
+<a name="ln705">		return B_BAD_ADDRESS;</a>
+<a name="ln706"> </a>
+<a name="ln707">	// copy name to kernel</a>
+<a name="ln708">	KPath nameBuffer(B_PATH_NAME_LENGTH);</a>
+<a name="ln709">	char* name;</a>
+<a name="ln710">	status_t error = copy_sem_name_to_kernel(userName, nameBuffer, name);</a>
+<a name="ln711">	if (error != B_OK)</a>
+<a name="ln712">		return error;</a>
+<a name="ln713"> </a>
+<a name="ln714">	// open the semaphore</a>
+<a name="ln715">	sem_t* usedUserSem;</a>
+<a name="ln716">	bool created = false;</a>
+<a name="ln717">	int32_t id;</a>
+<a name="ln718">	error = context-&gt;OpenSem(name, openFlagsOrShared, mode, semCount, userSem,</a>
+<a name="ln719">		usedUserSem, id, created);</a>
+<a name="ln720">	if (error != B_OK)</a>
+<a name="ln721">		return error;</a>
+<a name="ln722"> </a>
+<a name="ln723">	// copy results back to userland</a>
+<a name="ln724">	if (user_memcpy(&amp;userSem-&gt;u.named_sem_id, &amp;id, sizeof(int32_t)) != B_OK</a>
+<a name="ln725">		|| user_memcpy(_usedUserSem, &amp;usedUserSem, sizeof(sem_t*)) != B_OK) {</a>
+<a name="ln726">		if (created)</a>
+<a name="ln727">			sSemTable.UnlinkNamedSem(name);</a>
+<a name="ln728">		sem_t* dummy;</a>
+<a name="ln729">		context-&gt;CloseSem(id, dummy);</a>
+<a name="ln730">		return B_BAD_ADDRESS;</a>
+<a name="ln731">	}</a>
+<a name="ln732"> </a>
+<a name="ln733">	return B_OK;</a>
+<a name="ln734">}</a>
+<a name="ln735"> </a>
+<a name="ln736"> </a>
+<a name="ln737">status_t</a>
+<a name="ln738">_user_realtime_sem_close(sem_id semID, sem_t** _deleteUserSem)</a>
+<a name="ln739">{</a>
+<a name="ln740">	if (_deleteUserSem != NULL &amp;&amp; !IS_USER_ADDRESS(_deleteUserSem))</a>
+<a name="ln741">		return B_BAD_ADDRESS;</a>
+<a name="ln742"> </a>
+<a name="ln743">	realtime_sem_context* context = get_current_team_context();</a>
+<a name="ln744">	if (context == NULL)</a>
+<a name="ln745">		return B_BAD_VALUE;</a>
+<a name="ln746"> </a>
+<a name="ln747">	// close sem</a>
+<a name="ln748">	sem_t* deleteUserSem;</a>
+<a name="ln749">	status_t error = context-&gt;CloseSem(semID, deleteUserSem);</a>
+<a name="ln750">	if (error != B_OK)</a>
+<a name="ln751">		return error;</a>
+<a name="ln752"> </a>
+<a name="ln753">	// copy back result to userland</a>
+<a name="ln754">	if (_deleteUserSem != NULL</a>
+<a name="ln755">		&amp;&amp; user_memcpy(_deleteUserSem, &amp;deleteUserSem, sizeof(sem_t*))</a>
+<a name="ln756">			!= B_OK) {</a>
+<a name="ln757">		return B_BAD_ADDRESS;</a>
+<a name="ln758">	}</a>
+<a name="ln759"> </a>
+<a name="ln760">	return B_OK;</a>
+<a name="ln761">}</a>
+<a name="ln762"> </a>
+<a name="ln763"> </a>
+<a name="ln764">status_t</a>
+<a name="ln765">_user_realtime_sem_unlink(const char* userName)</a>
+<a name="ln766">{</a>
+<a name="ln767">	// copy name to kernel</a>
+<a name="ln768">	KPath nameBuffer(B_PATH_NAME_LENGTH);</a>
+<a name="ln769">	char* name;</a>
+<a name="ln770">	status_t error = copy_sem_name_to_kernel(userName, nameBuffer, name);</a>
+<a name="ln771">	if (error != B_OK)</a>
+<a name="ln772">		return error;</a>
+<a name="ln773"> </a>
+<a name="ln774">	return sSemTable.UnlinkNamedSem(name);</a>
+<a name="ln775">}</a>
+<a name="ln776"> </a>
+<a name="ln777"> </a>
+<a name="ln778">status_t</a>
+<a name="ln779">_user_realtime_sem_get_value(sem_id semID, int* _value)</a>
+<a name="ln780">{</a>
+<a name="ln781">	if (_value == NULL)</a>
+<a name="ln782">		return B_BAD_VALUE;</a>
+<a name="ln783">	if (!IS_USER_ADDRESS(_value))</a>
+<a name="ln784">		return B_BAD_ADDRESS;</a>
+<a name="ln785"> </a>
+<a name="ln786">	realtime_sem_context* context = get_current_team_context();</a>
+<a name="ln787">	if (context == NULL)</a>
+<a name="ln788">		return B_BAD_VALUE;</a>
+<a name="ln789"> </a>
+<a name="ln790">	// get sem count</a>
+<a name="ln791">	int count;</a>
+<a name="ln792">	status_t error = context-&gt;GetSemCount(semID, count);</a>
+<a name="ln793">	if (error != B_OK)</a>
+<a name="ln794">		return error;</a>
+<a name="ln795"> </a>
+<a name="ln796">	// copy back result to userland</a>
+<a name="ln797">	if (user_memcpy(_value, &amp;count, sizeof(int)) != B_OK)</a>
+<a name="ln798">		return B_BAD_ADDRESS;</a>
+<a name="ln799"> </a>
+<a name="ln800">	return B_OK;</a>
+<a name="ln801">}</a>
+<a name="ln802"> </a>
+<a name="ln803"> </a>
+<a name="ln804">status_t</a>
+<a name="ln805">_user_realtime_sem_post(sem_id semID)</a>
+<a name="ln806">{</a>
+<a name="ln807">	realtime_sem_context* context = get_current_team_context();</a>
+<a name="ln808">	if (context == NULL)</a>
+<a name="ln809">		return B_BAD_VALUE;</a>
+<a name="ln810"> </a>
+<a name="ln811">	return context-&gt;ReleaseSem(semID);</a>
+<a name="ln812">}</a>
+<a name="ln813"> </a>
+<a name="ln814"> </a>
+<a name="ln815">status_t</a>
+<a name="ln816">_user_realtime_sem_wait(sem_id semID, bigtime_t timeout)</a>
+<a name="ln817">{</a>
+<a name="ln818">	realtime_sem_context* context = get_current_team_context();</a>
+<a name="ln819">	if (context == NULL)</a>
+<a name="ln820">		return B_BAD_VALUE;</a>
+<a name="ln821"> </a>
+<a name="ln822">	return syscall_restart_handle_post(context-&gt;AcquireSem(semID, timeout));</a>
+<a name="ln823">}</a>
+
+</code></pre>
+<div class="balloon" rel="285"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fHashLink.</p></div>
+<div class="balloon" rel="373"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fNextPrivateSemID.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

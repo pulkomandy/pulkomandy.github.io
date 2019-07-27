@@ -1,0 +1,1077 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>ThreadHandler.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2009-2012, Ingo Weinhold, ingo_weinhold@gmx.de.</a>
+<a name="ln3"> * Copyright 2010-2016, Rene Gollent, rene@gollent.com.</a>
+<a name="ln4"> * Distributed under the terms of the MIT License.</a>
+<a name="ln5"> */</a>
+<a name="ln6"> </a>
+<a name="ln7"> </a>
+<a name="ln8">#include &quot;ThreadHandler.h&quot;</a>
+<a name="ln9"> </a>
+<a name="ln10">#include &lt;stdio.h&gt;</a>
+<a name="ln11"> </a>
+<a name="ln12">#include &lt;new&gt;</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &lt;AutoDeleter.h&gt;</a>
+<a name="ln15">#include &lt;AutoLocker.h&gt;</a>
+<a name="ln16">#include &lt;Variant.h&gt;</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &quot;Architecture.h&quot;</a>
+<a name="ln19">#include &quot;BreakpointManager.h&quot;</a>
+<a name="ln20">#include &quot;CpuState.h&quot;</a>
+<a name="ln21">#include &quot;DebugEvent.h&quot;</a>
+<a name="ln22">#include &quot;DebuggerInterface.h&quot;</a>
+<a name="ln23">#include &quot;ExpressionInfo.h&quot;</a>
+<a name="ln24">#include &quot;FunctionInstance.h&quot;</a>
+<a name="ln25">#include &quot;ImageDebugInfo.h&quot;</a>
+<a name="ln26">#include &quot;InstructionInfo.h&quot;</a>
+<a name="ln27">#include &quot;Jobs.h&quot;</a>
+<a name="ln28">#include &quot;MessageCodes.h&quot;</a>
+<a name="ln29">#include &quot;Register.h&quot;</a>
+<a name="ln30">#include &quot;SignalDispositionTypes.h&quot;</a>
+<a name="ln31">#include &quot;SourceCode.h&quot;</a>
+<a name="ln32">#include &quot;SourceLanguage.h&quot;</a>
+<a name="ln33">#include &quot;SpecificImageDebugInfo.h&quot;</a>
+<a name="ln34">#include &quot;StackTrace.h&quot;</a>
+<a name="ln35">#include &quot;Statement.h&quot;</a>
+<a name="ln36">#include &quot;SyntheticPrimitiveType.h&quot;</a>
+<a name="ln37">#include &quot;Team.h&quot;</a>
+<a name="ln38">#include &quot;Tracing.h&quot;</a>
+<a name="ln39">#include &quot;Value.h&quot;</a>
+<a name="ln40">#include &quot;ValueLocation.h&quot;</a>
+<a name="ln41">#include &quot;Worker.h&quot;</a>
+<a name="ln42"> </a>
+<a name="ln43"> </a>
+<a name="ln44">// step modes</a>
+<a name="ln45">enum {</a>
+<a name="ln46">	STEP_NONE,</a>
+<a name="ln47">	STEP_OVER,</a>
+<a name="ln48">	STEP_INTO,</a>
+<a name="ln49">	STEP_OUT,</a>
+<a name="ln50">	STEP_UNTIL</a>
+<a name="ln51">};</a>
+<a name="ln52"> </a>
+<a name="ln53"> </a>
+<a name="ln54">class ExpressionEvaluationListener : public ExpressionInfo::Listener {</a>
+<a name="ln55">public:</a>
+<a name="ln56">	ExpressionEvaluationListener(ThreadHandler* handler)</a>
+<a name="ln57">	:</a>
+<a name="ln58">	fHandler(handler)</a>
+<a name="ln59">	{</a>
+<a name="ln60">		fHandler-&gt;AcquireReference();</a>
+<a name="ln61">	}</a>
+<a name="ln62"> </a>
+<a name="ln63">	~ExpressionEvaluationListener()</a>
+<a name="ln64">	{</a>
+<a name="ln65">		fHandler-&gt;ReleaseReference();</a>
+<a name="ln66">	}</a>
+<a name="ln67"> </a>
+<a name="ln68">	virtual void ExpressionEvaluated(ExpressionInfo* info, status_t result,</a>
+<a name="ln69">		ExpressionResult* value)</a>
+<a name="ln70">	{</a>
+<a name="ln71">		fHandler-&gt;_HandleBreakpointConditionEvaluated(value);</a>
+<a name="ln72">	}</a>
+<a name="ln73"> </a>
+<a name="ln74">private:</a>
+<a name="ln75">	ThreadHandler* fHandler;</a>
+<a name="ln76">};</a>
+<a name="ln77"> </a>
+<a name="ln78"> </a>
+<a name="ln79">ThreadHandler::ThreadHandler(::Thread* thread, Worker* worker,</a>
+<a name="ln80">	DebuggerInterface* debuggerInterface, JobListener* jobListener,</a>
+<a name="ln81">	BreakpointManager* breakpointManager)</a>
+<a name="ln82">	:</a>
+<a name="ln83">	fThread(thread),</a>
+<a name="ln84">	fWorker(worker),</a>
+<a name="ln85">	fDebuggerInterface(debuggerInterface),</a>
+<a name="ln86">	fJobListener(jobListener),</a>
+<a name="ln87">	fBreakpointManager(breakpointManager),</a>
+<a name="ln88">	fStepMode(STEP_NONE),</a>
+<a name="ln89">	fStepStatement(NULL),</a>
+<a name="ln90">	fBreakpointAddress(0),</a>
+<a name="ln91">	fSteppedOverFunctionAddress(0),</a>
+<a name="ln92">	fPreviousInstructionPointer(0),</a>
+<a name="ln93">	fPreviousFrameAddress(0),</a>
+<a name="ln94">	fSingleStepping(false),</a>
+<a name="ln95">	fConditionWaitSem(-1),</a>
+<a name="ln96">	fConditionResult(NULL)</a>
+<a name="ln97">{</a>
+<a name="ln98">	fDebuggerInterface-&gt;AcquireReference();</a>
+<a name="ln99">}</a>
+<a name="ln100"> </a>
+<a name="ln101"> </a>
+<a name="ln102">ThreadHandler::~ThreadHandler()</a>
+<a name="ln103">{</a>
+<a name="ln104">	_ClearContinuationState();</a>
+<a name="ln105">	fDebuggerInterface-&gt;ReleaseReference();</a>
+<a name="ln106"> </a>
+<a name="ln107">	if (fConditionWaitSem &gt; 0)</a>
+<a name="ln108">		delete_sem(fConditionWaitSem);</a>
+<a name="ln109">}</a>
+<a name="ln110"> </a>
+<a name="ln111"> </a>
+<a name="ln112">void</a>
+<a name="ln113">ThreadHandler::Init()</a>
+<a name="ln114">{</a>
+<a name="ln115">	fWorker-&gt;ScheduleJob(new(std::nothrow) GetThreadStateJob(fDebuggerInterface,</a>
+<a name="ln116">		fThread), fJobListener);</a>
+<a name="ln117">	fConditionWaitSem = create_sem(0, &quot;breakpoint condition waiter&quot;);</a>
+<a name="ln118">}</a>
+<a name="ln119"> </a>
+<a name="ln120"> </a>
+<a name="ln121">status_t</a>
+<a name="ln122">ThreadHandler::SetBreakpointAndRun(target_addr_t address)</a>
+<a name="ln123">{</a>
+<a name="ln124">	status_t error = _InstallTemporaryBreakpoint(address);</a>
+<a name="ln125">	if (error != B_OK)</a>
+<a name="ln126">		return error;</a>
+<a name="ln127"> </a>
+<a name="ln128">	fPreviousInstructionPointer = 0;</a>
+<a name="ln129">	fDebuggerInterface-&gt;ContinueThread(ThreadID());</a>
+<a name="ln130"> </a>
+<a name="ln131">	// Pretend &quot;step out&quot; mode, so that the temporary breakpoint hit will not</a>
+<a name="ln132">	// be ignored.</a>
+<a name="ln133">	fStepMode = STEP_OUT;</a>
+<a name="ln134">	fSingleStepping = false;</a>
+<a name="ln135"> </a>
+<a name="ln136">	return B_OK;</a>
+<a name="ln137">}</a>
+<a name="ln138"> </a>
+<a name="ln139"> </a>
+<a name="ln140">bool</a>
+<a name="ln141">ThreadHandler::HandleThreadDebugged(ThreadDebuggedEvent* event,</a>
+<a name="ln142">	const BString&amp; stoppedReason)</a>
+<a name="ln143">{</a>
+<a name="ln144">	return _HandleThreadStopped(NULL, THREAD_STOPPED_DEBUGGED, stoppedReason);</a>
+<a name="ln145">}</a>
+<a name="ln146"> </a>
+<a name="ln147"> </a>
+<a name="ln148">bool</a>
+<a name="ln149">ThreadHandler::HandleDebuggerCall(DebuggerCallEvent* event)</a>
+<a name="ln150">{</a>
+<a name="ln151">	BString message;</a>
+<a name="ln152">	fDebuggerInterface-&gt;ReadMemoryString(event-&gt;Message(), 1024, message);</a>
+<a name="ln153">	return _HandleThreadStopped(NULL, THREAD_STOPPED_DEBUGGER_CALL, message);</a>
+<a name="ln154">}</a>
+<a name="ln155"> </a>
+<a name="ln156"> </a>
+<a name="ln157">bool</a>
+<a name="ln158">ThreadHandler::HandleBreakpointHit(BreakpointHitEvent* event)</a>
+<a name="ln159">{</a>
+<a name="ln160">	CpuState* cpuState = event-&gt;GetCpuState();</a>
+<a name="ln161">	target_addr_t instructionPointer = cpuState-&gt;InstructionPointer();</a>
+<a name="ln162"> </a>
+<a name="ln163">	TRACE_EVENTS(&quot;ThreadHandler::HandleBreakpointHit(): ip: %&quot; B_PRIx64 &quot;\n&quot;,</a>
+<a name="ln164">		instructionPointer);</a>
+<a name="ln165"> </a>
+<a name="ln166">	// check whether this is a temporary breakpoint we're waiting for</a>
+<a name="ln167">	if (fBreakpointAddress != 0 &amp;&amp; instructionPointer == fBreakpointAddress</a>
+<a name="ln168">		&amp;&amp; fStepMode != STEP_NONE) {</a>
+<a name="ln169">		if (fStepMode != STEP_UNTIL &amp;&amp; _HandleBreakpointHitStep(cpuState))</a>
+<a name="ln170">			return true;</a>
+<a name="ln171">	} else {</a>
+<a name="ln172">		// Might be a user breakpoint, but could as well be a temporary</a>
+<a name="ln173">		// breakpoint of another thread.</a>
+<a name="ln174">		AutoLocker&lt;Team&gt; locker(fThread-&gt;GetTeam());</a>
+<a name="ln175">		Breakpoint* breakpoint = fThread-&gt;GetTeam()-&gt;BreakpointAtAddress(</a>
+<a name="ln176">			cpuState-&gt;InstructionPointer());</a>
+<a name="ln177">		bool continueThread = false;</a>
+<a name="ln178">		if (breakpoint == NULL) {</a>
+<a name="ln179">			// spurious breakpoint -- might be a temporary breakpoint, that has</a>
+<a name="ln180">			// already been uninstalled</a>
+<a name="ln181">			continueThread = true;</a>
+<a name="ln182">		} else if (!breakpoint-&gt;HasEnabledUserBreakpoint()) {</a>
+<a name="ln183">			// breakpoint of another thread or one that has been disabled in</a>
+<a name="ln184">			// the meantime</a>
+<a name="ln185">			continueThread = true;</a>
+<a name="ln186">		}</a>
+<a name="ln187"> </a>
+<a name="ln188">		if (continueThread) {</a>
+<a name="ln189">			if (fSingleStepping) {</a>
+<a name="ln190">				// We might have hit a just-installed software breakpoint and</a>
+<a name="ln191">				// thus haven't stepped at all. Just try again.</a>
+<a name="ln192">				if (fPreviousInstructionPointer == instructionPointer) {</a>
+<a name="ln193">					fDebuggerInterface-&gt;SingleStepThread(ThreadID());</a>
+<a name="ln194">					return true;</a>
+<a name="ln195">				}</a>
+<a name="ln196"> </a>
+<a name="ln197">				// That shouldn't happen. Try something reasonable anyway.</a>
+<a name="ln198">				if (fStepMode != STEP_NONE) {</a>
+<a name="ln199">					if (_HandleSingleStepStep(cpuState))</a>
+<a name="ln200">						return true;</a>
+<a name="ln201">				}</a>
+<a name="ln202">			}</a>
+<a name="ln203"> </a>
+<a name="ln204">			return false;</a>
+<a name="ln205">		} else {</a>
+<a name="ln206">			locker.Unlock();</a>
+<a name="ln207">			if (_HandleBreakpointConditionIfNeeded(cpuState))</a>
+<a name="ln208">				return true;</a>
+<a name="ln209"> </a>
+<a name="ln210">			locker.Lock();</a>
+<a name="ln211">		}</a>
+<a name="ln212">	}</a>
+<a name="ln213"> </a>
+<a name="ln214">	return _HandleThreadStopped(cpuState, THREAD_STOPPED_BREAKPOINT);</a>
+<a name="ln215">}</a>
+<a name="ln216"> </a>
+<a name="ln217"> </a>
+<a name="ln218">bool</a>
+<a name="ln219">ThreadHandler::HandleWatchpointHit(WatchpointHitEvent* event)</a>
+<a name="ln220">{</a>
+<a name="ln221">	return _HandleThreadStopped(event-&gt;GetCpuState(),</a>
+<a name="ln222">		THREAD_STOPPED_WATCHPOINT);</a>
+<a name="ln223">}</a>
+<a name="ln224"> </a>
+<a name="ln225"> </a>
+<a name="ln226">bool</a>
+<a name="ln227">ThreadHandler::HandleSingleStep(SingleStepEvent* event)</a>
+<a name="ln228">{</a>
+<a name="ln229">	// Check whether we're stepping automatically.</a>
+<a name="ln230">	if (fStepMode != STEP_NONE) {</a>
+<a name="ln231">		if (_HandleSingleStepStep(event-&gt;GetCpuState()))</a>
+<a name="ln232">			return true;</a>
+<a name="ln233">	}</a>
+<a name="ln234"> </a>
+<a name="ln235">	return _HandleThreadStopped(event-&gt;GetCpuState(),</a>
+<a name="ln236">		THREAD_STOPPED_SINGLE_STEP);</a>
+<a name="ln237">}</a>
+<a name="ln238"> </a>
+<a name="ln239"> </a>
+<a name="ln240">bool</a>
+<a name="ln241">ThreadHandler::HandleExceptionOccurred(ExceptionOccurredEvent* event)</a>
+<a name="ln242">{</a>
+<a name="ln243">	char buffer[256];</a>
+<a name="ln244">	get_debug_exception_string(event-&gt;Exception(), buffer, sizeof(buffer));</a>
+<a name="ln245">	return _HandleThreadStopped(NULL, THREAD_STOPPED_EXCEPTION, buffer);</a>
+<a name="ln246">}</a>
+<a name="ln247"> </a>
+<a name="ln248"> </a>
+<a name="ln249">bool</a>
+<a name="ln250">ThreadHandler::HandleSignalReceived(SignalReceivedEvent* event)</a>
+<a name="ln251">{</a>
+<a name="ln252">	::Team* team = fThread-&gt;GetTeam();</a>
+<a name="ln253">	AutoLocker&lt;Team&gt; locker(team);</a>
+<a name="ln254"> </a>
+<a name="ln255">	const SignalInfo&amp; info = event-&gt;GetSignalInfo();</a>
+<a name="ln256">	int32 signal = info.Signal();</a>
+<a name="ln257">	int32 disposition = team-&gt;SignalDispositionFor(signal);</a>
+<a name="ln258"> </a>
+<a name="ln259">	switch (disposition) {</a>
+<a name="ln260">		case SIGNAL_DISPOSITION_IGNORE:</a>
+<a name="ln261">			return false;</a>
+<a name="ln262">		case SIGNAL_DISPOSITION_STOP_AT_SIGNAL_HANDLER:</a>
+<a name="ln263">		{</a>
+<a name="ln264">			const struct sigaction&amp; handlerInfo = info.Handler();</a>
+<a name="ln265">			target_addr_t address = 0;</a>
+<a name="ln266">			if ((handlerInfo.sa_flags &amp; SA_SIGINFO) != 0)</a>
+<a name="ln267">				address = (target_addr_t)handlerInfo.sa_sigaction;</a>
+<a name="ln268">			else</a>
+<a name="ln269">				address = (target_addr_t)handlerInfo.sa_handler;</a>
+<a name="ln270"> </a>
+<a name="ln271">			if (address == (target_addr_t)SIG_DFL</a>
+<a name="ln272">				|| address == (target_addr_t)SIG_IGN</a>
+<a name="ln273">				|| address == (target_addr_t)SIG_HOLD) {</a>
+<a name="ln274">				address = 0;</a>
+<a name="ln275">			}</a>
+<a name="ln276"> </a>
+<a name="ln277">			if (address != 0 &amp;&amp; _InstallTemporaryBreakpoint(address) == B_OK</a>
+<a name="ln278">				&amp;&amp; fDebuggerInterface-&gt;ContinueThread(ThreadID()) == B_OK) {</a>
+<a name="ln279">				fStepMode = STEP_UNTIL;</a>
+<a name="ln280">				return true;</a>
+<a name="ln281">			}</a>
+<a name="ln282"> </a>
+<a name="ln283">			// fall through if no handler or if we failed to</a>
+<a name="ln284">			// set a breakpoint at the handler</a>
+<a name="ln285">		}</a>
+<a name="ln286">		case SIGNAL_DISPOSITION_STOP_AT_RECEIPT:</a>
+<a name="ln287">		{</a>
+<a name="ln288">			BString stopReason;</a>
+<a name="ln289">			stopReason.SetToFormat(&quot;Received signal %&quot; B_PRId32 &quot; (%s)&quot;,</a>
+<a name="ln290">				signal, strsignal(signal));</a>
+<a name="ln291">			return _HandleThreadStopped(NULL, THREAD_STOPPED_DEBUGGED,</a>
+<a name="ln292">				stopReason);</a>
+<a name="ln293">		}</a>
+<a name="ln294">		default:</a>
+<a name="ln295">			break;</a>
+<a name="ln296">	}</a>
+<a name="ln297"> </a>
+<a name="ln298">	return false;</a>
+<a name="ln299">}</a>
+<a name="ln300"> </a>
+<a name="ln301"> </a>
+<a name="ln302">void</a>
+<a name="ln303">ThreadHandler::HandleThreadAction(uint32 action, target_addr_t address)</a>
+<a name="ln304">{</a>
+<a name="ln305">	AutoLocker&lt;Team&gt; locker(fThread-&gt;GetTeam());</a>
+<a name="ln306"> </a>
+<a name="ln307">	if (fThread-&gt;State() == THREAD_STATE_UNKNOWN)</a>
+<a name="ln308">		return;</a>
+<a name="ln309"> </a>
+<a name="ln310">	// When stop is requested, thread must be running, otherwise stopped.</a>
+<a name="ln311">	if (action == MSG_THREAD_STOP</a>
+<a name="ln312">			? fThread-&gt;State() != THREAD_STATE_RUNNING</a>
+<a name="ln313">			: fThread-&gt;State() != THREAD_STATE_STOPPED) {</a>
+<a name="ln314">		return;</a>
+<a name="ln315">	}</a>
+<a name="ln316"> </a>
+<a name="ln317">	// When stepping we need a stack trace. Save it before unsetting the state.</a>
+<a name="ln318">	CpuState* cpuState = fThread-&gt;GetCpuState();</a>
+<a name="ln319">	StackTrace* stackTrace = fThread-&gt;GetStackTrace();</a>
+<a name="ln320">	BReference&lt;CpuState&gt; cpuStateReference(cpuState);</a>
+<a name="ln321">	BReference&lt;StackTrace&gt; stackTraceReference(stackTrace);</a>
+<a name="ln322"> </a>
+<a name="ln323">	if (action == MSG_THREAD_SET_ADDRESS) {</a>
+<a name="ln324">		_HandleSetAddress(cpuState, address);</a>
+<a name="ln325">		return;</a>
+<a name="ln326">	}</a>
+<a name="ln327"> </a>
+<a name="ln328">	// When continuing the thread update thread state before actually issuing</a>
+<a name="ln329">	// the command, since we need to unlock.</a>
+<a name="ln330">	if (action != MSG_THREAD_STOP) {</a>
+<a name="ln331">		_SetThreadState(THREAD_STATE_RUNNING, NULL, THREAD_STOPPED_UNKNOWN,</a>
+<a name="ln332">			BString());</a>
+<a name="ln333">	}</a>
+<a name="ln334"> </a>
+<a name="ln335">	locker.Unlock();</a>
+<a name="ln336"> </a>
+<a name="ln337">	switch (action) {</a>
+<a name="ln338">		case MSG_THREAD_RUN:</a>
+<a name="ln339">			fStepMode = address != 0 ? STEP_UNTIL : STEP_NONE;</a>
+<a name="ln340">			if (address != 0)</a>
+<a name="ln341">				_InstallTemporaryBreakpoint(address);</a>
+<a name="ln342">			_RunThread(0);</a>
+<a name="ln343">			return;</a>
+<a name="ln344">		case MSG_THREAD_STOP:</a>
+<a name="ln345">			fStepMode = STEP_NONE;</a>
+<a name="ln346">			if (fDebuggerInterface-&gt;StopThread(ThreadID()) == B_OK)</a>
+<a name="ln347">				fThread-&gt;SetStopRequestPending();</a>
+<a name="ln348">			return;</a>
+<a name="ln349">		case MSG_THREAD_STEP_OVER:</a>
+<a name="ln350">		case MSG_THREAD_STEP_INTO:</a>
+<a name="ln351">		case MSG_THREAD_STEP_OUT:</a>
+<a name="ln352">			break;</a>
+<a name="ln353">	}</a>
+<a name="ln354"> </a>
+<a name="ln355">	TRACE_CONTROL(&quot;ThreadHandler::HandleThreadAction(MSG_THREAD_STEP_*)\n&quot;);</a>
+<a name="ln356"> </a>
+<a name="ln357">	// We want to step. We need a stack trace for that purpose. If we don't</a>
+<a name="ln358">	// have one yet, get it. Start with the CPU state.</a>
+<a name="ln359">	if (stackTrace == NULL &amp;&amp; cpuState == NULL) {</a>
+<a name="ln360">		if (fDebuggerInterface-&gt;GetCpuState(fThread-&gt;ID(), cpuState) == B_OK)</a>
+<a name="ln361">			cpuStateReference.SetTo(cpuState, true);</a>
+<a name="ln362">	}</a>
+<a name="ln363"> </a>
+<a name="ln364">	if (stackTrace == NULL &amp;&amp; cpuState != NULL) {</a>
+<a name="ln365">		if (fDebuggerInterface-&gt;GetArchitecture()-&gt;CreateStackTrace(</a>
+<a name="ln366">				fThread-&gt;GetTeam(), this, cpuState, stackTrace, NULL, 1,</a>
+<a name="ln367">				false, false) == B_OK) {</a>
+<a name="ln368">			stackTraceReference.SetTo(stackTrace, true);</a>
+<a name="ln369">		}</a>
+<a name="ln370">	}</a>
+<a name="ln371"> </a>
+<a name="ln372">	if (stackTrace == NULL || stackTrace-&gt;CountFrames() == 0) {</a>
+<a name="ln373">		_StepFallback();</a>
+<a name="ln374">		return;</a>
+<a name="ln375">	}</a>
+<a name="ln376"> </a>
+<a name="ln377">	StackFrame* frame = stackTrace-&gt;FrameAt(0);</a>
+<a name="ln378"> </a>
+<a name="ln379">	TRACE_CONTROL(&quot;  ip: %#&quot; B_PRIx64 &quot;\n&quot;, frame-&gt;InstructionPointer());</a>
+<a name="ln380"> </a>
+<a name="ln381">	target_addr_t frameIP = frame-&gt;GetCpuState()-&gt;InstructionPointer();</a>
+<a name="ln382">	// When the thread is in a syscall, do the same for all step kinds: Stop it</a>
+<a name="ln383">	// when it returns by means of a breakpoint.</a>
+<a name="ln384">	if (frame-&gt;Type() == STACK_FRAME_TYPE_SYSCALL) {</a>
+<a name="ln385">		// set a breakpoint at the CPU state's instruction pointer (points to</a>
+<a name="ln386">		// the return address, unlike the stack frame's instruction pointer)</a>
+<a name="ln387">// TODO: This is doesn't work correctly anymore. When stepping over a &quot;syscall&quot;</a>
+<a name="ln388">// instruction the thread is stopped twice. The after the first step the PC is</a>
+<a name="ln389">// incorrectly shown at the &quot;syscall&quot; instruction. Then we step again and are</a>
+<a name="ln390">// stopped at the temporary breakpoint after the &quot;syscall&quot; instruction. There</a>
+<a name="ln391">// are two problems. The first one is that we don't (cannot?) discriminate</a>
+<a name="ln392">// between the thread being in a syscall (like in a blocking syscall) and the</a>
+<a name="ln393">// thread having been stopped (or singled-stepped) at the end of the syscall.</a>
+<a name="ln394">// The second issue is that the temporary breakpoint is probably not necessary</a>
+<a name="ln395">// anymore, since single-stepping over &quot;syscall&quot; instructions should just work</a>
+<a name="ln396">// as expected.</a>
+<a name="ln397">		status_t error = _InstallTemporaryBreakpoint(frameIP);</a>
+<a name="ln398">		if (error != B_OK) {</a>
+<a name="ln399">			_StepFallback();</a>
+<a name="ln400">			return;</a>
+<a name="ln401">		}</a>
+<a name="ln402"> </a>
+<a name="ln403">		fStepMode = STEP_OUT;</a>
+<a name="ln404">		_RunThread(frameIP);</a>
+<a name="ln405">		return;</a>
+<a name="ln406">	}</a>
+<a name="ln407"> </a>
+<a name="ln408">	// For &quot;step out&quot; just set a temporary breakpoint on the return address.</a>
+<a name="ln409">	if (action == MSG_THREAD_STEP_OUT) {</a>
+<a name="ln410">		status_t error = _InstallTemporaryBreakpoint(frame-&gt;ReturnAddress());</a>
+<a name="ln411">		if (error != B_OK) {</a>
+<a name="ln412">			_StepFallback();</a>
+<a name="ln413">			return;</a>
+<a name="ln414">		}</a>
+<a name="ln415">		fPreviousInstructionPointer = frameIP;</a>
+<a name="ln416">		fPreviousFrameAddress = frame-&gt;FrameAddress();</a>
+<a name="ln417">		fStepMode = STEP_OUT;</a>
+<a name="ln418">		_RunThread(frameIP);</a>
+<a name="ln419">		return;</a>
+<a name="ln420">	}</a>
+<a name="ln421"> </a>
+<a name="ln422">	// For &quot;step in&quot; and &quot;step over&quot; we also need the source code statement at</a>
+<a name="ln423">	// the current instruction pointer.</a>
+<a name="ln424">	fStepStatement = _GetStatementAtInstructionPointer(frame);</a>
+<a name="ln425">	if (fStepStatement == NULL) {</a>
+<a name="ln426">		_StepFallback();</a>
+<a name="ln427">		return;</a>
+<a name="ln428">	}</a>
+<a name="ln429"> </a>
+<a name="ln430">	TRACE_CONTROL(&quot;  statement: %#&quot; B_PRIx64 &quot; - %#&quot; B_PRIx64 &quot;\n&quot;,</a>
+<a name="ln431">		fStepStatement-&gt;CoveringAddressRange().Start(),</a>
+<a name="ln432">		fStepStatement-&gt;CoveringAddressRange().End());</a>
+<a name="ln433"> </a>
+<a name="ln434">	if (action == MSG_THREAD_STEP_INTO) {</a>
+<a name="ln435">		// step into</a>
+<a name="ln436">		fStepMode = STEP_INTO;</a>
+<a name="ln437">		_SingleStepThread(frameIP);</a>
+<a name="ln438">	} else {</a>
+<a name="ln439">		fPreviousFrameAddress = frame-&gt;FrameAddress();</a>
+<a name="ln440">		// step over</a>
+<a name="ln441">		fStepMode = STEP_OVER;</a>
+<a name="ln442">		if (!_DoStepOver(frame-&gt;GetCpuState()))</a>
+<a name="ln443">			_StepFallback();</a>
+<a name="ln444">	}</a>
+<a name="ln445">}</a>
+<a name="ln446"> </a>
+<a name="ln447"> </a>
+<a name="ln448">void</a>
+<a name="ln449">ThreadHandler::HandleThreadStateChanged()</a>
+<a name="ln450">{</a>
+<a name="ln451">	AutoLocker&lt;Team&gt; locker(fThread-&gt;GetTeam());</a>
+<a name="ln452"> </a>
+<a name="ln453">	// cancel jobs for this thread</a>
+<a name="ln454">	fWorker-&gt;AbortJob(SimpleJobKey(fThread, JOB_TYPE_GET_CPU_STATE));</a>
+<a name="ln455">	fWorker-&gt;AbortJob(SimpleJobKey(fThread, JOB_TYPE_GET_STACK_TRACE));</a>
+<a name="ln456"> </a>
+<a name="ln457">	// If the thread is stopped and has no CPU state yet, schedule a job.</a>
+<a name="ln458">	if (fThread-&gt;State() == THREAD_STATE_STOPPED</a>
+<a name="ln459">			&amp;&amp; fThread-&gt;GetCpuState() == NULL) {</a>
+<a name="ln460">		fWorker-&gt;ScheduleJob(</a>
+<a name="ln461">			new(std::nothrow) GetCpuStateJob(fDebuggerInterface, fThread),</a>
+<a name="ln462">			fJobListener);</a>
+<a name="ln463">	}</a>
+<a name="ln464">}</a>
+<a name="ln465"> </a>
+<a name="ln466"> </a>
+<a name="ln467">void</a>
+<a name="ln468">ThreadHandler::HandleCpuStateChanged()</a>
+<a name="ln469">{</a>
+<a name="ln470">	AutoLocker&lt;Team&gt; locker(fThread-&gt;GetTeam());</a>
+<a name="ln471"> </a>
+<a name="ln472">	// cancel stack trace job for this thread</a>
+<a name="ln473">	fWorker-&gt;AbortJob(SimpleJobKey(fThread, JOB_TYPE_GET_STACK_TRACE));</a>
+<a name="ln474"> </a>
+<a name="ln475">	// If the thread has a CPU state, but no stack trace yet, schedule a job.</a>
+<a name="ln476">	if (fThread-&gt;GetCpuState() != NULL &amp;&amp; fThread-&gt;GetStackTrace() == NULL) {</a>
+<a name="ln477">		fWorker-&gt;ScheduleJob(</a>
+<a name="ln478">			new(std::nothrow) GetStackTraceJob(fDebuggerInterface,</a>
+<a name="ln479">				fJobListener, fDebuggerInterface-&gt;GetArchitecture(),</a>
+<a name="ln480">				fThread), fJobListener);</a>
+<a name="ln481">	}</a>
+<a name="ln482">}</a>
+<a name="ln483"> </a>
+<a name="ln484"> </a>
+<a name="ln485">void</a>
+<a name="ln486">ThreadHandler::HandleStackTraceChanged()</a>
+<a name="ln487">{</a>
+<a name="ln488">}</a>
+<a name="ln489"> </a>
+<a name="ln490"> </a>
+<a name="ln491">status_t</a>
+<a name="ln492">ThreadHandler::GetImageDebugInfo(Image* image, ImageDebugInfo*&amp; _info)</a>
+<a name="ln493">{</a>
+<a name="ln494">	AutoLocker&lt;Team&gt; teamLocker(fThread-&gt;GetTeam());</a>
+<a name="ln495"> </a>
+<a name="ln496">	if (image-&gt;GetImageDebugInfo() != NULL) {</a>
+<a name="ln497">		_info = image-&gt;GetImageDebugInfo();</a>
+<a name="ln498">		_info-&gt;AcquireReference();</a>
+<a name="ln499">		return B_OK;</a>
+<a name="ln500">	}</a>
+<a name="ln501"> </a>
+<a name="ln502">	// Let's be lazy. If the image debug info has not been loaded yet, the user</a>
+<a name="ln503">	// can't have seen any source code either.</a>
+<a name="ln504">	return B_ENTRY_NOT_FOUND;</a>
+<a name="ln505">}</a>
+<a name="ln506"> </a>
+<a name="ln507"> </a>
+<a name="ln508">bool</a>
+<a name="ln509">ThreadHandler::_HandleThreadStopped(CpuState* cpuState, uint32 stoppedReason,</a>
+<a name="ln510">	const BString&amp; stoppedReasonInfo)</a>
+<a name="ln511">{</a>
+<a name="ln512">	_ClearContinuationState();</a>
+<a name="ln513"> </a>
+<a name="ln514">	AutoLocker&lt;Team&gt; locker(fThread-&gt;GetTeam());</a>
+<a name="ln515"> </a>
+<a name="ln516">	_SetThreadState(THREAD_STATE_STOPPED, cpuState, stoppedReason,</a>
+<a name="ln517">		stoppedReasonInfo);</a>
+<a name="ln518"> </a>
+<a name="ln519">	return true;</a>
+<a name="ln520">}</a>
+<a name="ln521"> </a>
+<a name="ln522"> </a>
+<a name="ln523">bool</a>
+<a name="ln524">ThreadHandler::_HandleSetAddress(CpuState* state, target_addr_t address)</a>
+<a name="ln525">{</a>
+<a name="ln526">	CpuState* newState = NULL;</a>
+<a name="ln527">	if (state-&gt;Clone(newState) != B_OK)</a>
+<a name="ln528">		return false;</a>
+<a name="ln529">	BReference&lt;CpuState&gt; stateReference(newState, true);</a>
+<a name="ln530"> </a>
+<a name="ln531">	newState-&gt;SetInstructionPointer(address);</a>
+<a name="ln532">	if (fDebuggerInterface-&gt;SetCpuState(fThread-&gt;ID(), newState) != B_OK)</a>
+<a name="ln533">		return false;</a>
+<a name="ln534"> </a>
+<a name="ln535">	AutoLocker&lt;Team&gt; locker(fThread-&gt;GetTeam());</a>
+<a name="ln536">	fThread-&gt;SetStackTrace(NULL);</a>
+<a name="ln537">	fThread-&gt;SetCpuState(newState);</a>
+<a name="ln538"> </a>
+<a name="ln539">	return true;</a>
+<a name="ln540">}</a>
+<a name="ln541"> </a>
+<a name="ln542"> </a>
+<a name="ln543">void</a>
+<a name="ln544">ThreadHandler::_SetThreadState(uint32 state, CpuState* cpuState,</a>
+<a name="ln545">	uint32 stoppedReason, const BString&amp; stoppedReasonInfo)</a>
+<a name="ln546">{</a>
+<a name="ln547">	fThread-&gt;SetState(state, stoppedReason, stoppedReasonInfo);</a>
+<a name="ln548">	fThread-&gt;SetCpuState(cpuState);</a>
+<a name="ln549">}</a>
+<a name="ln550"> </a>
+<a name="ln551"> </a>
+<a name="ln552">Statement*</a>
+<a name="ln553">ThreadHandler::_GetStatementAtInstructionPointer(StackFrame* frame)</a>
+<a name="ln554">{</a>
+<a name="ln555">	AutoLocker&lt;Team&gt; locker(fThread-&gt;GetTeam());</a>
+<a name="ln556"> </a>
+<a name="ln557">	FunctionInstance* functionInstance = frame-&gt;Function();</a>
+<a name="ln558">	if (functionInstance == NULL)</a>
+<a name="ln559">		return NULL;</a>
+<a name="ln560">	FunctionDebugInfo* function = functionInstance-&gt;GetFunctionDebugInfo();</a>
+<a name="ln561"> </a>
+<a name="ln562">	// If there's source code attached to the function, we can just get the</a>
+<a name="ln563">	// statement.</a>
+<a name="ln564">//	SourceCode* sourceCode = function-&gt;GetSourceCode();</a>
+<a name="ln565">//	if (sourceCode != NULL) {</a>
+<a name="ln566">//		Statement* statement = sourceCode-&gt;StatementAtAddress(</a>
+<a name="ln567">//			frame-&gt;InstructionPointer());</a>
+<a name="ln568">//		if (statement != NULL)</a>
+<a name="ln569">//			statement-&gt;AcquireReference();</a>
+<a name="ln570">//		return statement;</a>
+<a name="ln571">//	}</a>
+<a name="ln572"> </a>
+<a name="ln573">	locker.Unlock();</a>
+<a name="ln574"> </a>
+<a name="ln575">	// We need to get the statement from the debug info of the function.</a>
+<a name="ln576">	Statement* statement;</a>
+<a name="ln577">	if (function-&gt;GetSpecificImageDebugInfo()-&gt;GetStatement(function,</a>
+<a name="ln578">			frame-&gt;InstructionPointer(), statement) != B_OK) {</a>
+<a name="ln579">		return NULL;</a>
+<a name="ln580">	}</a>
+<a name="ln581"> </a>
+<a name="ln582">	return statement;</a>
+<a name="ln583">}</a>
+<a name="ln584"> </a>
+<a name="ln585"> </a>
+<a name="ln586">void</a>
+<a name="ln587">ThreadHandler::_StepFallback()</a>
+<a name="ln588">{</a>
+<a name="ln589">	fStepMode = STEP_NONE;</a>
+<a name="ln590">	_SingleStepThread(0);</a>
+<a name="ln591">}</a>
+<a name="ln592"> </a>
+<a name="ln593"> </a>
+<a name="ln594">bool</a>
+<a name="ln595">ThreadHandler::_DoStepOver(CpuState* cpuState)</a>
+<a name="ln596">{</a>
+<a name="ln597">	TRACE_CONTROL(&quot;ThreadHandler::_DoStepOver()\n&quot;);</a>
+<a name="ln598"> </a>
+<a name="ln599">	// The basic strategy is to single-step out of the statement like for</a>
+<a name="ln600">	// &quot;step into&quot;, only we have to avoid stepping into subroutines. Hence we</a>
+<a name="ln601">	// check whether the current instruction is a subroutine call. If not, we</a>
+<a name="ln602">	// just single-step, otherwise we set a breakpoint after the instruction.</a>
+<a name="ln603">	InstructionInfo info;</a>
+<a name="ln604">	if (fDebuggerInterface-&gt;GetArchitecture()-&gt;GetInstructionInfo(</a>
+<a name="ln605">			cpuState-&gt;InstructionPointer(), info, cpuState) != B_OK) {</a>
+<a name="ln606">		TRACE_CONTROL(&quot;  failed to get instruction info\n&quot;);</a>
+<a name="ln607">		return false;</a>
+<a name="ln608">	}</a>
+<a name="ln609"> </a>
+<a name="ln610">	if (info.Type() != INSTRUCTION_TYPE_SUBROUTINE_CALL) {</a>
+<a name="ln611">		_SingleStepThread(cpuState-&gt;InstructionPointer());</a>
+<a name="ln612"> </a>
+<a name="ln613">		TRACE_CONTROL(&quot;  not a subroutine call\n&quot;);</a>
+<a name="ln614">		return true;</a>
+<a name="ln615">	}</a>
+<a name="ln616"> </a>
+<a name="ln617">	TRACE_CONTROL(&quot;  subroutine call -- installing breakpoint at address &quot;</a>
+<a name="ln618">		&quot;%#&quot; B_PRIx64 &quot;\n&quot;, info.Address() + info.Size());</a>
+<a name="ln619"> </a>
+<a name="ln620">	if (_InstallTemporaryBreakpoint(info.Address() + info.Size()) != B_OK)</a>
+<a name="ln621">		return false;</a>
+<a name="ln622"> </a>
+<a name="ln623">	fSteppedOverFunctionAddress = info.TargetAddress();</a>
+<a name="ln624"> </a>
+<a name="ln625">	_RunThread(cpuState-&gt;InstructionPointer());</a>
+<a name="ln626">	return true;</a>
+<a name="ln627">}</a>
+<a name="ln628"> </a>
+<a name="ln629"> </a>
+<a name="ln630">status_t</a>
+<a name="ln631">ThreadHandler::_InstallTemporaryBreakpoint(target_addr_t address)</a>
+<a name="ln632">{</a>
+<a name="ln633">	_UninstallTemporaryBreakpoint();</a>
+<a name="ln634"> </a>
+<a name="ln635">	status_t error = fBreakpointManager-&gt;InstallTemporaryBreakpoint(address,</a>
+<a name="ln636">		this);</a>
+<a name="ln637">	if (error != B_OK)</a>
+<a name="ln638">		return error;</a>
+<a name="ln639"> </a>
+<a name="ln640">	fBreakpointAddress = address;</a>
+<a name="ln641">	return B_OK;</a>
+<a name="ln642">}</a>
+<a name="ln643"> </a>
+<a name="ln644"> </a>
+<a name="ln645">void</a>
+<a name="ln646">ThreadHandler::_UninstallTemporaryBreakpoint()</a>
+<a name="ln647">{</a>
+<a name="ln648">	if (fBreakpointAddress == 0)</a>
+<a name="ln649">		return;</a>
+<a name="ln650"> </a>
+<a name="ln651">	fBreakpointManager-&gt;UninstallTemporaryBreakpoint(fBreakpointAddress, this);</a>
+<a name="ln652">	fBreakpointAddress = 0;</a>
+<a name="ln653">}</a>
+<a name="ln654"> </a>
+<a name="ln655"> </a>
+<a name="ln656">void</a>
+<a name="ln657">ThreadHandler::_ClearContinuationState()</a>
+<a name="ln658">{</a>
+<a name="ln659">	_UninstallTemporaryBreakpoint();</a>
+<a name="ln660"> </a>
+<a name="ln661">	if (fStepStatement != NULL) {</a>
+<a name="ln662">		fStepStatement-&gt;ReleaseReference();</a>
+<a name="ln663">		fStepStatement = NULL;</a>
+<a name="ln664">	}</a>
+<a name="ln665"> </a>
+<a name="ln666">	fStepMode = STEP_NONE;</a>
+<a name="ln667">	fSingleStepping = false;</a>
+<a name="ln668">}</a>
+<a name="ln669"> </a>
+<a name="ln670"> </a>
+<a name="ln671">void</a>
+<a name="ln672">ThreadHandler::_RunThread(target_addr_t instructionPointer)</a>
+<a name="ln673">{</a>
+<a name="ln674">	fPreviousInstructionPointer = instructionPointer;</a>
+<a name="ln675">	fDebuggerInterface-&gt;ContinueThread(ThreadID());</a>
+<a name="ln676">	fSingleStepping = false;</a>
+<a name="ln677">}</a>
+<a name="ln678"> </a>
+<a name="ln679"> </a>
+<a name="ln680">void</a>
+<a name="ln681">ThreadHandler::_SingleStepThread(target_addr_t instructionPointer)</a>
+<a name="ln682">{</a>
+<a name="ln683">	fPreviousInstructionPointer = instructionPointer;</a>
+<a name="ln684">	fDebuggerInterface-&gt;SingleStepThread(ThreadID());</a>
+<a name="ln685">	fSingleStepping = true;</a>
+<a name="ln686">}</a>
+<a name="ln687"> </a>
+<a name="ln688"> </a>
+<a name="ln689">bool</a>
+<a name="ln690">ThreadHandler::_HandleBreakpointHitStep(CpuState* cpuState)</a>
+<a name="ln691">{</a>
+<a name="ln692">	// in any case uninstall the temporary breakpoint</a>
+<a name="ln693">	_UninstallTemporaryBreakpoint();</a>
+<a name="ln694"> </a>
+<a name="ln695">	switch (fStepMode) {</a>
+<a name="ln696">		case STEP_OVER:</a>
+<a name="ln697">		{</a>
+<a name="ln698">			StackTrace* stackTrace = fThread-&gt;GetStackTrace();</a>
+<a name="ln699">			BReference&lt;StackTrace&gt; stackTraceReference(stackTrace);</a>
+<a name="ln700"> </a>
+<a name="ln701">			if (stackTrace == NULL &amp;&amp; cpuState != NULL) {</a>
+<a name="ln702">				if (fDebuggerInterface-&gt;GetArchitecture()-&gt;CreateStackTrace(</a>
+<a name="ln703">						fThread-&gt;GetTeam(), this, cpuState, stackTrace, NULL,</a>
+<a name="ln704">						1, false, false) == B_OK) {</a>
+<a name="ln705">					stackTraceReference.SetTo(stackTrace, true);</a>
+<a name="ln706">				}</a>
+<a name="ln707">			}</a>
+<a name="ln708">			if (stackTrace != NULL) {</a>
+<a name="ln709">				StackFrame* frame = stackTrace-&gt;FrameAt(0);</a>
+<a name="ln710">				// If we're not in the same frame we started in,</a>
+<a name="ln711">				// keep executing.</a>
+<a name="ln712">				if (frame != NULL &amp;&amp; fPreviousFrameAddress</a>
+<a name="ln713">						!= frame-&gt;FrameAddress()) {</a>
+<a name="ln714">					status_t error = _InstallTemporaryBreakpoint(</a>
+<a name="ln715">						cpuState-&gt;InstructionPointer());</a>
+<a name="ln716">					if (error != B_OK)</a>
+<a name="ln717">						_StepFallback();</a>
+<a name="ln718">					else</a>
+<a name="ln719">						_RunThread(cpuState-&gt;InstructionPointer());</a>
+<a name="ln720">					return true;</a>
+<a name="ln721">				}</a>
+<a name="ln722">			}</a>
+<a name="ln723"> </a>
+<a name="ln724">			if (fPreviousFrameAddress != 0 &amp;&amp; fSteppedOverFunctionAddress != 0</a>
+<a name="ln725">					&amp;&amp; fSteppedOverFunctionAddress != cpuState-&gt;InstructionPointer()) {</a>
+<a name="ln726">				TRACE_CONTROL(&quot;STEP_OVER: called function address %#&quot; B_PRIx64</a>
+<a name="ln727">					&quot;, previous frame address: %#&quot; B_PRIx64 &quot;, frame address: %#&quot;</a>
+<a name="ln728">					B_PRIx64 &quot;, adding return info\n&quot;, fSteppedOverFunctionAddress,</a>
+<a name="ln729">					fPreviousFrameAddress, stackTrace-&gt;FrameAt(0)-&gt;FrameAddress());</a>
+<a name="ln730">				ReturnValueInfo* returnInfo = new(std::nothrow) ReturnValueInfo(</a>
+<a name="ln731">					fSteppedOverFunctionAddress, cpuState);</a>
+<a name="ln732">				if (returnInfo == NULL)</a>
+<a name="ln733">					return false;</a>
+<a name="ln734"> </a>
+<a name="ln735">				BReference&lt;ReturnValueInfo&gt; returnInfoReference(returnInfo, true);</a>
+<a name="ln736"> </a>
+<a name="ln737">				if (fThread-&gt;AddReturnValueInfo(returnInfo) != B_OK)</a>
+<a name="ln738">					return false;</a>
+<a name="ln739"> </a>
+<a name="ln740">				returnInfoReference.Detach();</a>
+<a name="ln741">				fSteppedOverFunctionAddress = 0;</a>
+<a name="ln742">			}</a>
+<a name="ln743"> </a>
+<a name="ln744">			// If we're still in the statement, we continue single-stepping,</a>
+<a name="ln745">			// otherwise we're done.</a>
+<a name="ln746">			if (fStepStatement-&gt;ContainsAddress(</a>
+<a name="ln747">					cpuState-&gt;InstructionPointer())) {</a>
+<a name="ln748">				if (!_DoStepOver(cpuState))</a>
+<a name="ln749">					_StepFallback();</a>
+<a name="ln750">				return true;</a>
+<a name="ln751">			}</a>
+<a name="ln752">			fPreviousFrameAddress = 0;</a>
+<a name="ln753">			return false;</a>
+<a name="ln754">		}</a>
+<a name="ln755"> </a>
+<a name="ln756">		case STEP_INTO:</a>
+<a name="ln757">			// Should never happen -- we don't set a breakpoint in this case.</a>
+<a name="ln758">			return false;</a>
+<a name="ln759"> </a>
+<a name="ln760">		case STEP_OUT:</a>
+<a name="ln761">		{</a>
+<a name="ln762">			// That's the return address, so we're done in theory,</a>
+<a name="ln763">			// unless we're a recursive function. Check if we've actually</a>
+<a name="ln764">			// exited the previous stack frame or not</a>
+<a name="ln765">			if (!_HasExitedFrame(cpuState-&gt;StackFramePointer())) {</a>
+<a name="ln766">				status_t error = _InstallTemporaryBreakpoint(</a>
+<a name="ln767">					cpuState-&gt;InstructionPointer());</a>
+<a name="ln768">				if (error != B_OK)</a>
+<a name="ln769">					_StepFallback();</a>
+<a name="ln770">				else</a>
+<a name="ln771">					_RunThread(cpuState-&gt;InstructionPointer());</a>
+<a name="ln772">				return true;</a>
+<a name="ln773">			}</a>
+<a name="ln774"> </a>
+<a name="ln775">			if (fPreviousFrameAddress == 0)</a>
+<a name="ln776">				return false;</a>
+<a name="ln777"> </a>
+<a name="ln778">			TRACE_CONTROL(&quot;ThreadHandler::_HandleBreakpointHitStep() - &quot;</a>
+<a name="ln779">				&quot;frame pointer 0x%#&quot; B_PRIx64 &quot;, previous: 0x%#&quot; B_PRIx64</a>
+<a name="ln780">				&quot; - step out adding return value\n&quot;, cpuState</a>
+<a name="ln781">					-&gt;StackFramePointer(), fPreviousFrameAddress);</a>
+<a name="ln782">			ReturnValueInfo* info = new(std::nothrow) ReturnValueInfo(</a>
+<a name="ln783">				fPreviousInstructionPointer, cpuState);</a>
+<a name="ln784">			if (info == NULL)</a>
+<a name="ln785">				return false;</a>
+<a name="ln786">			BReference&lt;ReturnValueInfo&gt; infoReference(info, true);</a>
+<a name="ln787">			if (fThread-&gt;AddReturnValueInfo(info) != B_OK)</a>
+<a name="ln788">				return false;</a>
+<a name="ln789"> </a>
+<a name="ln790">			infoReference.Detach();</a>
+<a name="ln791">			fPreviousFrameAddress = 0;</a>
+<a name="ln792">		}</a>
+<a name="ln793"> </a>
+<a name="ln794">		default:</a>
+<a name="ln795">			return false;</a>
+<a name="ln796">	}</a>
+<a name="ln797">}</a>
+<a name="ln798"> </a>
+<a name="ln799"> </a>
+<a name="ln800">bool</a>
+<a name="ln801">ThreadHandler::_HandleSingleStepStep(CpuState* cpuState)</a>
+<a name="ln802">{</a>
+<a name="ln803">	TRACE_CONTROL(&quot;ThreadHandler::_HandleSingleStepStep(): ip: %&quot; B_PRIx64 &quot;\n&quot;,</a>
+<a name="ln804">		cpuState-&gt;InstructionPointer());</a>
+<a name="ln805"> </a>
+<a name="ln806">	switch (fStepMode) {</a>
+<a name="ln807">		case STEP_INTO:</a>
+<a name="ln808">		{</a>
+<a name="ln809">			// We continue stepping as long as we're in the statement.</a>
+<a name="ln810">			if (fStepStatement-&gt;ContainsAddress(cpuState-&gt;InstructionPointer())) {</a>
+<a name="ln811">				_SingleStepThread(cpuState-&gt;InstructionPointer());</a>
+<a name="ln812">				return true;</a>
+<a name="ln813">			}</a>
+<a name="ln814"> </a>
+<a name="ln815">			StackTrace* stackTrace = fThread-&gt;GetStackTrace();</a>
+<a name="ln816">			BReference&lt;StackTrace&gt; stackTraceReference(stackTrace);</a>
+<a name="ln817"> </a>
+<a name="ln818">			if (stackTrace == NULL &amp;&amp; cpuState != NULL) {</a>
+<a name="ln819">				if (fDebuggerInterface-&gt;GetArchitecture()-&gt;CreateStackTrace(</a>
+<a name="ln820">						fThread-&gt;GetTeam(), this, cpuState, stackTrace, NULL,</a>
+<a name="ln821">						1, false, false) == B_OK) {</a>
+<a name="ln822">					stackTraceReference.SetTo(stackTrace, true);</a>
+<a name="ln823">				}</a>
+<a name="ln824">			}</a>
+<a name="ln825"> </a>
+<a name="ln826">			if (stackTrace != NULL) {</a>
+<a name="ln827">				StackFrame* frame = stackTrace-&gt;FrameAt(0);</a>
+<a name="ln828">				Image* image = frame-&gt;GetImage();</a>
+<a name="ln829">				if (image == NULL)</a>
+<a name="ln830">					return false;</a>
+<a name="ln831"> </a>
+<a name="ln832">				ImageDebugInfo* info = NULL;</a>
+<a name="ln833">				if (GetImageDebugInfo(image, info) != B_OK)</a>
+<a name="ln834">					return false;</a>
+<a name="ln835"> </a>
+<a name="ln836">				BReference&lt;ImageDebugInfo&gt;(info, true);</a>
+<a name="ln837">				if (info-&gt;GetAddressSectionType(</a>
+<a name="ln838">						cpuState-&gt;InstructionPointer())</a>
+<a name="ln839">						== ADDRESS_SECTION_TYPE_PLT) {</a>
+<a name="ln840">					_SingleStepThread(cpuState-&gt;InstructionPointer());</a>
+<a name="ln841">					return true;</a>
+<a name="ln842">				}</a>
+<a name="ln843">			}</a>
+<a name="ln844">			return false;</a>
+<a name="ln845">		}</a>
+<a name="ln846"> </a>
+<a name="ln847">		case STEP_OVER:</a>
+<a name="ln848">		{</a>
+<a name="ln849">			// If we have stepped out of the statement, we're done.</a>
+<a name="ln850">			if (!fStepStatement-&gt;ContainsAddress(cpuState-&gt;InstructionPointer())) {</a>
+<a name="ln851">				StackTrace* stackTrace = fThread-&gt;GetStackTrace();</a>
+<a name="ln852">				BReference&lt;StackTrace&gt; stackTraceReference(stackTrace);</a>
+<a name="ln853">				if (stackTrace == NULL &amp;&amp; cpuState != NULL) {</a>
+<a name="ln854">					if (fDebuggerInterface-&gt;GetArchitecture()-&gt;CreateStackTrace(</a>
+<a name="ln855">							fThread-&gt;GetTeam(), this, cpuState, stackTrace,</a>
+<a name="ln856">							NULL, 1, false, false) == B_OK) {</a>
+<a name="ln857">						stackTraceReference.SetTo(stackTrace, true);</a>
+<a name="ln858">					}</a>
+<a name="ln859">				}</a>
+<a name="ln860"> </a>
+<a name="ln861"> </a>
+<a name="ln862">				if (stackTrace != NULL) {</a>
+<a name="ln863">					if (_HasExitedFrame(stackTrace-&gt;FrameAt(0)</a>
+<a name="ln864">						-&gt;FrameAddress())) {</a>
+<a name="ln865">						TRACE_CONTROL(&quot;ThreadHandler::_HandleSingleStepStep() &quot;</a>
+<a name="ln866">							&quot; - adding return value for STEP_OVER\n&quot;);</a>
+<a name="ln867">						ReturnValueInfo* info = new(std::nothrow)</a>
+<a name="ln868">							ReturnValueInfo(fStepStatement</a>
+<a name="ln869">								-&gt;CoveringAddressRange().Start(), cpuState);</a>
+<a name="ln870">						if (info == NULL)</a>
+<a name="ln871">							return false;</a>
+<a name="ln872">						BReference&lt;ReturnValueInfo&gt; infoReference(info, true);</a>
+<a name="ln873">						if (fThread-&gt;AddReturnValueInfo(info) != B_OK)</a>
+<a name="ln874">							return false;</a>
+<a name="ln875"> </a>
+<a name="ln876">						infoReference.Detach();</a>
+<a name="ln877">					}</a>
+<a name="ln878">				}</a>
+<a name="ln879">				return false;</a>
+<a name="ln880">			}</a>
+<a name="ln881">			return _DoStepOver(cpuState);</a>
+<a name="ln882">		}</a>
+<a name="ln883"> </a>
+<a name="ln884">		case STEP_OUT:</a>
+<a name="ln885">			// We never single-step in this case.</a>
+<a name="ln886">		default:</a>
+<a name="ln887">			return false;</a>
+<a name="ln888">	}</a>
+<a name="ln889">}</a>
+<a name="ln890"> </a>
+<a name="ln891"> </a>
+<a name="ln892">bool</a>
+<a name="ln893">ThreadHandler::_HandleBreakpointConditionIfNeeded(CpuState* cpuState)</a>
+<a name="ln894">{</a>
+<a name="ln895">	AutoLocker&lt; ::Team&gt; teamLocker(fThread-&gt;GetTeam());</a>
+<a name="ln896">	Breakpoint* breakpoint = fThread-&gt;GetTeam()-&gt;BreakpointAtAddress(</a>
+<a name="ln897">		cpuState-&gt;InstructionPointer());</a>
+<a name="ln898"> </a>
+<a name="ln899">	if (breakpoint == NULL)</a>
+<a name="ln900">		return false;</a>
+<a name="ln901"> </a>
+<a name="ln902">	if (!breakpoint-&gt;HasEnabledUserBreakpoint())</a>
+<a name="ln903">		return false;</a>
+<a name="ln904"> </a>
+<a name="ln905">	const UserBreakpointInstanceList&amp; breakpoints</a>
+<a name="ln906">		= breakpoint-&gt;UserBreakpoints();</a>
+<a name="ln907"> </a>
+<a name="ln908">	for (UserBreakpointInstanceList::ConstIterator it</a>
+<a name="ln909">			= breakpoints.GetIterator(); it.HasNext();) {</a>
+<a name="ln910">		UserBreakpoint* userBreakpoint = it.Next()-&gt;GetUserBreakpoint();</a>
+<a name="ln911">		if (!userBreakpoint-&gt;IsValid())</a>
+<a name="ln912">			continue;</a>
+<a name="ln913">		if (!userBreakpoint-&gt;IsEnabled())</a>
+<a name="ln914">			continue;</a>
+<a name="ln915">		if (!userBreakpoint-&gt;HasCondition())</a>
+<a name="ln916">			continue;</a>
+<a name="ln917"> </a>
+<a name="ln918">		StackTrace* stackTrace = fThread-&gt;GetStackTrace();</a>
+<a name="ln919">		BReference&lt;StackTrace&gt; stackTraceReference;</a>
+<a name="ln920">		if (stackTrace == NULL) {</a>
+<a name="ln921">			if (fDebuggerInterface-&gt;GetArchitecture()-&gt;CreateStackTrace(</a>
+<a name="ln922">				fThread-&gt;GetTeam(), this, cpuState, stackTrace, NULL, 1,</a>
+<a name="ln923">				false, true) == B_OK) {</a>
+<a name="ln924">				stackTraceReference.SetTo(stackTrace, true);</a>
+<a name="ln925">			} else</a>
+<a name="ln926">				return false;</a>
+<a name="ln927">		}</a>
+<a name="ln928"> </a>
+<a name="ln929">		StackFrame* frame = stackTrace-&gt;FrameAt(0);</a>
+<a name="ln930">		FunctionDebugInfo* info = frame-&gt;Function()-&gt;GetFunctionDebugInfo();</a>
+<a name="ln931">		if (info == NULL)</a>
+<a name="ln932">			return false;</a>
+<a name="ln933"> </a>
+<a name="ln934">		SpecificImageDebugInfo* specificInfo</a>
+<a name="ln935">			= info-&gt;GetSpecificImageDebugInfo();</a>
+<a name="ln936">		if (specificInfo == NULL)</a>
+<a name="ln937">			return false;</a>
+<a name="ln938"> </a>
+<a name="ln939">		SourceLanguage* language;</a>
+<a name="ln940">		if (specificInfo-&gt;GetSourceLanguage(info, language) != B_OK)</a>
+<a name="ln941">			return false;</a>
+<a name="ln942"> </a>
+<a name="ln943">		BReference&lt;SourceLanguage&gt; reference(language, true);</a>
+<a name="ln944">		ExpressionEvaluationListener* listener</a>
+<a name="ln945">			= new(std::nothrow) ExpressionEvaluationListener(this);</a>
+<a name="ln946">		if (listener == NULL)</a>
+<a name="ln947">			return false;</a>
+<a name="ln948"> </a>
+<a name="ln949">		ExpressionInfo* expressionInfo = new(std::nothrow) ExpressionInfo(</a>
+<a name="ln950">			userBreakpoint-&gt;Condition());</a>
+<a name="ln951"> </a>
+<a name="ln952">		if (expressionInfo == NULL)</a>
+<a name="ln953">			return false;</a>
+<a name="ln954"> </a>
+<a name="ln955">		BReference&lt;ExpressionInfo&gt; expressionReference(expressionInfo, true);</a>
+<a name="ln956"> </a>
+<a name="ln957">		expressionInfo-&gt;AddListener(listener);</a>
+<a name="ln958"> </a>
+<a name="ln959">		status_t error = fWorker-&gt;ScheduleJob(</a>
+<a name="ln960">			new(std::nothrow) ExpressionEvaluationJob(fThread-&gt;GetTeam(),</a>
+<a name="ln961">				fDebuggerInterface, language, expressionInfo, frame, fThread),</a>
+<a name="ln962">			fJobListener);</a>
+<a name="ln963"> </a>
+<a name="ln964">		BPrivate::ObjectDeleter&lt;ExpressionEvaluationListener&gt; deleter(</a>
+<a name="ln965">			listener);</a>
+<a name="ln966">		if (error == B_OK) {</a>
+<a name="ln967">			teamLocker.Unlock();</a>
+<a name="ln968">			do {</a>
+<a name="ln969">				error = acquire_sem(fConditionWaitSem);</a>
+<a name="ln970">			} while (error == B_INTERRUPTED);</a>
+<a name="ln971"> </a>
+<a name="ln972">			teamLocker.Lock();</a>
+<a name="ln973"> </a>
+<a name="ln974">			if (_CheckStopCondition()) {</a>
+<a name="ln975">				if (fConditionResult != NULL) {</a>
+<a name="ln976">					fConditionResult-&gt;ReleaseReference();</a>
+<a name="ln977">					fConditionResult = NULL;</a>
+<a name="ln978">				}</a>
+<a name="ln979">				_SetThreadState(THREAD_STATE_STOPPED, cpuState,</a>
+<a name="ln980">					THREAD_STOPPED_BREAKPOINT, BString());</a>
+<a name="ln981">				return false;</a>
+<a name="ln982">			} else {</a>
+<a name="ln983">				fDebuggerInterface-&gt;ContinueThread(ThreadID());</a>
+<a name="ln984">				return true;</a>
+<a name="ln985">			}</a>
+<a name="ln986">		}</a>
+<a name="ln987">	}</a>
+<a name="ln988"> </a>
+<a name="ln989">	return false;</a>
+<a name="ln990">}</a>
+<a name="ln991"> </a>
+<a name="ln992"> </a>
+<a name="ln993">void</a>
+<a name="ln994">ThreadHandler::_HandleBreakpointConditionEvaluated(ExpressionResult* value)</a>
+<a name="ln995">{</a>
+<a name="ln996">	fConditionResult = value;</a>
+<a name="ln997">	if (fConditionResult != NULL)</a>
+<a name="ln998">		fConditionResult-&gt;AcquireReference();</a>
+<a name="ln999">	release_sem(fConditionWaitSem);</a>
+<a name="ln1000">}</a>
+<a name="ln1001"> </a>
+<a name="ln1002"> </a>
+<a name="ln1003">bool</a>
+<a name="ln1004">ThreadHandler::_CheckStopCondition()</a>
+<a name="ln1005">{</a>
+<a name="ln1006">	// if we we're unable to properly assess the expression result</a>
+<a name="ln1007">	// in any way, fall back to behaving like an unconditional breakpoint.</a>
+<a name="ln1008">	if (fConditionResult == NULL)</a>
+<a name="ln1009">		return true;</a>
+<a name="ln1010"> </a>
+<a name="ln1011">	if (fConditionResult-&gt;Kind() != EXPRESSION_RESULT_KIND_PRIMITIVE)</a>
+<a name="ln1012">		return true;</a>
+<a name="ln1013"> </a>
+<a name="ln1014">	BVariant value;</a>
+<a name="ln1015">	if (!fConditionResult-&gt;PrimitiveValue()-&gt;ToVariant(value))</a>
+<a name="ln1016">		return true;</a>
+<a name="ln1017"> </a>
+<a name="ln1018">	return value.ToBool();</a>
+<a name="ln1019">}</a>
+<a name="ln1020"> </a>
+<a name="ln1021"> </a>
+<a name="ln1022">bool</a>
+<a name="ln1023">ThreadHandler::_HasExitedFrame(target_addr_t framePointer) const</a>
+<a name="ln1024">{</a>
+<a name="ln1025">	return fDebuggerInterface-&gt;GetArchitecture()-&gt;StackGrowthDirection()</a>
+<a name="ln1026">			== STACK_GROWTH_DIRECTION_POSITIVE</a>
+<a name="ln1027">				? framePointer &lt; fPreviousFrameAddress</a>
+<a name="ln1028">				: framePointer &gt; fPreviousFrameAddress;</a>
+<a name="ln1029">}</a>
+
+</code></pre>
+<div class="balloon" rel="953"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v773/" target="_blank">V773</a> The function was exited without releasing the 'listener' pointer. A memory leak is possible.</p></div>
+<div class="balloon" rel="811"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v595/" target="_blank">V595</a> The 'cpuState' pointer was utilized before it was verified against nullptr. Check lines: 811, 818.</p></div>
+<div class="balloon" rel="79"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fNext.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

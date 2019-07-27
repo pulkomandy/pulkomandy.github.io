@@ -1,0 +1,364 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>video.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2016, Haiku, Inc. All rights reserved.</a>
+<a name="ln3"> * Distributed under the terms of the MIT License.</a>
+<a name="ln4"> */</a>
+<a name="ln5"> </a>
+<a name="ln6"> </a>
+<a name="ln7">#include &quot;video.h&quot;</a>
+<a name="ln8"> </a>
+<a name="ln9">#include &lt;stdlib.h&gt;</a>
+<a name="ln10"> </a>
+<a name="ln11">#include &lt;boot/kernel_args.h&gt;</a>
+<a name="ln12">#include &lt;boot/menu.h&gt;</a>
+<a name="ln13">#include &lt;boot/platform.h&gt;</a>
+<a name="ln14">#include &lt;boot/platform/generic/video.h&gt;</a>
+<a name="ln15">#include &lt;boot/stage2.h&gt;</a>
+<a name="ln16">#include &lt;boot/stdio.h&gt;</a>
+<a name="ln17">#include &lt;drivers/driver_settings.h&gt;</a>
+<a name="ln18">#include &lt;util/list.h&gt;</a>
+<a name="ln19"> </a>
+<a name="ln20">#include &quot;efi_platform.h&quot;</a>
+<a name="ln21"> </a>
+<a name="ln22"> </a>
+<a name="ln23">//#define TRACE_VIDEO</a>
+<a name="ln24">#ifdef TRACE_VIDEO</a>
+<a name="ln25">#	define TRACE(x) dprintf x</a>
+<a name="ln26">#else</a>
+<a name="ln27">#	define TRACE(x) ;</a>
+<a name="ln28">#endif</a>
+<a name="ln29"> </a>
+<a name="ln30"> </a>
+<a name="ln31">struct video_mode {</a>
+<a name="ln32">	list_link	link;</a>
+<a name="ln33">	UINTN		mode;</a>
+<a name="ln34">	UINTN		width, height, bits_per_pixel, bytes_per_row;</a>
+<a name="ln35">};</a>
+<a name="ln36"> </a>
+<a name="ln37"> </a>
+<a name="ln38">static EFI_GUID sGraphicsOutputGuid = EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID;</a>
+<a name="ln39">static EFI_GRAPHICS_OUTPUT_PROTOCOL *sGraphicsOutput;</a>
+<a name="ln40">static UINTN sGraphicsMode;</a>
+<a name="ln41">static struct list sModeList;</a>
+<a name="ln42">static uint32 sModeCount;</a>
+<a name="ln43">static bool sModeChosen;</a>
+<a name="ln44">static bool sSettingsLoaded;</a>
+<a name="ln45"> </a>
+<a name="ln46"> </a>
+<a name="ln47">static int</a>
+<a name="ln48">compare_video_modes(video_mode *a, video_mode *b)</a>
+<a name="ln49">{</a>
+<a name="ln50">	int compare = a-&gt;width - b-&gt;width;</a>
+<a name="ln51">	if (compare != 0)</a>
+<a name="ln52">		return compare;</a>
+<a name="ln53"> </a>
+<a name="ln54">	compare = a-&gt;height - b-&gt;height;</a>
+<a name="ln55">	if (compare != 0)</a>
+<a name="ln56">		return compare;</a>
+<a name="ln57"> </a>
+<a name="ln58">	return a-&gt;bits_per_pixel - b-&gt;bits_per_pixel;</a>
+<a name="ln59">}</a>
+<a name="ln60"> </a>
+<a name="ln61"> </a>
+<a name="ln62">static void</a>
+<a name="ln63">add_video_mode(video_mode *videoMode)</a>
+<a name="ln64">{</a>
+<a name="ln65">	video_mode *mode = NULL;</a>
+<a name="ln66">	while ((mode = (video_mode*)list_get_next_item(&amp;sModeList, mode))</a>
+<a name="ln67">			!= NULL) {</a>
+<a name="ln68">		int compare = compare_video_modes(videoMode, mode);</a>
+<a name="ln69">		if (compare == 0) {</a>
+<a name="ln70">			// mode already exists</a>
+<a name="ln71">			return;</a>
+<a name="ln72">		}</a>
+<a name="ln73"> </a>
+<a name="ln74">		if (compare &gt; 0)</a>
+<a name="ln75">			break;</a>
+<a name="ln76">	}</a>
+<a name="ln77"> </a>
+<a name="ln78">	list_insert_item_before(&amp;sModeList, mode, videoMode);</a>
+<a name="ln79">	sModeCount++;</a>
+<a name="ln80">}</a>
+<a name="ln81"> </a>
+<a name="ln82"> </a>
+<a name="ln83">static video_mode*</a>
+<a name="ln84">closest_video_mode(uint32 width, uint32 height, uint32 depth)</a>
+<a name="ln85">{</a>
+<a name="ln86">	video_mode *bestMode = NULL;</a>
+<a name="ln87">	int64 bestDiff = 0;</a>
+<a name="ln88"> </a>
+<a name="ln89">	video_mode *mode = NULL;</a>
+<a name="ln90">	while ((mode = (video_mode*)list_get_next_item(&amp;sModeList, mode)) != NULL) {</a>
+<a name="ln91">		if (mode-&gt;width &gt; width) {</a>
+<a name="ln92">			// Only choose modes with a width less or equal than the searched</a>
+<a name="ln93">			// one; or else it might well be that the monitor cannot keep up.</a>
+<a name="ln94">			continue;</a>
+<a name="ln95">		}</a>
+<a name="ln96"> </a>
+<a name="ln97">		int64 diff = 2 * abs((int64)mode-&gt;width - width)</a>
+<a name="ln98">			+ abs((int64)mode-&gt;height - height)</a>
+<a name="ln99">			+ abs((int64)mode-&gt;bits_per_pixel - depth);</a>
+<a name="ln100"> </a>
+<a name="ln101">		if (bestMode == NULL || bestDiff &gt; diff) {</a>
+<a name="ln102">			bestMode = mode;</a>
+<a name="ln103">			bestDiff = diff;</a>
+<a name="ln104">		}</a>
+<a name="ln105">	}</a>
+<a name="ln106"> </a>
+<a name="ln107">	return bestMode;</a>
+<a name="ln108">}</a>
+<a name="ln109"> </a>
+<a name="ln110"> </a>
+<a name="ln111">static void</a>
+<a name="ln112">get_mode_from_settings(void)</a>
+<a name="ln113">{</a>
+<a name="ln114">	if (sSettingsLoaded)</a>
+<a name="ln115">		return;</a>
+<a name="ln116"> </a>
+<a name="ln117">	void *handle = load_driver_settings(&quot;vesa&quot;);</a>
+<a name="ln118">	if (handle == NULL)</a>
+<a name="ln119">		return;</a>
+<a name="ln120"> </a>
+<a name="ln121">	const driver_settings *settings = get_driver_settings(handle);</a>
+<a name="ln122">	if (settings == NULL)</a>
+<a name="ln123">		goto out;</a>
+<a name="ln124"> </a>
+<a name="ln125">	sSettingsLoaded = true;</a>
+<a name="ln126"> </a>
+<a name="ln127">	for (int32 i = 0; i &lt; settings-&gt;parameter_count; i++) {</a>
+<a name="ln128">		driver_parameter &amp;parameter = settings-&gt;parameters[i];</a>
+<a name="ln129"> </a>
+<a name="ln130">		if (parameter.value_count &lt; 3 || strcmp(parameter.name, &quot;mode&quot;) != 0) continue;</a>
+<a name="ln131">		uint32 width = strtoul(parameter.values[0], NULL, 0);</a>
+<a name="ln132">		uint32 height = strtoul(parameter.values[1], NULL, 0);</a>
+<a name="ln133">		uint32 depth = strtoul(parameter.values[2], NULL, 0);</a>
+<a name="ln134"> </a>
+<a name="ln135">		// search mode that fits</a>
+<a name="ln136">		video_mode *mode = closest_video_mode(width, height, depth);</a>
+<a name="ln137">		if (mode != NULL) {</a>
+<a name="ln138">			sGraphicsMode = mode-&gt;mode;</a>
+<a name="ln139">			break;</a>
+<a name="ln140">		}</a>
+<a name="ln141">	}</a>
+<a name="ln142"> </a>
+<a name="ln143">out:</a>
+<a name="ln144">	unload_driver_settings(handle);</a>
+<a name="ln145">}</a>
+<a name="ln146"> </a>
+<a name="ln147"> </a>
+<a name="ln148">extern &quot;C&quot; status_t</a>
+<a name="ln149">platform_init_video(void)</a>
+<a name="ln150">{</a>
+<a name="ln151">	list_init(&amp;sModeList);</a>
+<a name="ln152"> </a>
+<a name="ln153">	// we don't support VESA modes or EDID</a>
+<a name="ln154">	gKernelArgs.vesa_modes = NULL;</a>
+<a name="ln155">	gKernelArgs.vesa_modes_size = 0;</a>
+<a name="ln156">	gKernelArgs.edid_info = NULL;</a>
+<a name="ln157"> </a>
+<a name="ln158">	// make a guess at the best video mode to use, and save the mode ID</a>
+<a name="ln159">	// for switching to graphics mode</a>
+<a name="ln160">	EFI_STATUS status = kBootServices-&gt;LocateProtocol(&amp;sGraphicsOutputGuid,</a>
+<a name="ln161">		NULL, (void **)&amp;sGraphicsOutput);</a>
+<a name="ln162">	if (sGraphicsOutput == NULL || status != EFI_SUCCESS) {</a>
+<a name="ln163">		gKernelArgs.frame_buffer.enabled = false;</a>
+<a name="ln164">		sGraphicsOutput = NULL;</a>
+<a name="ln165">		return B_ERROR;</a>
+<a name="ln166">	}</a>
+<a name="ln167"> </a>
+<a name="ln168">	UINTN bestArea = 0;</a>
+<a name="ln169">	UINTN bestDepth = 0;</a>
+<a name="ln170"> </a>
+<a name="ln171">	TRACE((&quot;looking for best graphics mode...\n&quot;));</a>
+<a name="ln172"> </a>
+<a name="ln173">	for (UINTN mode = 0; mode &lt; sGraphicsOutput-&gt;Mode-&gt;MaxMode; ++mode) {</a>
+<a name="ln174">		EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *info;</a>
+<a name="ln175">		UINTN size, depth;</a>
+<a name="ln176">		sGraphicsOutput-&gt;QueryMode(sGraphicsOutput, mode, &amp;size, &amp;info);</a>
+<a name="ln177">		UINTN area = info-&gt;HorizontalResolution * info-&gt;VerticalResolution;</a>
+<a name="ln178">		TRACE((&quot;  mode: %lu\n&quot;, mode));</a>
+<a name="ln179">		TRACE((&quot;  width: %u\n&quot;, info-&gt;HorizontalResolution));</a>
+<a name="ln180">		TRACE((&quot;  height: %u\n&quot;, info-&gt;VerticalResolution));</a>
+<a name="ln181">		TRACE((&quot;  area: %lu\n&quot;, area));</a>
+<a name="ln182">		if (info-&gt;PixelFormat == PixelRedGreenBlueReserved8BitPerColor) {</a>
+<a name="ln183">			depth = 32;</a>
+<a name="ln184">		} else if (info-&gt;PixelFormat == PixelBlueGreenRedReserved8BitPerColor) {</a>
+<a name="ln185">			// seen this in the wild, but acts like RGB, go figure...</a>
+<a name="ln186">			depth = 32;</a>
+<a name="ln187">		} else if (info-&gt;PixelFormat == PixelBitMask</a>
+<a name="ln188">			&amp;&amp; info-&gt;PixelInformation.RedMask == 0xFF0000</a>
+<a name="ln189">			&amp;&amp; info-&gt;PixelInformation.GreenMask == 0x00FF00</a>
+<a name="ln190">			&amp;&amp; info-&gt;PixelInformation.BlueMask == 0x0000FF</a>
+<a name="ln191">			&amp;&amp; info-&gt;PixelInformation.ReservedMask == 0) {</a>
+<a name="ln192">			depth = 24;</a>
+<a name="ln193">		} else {</a>
+<a name="ln194">			TRACE((&quot;  pixel format: %x unsupported\n&quot;,</a>
+<a name="ln195">				info-&gt;PixelFormat));</a>
+<a name="ln196">			continue;</a>
+<a name="ln197">		}</a>
+<a name="ln198">		TRACE((&quot;  depth: %lu\n&quot;, depth));</a>
+<a name="ln199"> </a>
+<a name="ln200">		video_mode *videoMode = (video_mode*)malloc(sizeof(struct video_mode));</a>
+<a name="ln201">		if (videoMode != NULL) {</a>
+<a name="ln202">			videoMode-&gt;mode = mode;</a>
+<a name="ln203">			videoMode-&gt;width = info-&gt;HorizontalResolution;</a>
+<a name="ln204">			videoMode-&gt;height = info-&gt;VerticalResolution;</a>
+<a name="ln205">			videoMode-&gt;bits_per_pixel = info-&gt;PixelFormat == PixelBitMask ? 24 : 32;</a>
+<a name="ln206">			videoMode-&gt;bytes_per_row = info-&gt;PixelsPerScanLine * depth / 8;</a>
+<a name="ln207">			add_video_mode(videoMode);</a>
+<a name="ln208">		}</a>
+<a name="ln209"> </a>
+<a name="ln210">		area *= depth;</a>
+<a name="ln211">		TRACE((&quot;  area (w/depth): %lu\n&quot;, area));</a>
+<a name="ln212">		if (area &gt;= bestArea) {</a>
+<a name="ln213">			TRACE((&quot;selected new best mode: %lu\n&quot;, mode));</a>
+<a name="ln214">			bestArea = area;</a>
+<a name="ln215">			bestDepth = depth;</a>
+<a name="ln216">			sGraphicsMode = mode;</a>
+<a name="ln217">		}</a>
+<a name="ln218">	}</a>
+<a name="ln219"> </a>
+<a name="ln220">	if (bestArea == 0 || bestDepth == 0) {</a>
+<a name="ln221">		sGraphicsOutput = NULL;</a>
+<a name="ln222">		gKernelArgs.frame_buffer.enabled = false;</a>
+<a name="ln223">		return B_ERROR;</a>
+<a name="ln224">	}</a>
+<a name="ln225"> </a>
+<a name="ln226">	gKernelArgs.frame_buffer.enabled = true;</a>
+<a name="ln227">	sModeChosen = false;</a>
+<a name="ln228">	sSettingsLoaded = false;</a>
+<a name="ln229">	return B_OK;</a>
+<a name="ln230">}</a>
+<a name="ln231"> </a>
+<a name="ln232"> </a>
+<a name="ln233">extern &quot;C&quot; void</a>
+<a name="ln234">platform_switch_to_logo(void)</a>
+<a name="ln235">{</a>
+<a name="ln236">	if (sGraphicsOutput == NULL || !gKernelArgs.frame_buffer.enabled)</a>
+<a name="ln237">		return;</a>
+<a name="ln238"> </a>
+<a name="ln239">	if (!sModeChosen)</a>
+<a name="ln240">		get_mode_from_settings();</a>
+<a name="ln241"> </a>
+<a name="ln242">	sGraphicsOutput-&gt;SetMode(sGraphicsOutput, sGraphicsMode);</a>
+<a name="ln243">	gKernelArgs.frame_buffer.physical_buffer.start =</a>
+<a name="ln244">		sGraphicsOutput-&gt;Mode-&gt;FrameBufferBase;</a>
+<a name="ln245">	gKernelArgs.frame_buffer.physical_buffer.size =</a>
+<a name="ln246">		sGraphicsOutput-&gt;Mode-&gt;FrameBufferSize;</a>
+<a name="ln247">	gKernelArgs.frame_buffer.width =</a>
+<a name="ln248">		sGraphicsOutput-&gt;Mode-&gt;Info-&gt;HorizontalResolution;</a>
+<a name="ln249">	gKernelArgs.frame_buffer.height =</a>
+<a name="ln250">		sGraphicsOutput-&gt;Mode-&gt;Info-&gt;VerticalResolution;</a>
+<a name="ln251">	gKernelArgs.frame_buffer.depth =</a>
+<a name="ln252">		sGraphicsOutput-&gt;Mode-&gt;Info-&gt;PixelFormat == PixelBitMask ? 24 : 32;</a>
+<a name="ln253">	gKernelArgs.frame_buffer.bytes_per_row =</a>
+<a name="ln254">		sGraphicsOutput-&gt;Mode-&gt;Info-&gt;PixelsPerScanLine</a>
+<a name="ln255">			* gKernelArgs.frame_buffer.depth / 8;</a>
+<a name="ln256"> </a>
+<a name="ln257">	video_display_splash(gKernelArgs.frame_buffer.physical_buffer.start);</a>
+<a name="ln258">}</a>
+<a name="ln259"> </a>
+<a name="ln260"> </a>
+<a name="ln261">bool</a>
+<a name="ln262">video_mode_hook(Menu *menu, MenuItem *item)</a>
+<a name="ln263">{</a>
+<a name="ln264">	menu = item-&gt;Submenu();</a>
+<a name="ln265">	item = menu-&gt;FindMarked();</a>
+<a name="ln266">	if (item != NULL) {</a>
+<a name="ln267">		sGraphicsMode = (UINTN)item-&gt;Data();</a>
+<a name="ln268">		sModeChosen = true;</a>
+<a name="ln269">	}</a>
+<a name="ln270"> </a>
+<a name="ln271">	return true;</a>
+<a name="ln272">}</a>
+<a name="ln273"> </a>
+<a name="ln274"> </a>
+<a name="ln275">Menu*</a>
+<a name="ln276">video_mode_menu()</a>
+<a name="ln277">{</a>
+<a name="ln278">	Menu *menu = new(std::nothrow)Menu(CHOICE_MENU, &quot;Select Video Mode&quot;);</a>
+<a name="ln279">	MenuItem *item;</a>
+<a name="ln280"> </a>
+<a name="ln281">	video_mode *mode = NULL;</a>
+<a name="ln282">	while ((mode = (video_mode*)list_get_next_item(&amp;sModeList, mode)) != NULL) {</a>
+<a name="ln283">		char label[64];</a>
+<a name="ln284">		snprintf(label, sizeof(label), &quot;%lux%lu %lu bit&quot;, mode-&gt;width,</a>
+<a name="ln285">			mode-&gt;height, mode-&gt;bits_per_pixel);</a>
+<a name="ln286"> </a>
+<a name="ln287">		menu-&gt;AddItem(item = new (std::nothrow)MenuItem(label));</a>
+<a name="ln288">		item-&gt;SetData((const void*)mode-&gt;mode);</a>
+<a name="ln289">		if (mode-&gt;mode == sGraphicsMode) {</a>
+<a name="ln290">			item-&gt;SetMarked(true);</a>
+<a name="ln291">			item-&gt;Select(true);</a>
+<a name="ln292">		}</a>
+<a name="ln293">	}</a>
+<a name="ln294"> </a>
+<a name="ln295">	menu-&gt;AddSeparatorItem();</a>
+<a name="ln296">	menu-&gt;AddItem(item = new(std::nothrow)MenuItem(&quot;Return to main menu&quot;));</a>
+<a name="ln297">	item-&gt;SetType(MENU_ITEM_NO_CHOICE);</a>
+<a name="ln298"> </a>
+<a name="ln299">	return menu;</a>
+<a name="ln300">}</a>
+<a name="ln301"> </a>
+<a name="ln302"> </a>
+<a name="ln303">extern &quot;C&quot; void</a>
+<a name="ln304">platform_blit4(addr_t frameBuffer, const uint8 *data,</a>
+<a name="ln305">	uint16 width, uint16 height, uint16 imageWidth,</a>
+<a name="ln306">	uint16 left, uint16 top)</a>
+<a name="ln307">{</a>
+<a name="ln308">	panic(&quot;platform_blit4 unsupported&quot;);</a>
+<a name="ln309">	return;</a>
+<a name="ln310">}</a>
+<a name="ln311"> </a>
+<a name="ln312"> </a>
+<a name="ln313">extern &quot;C&quot; void</a>
+<a name="ln314">platform_set_palette(const uint8 *palette)</a>
+<a name="ln315">{</a>
+<a name="ln316">	panic(&quot;platform_set_palette unsupported&quot;);</a>
+<a name="ln317">	return;</a>
+<a name="ln318">}</a>
+
+</code></pre>
+<div class="balloon" rel="264"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v763/" target="_blank">V763</a> Parameter 'menu' is always rewritten in function body before being used.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

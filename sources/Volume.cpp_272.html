@@ -1,0 +1,451 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>Volume.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2012, Jérôme Duval, korli@users.berlios.de.</a>
+<a name="ln3"> * Copyright 2008, Salvatore Benedetto, salvatore.benedetto@gmail.com</a>
+<a name="ln4"> * Copyright 2003, Tyler Dauwalder, tyler@dauwalder.net.</a>
+<a name="ln5"> * Distributed under the terms of the MIT License.</a>
+<a name="ln6"> */</a>
+<a name="ln7"> </a>
+<a name="ln8">#include &quot;Volume.h&quot;</a>
+<a name="ln9"> </a>
+<a name="ln10">#include &quot;Icb.h&quot;</a>
+<a name="ln11">#include &quot;MemoryChunk.h&quot;</a>
+<a name="ln12">#include &quot;MetadataPartition.h&quot;</a>
+<a name="ln13">#include &quot;PhysicalPartition.h&quot;</a>
+<a name="ln14">#include &quot;Recognition.h&quot;</a>
+<a name="ln15"> </a>
+<a name="ln16">extern fs_volume_ops gUDFVolumeOps;</a>
+<a name="ln17">extern fs_vnode_ops gUDFVnodeOps;</a>
+<a name="ln18"> </a>
+<a name="ln19">/*! \brief Creates an unmounted volume with the given id. */</a>
+<a name="ln20">Volume::Volume(fs_volume *fsVolume)</a>
+<a name="ln21">	:</a>
+<a name="ln22">	fBlockCache(NULL),</a>
+<a name="ln23">	fBlockShift(0),</a>
+<a name="ln24">	fBlockSize(0),</a>
+<a name="ln25">	fDevice(-1),</a>
+<a name="ln26">	fFSVolume(fsVolume),</a>
+<a name="ln27">	fLength(0),</a>
+<a name="ln28">	fMounted(false),</a>
+<a name="ln29">	fOffset(0),</a>
+<a name="ln30">	fRootIcb(NULL)</a>
+<a name="ln31">{</a>
+<a name="ln32">	for (int i = 0; i &lt; UDF_MAX_PARTITION_MAPS; i++)</a>
+<a name="ln33">		fPartitions[i] = NULL;</a>
+<a name="ln34">}</a>
+<a name="ln35"> </a>
+<a name="ln36"> </a>
+<a name="ln37">Volume::~Volume()</a>
+<a name="ln38">{</a>
+<a name="ln39">	_Unset();</a>
+<a name="ln40">}</a>
+<a name="ln41"> </a>
+<a name="ln42"> </a>
+<a name="ln43">/*! \brief Attempts to mount the given device.</a>
+<a name="ln44"> </a>
+<a name="ln45">	\param lenght The length of the device in number of blocks</a>
+<a name="ln46">*/</a>
+<a name="ln47">status_t</a>
+<a name="ln48">Volume::Mount(const char *deviceName, off_t offset, off_t length,</a>
+<a name="ln49">	uint32 blockSize, uint32 flags)</a>
+<a name="ln50">{</a>
+<a name="ln51">	TRACE((&quot;Volume::Mount: deviceName = `%s', offset = %&quot; B_PRIdOFF &quot;, length &quot;</a>
+<a name="ln52">		&quot;= %&quot; B_PRIdOFF &quot;, blockSize: %&quot; B_PRIu32 &quot;, flags: %&quot; B_PRIu32 &quot;\n&quot;,</a>
+<a name="ln53">		deviceName, offset, length, blockSize, flags));</a>
+<a name="ln54">	if (!deviceName)</a>
+<a name="ln55">		return B_BAD_VALUE;</a>
+<a name="ln56">	if (Mounted())</a>
+<a name="ln57">		// Already mounted, thank you for asking</a>
+<a name="ln58">		return B_BUSY;</a>
+<a name="ln59"> </a>
+<a name="ln60">	// Open the device read only</a>
+<a name="ln61">	int device = open(deviceName, O_RDONLY);</a>
+<a name="ln62">	if (device &lt; B_OK) {</a>
+<a name="ln63">		TRACE_ERROR((&quot;Volume::Mount: failed to open device = %s\n&quot;, deviceName));</a>
+<a name="ln64">		return device;</a>
+<a name="ln65">	}</a>
+<a name="ln66"> </a>
+<a name="ln67">	DEBUG_INIT_ETC(&quot;Volume&quot;, (&quot;deviceName: %s&quot;, deviceName));</a>
+<a name="ln68">	status_t status = B_OK;</a>
+<a name="ln69"> </a>
+<a name="ln70">	// If the device is actually a normal file, try to disable the cache</a>
+<a name="ln71">	// for the file in the parent filesystem</a>
+<a name="ln72">#if 0 //  _KERNEL_MODE</a>
+<a name="ln73">	struct stat stat;</a>
+<a name="ln74">	error = fstat(device, &amp;stat) &lt; 0 ? B_ERROR : B_OK;</a>
+<a name="ln75">	if (!error) {</a>
+<a name="ln76">		if (stat.st_mode &amp; S_IFREG &amp;&amp; ioctl(device, IOCTL_FILE_UNCACHED_IO, NULL) &lt; 0) {</a>
+<a name="ln77">			DIE((&quot;Unable to disable cache of underlying file system.\n&quot;));</a>
+<a name="ln78">		}</a>
+<a name="ln79">	}</a>
+<a name="ln80">#endif</a>
+<a name="ln81"> </a>
+<a name="ln82">	logical_volume_descriptor logicalVolumeDescriptor;</a>
+<a name="ln83">	partition_descriptor partitionDescriptors[kMaxPartitionDescriptors];</a>
+<a name="ln84">	uint8 partitionDescriptorCount;</a>
+<a name="ln85">	uint32 blockShift;</a>
+<a name="ln86"> </a>
+<a name="ln87">	// Run through the volume recognition and descriptor sequences to</a>
+<a name="ln88">	// see if we have a potentially valid UDF volume on our hands</a>
+<a name="ln89">	status = udf_recognize(device, offset, length, blockSize, blockShift,</a>
+<a name="ln90">				fPrimaryVolumeDescriptor, logicalVolumeDescriptor,</a>
+<a name="ln91">				partitionDescriptors, partitionDescriptorCount);</a>
+<a name="ln92"> </a>
+<a name="ln93">	// Set up the block cache</a>
+<a name="ln94">	if (!status) {</a>
+<a name="ln95">		TRACE((&quot;Volume::Mount: partition recognized\n&quot;));</a>
+<a name="ln96">		fBlockCache = block_cache_create(device, length, blockSize, IsReadOnly());</a>
+<a name="ln97">	} else {</a>
+<a name="ln98">		TRACE_ERROR((&quot;Volume::Mount: failed to recognize partition\n&quot;));</a>
+<a name="ln99">		return status;</a>
+<a name="ln100">	}</a>
+<a name="ln101"> </a>
+<a name="ln102">	int physicalCount = 0;</a>
+<a name="ln103">	int virtualCount = 0;</a>
+<a name="ln104">	int sparableCount = 0;</a>
+<a name="ln105">	int metadataCount = 0;</a>
+<a name="ln106"> </a>
+<a name="ln107">	// Set up the partitions</a>
+<a name="ln108">	// Set up physical and sparable partitions first</a>
+<a name="ln109">	offset = 0;</a>
+<a name="ln110">	for (uint8 i = 0; i &lt; logicalVolumeDescriptor.partition_map_count()</a>
+<a name="ln111">	     &amp;&amp; !status; i++)</a>
+<a name="ln112">	{</a>
+<a name="ln113">		uint8 *maps = logicalVolumeDescriptor.partition_maps();</a>
+<a name="ln114">		partition_map_header *header = (partition_map_header *)(maps + offset);</a>
+<a name="ln115">		TRACE((&quot;Volume::Mount: partition map %d (type %d):\n&quot;, i,</a>
+<a name="ln116">			header-&gt;type()));</a>
+<a name="ln117">		if (header-&gt;type() == 1) {</a>
+<a name="ln118">			TRACE((&quot;Volume::Mount: map type -&gt; physical\n&quot;));</a>
+<a name="ln119">			physical_partition_map* map = (physical_partition_map *)header;</a>
+<a name="ln120">			// Find the corresponding partition descriptor</a>
+<a name="ln121">			partition_descriptor *descriptor = NULL;</a>
+<a name="ln122">			for (uint8 j = 0; j &lt; partitionDescriptorCount; j++) {</a>
+<a name="ln123">				if (map-&gt;partition_number() ==</a>
+<a name="ln124">				    partitionDescriptors[j].partition_number()) {</a>
+<a name="ln125">					descriptor = &amp;partitionDescriptors[j];</a>
+<a name="ln126">					break;</a>
+<a name="ln127">				}</a>
+<a name="ln128">			}</a>
+<a name="ln129">			// Create and add the partition</a>
+<a name="ln130">			if (descriptor) {</a>
+<a name="ln131">				PhysicalPartition *partition</a>
+<a name="ln132">					= new(nothrow) PhysicalPartition(map-&gt;partition_number(),</a>
+<a name="ln133">						descriptor-&gt;start(), descriptor-&gt;length());</a>
+<a name="ln134">				status = partition ? B_OK : B_NO_MEMORY;</a>
+<a name="ln135">				if (!status) {</a>
+<a name="ln136">					TRACE((&quot;Volume::Mount: adding PhysicalPartition(number: %d, &quot;</a>
+<a name="ln137">						&quot;start: %&quot; B_PRIu32 &quot;, length: %&quot; B_PRIu32 &quot;)\n&quot;,</a>
+<a name="ln138">						map-&gt;partition_number(), descriptor-&gt;start(),</a>
+<a name="ln139">						descriptor-&gt;length()));</a>
+<a name="ln140">					status = _SetPartition(i, partition);</a>
+<a name="ln141">					if (!status)</a>
+<a name="ln142">						physicalCount++;</a>
+<a name="ln143">				}</a>
+<a name="ln144">			} else {</a>
+<a name="ln145">				TRACE_ERROR((&quot;Volume::Mount: no matching partition descriptor found!\n&quot;));</a>
+<a name="ln146">				status = B_ERROR;</a>
+<a name="ln147">			}</a>
+<a name="ln148">		} else if (header-&gt;type() == 2) {</a>
+<a name="ln149">			// Figure out what kind of type 2 partition map we have based</a>
+<a name="ln150">			// on the type identifier</a>
+<a name="ln151">			const entity_id &amp;typeId = header-&gt;partition_type_id();</a>
+<a name="ln152">			DUMP(typeId);</a>
+<a name="ln153">			DUMP(kSparablePartitionMapId);</a>
+<a name="ln154">			if (typeId.matches(kVirtualPartitionMapId)) {</a>
+<a name="ln155">				TRACE((&quot;map type: virtual\n&quot;));</a>
+<a name="ln156">				virtual_partition_map* map =</a>
+<a name="ln157">					reinterpret_cast&lt;virtual_partition_map*&gt;(header);</a>
+<a name="ln158">				virtualCount++;</a>
+<a name="ln159">				(void)map;	// kill the warning for now</a>
+<a name="ln160">			} else if (typeId.matches(kSparablePartitionMapId)) {</a>
+<a name="ln161">				TRACE((&quot;map type: sparable\n&quot;));</a>
+<a name="ln162">				sparable_partition_map* map =</a>
+<a name="ln163">					reinterpret_cast&lt;sparable_partition_map*&gt;(header);</a>
+<a name="ln164">				sparableCount++;</a>
+<a name="ln165">				(void)map;	// kill the warning for now</a>
+<a name="ln166">			} else if (typeId.matches(kMetadataPartitionMapId)) {</a>
+<a name="ln167">				TRACE((&quot;map type: metadata\n&quot;));</a>
+<a name="ln168">				metadata_partition_map* map =</a>
+<a name="ln169">					reinterpret_cast&lt;metadata_partition_map*&gt;(header);</a>
+<a name="ln170">				</a>
+<a name="ln171">				</a>
+<a name="ln172">				// Find the corresponding partition descriptor</a>
+<a name="ln173">				partition_descriptor *descriptor = NULL;</a>
+<a name="ln174">				for (uint8 j = 0; j &lt; partitionDescriptorCount; j++) {</a>
+<a name="ln175">					if (map-&gt;partition_number() ==</a>
+<a name="ln176">						partitionDescriptors[j].partition_number()) {</a>
+<a name="ln177">						descriptor = &amp;partitionDescriptors[j];</a>
+<a name="ln178">						break;</a>
+<a name="ln179">					}</a>
+<a name="ln180">				}</a>
+<a name="ln181">				Partition *parent = _GetPartition(map-&gt;partition_number());</a>
+<a name="ln182">				// Create and add the partition</a>
+<a name="ln183">				if (descriptor != NULL &amp;&amp; parent != NULL) {</a>
+<a name="ln184">					MetadataPartition *partition</a>
+<a name="ln185">						= new(nothrow) MetadataPartition(this,</a>
+<a name="ln186">							map-&gt;partition_number(), *parent,</a>
+<a name="ln187">							map-&gt;metadata_file_location(),</a>
+<a name="ln188">							map-&gt;metadata_mirror_file_location(),</a>
+<a name="ln189">							map-&gt;metadata_bitmap_file_location(),</a>
+<a name="ln190">							map-&gt;allocation_unit_size(),</a>
+<a name="ln191">							map-&gt;alignment_unit_size(),</a>
+<a name="ln192">							map-&gt;flags() &amp; 1);</a>
+<a name="ln193">					status = partition ? partition-&gt;InitCheck() : B_NO_MEMORY;</a>
+<a name="ln194">					if (!status) {</a>
+<a name="ln195">						TRACE((&quot;Volume::Mount: adding MetadataPartition()&quot;));</a>
+<a name="ln196">						status = _SetPartition(i, partition);</a>
+<a name="ln197">						if (status == B_OK)</a>
+<a name="ln198">							metadataCount++;</a>
+<a name="ln199">					} else {</a>
+<a name="ln200">						TRACE_ERROR((&quot;Volume::Mount: metadata partition &quot;</a>
+<a name="ln201">							&quot;creation failed! 0x%&quot; B_PRIx32 &quot;\n&quot;, status));</a>
+<a name="ln202">					}</a>
+<a name="ln203">				} else {</a>
+<a name="ln204">					TRACE_ERROR((&quot;Volume::Mount: no matching partition descriptor found!\n&quot;));</a>
+<a name="ln205">					status = B_ERROR;</a>
+<a name="ln206">				}</a>
+<a name="ln207">			} else {</a>
+<a name="ln208">				TRACE((&quot;map type: unrecognized (`%.23s')\n&quot;,</a>
+<a name="ln209">				       typeId.identifier()));</a>
+<a name="ln210">				status = B_ERROR;				</a>
+<a name="ln211">			}</a>
+<a name="ln212">		} else {</a>
+<a name="ln213">			TRACE((&quot;Invalid partition type %d found!\n&quot;, header-&gt;type()));</a>
+<a name="ln214">			status = B_ERROR;</a>
+<a name="ln215">		}			    </a>
+<a name="ln216">		offset += header-&gt;length();</a>
+<a name="ln217">	}</a>
+<a name="ln218"> </a>
+<a name="ln219">	// Do some checking as to what sorts of partitions we've actually found.</a>
+<a name="ln220">	if (!status) {</a>
+<a name="ln221">		status = (physicalCount == 1 &amp;&amp; virtualCount == 0</a>
+<a name="ln222">		         &amp;&amp; sparableCount == 0)</a>
+<a name="ln223">		        || (physicalCount == 2 &amp;&amp; virtualCount == 0</a>
+<a name="ln224">		           &amp;&amp; sparableCount == 0)</a>
+<a name="ln225">		        ? B_OK : B_ERROR;</a>
+<a name="ln226">		if (status) {</a>
+<a name="ln227">			TRACE((&quot;Invalid partition layout found:\n&quot;));</a>
+<a name="ln228">			TRACE((&quot;  physical partitions: %d\n&quot;, physicalCount));</a>
+<a name="ln229">			TRACE((&quot;  virtual partitions:  %d\n&quot;, virtualCount));</a>
+<a name="ln230">			TRACE((&quot;  sparable partitions: %d\n&quot;, sparableCount));</a>
+<a name="ln231">			TRACE((&quot;  metadata partitions: %d\n&quot;, metadataCount));</a>
+<a name="ln232">		}		                 </a>
+<a name="ln233">	}</a>
+<a name="ln234">	</a>
+<a name="ln235">	// We're now going to start creating Icb's, which will expect</a>
+<a name="ln236">	// certain parts of the volume to be initialized properly. Thus,</a>
+<a name="ln237">	// we initialize those parts here.</a>
+<a name="ln238">	if (!status) {</a>
+<a name="ln239">		fDevice = device;	</a>
+<a name="ln240">		fOffset = offset;</a>
+<a name="ln241">		fLength = length;	</a>
+<a name="ln242">		fBlockSize = blockSize;</a>
+<a name="ln243">		fBlockShift = blockShift;</a>
+<a name="ln244">	}</a>
+<a name="ln245">	TRACE((&quot;Volume::Mount: device = %d, offset = %&quot; B_PRIdOFF &quot;, length = %&quot;</a>
+<a name="ln246">		B_PRIdOFF &quot;, blockSize = %&quot; B_PRIu32 &quot;, blockShift = %&quot; B_PRIu32 &quot;\n&quot;,</a>
+<a name="ln247">		device, offset, length, blockSize, blockShift));</a>
+<a name="ln248">	// At this point we've found a valid set of volume descriptors and</a>
+<a name="ln249">	// our partitions are all set up. We now need to investigate the file</a>
+<a name="ln250">	// set descriptor pointed to by the logical volume descriptor.</a>
+<a name="ln251">	if (!status) {</a>
+<a name="ln252">		TRACE((&quot;Volume::Mount: Partition has been set up\n&quot;));</a>
+<a name="ln253">		MemoryChunk chunk(logicalVolumeDescriptor.file_set_address().length());</a>
+<a name="ln254">	</a>
+<a name="ln255">		status = chunk.InitCheck();</a>
+<a name="ln256"> </a>
+<a name="ln257">		if (!status) {</a>
+<a name="ln258">			off_t address;</a>
+<a name="ln259">			// Read in the file set descriptor</a>
+<a name="ln260">			status = MapBlock(logicalVolumeDescriptor.file_set_address(),</a>
+<a name="ln261">				&amp;address);</a>
+<a name="ln262">			if (!status)</a>
+<a name="ln263">				address &lt;&lt;= blockShift;</a>
+<a name="ln264">			if (!status) {</a>
+<a name="ln265">				ssize_t bytesRead</a>
+<a name="ln266">					= read_pos(device, address, chunk.Data(), blockSize);</a>
+<a name="ln267">				if (bytesRead != ssize_t(blockSize)) {</a>
+<a name="ln268">					status = B_IO_ERROR;</a>
+<a name="ln269">					TRACE_ERROR((&quot;read_pos(pos:%&quot; B_PRIdOFF &quot;, len:%&quot; B_PRIu32</a>
+<a name="ln270">						&quot;) failed with: 0x%lx\n&quot;, address, blockSize,</a>
+<a name="ln271">						bytesRead));</a>
+<a name="ln272">				}</a>
+<a name="ln273">			}</a>
+<a name="ln274">			// See if it's valid, and if so, create the root icb</a>
+<a name="ln275">			if (!status) {</a>
+<a name="ln276">				file_set_descriptor *fileSet =</a>
+<a name="ln277">				 	reinterpret_cast&lt;file_set_descriptor*&gt;(chunk.Data());</a>
+<a name="ln278">				PDUMP(fileSet);</a>
+<a name="ln279">				status = fileSet-&gt;tag().id() == TAGID_FILE_SET_DESCRIPTOR</a>
+<a name="ln280">				        ? B_OK : B_ERROR;</a>
+<a name="ln281">				if (!status) </a>
+<a name="ln282">					status = fileSet-&gt;tag().init_check(</a>
+<a name="ln283">					        logicalVolumeDescriptor.file_set_address().block());</a>
+<a name="ln284">				if (!status) {</a>
+<a name="ln285">					PDUMP(fileSet);</a>
+<a name="ln286">					fRootIcb = new(nothrow) Icb(this, fileSet-&gt;root_directory_icb());</a>
+<a name="ln287">					if (fRootIcb == NULL || fRootIcb-&gt;InitCheck() != B_OK)</a>
+<a name="ln288">						return B_NO_MEMORY;</a>
+<a name="ln289">				}</a>
+<a name="ln290"> </a>
+<a name="ln291">				TRACE((&quot;Volume::Mount: Root Node id = %&quot; B_PRIdINO &quot;\n&quot;,</a>
+<a name="ln292">					fRootIcb-&gt;Id()));</a>
+<a name="ln293">				if (!status) {</a>
+<a name="ln294">					status = publish_vnode(fFSVolume, fRootIcb-&gt;Id(), fRootIcb,</a>
+<a name="ln295">						&amp;gUDFVnodeOps, fRootIcb-&gt;Mode(), 0);</a>
+<a name="ln296">					if (status != B_OK) {</a>
+<a name="ln297">						TRACE_ERROR((&quot;Error creating vnode for root icb! &quot;</a>
+<a name="ln298">						       &quot;status = 0x%&quot; B_PRIx32 &quot;, `%s'\n&quot;, status,</a>
+<a name="ln299">						       strerror(status)));</a>
+<a name="ln300">						// Clean up the icb we created, since _Unset()</a>
+<a name="ln301">						// won't do this for us.</a>
+<a name="ln302">						delete fRootIcb;</a>
+<a name="ln303">						fRootIcb = NULL;</a>
+<a name="ln304">					}</a>
+<a name="ln305">					TRACE((&quot;Volume::Mount: Root vnode published. Id = %&quot;</a>
+<a name="ln306">						B_PRIdINO &quot;\n&quot;, fRootIcb-&gt;Id()));</a>
+<a name="ln307">				}</a>
+<a name="ln308">			}</a>
+<a name="ln309">		}</a>
+<a name="ln310">	}</a>
+<a name="ln311"> </a>
+<a name="ln312">	// If we've made it this far, we're good to go; set the volume</a>
+<a name="ln313">	// name and then flag that we're mounted. On the other hand, if</a>
+<a name="ln314">	// an error occurred, we need to clean things up.</a>
+<a name="ln315">	if (!status) {</a>
+<a name="ln316">		fName.SetTo(logicalVolumeDescriptor.logical_volume_identifier()); </a>
+<a name="ln317">		fMounted = true;</a>
+<a name="ln318">	} else {</a>
+<a name="ln319">		_Unset();</a>
+<a name="ln320">	}</a>
+<a name="ln321"> </a>
+<a name="ln322">	RETURN(status);</a>
+<a name="ln323">}</a>
+<a name="ln324"> </a>
+<a name="ln325"> </a>
+<a name="ln326">const char*</a>
+<a name="ln327">Volume::Name() const {</a>
+<a name="ln328">	return fName.Utf8();</a>
+<a name="ln329">}</a>
+<a name="ln330"> </a>
+<a name="ln331">/*! \brief Maps the given logical block to a physical block.</a>
+<a name="ln332">*/</a>
+<a name="ln333">status_t</a>
+<a name="ln334">Volume::MapBlock(long_address address, off_t *mappedBlock)</a>
+<a name="ln335">{</a>
+<a name="ln336">	TRACE((&quot;Volume::MapBlock: partition = %d, block = %&quot; B_PRIu32</a>
+<a name="ln337">		&quot;, mappedBlock = %p\n&quot;, address.partition(), address.block(),</a>
+<a name="ln338">		mappedBlock));</a>
+<a name="ln339">	DEBUG_INIT_ETC(&quot;Volume&quot;, (&quot;partition = %d, block = %&quot; B_PRIu32</a>
+<a name="ln340">		&quot;, mappedBlock = %p&quot;, address.partition(), address.block(),</a>
+<a name="ln341">		mappedBlock));</a>
+<a name="ln342">	status_t error = mappedBlock ? B_OK : B_BAD_VALUE;</a>
+<a name="ln343">	if (!error) {</a>
+<a name="ln344">		Partition *partition = _GetPartition(address.partition());</a>
+<a name="ln345">		error = partition ? B_OK : B_BAD_ADDRESS;</a>
+<a name="ln346">		if (!error) </a>
+<a name="ln347">			error = partition-&gt;MapBlock(address.block(), *mappedBlock);</a>
+<a name="ln348">	}</a>
+<a name="ln349">	RETURN(error);</a>
+<a name="ln350">}</a>
+<a name="ln351"> </a>
+<a name="ln352">/*! \brief Unsets the volume and deletes any partitions.</a>
+<a name="ln353"> </a>
+<a name="ln354">	Does *not* delete the root icb object.</a>
+<a name="ln355">*/</a>
+<a name="ln356">void</a>
+<a name="ln357">Volume::_Unset()</a>
+<a name="ln358">{</a>
+<a name="ln359">	DEBUG_INIT(&quot;Volume&quot;);</a>
+<a name="ln360">	// delete our partitions</a>
+<a name="ln361">	for (int i = 0; i &lt; UDF_MAX_PARTITION_MAPS; i++)</a>
+<a name="ln362">		_SetPartition(i, NULL);</a>
+<a name="ln363">	fFSVolume-&gt;id = 0;</a>
+<a name="ln364">	if (fDevice &gt;= 0) {</a>
+<a name="ln365">		block_cache_delete(fBlockCache, true);	</a>
+<a name="ln366">		close(fDevice);</a>
+<a name="ln367">	}</a>
+<a name="ln368">	fBlockCache = NULL;</a>
+<a name="ln369">	fDevice = -1;</a>
+<a name="ln370">	fMounted = false;</a>
+<a name="ln371">	fOffset = 0;</a>
+<a name="ln372">	fLength = 0;</a>
+<a name="ln373">	fBlockSize = 0;</a>
+<a name="ln374">	fBlockShift = 0;</a>
+<a name="ln375">	fName.SetTo(&quot;&quot;, 0);</a>
+<a name="ln376">}</a>
+<a name="ln377"> </a>
+<a name="ln378">/*! \brief Sets the partition associated with the given number after</a>
+<a name="ln379">	deleting any previously associated partition.</a>
+<a name="ln380">	</a>
+<a name="ln381">	\param number The partition number (should be the same as the index</a>
+<a name="ln382">	              into the lvd's partition map array).</a>
+<a name="ln383">	\param partition The new partition (may be NULL).</a>
+<a name="ln384">*/</a>
+<a name="ln385">status_t</a>
+<a name="ln386">Volume::_SetPartition(uint number, Partition *partition)</a>
+<a name="ln387">{</a>
+<a name="ln388">	status_t error = number &lt; UDF_MAX_PARTITION_MAPS</a>
+<a name="ln389">	                 ? B_OK : B_BAD_VALUE;</a>
+<a name="ln390">	if (!error) {</a>
+<a name="ln391">		delete fPartitions[number];</a>
+<a name="ln392">		fPartitions[number] = partition;</a>
+<a name="ln393">	}</a>
+<a name="ln394">	return error;</a>
+<a name="ln395">}</a>
+<a name="ln396"> </a>
+<a name="ln397">/*! \brief Returns the partition associated with the given number, or</a>
+<a name="ln398">	NULL if no such partition exists or the number is invalid.</a>
+<a name="ln399">*/</a>
+<a name="ln400">Partition*</a>
+<a name="ln401">Volume::_GetPartition(uint number)</a>
+<a name="ln402">{</a>
+<a name="ln403">	return (number &lt; UDF_MAX_PARTITION_MAPS)</a>
+<a name="ln404">	       ? fPartitions[number] : NULL;</a>
+<a name="ln405">}</a>
+
+</code></pre>
+<div class="balloon" rel="20"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fPrimaryVolumeDescriptor.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

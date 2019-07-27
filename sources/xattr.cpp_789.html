@@ -1,0 +1,413 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>xattr.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2009, Ingo Weinhold, ingo_weinhold@gmx.de.</a>
+<a name="ln3"> * Distributed under the terms of the MIT License.</a>
+<a name="ln4"> */</a>
+<a name="ln5"> </a>
+<a name="ln6">#include &lt;sys/xattr.h&gt;</a>
+<a name="ln7"> </a>
+<a name="ln8">#include &lt;ctype.h&gt;</a>
+<a name="ln9">#include &lt;errno.h&gt;</a>
+<a name="ln10">#include &lt;stdio.h&gt;</a>
+<a name="ln11">#include &lt;stdlib.h&gt;</a>
+<a name="ln12">#include &lt;string.h&gt;</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &lt;algorithm&gt;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &lt;fs_attr.h&gt;</a>
+<a name="ln17">#include &lt;TypeConstants.h&gt;</a>
+<a name="ln18"> </a>
+<a name="ln19">#include &lt;syscall_utils.h&gt;</a>
+<a name="ln20"> </a>
+<a name="ln21"> </a>
+<a name="ln22">static const char* const kXattrNamespace = &quot;user.haiku.&quot;;</a>
+<a name="ln23">static const size_t kXattrNamespaceLength = 11;</a>
+<a name="ln24"> </a>
+<a name="ln25"> </a>
+<a name="ln26">namespace {</a>
+<a name="ln27"> </a>
+<a name="ln28"> </a>
+<a name="ln29">struct AttributeName {</a>
+<a name="ln30">	char	name[B_ATTR_NAME_LENGTH + 32];</a>
+<a name="ln31">	uint32	type;</a>
+<a name="ln32"> </a>
+<a name="ln33">	void Init(const char* haikuName, uint32 type)</a>
+<a name="ln34">	{</a>
+<a name="ln35">		if (type == B_XATTR_TYPE) {</a>
+<a name="ln36">			// a simple xattr -- copy the name verbatim</a>
+<a name="ln37">			strlcpy(name, haikuName, sizeof(name));</a>
+<a name="ln38">			this-&gt;type = type;</a>
+<a name="ln39">		} else {</a>
+<a name="ln40">			// a Haiku attribute -- map the name</a>
+<a name="ln41"> </a>
+<a name="ln42">			// create a type string -- if the four bytes of the type are</a>
+<a name="ln43">			// printable, just use them as the type string, otherwise convert</a>
+<a name="ln44">			// to hex</a>
+<a name="ln45">			char typeString[9];</a>
+<a name="ln46">			uint8 typeBytes[4] = { (uint8)((type &gt;&gt; 24) &amp; 0xff),</a>
+<a name="ln47">				(uint8)((type &gt;&gt; 16) &amp; 0xff), (uint8)((type &gt;&gt; 8) &amp; 0xff),</a>
+<a name="ln48">				(uint8)(type &amp; 0xff) };</a>
+<a name="ln49">			if (isprint(typeBytes[0]) &amp;&amp; isprint(typeBytes[1])</a>
+<a name="ln50">				&amp;&amp; isprint(typeBytes[2]) &amp;&amp; isprint(typeBytes[3])) {</a>
+<a name="ln51">				typeString[0] = typeBytes[0];</a>
+<a name="ln52">				typeString[1] = typeBytes[1];</a>
+<a name="ln53">				typeString[2] = typeBytes[2];</a>
+<a name="ln54">				typeString[3] = typeBytes[3];</a>
+<a name="ln55">				typeString[4] = '\0';</a>
+<a name="ln56">			} else</a>
+<a name="ln57">				sprintf(typeString, &quot;%08lx&quot;, type);</a>
+<a name="ln58"> </a>
+<a name="ln59">			snprintf(name, sizeof(name), &quot;%s%s#%s&quot;, kXattrNamespace,</a>
+<a name="ln60">				haikuName, typeString);</a>
+<a name="ln61">		}</a>
+<a name="ln62">	}</a>
+<a name="ln63"> </a>
+<a name="ln64">	void Init(const char* xattrName)</a>
+<a name="ln65">	{</a>
+<a name="ln66">		if (strncmp(xattrName, kXattrNamespace, kXattrNamespaceLength) == 0) {</a>
+<a name="ln67">			// a Haiku attribute -- extract the actual name and type</a>
+<a name="ln68">			xattrName += kXattrNamespaceLength;</a>
+<a name="ln69"> </a>
+<a name="ln70">			if (_DecodeNameAndType(xattrName))</a>
+<a name="ln71">				return;</a>
+<a name="ln72">		}</a>
+<a name="ln73"> </a>
+<a name="ln74">		// a simple xattr</a>
+<a name="ln75">		strlcpy(name, xattrName, sizeof(name));</a>
+<a name="ln76">		this-&gt;type = B_XATTR_TYPE;</a>
+<a name="ln77">	}</a>
+<a name="ln78"> </a>
+<a name="ln79">private:</a>
+<a name="ln80"> </a>
+<a name="ln81">	bool _DecodeNameAndType(const char* xattrName)</a>
+<a name="ln82">	{</a>
+<a name="ln83">		const char* typeString = strrchr(xattrName, '#');</a>
+<a name="ln84">		if (typeString == NULL || typeString == xattrName)</a>
+<a name="ln85">			return false;</a>
+<a name="ln86">		typeString++;</a>
+<a name="ln87"> </a>
+<a name="ln88">		size_t typeStringLength = strlen(typeString);</a>
+<a name="ln89">		if (typeStringLength == 4) {</a>
+<a name="ln90">			// the type string consists of the literal type bytes</a>
+<a name="ln91">			type = ((uint32)typeString[0] &lt;&lt; 24) | ((uint32)typeString[1] &lt;&lt; 16)</a>
+<a name="ln92">				| ((uint32)typeString[2] &lt;&lt; 8) | (uint32)typeString[3];</a>
+<a name="ln93">		} else if (typeStringLength == 8) {</a>
+<a name="ln94">			// must be hex-encoded</a>
+<a name="ln95">			char* numberEnd;</a>
+<a name="ln96">			type = strtoul(typeString, &amp;numberEnd, 16);</a>
+<a name="ln97">			if (numberEnd != typeString + 8)</a>
+<a name="ln98">				return false;</a>
+<a name="ln99">		} else</a>
+<a name="ln100">			return false;</a>
+<a name="ln101"> </a>
+<a name="ln102">		strlcpy(name, xattrName,</a>
+<a name="ln103">			std::min(sizeof(name), (size_t)(typeString - xattrName)));</a>
+<a name="ln104">			// typeString - xattrName - 1 is the name length, but we need to</a>
+<a name="ln105">			// specify one more for the terminating null</a>
+<a name="ln106">		return true;</a>
+<a name="ln107">	}</a>
+<a name="ln108">};</a>
+<a name="ln109"> </a>
+<a name="ln110"> </a>
+<a name="ln111">struct Node {</a>
+<a name="ln112">	Node(const char* path, bool traverseSymlinks)</a>
+<a name="ln113">	{</a>
+<a name="ln114">		fFileFD = open(path, O_RDONLY | (traverseSymlinks ? 0 : O_NOTRAVERSE));</a>
+<a name="ln115">		fOwnsFileFD = true;</a>
+<a name="ln116">	}</a>
+<a name="ln117"> </a>
+<a name="ln118">	Node(int fileFD)</a>
+<a name="ln119">	{</a>
+<a name="ln120">		fFileFD = fileFD;</a>
+<a name="ln121">		fOwnsFileFD = false;</a>
+<a name="ln122"> </a>
+<a name="ln123">		if (fileFD &lt; 0)</a>
+<a name="ln124">			errno = B_FILE_ERROR;</a>
+<a name="ln125">	}</a>
+<a name="ln126"> </a>
+<a name="ln127">	~Node()</a>
+<a name="ln128">	{</a>
+<a name="ln129">		if (fFileFD &gt;= 0 &amp;&amp; fOwnsFileFD)</a>
+<a name="ln130">			close(fFileFD);</a>
+<a name="ln131">	}</a>
+<a name="ln132"> </a>
+<a name="ln133">	int Set(const char* attribute, int flags, const void* buffer, size_t size)</a>
+<a name="ln134">	{</a>
+<a name="ln135">		if (fFileFD &lt; 0)</a>
+<a name="ln136">			return -1;</a>
+<a name="ln137"> </a>
+<a name="ln138">		// flags to open mode</a>
+<a name="ln139">		int openMode = O_WRONLY | O_TRUNC;</a>
+<a name="ln140">		if (flags == XATTR_CREATE) {</a>
+<a name="ln141">			openMode |= O_CREAT | O_EXCL;</a>
+<a name="ln142">		} else if (flags == XATTR_REPLACE) {</a>
+<a name="ln143">			// pure open -- attribute must exist</a>
+<a name="ln144">		} else</a>
+<a name="ln145">			openMode |= O_CREAT;</a>
+<a name="ln146"> </a>
+<a name="ln147">		AttributeName attributeName;</a>
+<a name="ln148">		attributeName.Init(attribute);</a>
+<a name="ln149"> </a>
+<a name="ln150">		int attributeFD = fs_fopen_attr(fFileFD, attributeName.name,</a>
+<a name="ln151">			attributeName.type, openMode);</a>
+<a name="ln152">		if (attributeFD &lt; 0) {</a>
+<a name="ln153">			// translate B_ENTRY_NOT_FOUND to ENOATTR</a>
+<a name="ln154">			if (errno == B_ENTRY_NOT_FOUND)</a>
+<a name="ln155">				errno = ENOATTR;</a>
+<a name="ln156"> </a>
+<a name="ln157">			return -1;</a>
+<a name="ln158">		}</a>
+<a name="ln159"> </a>
+<a name="ln160">		ssize_t written = write(attributeFD, buffer, size);</a>
+<a name="ln161"> </a>
+<a name="ln162">		fs_close_attr(attributeFD);</a>
+<a name="ln163"> </a>
+<a name="ln164">		if (written &lt; 0)</a>
+<a name="ln165">			return -1;</a>
+<a name="ln166">		if ((size_t)written != size)</a>
+<a name="ln167">			RETURN_AND_SET_ERRNO(B_FILE_ERROR);</a>
+<a name="ln168"> </a>
+<a name="ln169">		return 0;</a>
+<a name="ln170">	}</a>
+<a name="ln171"> </a>
+<a name="ln172">	ssize_t Get(const char* attribute, void* buffer, size_t size)</a>
+<a name="ln173">	{</a>
+<a name="ln174">		if (fFileFD &lt; 0)</a>
+<a name="ln175">			return -1;</a>
+<a name="ln176"> </a>
+<a name="ln177">		AttributeName attributeName;</a>
+<a name="ln178">		attributeName.Init(attribute);</a>
+<a name="ln179"> </a>
+<a name="ln180">		// get the attribute size -- we read all or nothing</a>
+<a name="ln181">		attr_info info;</a>
+<a name="ln182">		if (fs_stat_attr(fFileFD, attributeName.name, &amp;info) != 0) {</a>
+<a name="ln183">			// translate B_ENTRY_NOT_FOUND to ENOATTR</a>
+<a name="ln184">			if (errno == B_ENTRY_NOT_FOUND)</a>
+<a name="ln185">				errno = ENOATTR;</a>
+<a name="ln186">			return -1;</a>
+<a name="ln187">		}</a>
+<a name="ln188"> </a>
+<a name="ln189">		// if an empty buffer is given, return the attribute size</a>
+<a name="ln190">		if (size == 0)</a>
+<a name="ln191">			return info.size;</a>
+<a name="ln192"> </a>
+<a name="ln193">		// if the buffer is too small, fail</a>
+<a name="ln194">		if (size &lt; info.size) {</a>
+<a name="ln195">			errno = ERANGE;</a>
+<a name="ln196">			return -1;</a>
+<a name="ln197">		}</a>
+<a name="ln198"> </a>
+<a name="ln199">		ssize_t bytesRead = fs_read_attr(fFileFD, attributeName.name,</a>
+<a name="ln200">			info.type, 0, buffer, info.size);</a>
+<a name="ln201"> </a>
+<a name="ln202">		// translate B_ENTRY_NOT_FOUND to ENOATTR</a>
+<a name="ln203">		if (bytesRead &lt; 0 &amp;&amp; errno == B_ENTRY_NOT_FOUND)</a>
+<a name="ln204">			errno = ENOATTR;</a>
+<a name="ln205"> </a>
+<a name="ln206">		return bytesRead;</a>
+<a name="ln207">	}</a>
+<a name="ln208"> </a>
+<a name="ln209">	int Remove(const char* attribute)</a>
+<a name="ln210">	{</a>
+<a name="ln211">		if (fFileFD &lt; 0)</a>
+<a name="ln212">			return -1;</a>
+<a name="ln213"> </a>
+<a name="ln214">		AttributeName attributeName;</a>
+<a name="ln215">		attributeName.Init(attribute);</a>
+<a name="ln216"> </a>
+<a name="ln217">		int result = fs_remove_attr(fFileFD, attributeName.name);</a>
+<a name="ln218"> </a>
+<a name="ln219">		// translate B_ENTRY_NOT_FOUND to ENOATTR</a>
+<a name="ln220">		if (result != 0 &amp;&amp; errno == B_ENTRY_NOT_FOUND)</a>
+<a name="ln221">			errno = ENOATTR;</a>
+<a name="ln222"> </a>
+<a name="ln223">		return result;</a>
+<a name="ln224">	}</a>
+<a name="ln225"> </a>
+<a name="ln226">	ssize_t GetList(void* _buffer, size_t size)</a>
+<a name="ln227">	{</a>
+<a name="ln228">		char* buffer = (char*)_buffer;</a>
+<a name="ln229"> </a>
+<a name="ln230">		if (fFileFD &lt; 0)</a>
+<a name="ln231">			return -1;</a>
+<a name="ln232"> </a>
+<a name="ln233">		// open attribute directory</a>
+<a name="ln234">		DIR* dir = fs_fopen_attr_dir(fFileFD);</a>
+<a name="ln235">		if (dir == NULL)</a>
+<a name="ln236">			return -1;</a>
+<a name="ln237"> </a>
+<a name="ln238">		// read the attributes</a>
+<a name="ln239">		size_t remainingSize = size;</a>
+<a name="ln240">		size_t totalSize = 0;</a>
+<a name="ln241">		while (struct dirent* entry = readdir(dir)) {</a>
+<a name="ln242">			attr_info info;</a>
+<a name="ln243">			if (fs_stat_attr(fFileFD, entry-&gt;d_name, &amp;info) != 0)</a>
+<a name="ln244">				continue;</a>
+<a name="ln245"> </a>
+<a name="ln246">			AttributeName attributeName;</a>
+<a name="ln247">			attributeName.Init(entry-&gt;d_name, info.type);</a>
+<a name="ln248"> </a>
+<a name="ln249">			size_t nameLength = strlen(attributeName.name);</a>
+<a name="ln250">			totalSize += nameLength + 1;</a>
+<a name="ln251"> </a>
+<a name="ln252">			if (remainingSize &gt; nameLength) {</a>
+<a name="ln253">				strcpy((char*)buffer, attributeName.name);</a>
+<a name="ln254">				buffer += nameLength + 1;</a>
+<a name="ln255">				remainingSize -= nameLength + 1;</a>
+<a name="ln256">			} else</a>
+<a name="ln257">				remainingSize = 0;</a>
+<a name="ln258">		}</a>
+<a name="ln259"> </a>
+<a name="ln260">		closedir(dir);</a>
+<a name="ln261"> </a>
+<a name="ln262">		// If the buffer was too small, fail.</a>
+<a name="ln263">		if (size != 0 &amp;&amp; totalSize &gt; size) {</a>
+<a name="ln264">			errno = ERANGE;</a>
+<a name="ln265">			return -1;</a>
+<a name="ln266">		}</a>
+<a name="ln267"> </a>
+<a name="ln268">		return totalSize;</a>
+<a name="ln269">	}</a>
+<a name="ln270"> </a>
+<a name="ln271">private:</a>
+<a name="ln272">	int		fFileFD;</a>
+<a name="ln273">	bool	fOwnsFileFD;</a>
+<a name="ln274">};</a>
+<a name="ln275"> </a>
+<a name="ln276"> </a>
+<a name="ln277">}	// namespace</a>
+<a name="ln278"> </a>
+<a name="ln279"> </a>
+<a name="ln280">// #pragma mark -</a>
+<a name="ln281"> </a>
+<a name="ln282"> </a>
+<a name="ln283">ssize_t</a>
+<a name="ln284">getxattr(const char* path, const char* attribute, void* buffer, size_t size)</a>
+<a name="ln285">{</a>
+<a name="ln286">	return Node(path, true).Get(attribute, buffer, size);</a>
+<a name="ln287">}</a>
+<a name="ln288"> </a>
+<a name="ln289"> </a>
+<a name="ln290">ssize_t</a>
+<a name="ln291">lgetxattr(const char* path, const char* attribute, void* buffer, size_t size)</a>
+<a name="ln292">{</a>
+<a name="ln293">	return Node(path, false).Get(attribute, buffer, size);</a>
+<a name="ln294">}</a>
+<a name="ln295"> </a>
+<a name="ln296"> </a>
+<a name="ln297">ssize_t</a>
+<a name="ln298">fgetxattr(int fd, const char* attribute, void* buffer, size_t size)</a>
+<a name="ln299">{</a>
+<a name="ln300">	return Node(fd).Get(attribute, buffer, size);</a>
+<a name="ln301">}</a>
+<a name="ln302"> </a>
+<a name="ln303"> </a>
+<a name="ln304">int</a>
+<a name="ln305">setxattr(const char* path, const char* attribute, const void* buffer,</a>
+<a name="ln306">	size_t size, int flags)</a>
+<a name="ln307">{</a>
+<a name="ln308">	return Node(path, true).Set(attribute, flags, buffer, size);</a>
+<a name="ln309">}</a>
+<a name="ln310"> </a>
+<a name="ln311"> </a>
+<a name="ln312">int</a>
+<a name="ln313">lsetxattr(const char* path, const char* attribute, const void* buffer,</a>
+<a name="ln314">	size_t size, int flags)</a>
+<a name="ln315">{</a>
+<a name="ln316">	return Node(path, false).Set(attribute, flags, buffer, size);</a>
+<a name="ln317">}</a>
+<a name="ln318"> </a>
+<a name="ln319"> </a>
+<a name="ln320">int</a>
+<a name="ln321">fsetxattr(int fd, const char* attribute, const void* buffer, size_t size,</a>
+<a name="ln322">	int flags)</a>
+<a name="ln323">{</a>
+<a name="ln324">	return Node(fd).Set(attribute, flags, buffer, size);</a>
+<a name="ln325">}</a>
+<a name="ln326"> </a>
+<a name="ln327"> </a>
+<a name="ln328">int</a>
+<a name="ln329">removexattr (const char* path, const char* attribute)</a>
+<a name="ln330">{</a>
+<a name="ln331">	return Node(path, true).Remove(attribute);</a>
+<a name="ln332">}</a>
+<a name="ln333"> </a>
+<a name="ln334"> </a>
+<a name="ln335">int</a>
+<a name="ln336">lremovexattr (const char* path, const char* attribute)</a>
+<a name="ln337">{</a>
+<a name="ln338">	return Node(path, false).Remove(attribute);</a>
+<a name="ln339">}</a>
+<a name="ln340"> </a>
+<a name="ln341"> </a>
+<a name="ln342">int</a>
+<a name="ln343">fremovexattr (int fd, const char* attribute)</a>
+<a name="ln344">{</a>
+<a name="ln345">	return Node(fd).Remove(attribute);</a>
+<a name="ln346">}</a>
+<a name="ln347"> </a>
+<a name="ln348"> </a>
+<a name="ln349">ssize_t</a>
+<a name="ln350">listxattr(const char* path, char* buffer, size_t size)</a>
+<a name="ln351">{</a>
+<a name="ln352">	return Node(path, true).GetList(buffer, size);</a>
+<a name="ln353">}</a>
+<a name="ln354"> </a>
+<a name="ln355"> </a>
+<a name="ln356">ssize_t</a>
+<a name="ln357">llistxattr(const char* path, char* buffer, size_t size)</a>
+<a name="ln358">{</a>
+<a name="ln359">	return Node(path, false).GetList(buffer, size);</a>
+<a name="ln360">}</a>
+<a name="ln361"> </a>
+<a name="ln362"> </a>
+<a name="ln363">ssize_t</a>
+<a name="ln364">flistxattr(int fd, char* buffer, size_t size)</a>
+<a name="ln365">{</a>
+<a name="ln366">	return Node(fd).GetList(buffer, size);</a>
+<a name="ln367">}</a>
+
+</code></pre>
+<div class="balloon" rel="57"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the third actual argument of the 'sprintf' function. The memsize type argument is expected.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

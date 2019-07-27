@@ -1,0 +1,827 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>IOCache.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2010-2011, Ingo Weinhold, ingo_weinhold@gmx.de.</a>
+<a name="ln3"> * Distributed under the terms of the MIT License.</a>
+<a name="ln4"> */</a>
+<a name="ln5"> </a>
+<a name="ln6"> </a>
+<a name="ln7">#include &quot;IOCache.h&quot;</a>
+<a name="ln8"> </a>
+<a name="ln9">#include &lt;algorithm&gt;</a>
+<a name="ln10"> </a>
+<a name="ln11">#include &lt;condition_variable.h&gt;</a>
+<a name="ln12">#include &lt;heap.h&gt;</a>
+<a name="ln13">#include &lt;low_resource_manager.h&gt;</a>
+<a name="ln14">#include &lt;util/AutoLock.h&gt;</a>
+<a name="ln15">#include &lt;vm/vm.h&gt;</a>
+<a name="ln16">#include &lt;vm/VMAddressSpace.h&gt;</a>
+<a name="ln17">#include &lt;vm/VMCache.h&gt;</a>
+<a name="ln18">#include &lt;vm/VMTranslationMap.h&gt;</a>
+<a name="ln19"> </a>
+<a name="ln20"> </a>
+<a name="ln21">//#define TRACE_IO_CACHE 1</a>
+<a name="ln22">#ifdef TRACE_IO_CACHE</a>
+<a name="ln23">#	define TRACE(format...)	dprintf(format)</a>
+<a name="ln24">#else</a>
+<a name="ln25">#	define TRACE(format...)	do {} while (false)</a>
+<a name="ln26">#endif</a>
+<a name="ln27"> </a>
+<a name="ln28"> </a>
+<a name="ln29">static inline bool</a>
+<a name="ln30">page_physical_number_less(const vm_page* a, const vm_page* b)</a>
+<a name="ln31">{</a>
+<a name="ln32">	return a-&gt;physical_page_number &lt; b-&gt;physical_page_number;</a>
+<a name="ln33">}</a>
+<a name="ln34"> </a>
+<a name="ln35"> </a>
+<a name="ln36">struct IOCache::Operation : IOOperation {</a>
+<a name="ln37">	ConditionVariable	finishedCondition;</a>
+<a name="ln38">};</a>
+<a name="ln39"> </a>
+<a name="ln40"> </a>
+<a name="ln41">IOCache::IOCache(DMAResource* resource, size_t cacheLineSize)</a>
+<a name="ln42">	:</a>
+<a name="ln43">	IOScheduler(resource),</a>
+<a name="ln44">	fDeviceCapacity(0),</a>
+<a name="ln45">	fLineSize(cacheLineSize),</a>
+<a name="ln46">	fPagesPerLine(cacheLineSize / B_PAGE_SIZE),</a>
+<a name="ln47">	fArea(-1),</a>
+<a name="ln48">	fCache(NULL),</a>
+<a name="ln49">	fPages(NULL),</a>
+<a name="ln50">	fVecs(NULL)</a>
+<a name="ln51">{</a>
+<a name="ln52">	ASSERT(resource != NULL);</a>
+<a name="ln53">	TRACE(&quot;%p-&gt;IOCache::IOCache(%p, %&quot; B_PRIuSIZE &quot;)\n&quot;, this, resource,</a>
+<a name="ln54">		cacheLineSize);</a>
+<a name="ln55"> </a>
+<a name="ln56">	if (cacheLineSize &lt; B_PAGE_SIZE</a>
+<a name="ln57">		|| (cacheLineSize &amp; (cacheLineSize - 1)) != 0) {</a>
+<a name="ln58">		panic(&quot;Invalid cache line size (%&quot; B_PRIuSIZE &quot;). Must be a power of 2 &quot;</a>
+<a name="ln59">			&quot;multiple of the page size.&quot;, cacheLineSize);</a>
+<a name="ln60">	}</a>
+<a name="ln61"> </a>
+<a name="ln62">	mutex_init(&amp;fSerializationLock, &quot;I/O cache request serialization&quot;);</a>
+<a name="ln63"> </a>
+<a name="ln64">	fLineSizeShift = 0;</a>
+<a name="ln65">	while (cacheLineSize != 1) {</a>
+<a name="ln66">		fLineSizeShift++;</a>
+<a name="ln67">		cacheLineSize &gt;&gt;= 1;</a>
+<a name="ln68">	}</a>
+<a name="ln69">}</a>
+<a name="ln70"> </a>
+<a name="ln71"> </a>
+<a name="ln72">IOCache::~IOCache()</a>
+<a name="ln73">{</a>
+<a name="ln74">	if (fArea &gt;= 0) {</a>
+<a name="ln75">		vm_page_unreserve_pages(&amp;fMappingReservation);</a>
+<a name="ln76">		delete_area(fArea);</a>
+<a name="ln77">	}</a>
+<a name="ln78"> </a>
+<a name="ln79">	delete[] fPages;</a>
+<a name="ln80">	delete[] fVecs;</a>
+<a name="ln81"> </a>
+<a name="ln82">	mutex_destroy(&amp;fSerializationLock);</a>
+<a name="ln83">}</a>
+<a name="ln84"> </a>
+<a name="ln85"> </a>
+<a name="ln86">status_t</a>
+<a name="ln87">IOCache::Init(const char* name)</a>
+<a name="ln88">{</a>
+<a name="ln89">	TRACE(&quot;%p-&gt;IOCache::Init(\&quot;%s\&quot;)\n&quot;, this, name);</a>
+<a name="ln90"> </a>
+<a name="ln91">	status_t error = IOScheduler::Init(name);</a>
+<a name="ln92">	if (error != B_OK)</a>
+<a name="ln93">		return error;</a>
+<a name="ln94"> </a>
+<a name="ln95">	// create the area for mapping cache lines</a>
+<a name="ln96">	fArea = vm_create_null_area(B_SYSTEM_TEAM, &quot;I/O cache line&quot;, &amp;fAreaBase,</a>
+<a name="ln97">		B_ANY_KERNEL_ADDRESS, fLineSize, 0);</a>
+<a name="ln98">	if (fArea &lt; 0)</a>
+<a name="ln99">		return fArea;</a>
+<a name="ln100"> </a>
+<a name="ln101">	// reserve pages for mapping a complete cache line</a>
+<a name="ln102">	VMAddressSpace* addressSpace = VMAddressSpace::Kernel();</a>
+<a name="ln103">	VMTranslationMap* translationMap = addressSpace-&gt;TranslationMap();</a>
+<a name="ln104">	size_t pagesNeeded = translationMap-&gt;MaxPagesNeededToMap((addr_t)fAreaBase,</a>
+<a name="ln105">		(addr_t)fAreaBase + fLineSize - 1);</a>
+<a name="ln106">	vm_page_reserve_pages(&amp;fMappingReservation, pagesNeeded,</a>
+<a name="ln107">		VM_PRIORITY_SYSTEM);</a>
+<a name="ln108"> </a>
+<a name="ln109">	// get the area's cache</a>
+<a name="ln110">	VMArea* area = VMAreaHash::Lookup(fArea);</a>
+<a name="ln111">	if (area == NULL) {</a>
+<a name="ln112">		panic(&quot;IOCache::Init(): Where's our area (id: %&quot; B_PRId32 &quot;)?!&quot;, fArea);</a>
+<a name="ln113">		return B_ERROR;</a>
+<a name="ln114">	}</a>
+<a name="ln115">	fCache = area-&gt;cache;</a>
+<a name="ln116"> </a>
+<a name="ln117">	// allocate arrays for pages and io vecs</a>
+<a name="ln118">	fPages = new(std::nothrow) vm_page*[fPagesPerLine];</a>
+<a name="ln119">	fVecs = new(std::nothrow) generic_io_vec[fPagesPerLine];</a>
+<a name="ln120">	if (fPages == NULL || fVecs == NULL)</a>
+<a name="ln121">		return B_NO_MEMORY;</a>
+<a name="ln122"> </a>
+<a name="ln123">	return B_OK;</a>
+<a name="ln124">}</a>
+<a name="ln125"> </a>
+<a name="ln126"> </a>
+<a name="ln127">void</a>
+<a name="ln128">IOCache::SetDeviceCapacity(off_t deviceCapacity)</a>
+<a name="ln129">{</a>
+<a name="ln130">	TRACE(&quot;%p-&gt;IOCache::SetDeviceCapacity(%&quot; B_PRIdOFF &quot;)\n&quot;, this,</a>
+<a name="ln131">		deviceCapacity);</a>
+<a name="ln132"> </a>
+<a name="ln133">	MutexLocker serializationLocker(fSerializationLock);</a>
+<a name="ln134">	AutoLocker&lt;VMCache&gt; cacheLocker(fCache);</a>
+<a name="ln135"> </a>
+<a name="ln136">	fDeviceCapacity = deviceCapacity;</a>
+<a name="ln137">}</a>
+<a name="ln138"> </a>
+<a name="ln139"> </a>
+<a name="ln140">void</a>
+<a name="ln141">IOCache::MediaChanged()</a>
+<a name="ln142">{</a>
+<a name="ln143">	TRACE(&quot;%p-&gt;IOCache::MediaChanged()\n&quot;, this);</a>
+<a name="ln144"> </a>
+<a name="ln145">	MutexLocker serializationLocker(fSerializationLock);</a>
+<a name="ln146">	AutoLocker&lt;VMCache&gt; cacheLocker(fCache);</a>
+<a name="ln147"> </a>
+<a name="ln148">	// new media -- burn all cached data</a>
+<a name="ln149">	while (vm_page* page = fCache-&gt;pages.Root()) {</a>
+<a name="ln150">		DEBUG_PAGE_ACCESS_START(page);</a>
+<a name="ln151">		fCache-&gt;RemovePage(page);</a>
+<a name="ln152">		vm_page_free(NULL, page);</a>
+<a name="ln153">	}</a>
+<a name="ln154">}</a>
+<a name="ln155"> </a>
+<a name="ln156"> </a>
+<a name="ln157">status_t</a>
+<a name="ln158">IOCache::ScheduleRequest(IORequest* request)</a>
+<a name="ln159">{</a>
+<a name="ln160">	TRACE(&quot;%p-&gt;IOCache::ScheduleRequest(%p)\n&quot;, this, request);</a>
+<a name="ln161"> </a>
+<a name="ln162">	// lock the request's memory</a>
+<a name="ln163">	status_t error;</a>
+<a name="ln164">	IOBuffer* buffer = request-&gt;Buffer();</a>
+<a name="ln165">	if (buffer-&gt;IsVirtual()) {</a>
+<a name="ln166">		error = buffer-&gt;LockMemory(request-&gt;TeamID(), request-&gt;IsWrite());</a>
+<a name="ln167">		if (error != B_OK) {</a>
+<a name="ln168">			request-&gt;SetStatusAndNotify(error);</a>
+<a name="ln169">			return error;</a>
+<a name="ln170">		}</a>
+<a name="ln171">	}</a>
+<a name="ln172"> </a>
+<a name="ln173">	// we completely serialize all I/O in FIFO order</a>
+<a name="ln174">	MutexLocker serializationLocker(fSerializationLock);</a>
+<a name="ln175">	generic_size_t bytesTransferred = 0;</a>
+<a name="ln176">	error = _DoRequest(request, bytesTransferred);</a>
+<a name="ln177">	serializationLocker.Unlock();</a>
+<a name="ln178"> </a>
+<a name="ln179">	// unlock memory</a>
+<a name="ln180">	if (buffer-&gt;IsVirtual())</a>
+<a name="ln181">		buffer-&gt;UnlockMemory(request-&gt;TeamID(), request-&gt;IsWrite());</a>
+<a name="ln182"> </a>
+<a name="ln183">	// set status and notify</a>
+<a name="ln184">	if (error == B_OK) {</a>
+<a name="ln185">		request-&gt;SetTransferredBytes(bytesTransferred &lt; request-&gt;Length(),</a>
+<a name="ln186">			bytesTransferred);</a>
+<a name="ln187">		request-&gt;SetStatusAndNotify(B_OK);</a>
+<a name="ln188">	} else</a>
+<a name="ln189">		request-&gt;SetStatusAndNotify(error);</a>
+<a name="ln190"> </a>
+<a name="ln191">	return error;</a>
+<a name="ln192">}</a>
+<a name="ln193"> </a>
+<a name="ln194"> </a>
+<a name="ln195">void</a>
+<a name="ln196">IOCache::AbortRequest(IORequest* request, status_t status)</a>
+<a name="ln197">{</a>
+<a name="ln198">	// TODO:...</a>
+<a name="ln199">}</a>
+<a name="ln200"> </a>
+<a name="ln201"> </a>
+<a name="ln202">void</a>
+<a name="ln203">IOCache::OperationCompleted(IOOperation* operation, status_t status,</a>
+<a name="ln204">	generic_size_t transferredBytes)</a>
+<a name="ln205">{</a>
+<a name="ln206">	if (status == B_OK) {</a>
+<a name="ln207">		// always fail in case of partial transfers</a>
+<a name="ln208">		((Operation*)operation)-&gt;finishedCondition.NotifyAll(</a>
+<a name="ln209">			transferredBytes == operation-&gt;Length() ? B_OK : B_ERROR);</a>
+<a name="ln210">	} else</a>
+<a name="ln211">		((Operation*)operation)-&gt;finishedCondition.NotifyAll(status);</a>
+<a name="ln212">}</a>
+<a name="ln213"> </a>
+<a name="ln214"> </a>
+<a name="ln215">void</a>
+<a name="ln216">IOCache::Dump() const</a>
+<a name="ln217">{</a>
+<a name="ln218">	kprintf(&quot;IOCache at %p\n&quot;, this);</a>
+<a name="ln219">	kprintf(&quot;  DMA resource:   %p\n&quot;, fDMAResource);</a>
+<a name="ln220">}</a>
+<a name="ln221"> </a>
+<a name="ln222"> </a>
+<a name="ln223">status_t</a>
+<a name="ln224">IOCache::_DoRequest(IORequest* request, generic_size_t&amp; _bytesTransferred)</a>
+<a name="ln225">{</a>
+<a name="ln226">	off_t offset = request-&gt;Offset();</a>
+<a name="ln227">	generic_size_t length = request-&gt;Length();</a>
+<a name="ln228"> </a>
+<a name="ln229">	TRACE(&quot;%p-&gt;IOCache::ScheduleRequest(%p): offset: %&quot; B_PRIdOFF</a>
+<a name="ln230">		&quot;, length: %&quot; B_PRIuSIZE &quot;\n&quot;, this, request, offset, length);</a>
+<a name="ln231"> </a>
+<a name="ln232">	if (offset &lt; 0 || offset &gt; fDeviceCapacity)</a>
+<a name="ln233">		return B_BAD_VALUE;</a>
+<a name="ln234"> </a>
+<a name="ln235">	// truncate the request to the device capacity</a>
+<a name="ln236">	if (fDeviceCapacity - offset &lt; (off_t)length)</a>
+<a name="ln237">		length = fDeviceCapacity - offset;</a>
+<a name="ln238"> </a>
+<a name="ln239">	_bytesTransferred = 0;</a>
+<a name="ln240"> </a>
+<a name="ln241">	while (length &gt; 0) {</a>
+<a name="ln242">		// the start of the current cache line</a>
+<a name="ln243">		off_t lineOffset = (offset &gt;&gt; fLineSizeShift) &lt;&lt; fLineSizeShift;</a>
+<a name="ln244"> </a>
+<a name="ln245">		// intersection of request and cache line</a>
+<a name="ln246">		off_t cacheLineEnd = std::min(lineOffset + (off_t)fLineSize, fDeviceCapacity);</a>
+<a name="ln247">		size_t requestLineLength</a>
+<a name="ln248">			= std::min(cacheLineEnd - offset, (off_t)length);</a>
+<a name="ln249"> </a>
+<a name="ln250">		// transfer the data of the cache line</a>
+<a name="ln251">		status_t error = _TransferRequestLine(request, lineOffset,</a>
+<a name="ln252">			cacheLineEnd - lineOffset, offset, requestLineLength);</a>
+<a name="ln253">		if (error != B_OK)</a>
+<a name="ln254">			return error;</a>
+<a name="ln255"> </a>
+<a name="ln256">		offset = cacheLineEnd;</a>
+<a name="ln257">		length -= requestLineLength;</a>
+<a name="ln258">		_bytesTransferred += requestLineLength;</a>
+<a name="ln259">	}</a>
+<a name="ln260"> </a>
+<a name="ln261">	return B_OK;</a>
+<a name="ln262">}</a>
+<a name="ln263"> </a>
+<a name="ln264"> </a>
+<a name="ln265">status_t</a>
+<a name="ln266">IOCache::_TransferRequestLine(IORequest* request, off_t lineOffset,</a>
+<a name="ln267">	size_t lineSize, off_t requestOffset, size_t requestLength)</a>
+<a name="ln268">{</a>
+<a name="ln269">	TRACE(&quot;%p-&gt;IOCache::_TransferRequestLine(%p, %&quot; B_PRIdOFF</a>
+<a name="ln270">		&quot;, %&quot; B_PRIdOFF  &quot;, %&quot; B_PRIuSIZE &quot;)\n&quot;, this, request, lineOffset,</a>
+<a name="ln271">		requestOffset, requestLength);</a>
+<a name="ln272"> </a>
+<a name="ln273">	// check whether there are pages of the cache line and the mark them used</a>
+<a name="ln274">	page_num_t firstPageOffset = lineOffset / B_PAGE_SIZE;</a>
+<a name="ln275">	page_num_t linePageCount = (lineSize + B_PAGE_SIZE - 1) / B_PAGE_SIZE;</a>
+<a name="ln276"> </a>
+<a name="ln277">	AutoLocker&lt;VMCache&gt; cacheLocker(fCache);</a>
+<a name="ln278"> </a>
+<a name="ln279">	page_num_t firstMissing = 0;</a>
+<a name="ln280">	page_num_t lastMissing = 0;</a>
+<a name="ln281">	page_num_t missingPages = 0;</a>
+<a name="ln282">	page_num_t pageOffset = firstPageOffset;</a>
+<a name="ln283"> </a>
+<a name="ln284">	VMCachePagesTree::Iterator it = fCache-&gt;pages.GetIterator(pageOffset, true,</a>
+<a name="ln285">		true);</a>
+<a name="ln286">	while (pageOffset &lt; firstPageOffset + linePageCount) {</a>
+<a name="ln287">		vm_page* page = it.Next();</a>
+<a name="ln288">		page_num_t currentPageOffset;</a>
+<a name="ln289">		if (page == NULL</a>
+<a name="ln290">			|| page-&gt;cache_offset &gt;= firstPageOffset + linePageCount) {</a>
+<a name="ln291">			page = NULL;</a>
+<a name="ln292">			currentPageOffset = firstPageOffset + linePageCount;</a>
+<a name="ln293">		} else</a>
+<a name="ln294">			currentPageOffset = page-&gt;cache_offset;</a>
+<a name="ln295"> </a>
+<a name="ln296">		if (pageOffset &lt; currentPageOffset) {</a>
+<a name="ln297">			// pages are missing</a>
+<a name="ln298">			if (missingPages == 0)</a>
+<a name="ln299">				firstMissing = pageOffset;</a>
+<a name="ln300">			lastMissing = currentPageOffset - 1;</a>
+<a name="ln301">			missingPages += currentPageOffset - pageOffset;</a>
+<a name="ln302"> </a>
+<a name="ln303">			for (; pageOffset &lt; currentPageOffset; pageOffset++)</a>
+<a name="ln304">				fPages[pageOffset - firstPageOffset] = NULL;</a>
+<a name="ln305">		}</a>
+<a name="ln306"> </a>
+<a name="ln307">		if (page != NULL) {</a>
+<a name="ln308">			fPages[pageOffset++ - firstPageOffset] = page;</a>
+<a name="ln309">			DEBUG_PAGE_ACCESS_START(page);</a>
+<a name="ln310">			vm_page_set_state(page, PAGE_STATE_UNUSED);</a>
+<a name="ln311">			DEBUG_PAGE_ACCESS_END(page);</a>
+<a name="ln312">		}</a>
+<a name="ln313">	}</a>
+<a name="ln314"> </a>
+<a name="ln315">	cacheLocker.Unlock();</a>
+<a name="ln316"> </a>
+<a name="ln317">	bool isVIP = (request-&gt;Flags() &amp; B_VIP_IO_REQUEST) != 0;</a>
+<a name="ln318"> </a>
+<a name="ln319">	if (missingPages &gt; 0) {</a>
+<a name="ln320">// TODO: If this is a read request and the missing pages range doesn't intersect</a>
+<a name="ln321">// with the request, just satisfy the request and don't read anything at all.</a>
+<a name="ln322">		// There are pages of the cache line missing. We have to allocate fresh</a>
+<a name="ln323">		// ones.</a>
+<a name="ln324"> </a>
+<a name="ln325">		// reserve</a>
+<a name="ln326">		vm_page_reservation reservation;</a>
+<a name="ln327">		if (!vm_page_try_reserve_pages(&amp;reservation, missingPages,</a>
+<a name="ln328">				VM_PRIORITY_SYSTEM)) {</a>
+<a name="ln329">			_DiscardPages(firstMissing - firstPageOffset, missingPages);</a>
+<a name="ln330"> </a>
+<a name="ln331">			// fall back to uncached transfer</a>
+<a name="ln332">			return _TransferRequestLineUncached(request, lineOffset,</a>
+<a name="ln333">				requestOffset, requestLength);</a>
+<a name="ln334">		}</a>
+<a name="ln335"> </a>
+<a name="ln336">		// Allocate the missing pages and remove the already existing pages in</a>
+<a name="ln337">		// the range from the cache. We're going to read/write the whole range</a>
+<a name="ln338">		// anyway and this way we can sort it, possibly improving the physical</a>
+<a name="ln339">		// vecs.</a>
+<a name="ln340">// TODO: When memory is low, we should consider cannibalizing ourselves or</a>
+<a name="ln341">// simply transferring past the cache!</a>
+<a name="ln342">		for (pageOffset = firstMissing; pageOffset &lt;= lastMissing;</a>
+<a name="ln343">				pageOffset++) {</a>
+<a name="ln344">			page_num_t index = pageOffset - firstPageOffset;</a>
+<a name="ln345">			if (fPages[index] == NULL) {</a>
+<a name="ln346">				fPages[index] = vm_page_allocate_page(&amp;reservation,</a>
+<a name="ln347">					PAGE_STATE_UNUSED);</a>
+<a name="ln348">				DEBUG_PAGE_ACCESS_END(fPages[index]);</a>
+<a name="ln349">			} else {</a>
+<a name="ln350">				cacheLocker.Lock();</a>
+<a name="ln351">				fCache-&gt;RemovePage(fPages[index]);</a>
+<a name="ln352">				cacheLocker.Unlock();</a>
+<a name="ln353">			}</a>
+<a name="ln354">		}</a>
+<a name="ln355"> </a>
+<a name="ln356">		missingPages = lastMissing - firstMissing + 1;</a>
+<a name="ln357"> </a>
+<a name="ln358">		// sort the page array by physical page number</a>
+<a name="ln359">		std::sort(fPages + firstMissing - firstPageOffset,</a>
+<a name="ln360">			fPages + lastMissing - firstPageOffset + 1,</a>
+<a name="ln361">			page_physical_number_less);</a>
+<a name="ln362"> </a>
+<a name="ln363">		// add the pages to the cache</a>
+<a name="ln364">		cacheLocker.Lock();</a>
+<a name="ln365"> </a>
+<a name="ln366">		for (pageOffset = firstMissing; pageOffset &lt;= lastMissing;</a>
+<a name="ln367">				pageOffset++) {</a>
+<a name="ln368">			page_num_t index = pageOffset - firstPageOffset;</a>
+<a name="ln369">			fCache-&gt;InsertPage(fPages[index], (off_t)pageOffset * B_PAGE_SIZE);</a>
+<a name="ln370">		}</a>
+<a name="ln371"> </a>
+<a name="ln372">		cacheLocker.Unlock();</a>
+<a name="ln373"> </a>
+<a name="ln374">		// Read in the missing pages, if this is a read request or a write</a>
+<a name="ln375">		// request that doesn't cover the complete missing range.</a>
+<a name="ln376">		if (request-&gt;IsRead()</a>
+<a name="ln377">			|| requestOffset &lt; (off_t)firstMissing * B_PAGE_SIZE</a>
+<a name="ln378">			|| requestOffset + (off_t)requestLength</a>
+<a name="ln379">				&gt; (off_t)(lastMissing + 1) * B_PAGE_SIZE) {</a>
+<a name="ln380">			status_t error = _TransferPages(firstMissing - firstPageOffset,</a>
+<a name="ln381">				missingPages, false, isVIP);</a>
+<a name="ln382">			if (error != B_OK) {</a>
+<a name="ln383">				dprintf(&quot;IOCache::_TransferRequestLine(): Failed to read into &quot;</a>
+<a name="ln384">					&quot;cache (offset: %&quot; B_PRIdOFF &quot;, length: %&quot; B_PRIuSIZE &quot;), &quot;</a>
+<a name="ln385">					&quot;trying uncached read (offset: %&quot; B_PRIdOFF &quot;, length: %&quot;</a>
+<a name="ln386">					B_PRIuSIZE &quot;)\n&quot;, (off_t)firstMissing * B_PAGE_SIZE,</a>
+<a name="ln387">					(size_t)missingPages * B_PAGE_SIZE, requestOffset,</a>
+<a name="ln388">					requestLength);</a>
+<a name="ln389"> </a>
+<a name="ln390">				_DiscardPages(firstMissing - firstPageOffset, missingPages);</a>
+<a name="ln391"> </a>
+<a name="ln392">				// Try again using an uncached transfer</a>
+<a name="ln393">				return _TransferRequestLineUncached(request, lineOffset,</a>
+<a name="ln394">					requestOffset, requestLength);</a>
+<a name="ln395">			}</a>
+<a name="ln396">		}</a>
+<a name="ln397">	}</a>
+<a name="ln398"> </a>
+<a name="ln399">	if (request-&gt;IsRead()) {</a>
+<a name="ln400">		// copy data to request</a>
+<a name="ln401">		status_t error = _CopyPages(request, requestOffset - lineOffset,</a>
+<a name="ln402">			requestOffset, requestLength, true);</a>
+<a name="ln403">		_CachePages(0, linePageCount);</a>
+<a name="ln404">		return error;</a>
+<a name="ln405">	}</a>
+<a name="ln406"> </a>
+<a name="ln407">	// copy data from request</a>
+<a name="ln408">	status_t error = _CopyPages(request, requestOffset - lineOffset,</a>
+<a name="ln409">		requestOffset, requestLength, false);</a>
+<a name="ln410">	if (error != B_OK) {</a>
+<a name="ln411">		_DiscardPages(0, linePageCount);</a>
+<a name="ln412">		return error;</a>
+<a name="ln413">	}</a>
+<a name="ln414"> </a>
+<a name="ln415">	// write the pages to disk</a>
+<a name="ln416">	page_num_t firstPage = (requestOffset - lineOffset) / B_PAGE_SIZE;</a>
+<a name="ln417">	page_num_t endPage = (requestOffset + requestLength - lineOffset</a>
+<a name="ln418">		+ B_PAGE_SIZE - 1) / B_PAGE_SIZE;</a>
+<a name="ln419">	error = _TransferPages(firstPage, endPage - firstPage, true, isVIP);</a>
+<a name="ln420"> </a>
+<a name="ln421">	if (error != B_OK) {</a>
+<a name="ln422">		_DiscardPages(firstPage, endPage - firstPage);</a>
+<a name="ln423">		return error;</a>
+<a name="ln424">	}</a>
+<a name="ln425"> </a>
+<a name="ln426">	_CachePages(0, linePageCount);</a>
+<a name="ln427">	return error;</a>
+<a name="ln428">}</a>
+<a name="ln429"> </a>
+<a name="ln430"> </a>
+<a name="ln431">status_t</a>
+<a name="ln432">IOCache::_TransferRequestLineUncached(IORequest* request, off_t lineOffset,</a>
+<a name="ln433">	off_t requestOffset, size_t requestLength)</a>
+<a name="ln434">{</a>
+<a name="ln435">	TRACE(&quot;%p-&gt;IOCache::_TransferRequestLineUncached(%p, %&quot; B_PRIdOFF</a>
+<a name="ln436">		&quot;, %&quot; B_PRIdOFF  &quot;, %&quot; B_PRIuSIZE &quot;)\n&quot;, this, request, lineOffset,</a>
+<a name="ln437">		requestOffset, requestLength);</a>
+<a name="ln438"> </a>
+<a name="ln439">	// Advance the request to the interesting offset, so the DMAResource can</a>
+<a name="ln440">	// provide us with fitting operations.</a>
+<a name="ln441">	off_t actualRequestOffset</a>
+<a name="ln442">		= request-&gt;Offset() + request-&gt;Length() - request-&gt;RemainingBytes();</a>
+<a name="ln443">	if (actualRequestOffset &gt; requestOffset) {</a>
+<a name="ln444">		dprintf(&quot;IOCache::_TransferRequestLineUncached(): Request %p advanced &quot;</a>
+<a name="ln445">			&quot;beyond current cache line (%&quot; B_PRIdOFF &quot; vs. %&quot; B_PRIdOFF &quot;)\n&quot;,</a>
+<a name="ln446">			request, actualRequestOffset, requestOffset);</a>
+<a name="ln447">		return B_BAD_VALUE;</a>
+<a name="ln448">	}</a>
+<a name="ln449"> </a>
+<a name="ln450">	if (actualRequestOffset &lt; requestOffset)</a>
+<a name="ln451">		request-&gt;Advance(requestOffset - actualRequestOffset);</a>
+<a name="ln452"> </a>
+<a name="ln453">	generic_size_t requestRemaining = request-&gt;RemainingBytes() - requestLength;</a>
+<a name="ln454"> </a>
+<a name="ln455">	// Process single operations until the specified part of the request is</a>
+<a name="ln456">	// finished or until an error occurs.</a>
+<a name="ln457">	Operation operation;</a>
+<a name="ln458">	operation.finishedCondition.Init(this, &quot;I/O cache operation finished&quot;);</a>
+<a name="ln459"> </a>
+<a name="ln460">	while (request-&gt;RemainingBytes() &gt; requestRemaining</a>
+<a name="ln461">		&amp;&amp; request-&gt;Status() &gt; 0) {</a>
+<a name="ln462">		status_t error = fDMAResource-&gt;TranslateNext(request, &amp;operation,</a>
+<a name="ln463">			request-&gt;RemainingBytes() - requestRemaining);</a>
+<a name="ln464">		if (error != B_OK)</a>
+<a name="ln465">			return error;</a>
+<a name="ln466"> </a>
+<a name="ln467">		error = _DoOperation(operation);</a>
+<a name="ln468"> </a>
+<a name="ln469">		request-&gt;OperationFinished(&amp;operation, error, false,</a>
+<a name="ln470">			error == B_OK ? operation.OriginalLength() : 0);</a>
+<a name="ln471">		request-&gt;SetUnfinished();</a>
+<a name="ln472">			// Keep the request in unfinished state. ScheduleRequest() will set</a>
+<a name="ln473">			// the final status and notify.</a>
+<a name="ln474"> </a>
+<a name="ln475">		fDMAResource-&gt;RecycleBuffer(operation.Buffer());</a>
+<a name="ln476"> </a>
+<a name="ln477">		if (error != B_OK) {</a>
+<a name="ln478">			TRACE(&quot;%p-&gt;IOCache::_TransferRequestLineUncached(): operation at &quot;</a>
+<a name="ln479">				&quot;%&quot; B_PRIdOFF &quot; failed: %s\n&quot;, this, operation.Offset(),</a>
+<a name="ln480">				strerror(error));</a>
+<a name="ln481">			return error;</a>
+<a name="ln482">		}</a>
+<a name="ln483">	}</a>
+<a name="ln484"> </a>
+<a name="ln485">	return B_OK;</a>
+<a name="ln486">}</a>
+<a name="ln487"> </a>
+<a name="ln488"> </a>
+<a name="ln489">status_t</a>
+<a name="ln490">IOCache::_DoOperation(Operation&amp; operation)</a>
+<a name="ln491">{</a>
+<a name="ln492">	TRACE(&quot;%p-&gt;IOCache::_DoOperation(%&quot; B_PRIdOFF &quot;, %&quot; B_PRIuSIZE &quot;)\n&quot;, this,</a>
+<a name="ln493">		operation.Offset(), operation.Length());</a>
+<a name="ln494"> </a>
+<a name="ln495">	while (true) {</a>
+<a name="ln496">		ConditionVariableEntry waitEntry;</a>
+<a name="ln497">		operation.finishedCondition.Add(&amp;waitEntry);</a>
+<a name="ln498"> </a>
+<a name="ln499">		status_t error = fIOCallback(fIOCallbackData, &amp;operation);</a>
+<a name="ln500">		if (error != B_OK) {</a>
+<a name="ln501">			operation.finishedCondition.NotifyAll(error);</a>
+<a name="ln502">				// removes the entry from the variable</a>
+<a name="ln503">			return error;</a>
+<a name="ln504">		}</a>
+<a name="ln505"> </a>
+<a name="ln506">		// wait for the operation to finish</a>
+<a name="ln507">		error = waitEntry.Wait();</a>
+<a name="ln508">		if (error != B_OK)</a>
+<a name="ln509">			return error;</a>
+<a name="ln510"> </a>
+<a name="ln511">		if (operation.Finish())</a>
+<a name="ln512">			return B_OK;</a>
+<a name="ln513">	}</a>
+<a name="ln514">}</a>
+<a name="ln515"> </a>
+<a name="ln516"> </a>
+<a name="ln517">status_t</a>
+<a name="ln518">IOCache::_TransferPages(size_t firstPage, size_t pageCount, bool isWrite,</a>
+<a name="ln519">	bool isVIP)</a>
+<a name="ln520">{</a>
+<a name="ln521">	TRACE(&quot;%p-&gt;IOCache::_TransferPages(%&quot; B_PRIuSIZE &quot;, %&quot; B_PRIuSIZE</a>
+<a name="ln522">		&quot;, write: %d, vip: %d)\n&quot;, this, firstPage, pageCount, isWrite, isVIP);</a>
+<a name="ln523"> </a>
+<a name="ln524">	off_t firstPageOffset = (off_t)fPages[firstPage]-&gt;cache_offset</a>
+<a name="ln525">		* B_PAGE_SIZE;</a>
+<a name="ln526">	generic_size_t requestLength = std::min(</a>
+<a name="ln527">			firstPageOffset + (off_t)pageCount * B_PAGE_SIZE, fDeviceCapacity)</a>
+<a name="ln528">		- firstPageOffset;</a>
+<a name="ln529"> </a>
+<a name="ln530">	// prepare the I/O vecs</a>
+<a name="ln531">	size_t vecCount = 0;</a>
+<a name="ln532">	size_t endPage = firstPage + pageCount;</a>
+<a name="ln533">	phys_addr_t vecsEndAddress = 0;</a>
+<a name="ln534">	for (size_t i = firstPage; i &lt; endPage; i++) {</a>
+<a name="ln535">		phys_addr_t pageAddress</a>
+<a name="ln536">			= (phys_addr_t)fPages[i]-&gt;physical_page_number * B_PAGE_SIZE;</a>
+<a name="ln537">		if (vecCount == 0 || pageAddress != vecsEndAddress) {</a>
+<a name="ln538">			fVecs[vecCount].base = pageAddress;</a>
+<a name="ln539">			fVecs[vecCount++].length = B_PAGE_SIZE;</a>
+<a name="ln540">			vecsEndAddress = pageAddress + B_PAGE_SIZE;</a>
+<a name="ln541">		} else {</a>
+<a name="ln542">			// extend the previous vec</a>
+<a name="ln543">			fVecs[vecCount - 1].length += B_PAGE_SIZE;</a>
+<a name="ln544">			vecsEndAddress += B_PAGE_SIZE;</a>
+<a name="ln545">		}</a>
+<a name="ln546">	}</a>
+<a name="ln547"> </a>
+<a name="ln548">	// create a request for the transfer</a>
+<a name="ln549">	IORequest request;</a>
+<a name="ln550">	status_t error = request.Init(firstPageOffset, fVecs, vecCount,</a>
+<a name="ln551">		requestLength, isWrite,</a>
+<a name="ln552">		B_PHYSICAL_IO_REQUEST | (isVIP ? B_VIP_IO_REQUEST : 0));</a>
+<a name="ln553">	if (error != B_OK)</a>
+<a name="ln554">		return error;</a>
+<a name="ln555"> </a>
+<a name="ln556">	// Process single operations until the complete request is finished or</a>
+<a name="ln557">	// until an error occurs.</a>
+<a name="ln558">	Operation operation;</a>
+<a name="ln559">	operation.finishedCondition.Init(this, &quot;I/O cache operation finished&quot;);</a>
+<a name="ln560"> </a>
+<a name="ln561">	while (request.RemainingBytes() &gt; 0 &amp;&amp; request.Status() &gt; 0) {</a>
+<a name="ln562">		error = fDMAResource-&gt;TranslateNext(&amp;request, &amp;operation,</a>
+<a name="ln563">			requestLength);</a>
+<a name="ln564">		if (error != B_OK)</a>
+<a name="ln565">			return error;</a>
+<a name="ln566"> </a>
+<a name="ln567">		error = _DoOperation(operation);</a>
+<a name="ln568"> </a>
+<a name="ln569">		request.RemoveOperation(&amp;operation);</a>
+<a name="ln570"> </a>
+<a name="ln571">		fDMAResource-&gt;RecycleBuffer(operation.Buffer());</a>
+<a name="ln572"> </a>
+<a name="ln573">		if (error != B_OK) {</a>
+<a name="ln574">			TRACE(&quot;%p-&gt;IOCache::_TransferLine(): operation at %&quot; B_PRIdOFF</a>
+<a name="ln575">				&quot; failed: %s\n&quot;, this, operation.Offset(), strerror(error));</a>
+<a name="ln576">			return error;</a>
+<a name="ln577">		}</a>
+<a name="ln578">	}</a>
+<a name="ln579"> </a>
+<a name="ln580">	return B_OK;</a>
+<a name="ln581">}</a>
+<a name="ln582"> </a>
+<a name="ln583"> </a>
+<a name="ln584">/*!	Frees all pages in given range of the \c fPages array.</a>
+<a name="ln585">	\c NULL entries in the range are OK. All non \c NULL entries must refer</a>
+<a name="ln586">	to pages with \c PAGE_STATE_UNUSED. The pages may belong to \c fCache or</a>
+<a name="ln587">	may not have a cache.</a>
+<a name="ln588">	\c fCache must not be locked.</a>
+<a name="ln589">*/</a>
+<a name="ln590">void</a>
+<a name="ln591">IOCache::_DiscardPages(size_t firstPage, size_t pageCount)</a>
+<a name="ln592">{</a>
+<a name="ln593">	TRACE(&quot;%p-&gt;IOCache::_DiscardPages(%&quot; B_PRIuSIZE &quot;, %&quot; B_PRIuSIZE &quot;)\n&quot;,</a>
+<a name="ln594">		this, firstPage, pageCount);</a>
+<a name="ln595"> </a>
+<a name="ln596">	AutoLocker&lt;VMCache&gt; cacheLocker(fCache);</a>
+<a name="ln597"> </a>
+<a name="ln598">	for (size_t i = firstPage; i &lt; firstPage + pageCount; i++) {</a>
+<a name="ln599">		vm_page* page = fPages[i];</a>
+<a name="ln600">		if (page == NULL)</a>
+<a name="ln601">			continue;</a>
+<a name="ln602"> </a>
+<a name="ln603">		DEBUG_PAGE_ACCESS_START(page);</a>
+<a name="ln604"> </a>
+<a name="ln605">		ASSERT_PRINT(page-&gt;State() == PAGE_STATE_UNUSED,</a>
+<a name="ln606">			&quot;page: %p @! page -m %p&quot;, page, page);</a>
+<a name="ln607"> </a>
+<a name="ln608">		if (page-&gt;Cache() != NULL)</a>
+<a name="ln609">			fCache-&gt;RemovePage(page);</a>
+<a name="ln610"> </a>
+<a name="ln611">		vm_page_free(NULL, page);</a>
+<a name="ln612">	}</a>
+<a name="ln613">}</a>
+<a name="ln614"> </a>
+<a name="ln615"> </a>
+<a name="ln616">/*!	Marks all pages in the given range of the \c fPages array cached.</a>
+<a name="ln617">	There must not be any \c NULL entries in the given array range. All pages</a>
+<a name="ln618">	must belong to \c cache and have state \c PAGE_STATE_UNUSED.</a>
+<a name="ln619">	\c fCache must not be locked.</a>
+<a name="ln620">*/</a>
+<a name="ln621">void</a>
+<a name="ln622">IOCache::_CachePages(size_t firstPage, size_t pageCount)</a>
+<a name="ln623">{</a>
+<a name="ln624">	TRACE(&quot;%p-&gt;IOCache::_CachePages(%&quot; B_PRIuSIZE &quot;, %&quot; B_PRIuSIZE &quot;)\n&quot;,</a>
+<a name="ln625">		this, firstPage, pageCount);</a>
+<a name="ln626"> </a>
+<a name="ln627">	AutoLocker&lt;VMCache&gt; cacheLocker(fCache);</a>
+<a name="ln628"> </a>
+<a name="ln629">	for (size_t i = firstPage; i &lt; firstPage + pageCount; i++) {</a>
+<a name="ln630">		vm_page* page = fPages[i];</a>
+<a name="ln631">		ASSERT(page != NULL);</a>
+<a name="ln632">		ASSERT_PRINT(page-&gt;State() == PAGE_STATE_UNUSED</a>
+<a name="ln633">				&amp;&amp; page-&gt;Cache() == fCache,</a>
+<a name="ln634">			&quot;page: %p @! page -m %p&quot;, page, page);</a>
+<a name="ln635"> </a>
+<a name="ln636">		DEBUG_PAGE_ACCESS_START(page);</a>
+<a name="ln637">		vm_page_set_state(page, PAGE_STATE_CACHED);</a>
+<a name="ln638">		DEBUG_PAGE_ACCESS_END(page);</a>
+<a name="ln639">	}</a>
+<a name="ln640">}</a>
+<a name="ln641"> </a>
+<a name="ln642"> </a>
+<a name="ln643">/*!	Copies the contents of pages in \c fPages to \a request, or vice versa.</a>
+<a name="ln644">	\param request The request.</a>
+<a name="ln645">	\param pagesRelativeOffset The offset relative to \c fPages[0] where to</a>
+<a name="ln646">		start copying.</a>
+<a name="ln647">	\param requestOffset The request offset where to start copying.</a>
+<a name="ln648">	\param requestLength The number of bytes to copy.</a>
+<a name="ln649">	\param toRequest If \c true the copy directory is from \c fPages to</a>
+<a name="ln650">		\a request, otherwise the other way around.</a>
+<a name="ln651">	\return \c B_OK, if copying went fine, another error code otherwise.</a>
+<a name="ln652">*/</a>
+<a name="ln653">status_t</a>
+<a name="ln654">IOCache::_CopyPages(IORequest* request, size_t pagesRelativeOffset,</a>
+<a name="ln655">	off_t requestOffset, size_t requestLength, bool toRequest)</a>
+<a name="ln656">{</a>
+<a name="ln657">	TRACE(&quot;%p-&gt;IOCache::_CopyPages(%p, %&quot; B_PRIuSIZE &quot;, %&quot; B_PRIdOFF</a>
+<a name="ln658">		&quot;, %&quot; B_PRIuSIZE &quot;, %d)\n&quot;, this, request, pagesRelativeOffset,</a>
+<a name="ln659">		requestOffset, requestLength, toRequest);</a>
+<a name="ln660"> </a>
+<a name="ln661">	size_t firstPage = pagesRelativeOffset / B_PAGE_SIZE;</a>
+<a name="ln662">	size_t endPage = (pagesRelativeOffset + requestLength + B_PAGE_SIZE - 1)</a>
+<a name="ln663">		/ B_PAGE_SIZE;</a>
+<a name="ln664"> </a>
+<a name="ln665">	// map the pages</a>
+<a name="ln666">	status_t error = _MapPages(firstPage, endPage);</a>
+<a name="ln667">// TODO: _MapPages() cannot fail, so the fallback is never needed. Test which</a>
+<a name="ln668">// method is faster (probably the active one)!</a>
+<a name="ln669">#if 0</a>
+<a name="ln670">	if (error != B_OK) {</a>
+<a name="ln671">		// fallback to copying individual pages</a>
+<a name="ln672">		size_t inPageOffset = pagesRelativeOffset % B_PAGE_SIZE;</a>
+<a name="ln673">		for (size_t i = firstPage; i &lt; endPage; i++) {</a>
+<a name="ln674">			// map the page</a>
+<a name="ln675">			void* handle;</a>
+<a name="ln676">			addr_t address;</a>
+<a name="ln677">			error = vm_get_physical_page(</a>
+<a name="ln678">				fPages[i]-&gt;physical_page_number * B_PAGE_SIZE, &amp;address,</a>
+<a name="ln679">				&amp;handle);</a>
+<a name="ln680">			if (error != B_OK)</a>
+<a name="ln681">				return error;</a>
+<a name="ln682"> </a>
+<a name="ln683">			// copy the page's data</a>
+<a name="ln684">			size_t toCopy = std::min(B_PAGE_SIZE - inPageOffset, requestLength);</a>
+<a name="ln685"> </a>
+<a name="ln686">			if (toRequest) {</a>
+<a name="ln687">				error = request-&gt;CopyData((uint8*)(address + inPageOffset),</a>
+<a name="ln688">					requestOffset, toCopy);</a>
+<a name="ln689">			} else {</a>
+<a name="ln690">				error = request-&gt;CopyData(requestOffset,</a>
+<a name="ln691">					(uint8*)(address + inPageOffset), toCopy);</a>
+<a name="ln692">			}</a>
+<a name="ln693"> </a>
+<a name="ln694">			// unmap the page</a>
+<a name="ln695">			vm_put_physical_page(address, handle);</a>
+<a name="ln696"> </a>
+<a name="ln697">			if (error != B_OK)</a>
+<a name="ln698">				return error;</a>
+<a name="ln699"> </a>
+<a name="ln700">			inPageOffset = 0;</a>
+<a name="ln701">			requestOffset += toCopy;</a>
+<a name="ln702">			requestLength -= toCopy;</a>
+<a name="ln703">		}</a>
+<a name="ln704"> </a>
+<a name="ln705">		return B_OK;</a>
+<a name="ln706">	}</a>
+<a name="ln707">#endif	// 0</a>
+<a name="ln708"> </a>
+<a name="ln709">	// copy</a>
+<a name="ln710">	if (toRequest) {</a>
+<a name="ln711">		error = request-&gt;CopyData((uint8*)fAreaBase + pagesRelativeOffset,</a>
+<a name="ln712">			requestOffset, requestLength);</a>
+<a name="ln713">	} else {</a>
+<a name="ln714">		error = request-&gt;CopyData(requestOffset,</a>
+<a name="ln715">			(uint8*)fAreaBase + pagesRelativeOffset, requestLength);</a>
+<a name="ln716">	}</a>
+<a name="ln717"> </a>
+<a name="ln718">	// unmap the pages</a>
+<a name="ln719">	_UnmapPages(firstPage, endPage);</a>
+<a name="ln720"> </a>
+<a name="ln721">	return error;</a>
+<a name="ln722">}</a>
+<a name="ln723"> </a>
+<a name="ln724"> </a>
+<a name="ln725">/*!	Maps a range of pages in \c fPages into fArea.</a>
+<a name="ln726"> </a>
+<a name="ln727">	If successful, it must be balanced by a call to _UnmapPages().</a>
+<a name="ln728"> </a>
+<a name="ln729">	\param firstPage The \c fPages relative index of the first page to map.</a>
+<a name="ln730">	\param endPage The \c fPages relative index of the page after the last page</a>
+<a name="ln731">		to map.</a>
+<a name="ln732">	\return \c B_OK, if mapping went fine, another error code otherwise.</a>
+<a name="ln733">*/</a>
+<a name="ln734">status_t</a>
+<a name="ln735">IOCache::_MapPages(size_t firstPage, size_t endPage)</a>
+<a name="ln736">{</a>
+<a name="ln737">	VMTranslationMap* translationMap</a>
+<a name="ln738">		= VMAddressSpace::Kernel()-&gt;TranslationMap();</a>
+<a name="ln739"> </a>
+<a name="ln740">	translationMap-&gt;Lock();</a>
+<a name="ln741"> </a>
+<a name="ln742">	for (size_t i = firstPage; i &lt; endPage; i++) {</a>
+<a name="ln743">		vm_page* page = fPages[i];</a>
+<a name="ln744"> </a>
+<a name="ln745">		ASSERT_PRINT(page-&gt;State() == PAGE_STATE_UNUSED,</a>
+<a name="ln746">			&quot;page: %p @! page -m %p&quot;, page, page);</a>
+<a name="ln747"> </a>
+<a name="ln748">		translationMap-&gt;Map((addr_t)fAreaBase + i * B_PAGE_SIZE,</a>
+<a name="ln749">			page-&gt;physical_page_number * B_PAGE_SIZE,</a>
+<a name="ln750">			B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, 0, &amp;fMappingReservation);</a>
+<a name="ln751">		// NOTE: We don't increment gMappedPagesCount. Our pages have state</a>
+<a name="ln752">		// PAGE_STATE_UNUSED anyway and we map them only for a short time.</a>
+<a name="ln753">	}</a>
+<a name="ln754"> </a>
+<a name="ln755">	translationMap-&gt;Unlock();</a>
+<a name="ln756"> </a>
+<a name="ln757">	return B_OK;</a>
+<a name="ln758">}</a>
+<a name="ln759"> </a>
+<a name="ln760"> </a>
+<a name="ln761">/*!	Unmaps a range of pages in \c fPages into fArea.</a>
+<a name="ln762"> </a>
+<a name="ln763">	Must balance a call to _MapPages().</a>
+<a name="ln764"> </a>
+<a name="ln765">	\param firstPage The \c fPages relative index of the first page to unmap.</a>
+<a name="ln766">	\param endPage The \c fPages relative index of the page after the last page</a>
+<a name="ln767">		to unmap.</a>
+<a name="ln768">*/</a>
+<a name="ln769">void</a>
+<a name="ln770">IOCache::_UnmapPages(size_t firstPage, size_t endPage)</a>
+<a name="ln771">{</a>
+<a name="ln772">	VMTranslationMap* translationMap</a>
+<a name="ln773">		= VMAddressSpace::Kernel()-&gt;TranslationMap();</a>
+<a name="ln774"> </a>
+<a name="ln775">	translationMap-&gt;Lock();</a>
+<a name="ln776"> </a>
+<a name="ln777">	translationMap-&gt;Unmap((addr_t)fAreaBase + firstPage * B_PAGE_SIZE,</a>
+<a name="ln778">		(addr_t)fAreaBase + endPage * B_PAGE_SIZE - 1);</a>
+<a name="ln779"> </a>
+<a name="ln780">	translationMap-&gt;Unlock();</a>
+<a name="ln781">}</a>
+
+</code></pre>
+<div class="balloon" rel="41"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fAreaBase, fMappingReservation.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

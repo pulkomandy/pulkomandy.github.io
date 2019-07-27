@@ -1,0 +1,1263 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>arp.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2006-2010, Haiku, Inc. All Rights Reserved.</a>
+<a name="ln3"> * Distributed under the terms of the MIT License.</a>
+<a name="ln4"> *</a>
+<a name="ln5"> * Authors:</a>
+<a name="ln6"> *		Axel Dörfler, axeld@pinc-software.de</a>
+<a name="ln7"> *		Hugo Santos, hugosantos@gmail.com</a>
+<a name="ln8"> */</a>
+<a name="ln9"> </a>
+<a name="ln10"> </a>
+<a name="ln11">//! Ethernet Address Resolution Protocol, see RFC 826.</a>
+<a name="ln12"> </a>
+<a name="ln13"> </a>
+<a name="ln14">#include &lt;arp_control.h&gt;</a>
+<a name="ln15">#include &lt;net_datalink_protocol.h&gt;</a>
+<a name="ln16">#include &lt;net_device.h&gt;</a>
+<a name="ln17">#include &lt;net_datalink.h&gt;</a>
+<a name="ln18">#include &lt;net_stack.h&gt;</a>
+<a name="ln19">#include &lt;NetBufferUtilities.h&gt;</a>
+<a name="ln20"> </a>
+<a name="ln21">#include &lt;generic_syscall.h&gt;</a>
+<a name="ln22">#include &lt;util/atomic.h&gt;</a>
+<a name="ln23">#include &lt;util/AutoLock.h&gt;</a>
+<a name="ln24">#include &lt;util/DoublyLinkedList.h&gt;</a>
+<a name="ln25"> </a>
+<a name="ln26">#include &lt;ByteOrder.h&gt;</a>
+<a name="ln27">#include &lt;KernelExport.h&gt;</a>
+<a name="ln28"> </a>
+<a name="ln29">#include &lt;net/if.h&gt;</a>
+<a name="ln30">#include &lt;net/if_dl.h&gt;</a>
+<a name="ln31">#include &lt;net/if_types.h&gt;</a>
+<a name="ln32">#include &lt;new&gt;</a>
+<a name="ln33">#include &lt;stdio.h&gt;</a>
+<a name="ln34">#include &lt;string.h&gt;</a>
+<a name="ln35">#include &lt;sys/sockio.h&gt;</a>
+<a name="ln36"> </a>
+<a name="ln37"> </a>
+<a name="ln38">//#define TRACE_ARP</a>
+<a name="ln39">#ifdef TRACE_ARP</a>
+<a name="ln40">#	define TRACE(x) dprintf x</a>
+<a name="ln41">#else</a>
+<a name="ln42">#	define TRACE(x) ;</a>
+<a name="ln43">#endif</a>
+<a name="ln44"> </a>
+<a name="ln45"> </a>
+<a name="ln46">struct arp_header {</a>
+<a name="ln47">	uint16		hardware_type;</a>
+<a name="ln48">	uint16		protocol_type;</a>
+<a name="ln49">	uint8		hardware_length;</a>
+<a name="ln50">	uint8		protocol_length;</a>
+<a name="ln51">	uint16		opcode;</a>
+<a name="ln52"> </a>
+<a name="ln53">	// TODO: this should be a variable length header, but for our current</a>
+<a name="ln54">	//	usage (Ethernet/IPv4), this should work fine.</a>
+<a name="ln55">	uint8		hardware_sender[6];</a>
+<a name="ln56">	in_addr_t	protocol_sender;</a>
+<a name="ln57">	uint8		hardware_target[6];</a>
+<a name="ln58">	in_addr_t	protocol_target;</a>
+<a name="ln59">} _PACKED;</a>
+<a name="ln60"> </a>
+<a name="ln61">#define ARP_OPCODE_REQUEST	1</a>
+<a name="ln62">#define ARP_OPCODE_REPLY	2</a>
+<a name="ln63"> </a>
+<a name="ln64">#define ARP_HARDWARE_TYPE_ETHER	1</a>
+<a name="ln65"> </a>
+<a name="ln66">struct arp_entry {</a>
+<a name="ln67">	arp_entry	*next;</a>
+<a name="ln68">	in_addr_t	protocol_address;</a>
+<a name="ln69">	sockaddr_dl	hardware_address;</a>
+<a name="ln70">	uint32		flags;</a>
+<a name="ln71">	net_buffer	*request_buffer;</a>
+<a name="ln72">	net_timer	timer;</a>
+<a name="ln73">	uint32		timer_state;</a>
+<a name="ln74">	bigtime_t	timestamp;</a>
+<a name="ln75">	net_datalink_protocol *protocol;</a>
+<a name="ln76"> </a>
+<a name="ln77">	typedef DoublyLinkedListCLink&lt;net_buffer&gt; NetBufferLink;</a>
+<a name="ln78">	typedef DoublyLinkedList&lt;net_buffer, NetBufferLink&gt; BufferList;</a>
+<a name="ln79"> </a>
+<a name="ln80">	BufferList  queue;</a>
+<a name="ln81"> </a>
+<a name="ln82">	static arp_entry *Lookup(in_addr_t protocolAddress);</a>
+<a name="ln83">	static arp_entry *Add(in_addr_t protocolAddress,</a>
+<a name="ln84">		sockaddr_dl *hardwareAddress, uint32 flags);</a>
+<a name="ln85"> </a>
+<a name="ln86">	~arp_entry();</a>
+<a name="ln87"> </a>
+<a name="ln88">	void ClearQueue();</a>
+<a name="ln89">	void MarkFailed();</a>
+<a name="ln90">	void MarkValid();</a>
+<a name="ln91">	void ScheduleRemoval();</a>
+<a name="ln92">};</a>
+<a name="ln93"> </a>
+<a name="ln94">// see arp_control.h for more flags</a>
+<a name="ln95">#define ARP_FLAG_REMOVED			0x00010000</a>
+<a name="ln96">#define ARP_PUBLIC_FLAG_MASK		0x0000ffff</a>
+<a name="ln97"> </a>
+<a name="ln98">#define ARP_NO_STATE				0</a>
+<a name="ln99">#define ARP_STATE_REQUEST			1</a>
+<a name="ln100">#define ARP_STATE_LAST_REQUEST		5</a>
+<a name="ln101">#define ARP_STATE_REQUEST_FAILED	6</a>
+<a name="ln102">#define ARP_STATE_REMOVE_FAILED		7</a>
+<a name="ln103">#define ARP_STATE_STALE				8</a>
+<a name="ln104"> </a>
+<a name="ln105">#define ARP_STALE_TIMEOUT	30 * 60000000LL		// 30 minutes</a>
+<a name="ln106">#define ARP_REJECT_TIMEOUT	20000000LL			// 20 seconds</a>
+<a name="ln107">#define ARP_REQUEST_TIMEOUT	1000000LL			// 1 second</a>
+<a name="ln108"> </a>
+<a name="ln109">struct arp_protocol : net_datalink_protocol {</a>
+<a name="ln110">	sockaddr_dl	hardware_address;</a>
+<a name="ln111">	in_addr_t	local_address;</a>
+<a name="ln112">};</a>
+<a name="ln113"> </a>
+<a name="ln114"> </a>
+<a name="ln115">static const net_buffer* kDeletedBuffer = (net_buffer*)~0;</a>
+<a name="ln116"> </a>
+<a name="ln117">static void arp_timer(struct net_timer *timer, void *data);</a>
+<a name="ln118"> </a>
+<a name="ln119">net_buffer_module_info* gBufferModule;</a>
+<a name="ln120">static net_stack_module_info* sStackModule;</a>
+<a name="ln121">static net_datalink_module_info* sDatalinkModule;</a>
+<a name="ln122">static mutex sCacheLock;</a>
+<a name="ln123">static bool sIgnoreReplies;</a>
+<a name="ln124"> </a>
+<a name="ln125"> </a>
+<a name="ln126">struct arpHash {</a>
+<a name="ln127">	typedef in_addr_t KeyType;</a>
+<a name="ln128">	typedef arp_entry ValueType;</a>
+<a name="ln129"> </a>
+<a name="ln130">	size_t HashKey(KeyType key) const</a>
+<a name="ln131">	{</a>
+<a name="ln132">		return key;</a>
+<a name="ln133">	}</a>
+<a name="ln134"> </a>
+<a name="ln135">	size_t Hash(ValueType* value) const</a>
+<a name="ln136">	{</a>
+<a name="ln137">		return HashKey(value-&gt;protocol_address);</a>
+<a name="ln138">	}</a>
+<a name="ln139"> </a>
+<a name="ln140">	bool Compare(KeyType key, ValueType* value) const</a>
+<a name="ln141">	{</a>
+<a name="ln142">		return value-&gt;protocol_address == key;</a>
+<a name="ln143">	}</a>
+<a name="ln144"> </a>
+<a name="ln145">	ValueType*&amp; GetLink(ValueType* value) const</a>
+<a name="ln146">	{</a>
+<a name="ln147">		return value-&gt;next;</a>
+<a name="ln148">	}</a>
+<a name="ln149">};</a>
+<a name="ln150"> </a>
+<a name="ln151"> </a>
+<a name="ln152">typedef BOpenHashTable&lt;arpHash&gt; AddressCache;</a>
+<a name="ln153">static AddressCache* sCache;</a>
+<a name="ln154"> </a>
+<a name="ln155"> </a>
+<a name="ln156">#ifdef TRACE_ARP</a>
+<a name="ln157"> </a>
+<a name="ln158"> </a>
+<a name="ln159">const char*</a>
+<a name="ln160">mac_to_string(uint8* address)</a>
+<a name="ln161">{</a>
+<a name="ln162">	static char buffer[20];</a>
+<a name="ln163">	snprintf(buffer, sizeof(buffer), &quot;%02x:%02x:%02x:%02x:%02x:%02x&quot;,</a>
+<a name="ln164">		address[0], address[1], address[2], address[3], address[4], address[5]);</a>
+<a name="ln165">	return buffer;</a>
+<a name="ln166">}</a>
+<a name="ln167"> </a>
+<a name="ln168"> </a>
+<a name="ln169">const char*</a>
+<a name="ln170">inet_to_string(in_addr_t address)</a>
+<a name="ln171">{</a>
+<a name="ln172">	static char buffer[20];</a>
+<a name="ln173"> </a>
+<a name="ln174">	unsigned int hostAddress = ntohl(address);</a>
+<a name="ln175">	snprintf(buffer, sizeof(buffer), &quot;%d.%d.%d.%d&quot;,</a>
+<a name="ln176">		hostAddress &gt;&gt; 24, (hostAddress &gt;&gt; 16) &amp; 0xff,</a>
+<a name="ln177">		(hostAddress &gt;&gt; 8) &amp; 0xff, hostAddress &amp; 0xff);</a>
+<a name="ln178">	return buffer;</a>
+<a name="ln179">}</a>
+<a name="ln180"> </a>
+<a name="ln181"> </a>
+<a name="ln182">#endif	// TRACE_ARP</a>
+<a name="ln183"> </a>
+<a name="ln184"> </a>
+<a name="ln185">static net_buffer*</a>
+<a name="ln186">get_request_buffer(arp_entry* entry)</a>
+<a name="ln187">{</a>
+<a name="ln188">	net_buffer* buffer = entry-&gt;request_buffer;</a>
+<a name="ln189">	if (buffer == NULL || buffer == kDeletedBuffer)</a>
+<a name="ln190">		return NULL;</a>
+<a name="ln191"> </a>
+<a name="ln192">	buffer = atomic_pointer_test_and_set(&amp;entry-&gt;request_buffer,</a>
+<a name="ln193">		(net_buffer*)NULL, buffer);</a>
+<a name="ln194">	if (buffer == kDeletedBuffer)</a>
+<a name="ln195">		return NULL;</a>
+<a name="ln196"> </a>
+<a name="ln197">	return buffer;</a>
+<a name="ln198">}</a>
+<a name="ln199"> </a>
+<a name="ln200"> </a>
+<a name="ln201">static void</a>
+<a name="ln202">put_request_buffer(arp_entry* entry, net_buffer* buffer)</a>
+<a name="ln203">{</a>
+<a name="ln204">	net_buffer* requestBuffer = atomic_pointer_test_and_set(</a>
+<a name="ln205">		&amp;entry-&gt;request_buffer, buffer, (net_buffer*)NULL);</a>
+<a name="ln206">	if (requestBuffer != NULL) {</a>
+<a name="ln207">		// someone else took over ownership of the request buffer</a>
+<a name="ln208">		gBufferModule-&gt;free(buffer);</a>
+<a name="ln209">	}</a>
+<a name="ln210">}</a>
+<a name="ln211"> </a>
+<a name="ln212"> </a>
+<a name="ln213">static void</a>
+<a name="ln214">delete_request_buffer(arp_entry* entry)</a>
+<a name="ln215">{</a>
+<a name="ln216">	net_buffer* buffer = atomic_pointer_get_and_set(&amp;entry-&gt;request_buffer,</a>
+<a name="ln217">		kDeletedBuffer);</a>
+<a name="ln218">	if (buffer != NULL &amp;&amp; buffer != kDeletedBuffer)</a>
+<a name="ln219">		gBufferModule-&gt;free(buffer);</a>
+<a name="ln220">}</a>
+<a name="ln221"> </a>
+<a name="ln222"> </a>
+<a name="ln223">static void</a>
+<a name="ln224">ipv4_to_ether_multicast(sockaddr_dl *destination, const sockaddr_in *source)</a>
+<a name="ln225">{</a>
+<a name="ln226">	// RFC 1112 - Host extensions for IP multicasting</a>
+<a name="ln227">	//</a>
+<a name="ln228">	//   ``An IP host group address is mapped to an Ethernet multicast</a>
+<a name="ln229">	//   address by placing the low-order 23-bits of the IP address into</a>
+<a name="ln230">	//   the low-order 23 bits of the Ethernet multicast address</a>
+<a name="ln231">	//   01-00-5E-00-00-00 (hex).''</a>
+<a name="ln232"> </a>
+<a name="ln233">	destination-&gt;sdl_len = sizeof(sockaddr_dl);</a>
+<a name="ln234">	destination-&gt;sdl_family = AF_LINK;</a>
+<a name="ln235">	destination-&gt;sdl_index = 0;</a>
+<a name="ln236">	destination-&gt;sdl_type = IFT_ETHER;</a>
+<a name="ln237">	destination-&gt;sdl_e_type = htons(ETHER_TYPE_IP);</a>
+<a name="ln238">	destination-&gt;sdl_nlen = destination-&gt;sdl_slen = 0;</a>
+<a name="ln239">	destination-&gt;sdl_alen = ETHER_ADDRESS_LENGTH;</a>
+<a name="ln240"> </a>
+<a name="ln241">	memcpy(LLADDR(destination) + 2, &amp;source-&gt;sin_addr, sizeof(in_addr));</a>
+<a name="ln242">	uint32 *data = (uint32 *)LLADDR(destination);</a>
+<a name="ln243">	data[0] = (data[0] &amp; htonl(0x7f)) | htonl(0x01005e00);</a>
+<a name="ln244">}</a>
+<a name="ln245"> </a>
+<a name="ln246"> </a>
+<a name="ln247">// #pragma mark -</a>
+<a name="ln248"> </a>
+<a name="ln249"> </a>
+<a name="ln250">/*static*/ arp_entry *</a>
+<a name="ln251">arp_entry::Lookup(in_addr_t address)</a>
+<a name="ln252">{</a>
+<a name="ln253">	return sCache-&gt;Lookup(address);</a>
+<a name="ln254">}</a>
+<a name="ln255"> </a>
+<a name="ln256"> </a>
+<a name="ln257">/*static*/ arp_entry *</a>
+<a name="ln258">arp_entry::Add(in_addr_t protocolAddress, sockaddr_dl *hardwareAddress,</a>
+<a name="ln259">	uint32 flags)</a>
+<a name="ln260">{</a>
+<a name="ln261">	ASSERT_LOCKED_MUTEX(&amp;sCacheLock);</a>
+<a name="ln262"> </a>
+<a name="ln263">	arp_entry *entry = new (std::nothrow) arp_entry;</a>
+<a name="ln264">	if (entry == NULL)</a>
+<a name="ln265">		return NULL;</a>
+<a name="ln266"> </a>
+<a name="ln267">	entry-&gt;protocol_address = protocolAddress;</a>
+<a name="ln268">	entry-&gt;flags = flags;</a>
+<a name="ln269">	entry-&gt;timestamp = system_time();</a>
+<a name="ln270">	entry-&gt;protocol = NULL;</a>
+<a name="ln271">	entry-&gt;request_buffer = NULL;</a>
+<a name="ln272">	entry-&gt;timer_state = ARP_NO_STATE;</a>
+<a name="ln273">	sStackModule-&gt;init_timer(&amp;entry-&gt;timer, arp_timer, entry);</a>
+<a name="ln274"> </a>
+<a name="ln275">	if (hardwareAddress != NULL) {</a>
+<a name="ln276">		// this entry is already resolved</a>
+<a name="ln277">		entry-&gt;hardware_address = *hardwareAddress;</a>
+<a name="ln278">		entry-&gt;hardware_address.sdl_e_type = htons(ETHER_TYPE_IP);</a>
+<a name="ln279">	} else {</a>
+<a name="ln280">		// this entry still needs to be resolved</a>
+<a name="ln281">		entry-&gt;hardware_address.sdl_alen = 0;</a>
+<a name="ln282">	}</a>
+<a name="ln283">	if (entry-&gt;hardware_address.sdl_len != sizeof(sockaddr_dl)) {</a>
+<a name="ln284">		// explicitly set correct length in case our caller hasn't...</a>
+<a name="ln285">		entry-&gt;hardware_address.sdl_len = sizeof(sockaddr_dl);</a>
+<a name="ln286">	}</a>
+<a name="ln287"> </a>
+<a name="ln288">	if (sCache-&gt;Insert(entry) != B_OK) {</a>
+<a name="ln289">		// We can delete the entry here with the sCacheLock held, since it's</a>
+<a name="ln290">		// guaranteed there are no timers pending.</a>
+<a name="ln291">		delete entry;</a>
+<a name="ln292">		return NULL;</a>
+<a name="ln293">	}</a>
+<a name="ln294"> </a>
+<a name="ln295">	return entry;</a>
+<a name="ln296">}</a>
+<a name="ln297"> </a>
+<a name="ln298"> </a>
+<a name="ln299">arp_entry::~arp_entry()</a>
+<a name="ln300">{</a>
+<a name="ln301">	// make sure there is no active timer left for us</a>
+<a name="ln302">	sStackModule-&gt;cancel_timer(&amp;timer);</a>
+<a name="ln303">	sStackModule-&gt;wait_for_timer(&amp;timer);</a>
+<a name="ln304"> </a>
+<a name="ln305">	ClearQueue();</a>
+<a name="ln306">}</a>
+<a name="ln307"> </a>
+<a name="ln308"> </a>
+<a name="ln309">void</a>
+<a name="ln310">arp_entry::ClearQueue()</a>
+<a name="ln311">{</a>
+<a name="ln312">	BufferList::Iterator iterator = queue.GetIterator();</a>
+<a name="ln313">	while (iterator.HasNext()) {</a>
+<a name="ln314">		net_buffer *buffer = iterator.Next();</a>
+<a name="ln315">		iterator.Remove();</a>
+<a name="ln316">		gBufferModule-&gt;free(buffer);</a>
+<a name="ln317">	}</a>
+<a name="ln318">}</a>
+<a name="ln319"> </a>
+<a name="ln320"> </a>
+<a name="ln321">void</a>
+<a name="ln322">arp_entry::MarkFailed()</a>
+<a name="ln323">{</a>
+<a name="ln324">	TRACE((&quot;ARP entry %p Marked as FAILED\n&quot;, this));</a>
+<a name="ln325"> </a>
+<a name="ln326">	flags = (flags &amp; ~ARP_FLAG_VALID) | ARP_FLAG_REJECT;</a>
+<a name="ln327">	ClearQueue();</a>
+<a name="ln328">}</a>
+<a name="ln329"> </a>
+<a name="ln330"> </a>
+<a name="ln331">void</a>
+<a name="ln332">arp_entry::MarkValid()</a>
+<a name="ln333">{</a>
+<a name="ln334">	TRACE((&quot;ARP entry %p Marked as VALID, have %li packets queued.\n&quot;, this,</a>
+<a name="ln335">		queue.Count()));</a>
+<a name="ln336"> </a>
+<a name="ln337">	flags = (flags &amp; ~ARP_FLAG_REJECT) | ARP_FLAG_VALID;</a>
+<a name="ln338"> </a>
+<a name="ln339">	BufferList::Iterator iterator = queue.GetIterator();</a>
+<a name="ln340">	while (iterator.HasNext()) {</a>
+<a name="ln341">		net_buffer *buffer = iterator.Next();</a>
+<a name="ln342">		iterator.Remove();</a>
+<a name="ln343"> </a>
+<a name="ln344">		TRACE((&quot;  ARP Dequeing packet %p...\n&quot;, buffer));</a>
+<a name="ln345"> </a>
+<a name="ln346">		memcpy(buffer-&gt;destination, &amp;hardware_address,</a>
+<a name="ln347">			hardware_address.sdl_len);</a>
+<a name="ln348">		protocol-&gt;next-&gt;module-&gt;send_data(protocol-&gt;next, buffer);</a>
+<a name="ln349">	}</a>
+<a name="ln350">}</a>
+<a name="ln351"> </a>
+<a name="ln352"> </a>
+<a name="ln353">void</a>
+<a name="ln354">arp_entry::ScheduleRemoval()</a>
+<a name="ln355">{</a>
+<a name="ln356">	// schedule a timer to remove this entry</a>
+<a name="ln357">	timer_state = ARP_STATE_REMOVE_FAILED;</a>
+<a name="ln358">	sStackModule-&gt;set_timer(&amp;timer, 0);</a>
+<a name="ln359">}</a>
+<a name="ln360"> </a>
+<a name="ln361"> </a>
+<a name="ln362">//	#pragma mark -</a>
+<a name="ln363"> </a>
+<a name="ln364"> </a>
+<a name="ln365">/*!	Updates the entry determined by \a protocolAddress with the specified</a>
+<a name="ln366">	\a hardwareAddress.</a>
+<a name="ln367">	If such an entry does not exist yet, a new entry is added. If you try</a>
+<a name="ln368">	to update a local existing entry but didn't ask for it (by setting</a>
+<a name="ln369">	\a flags to ARP_FLAG_LOCAL), an error is returned.</a>
+<a name="ln370"> </a>
+<a name="ln371">	This function does not lock the cache - you have to do it yourself</a>
+<a name="ln372">	before calling it.</a>
+<a name="ln373">*/</a>
+<a name="ln374">static status_t</a>
+<a name="ln375">arp_update_entry(in_addr_t protocolAddress, sockaddr_dl *hardwareAddress,</a>
+<a name="ln376">	uint32 flags, arp_entry **_entry = NULL)</a>
+<a name="ln377">{</a>
+<a name="ln378">	ASSERT_LOCKED_MUTEX(&amp;sCacheLock);</a>
+<a name="ln379">	TRACE((&quot;%s(%s, %s, flags 0x%&quot; B_PRIx32 &quot;)\n&quot;, __FUNCTION__,</a>
+<a name="ln380">		inet_to_string(protocolAddress), mac_to_string(LLADDR(hardwareAddress)),</a>
+<a name="ln381">		flags));</a>
+<a name="ln382"> </a>
+<a name="ln383">	arp_entry *entry = arp_entry::Lookup(protocolAddress);</a>
+<a name="ln384">	if (entry != NULL) {</a>
+<a name="ln385">		// We disallow updating of entries that had been resolved before,</a>
+<a name="ln386">		// but to a different address (only for those that belong to a</a>
+<a name="ln387">		// specific address - redefining INADDR_ANY is always allowed).</a>
+<a name="ln388">		// Right now, you have to manually purge the ARP entries (or wait some</a>
+<a name="ln389">		// time) to let us switch to the new address.</a>
+<a name="ln390">		if (protocolAddress != INADDR_ANY</a>
+<a name="ln391">			&amp;&amp; entry-&gt;hardware_address.sdl_alen != 0</a>
+<a name="ln392">			&amp;&amp; memcmp(LLADDR(&amp;entry-&gt;hardware_address),</a>
+<a name="ln393">				LLADDR(hardwareAddress), ETHER_ADDRESS_LENGTH)) {</a>
+<a name="ln394">			uint8* data = LLADDR(hardwareAddress);</a>
+<a name="ln395">			dprintf(&quot;ARP host %08x updated with different hardware address &quot;</a>
+<a name="ln396">				&quot;%02x:%02x:%02x:%02x:%02x:%02x.\n&quot;, protocolAddress,</a>
+<a name="ln397">				data[0], data[1], data[2], data[3], data[4], data[5]);</a>
+<a name="ln398">			return B_ERROR;</a>
+<a name="ln399">		}</a>
+<a name="ln400"> </a>
+<a name="ln401">		entry-&gt;hardware_address = *hardwareAddress;</a>
+<a name="ln402">		entry-&gt;timestamp = system_time();</a>
+<a name="ln403">	} else {</a>
+<a name="ln404">		entry = arp_entry::Add(protocolAddress, hardwareAddress, flags);</a>
+<a name="ln405">		if (entry == NULL)</a>
+<a name="ln406">			return B_NO_MEMORY;</a>
+<a name="ln407">	}</a>
+<a name="ln408"> </a>
+<a name="ln409">	delete_request_buffer(entry);</a>
+<a name="ln410"> </a>
+<a name="ln411">	if ((entry-&gt;flags &amp; ARP_FLAG_PERMANENT) == 0) {</a>
+<a name="ln412">		// (re)start the stale timer</a>
+<a name="ln413">		entry-&gt;timer_state = ARP_STATE_STALE;</a>
+<a name="ln414">		sStackModule-&gt;set_timer(&amp;entry-&gt;timer, ARP_STALE_TIMEOUT);</a>
+<a name="ln415">	}</a>
+<a name="ln416"> </a>
+<a name="ln417">	if ((entry-&gt;flags &amp; ARP_FLAG_REJECT) != 0)</a>
+<a name="ln418">		entry-&gt;MarkFailed();</a>
+<a name="ln419">	else</a>
+<a name="ln420">		entry-&gt;MarkValid();</a>
+<a name="ln421"> </a>
+<a name="ln422">	if (_entry)</a>
+<a name="ln423">		*_entry = entry;</a>
+<a name="ln424"> </a>
+<a name="ln425">	return B_OK;</a>
+<a name="ln426">}</a>
+<a name="ln427"> </a>
+<a name="ln428"> </a>
+<a name="ln429">static status_t</a>
+<a name="ln430">arp_set_local_entry(arp_protocol* protocol, const sockaddr* local)</a>
+<a name="ln431">{</a>
+<a name="ln432">	MutexLocker locker(sCacheLock);</a>
+<a name="ln433"> </a>
+<a name="ln434">	net_interface* interface = protocol-&gt;interface;</a>
+<a name="ln435">	in_addr_t inetAddress;</a>
+<a name="ln436"> </a>
+<a name="ln437">	if (local == NULL) {</a>
+<a name="ln438">		// interface has not yet been set</a>
+<a name="ln439">		inetAddress = INADDR_ANY;</a>
+<a name="ln440">	} else</a>
+<a name="ln441">		inetAddress = ((sockaddr_in*)local)-&gt;sin_addr.s_addr;</a>
+<a name="ln442"> </a>
+<a name="ln443">	TRACE((&quot;%s(): address %s\n&quot;, __FUNCTION__, inet_to_string(inetAddress)));</a>
+<a name="ln444"> </a>
+<a name="ln445">	if (protocol-&gt;local_address == 0)</a>
+<a name="ln446">		protocol-&gt;local_address = inetAddress;</a>
+<a name="ln447"> </a>
+<a name="ln448">	sockaddr_dl address;</a>
+<a name="ln449">	address.sdl_len = sizeof(sockaddr_dl);</a>
+<a name="ln450">	address.sdl_family = AF_LINK;</a>
+<a name="ln451">	address.sdl_type = IFT_ETHER;</a>
+<a name="ln452">	address.sdl_e_type = htons(ETHER_TYPE_IP);</a>
+<a name="ln453">	address.sdl_nlen = 0;</a>
+<a name="ln454">	address.sdl_slen = 0;</a>
+<a name="ln455">	address.sdl_alen = interface-&gt;device-&gt;address.length;</a>
+<a name="ln456">	memcpy(LLADDR(&amp;address), interface-&gt;device-&gt;address.data, address.sdl_alen);</a>
+<a name="ln457"> </a>
+<a name="ln458">	memcpy(&amp;protocol-&gt;hardware_address, &amp;address, sizeof(sockaddr_dl));</a>
+<a name="ln459">		// cache the address in our protocol</a>
+<a name="ln460"> </a>
+<a name="ln461">	arp_entry* entry;</a>
+<a name="ln462">	status_t status = arp_update_entry(inetAddress, &amp;address,</a>
+<a name="ln463">		ARP_FLAG_LOCAL | ARP_FLAG_PERMANENT, &amp;entry);</a>
+<a name="ln464">	if (status == B_OK)</a>
+<a name="ln465">		entry-&gt;protocol = protocol;</a>
+<a name="ln466"> </a>
+<a name="ln467">	return status;</a>
+<a name="ln468">}</a>
+<a name="ln469"> </a>
+<a name="ln470"> </a>
+<a name="ln471">static void</a>
+<a name="ln472">arp_remove_local_entry(arp_protocol* protocol, const sockaddr* local,</a>
+<a name="ln473">	net_interface_address* updateLocalAddress = NULL)</a>
+<a name="ln474">{</a>
+<a name="ln475">	in_addr_t inetAddress;</a>
+<a name="ln476"> </a>
+<a name="ln477">	if (local == NULL) {</a>
+<a name="ln478">		// interface has not yet been set</a>
+<a name="ln479">		inetAddress = INADDR_ANY;</a>
+<a name="ln480">	} else</a>
+<a name="ln481">		inetAddress = ((sockaddr_in*)local)-&gt;sin_addr.s_addr;</a>
+<a name="ln482"> </a>
+<a name="ln483">	TRACE((&quot;%s(): address %s\n&quot;, __FUNCTION__, inet_to_string(inetAddress)));</a>
+<a name="ln484"> </a>
+<a name="ln485">	MutexLocker locker(sCacheLock);</a>
+<a name="ln486"> </a>
+<a name="ln487">	arp_entry* entry = arp_entry::Lookup(inetAddress);</a>
+<a name="ln488">	if (entry != NULL) {</a>
+<a name="ln489">		sCache-&gt;Remove(entry);</a>
+<a name="ln490">		entry-&gt;flags |= ARP_FLAG_REMOVED;</a>
+<a name="ln491">	}</a>
+<a name="ln492"> </a>
+<a name="ln493">	if (updateLocalAddress != NULL &amp;&amp; protocol-&gt;local_address == inetAddress) {</a>
+<a name="ln494">		// find new local sender address</a>
+<a name="ln495">		protocol-&gt;local_address = 0;</a>
+<a name="ln496"> </a>
+<a name="ln497">		net_interface_address* address = NULL;</a>
+<a name="ln498">		while (sDatalinkModule-&gt;get_next_interface_address(protocol-&gt;interface,</a>
+<a name="ln499">				&amp;address)) {</a>
+<a name="ln500">			if (address == updateLocalAddress || address-&gt;local == NULL</a>
+<a name="ln501">				|| address-&gt;local-&gt;sa_family != AF_INET)</a>
+<a name="ln502">				continue;</a>
+<a name="ln503"> </a>
+<a name="ln504">			protocol-&gt;local_address</a>
+<a name="ln505">				= ((sockaddr_in*)address-&gt;local)-&gt;sin_addr.s_addr;</a>
+<a name="ln506">		}</a>
+<a name="ln507">	}</a>
+<a name="ln508"> </a>
+<a name="ln509">	locker.Unlock();</a>
+<a name="ln510">	delete entry;</a>
+<a name="ln511"> </a>
+<a name="ln512">	if (protocol-&gt;local_address == 0 &amp;&amp; updateLocalAddress) {</a>
+<a name="ln513">		// Try to keep the interface operational</a>
+<a name="ln514">		arp_set_local_entry(protocol, NULL);</a>
+<a name="ln515">	}</a>
+<a name="ln516">}</a>
+<a name="ln517"> </a>
+<a name="ln518"> </a>
+<a name="ln519">/*!	Removes all entries belonging to the local interface of the \a procotol</a>
+<a name="ln520">	given.</a>
+<a name="ln521">*/</a>
+<a name="ln522">static void</a>
+<a name="ln523">arp_remove_local(arp_protocol* protocol)</a>
+<a name="ln524">{</a>
+<a name="ln525">	net_interface_address* address = NULL;</a>
+<a name="ln526">	while (sDatalinkModule-&gt;get_next_interface_address(protocol-&gt;interface,</a>
+<a name="ln527">			&amp;address)) {</a>
+<a name="ln528">		if (address-&gt;local == NULL || address-&gt;local-&gt;sa_family != AF_INET)</a>
+<a name="ln529">			continue;</a>
+<a name="ln530"> </a>
+<a name="ln531">		arp_remove_local_entry(protocol, address-&gt;local);</a>
+<a name="ln532">	}</a>
+<a name="ln533">}</a>
+<a name="ln534"> </a>
+<a name="ln535"> </a>
+<a name="ln536">/*!	Creates permanent local entries for all addresses of the interface belonging</a>
+<a name="ln537">	to this protocol.</a>
+<a name="ln538">	Returns an error if no entry could be added.</a>
+<a name="ln539">*/</a>
+<a name="ln540">static status_t</a>
+<a name="ln541">arp_update_local(arp_protocol* protocol)</a>
+<a name="ln542">{</a>
+<a name="ln543">	protocol-&gt;local_address = 0;</a>
+<a name="ln544">		// TODO: test if this actually works - maybe we should use</a>
+<a name="ln545">		// INADDR_BROADCAST instead</a>
+<a name="ln546"> </a>
+<a name="ln547">	ssize_t count = 0;</a>
+<a name="ln548"> </a>
+<a name="ln549">	net_interface_address* address = NULL;</a>
+<a name="ln550">	while (sDatalinkModule-&gt;get_next_interface_address(protocol-&gt;interface,</a>
+<a name="ln551">			&amp;address)) {</a>
+<a name="ln552">		if (address-&gt;local == NULL || address-&gt;local-&gt;sa_family != AF_INET)</a>
+<a name="ln553">			continue;</a>
+<a name="ln554"> </a>
+<a name="ln555">		if (arp_set_local_entry(protocol, address-&gt;local) == B_OK) {</a>
+<a name="ln556">			count++;</a>
+<a name="ln557">		}</a>
+<a name="ln558">	}</a>
+<a name="ln559"> </a>
+<a name="ln560">	if (count == 0)</a>
+<a name="ln561">		return arp_set_local_entry(protocol, NULL);</a>
+<a name="ln562"> </a>
+<a name="ln563">	return B_OK;</a>
+<a name="ln564">}</a>
+<a name="ln565"> </a>
+<a name="ln566"> </a>
+<a name="ln567">static status_t</a>
+<a name="ln568">handle_arp_request(net_buffer *buffer, arp_header &amp;header)</a>
+<a name="ln569">{</a>
+<a name="ln570">	MutexLocker locker(sCacheLock);</a>
+<a name="ln571"> </a>
+<a name="ln572">	if (!sIgnoreReplies) {</a>
+<a name="ln573">		arp_update_entry(header.protocol_sender,</a>
+<a name="ln574">			(sockaddr_dl *)buffer-&gt;source, 0);</a>
+<a name="ln575">			// remember the address of the sender as we might need it later</a>
+<a name="ln576">	}</a>
+<a name="ln577"> </a>
+<a name="ln578">	// check if this request is for us</a>
+<a name="ln579"> </a>
+<a name="ln580">	arp_entry *entry = arp_entry::Lookup(header.protocol_target);</a>
+<a name="ln581">	if (entry == NULL || entry-&gt;protocol == NULL</a>
+<a name="ln582">		|| (entry-&gt;flags &amp; (ARP_FLAG_LOCAL | ARP_FLAG_PUBLISH)) == 0) {</a>
+<a name="ln583">		// We're not the one to answer this request</a>
+<a name="ln584">		// TODO: instead of letting the other's request time-out, can we reply</a>
+<a name="ln585">		//	failure somehow?</a>
+<a name="ln586">		TRACE((&quot;  not for us\n&quot;));</a>
+<a name="ln587">		return B_ERROR;</a>
+<a name="ln588">	}</a>
+<a name="ln589"> </a>
+<a name="ln590">	// send a reply (by reusing the buffer we got)</a>
+<a name="ln591"> </a>
+<a name="ln592">	TRACE((&quot;  send reply!\n&quot;));</a>
+<a name="ln593">	header.opcode = htons(ARP_OPCODE_REPLY);</a>
+<a name="ln594"> </a>
+<a name="ln595">	memcpy(header.hardware_target, header.hardware_sender, ETHER_ADDRESS_LENGTH);</a>
+<a name="ln596">	header.protocol_target = header.protocol_sender;</a>
+<a name="ln597">	memcpy(header.hardware_sender, LLADDR(&amp;entry-&gt;hardware_address),</a>
+<a name="ln598">		ETHER_ADDRESS_LENGTH);</a>
+<a name="ln599">	header.protocol_sender = entry-&gt;protocol_address;</a>
+<a name="ln600"> </a>
+<a name="ln601">	// exchange source and destination address</a>
+<a name="ln602">	memcpy(LLADDR((sockaddr_dl *)buffer-&gt;source), header.hardware_sender,</a>
+<a name="ln603">		ETHER_ADDRESS_LENGTH);</a>
+<a name="ln604">	memcpy(LLADDR((sockaddr_dl *)buffer-&gt;destination), header.hardware_target,</a>
+<a name="ln605">		ETHER_ADDRESS_LENGTH);</a>
+<a name="ln606"> </a>
+<a name="ln607">	buffer-&gt;flags = 0;</a>
+<a name="ln608">		// make sure this won't be a broadcast message</a>
+<a name="ln609"> </a>
+<a name="ln610">	gBufferModule-&gt;trim(buffer, sizeof(arp_header));</a>
+<a name="ln611">	return entry-&gt;protocol-&gt;next-&gt;module-&gt;send_data(entry-&gt;protocol-&gt;next,</a>
+<a name="ln612">		buffer);</a>
+<a name="ln613">}</a>
+<a name="ln614"> </a>
+<a name="ln615"> </a>
+<a name="ln616">static void</a>
+<a name="ln617">handle_arp_reply(net_buffer *buffer, arp_header &amp;header)</a>
+<a name="ln618">{</a>
+<a name="ln619">	if (sIgnoreReplies)</a>
+<a name="ln620">		return;</a>
+<a name="ln621"> </a>
+<a name="ln622">	MutexLocker locker(sCacheLock);</a>
+<a name="ln623">	arp_update_entry(header.protocol_sender, (sockaddr_dl *)buffer-&gt;source, 0);</a>
+<a name="ln624">}</a>
+<a name="ln625"> </a>
+<a name="ln626"> </a>
+<a name="ln627">static status_t</a>
+<a name="ln628">arp_receive(void *cookie, net_device *device, net_buffer *buffer)</a>
+<a name="ln629">{</a>
+<a name="ln630">	TRACE((&quot;ARP receive\n&quot;));</a>
+<a name="ln631"> </a>
+<a name="ln632">	NetBufferHeaderReader&lt;arp_header&gt; bufferHeader(buffer);</a>
+<a name="ln633">	if (bufferHeader.Status() &lt; B_OK)</a>
+<a name="ln634">		return bufferHeader.Status();</a>
+<a name="ln635"> </a>
+<a name="ln636">	arp_header &amp;header = bufferHeader.Data();</a>
+<a name="ln637">	uint16 opcode = ntohs(header.opcode);</a>
+<a name="ln638"> </a>
+<a name="ln639">#ifdef TRACE_ARP</a>
+<a name="ln640">	dprintf(&quot;  hw sender: %s\n&quot;, mac_to_string(header.hardware_sender));</a>
+<a name="ln641">	dprintf(&quot;  proto sender: %s\n&quot;, inet_to_string(header.protocol_sender));</a>
+<a name="ln642">	dprintf(&quot;  hw target: %s\n&quot;, mac_to_string(header.hardware_target));;</a>
+<a name="ln643">	dprintf(&quot;  proto target: %s\n&quot;, inet_to_string(header.protocol_target));</a>
+<a name="ln644">#endif	// TRACE_ARP</a>
+<a name="ln645"> </a>
+<a name="ln646">	if (ntohs(header.protocol_type) != ETHER_TYPE_IP</a>
+<a name="ln647">		|| ntohs(header.hardware_type) != ARP_HARDWARE_TYPE_ETHER)</a>
+<a name="ln648">		return B_BAD_TYPE;</a>
+<a name="ln649"> </a>
+<a name="ln650">	// check if the packet is okay</a>
+<a name="ln651"> </a>
+<a name="ln652">	if (header.hardware_length != ETHER_ADDRESS_LENGTH</a>
+<a name="ln653">		|| header.protocol_length != sizeof(in_addr_t))</a>
+<a name="ln654">		return B_BAD_DATA;</a>
+<a name="ln655"> </a>
+<a name="ln656">	// handle packet</a>
+<a name="ln657"> </a>
+<a name="ln658">	switch (opcode) {</a>
+<a name="ln659">		case ARP_OPCODE_REQUEST:</a>
+<a name="ln660">			TRACE((&quot;  got ARP request\n&quot;));</a>
+<a name="ln661">			if (handle_arp_request(buffer, header) == B_OK) {</a>
+<a name="ln662">				// the function will take care of the buffer if everything</a>
+<a name="ln663">				// went well</a>
+<a name="ln664">				return B_OK;</a>
+<a name="ln665">			}</a>
+<a name="ln666">			break;</a>
+<a name="ln667">		case ARP_OPCODE_REPLY:</a>
+<a name="ln668">			TRACE((&quot;  got ARP reply\n&quot;));</a>
+<a name="ln669">			handle_arp_reply(buffer, header);</a>
+<a name="ln670">			break;</a>
+<a name="ln671"> </a>
+<a name="ln672">		default:</a>
+<a name="ln673">			dprintf(&quot;unknown ARP opcode %d\n&quot;, opcode);</a>
+<a name="ln674">			return B_ERROR;</a>
+<a name="ln675">	}</a>
+<a name="ln676"> </a>
+<a name="ln677">	gBufferModule-&gt;free(buffer);</a>
+<a name="ln678">	return B_OK;</a>
+<a name="ln679">}</a>
+<a name="ln680"> </a>
+<a name="ln681"> </a>
+<a name="ln682">static void</a>
+<a name="ln683">arp_timer(struct net_timer *timer, void *data)</a>
+<a name="ln684">{</a>
+<a name="ln685">	arp_entry *entry = (arp_entry *)data;</a>
+<a name="ln686">	TRACE((&quot;ARP timer %ld, entry %p!\n&quot;, entry-&gt;timer_state, entry));</a>
+<a name="ln687"> </a>
+<a name="ln688">	switch (entry-&gt;timer_state) {</a>
+<a name="ln689">		case ARP_NO_STATE:</a>
+<a name="ln690">			// who are you kidding?</a>
+<a name="ln691">			break;</a>
+<a name="ln692"> </a>
+<a name="ln693">		case ARP_STATE_REQUEST_FAILED:</a>
+<a name="ln694">			// Requesting the ARP entry failed, we keep it around for a while,</a>
+<a name="ln695">			// though, so that we won't try to request the same address again</a>
+<a name="ln696">			// too soon.</a>
+<a name="ln697">			TRACE((&quot;  requesting ARP entry %p failed!\n&quot;, entry));</a>
+<a name="ln698">			entry-&gt;timer_state = ARP_STATE_REMOVE_FAILED;</a>
+<a name="ln699">			entry-&gt;MarkFailed();</a>
+<a name="ln700">			sStackModule-&gt;set_timer(&amp;entry-&gt;timer, ARP_REJECT_TIMEOUT);</a>
+<a name="ln701">			break;</a>
+<a name="ln702"> </a>
+<a name="ln703">		case ARP_STATE_REMOVE_FAILED:</a>
+<a name="ln704">		case ARP_STATE_STALE:</a>
+<a name="ln705">		{</a>
+<a name="ln706">			// the entry has aged so much that we're going to remove it</a>
+<a name="ln707">			TRACE((&quot;  remove ARP entry %p!\n&quot;, entry));</a>
+<a name="ln708"> </a>
+<a name="ln709">			MutexLocker locker(sCacheLock);</a>
+<a name="ln710">			if ((entry-&gt;flags &amp; ARP_FLAG_REMOVED) != 0) {</a>
+<a name="ln711">				// The entry has already been removed, and is about to be</a>
+<a name="ln712">				// deleted</a>
+<a name="ln713">				break;</a>
+<a name="ln714">			}</a>
+<a name="ln715"> </a>
+<a name="ln716">			sCache-&gt;Remove(entry);</a>
+<a name="ln717">			locker.Unlock();</a>
+<a name="ln718"> </a>
+<a name="ln719">			delete entry;</a>
+<a name="ln720">			break;</a>
+<a name="ln721">		}</a>
+<a name="ln722"> </a>
+<a name="ln723">		default:</a>
+<a name="ln724">		{</a>
+<a name="ln725">			if (entry-&gt;timer_state &gt; ARP_STATE_LAST_REQUEST</a>
+<a name="ln726">				|| entry-&gt;protocol == NULL)</a>
+<a name="ln727">				break;</a>
+<a name="ln728"> </a>
+<a name="ln729">			TRACE((&quot;  send request for ARP entry %p!\n&quot;, entry));</a>
+<a name="ln730"> </a>
+<a name="ln731">			net_buffer *request = get_request_buffer(entry);</a>
+<a name="ln732">			if (request == NULL)</a>
+<a name="ln733">				break;</a>
+<a name="ln734"> </a>
+<a name="ln735">			if (entry-&gt;timer_state &lt; ARP_STATE_LAST_REQUEST) {</a>
+<a name="ln736">				// we'll still need our buffer, so in order to prevent it being</a>
+<a name="ln737">				// freed by a successful send, we need to clone it</a>
+<a name="ln738">				net_buffer* clone = gBufferModule-&gt;clone(request, true);</a>
+<a name="ln739">				if (clone == NULL) {</a>
+<a name="ln740">					// cloning failed - that means we won't be able to send as</a>
+<a name="ln741">					// many requests as originally planned</a>
+<a name="ln742">					entry-&gt;timer_state = ARP_STATE_LAST_REQUEST;</a>
+<a name="ln743">				} else {</a>
+<a name="ln744">					put_request_buffer(entry, request);</a>
+<a name="ln745">					request = clone;</a>
+<a name="ln746">				}</a>
+<a name="ln747">			}</a>
+<a name="ln748"> </a>
+<a name="ln749">			// we're trying to resolve the address, so keep sending requests</a>
+<a name="ln750">			status_t status = entry-&gt;protocol-&gt;next-&gt;module-&gt;send_data(</a>
+<a name="ln751">				entry-&gt;protocol-&gt;next, request);</a>
+<a name="ln752">			if (status &lt; B_OK)</a>
+<a name="ln753">				gBufferModule-&gt;free(request);</a>
+<a name="ln754"> </a>
+<a name="ln755">			entry-&gt;timer_state++;</a>
+<a name="ln756">			sStackModule-&gt;set_timer(&amp;entry-&gt;timer, ARP_REQUEST_TIMEOUT);</a>
+<a name="ln757">			break;</a>
+<a name="ln758">		}</a>
+<a name="ln759">	}</a>
+<a name="ln760">}</a>
+<a name="ln761"> </a>
+<a name="ln762"> </a>
+<a name="ln763">/*!	Address resolver function: prepares and triggers the ARP request necessary</a>
+<a name="ln764">	to retrieve the hardware address for \a address.</a>
+<a name="ln765"> </a>
+<a name="ln766">	You need to have the sCacheLock held when calling this function.</a>
+<a name="ln767">*/</a>
+<a name="ln768">static status_t</a>
+<a name="ln769">arp_start_resolve(arp_protocol* protocol, in_addr_t address, arp_entry** _entry)</a>
+<a name="ln770">{</a>
+<a name="ln771">	ASSERT_LOCKED_MUTEX(&amp;sCacheLock);</a>
+<a name="ln772"> </a>
+<a name="ln773">	// create an unresolved ARP entry as a placeholder</a>
+<a name="ln774">	arp_entry *entry = arp_entry::Add(address, NULL, 0);</a>
+<a name="ln775">	if (entry == NULL)</a>
+<a name="ln776">		return B_NO_MEMORY;</a>
+<a name="ln777"> </a>
+<a name="ln778">	// prepare ARP request</a>
+<a name="ln779"> </a>
+<a name="ln780">	entry-&gt;request_buffer = gBufferModule-&gt;create(256);</a>
+<a name="ln781">	if (entry-&gt;request_buffer == NULL) {</a>
+<a name="ln782">		entry-&gt;ScheduleRemoval();</a>
+<a name="ln783">		return B_NO_MEMORY;</a>
+<a name="ln784">	}</a>
+<a name="ln785"> </a>
+<a name="ln786">	NetBufferPrepend&lt;arp_header&gt; bufferHeader(entry-&gt;request_buffer);</a>
+<a name="ln787">	status_t status = bufferHeader.Status();</a>
+<a name="ln788">	if (status &lt; B_OK) {</a>
+<a name="ln789">		entry-&gt;ScheduleRemoval();</a>
+<a name="ln790">		return status;</a>
+<a name="ln791">	}</a>
+<a name="ln792"> </a>
+<a name="ln793">	// prepare ARP header</a>
+<a name="ln794"> </a>
+<a name="ln795">	net_device *device = protocol-&gt;interface-&gt;device;</a>
+<a name="ln796">	arp_header &amp;header = bufferHeader.Data();</a>
+<a name="ln797"> </a>
+<a name="ln798">	header.hardware_type = htons(ARP_HARDWARE_TYPE_ETHER);</a>
+<a name="ln799">	header.protocol_type = htons(ETHER_TYPE_IP);</a>
+<a name="ln800">	header.hardware_length = ETHER_ADDRESS_LENGTH;</a>
+<a name="ln801">	header.protocol_length = sizeof(in_addr_t);</a>
+<a name="ln802">	header.opcode = htons(ARP_OPCODE_REQUEST);</a>
+<a name="ln803"> </a>
+<a name="ln804">	memcpy(header.hardware_sender, device-&gt;address.data, ETHER_ADDRESS_LENGTH);</a>
+<a name="ln805">	memset(header.hardware_target, 0, ETHER_ADDRESS_LENGTH);</a>
+<a name="ln806">	header.protocol_sender = protocol-&gt;local_address;</a>
+<a name="ln807">	header.protocol_target = address;</a>
+<a name="ln808"> </a>
+<a name="ln809">	// prepare source and target addresses</a>
+<a name="ln810"> </a>
+<a name="ln811">	struct sockaddr_dl &amp;source = *(struct sockaddr_dl *)</a>
+<a name="ln812">		entry-&gt;request_buffer-&gt;source;</a>
+<a name="ln813">	source.sdl_len = sizeof(sockaddr_dl);</a>
+<a name="ln814">	source.sdl_family = AF_LINK;</a>
+<a name="ln815">	source.sdl_index = device-&gt;index;</a>
+<a name="ln816">	source.sdl_type = IFT_ETHER;</a>
+<a name="ln817">	source.sdl_e_type = htons(ETHER_TYPE_ARP);</a>
+<a name="ln818">	source.sdl_nlen = source.sdl_slen = 0;</a>
+<a name="ln819">	source.sdl_alen = ETHER_ADDRESS_LENGTH;</a>
+<a name="ln820">	memcpy(source.sdl_data, device-&gt;address.data, ETHER_ADDRESS_LENGTH);</a>
+<a name="ln821"> </a>
+<a name="ln822">	entry-&gt;request_buffer-&gt;flags = MSG_BCAST;</a>
+<a name="ln823">		// this is a broadcast packet, we don't need to fill in the destination</a>
+<a name="ln824"> </a>
+<a name="ln825">	entry-&gt;protocol = protocol;</a>
+<a name="ln826">	entry-&gt;timer_state = ARP_STATE_REQUEST;</a>
+<a name="ln827">	sStackModule-&gt;set_timer(&amp;entry-&gt;timer, 0);</a>
+<a name="ln828">		// start request timer</a>
+<a name="ln829"> </a>
+<a name="ln830">	*_entry = entry;</a>
+<a name="ln831">	return B_OK;</a>
+<a name="ln832">}</a>
+<a name="ln833"> </a>
+<a name="ln834"> </a>
+<a name="ln835">static status_t</a>
+<a name="ln836">arp_control(const char *subsystem, uint32 function, void *buffer,</a>
+<a name="ln837">	size_t bufferSize)</a>
+<a name="ln838">{</a>
+<a name="ln839">	struct arp_control control;</a>
+<a name="ln840">	if (bufferSize != sizeof(struct arp_control))</a>
+<a name="ln841">		return B_BAD_VALUE;</a>
+<a name="ln842">	if (user_memcpy(&amp;control, buffer, sizeof(struct arp_control)) &lt; B_OK)</a>
+<a name="ln843">		return B_BAD_ADDRESS;</a>
+<a name="ln844"> </a>
+<a name="ln845">	MutexLocker locker(sCacheLock);</a>
+<a name="ln846"> </a>
+<a name="ln847">	switch (function) {</a>
+<a name="ln848">		case ARP_SET_ENTRY:</a>
+<a name="ln849">		{</a>
+<a name="ln850">			sockaddr_dl hardwareAddress;</a>
+<a name="ln851"> </a>
+<a name="ln852">			hardwareAddress.sdl_len = sizeof(sockaddr_dl);</a>
+<a name="ln853">			hardwareAddress.sdl_family = AF_LINK;</a>
+<a name="ln854">			hardwareAddress.sdl_index = 0;</a>
+<a name="ln855">			hardwareAddress.sdl_type = IFT_ETHER;</a>
+<a name="ln856">			hardwareAddress.sdl_e_type = htons(ETHER_TYPE_IP);</a>
+<a name="ln857">			hardwareAddress.sdl_nlen = hardwareAddress.sdl_slen = 0;</a>
+<a name="ln858">			hardwareAddress.sdl_alen = ETHER_ADDRESS_LENGTH;</a>
+<a name="ln859">			memcpy(hardwareAddress.sdl_data, control.ethernet_address,</a>
+<a name="ln860">				ETHER_ADDRESS_LENGTH);</a>
+<a name="ln861"> </a>
+<a name="ln862">			return arp_update_entry(control.address, &amp;hardwareAddress,</a>
+<a name="ln863">				control.flags &amp; (ARP_FLAG_PUBLISH | ARP_FLAG_PERMANENT</a>
+<a name="ln864">					| ARP_FLAG_REJECT));</a>
+<a name="ln865">		}</a>
+<a name="ln866"> </a>
+<a name="ln867">		case ARP_GET_ENTRY:</a>
+<a name="ln868">		{</a>
+<a name="ln869">			arp_entry *entry = arp_entry::Lookup(control.address);</a>
+<a name="ln870">			if (entry == NULL || !(entry-&gt;flags &amp; ARP_FLAG_VALID))</a>
+<a name="ln871">				return B_ENTRY_NOT_FOUND;</a>
+<a name="ln872"> </a>
+<a name="ln873">			if (entry-&gt;hardware_address.sdl_alen == ETHER_ADDRESS_LENGTH) {</a>
+<a name="ln874">				memcpy(control.ethernet_address,</a>
+<a name="ln875">					entry-&gt;hardware_address.sdl_data, ETHER_ADDRESS_LENGTH);</a>
+<a name="ln876">			} else</a>
+<a name="ln877">				memset(control.ethernet_address, 0, ETHER_ADDRESS_LENGTH);</a>
+<a name="ln878"> </a>
+<a name="ln879">			control.flags = entry-&gt;flags &amp; ARP_PUBLIC_FLAG_MASK;</a>
+<a name="ln880">			return user_memcpy(buffer, &amp;control, sizeof(struct arp_control));</a>
+<a name="ln881">		}</a>
+<a name="ln882"> </a>
+<a name="ln883">		case ARP_GET_ENTRIES:</a>
+<a name="ln884">		{</a>
+<a name="ln885">			AddressCache::Iterator iterator(sCache);</a>
+<a name="ln886"> </a>
+<a name="ln887">			arp_entry *entry = NULL;</a>
+<a name="ln888">			for (uint32 i = 0; i &lt;= control.cookie; i++) {</a>
+<a name="ln889">				if (!iterator.HasNext())</a>
+<a name="ln890">					return B_ENTRY_NOT_FOUND;</a>
+<a name="ln891">				entry = iterator.Next();</a>
+<a name="ln892">			}</a>
+<a name="ln893"> </a>
+<a name="ln894">			control.cookie++;</a>
+<a name="ln895">			control.address = entry-&gt;protocol_address;</a>
+<a name="ln896">			if (entry-&gt;hardware_address.sdl_alen == ETHER_ADDRESS_LENGTH) {</a>
+<a name="ln897">				memcpy(control.ethernet_address,</a>
+<a name="ln898">					entry-&gt;hardware_address.sdl_data, ETHER_ADDRESS_LENGTH);</a>
+<a name="ln899">			} else</a>
+<a name="ln900">				memset(control.ethernet_address, 0, ETHER_ADDRESS_LENGTH);</a>
+<a name="ln901">			control.flags = entry-&gt;flags &amp; ARP_PUBLIC_FLAG_MASK;</a>
+<a name="ln902"> </a>
+<a name="ln903">			return user_memcpy(buffer, &amp;control, sizeof(struct arp_control));</a>
+<a name="ln904">		}</a>
+<a name="ln905"> </a>
+<a name="ln906">		case ARP_DELETE_ENTRY:</a>
+<a name="ln907">		{</a>
+<a name="ln908">			arp_entry *entry = arp_entry::Lookup(control.address);</a>
+<a name="ln909">			if (entry == NULL)</a>
+<a name="ln910">				return B_ENTRY_NOT_FOUND;</a>
+<a name="ln911">			if ((entry-&gt;flags &amp; ARP_FLAG_LOCAL) != 0)</a>
+<a name="ln912">				return B_BAD_VALUE;</a>
+<a name="ln913"> </a>
+<a name="ln914">			entry-&gt;ScheduleRemoval();</a>
+<a name="ln915">			return B_OK;</a>
+<a name="ln916">		}</a>
+<a name="ln917"> </a>
+<a name="ln918">		case ARP_FLUSH_ENTRIES:</a>
+<a name="ln919">		{</a>
+<a name="ln920">			AddressCache::Iterator iterator(sCache);</a>
+<a name="ln921"> </a>
+<a name="ln922">			arp_entry *entry;</a>
+<a name="ln923">			while (iterator.HasNext()) {</a>
+<a name="ln924">				entry = iterator.Next();</a>
+<a name="ln925">				// we never flush local ARP entries</a>
+<a name="ln926">				if ((entry-&gt;flags &amp; ARP_FLAG_LOCAL) != 0)</a>
+<a name="ln927">					continue;</a>
+<a name="ln928"> </a>
+<a name="ln929">				entry-&gt;ScheduleRemoval();</a>
+<a name="ln930">			}</a>
+<a name="ln931">			return B_OK;</a>
+<a name="ln932">		}</a>
+<a name="ln933"> </a>
+<a name="ln934">		case ARP_IGNORE_REPLIES:</a>
+<a name="ln935">			sIgnoreReplies = control.flags != 0;</a>
+<a name="ln936">			return B_OK;</a>
+<a name="ln937">	}</a>
+<a name="ln938"> </a>
+<a name="ln939">	return B_BAD_VALUE;</a>
+<a name="ln940">}</a>
+<a name="ln941"> </a>
+<a name="ln942"> </a>
+<a name="ln943">static status_t</a>
+<a name="ln944">arp_init()</a>
+<a name="ln945">{</a>
+<a name="ln946">	mutex_init(&amp;sCacheLock, &quot;arp cache&quot;);</a>
+<a name="ln947"> </a>
+<a name="ln948">	sCache = new(std::nothrow) AddressCache();</a>
+<a name="ln949">	if (sCache == NULL || sCache-&gt;Init(64) != B_OK) {</a>
+<a name="ln950">		mutex_destroy(&amp;sCacheLock);</a>
+<a name="ln951">		return B_NO_MEMORY;</a>
+<a name="ln952">	}</a>
+<a name="ln953"> </a>
+<a name="ln954">	register_generic_syscall(ARP_SYSCALLS, arp_control, 1, 0);</a>
+<a name="ln955">	return B_OK;</a>
+<a name="ln956">}</a>
+<a name="ln957"> </a>
+<a name="ln958"> </a>
+<a name="ln959">static status_t</a>
+<a name="ln960">arp_uninit()</a>
+<a name="ln961">{</a>
+<a name="ln962">	unregister_generic_syscall(ARP_SYSCALLS, 1);</a>
+<a name="ln963">	return B_OK;</a>
+<a name="ln964">}</a>
+<a name="ln965"> </a>
+<a name="ln966"> </a>
+<a name="ln967">//	#pragma mark - net_datalink_protocol</a>
+<a name="ln968"> </a>
+<a name="ln969"> </a>
+<a name="ln970">status_t</a>
+<a name="ln971">arp_init_protocol(net_interface* interface, net_domain* domain,</a>
+<a name="ln972">	net_datalink_protocol** _protocol)</a>
+<a name="ln973">{</a>
+<a name="ln974">	// We currently only support a single family and type!</a>
+<a name="ln975">	if (interface-&gt;device-&gt;type != IFT_ETHER</a>
+<a name="ln976">		|| domain-&gt;family != AF_INET)</a>
+<a name="ln977">		return B_BAD_TYPE;</a>
+<a name="ln978"> </a>
+<a name="ln979">	status_t status = sStackModule-&gt;register_device_handler(interface-&gt;device,</a>
+<a name="ln980">		B_NET_FRAME_TYPE(IFT_ETHER, ETHER_TYPE_ARP), &amp;arp_receive, NULL);</a>
+<a name="ln981">	if (status != B_OK)</a>
+<a name="ln982">		return status;</a>
+<a name="ln983"> </a>
+<a name="ln984">	status = sStackModule-&gt;register_domain_device_handler(</a>
+<a name="ln985">		interface-&gt;device, B_NET_FRAME_TYPE(IFT_ETHER, ETHER_TYPE_IP), domain);</a>
+<a name="ln986">	if (status != B_OK)</a>
+<a name="ln987">		return status;</a>
+<a name="ln988"> </a>
+<a name="ln989">	arp_protocol* protocol = new(std::nothrow) arp_protocol;</a>
+<a name="ln990">	if (protocol == NULL)</a>
+<a name="ln991">		return B_NO_MEMORY;</a>
+<a name="ln992"> </a>
+<a name="ln993">	memset(&amp;protocol-&gt;hardware_address, 0, sizeof(sockaddr_dl));</a>
+<a name="ln994">	protocol-&gt;local_address = 0;</a>
+<a name="ln995"> </a>
+<a name="ln996">	*_protocol = protocol;</a>
+<a name="ln997">	return B_OK;</a>
+<a name="ln998">}</a>
+<a name="ln999"> </a>
+<a name="ln1000"> </a>
+<a name="ln1001">status_t</a>
+<a name="ln1002">arp_uninit_protocol(net_datalink_protocol *protocol)</a>
+<a name="ln1003">{</a>
+<a name="ln1004">	sStackModule-&gt;unregister_device_handler(protocol-&gt;interface-&gt;device,</a>
+<a name="ln1005">		B_NET_FRAME_TYPE(IFT_ETHER, ETHER_TYPE_ARP));</a>
+<a name="ln1006">	sStackModule-&gt;unregister_device_handler(protocol-&gt;interface-&gt;device,</a>
+<a name="ln1007">		B_NET_FRAME_TYPE(IFT_ETHER, ETHER_TYPE_IP));</a>
+<a name="ln1008"> </a>
+<a name="ln1009">	delete protocol;</a>
+<a name="ln1010">	return B_OK;</a>
+<a name="ln1011">}</a>
+<a name="ln1012"> </a>
+<a name="ln1013"> </a>
+<a name="ln1014">status_t</a>
+<a name="ln1015">arp_send_data(net_datalink_protocol *_protocol, net_buffer *buffer)</a>
+<a name="ln1016">{</a>
+<a name="ln1017">	arp_protocol *protocol = (arp_protocol *)_protocol;</a>
+<a name="ln1018">	{</a>
+<a name="ln1019">		MutexLocker locker(sCacheLock);</a>
+<a name="ln1020"> </a>
+<a name="ln1021">		// Set buffer target and destination address</a>
+<a name="ln1022"> </a>
+<a name="ln1023">		memcpy(buffer-&gt;source, &amp;protocol-&gt;hardware_address,</a>
+<a name="ln1024">			protocol-&gt;hardware_address.sdl_len);</a>
+<a name="ln1025"> </a>
+<a name="ln1026">		if ((buffer-&gt;flags &amp; MSG_MCAST) != 0) {</a>
+<a name="ln1027">			sockaddr_dl multicastDestination;</a>
+<a name="ln1028">			ipv4_to_ether_multicast(&amp;multicastDestination,</a>
+<a name="ln1029">				(sockaddr_in *)buffer-&gt;destination);</a>
+<a name="ln1030">			memcpy(buffer-&gt;destination, &amp;multicastDestination,</a>
+<a name="ln1031">				sizeof(multicastDestination));</a>
+<a name="ln1032">		} else if ((buffer-&gt;flags &amp; MSG_BCAST) == 0) {</a>
+<a name="ln1033">			// Lookup destination (we may need to wait for this)</a>
+<a name="ln1034">			arp_entry *entry = arp_entry::Lookup(</a>
+<a name="ln1035">				((struct sockaddr_in *)buffer-&gt;destination)-&gt;sin_addr.s_addr);</a>
+<a name="ln1036">			if (entry == NULL) {</a>
+<a name="ln1037">				status_t status = arp_start_resolve(protocol,</a>
+<a name="ln1038">					((struct sockaddr_in*)buffer-&gt;destination)-&gt;sin_addr.s_addr,</a>
+<a name="ln1039">					&amp;entry);</a>
+<a name="ln1040">				if (status != B_OK)</a>
+<a name="ln1041">					return status;</a>
+<a name="ln1042">			}</a>
+<a name="ln1043"> </a>
+<a name="ln1044">			if ((entry-&gt;flags &amp; ARP_FLAG_REJECT) != 0)</a>
+<a name="ln1045">				return EHOSTUNREACH;</a>
+<a name="ln1046"> </a>
+<a name="ln1047">			if ((entry-&gt;flags &amp; ARP_FLAG_VALID) == 0) {</a>
+<a name="ln1048">				// entry is still being resolved.</a>
+<a name="ln1049">				TRACE((&quot;ARP Queuing packet %p, entry still being resolved.\n&quot;,</a>
+<a name="ln1050">					buffer));</a>
+<a name="ln1051">				entry-&gt;queue.Add(buffer);</a>
+<a name="ln1052">				return B_OK;</a>
+<a name="ln1053">			}</a>
+<a name="ln1054"> </a>
+<a name="ln1055">			memcpy(buffer-&gt;destination, &amp;entry-&gt;hardware_address,</a>
+<a name="ln1056">				entry-&gt;hardware_address.sdl_len);</a>
+<a name="ln1057">		}</a>
+<a name="ln1058">		// the broadcast address is set in the ethernet frame module</a>
+<a name="ln1059">	}</a>
+<a name="ln1060">	TRACE((&quot;%s(%p): from %s\n&quot;, __FUNCTION__, buffer,</a>
+<a name="ln1061">		mac_to_string(LLADDR((sockaddr_dl*)buffer-&gt;source))));</a>
+<a name="ln1062">	TRACE((&quot;  to %s\n&quot;,</a>
+<a name="ln1063">		mac_to_string(LLADDR((sockaddr_dl*)buffer-&gt;destination))));</a>
+<a name="ln1064"> </a>
+<a name="ln1065">	return protocol-&gt;next-&gt;module-&gt;send_data(protocol-&gt;next, buffer);</a>
+<a name="ln1066">}</a>
+<a name="ln1067"> </a>
+<a name="ln1068"> </a>
+<a name="ln1069">status_t</a>
+<a name="ln1070">arp_up(net_datalink_protocol* _protocol)</a>
+<a name="ln1071">{</a>
+<a name="ln1072">	arp_protocol* protocol = (arp_protocol*)_protocol;</a>
+<a name="ln1073">	status_t status = protocol-&gt;next-&gt;module-&gt;interface_up(protocol-&gt;next);</a>
+<a name="ln1074">	if (status != B_OK)</a>
+<a name="ln1075">		return status;</a>
+<a name="ln1076"> </a>
+<a name="ln1077">	// cache this device's address for later use</a>
+<a name="ln1078"> </a>
+<a name="ln1079">	status = arp_update_local(protocol);</a>
+<a name="ln1080">	if (status != B_OK) {</a>
+<a name="ln1081">		protocol-&gt;next-&gt;module-&gt;interface_down(protocol-&gt;next);</a>
+<a name="ln1082">		return status;</a>
+<a name="ln1083">	}</a>
+<a name="ln1084"> </a>
+<a name="ln1085">	return B_OK;</a>
+<a name="ln1086">}</a>
+<a name="ln1087"> </a>
+<a name="ln1088"> </a>
+<a name="ln1089">void</a>
+<a name="ln1090">arp_down(net_datalink_protocol *protocol)</a>
+<a name="ln1091">{</a>
+<a name="ln1092">	// remove local ARP entries from the cache</a>
+<a name="ln1093">	arp_remove_local((arp_protocol*)protocol);</a>
+<a name="ln1094"> </a>
+<a name="ln1095">	protocol-&gt;next-&gt;module-&gt;interface_down(protocol-&gt;next);</a>
+<a name="ln1096">}</a>
+<a name="ln1097"> </a>
+<a name="ln1098"> </a>
+<a name="ln1099">status_t</a>
+<a name="ln1100">arp_change_address(net_datalink_protocol* _protocol,</a>
+<a name="ln1101">	net_interface_address* address, int32 option,</a>
+<a name="ln1102">	const struct sockaddr* oldAddress, const struct sockaddr* newAddress)</a>
+<a name="ln1103">{</a>
+<a name="ln1104">	arp_protocol* protocol = (arp_protocol*)_protocol;</a>
+<a name="ln1105">	TRACE((&quot;%s(option %&quot; B_PRId32 &quot;)\n&quot;, __FUNCTION__, option));</a>
+<a name="ln1106"> </a>
+<a name="ln1107">	switch (option) {</a>
+<a name="ln1108">		case SIOCSIFADDR:</a>
+<a name="ln1109">		case SIOCAIFADDR:</a>
+<a name="ln1110">		case SIOCDIFADDR:</a>
+<a name="ln1111">			// Those are the options we handle</a>
+<a name="ln1112">			if ((protocol-&gt;interface-&gt;flags &amp; IFF_UP) != 0) {</a>
+<a name="ln1113">				// Update ARP entry for the local address</a>
+<a name="ln1114"> </a>
+<a name="ln1115">				if (newAddress != NULL &amp;&amp; newAddress-&gt;sa_family == AF_INET) {</a>
+<a name="ln1116">					status_t status = arp_set_local_entry(protocol, newAddress);</a>
+<a name="ln1117">					if (status != B_OK)</a>
+<a name="ln1118">						return status;</a>
+<a name="ln1119">				}</a>
+<a name="ln1120"> </a>
+<a name="ln1121">				if (option != SIOCAIFADDR</a>
+<a name="ln1122">					&amp;&amp; (oldAddress == NULL || oldAddress-&gt;sa_family == AF_INET))</a>
+<a name="ln1123">					arp_remove_local_entry(protocol, oldAddress, address);</a>
+<a name="ln1124">			}</a>
+<a name="ln1125">			break;</a>
+<a name="ln1126"> </a>
+<a name="ln1127">		default:</a>
+<a name="ln1128">			break;</a>
+<a name="ln1129">	}</a>
+<a name="ln1130"> </a>
+<a name="ln1131">	return protocol-&gt;next-&gt;module-&gt;change_address(protocol-&gt;next, address,</a>
+<a name="ln1132">		option, oldAddress, newAddress);</a>
+<a name="ln1133">}</a>
+<a name="ln1134"> </a>
+<a name="ln1135"> </a>
+<a name="ln1136">status_t</a>
+<a name="ln1137">arp_control(net_datalink_protocol *_protocol, int32 op, void *argument,</a>
+<a name="ln1138">	size_t length)</a>
+<a name="ln1139">{</a>
+<a name="ln1140">	arp_protocol* protocol = (arp_protocol*)_protocol;</a>
+<a name="ln1141">	return protocol-&gt;next-&gt;module-&gt;control(protocol-&gt;next, op, argument,</a>
+<a name="ln1142">		length);</a>
+<a name="ln1143">}</a>
+<a name="ln1144"> </a>
+<a name="ln1145"> </a>
+<a name="ln1146">static status_t</a>
+<a name="ln1147">arp_join_multicast(net_datalink_protocol *protocol, const sockaddr *address)</a>
+<a name="ln1148">{</a>
+<a name="ln1149">	if (address-&gt;sa_family != AF_INET)</a>
+<a name="ln1150">		return EINVAL;</a>
+<a name="ln1151"> </a>
+<a name="ln1152">	sockaddr_dl multicastAddress;</a>
+<a name="ln1153">	ipv4_to_ether_multicast(&amp;multicastAddress, (const sockaddr_in *)address);</a>
+<a name="ln1154"> </a>
+<a name="ln1155">	return protocol-&gt;next-&gt;module-&gt;join_multicast(protocol-&gt;next,</a>
+<a name="ln1156">		(sockaddr *)&amp;multicastAddress);</a>
+<a name="ln1157">}</a>
+<a name="ln1158"> </a>
+<a name="ln1159"> </a>
+<a name="ln1160">static status_t</a>
+<a name="ln1161">arp_leave_multicast(net_datalink_protocol *protocol, const sockaddr *address)</a>
+<a name="ln1162">{</a>
+<a name="ln1163">	if (address-&gt;sa_family != AF_INET)</a>
+<a name="ln1164">		return EINVAL;</a>
+<a name="ln1165"> </a>
+<a name="ln1166">	sockaddr_dl multicastAddress;</a>
+<a name="ln1167">	ipv4_to_ether_multicast(&amp;multicastAddress, (const sockaddr_in *)address);</a>
+<a name="ln1168"> </a>
+<a name="ln1169">	return protocol-&gt;next-&gt;module-&gt;leave_multicast(protocol-&gt;next,</a>
+<a name="ln1170">		(sockaddr *)&amp;multicastAddress);</a>
+<a name="ln1171">}</a>
+<a name="ln1172"> </a>
+<a name="ln1173"> </a>
+<a name="ln1174">static status_t</a>
+<a name="ln1175">arp_std_ops(int32 op, ...)</a>
+<a name="ln1176">{</a>
+<a name="ln1177">	switch (op) {</a>
+<a name="ln1178">		case B_MODULE_INIT:</a>
+<a name="ln1179">			return arp_init();</a>
+<a name="ln1180">		case B_MODULE_UNINIT:</a>
+<a name="ln1181">			return arp_uninit();</a>
+<a name="ln1182"> </a>
+<a name="ln1183">		default:</a>
+<a name="ln1184">			return B_ERROR;</a>
+<a name="ln1185">	}</a>
+<a name="ln1186">}</a>
+<a name="ln1187"> </a>
+<a name="ln1188"> </a>
+<a name="ln1189">static net_datalink_protocol_module_info sARPModule = {</a>
+<a name="ln1190">	{</a>
+<a name="ln1191">		&quot;network/datalink_protocols/arp/v1&quot;,</a>
+<a name="ln1192">		0,</a>
+<a name="ln1193">		arp_std_ops</a>
+<a name="ln1194">	},</a>
+<a name="ln1195">	arp_init_protocol,</a>
+<a name="ln1196">	arp_uninit_protocol,</a>
+<a name="ln1197">	arp_send_data,</a>
+<a name="ln1198">	arp_up,</a>
+<a name="ln1199">	arp_down,</a>
+<a name="ln1200">	arp_change_address,</a>
+<a name="ln1201">	arp_control,</a>
+<a name="ln1202">	arp_join_multicast,</a>
+<a name="ln1203">	arp_leave_multicast,</a>
+<a name="ln1204">};</a>
+<a name="ln1205"> </a>
+<a name="ln1206"> </a>
+<a name="ln1207">module_dependency module_dependencies[] = {</a>
+<a name="ln1208">	{NET_STACK_MODULE_NAME, (module_info**)&amp;sStackModule},</a>
+<a name="ln1209">	{NET_DATALINK_MODULE_NAME, (module_info**)&amp;sDatalinkModule},</a>
+<a name="ln1210">	{NET_BUFFER_MODULE_NAME, (module_info**)&amp;gBufferModule},</a>
+<a name="ln1211">	{}</a>
+<a name="ln1212">};</a>
+<a name="ln1213"> </a>
+<a name="ln1214">module_info* modules[] = {</a>
+<a name="ln1215">	(module_info*)&amp;sARPModule,</a>
+<a name="ln1216">	NULL</a>
+<a name="ln1217">};</a>
+
+</code></pre>
+<div class="balloon" rel="1030"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v512/" target="_blank">V512</a> A call of the 'memcpy' function will lead to overflow of the buffer 'buffer->destination'.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

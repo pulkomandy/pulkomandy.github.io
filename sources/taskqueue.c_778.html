@@ -1,0 +1,647 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>taskqueue.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2009, Colin Günther, coling@gmx.de</a>
+<a name="ln3"> * Copyright 2007, Hugo Santos. All Rights Reserved.</a>
+<a name="ln4"> * Distributed under the terms of the MIT License.</a>
+<a name="ln5"> *</a>
+<a name="ln6"> * Authors:</a>
+<a name="ln7"> *      Hugo Santos, hugosantos@gmail.com</a>
+<a name="ln8"> */</a>
+<a name="ln9"> </a>
+<a name="ln10"> </a>
+<a name="ln11">#include &quot;device.h&quot;</a>
+<a name="ln12"> </a>
+<a name="ln13">#include &lt;stdio.h&gt;</a>
+<a name="ln14"> </a>
+<a name="ln15">#include &lt;compat/sys/callout.h&gt;</a>
+<a name="ln16">#include &lt;compat/sys/taskqueue.h&gt;</a>
+<a name="ln17">#include &lt;compat/sys/haiku-module.h&gt;</a>
+<a name="ln18"> </a>
+<a name="ln19"> </a>
+<a name="ln20">#define TQ_FLAGS_ACTIVE		(1 &lt;&lt; 0)</a>
+<a name="ln21">#define TQ_FLAGS_BLOCKED	(1 &lt;&lt; 1)</a>
+<a name="ln22">#define TQ_FLAGS_PENDING	(1 &lt;&lt; 2)</a>
+<a name="ln23"> </a>
+<a name="ln24">#define	DT_CALLOUT_ARMED		(1 &lt;&lt; 0)</a>
+<a name="ln25">#define	DT_DRAIN_IN_PROGRESS	(1 &lt;&lt; 1)</a>
+<a name="ln26"> </a>
+<a name="ln27">struct taskqueue {</a>
+<a name="ln28">	char tq_name[TASKQUEUE_NAMELEN];</a>
+<a name="ln29">	struct mtx tq_mutex;</a>
+<a name="ln30">	struct list tq_list;</a>
+<a name="ln31">	taskqueue_enqueue_fn tq_enqueue;</a>
+<a name="ln32">	void *tq_arg;</a>
+<a name="ln33">	int tq_fast;</a>
+<a name="ln34">	spinlock tq_spinlock;</a>
+<a name="ln35">	sem_id tq_sem;</a>
+<a name="ln36">	thread_id *tq_threads;</a>
+<a name="ln37">	thread_id tq_thread_storage;</a>
+<a name="ln38">	int tq_threadcount;</a>
+<a name="ln39">	int tq_flags;</a>
+<a name="ln40">	int tq_callouts;</a>
+<a name="ln41">};</a>
+<a name="ln42"> </a>
+<a name="ln43">struct taskqueue *taskqueue_fast = NULL;</a>
+<a name="ln44">struct taskqueue *taskqueue_swi = NULL;</a>
+<a name="ln45">struct taskqueue *taskqueue_thread = NULL;</a>
+<a name="ln46"> </a>
+<a name="ln47"> </a>
+<a name="ln48">static struct taskqueue *</a>
+<a name="ln49">_taskqueue_create(const char *name, int mflags, int fast,</a>
+<a name="ln50">	taskqueue_enqueue_fn enqueueFunction, void *context)</a>
+<a name="ln51">{</a>
+<a name="ln52">	struct taskqueue *tq = malloc(sizeof(struct taskqueue));</a>
+<a name="ln53">	if (tq == NULL)</a>
+<a name="ln54">		return NULL;</a>
+<a name="ln55"> </a>
+<a name="ln56">	tq-&gt;tq_fast = fast;</a>
+<a name="ln57"> </a>
+<a name="ln58">	if (fast) {</a>
+<a name="ln59">		B_INITIALIZE_SPINLOCK(&amp;tq-&gt;tq_spinlock);</a>
+<a name="ln60">	} else {</a>
+<a name="ln61">		mtx_init(&amp;tq-&gt;tq_mutex, name, NULL, MTX_DEF);</a>
+<a name="ln62">	}</a>
+<a name="ln63"> </a>
+<a name="ln64">	strlcpy(tq-&gt;tq_name, name, sizeof(tq-&gt;tq_name));</a>
+<a name="ln65">	list_init_etc(&amp;tq-&gt;tq_list, offsetof(struct task, ta_link));</a>
+<a name="ln66">	tq-&gt;tq_enqueue = enqueueFunction;</a>
+<a name="ln67">	tq-&gt;tq_arg = context;</a>
+<a name="ln68"> </a>
+<a name="ln69">	tq-&gt;tq_sem = -1;</a>
+<a name="ln70">	tq-&gt;tq_threads = NULL;</a>
+<a name="ln71">	tq-&gt;tq_threadcount = 0;</a>
+<a name="ln72">	tq-&gt;tq_flags = TQ_FLAGS_ACTIVE;</a>
+<a name="ln73">	tq-&gt;tq_callouts = 0;</a>
+<a name="ln74"> </a>
+<a name="ln75">	return tq;</a>
+<a name="ln76">}</a>
+<a name="ln77"> </a>
+<a name="ln78"> </a>
+<a name="ln79">static void</a>
+<a name="ln80">tq_lock(struct taskqueue *taskQueue, cpu_status *status)</a>
+<a name="ln81">{</a>
+<a name="ln82">	if (taskQueue-&gt;tq_fast) {</a>
+<a name="ln83">		*status = disable_interrupts();</a>
+<a name="ln84">		acquire_spinlock(&amp;taskQueue-&gt;tq_spinlock);</a>
+<a name="ln85">	} else {</a>
+<a name="ln86">		mtx_lock(&amp;taskQueue-&gt;tq_mutex);</a>
+<a name="ln87">	}</a>
+<a name="ln88">}</a>
+<a name="ln89"> </a>
+<a name="ln90"> </a>
+<a name="ln91">static void</a>
+<a name="ln92">tq_unlock(struct taskqueue *taskQueue, cpu_status status)</a>
+<a name="ln93">{</a>
+<a name="ln94">	if (taskQueue-&gt;tq_fast) {</a>
+<a name="ln95">		release_spinlock(&amp;taskQueue-&gt;tq_spinlock);</a>
+<a name="ln96">		restore_interrupts(status);</a>
+<a name="ln97">	} else {</a>
+<a name="ln98">		mtx_unlock(&amp;taskQueue-&gt;tq_mutex);</a>
+<a name="ln99">	}</a>
+<a name="ln100">}</a>
+<a name="ln101"> </a>
+<a name="ln102"> </a>
+<a name="ln103">struct taskqueue *</a>
+<a name="ln104">taskqueue_create(const char *name, int mflags,</a>
+<a name="ln105">	taskqueue_enqueue_fn enqueueFunction, void *context)</a>
+<a name="ln106">{</a>
+<a name="ln107">	return _taskqueue_create(name, mflags, 0, enqueueFunction, context);</a>
+<a name="ln108">}</a>
+<a name="ln109"> </a>
+<a name="ln110"> </a>
+<a name="ln111">static int32</a>
+<a name="ln112">tq_handle_thread(void *data)</a>
+<a name="ln113">{</a>
+<a name="ln114">	struct taskqueue *tq = data;</a>
+<a name="ln115">	cpu_status cpu_state;</a>
+<a name="ln116">	struct task *t;</a>
+<a name="ln117">	int pending;</a>
+<a name="ln118">	sem_id sem;</a>
+<a name="ln119"> </a>
+<a name="ln120">	/* just a synchronization point */</a>
+<a name="ln121">	tq_lock(tq, &amp;cpu_state);</a>
+<a name="ln122">	sem = tq-&gt;tq_sem;</a>
+<a name="ln123">	tq_unlock(tq, cpu_state);</a>
+<a name="ln124"> </a>
+<a name="ln125">	while (acquire_sem(sem) == B_NO_ERROR) {</a>
+<a name="ln126">		tq_lock(tq, &amp;cpu_state);</a>
+<a name="ln127">		t = list_remove_head_item(&amp;tq-&gt;tq_list);</a>
+<a name="ln128">		tq_unlock(tq, cpu_state);</a>
+<a name="ln129">		if (t == NULL)</a>
+<a name="ln130">			continue;</a>
+<a name="ln131">		pending = t-&gt;ta_pending;</a>
+<a name="ln132">		t-&gt;ta_pending = 0;</a>
+<a name="ln133"> </a>
+<a name="ln134">		t-&gt;ta_handler(t-&gt;ta_argument, pending);</a>
+<a name="ln135">	}</a>
+<a name="ln136"> </a>
+<a name="ln137">	return 0;</a>
+<a name="ln138">}</a>
+<a name="ln139"> </a>
+<a name="ln140"> </a>
+<a name="ln141">static int</a>
+<a name="ln142">_taskqueue_start_threads(struct taskqueue **taskQueue, int count, int priority,</a>
+<a name="ln143">	const char *name)</a>
+<a name="ln144">{</a>
+<a name="ln145">	struct taskqueue *tq = (*taskQueue);</a>
+<a name="ln146">	int i, j;</a>
+<a name="ln147"> </a>
+<a name="ln148">	if (count == 0)</a>
+<a name="ln149">		return -1;</a>
+<a name="ln150"> </a>
+<a name="ln151">	if (tq-&gt;tq_threads != NULL)</a>
+<a name="ln152">		return -1;</a>
+<a name="ln153"> </a>
+<a name="ln154">	if (count == 1) {</a>
+<a name="ln155">		tq-&gt;tq_threads = &amp;tq-&gt;tq_thread_storage;</a>
+<a name="ln156">	} else {</a>
+<a name="ln157">		tq-&gt;tq_threads = malloc(sizeof(thread_id) * count);</a>
+<a name="ln158">		if (tq-&gt;tq_threads == NULL)</a>
+<a name="ln159">			return B_NO_MEMORY;</a>
+<a name="ln160">	}</a>
+<a name="ln161"> </a>
+<a name="ln162">	tq-&gt;tq_sem = create_sem(0, tq-&gt;tq_name);</a>
+<a name="ln163">	if (tq-&gt;tq_sem &lt; B_OK) {</a>
+<a name="ln164">		if (count &gt; 1)</a>
+<a name="ln165">			free(tq-&gt;tq_threads);</a>
+<a name="ln166">		tq-&gt;tq_threads = NULL;</a>
+<a name="ln167">		return tq-&gt;tq_sem;</a>
+<a name="ln168">	}</a>
+<a name="ln169"> </a>
+<a name="ln170">	for (i = 0; i &lt; count; i++) {</a>
+<a name="ln171">		tq-&gt;tq_threads[i] = spawn_kernel_thread(tq_handle_thread, tq-&gt;tq_name,</a>
+<a name="ln172">			priority, tq);</a>
+<a name="ln173">		if (tq-&gt;tq_threads[i] &lt; B_OK) {</a>
+<a name="ln174">			status_t status = tq-&gt;tq_threads[i];</a>
+<a name="ln175">			for (j = 0; j &lt; i; j++)</a>
+<a name="ln176">				kill_thread(tq-&gt;tq_threads[j]);</a>
+<a name="ln177">			if (count &gt; 1)</a>
+<a name="ln178">				free(tq-&gt;tq_threads);</a>
+<a name="ln179">			tq-&gt;tq_threads = NULL;</a>
+<a name="ln180">			delete_sem(tq-&gt;tq_sem);</a>
+<a name="ln181">			return status;</a>
+<a name="ln182">		}</a>
+<a name="ln183">	}</a>
+<a name="ln184"> </a>
+<a name="ln185">	tq-&gt;tq_threadcount = count;</a>
+<a name="ln186"> </a>
+<a name="ln187">	for (i = 0; i &lt; count; i++)</a>
+<a name="ln188">		resume_thread(tq-&gt;tq_threads[i]);</a>
+<a name="ln189"> </a>
+<a name="ln190">	return 0;</a>
+<a name="ln191">}</a>
+<a name="ln192"> </a>
+<a name="ln193"> </a>
+<a name="ln194">int</a>
+<a name="ln195">taskqueue_start_threads(struct taskqueue **taskQueue, int count, int priority,</a>
+<a name="ln196">	const char *format, ...)</a>
+<a name="ln197">{</a>
+<a name="ln198">	/* we assume that start_threads is called in a sane place, and thus</a>
+<a name="ln199">	 * don't need to be locked. This is mostly due to the fact that if</a>
+<a name="ln200">	 * the TQ is 'fast', locking the TQ disables interrupts... and then</a>
+<a name="ln201">	 * we can't create semaphores, threads and bananas. */</a>
+<a name="ln202"> </a>
+<a name="ln203">	/* cpu_status state; */</a>
+<a name="ln204">	char name[64];</a>
+<a name="ln205">	int result;</a>
+<a name="ln206">	va_list vl;</a>
+<a name="ln207"> </a>
+<a name="ln208">	va_start(vl, format);</a>
+<a name="ln209">	vsnprintf(name, sizeof(name), format, vl);</a>
+<a name="ln210">	va_end(vl);</a>
+<a name="ln211"> </a>
+<a name="ln212">	/*tq_lock(*tqp, &amp;state);*/</a>
+<a name="ln213">	result = _taskqueue_start_threads(taskQueue, count, priority, name);</a>
+<a name="ln214">	/*tq_unlock(*tqp, state);*/</a>
+<a name="ln215"> </a>
+<a name="ln216">	return result;</a>
+<a name="ln217">}</a>
+<a name="ln218"> </a>
+<a name="ln219"> </a>
+<a name="ln220">void</a>
+<a name="ln221">taskqueue_free(struct taskqueue *taskQueue)</a>
+<a name="ln222">{</a>
+<a name="ln223">	if (taskQueue == NULL) {</a>
+<a name="ln224">		printf(&quot;taskqueue_free called with NULL taskqueue\n&quot;);</a>
+<a name="ln225">		return;</a>
+<a name="ln226">	}</a>
+<a name="ln227"> </a>
+<a name="ln228">	/* lock and  drain list? */</a>
+<a name="ln229">	taskQueue-&gt;tq_flags &amp;= ~TQ_FLAGS_ACTIVE;</a>
+<a name="ln230">	if (!taskQueue-&gt;tq_fast)</a>
+<a name="ln231">		mtx_destroy(&amp;taskQueue-&gt;tq_mutex);</a>
+<a name="ln232">	if (taskQueue-&gt;tq_sem != -1) {</a>
+<a name="ln233">		int i;</a>
+<a name="ln234"> </a>
+<a name="ln235">		delete_sem(taskQueue-&gt;tq_sem);</a>
+<a name="ln236"> </a>
+<a name="ln237">		for (i = 0; i &lt; taskQueue-&gt;tq_threadcount; i++) {</a>
+<a name="ln238">			status_t status;</a>
+<a name="ln239">			wait_for_thread(taskQueue-&gt;tq_threads[i], &amp;status);</a>
+<a name="ln240">		}</a>
+<a name="ln241"> </a>
+<a name="ln242">		if (taskQueue-&gt;tq_threadcount &gt; 1)</a>
+<a name="ln243">			free(taskQueue-&gt;tq_threads);</a>
+<a name="ln244">	}</a>
+<a name="ln245"> </a>
+<a name="ln246">	free(taskQueue);</a>
+<a name="ln247">}</a>
+<a name="ln248"> </a>
+<a name="ln249"> </a>
+<a name="ln250">void</a>
+<a name="ln251">taskqueue_drain(struct taskqueue *taskQueue, struct task *task)</a>
+<a name="ln252">{</a>
+<a name="ln253">	cpu_status status;</a>
+<a name="ln254"> </a>
+<a name="ln255">	if (taskQueue == NULL) {</a>
+<a name="ln256">		printf(&quot;taskqueue_drain called with NULL taskqueue\n&quot;);</a>
+<a name="ln257">		return;</a>
+<a name="ln258">	}</a>
+<a name="ln259"> </a>
+<a name="ln260">	tq_lock(taskQueue, &amp;status);</a>
+<a name="ln261">	while (task-&gt;ta_pending != 0) {</a>
+<a name="ln262">		tq_unlock(taskQueue, status);</a>
+<a name="ln263">		snooze(0);</a>
+<a name="ln264">		tq_lock(taskQueue, &amp;status);</a>
+<a name="ln265">	}</a>
+<a name="ln266">	tq_unlock(taskQueue, status);</a>
+<a name="ln267">}</a>
+<a name="ln268"> </a>
+<a name="ln269"> </a>
+<a name="ln270">void</a>
+<a name="ln271">taskqueue_drain_timeout(struct taskqueue *queue,</a>
+<a name="ln272">	struct timeout_task *timeout_task)</a>
+<a name="ln273">{</a>
+<a name="ln274">	cpu_status status;</a>
+<a name="ln275">	/*</a>
+<a name="ln276">	 * Set flag to prevent timer from re-starting during drain:</a>
+<a name="ln277">	 */</a>
+<a name="ln278">	tq_lock(queue, &amp;status);</a>
+<a name="ln279">	KASSERT((timeout_task-&gt;f &amp; DT_DRAIN_IN_PROGRESS) == 0,</a>
+<a name="ln280">		(&quot;Drain already in progress&quot;));</a>
+<a name="ln281">	timeout_task-&gt;f |= DT_DRAIN_IN_PROGRESS;</a>
+<a name="ln282">	tq_unlock(queue, status);</a>
+<a name="ln283"> </a>
+<a name="ln284">	callout_drain(&amp;timeout_task-&gt;c);</a>
+<a name="ln285">	taskqueue_drain(queue, &amp;timeout_task-&gt;t);</a>
+<a name="ln286"> </a>
+<a name="ln287">	/*</a>
+<a name="ln288">	 * Clear flag to allow timer to re-start:</a>
+<a name="ln289">	 */</a>
+<a name="ln290">	tq_lock(queue, &amp;status);</a>
+<a name="ln291">	timeout_task-&gt;f &amp;= ~DT_DRAIN_IN_PROGRESS;</a>
+<a name="ln292">	tq_unlock(queue, status);</a>
+<a name="ln293">}</a>
+<a name="ln294"> </a>
+<a name="ln295"> </a>
+<a name="ln296">static void</a>
+<a name="ln297">taskqueue_task_nop_fn(void* context, int pending)</a>
+<a name="ln298">{</a>
+<a name="ln299">}</a>
+<a name="ln300"> </a>
+<a name="ln301"> </a>
+<a name="ln302">void</a>
+<a name="ln303">taskqueue_drain_all(struct taskqueue *taskQueue)</a>
+<a name="ln304">{</a>
+<a name="ln305">	struct task t_barrier;</a>
+<a name="ln306"> </a>
+<a name="ln307">	if (taskQueue == NULL) {</a>
+<a name="ln308">		printf(&quot;taskqueue_drain_all called with NULL taskqueue\n&quot;);</a>
+<a name="ln309">		return;</a>
+<a name="ln310">	}</a>
+<a name="ln311"> </a>
+<a name="ln312">	TASK_INIT(&amp;t_barrier, USHRT_MAX, taskqueue_task_nop_fn, &amp;t_barrier);</a>
+<a name="ln313">	taskqueue_enqueue(taskQueue, &amp;t_barrier);</a>
+<a name="ln314">	taskqueue_drain(taskQueue, &amp;t_barrier);</a>
+<a name="ln315">}</a>
+<a name="ln316"> </a>
+<a name="ln317"> </a>
+<a name="ln318">static void</a>
+<a name="ln319">taskqueue_enqueue_locked(struct taskqueue *taskQueue, struct task *task,</a>
+<a name="ln320">	cpu_status status)</a>
+<a name="ln321">{</a>
+<a name="ln322">	/* we don't really support priorities */</a>
+<a name="ln323">	if (task-&gt;ta_pending) {</a>
+<a name="ln324">		task-&gt;ta_pending++;</a>
+<a name="ln325">	} else {</a>
+<a name="ln326">		list_add_item(&amp;taskQueue-&gt;tq_list, task);</a>
+<a name="ln327">		task-&gt;ta_pending = 1;</a>
+<a name="ln328">		if ((taskQueue-&gt;tq_flags &amp; TQ_FLAGS_BLOCKED) == 0)</a>
+<a name="ln329">			taskQueue-&gt;tq_enqueue(taskQueue-&gt;tq_arg);</a>
+<a name="ln330">		else</a>
+<a name="ln331">			taskQueue-&gt;tq_flags |= TQ_FLAGS_PENDING;</a>
+<a name="ln332">	}</a>
+<a name="ln333">	tq_unlock(taskQueue, status);</a>
+<a name="ln334">}</a>
+<a name="ln335"> </a>
+<a name="ln336"> </a>
+<a name="ln337">int</a>
+<a name="ln338">taskqueue_enqueue(struct taskqueue *taskQueue, struct task *task)</a>
+<a name="ln339">{</a>
+<a name="ln340">	cpu_status status;</a>
+<a name="ln341"> </a>
+<a name="ln342">	tq_lock(taskQueue, &amp;status);</a>
+<a name="ln343">	taskqueue_enqueue_locked(taskQueue, task, status);</a>
+<a name="ln344">	/* The lock is released inside. */</a>
+<a name="ln345"> </a>
+<a name="ln346">	return 0;</a>
+<a name="ln347">}</a>
+<a name="ln348"> </a>
+<a name="ln349"> </a>
+<a name="ln350">static void</a>
+<a name="ln351">taskqueue_timeout_func(void *arg)</a>
+<a name="ln352">{</a>
+<a name="ln353">	struct taskqueue *queue;</a>
+<a name="ln354">	struct timeout_task *timeout_task;</a>
+<a name="ln355">	cpu_status status;</a>
+<a name="ln356">		// dummy, as we should never get here on a spin taskqueue</a>
+<a name="ln357"> </a>
+<a name="ln358">	timeout_task = arg;</a>
+<a name="ln359">	queue = timeout_task-&gt;q;</a>
+<a name="ln360">	KASSERT((timeout_task-&gt;f &amp; DT_CALLOUT_ARMED) != 0, (&quot;Stray timeout&quot;));</a>
+<a name="ln361">	timeout_task-&gt;f &amp;= ~DT_CALLOUT_ARMED;</a>
+<a name="ln362">	queue-&gt;tq_callouts--;</a>
+<a name="ln363">	taskqueue_enqueue_locked(timeout_task-&gt;q, &amp;timeout_task-&gt;t, status);</a>
+<a name="ln364">	/* The lock is released inside. */</a>
+<a name="ln365">}</a>
+<a name="ln366"> </a>
+<a name="ln367"> </a>
+<a name="ln368">int</a>
+<a name="ln369">taskqueue_enqueue_timeout(struct taskqueue *queue,</a>
+<a name="ln370">	struct timeout_task *ttask, int _ticks)</a>
+<a name="ln371">{</a>
+<a name="ln372">	int res;</a>
+<a name="ln373">	cpu_status status;</a>
+<a name="ln374"> </a>
+<a name="ln375">	tq_lock(queue, &amp;status);</a>
+<a name="ln376">	KASSERT(ttask-&gt;q == NULL || ttask-&gt;q == queue,</a>
+<a name="ln377">		(&quot;Migrated queue&quot;));</a>
+<a name="ln378">	ttask-&gt;q = queue;</a>
+<a name="ln379">	res = ttask-&gt;t.ta_pending;</a>
+<a name="ln380">	if (ttask-&gt;f &amp; DT_DRAIN_IN_PROGRESS) {</a>
+<a name="ln381">		/* Do nothing */</a>
+<a name="ln382">		tq_unlock(queue, status);</a>
+<a name="ln383">		res = -1;</a>
+<a name="ln384">	} else if (_ticks == 0) {</a>
+<a name="ln385">		tq_unlock(queue, status);</a>
+<a name="ln386">		taskqueue_enqueue(queue, &amp;ttask-&gt;t);</a>
+<a name="ln387">	} else {</a>
+<a name="ln388">		if ((ttask-&gt;f &amp; DT_CALLOUT_ARMED) != 0) {</a>
+<a name="ln389">			res++;</a>
+<a name="ln390">		} else {</a>
+<a name="ln391">			queue-&gt;tq_callouts++;</a>
+<a name="ln392">			ttask-&gt;f |= DT_CALLOUT_ARMED;</a>
+<a name="ln393">			if (_ticks &lt; 0)</a>
+<a name="ln394">				_ticks = -_ticks; /* Ignore overflow. */</a>
+<a name="ln395">		}</a>
+<a name="ln396">		tq_unlock(queue, status);</a>
+<a name="ln397">		if (_ticks &gt; 0) {</a>
+<a name="ln398">			callout_reset(&amp;ttask-&gt;c, _ticks,</a>
+<a name="ln399">				taskqueue_timeout_func, ttask);</a>
+<a name="ln400">		}</a>
+<a name="ln401">	}</a>
+<a name="ln402">	return (res);</a>
+<a name="ln403">}</a>
+<a name="ln404"> </a>
+<a name="ln405"> </a>
+<a name="ln406">static int</a>
+<a name="ln407">taskqueue_cancel_locked(struct taskqueue *queue, struct task *task,</a>
+<a name="ln408">	u_int *pendp)</a>
+<a name="ln409">{</a>
+<a name="ln410">	if (task-&gt;ta_pending &gt; 0)</a>
+<a name="ln411">		list_remove_item(&amp;queue-&gt;tq_list, task);</a>
+<a name="ln412">	if (pendp != NULL)</a>
+<a name="ln413">		*pendp = task-&gt;ta_pending;</a>
+<a name="ln414">	task-&gt;ta_pending = 0;</a>
+<a name="ln415">	return 0;</a>
+<a name="ln416">}</a>
+<a name="ln417"> </a>
+<a name="ln418"> </a>
+<a name="ln419">int</a>
+<a name="ln420">taskqueue_cancel(struct taskqueue *queue, struct task *task, u_int *pendp)</a>
+<a name="ln421">{</a>
+<a name="ln422">	int error;</a>
+<a name="ln423">	cpu_status status;</a>
+<a name="ln424"> </a>
+<a name="ln425">	tq_lock(queue, &amp;status);</a>
+<a name="ln426">	error = taskqueue_cancel_locked(queue, task, pendp);</a>
+<a name="ln427">	tq_unlock(queue, status);</a>
+<a name="ln428"> </a>
+<a name="ln429">	return (error);</a>
+<a name="ln430">}</a>
+<a name="ln431"> </a>
+<a name="ln432"> </a>
+<a name="ln433">int</a>
+<a name="ln434">taskqueue_cancel_timeout(struct taskqueue *queue,</a>
+<a name="ln435">	struct timeout_task *timeout_task, u_int *pendp)</a>
+<a name="ln436">{</a>
+<a name="ln437">	u_int pending, pending1;</a>
+<a name="ln438">	int error;</a>
+<a name="ln439">	cpu_status status;</a>
+<a name="ln440"> </a>
+<a name="ln441">	tq_lock(queue, &amp;status);</a>
+<a name="ln442">	pending = !!(callout_stop(&amp;timeout_task-&gt;c) &gt; 0);</a>
+<a name="ln443">	error = taskqueue_cancel_locked(queue, &amp;timeout_task-&gt;t, &amp;pending1);</a>
+<a name="ln444">	if ((timeout_task-&gt;f &amp; DT_CALLOUT_ARMED) != 0) {</a>
+<a name="ln445">		timeout_task-&gt;f &amp;= ~DT_CALLOUT_ARMED;</a>
+<a name="ln446">		queue-&gt;tq_callouts--;</a>
+<a name="ln447">	}</a>
+<a name="ln448">	tq_unlock(queue, status);</a>
+<a name="ln449"> </a>
+<a name="ln450">	if (pendp != NULL)</a>
+<a name="ln451">		*pendp = pending + pending1;</a>
+<a name="ln452">	return (error);</a>
+<a name="ln453">}</a>
+<a name="ln454"> </a>
+<a name="ln455"> </a>
+<a name="ln456">void</a>
+<a name="ln457">taskqueue_thread_enqueue(void *context)</a>
+<a name="ln458">{</a>
+<a name="ln459">	struct taskqueue **tqp = context;</a>
+<a name="ln460">	release_sem_etc((*tqp)-&gt;tq_sem, 1, B_DO_NOT_RESCHEDULE);</a>
+<a name="ln461">}</a>
+<a name="ln462"> </a>
+<a name="ln463"> </a>
+<a name="ln464">int</a>
+<a name="ln465">taskqueue_enqueue_fast(struct taskqueue *taskQueue, struct task *task)</a>
+<a name="ln466">{</a>
+<a name="ln467">	return taskqueue_enqueue(taskQueue, task);</a>
+<a name="ln468">}</a>
+<a name="ln469"> </a>
+<a name="ln470"> </a>
+<a name="ln471">struct taskqueue *</a>
+<a name="ln472">taskqueue_create_fast(const char *name, int mflags,</a>
+<a name="ln473">	taskqueue_enqueue_fn enqueueFunction, void *context)</a>
+<a name="ln474">{</a>
+<a name="ln475">	return _taskqueue_create(name, mflags, 1, enqueueFunction, context);</a>
+<a name="ln476">}</a>
+<a name="ln477"> </a>
+<a name="ln478"> </a>
+<a name="ln479">void</a>
+<a name="ln480">task_init(struct task *task, int prio, task_fn_t handler, void *context)</a>
+<a name="ln481">{</a>
+<a name="ln482">	task-&gt;ta_priority = prio;</a>
+<a name="ln483">	task-&gt;ta_handler = handler;</a>
+<a name="ln484">	task-&gt;ta_argument = context;</a>
+<a name="ln485">	task-&gt;ta_pending = 0;</a>
+<a name="ln486">}</a>
+<a name="ln487"> </a>
+<a name="ln488"> </a>
+<a name="ln489">void</a>
+<a name="ln490">timeout_task_init(struct taskqueue *queue, struct timeout_task *timeout_task,</a>
+<a name="ln491">	int priority, task_fn_t func, void *context)</a>
+<a name="ln492">{</a>
+<a name="ln493">	TASK_INIT(&amp;timeout_task-&gt;t, priority, func, context);</a>
+<a name="ln494">	callout_init_mtx(&amp;timeout_task-&gt;c, &amp;queue-&gt;tq_mutex,</a>
+<a name="ln495">		CALLOUT_RETURNUNLOCKED);</a>
+<a name="ln496">	timeout_task-&gt;q = queue;</a>
+<a name="ln497">	timeout_task-&gt;f = 0;</a>
+<a name="ln498">}</a>
+<a name="ln499"> </a>
+<a name="ln500"> </a>
+<a name="ln501">status_t</a>
+<a name="ln502">init_taskqueues()</a>
+<a name="ln503">{</a>
+<a name="ln504">	status_t status = B_NO_MEMORY;</a>
+<a name="ln505"> </a>
+<a name="ln506">	if (HAIKU_DRIVER_REQUIRES(FBSD_FAST_TASKQUEUE)) {</a>
+<a name="ln507">		taskqueue_fast = taskqueue_create_fast(&quot;fast taskq&quot;, 0,</a>
+<a name="ln508">			taskqueue_thread_enqueue, &amp;taskqueue_fast);</a>
+<a name="ln509">		if (taskqueue_fast == NULL)</a>
+<a name="ln510">			return B_NO_MEMORY;</a>
+<a name="ln511"> </a>
+<a name="ln512">		status = taskqueue_start_threads(&amp;taskqueue_fast, 1,</a>
+<a name="ln513">			B_REAL_TIME_PRIORITY, &quot;fast taskq thread&quot;);</a>
+<a name="ln514">		if (status &lt; B_OK)</a>
+<a name="ln515">			goto err_1;</a>
+<a name="ln516">	}</a>
+<a name="ln517"> </a>
+<a name="ln518">	if (HAIKU_DRIVER_REQUIRES(FBSD_SWI_TASKQUEUE)) {</a>
+<a name="ln519">		taskqueue_swi = taskqueue_create_fast(&quot;swi taskq&quot;, 0,</a>
+<a name="ln520">			taskqueue_thread_enqueue, &amp;taskqueue_swi);</a>
+<a name="ln521">		if (taskqueue_swi == NULL) {</a>
+<a name="ln522">			status = B_NO_MEMORY;</a>
+<a name="ln523">			goto err_1;</a>
+<a name="ln524">		}</a>
+<a name="ln525"> </a>
+<a name="ln526">		status = taskqueue_start_threads(&amp;taskqueue_swi, 1,</a>
+<a name="ln527">			B_REAL_TIME_PRIORITY, &quot;swi taskq&quot;);</a>
+<a name="ln528">		if (status &lt; B_OK)</a>
+<a name="ln529">			goto err_2;</a>
+<a name="ln530">	}</a>
+<a name="ln531"> </a>
+<a name="ln532">	if (HAIKU_DRIVER_REQUIRES(FBSD_THREAD_TASKQUEUE)) {</a>
+<a name="ln533">		taskqueue_thread = taskqueue_create_fast(&quot;thread taskq&quot;, 0,</a>
+<a name="ln534">			taskqueue_thread_enqueue, &amp;taskqueue_thread);</a>
+<a name="ln535">		if (taskqueue_thread == NULL) {</a>
+<a name="ln536">			status = B_NO_MEMORY;</a>
+<a name="ln537">			goto err_2;</a>
+<a name="ln538">		}</a>
+<a name="ln539"> </a>
+<a name="ln540">		status = taskqueue_start_threads(&amp;taskqueue_thread, 1,</a>
+<a name="ln541">			B_REAL_TIME_PRIORITY, &quot;swi taskq&quot;);</a>
+<a name="ln542">		if (status &lt; B_OK)</a>
+<a name="ln543">			goto err_3;</a>
+<a name="ln544">	}</a>
+<a name="ln545"> </a>
+<a name="ln546">	return B_OK;</a>
+<a name="ln547"> </a>
+<a name="ln548">err_3:</a>
+<a name="ln549">	if (taskqueue_thread)</a>
+<a name="ln550">		taskqueue_free(taskqueue_thread);</a>
+<a name="ln551"> </a>
+<a name="ln552">err_2:</a>
+<a name="ln553">	if (taskqueue_swi)</a>
+<a name="ln554">		taskqueue_free(taskqueue_swi);</a>
+<a name="ln555"> </a>
+<a name="ln556">err_1:</a>
+<a name="ln557">	if (taskqueue_fast)</a>
+<a name="ln558">		taskqueue_free(taskqueue_fast);</a>
+<a name="ln559"> </a>
+<a name="ln560">	return status;</a>
+<a name="ln561">}</a>
+<a name="ln562"> </a>
+<a name="ln563"> </a>
+<a name="ln564">void</a>
+<a name="ln565">uninit_taskqueues()</a>
+<a name="ln566">{</a>
+<a name="ln567">	if (HAIKU_DRIVER_REQUIRES(FBSD_THREAD_TASKQUEUE))</a>
+<a name="ln568">		taskqueue_free(taskqueue_thread);</a>
+<a name="ln569"> </a>
+<a name="ln570">	if (HAIKU_DRIVER_REQUIRES(FBSD_SWI_TASKQUEUE))</a>
+<a name="ln571">		taskqueue_free(taskqueue_swi);</a>
+<a name="ln572"> </a>
+<a name="ln573">	if (HAIKU_DRIVER_REQUIRES(FBSD_FAST_TASKQUEUE))</a>
+<a name="ln574">		taskqueue_free(taskqueue_fast);</a>
+<a name="ln575">}</a>
+<a name="ln576"> </a>
+<a name="ln577"> </a>
+<a name="ln578">void</a>
+<a name="ln579">taskqueue_block(struct taskqueue *taskQueue)</a>
+<a name="ln580">{</a>
+<a name="ln581">	cpu_status status;</a>
+<a name="ln582"> </a>
+<a name="ln583">	tq_lock(taskQueue, &amp;status);</a>
+<a name="ln584">	taskQueue-&gt;tq_flags |= TQ_FLAGS_BLOCKED;</a>
+<a name="ln585">	tq_unlock(taskQueue, status);</a>
+<a name="ln586">}</a>
+<a name="ln587"> </a>
+<a name="ln588"> </a>
+<a name="ln589">void</a>
+<a name="ln590">taskqueue_unblock(struct taskqueue *taskQueue)</a>
+<a name="ln591">{</a>
+<a name="ln592">	cpu_status status;</a>
+<a name="ln593"> </a>
+<a name="ln594">	tq_lock(taskQueue, &amp;status);</a>
+<a name="ln595">	taskQueue-&gt;tq_flags &amp;= ~TQ_FLAGS_BLOCKED;</a>
+<a name="ln596">	if (taskQueue-&gt;tq_flags &amp; TQ_FLAGS_PENDING) {</a>
+<a name="ln597">		taskQueue-&gt;tq_flags &amp;= ~TQ_FLAGS_PENDING;</a>
+<a name="ln598">		taskQueue-&gt;tq_enqueue(taskQueue-&gt;tq_arg);</a>
+<a name="ln599">	}</a>
+<a name="ln600">	tq_unlock(taskQueue, status);</a>
+<a name="ln601">}</a>
+
+</code></pre>
+<div class="balloon" rel="363"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v614/" target="_blank">V614</a> Uninitialized variable 'status' used. Consider checking the third actual argument of the 'taskqueue_enqueue_locked' function.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

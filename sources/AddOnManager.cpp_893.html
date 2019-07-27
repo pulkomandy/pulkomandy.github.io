@@ -1,0 +1,965 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>AddOnManager.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2004-2013 Haiku, Inc. All rights reserved.</a>
+<a name="ln3"> * Distributed under the terms of the MIT License.</a>
+<a name="ln4"> *</a>
+<a name="ln5"> * Authors:</a>
+<a name="ln6"> *		Axel Dörfler, axeld@pinc-software.de</a>
+<a name="ln7"> *		Jérôme Duval</a>
+<a name="ln8"> *		Marcus Overhagen</a>
+<a name="ln9"> *		John Scipione, jscipione@gmail.com</a>
+<a name="ln10"> */</a>
+<a name="ln11"> </a>
+<a name="ln12"> </a>
+<a name="ln13">//! Manager for input_server add-ons (devices, filters, methods)</a>
+<a name="ln14"> </a>
+<a name="ln15"> </a>
+<a name="ln16">#include &quot;AddOnManager.h&quot;</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &lt;stdio.h&gt;</a>
+<a name="ln19">#include &lt;string.h&gt;</a>
+<a name="ln20"> </a>
+<a name="ln21">#include &lt;Autolock.h&gt;</a>
+<a name="ln22">#include &lt;Deskbar.h&gt;</a>
+<a name="ln23">#include &lt;Directory.h&gt;</a>
+<a name="ln24">#include &lt;Entry.h&gt;</a>
+<a name="ln25">#include &lt;image.h&gt;</a>
+<a name="ln26">#include &lt;Path.h&gt;</a>
+<a name="ln27">#include &lt;Roster.h&gt;</a>
+<a name="ln28">#include &lt;String.h&gt;</a>
+<a name="ln29"> </a>
+<a name="ln30">#include &lt;PathMonitor.h&gt;</a>
+<a name="ln31"> </a>
+<a name="ln32">#include &quot;InputServer.h&quot;</a>
+<a name="ln33">#include &quot;InputServerTypes.h&quot;</a>
+<a name="ln34">#include &quot;MethodReplicant.h&quot;</a>
+<a name="ln35"> </a>
+<a name="ln36"> </a>
+<a name="ln37">#undef TRACE</a>
+<a name="ln38">//#define TRACE_ADD_ON_MONITOR</a>
+<a name="ln39">#ifdef TRACE_ADD_ON_MONITOR</a>
+<a name="ln40">#	define TRACE(x...) debug_printf(x)</a>
+<a name="ln41">#	define ERROR(x...) debug_printf(x)</a>
+<a name="ln42">#else</a>
+<a name="ln43">#	define TRACE(x...) ;</a>
+<a name="ln44">// TODO: probably better to the syslog</a>
+<a name="ln45">#	define ERROR(x...) debug_printf(x)</a>
+<a name="ln46">#endif</a>
+<a name="ln47"> </a>
+<a name="ln48"> </a>
+<a name="ln49"> </a>
+<a name="ln50">class AddOnManager::MonitorHandler : public AddOnMonitorHandler {</a>
+<a name="ln51">public:</a>
+<a name="ln52">	MonitorHandler(AddOnManager* manager)</a>
+<a name="ln53">	{</a>
+<a name="ln54">		fManager = manager;</a>
+<a name="ln55">	}</a>
+<a name="ln56"> </a>
+<a name="ln57">	virtual void AddOnEnabled(const add_on_entry_info* entryInfo)</a>
+<a name="ln58">	{</a>
+<a name="ln59">		CALLED();</a>
+<a name="ln60">		entry_ref ref;</a>
+<a name="ln61">		make_entry_ref(entryInfo-&gt;dir_nref.device, entryInfo-&gt;dir_nref.node,</a>
+<a name="ln62">			entryInfo-&gt;name, &amp;ref);</a>
+<a name="ln63">		BEntry entry(&amp;ref, false);</a>
+<a name="ln64"> </a>
+<a name="ln65">		fManager-&gt;_RegisterAddOn(entry);</a>
+<a name="ln66">	}</a>
+<a name="ln67"> </a>
+<a name="ln68">	virtual void AddOnDisabled(const add_on_entry_info* entryInfo)</a>
+<a name="ln69">	{</a>
+<a name="ln70">		CALLED();</a>
+<a name="ln71">		entry_ref ref;</a>
+<a name="ln72">		make_entry_ref(entryInfo-&gt;dir_nref.device, entryInfo-&gt;dir_nref.node,</a>
+<a name="ln73">			entryInfo-&gt;name, &amp;ref);</a>
+<a name="ln74">		BEntry entry(&amp;ref, false);</a>
+<a name="ln75"> </a>
+<a name="ln76">		fManager-&gt;_UnregisterAddOn(entry);</a>
+<a name="ln77">	}</a>
+<a name="ln78"> </a>
+<a name="ln79">private:</a>
+<a name="ln80">	AddOnManager* fManager;</a>
+<a name="ln81">};</a>
+<a name="ln82"> </a>
+<a name="ln83"> </a>
+<a name="ln84">//	#pragma mark -</a>
+<a name="ln85"> </a>
+<a name="ln86"> </a>
+<a name="ln87">template&lt;class T&gt; T*</a>
+<a name="ln88">instantiate_add_on(image_id image, const char* path, const char* type)</a>
+<a name="ln89">{</a>
+<a name="ln90">	T* (*instantiateFunction)();</a>
+<a name="ln91"> </a>
+<a name="ln92">	BString functionName = &quot;instantiate_input_&quot;;</a>
+<a name="ln93">	functionName += type;</a>
+<a name="ln94"> </a>
+<a name="ln95">	if (get_image_symbol(image, functionName.String(), B_SYMBOL_TYPE_TEXT,</a>
+<a name="ln96">			(void**)&amp;instantiateFunction) &lt; B_OK) {</a>
+<a name="ln97">		ERROR(&quot;AddOnManager::_RegisterAddOn(): can't find %s() in \&quot;%s\&quot;\n&quot;,</a>
+<a name="ln98">			functionName.String(), path);</a>
+<a name="ln99">		return NULL;</a>
+<a name="ln100">	}</a>
+<a name="ln101"> </a>
+<a name="ln102">	T* addOn = (*instantiateFunction)();</a>
+<a name="ln103">	if (addOn == NULL) {</a>
+<a name="ln104">		ERROR(&quot;AddOnManager::_RegisterAddOn(): %s() in \&quot;%s\&quot; returned &quot;</a>
+<a name="ln105">			&quot;NULL\n&quot;, functionName.String(), path);</a>
+<a name="ln106">		return NULL;</a>
+<a name="ln107">	}</a>
+<a name="ln108"> </a>
+<a name="ln109">	status_t status = addOn-&gt;InitCheck();</a>
+<a name="ln110">	if (status != B_OK) {</a>
+<a name="ln111">		ERROR(&quot;AddOnManager::_RegisterAddOn(): InitCheck() in \&quot;%s\&quot; &quot;</a>
+<a name="ln112">			&quot;returned %s\n&quot;, path, strerror(status));</a>
+<a name="ln113">		delete addOn;</a>
+<a name="ln114">		return NULL;</a>
+<a name="ln115">	}</a>
+<a name="ln116"> </a>
+<a name="ln117">	return addOn;</a>
+<a name="ln118">}</a>
+<a name="ln119"> </a>
+<a name="ln120"> </a>
+<a name="ln121">//	#pragma mark - AddOnManager</a>
+<a name="ln122"> </a>
+<a name="ln123"> </a>
+<a name="ln124">AddOnManager::AddOnManager()</a>
+<a name="ln125">	:</a>
+<a name="ln126">	AddOnMonitor(),</a>
+<a name="ln127">	fHandler(new(std::nothrow) MonitorHandler(this))</a>
+<a name="ln128">{</a>
+<a name="ln129">	SetHandler(fHandler);</a>
+<a name="ln130">}</a>
+<a name="ln131"> </a>
+<a name="ln132"> </a>
+<a name="ln133">AddOnManager::~AddOnManager()</a>
+<a name="ln134">{</a>
+<a name="ln135">	delete fHandler;</a>
+<a name="ln136">}</a>
+<a name="ln137"> </a>
+<a name="ln138"> </a>
+<a name="ln139">void</a>
+<a name="ln140">AddOnManager::MessageReceived(BMessage* message)</a>
+<a name="ln141">{</a>
+<a name="ln142">	CALLED();</a>
+<a name="ln143"> </a>
+<a name="ln144">	BMessage reply;</a>
+<a name="ln145">	status_t status;</a>
+<a name="ln146"> </a>
+<a name="ln147">	TRACE(&quot;%s what: %.4s\n&quot;, __PRETTY_FUNCTION__, (char*)&amp;message-&gt;what);</a>
+<a name="ln148"> </a>
+<a name="ln149">	switch (message-&gt;what) {</a>
+<a name="ln150">		case IS_FIND_DEVICES:</a>
+<a name="ln151">			status = _HandleFindDevices(message, &amp;reply);</a>
+<a name="ln152">			break;</a>
+<a name="ln153">		case IS_WATCH_DEVICES:</a>
+<a name="ln154">			status = _HandleWatchDevices(message, &amp;reply);</a>
+<a name="ln155">			break;</a>
+<a name="ln156">		case IS_IS_DEVICE_RUNNING:</a>
+<a name="ln157">			status = _HandleIsDeviceRunning(message, &amp;reply);</a>
+<a name="ln158">			break;</a>
+<a name="ln159">		case IS_START_DEVICE:</a>
+<a name="ln160">			status = _HandleStartStopDevices(message, &amp;reply);</a>
+<a name="ln161">			break;</a>
+<a name="ln162">		case IS_STOP_DEVICE:</a>
+<a name="ln163">			status = _HandleStartStopDevices(message, &amp;reply);</a>
+<a name="ln164">			break;</a>
+<a name="ln165">		case IS_CONTROL_DEVICES:</a>
+<a name="ln166">			status = _HandleControlDevices(message, &amp;reply);</a>
+<a name="ln167">			break;</a>
+<a name="ln168">		case SYSTEM_SHUTTING_DOWN:</a>
+<a name="ln169">			status = _HandleSystemShuttingDown(message, &amp;reply);</a>
+<a name="ln170">			break;</a>
+<a name="ln171">		case IS_METHOD_REGISTER:</a>
+<a name="ln172">			status = _HandleMethodReplicant(message, &amp;reply);</a>
+<a name="ln173">			break;</a>
+<a name="ln174"> </a>
+<a name="ln175">		case B_PATH_MONITOR:</a>
+<a name="ln176">			_HandleDeviceMonitor(message);</a>
+<a name="ln177">			return;</a>
+<a name="ln178"> </a>
+<a name="ln179">		default:</a>
+<a name="ln180">			AddOnMonitor::MessageReceived(message);</a>
+<a name="ln181">			return;</a>
+<a name="ln182">	}</a>
+<a name="ln183"> </a>
+<a name="ln184">	reply.AddInt32(&quot;status&quot;, status);</a>
+<a name="ln185">	message-&gt;SendReply(&amp;reply);</a>
+<a name="ln186">}</a>
+<a name="ln187"> </a>
+<a name="ln188"> </a>
+<a name="ln189">void</a>
+<a name="ln190">AddOnManager::LoadState()</a>
+<a name="ln191">{</a>
+<a name="ln192">	_RegisterAddOns();</a>
+<a name="ln193">}</a>
+<a name="ln194"> </a>
+<a name="ln195"> </a>
+<a name="ln196">void</a>
+<a name="ln197">AddOnManager::SaveState()</a>
+<a name="ln198">{</a>
+<a name="ln199">	CALLED();</a>
+<a name="ln200">	_UnregisterAddOns();</a>
+<a name="ln201">}</a>
+<a name="ln202"> </a>
+<a name="ln203"> </a>
+<a name="ln204">status_t</a>
+<a name="ln205">AddOnManager::StartMonitoringDevice(DeviceAddOn* addOn, const char* device)</a>
+<a name="ln206">{</a>
+<a name="ln207">	CALLED();</a>
+<a name="ln208"> </a>
+<a name="ln209">	BString path;</a>
+<a name="ln210">	if (device[0] != '/')</a>
+<a name="ln211">		path = &quot;/dev/&quot;;</a>
+<a name="ln212">	path += device;</a>
+<a name="ln213"> </a>
+<a name="ln214">	TRACE(&quot;AddOnMonitor::StartMonitoringDevice(%s)\n&quot;, path.String());</a>
+<a name="ln215"> </a>
+<a name="ln216">	bool newPath;</a>
+<a name="ln217">	status_t status = _AddDevicePath(addOn, path.String(), newPath);</a>
+<a name="ln218">	if (status == B_OK &amp;&amp; newPath) {</a>
+<a name="ln219">		status = BPathMonitor::StartWatching(path.String(),</a>
+<a name="ln220">			B_WATCH_FILES_ONLY | B_WATCH_RECURSIVELY, this);</a>
+<a name="ln221">		if (status != B_OK) {</a>
+<a name="ln222">			bool lastPath;</a>
+<a name="ln223">			_RemoveDevicePath(addOn, path.String(), lastPath);</a>
+<a name="ln224">		}</a>
+<a name="ln225">	}</a>
+<a name="ln226"> </a>
+<a name="ln227">	return status;</a>
+<a name="ln228">}</a>
+<a name="ln229"> </a>
+<a name="ln230"> </a>
+<a name="ln231">status_t</a>
+<a name="ln232">AddOnManager::StopMonitoringDevice(DeviceAddOn* addOn, const char *device)</a>
+<a name="ln233">{</a>
+<a name="ln234">	CALLED();</a>
+<a name="ln235"> </a>
+<a name="ln236">	BString path;</a>
+<a name="ln237">	if (device[0] != '/')</a>
+<a name="ln238">		path = &quot;/dev/&quot;;</a>
+<a name="ln239">	path += device;</a>
+<a name="ln240"> </a>
+<a name="ln241">	TRACE(&quot;AddOnMonitor::StopMonitoringDevice(%s)\n&quot;, path.String());</a>
+<a name="ln242"> </a>
+<a name="ln243">	bool lastPath;</a>
+<a name="ln244">	status_t status = _RemoveDevicePath(addOn, path.String(), lastPath);</a>
+<a name="ln245">	if (status == B_OK &amp;&amp; lastPath)</a>
+<a name="ln246">		BPathMonitor::StopWatching(path.String(), this);</a>
+<a name="ln247"> </a>
+<a name="ln248">	return status;</a>
+<a name="ln249">}</a>
+<a name="ln250"> </a>
+<a name="ln251"> </a>
+<a name="ln252">// #pragma mark -</a>
+<a name="ln253"> </a>
+<a name="ln254"> </a>
+<a name="ln255">void</a>
+<a name="ln256">AddOnManager::_RegisterAddOns()</a>
+<a name="ln257">{</a>
+<a name="ln258">	CALLED();</a>
+<a name="ln259">	BAutolock locker(this);</a>
+<a name="ln260"> </a>
+<a name="ln261">	fHandler-&gt;AddAddOnDirectories(&quot;input_server/devices&quot;);</a>
+<a name="ln262">	fHandler-&gt;AddAddOnDirectories(&quot;input_server/filters&quot;);</a>
+<a name="ln263">	fHandler-&gt;AddAddOnDirectories(&quot;input_server/methods&quot;);</a>
+<a name="ln264">}</a>
+<a name="ln265"> </a>
+<a name="ln266"> </a>
+<a name="ln267">void</a>
+<a name="ln268">AddOnManager::_UnregisterAddOns()</a>
+<a name="ln269">{</a>
+<a name="ln270">	BAutolock locker(this);</a>
+<a name="ln271"> </a>
+<a name="ln272">	// We have to stop manually the add-ons because the monitor doesn't</a>
+<a name="ln273">	// disable them on exit</a>
+<a name="ln274"> </a>
+<a name="ln275">	while (device_info* info = fDeviceList.RemoveItemAt(0)) {</a>
+<a name="ln276">		gInputServer-&gt;StartStopDevices(*info-&gt;add_on, false);</a>
+<a name="ln277">		delete info;</a>
+<a name="ln278">	}</a>
+<a name="ln279"> </a>
+<a name="ln280">	// TODO: what about the filters/methods lists in the input_server?</a>
+<a name="ln281"> </a>
+<a name="ln282">	while (filter_info* info = fFilterList.RemoveItemAt(0)) {</a>
+<a name="ln283">		delete info;</a>
+<a name="ln284">	}</a>
+<a name="ln285"> </a>
+<a name="ln286">	while (method_info* info = fMethodList.RemoveItemAt(0)) {</a>
+<a name="ln287">		delete info;</a>
+<a name="ln288">	}</a>
+<a name="ln289">}</a>
+<a name="ln290"> </a>
+<a name="ln291"> </a>
+<a name="ln292">bool</a>
+<a name="ln293">AddOnManager::_IsDevice(const char* path) const</a>
+<a name="ln294">{</a>
+<a name="ln295">	return strstr(path, &quot;input_server/devices&quot;) != 0;</a>
+<a name="ln296">}</a>
+<a name="ln297"> </a>
+<a name="ln298"> </a>
+<a name="ln299">bool</a>
+<a name="ln300">AddOnManager::_IsFilter(const char* path) const</a>
+<a name="ln301">{</a>
+<a name="ln302">	return strstr(path, &quot;input_server/filters&quot;) != 0;</a>
+<a name="ln303">}</a>
+<a name="ln304"> </a>
+<a name="ln305"> </a>
+<a name="ln306">bool</a>
+<a name="ln307">AddOnManager::_IsMethod(const char* path) const</a>
+<a name="ln308">{</a>
+<a name="ln309">	return strstr(path, &quot;input_server/methods&quot;) != 0;</a>
+<a name="ln310">}</a>
+<a name="ln311"> </a>
+<a name="ln312"> </a>
+<a name="ln313">status_t</a>
+<a name="ln314">AddOnManager::_RegisterAddOn(BEntry&amp; entry)</a>
+<a name="ln315">{</a>
+<a name="ln316">	BPath path(&amp;entry);</a>
+<a name="ln317"> </a>
+<a name="ln318">	entry_ref ref;</a>
+<a name="ln319">	status_t status = entry.GetRef(&amp;ref);</a>
+<a name="ln320">	if (status &lt; B_OK)</a>
+<a name="ln321">		return status;</a>
+<a name="ln322"> </a>
+<a name="ln323">	TRACE(&quot;AddOnManager::RegisterAddOn(): trying to load \&quot;%s\&quot;\n&quot;,</a>
+<a name="ln324">		path.Path());</a>
+<a name="ln325"> </a>
+<a name="ln326">	image_id image = load_add_on(path.Path());</a>
+<a name="ln327">	if (image &lt; B_OK) {</a>
+<a name="ln328">		ERROR(&quot;load addon %s failed\n&quot;, path.Path());</a>
+<a name="ln329">		return image;</a>
+<a name="ln330">	}</a>
+<a name="ln331"> </a>
+<a name="ln332">	status = B_ERROR;</a>
+<a name="ln333"> </a>
+<a name="ln334">	if (_IsDevice(path.Path())) {</a>
+<a name="ln335">		BInputServerDevice* device = instantiate_add_on&lt;BInputServerDevice&gt;(</a>
+<a name="ln336">			image, path.Path(), &quot;device&quot;);</a>
+<a name="ln337">		if (device != NULL)</a>
+<a name="ln338">			status = _RegisterDevice(device, ref, image);</a>
+<a name="ln339">	} else if (_IsFilter(path.Path())) {</a>
+<a name="ln340">		BInputServerFilter* filter = instantiate_add_on&lt;BInputServerFilter&gt;(</a>
+<a name="ln341">			image, path.Path(), &quot;filter&quot;);</a>
+<a name="ln342">		if (filter != NULL)</a>
+<a name="ln343">			status = _RegisterFilter(filter, ref, image);</a>
+<a name="ln344">	} else if (_IsMethod(path.Path())) {</a>
+<a name="ln345">		BInputServerMethod* method = instantiate_add_on&lt;BInputServerMethod&gt;(</a>
+<a name="ln346">			image, path.Path(), &quot;method&quot;);</a>
+<a name="ln347">		if (method != NULL)</a>
+<a name="ln348">			status = _RegisterMethod(method, ref, image);</a>
+<a name="ln349">	} else {</a>
+<a name="ln350">		ERROR(&quot;AddOnManager::_RegisterAddOn(): addon type not found for &quot;</a>
+<a name="ln351">			&quot;\&quot;%s\&quot; \n&quot;, path.Path());</a>
+<a name="ln352">	}</a>
+<a name="ln353"> </a>
+<a name="ln354">	if (status != B_OK)</a>
+<a name="ln355">		unload_add_on(image);</a>
+<a name="ln356"> </a>
+<a name="ln357">	return status;</a>
+<a name="ln358">}</a>
+<a name="ln359"> </a>
+<a name="ln360"> </a>
+<a name="ln361">status_t</a>
+<a name="ln362">AddOnManager::_UnregisterAddOn(BEntry&amp; entry)</a>
+<a name="ln363">{</a>
+<a name="ln364">	BPath path(&amp;entry);</a>
+<a name="ln365"> </a>
+<a name="ln366">	entry_ref ref;</a>
+<a name="ln367">	status_t status = entry.GetRef(&amp;ref);</a>
+<a name="ln368">	if (status &lt; B_OK)</a>
+<a name="ln369">		return status;</a>
+<a name="ln370"> </a>
+<a name="ln371">	TRACE(&quot;AddOnManager::UnregisterAddOn(): trying to unload \&quot;%s\&quot;\n&quot;,</a>
+<a name="ln372">		path.Path());</a>
+<a name="ln373"> </a>
+<a name="ln374">	BAutolock _(this);</a>
+<a name="ln375"> </a>
+<a name="ln376">	if (_IsDevice(path.Path())) {</a>
+<a name="ln377">		for (int32 i = fDeviceList.CountItems(); i-- &gt; 0;) {</a>
+<a name="ln378">			device_info* info = fDeviceList.ItemAt(i);</a>
+<a name="ln379">			if (!strcmp(info-&gt;ref.name, ref.name)) {</a>
+<a name="ln380">				gInputServer-&gt;StartStopDevices(*info-&gt;add_on, false);</a>
+<a name="ln381">				delete fDeviceList.RemoveItemAt(i);</a>
+<a name="ln382">				break;</a>
+<a name="ln383">			}</a>
+<a name="ln384">		}</a>
+<a name="ln385">	} else if (_IsFilter(path.Path())) {</a>
+<a name="ln386">		for (int32 i = fFilterList.CountItems(); i-- &gt; 0;) {</a>
+<a name="ln387">			filter_info* info = fFilterList.ItemAt(i);</a>
+<a name="ln388">			if (!strcmp(info-&gt;ref.name, ref.name)) {</a>
+<a name="ln389">				BAutolock locker(InputServer::gInputFilterListLocker);</a>
+<a name="ln390">				InputServer::gInputFilterList.RemoveItem(info-&gt;add_on);</a>
+<a name="ln391">				delete fFilterList.RemoveItemAt(i);</a>
+<a name="ln392">				break;</a>
+<a name="ln393">			}</a>
+<a name="ln394">		}</a>
+<a name="ln395">	} else if (_IsMethod(path.Path())) {</a>
+<a name="ln396">		BInputServerMethod* method = NULL;</a>
+<a name="ln397"> </a>
+<a name="ln398">		for (int32 i = fMethodList.CountItems(); i-- &gt; 0;) {</a>
+<a name="ln399">			method_info* info = fMethodList.ItemAt(i);</a>
+<a name="ln400">			if (!strcmp(info-&gt;ref.name, ref.name)) {</a>
+<a name="ln401">				BAutolock locker(InputServer::gInputMethodListLocker);</a>
+<a name="ln402">				InputServer::gInputMethodList.RemoveItem(info-&gt;add_on);</a>
+<a name="ln403">				method = info-&gt;add_on;</a>
+<a name="ln404">					// this will only be used as a cookie, and not referenced</a>
+<a name="ln405">					// anymore</a>
+<a name="ln406">				delete fMethodList.RemoveItemAt(i);</a>
+<a name="ln407">				break;</a>
+<a name="ln408">			}</a>
+<a name="ln409">		}</a>
+<a name="ln410"> </a>
+<a name="ln411">		if (fMethodList.CountItems() &lt;= 0) {</a>
+<a name="ln412">			// we remove the method replicant</a>
+<a name="ln413">			BDeskbar().RemoveItem(REPLICANT_CTL_NAME);</a>
+<a name="ln414">			gInputServer-&gt;SetMethodReplicant(NULL);</a>
+<a name="ln415">		} else if (method != NULL) {</a>
+<a name="ln416">			BMessage msg(IS_REMOVE_METHOD);</a>
+<a name="ln417">			msg.AddInt32(&quot;cookie&quot;, method-&gt;fOwner-&gt;Cookie());</a>
+<a name="ln418">			if (gInputServer-&gt;MethodReplicant())</a>
+<a name="ln419">				gInputServer-&gt;MethodReplicant()-&gt;SendMessage(&amp;msg);</a>
+<a name="ln420">		}</a>
+<a name="ln421">	}</a>
+<a name="ln422"> </a>
+<a name="ln423">	return B_OK;</a>
+<a name="ln424">}</a>
+<a name="ln425"> </a>
+<a name="ln426"> </a>
+<a name="ln427">//!	Takes over ownership of the \a device, regardless of success.</a>
+<a name="ln428">status_t</a>
+<a name="ln429">AddOnManager::_RegisterDevice(BInputServerDevice* device, const entry_ref&amp; ref,</a>
+<a name="ln430">	image_id addOnImage)</a>
+<a name="ln431">{</a>
+<a name="ln432">	BAutolock locker(this);</a>
+<a name="ln433"> </a>
+<a name="ln434">	for (int32 i = fDeviceList.CountItems(); i-- &gt; 0;) {</a>
+<a name="ln435">		device_info* info = fDeviceList.ItemAt(i);</a>
+<a name="ln436">		if (!strcmp(info-&gt;ref.name, ref.name)) {</a>
+<a name="ln437">			// we already know this device</a>
+<a name="ln438">			delete device;</a>
+<a name="ln439">			return B_NAME_IN_USE;</a>
+<a name="ln440">		}</a>
+<a name="ln441">	}</a>
+<a name="ln442"> </a>
+<a name="ln443">	TRACE(&quot;AddOnManager::RegisterDevice, name %s\n&quot;, ref.name);</a>
+<a name="ln444"> </a>
+<a name="ln445">	device_info* info = new(std::nothrow) device_info;</a>
+<a name="ln446">	if (info == NULL) {</a>
+<a name="ln447">		delete device;</a>
+<a name="ln448">		return B_NO_MEMORY;</a>
+<a name="ln449">	}</a>
+<a name="ln450"> </a>
+<a name="ln451">	info-&gt;ref = ref;</a>
+<a name="ln452">	info-&gt;add_on = device;</a>
+<a name="ln453"> </a>
+<a name="ln454">	if (!fDeviceList.AddItem(info)) {</a>
+<a name="ln455">		delete info;</a>
+<a name="ln456">		return B_NO_MEMORY;</a>
+<a name="ln457">	}</a>
+<a name="ln458"> </a>
+<a name="ln459">	info-&gt;image = addOnImage;</a>
+<a name="ln460"> </a>
+<a name="ln461">	return B_OK;</a>
+<a name="ln462">}</a>
+<a name="ln463"> </a>
+<a name="ln464"> </a>
+<a name="ln465">//!	Takes over ownership of the \a filter, regardless of success.</a>
+<a name="ln466">status_t</a>
+<a name="ln467">AddOnManager::_RegisterFilter(BInputServerFilter* filter, const entry_ref&amp; ref,</a>
+<a name="ln468">	image_id addOnImage)</a>
+<a name="ln469">{</a>
+<a name="ln470">	BAutolock _(this);</a>
+<a name="ln471"> </a>
+<a name="ln472">	for (int32 i = fFilterList.CountItems(); i-- &gt; 0;) {</a>
+<a name="ln473">		filter_info* info = fFilterList.ItemAt(i);</a>
+<a name="ln474">		if (strcmp(info-&gt;ref.name, ref.name) == 0) {</a>
+<a name="ln475">			// we already know this ref</a>
+<a name="ln476">			delete filter;</a>
+<a name="ln477">			return B_NAME_IN_USE;</a>
+<a name="ln478">		}</a>
+<a name="ln479">	}</a>
+<a name="ln480"> </a>
+<a name="ln481">	TRACE(&quot;%s, name %s\n&quot;, __PRETTY_FUNCTION__, ref.name);</a>
+<a name="ln482"> </a>
+<a name="ln483">	filter_info* info = new(std::nothrow) filter_info;</a>
+<a name="ln484">	if (info == NULL) {</a>
+<a name="ln485">		delete filter;</a>
+<a name="ln486">		return B_NO_MEMORY;</a>
+<a name="ln487">	}</a>
+<a name="ln488"> </a>
+<a name="ln489">	info-&gt;ref = ref;</a>
+<a name="ln490">	info-&gt;add_on = filter;</a>
+<a name="ln491"> </a>
+<a name="ln492">	if (!fFilterList.AddItem(info)) {</a>
+<a name="ln493">		delete info;</a>
+<a name="ln494">		return B_NO_MEMORY;</a>
+<a name="ln495">	}</a>
+<a name="ln496"> </a>
+<a name="ln497">	BAutolock locker(InputServer::gInputFilterListLocker);</a>
+<a name="ln498">	if (!InputServer::gInputFilterList.AddItem(filter)) {</a>
+<a name="ln499">		fFilterList.RemoveItem(info, false);</a>
+<a name="ln500">		delete info;</a>
+<a name="ln501">		return B_NO_MEMORY;</a>
+<a name="ln502">	}</a>
+<a name="ln503"> </a>
+<a name="ln504">	info-&gt;image = addOnImage;</a>
+<a name="ln505"> </a>
+<a name="ln506">	return B_OK;</a>
+<a name="ln507">}</a>
+<a name="ln508"> </a>
+<a name="ln509"> </a>
+<a name="ln510">//!	Takes over ownership of the \a method, regardless of success.</a>
+<a name="ln511">status_t</a>
+<a name="ln512">AddOnManager::_RegisterMethod(BInputServerMethod* method, const entry_ref&amp; ref,</a>
+<a name="ln513">	image_id addOnImage)</a>
+<a name="ln514">{</a>
+<a name="ln515">	BAutolock _(this);</a>
+<a name="ln516"> </a>
+<a name="ln517">	for (int32 i = fMethodList.CountItems(); i-- &gt; 0;) {</a>
+<a name="ln518">		method_info* info = fMethodList.ItemAt(i);</a>
+<a name="ln519">		if (!strcmp(info-&gt;ref.name, ref.name)) {</a>
+<a name="ln520">			// we already know this ref</a>
+<a name="ln521">			delete method;</a>
+<a name="ln522">			return B_NAME_IN_USE;</a>
+<a name="ln523">		}</a>
+<a name="ln524">	}</a>
+<a name="ln525"> </a>
+<a name="ln526">	TRACE(&quot;%s, name %s\n&quot;, __PRETTY_FUNCTION__, ref.name);</a>
+<a name="ln527"> </a>
+<a name="ln528">	method_info* info = new(std::nothrow) method_info;</a>
+<a name="ln529">	if (info == NULL) {</a>
+<a name="ln530">		delete method;</a>
+<a name="ln531">		return B_NO_MEMORY;</a>
+<a name="ln532">	}</a>
+<a name="ln533"> </a>
+<a name="ln534">	info-&gt;ref = ref;</a>
+<a name="ln535">	info-&gt;add_on = method;</a>
+<a name="ln536"> </a>
+<a name="ln537">	if (!fMethodList.AddItem(info)) {</a>
+<a name="ln538">		delete info;</a>
+<a name="ln539">		return B_NO_MEMORY;</a>
+<a name="ln540">	}</a>
+<a name="ln541"> </a>
+<a name="ln542">	BAutolock locker(InputServer::gInputMethodListLocker);</a>
+<a name="ln543">	if (!InputServer::gInputMethodList.AddItem(method)) {</a>
+<a name="ln544">		fMethodList.RemoveItem(info);</a>
+<a name="ln545">		delete info;</a>
+<a name="ln546">		return B_NO_MEMORY;</a>
+<a name="ln547">	}</a>
+<a name="ln548"> </a>
+<a name="ln549">	info-&gt;image = addOnImage;</a>
+<a name="ln550"> </a>
+<a name="ln551">	if (gInputServer-&gt;MethodReplicant() == NULL) {</a>
+<a name="ln552">		_LoadReplicant();</a>
+<a name="ln553"> </a>
+<a name="ln554">		if (gInputServer-&gt;MethodReplicant()) {</a>
+<a name="ln555">			_BMethodAddOn_ *addon = InputServer::gKeymapMethod.fOwner;</a>
+<a name="ln556">			addon-&gt;AddMethod();</a>
+<a name="ln557">		}</a>
+<a name="ln558">	}</a>
+<a name="ln559"> </a>
+<a name="ln560">	if (gInputServer-&gt;MethodReplicant() != NULL) {</a>
+<a name="ln561">		_BMethodAddOn_ *addon = method-&gt;fOwner;</a>
+<a name="ln562">		addon-&gt;AddMethod();</a>
+<a name="ln563">	}</a>
+<a name="ln564"> </a>
+<a name="ln565">	return B_OK;</a>
+<a name="ln566">}</a>
+<a name="ln567"> </a>
+<a name="ln568"> </a>
+<a name="ln569">// #pragma mark -</a>
+<a name="ln570"> </a>
+<a name="ln571"> </a>
+<a name="ln572">void</a>
+<a name="ln573">AddOnManager::_UnloadReplicant()</a>
+<a name="ln574">{</a>
+<a name="ln575">	BDeskbar().RemoveItem(REPLICANT_CTL_NAME);</a>
+<a name="ln576">}</a>
+<a name="ln577"> </a>
+<a name="ln578"> </a>
+<a name="ln579">void</a>
+<a name="ln580">AddOnManager::_LoadReplicant()</a>
+<a name="ln581">{</a>
+<a name="ln582">	CALLED();</a>
+<a name="ln583">	app_info info;</a>
+<a name="ln584">	be_app-&gt;GetAppInfo(&amp;info);</a>
+<a name="ln585"> </a>
+<a name="ln586">	status_t err = BDeskbar().AddItem(&amp;info.ref);</a>
+<a name="ln587">	if (err != B_OK)</a>
+<a name="ln588">		ERROR(&quot;Deskbar refuses to add method replicant: %s\n&quot;, strerror(err));</a>
+<a name="ln589"> </a>
+<a name="ln590">	BMessage request(B_GET_PROPERTY);</a>
+<a name="ln591">	BMessenger to;</a>
+<a name="ln592">	BMessenger status;</a>
+<a name="ln593"> </a>
+<a name="ln594">	request.AddSpecifier(&quot;Messenger&quot;);</a>
+<a name="ln595">	request.AddSpecifier(&quot;Shelf&quot;);</a>
+<a name="ln596"> </a>
+<a name="ln597">	// In the Deskbar the Shelf is in the View &quot;Status&quot; in Window &quot;Deskbar&quot;</a>
+<a name="ln598">	request.AddSpecifier(&quot;View&quot;, &quot;Status&quot;);</a>
+<a name="ln599">	request.AddSpecifier(&quot;Window&quot;, &quot;Deskbar&quot;);</a>
+<a name="ln600">	to = BMessenger(&quot;application/x-vnd.Be-TSKB&quot;, -1);</a>
+<a name="ln601"> </a>
+<a name="ln602">	BMessage reply;</a>
+<a name="ln603"> </a>
+<a name="ln604">	if (to.SendMessage(&amp;request, &amp;reply) == B_OK</a>
+<a name="ln605">		&amp;&amp; reply.FindMessenger(&quot;result&quot;, &amp;status) == B_OK) {</a>
+<a name="ln606">		// enum replicant in Status view</a>
+<a name="ln607">		int32 index = 0;</a>
+<a name="ln608">		int32 uid;</a>
+<a name="ln609">		while ((uid = _GetReplicantAt(status, index++)) &gt;= B_OK) {</a>
+<a name="ln610">			BMessage replicantInfo;</a>
+<a name="ln611">			if (_GetReplicantName(status, uid, &amp;replicantInfo) != B_OK)</a>
+<a name="ln612">				continue;</a>
+<a name="ln613"> </a>
+<a name="ln614">			const char *name;</a>
+<a name="ln615">			if (replicantInfo.FindString(&quot;result&quot;, &amp;name) == B_OK</a>
+<a name="ln616">				&amp;&amp; !strcmp(name, REPLICANT_CTL_NAME)) {</a>
+<a name="ln617">				BMessage replicant;</a>
+<a name="ln618">				if (_GetReplicantView(status, uid, &amp;replicant) == B_OK) {</a>
+<a name="ln619">					BMessenger result;</a>
+<a name="ln620">					if (replicant.FindMessenger(&quot;result&quot;, &amp;result) == B_OK) {</a>
+<a name="ln621">						gInputServer-&gt;SetMethodReplicant(new BMessenger(result));</a>
+<a name="ln622">					}</a>
+<a name="ln623">				}</a>
+<a name="ln624">			}</a>
+<a name="ln625">		}</a>
+<a name="ln626">	}</a>
+<a name="ln627"> </a>
+<a name="ln628">	if (!gInputServer-&gt;MethodReplicant()) {</a>
+<a name="ln629">		ERROR(&quot;LoadReplicant(): Method replicant not found!\n&quot;);</a>
+<a name="ln630">	}</a>
+<a name="ln631">}</a>
+<a name="ln632"> </a>
+<a name="ln633"> </a>
+<a name="ln634">int32</a>
+<a name="ln635">AddOnManager::_GetReplicantAt(BMessenger target, int32 index) const</a>
+<a name="ln636">{</a>
+<a name="ln637">	// So here we want to get the Unique ID of the replicant at the given index</a>
+<a name="ln638">	// in the target Shelf.</a>
+<a name="ln639"> </a>
+<a name="ln640">	BMessage request(B_GET_PROPERTY);// We're getting the ID property</a>
+<a name="ln641">	BMessage reply;</a>
+<a name="ln642">	status_t err;</a>
+<a name="ln643"> </a>
+<a name="ln644">	request.AddSpecifier(&quot;ID&quot;);// want the ID</a>
+<a name="ln645">	request.AddSpecifier(&quot;Replicant&quot;, index);// of the index'th replicant</a>
+<a name="ln646"> </a>
+<a name="ln647">	if ((err = target.SendMessage(&amp;request, &amp;reply)) != B_OK)</a>
+<a name="ln648">		return err;</a>
+<a name="ln649"> </a>
+<a name="ln650">	int32 uid;</a>
+<a name="ln651">	if ((err = reply.FindInt32(&quot;result&quot;, &amp;uid)) != B_OK)</a>
+<a name="ln652">		return err;</a>
+<a name="ln653"> </a>
+<a name="ln654">	return uid;</a>
+<a name="ln655">}</a>
+<a name="ln656"> </a>
+<a name="ln657"> </a>
+<a name="ln658">status_t</a>
+<a name="ln659">AddOnManager::_GetReplicantName(BMessenger target, int32 uid,</a>
+<a name="ln660">	BMessage* reply) const</a>
+<a name="ln661">{</a>
+<a name="ln662">	// We send a message to the target shelf, asking it for the Name of the</a>
+<a name="ln663">	// replicant with the given unique id.</a>
+<a name="ln664"> </a>
+<a name="ln665">	BMessage request(B_GET_PROPERTY);</a>
+<a name="ln666">	BMessage uid_specifier(B_ID_SPECIFIER);// specifying via ID</a>
+<a name="ln667">	status_t err;</a>
+<a name="ln668">	status_t e;</a>
+<a name="ln669"> </a>
+<a name="ln670">	request.AddSpecifier(&quot;Name&quot;);// ask for the Name of the replicant</a>
+<a name="ln671"> </a>
+<a name="ln672">	// IDs are specified using code like the following 3 lines:</a>
+<a name="ln673">	uid_specifier.AddInt32(&quot;id&quot;, uid);</a>
+<a name="ln674">	uid_specifier.AddString(&quot;property&quot;, &quot;Replicant&quot;);</a>
+<a name="ln675">	request.AddSpecifier(&amp;uid_specifier);</a>
+<a name="ln676"> </a>
+<a name="ln677">	if ((err = target.SendMessage(&amp;request, reply)) != B_OK)</a>
+<a name="ln678">		return err;</a>
+<a name="ln679"> </a>
+<a name="ln680">	if (((err = reply-&gt;FindInt32(&quot;error&quot;, &amp;e)) != B_OK) || (e != B_OK))</a>
+<a name="ln681">		return err ? err : e;</a>
+<a name="ln682"> </a>
+<a name="ln683">	return B_OK;</a>
+<a name="ln684">}</a>
+<a name="ln685"> </a>
+<a name="ln686"> </a>
+<a name="ln687">status_t</a>
+<a name="ln688">AddOnManager::_GetReplicantView(BMessenger target, int32 uid,</a>
+<a name="ln689">	BMessage* reply) const</a>
+<a name="ln690">{</a>
+<a name="ln691">	// We send a message to the target shelf, asking it for the Name of the</a>
+<a name="ln692">	// replicant with the given unique id.</a>
+<a name="ln693"> </a>
+<a name="ln694">	BMessage request(B_GET_PROPERTY);</a>
+<a name="ln695">	BMessage uid_specifier(B_ID_SPECIFIER);</a>
+<a name="ln696">		// specifying via ID</a>
+<a name="ln697">	status_t err;</a>
+<a name="ln698">	status_t e;</a>
+<a name="ln699"> </a>
+<a name="ln700">	request.AddSpecifier(&quot;View&quot;);</a>
+<a name="ln701">		// ask for the Name of the replicant</a>
+<a name="ln702"> </a>
+<a name="ln703">	// IDs are specified using code like the following 3 lines:</a>
+<a name="ln704">	uid_specifier.AddInt32(&quot;id&quot;, uid);</a>
+<a name="ln705">	uid_specifier.AddString(&quot;property&quot;, &quot;Replicant&quot;);</a>
+<a name="ln706">	request.AddSpecifier(&amp;uid_specifier);</a>
+<a name="ln707"> </a>
+<a name="ln708">	if ((err = target.SendMessage(&amp;request, reply)) != B_OK)</a>
+<a name="ln709">		return err;</a>
+<a name="ln710"> </a>
+<a name="ln711">	if (((err = reply-&gt;FindInt32(&quot;error&quot;, &amp;e)) != B_OK) || (e != B_OK))</a>
+<a name="ln712">		return err ? err : e;</a>
+<a name="ln713"> </a>
+<a name="ln714">	return B_OK;</a>
+<a name="ln715">}</a>
+<a name="ln716"> </a>
+<a name="ln717"> </a>
+<a name="ln718">status_t</a>
+<a name="ln719">AddOnManager::_HandleStartStopDevices(BMessage* message, BMessage* reply)</a>
+<a name="ln720">{</a>
+<a name="ln721">	const char *name = NULL;</a>
+<a name="ln722">	int32 type = 0;</a>
+<a name="ln723">	if (!((message-&gt;FindInt32(&quot;type&quot;, &amp;type) != B_OK)</a>
+<a name="ln724">			^ (message-&gt;FindString(&quot;device&quot;, &amp;name) != B_OK)))</a>
+<a name="ln725">		return B_ERROR;</a>
+<a name="ln726"> </a>
+<a name="ln727">	return gInputServer-&gt;StartStopDevices(name, (input_device_type)type,</a>
+<a name="ln728">		message-&gt;what == IS_START_DEVICE);</a>
+<a name="ln729">}</a>
+<a name="ln730"> </a>
+<a name="ln731"> </a>
+<a name="ln732">status_t</a>
+<a name="ln733">AddOnManager::_HandleFindDevices(BMessage* message, BMessage* reply)</a>
+<a name="ln734">{</a>
+<a name="ln735">	CALLED();</a>
+<a name="ln736">	const char *name = NULL;</a>
+<a name="ln737">	input_device_type type;</a>
+<a name="ln738">	if (message-&gt;FindString(&quot;device&quot;, &amp;name) == B_OK) {</a>
+<a name="ln739">		if (gInputServer-&gt;GetDeviceInfo(name, &amp;type) != B_OK)</a>
+<a name="ln740">			return B_NAME_NOT_FOUND;</a>
+<a name="ln741">		reply-&gt;AddString(&quot;device&quot;, name);</a>
+<a name="ln742">		reply-&gt;AddInt32(&quot;type&quot;, type);</a>
+<a name="ln743">	} else {</a>
+<a name="ln744">		gInputServer-&gt;GetDeviceInfos(reply);</a>
+<a name="ln745">	}</a>
+<a name="ln746">	return B_OK;</a>
+<a name="ln747">}</a>
+<a name="ln748"> </a>
+<a name="ln749"> </a>
+<a name="ln750">status_t</a>
+<a name="ln751">AddOnManager::_HandleWatchDevices(BMessage* message, BMessage* reply)</a>
+<a name="ln752">{</a>
+<a name="ln753">	// TODO</a>
+<a name="ln754">	return B_OK;</a>
+<a name="ln755">}</a>
+<a name="ln756"> </a>
+<a name="ln757"> </a>
+<a name="ln758">status_t</a>
+<a name="ln759">AddOnManager::_HandleIsDeviceRunning(BMessage* message, BMessage* reply)</a>
+<a name="ln760">{</a>
+<a name="ln761">	const char* name;</a>
+<a name="ln762">	bool running;</a>
+<a name="ln763">	if (message-&gt;FindString(&quot;device&quot;, &amp;name) != B_OK</a>
+<a name="ln764">		|| gInputServer-&gt;GetDeviceInfo(name, NULL, &amp;running) != B_OK)</a>
+<a name="ln765">		return B_NAME_NOT_FOUND;</a>
+<a name="ln766"> </a>
+<a name="ln767">	return running ? B_OK : B_ERROR;</a>
+<a name="ln768">}</a>
+<a name="ln769"> </a>
+<a name="ln770"> </a>
+<a name="ln771">status_t</a>
+<a name="ln772">AddOnManager::_HandleControlDevices(BMessage* message, BMessage* reply)</a>
+<a name="ln773">{</a>
+<a name="ln774">	CALLED();</a>
+<a name="ln775">	const char *name = NULL;</a>
+<a name="ln776">	int32 type = 0;</a>
+<a name="ln777">	if (!((message-&gt;FindInt32(&quot;type&quot;, &amp;type) != B_OK)</a>
+<a name="ln778">			^ (message-&gt;FindString(&quot;device&quot;, &amp;name) != B_OK)))</a>
+<a name="ln779">		return B_BAD_VALUE;</a>
+<a name="ln780"> </a>
+<a name="ln781">	uint32 code = 0;</a>
+<a name="ln782">	BMessage controlMessage;</a>
+<a name="ln783">	bool hasMessage = true;</a>
+<a name="ln784">	if (message-&gt;FindInt32(&quot;code&quot;, (int32*)&amp;code) != B_OK)</a>
+<a name="ln785">		return B_BAD_VALUE;</a>
+<a name="ln786">	if (message-&gt;FindMessage(&quot;message&quot;, &amp;controlMessage) != B_OK)</a>
+<a name="ln787">		hasMessage = false;</a>
+<a name="ln788"> </a>
+<a name="ln789">	return gInputServer-&gt;ControlDevices(name, (input_device_type)type,</a>
+<a name="ln790">		code, hasMessage ? &amp;controlMessage : NULL);</a>
+<a name="ln791">}</a>
+<a name="ln792"> </a>
+<a name="ln793"> </a>
+<a name="ln794">status_t</a>
+<a name="ln795">AddOnManager::_HandleSystemShuttingDown(BMessage* message, BMessage* reply)</a>
+<a name="ln796">{</a>
+<a name="ln797">	CALLED();</a>
+<a name="ln798"> </a>
+<a name="ln799">	for (int32 i = 0; i &lt; fDeviceList.CountItems(); i++) {</a>
+<a name="ln800">		device_info* info = fDeviceList.ItemAt(i);</a>
+<a name="ln801">		info-&gt;add_on-&gt;SystemShuttingDown();</a>
+<a name="ln802">	}</a>
+<a name="ln803"> </a>
+<a name="ln804">	return B_OK;</a>
+<a name="ln805">}</a>
+<a name="ln806"> </a>
+<a name="ln807"> </a>
+<a name="ln808">status_t</a>
+<a name="ln809">AddOnManager::_HandleMethodReplicant(BMessage* message, BMessage* reply)</a>
+<a name="ln810">{</a>
+<a name="ln811">	CALLED();</a>
+<a name="ln812"> </a>
+<a name="ln813">	if (InputServer::gInputMethodList.CountItems() == 0) {</a>
+<a name="ln814">		_UnloadReplicant();</a>
+<a name="ln815">		return B_OK;</a>
+<a name="ln816">	}</a>
+<a name="ln817"> </a>
+<a name="ln818">	_LoadReplicant();</a>
+<a name="ln819"> </a>
+<a name="ln820">	BAutolock lock(InputServer::gInputMethodListLocker);</a>
+<a name="ln821"> </a>
+<a name="ln822">	if (gInputServer-&gt;MethodReplicant()) {</a>
+<a name="ln823">		_BMethodAddOn_* addon = InputServer::gKeymapMethod.fOwner;</a>
+<a name="ln824">		addon-&gt;AddMethod();</a>
+<a name="ln825"> </a>
+<a name="ln826">		for (int32 i = 0; i &lt; InputServer::gInputMethodList.CountItems(); i++) {</a>
+<a name="ln827">			BInputServerMethod* method</a>
+<a name="ln828">				= (BInputServerMethod*)InputServer::gInputMethodList.ItemAt(i);</a>
+<a name="ln829"> </a>
+<a name="ln830">			_BMethodAddOn_* addon = method-&gt;fOwner;</a>
+<a name="ln831">			addon-&gt;AddMethod();</a>
+<a name="ln832">		}</a>
+<a name="ln833">	}</a>
+<a name="ln834"> </a>
+<a name="ln835">	return B_OK;</a>
+<a name="ln836">}</a>
+<a name="ln837"> </a>
+<a name="ln838"> </a>
+<a name="ln839">void</a>
+<a name="ln840">AddOnManager::_HandleDeviceMonitor(BMessage* message)</a>
+<a name="ln841">{</a>
+<a name="ln842">	int32 opcode;</a>
+<a name="ln843">	if (message-&gt;FindInt32(&quot;opcode&quot;, &amp;opcode) != B_OK)</a>
+<a name="ln844">		return;</a>
+<a name="ln845"> </a>
+<a name="ln846">	switch (opcode) {</a>
+<a name="ln847">		case B_ENTRY_CREATED:</a>
+<a name="ln848">		case B_ENTRY_REMOVED:</a>
+<a name="ln849">		{</a>
+<a name="ln850">			const char* path;</a>
+<a name="ln851">			const char* watchedPath;</a>
+<a name="ln852">			if (message-&gt;FindString(&quot;watched_path&quot;, &amp;watchedPath) != B_OK</a>
+<a name="ln853">				|| message-&gt;FindString(&quot;path&quot;, &amp;path) != B_OK) {</a>
+<a name="ln854">#if DEBUG</a>
+<a name="ln855">				char string[1024];</a>
+<a name="ln856">				sprintf(string, &quot;message does not contain all fields - &quot;</a>
+<a name="ln857">					&quot;watched_path: %d, path: %d\n&quot;,</a>
+<a name="ln858">					message-&gt;HasString(&quot;watched_path&quot;),</a>
+<a name="ln859">					message-&gt;HasString(&quot;path&quot;));</a>
+<a name="ln860">				debugger(string);</a>
+<a name="ln861">#endif</a>
+<a name="ln862">				return;</a>
+<a name="ln863">			}</a>
+<a name="ln864"> </a>
+<a name="ln865">			// Notify all watching devices</a>
+<a name="ln866"> </a>
+<a name="ln867">			for (int32 i = 0; i &lt; fDeviceAddOns.CountItems(); i++) {</a>
+<a name="ln868">				DeviceAddOn* addOn = fDeviceAddOns.ItemAt(i);</a>
+<a name="ln869">				if (!addOn-&gt;HasPath(watchedPath))</a>
+<a name="ln870">					continue;</a>
+<a name="ln871"> </a>
+<a name="ln872">				addOn-&gt;Device()-&gt;Control(NULL, NULL, B_NODE_MONITOR, message);</a>
+<a name="ln873">			}</a>
+<a name="ln874">			break;</a>
+<a name="ln875">		}</a>
+<a name="ln876">	}</a>
+<a name="ln877">}</a>
+<a name="ln878"> </a>
+<a name="ln879"> </a>
+<a name="ln880">status_t</a>
+<a name="ln881">AddOnManager::_AddDevicePath(DeviceAddOn* addOn, const char* path,</a>
+<a name="ln882">	bool&amp; newPath)</a>
+<a name="ln883">{</a>
+<a name="ln884">	newPath = !fDevicePaths.HasPath(path);</a>
+<a name="ln885"> </a>
+<a name="ln886">	status_t status = fDevicePaths.AddPath(path);</a>
+<a name="ln887">	if (status == B_OK) {</a>
+<a name="ln888">		status = addOn-&gt;AddPath(path);</a>
+<a name="ln889">		if (status == B_OK) {</a>
+<a name="ln890">			if (!fDeviceAddOns.HasItem(addOn)</a>
+<a name="ln891">				&amp;&amp; !fDeviceAddOns.AddItem(addOn)) {</a>
+<a name="ln892">				addOn-&gt;RemovePath(path);</a>
+<a name="ln893">				status = B_NO_MEMORY;</a>
+<a name="ln894">			}</a>
+<a name="ln895">		} else</a>
+<a name="ln896">			fDevicePaths.RemovePath(path);</a>
+<a name="ln897">	}</a>
+<a name="ln898"> </a>
+<a name="ln899">	return status;</a>
+<a name="ln900">}</a>
+<a name="ln901"> </a>
+<a name="ln902"> </a>
+<a name="ln903">status_t</a>
+<a name="ln904">AddOnManager::_RemoveDevicePath(DeviceAddOn* addOn, const char* path,</a>
+<a name="ln905">	bool&amp; lastPath)</a>
+<a name="ln906">{</a>
+<a name="ln907">	if (!fDevicePaths.HasPath(path) || !addOn-&gt;HasPath(path))</a>
+<a name="ln908">		return B_ENTRY_NOT_FOUND;</a>
+<a name="ln909"> </a>
+<a name="ln910">	fDevicePaths.RemovePath(path);</a>
+<a name="ln911"> </a>
+<a name="ln912">	lastPath = !fDevicePaths.HasPath(path);</a>
+<a name="ln913"> </a>
+<a name="ln914">	addOn-&gt;RemovePath(path);</a>
+<a name="ln915">	if (addOn-&gt;CountPaths() == 0)</a>
+<a name="ln916">		fDeviceAddOns.RemoveItem(addOn);</a>
+<a name="ln917"> </a>
+<a name="ln918">	return B_OK;</a>
+<a name="ln919">}</a>
+
+</code></pre>
+<div class="balloon" rel="124"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fSafeMode.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

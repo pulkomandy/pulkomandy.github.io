@@ -1,0 +1,1377 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>RemoteView.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2009-2014, Haiku, Inc.</a>
+<a name="ln3"> * Distributed under the terms of the MIT License.</a>
+<a name="ln4"> *</a>
+<a name="ln5"> * Authors:</a>
+<a name="ln6"> *		Michael Lotz &lt;mmlr@mlotz.ch&gt;</a>
+<a name="ln7"> */</a>
+<a name="ln8"> </a>
+<a name="ln9">#include &quot;NetReceiver.h&quot;</a>
+<a name="ln10">#include &quot;NetSender.h&quot;</a>
+<a name="ln11">#include &quot;RemoteMessage.h&quot;</a>
+<a name="ln12">#include &quot;RemoteView.h&quot;</a>
+<a name="ln13">#include &quot;StreamingRingBuffer.h&quot;</a>
+<a name="ln14"> </a>
+<a name="ln15">#include &lt;Application.h&gt;</a>
+<a name="ln16">#include &lt;Autolock.h&gt;</a>
+<a name="ln17">#include &lt;Bitmap.h&gt;</a>
+<a name="ln18">#include &lt;Message.h&gt;</a>
+<a name="ln19">#include &lt;NetEndpoint.h&gt;</a>
+<a name="ln20">#include &lt;Region.h&gt;</a>
+<a name="ln21">#include &lt;Shape.h&gt;</a>
+<a name="ln22">#include &lt;Window.h&gt;</a>
+<a name="ln23">#include &lt;utf8_functions.h&gt;</a>
+<a name="ln24"> </a>
+<a name="ln25">#include &lt;new&gt;</a>
+<a name="ln26">#include &lt;stdio.h&gt;</a>
+<a name="ln27"> </a>
+<a name="ln28"> </a>
+<a name="ln29">static const uint8 kCursorData[] = { 16 /* size, 16x16 */,</a>
+<a name="ln30">	1 /* depth, 1 bit per pixel */, 0, 0, /* hot spot at 0, 0 */</a>
+<a name="ln31">	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,</a>
+<a name="ln32">	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,</a>
+<a name="ln33">	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,</a>
+<a name="ln34">	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,</a>
+<a name="ln35">	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,</a>
+<a name="ln36">	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,</a>
+<a name="ln37">	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,</a>
+<a name="ln38">	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00</a>
+<a name="ln39">};</a>
+<a name="ln40"> </a>
+<a name="ln41"> </a>
+<a name="ln42">#define TRACE(x...)				/*printf(&quot;RemoteView: &quot; x)*/</a>
+<a name="ln43">#define TRACE_ALWAYS(x...)		printf(&quot;RemoteView: &quot; x)</a>
+<a name="ln44">#define TRACE_ERROR(x...)		printf(&quot;RemoteView: &quot; x)</a>
+<a name="ln45"> </a>
+<a name="ln46"> </a>
+<a name="ln47">typedef struct engine_state {</a>
+<a name="ln48">	uint32		token;</a>
+<a name="ln49">	BView *		view;</a>
+<a name="ln50">	::pattern	pattern;</a>
+<a name="ln51">	BRegion		clipping_region;</a>
+<a name="ln52">	float		pen_size;</a>
+<a name="ln53">	bool		sync_drawing;</a>
+<a name="ln54">} engine_state;</a>
+<a name="ln55"> </a>
+<a name="ln56"> </a>
+<a name="ln57">RemoteView::RemoteView(BRect frame, const char *remoteHost, uint16 remotePort)</a>
+<a name="ln58">	:</a>
+<a name="ln59">	BView(frame, &quot;RemoteView&quot;, B_FOLLOW_NONE, B_WILL_DRAW),</a>
+<a name="ln60">	fInitStatus(B_NO_INIT),</a>
+<a name="ln61">	fIsConnected(false),</a>
+<a name="ln62">	fReceiveBuffer(NULL),</a>
+<a name="ln63">	fSendBuffer(NULL),</a>
+<a name="ln64">	fEndpoint(NULL),</a>
+<a name="ln65">	fReceiver(NULL),</a>
+<a name="ln66">	fSender(NULL),</a>
+<a name="ln67">	fStopThread(false),</a>
+<a name="ln68">	fOffscreenBitmap(NULL),</a>
+<a name="ln69">	fOffscreen(NULL),</a>
+<a name="ln70">	fViewCursor(kCursorData),</a>
+<a name="ln71">	fCursorBitmap(NULL),</a>
+<a name="ln72">	fCursorVisible(false)</a>
+<a name="ln73">{</a>
+<a name="ln74">	fReceiveBuffer = new(std::nothrow) StreamingRingBuffer(16 * 1024);</a>
+<a name="ln75">	if (fReceiveBuffer == NULL) {</a>
+<a name="ln76">		fInitStatus = B_NO_MEMORY;</a>
+<a name="ln77">		TRACE_ERROR(&quot;no memory available\n&quot;);</a>
+<a name="ln78">		return;</a>
+<a name="ln79">	}</a>
+<a name="ln80"> </a>
+<a name="ln81">	fInitStatus = fReceiveBuffer-&gt;InitCheck();</a>
+<a name="ln82">	if (fInitStatus != B_OK)</a>
+<a name="ln83">		return;</a>
+<a name="ln84"> </a>
+<a name="ln85">	fSendBuffer = new(std::nothrow) StreamingRingBuffer(16 * 1024);</a>
+<a name="ln86">	if (fSendBuffer == NULL) {</a>
+<a name="ln87">		fInitStatus = B_NO_MEMORY;</a>
+<a name="ln88">		TRACE_ERROR(&quot;no memory available\n&quot;);</a>
+<a name="ln89">		return;</a>
+<a name="ln90">	}</a>
+<a name="ln91"> </a>
+<a name="ln92">	fInitStatus = fSendBuffer-&gt;InitCheck();</a>
+<a name="ln93">	if (fInitStatus != B_OK)</a>
+<a name="ln94">		return;</a>
+<a name="ln95"> </a>
+<a name="ln96">	fEndpoint = new(std::nothrow) BNetEndpoint();</a>
+<a name="ln97">	if (fEndpoint == NULL) {</a>
+<a name="ln98">		fInitStatus = B_NO_MEMORY;</a>
+<a name="ln99">		TRACE_ERROR(&quot;no memory available\n&quot;);</a>
+<a name="ln100">		return;</a>
+<a name="ln101">	}</a>
+<a name="ln102"> </a>
+<a name="ln103">	fInitStatus = fEndpoint-&gt;Connect(remoteHost, remotePort);</a>
+<a name="ln104">	if (fInitStatus != B_OK) {</a>
+<a name="ln105">		TRACE_ERROR(&quot;failed to connect to %s:%&quot; B_PRIu16 &quot;\n&quot;,</a>
+<a name="ln106">			remoteHost, remotePort);</a>
+<a name="ln107">		return;</a>
+<a name="ln108">	}</a>
+<a name="ln109"> </a>
+<a name="ln110">	fSender = new(std::nothrow) NetSender(fEndpoint, fSendBuffer);</a>
+<a name="ln111">	if (fSender == NULL) {</a>
+<a name="ln112">		fInitStatus = B_NO_MEMORY;</a>
+<a name="ln113">		TRACE_ERROR(&quot;no memory available\n&quot;);</a>
+<a name="ln114">		return;</a>
+<a name="ln115">	}</a>
+<a name="ln116"> </a>
+<a name="ln117">	fReceiver = new(std::nothrow) NetReceiver(fEndpoint, fReceiveBuffer);</a>
+<a name="ln118">	if (fReceiver == NULL) {</a>
+<a name="ln119">		fInitStatus = B_NO_MEMORY;</a>
+<a name="ln120">		TRACE_ERROR(&quot;no memory available\n&quot;);</a>
+<a name="ln121">		return;</a>
+<a name="ln122">	}</a>
+<a name="ln123"> </a>
+<a name="ln124">	BRect bounds = frame.OffsetToCopy(0, 0);</a>
+<a name="ln125">	fOffscreenBitmap = new(std::nothrow) BBitmap(bounds, B_BITMAP_ACCEPTS_VIEWS,</a>
+<a name="ln126">		B_RGB32);</a>
+<a name="ln127">	if (fOffscreenBitmap == NULL) {</a>
+<a name="ln128">		fInitStatus = B_NO_MEMORY;</a>
+<a name="ln129">		TRACE_ERROR(&quot;no memory available\n&quot;);</a>
+<a name="ln130">		return;</a>
+<a name="ln131">	}</a>
+<a name="ln132"> </a>
+<a name="ln133">	fOffscreen = new(std::nothrow) BView(bounds, &quot;offscreen remote view&quot;,</a>
+<a name="ln134">		B_FOLLOW_NONE, B_WILL_DRAW);</a>
+<a name="ln135">	if (fOffscreen == NULL) {</a>
+<a name="ln136">		fInitStatus = B_NO_MEMORY;</a>
+<a name="ln137">		TRACE_ERROR(&quot;no memory available\n&quot;);</a>
+<a name="ln138">		return;</a>
+<a name="ln139">	}</a>
+<a name="ln140"> </a>
+<a name="ln141">	fOffscreenBitmap-&gt;AddChild(fOffscreen);</a>
+<a name="ln142">	fOffscreen-&gt;SetDrawingMode(B_OP_COPY);</a>
+<a name="ln143"> </a>
+<a name="ln144">	fDrawThread = spawn_thread(&amp;_DrawEntry, &quot;draw thread&quot;, B_NORMAL_PRIORITY,</a>
+<a name="ln145">		this);</a>
+<a name="ln146">	if (fDrawThread &lt; 0) {</a>
+<a name="ln147">		fInitStatus = fDrawThread;</a>
+<a name="ln148"> </a>
+<a name="ln149">		TRACE_ERROR(&quot;failed to start _DrawThread()\n&quot;);</a>
+<a name="ln150">		TRACE_ERROR(&quot;status = %&quot; B_PRIx32 &quot;\n&quot;, fInitStatus);</a>
+<a name="ln151"> </a>
+<a name="ln152">		return;</a>
+<a name="ln153">	}</a>
+<a name="ln154"> </a>
+<a name="ln155">	resume_thread(fDrawThread);</a>
+<a name="ln156">}</a>
+<a name="ln157"> </a>
+<a name="ln158"> </a>
+<a name="ln159">RemoteView::~RemoteView()</a>
+<a name="ln160">{</a>
+<a name="ln161">	fStopThread = true;</a>
+<a name="ln162"> </a>
+<a name="ln163">	delete fReceiver;</a>
+<a name="ln164">	delete fReceiveBuffer;</a>
+<a name="ln165"> </a>
+<a name="ln166">	delete fSendBuffer;</a>
+<a name="ln167">	delete fSender;</a>
+<a name="ln168"> </a>
+<a name="ln169">	delete fEndpoint;</a>
+<a name="ln170"> </a>
+<a name="ln171">	delete fOffscreenBitmap;</a>
+<a name="ln172">	delete fCursorBitmap;</a>
+<a name="ln173"> </a>
+<a name="ln174">	int32 result;</a>
+<a name="ln175">	wait_for_thread(fDrawThread, &amp;result);</a>
+<a name="ln176">}</a>
+<a name="ln177"> </a>
+<a name="ln178"> </a>
+<a name="ln179">status_t</a>
+<a name="ln180">RemoteView::InitCheck()</a>
+<a name="ln181">{</a>
+<a name="ln182">	return fInitStatus;</a>
+<a name="ln183">}</a>
+<a name="ln184"> </a>
+<a name="ln185"> </a>
+<a name="ln186">void</a>
+<a name="ln187">RemoteView::AttachedToWindow()</a>
+<a name="ln188">{</a>
+<a name="ln189">	SetViewColor(B_TRANSPARENT_COLOR);</a>
+<a name="ln190">	SetViewCursor(&amp;fViewCursor);</a>
+<a name="ln191">}</a>
+<a name="ln192"> </a>
+<a name="ln193"> </a>
+<a name="ln194">void</a>
+<a name="ln195">RemoteView::Draw(BRect updateRect)</a>
+<a name="ln196">{</a>
+<a name="ln197">	SetDrawingMode(B_OP_COPY);</a>
+<a name="ln198">	fOffscreenBitmap-&gt;Lock();</a>
+<a name="ln199">	fOffscreen-&gt;Sync();</a>
+<a name="ln200"> </a>
+<a name="ln201">	DrawBitmap(fOffscreenBitmap, updateRect, updateRect);</a>
+<a name="ln202"> </a>
+<a name="ln203">	if (fCursorVisible &amp;&amp; fCursorBitmap != NULL</a>
+<a name="ln204">		&amp;&amp; fCursorFrame.Intersects(updateRect)) {</a>
+<a name="ln205">		DrawBitmap(fOffscreenBitmap, fCursorFrame, fCursorFrame);</a>
+<a name="ln206">		SetDrawingMode(B_OP_ALPHA);</a>
+<a name="ln207">		DrawBitmap(fCursorBitmap, fCursorFrame.LeftTop());</a>
+<a name="ln208">	}</a>
+<a name="ln209"> </a>
+<a name="ln210">	fOffscreenBitmap-&gt;Unlock();</a>
+<a name="ln211">}</a>
+<a name="ln212"> </a>
+<a name="ln213"> </a>
+<a name="ln214">void</a>
+<a name="ln215">RemoteView::MouseMoved(BPoint where, uint32 code, const BMessage *dragMessage)</a>
+<a name="ln216">{</a>
+<a name="ln217">	if (!fIsConnected)</a>
+<a name="ln218">		return;</a>
+<a name="ln219"> </a>
+<a name="ln220">	_SendMouseMessage(RP_MOUSE_MOVED, where);</a>
+<a name="ln221">}</a>
+<a name="ln222"> </a>
+<a name="ln223"> </a>
+<a name="ln224">void</a>
+<a name="ln225">RemoteView::MouseDown(BPoint where)</a>
+<a name="ln226">{</a>
+<a name="ln227">	if (!fIsConnected)</a>
+<a name="ln228">		return;</a>
+<a name="ln229"> </a>
+<a name="ln230">	_SendMouseMessage(RP_MOUSE_DOWN, where);</a>
+<a name="ln231">}</a>
+<a name="ln232"> </a>
+<a name="ln233"> </a>
+<a name="ln234">void</a>
+<a name="ln235">RemoteView::MouseUp(BPoint where)</a>
+<a name="ln236">{</a>
+<a name="ln237">	if (!fIsConnected)</a>
+<a name="ln238">		return;</a>
+<a name="ln239"> </a>
+<a name="ln240">	_SendMouseMessage(RP_MOUSE_UP, where);</a>
+<a name="ln241">}</a>
+<a name="ln242"> </a>
+<a name="ln243"> </a>
+<a name="ln244">void</a>
+<a name="ln245">RemoteView::KeyDown(const char *bytes, int32 numBytes)</a>
+<a name="ln246">{</a>
+<a name="ln247">	if (!fIsConnected)</a>
+<a name="ln248">		return;</a>
+<a name="ln249"> </a>
+<a name="ln250">	_SendKeyMessage(RP_KEY_DOWN, bytes, numBytes);</a>
+<a name="ln251">}</a>
+<a name="ln252"> </a>
+<a name="ln253"> </a>
+<a name="ln254">void</a>
+<a name="ln255">RemoteView::KeyUp(const char *bytes, int32 numBytes)</a>
+<a name="ln256">{</a>
+<a name="ln257">	if (!fIsConnected)</a>
+<a name="ln258">		return;</a>
+<a name="ln259"> </a>
+<a name="ln260">	_SendKeyMessage(RP_KEY_UP, bytes, numBytes);</a>
+<a name="ln261">}</a>
+<a name="ln262"> </a>
+<a name="ln263"> </a>
+<a name="ln264">void</a>
+<a name="ln265">RemoteView::MessageReceived(BMessage *message)</a>
+<a name="ln266">{</a>
+<a name="ln267">	if (!fIsConnected) {</a>
+<a name="ln268">		BView::MessageReceived(message);</a>
+<a name="ln269">		return;</a>
+<a name="ln270">	}</a>
+<a name="ln271"> </a>
+<a name="ln272">	switch (message-&gt;what) {</a>
+<a name="ln273">		case B_UNMAPPED_KEY_DOWN:</a>
+<a name="ln274">		case B_UNMAPPED_KEY_UP:</a>
+<a name="ln275">			// these are easily repeated and then cause a flood of messages</a>
+<a name="ln276">			// so we might not want them.</a>
+<a name="ln277">			break;</a>
+<a name="ln278"> </a>
+<a name="ln279">		case B_MODIFIERS_CHANGED:</a>
+<a name="ln280">		{</a>
+<a name="ln281">			uint32 modifiers = 0;</a>
+<a name="ln282">			message-&gt;FindInt32(&quot;modifiers&quot;, (int32 *)&amp;modifiers);</a>
+<a name="ln283">			RemoteMessage message(NULL, fSendBuffer);</a>
+<a name="ln284">			message.Start(RP_MODIFIERS_CHANGED);</a>
+<a name="ln285">			message.Add(modifiers);</a>
+<a name="ln286">			break;</a>
+<a name="ln287">		}</a>
+<a name="ln288"> </a>
+<a name="ln289">		case B_MOUSE_WHEEL_CHANGED:</a>
+<a name="ln290">		{</a>
+<a name="ln291">			float xDelta, yDelta;</a>
+<a name="ln292">			if (message-&gt;FindFloat(&quot;be:wheel_delta_x&quot;, &amp;xDelta) != B_OK)</a>
+<a name="ln293">				xDelta = 0;</a>
+<a name="ln294">			if (message-&gt;FindFloat(&quot;be:wheel_delta_y&quot;, &amp;yDelta) != B_OK)</a>
+<a name="ln295">				yDelta = 0;</a>
+<a name="ln296"> </a>
+<a name="ln297">			RemoteMessage message(NULL, fSendBuffer);</a>
+<a name="ln298">			message.Start(RP_MOUSE_WHEEL_CHANGED);</a>
+<a name="ln299">			message.Add(xDelta);</a>
+<a name="ln300">			message.Add(yDelta);</a>
+<a name="ln301">			break;</a>
+<a name="ln302">		}</a>
+<a name="ln303">	}</a>
+<a name="ln304"> </a>
+<a name="ln305">	BView::MessageReceived(message);</a>
+<a name="ln306">}</a>
+<a name="ln307"> </a>
+<a name="ln308"> </a>
+<a name="ln309">void</a>
+<a name="ln310">RemoteView::_SendMouseMessage(uint16 code, BPoint where)</a>
+<a name="ln311">{</a>
+<a name="ln312">	RemoteMessage message(NULL, fSendBuffer);</a>
+<a name="ln313">	message.Start(code);</a>
+<a name="ln314">	message.Add(where);</a>
+<a name="ln315"> </a>
+<a name="ln316">	if (code == RP_MOUSE_MOVED)</a>
+<a name="ln317">		return;</a>
+<a name="ln318"> </a>
+<a name="ln319">	BMessage *event = Window()-&gt;CurrentMessage();</a>
+<a name="ln320"> </a>
+<a name="ln321">	int32 buttons = 0;</a>
+<a name="ln322">	event-&gt;FindInt32(&quot;buttons&quot;, &amp;buttons);</a>
+<a name="ln323">	message.Add(buttons);</a>
+<a name="ln324"> </a>
+<a name="ln325">	if (code == RP_MOUSE_DOWN)</a>
+<a name="ln326">		return;</a>
+<a name="ln327"> </a>
+<a name="ln328">	int32 clicks;</a>
+<a name="ln329">	event-&gt;FindInt32(&quot;clicks&quot;, &amp;clicks);</a>
+<a name="ln330">	message.Add(clicks);</a>
+<a name="ln331">}</a>
+<a name="ln332"> </a>
+<a name="ln333"> </a>
+<a name="ln334">void</a>
+<a name="ln335">RemoteView::_SendKeyMessage(uint16 code, const char *bytes, int32 numBytes)</a>
+<a name="ln336">{</a>
+<a name="ln337">	RemoteMessage message(NULL, fSendBuffer);</a>
+<a name="ln338">	message.Start(code);</a>
+<a name="ln339">	message.Add(numBytes);</a>
+<a name="ln340">	message.AddList(bytes, numBytes);</a>
+<a name="ln341"> </a>
+<a name="ln342">	BMessage *event = Window()-&gt;CurrentMessage();</a>
+<a name="ln343"> </a>
+<a name="ln344">	int32 rawChar, key;</a>
+<a name="ln345">	event-&gt;FindInt32(&quot;raw_char&quot;, &amp;rawChar);</a>
+<a name="ln346">	event-&gt;FindInt32(&quot;key&quot;, &amp;key);</a>
+<a name="ln347"> </a>
+<a name="ln348">	message.Add(rawChar);</a>
+<a name="ln349">	message.Add(key);</a>
+<a name="ln350">}</a>
+<a name="ln351"> </a>
+<a name="ln352"> </a>
+<a name="ln353">int</a>
+<a name="ln354">RemoteView::_StateCompareByKey(const uint32 *key, const engine_state *state)</a>
+<a name="ln355">{</a>
+<a name="ln356">	if (state-&gt;token == *key)</a>
+<a name="ln357">		return 0;</a>
+<a name="ln358"> </a>
+<a name="ln359">	if (state-&gt;token &lt; *key)</a>
+<a name="ln360">		return -1;</a>
+<a name="ln361"> </a>
+<a name="ln362">	return 1;</a>
+<a name="ln363">}</a>
+<a name="ln364"> </a>
+<a name="ln365"> </a>
+<a name="ln366">engine_state *</a>
+<a name="ln367">RemoteView::_CreateState(uint32 token)</a>
+<a name="ln368">{</a>
+<a name="ln369">	int32 index = fStates.BinarySearchIndexByKey(token, &amp;_StateCompareByKey);</a>
+<a name="ln370">	if (index &gt;= 0) {</a>
+<a name="ln371">		TRACE_ERROR(&quot;state for token %&quot; B_PRIu32 &quot; already in list\n&quot;, token);</a>
+<a name="ln372">		return NULL;</a>
+<a name="ln373">	}</a>
+<a name="ln374"> </a>
+<a name="ln375">	engine_state *state = new(std::nothrow) engine_state;</a>
+<a name="ln376">	if (state == NULL) {</a>
+<a name="ln377">		TRACE_ERROR(&quot;failed to allocate engine state\n&quot;);</a>
+<a name="ln378">		return NULL;</a>
+<a name="ln379">	}</a>
+<a name="ln380"> </a>
+<a name="ln381">	fOffscreenBitmap-&gt;Lock();</a>
+<a name="ln382">	BView *offscreen = new(std::nothrow) BView(fOffscreenBitmap-&gt;Bounds(),</a>
+<a name="ln383">		&quot;offscreen remote view&quot;, B_FOLLOW_NONE, B_WILL_DRAW);</a>
+<a name="ln384">	if (offscreen == NULL) {</a>
+<a name="ln385">		TRACE_ERROR(&quot;failed to allocate offscreen view\n&quot;);</a>
+<a name="ln386">		fOffscreenBitmap-&gt;Unlock();</a>
+<a name="ln387">		delete state;</a>
+<a name="ln388">		return NULL;</a>
+<a name="ln389">	}</a>
+<a name="ln390"> </a>
+<a name="ln391">	fOffscreenBitmap-&gt;AddChild(offscreen);</a>
+<a name="ln392">	fOffscreenBitmap-&gt;Unlock();</a>
+<a name="ln393"> </a>
+<a name="ln394">	state-&gt;token = token;</a>
+<a name="ln395">	state-&gt;view = offscreen;</a>
+<a name="ln396">	state-&gt;pattern = B_SOLID_HIGH;</a>
+<a name="ln397">	state-&gt;clipping_region.MakeEmpty();</a>
+<a name="ln398">	state-&gt;pen_size = 0;</a>
+<a name="ln399">	state-&gt;sync_drawing = true;</a>
+<a name="ln400"> </a>
+<a name="ln401">	fStates.AddItem(state, -index - 1);</a>
+<a name="ln402">	return state;</a>
+<a name="ln403">}</a>
+<a name="ln404"> </a>
+<a name="ln405"> </a>
+<a name="ln406">void</a>
+<a name="ln407">RemoteView::_DeleteState(uint32 token)</a>
+<a name="ln408">{</a>
+<a name="ln409">	int32 index = fStates.BinarySearchIndexByKey(token, &amp;_StateCompareByKey);</a>
+<a name="ln410">	if (index &lt; 0)</a>
+<a name="ln411">		return;</a>
+<a name="ln412"> </a>
+<a name="ln413">	engine_state *state = fStates.RemoveItemAt(index);</a>
+<a name="ln414"> </a>
+<a name="ln415">	fOffscreenBitmap-&gt;RemoveChild(state-&gt;view);</a>
+<a name="ln416">	delete state-&gt;view;</a>
+<a name="ln417">	delete state;</a>
+<a name="ln418">}</a>
+<a name="ln419"> </a>
+<a name="ln420"> </a>
+<a name="ln421">engine_state *</a>
+<a name="ln422">RemoteView::_FindState(uint32 token)</a>
+<a name="ln423">{</a>
+<a name="ln424">	return fStates.BinarySearchByKey(token, &amp;_StateCompareByKey);</a>
+<a name="ln425">}</a>
+<a name="ln426"> </a>
+<a name="ln427"> </a>
+<a name="ln428">int32</a>
+<a name="ln429">RemoteView::_DrawEntry(void *data)</a>
+<a name="ln430">{</a>
+<a name="ln431">	((RemoteView *)data)-&gt;_DrawThread();</a>
+<a name="ln432">	return 0;</a>
+<a name="ln433">}</a>
+<a name="ln434"> </a>
+<a name="ln435"> </a>
+<a name="ln436">void</a>
+<a name="ln437">RemoteView::_DrawThread()</a>
+<a name="ln438">{</a>
+<a name="ln439">	RemoteMessage reply(NULL, fSendBuffer);</a>
+<a name="ln440">	RemoteMessage message(fReceiveBuffer, NULL);</a>
+<a name="ln441"> </a>
+<a name="ln442">	// cursor</a>
+<a name="ln443">	BPoint cursorHotSpot(0, 0);</a>
+<a name="ln444"> </a>
+<a name="ln445">	reply.Start(RP_INIT_CONNECTION);</a>
+<a name="ln446">	reply.Flush();</a>
+<a name="ln447"> </a>
+<a name="ln448">	while (!fStopThread) {</a>
+<a name="ln449">		uint16 code;</a>
+<a name="ln450">		status_t status = message.NextMessage(code);</a>
+<a name="ln451"> </a>
+<a name="ln452">		if (status != B_OK) {</a>
+<a name="ln453">			if (status == B_TIMED_OUT || status == -1) {</a>
+<a name="ln454">				TRACE_ERROR(&quot;could not connect to device\n&quot;);</a>
+<a name="ln455">			} else {</a>
+<a name="ln456">				TRACE_ERROR(&quot;failed to read message from receiver\n&quot;);</a>
+<a name="ln457">				break;</a>
+<a name="ln458">			}</a>
+<a name="ln459">		}</a>
+<a name="ln460"> </a>
+<a name="ln461">		TRACE(&quot;code %u with %ld bytes data\n&quot;, code, message.DataLeft());</a>
+<a name="ln462"> </a>
+<a name="ln463">		BAutolock locker(this-&gt;Looper());</a>
+<a name="ln464">		if (!locker.IsLocked())</a>
+<a name="ln465">			break;</a>
+<a name="ln466"> </a>
+<a name="ln467">		// handle stuff that doesn't go to a specific engine</a>
+<a name="ln468">		switch (code) {</a>
+<a name="ln469">			case RP_INIT_CONNECTION:</a>
+<a name="ln470">			{</a>
+<a name="ln471">				BRect bounds = fOffscreenBitmap-&gt;Bounds();</a>
+<a name="ln472">				reply.Start(RP_UPDATE_DISPLAY_MODE);</a>
+<a name="ln473">				reply.Add(bounds.IntegerWidth() + 1);</a>
+<a name="ln474">				reply.Add(bounds.IntegerHeight() + 1);</a>
+<a name="ln475">				if (reply.Flush() == B_OK)</a>
+<a name="ln476">					fIsConnected = true;</a>
+<a name="ln477"> </a>
+<a name="ln478">				continue;</a>
+<a name="ln479">			}</a>
+<a name="ln480"> </a>
+<a name="ln481">			case RP_CLOSE_CONNECTION:</a>
+<a name="ln482">			{</a>
+<a name="ln483">				be_app-&gt;PostMessage(B_QUIT_REQUESTED);</a>
+<a name="ln484">				continue;</a>
+<a name="ln485">			}</a>
+<a name="ln486"> </a>
+<a name="ln487">			case RP_CREATE_STATE:</a>
+<a name="ln488">			case RP_DELETE_STATE:</a>
+<a name="ln489">			{</a>
+<a name="ln490">				uint32 token;</a>
+<a name="ln491">				message.Read(token);</a>
+<a name="ln492"> </a>
+<a name="ln493">				if (code == RP_CREATE_STATE)</a>
+<a name="ln494">					_CreateState(token);</a>
+<a name="ln495">				else</a>
+<a name="ln496">					_DeleteState(token);</a>
+<a name="ln497"> </a>
+<a name="ln498">				continue;</a>
+<a name="ln499">			}</a>
+<a name="ln500"> </a>
+<a name="ln501">			case RP_SET_CURSOR:</a>
+<a name="ln502">			{</a>
+<a name="ln503">				BBitmap *bitmap;</a>
+<a name="ln504">				BPoint oldHotSpot = cursorHotSpot;</a>
+<a name="ln505">				message.Read(cursorHotSpot);</a>
+<a name="ln506">				if (message.ReadBitmap(&amp;bitmap) != B_OK)</a>
+<a name="ln507">					continue;</a>
+<a name="ln508"> </a>
+<a name="ln509">				delete fCursorBitmap;</a>
+<a name="ln510">				fCursorBitmap = bitmap;</a>
+<a name="ln511"> </a>
+<a name="ln512">				Invalidate(fCursorFrame);</a>
+<a name="ln513"> </a>
+<a name="ln514">				BRect bounds = fCursorBitmap-&gt;Bounds();</a>
+<a name="ln515">				fCursorFrame.right = fCursorFrame.left</a>
+<a name="ln516">					+ bounds.IntegerWidth() + 1;</a>
+<a name="ln517">				fCursorFrame.bottom = fCursorFrame.bottom</a>
+<a name="ln518">					+ bounds.IntegerHeight() + 1;</a>
+<a name="ln519"> </a>
+<a name="ln520">				fCursorFrame.OffsetBy(oldHotSpot - cursorHotSpot);</a>
+<a name="ln521"> </a>
+<a name="ln522">				Invalidate(fCursorFrame);</a>
+<a name="ln523">				continue;</a>
+<a name="ln524">			}</a>
+<a name="ln525"> </a>
+<a name="ln526">			case RP_SET_CURSOR_VISIBLE:</a>
+<a name="ln527">			{</a>
+<a name="ln528">				bool wasVisible = fCursorVisible;</a>
+<a name="ln529">				message.Read(fCursorVisible);</a>
+<a name="ln530">				if (wasVisible != fCursorVisible)</a>
+<a name="ln531">					Invalidate(fCursorFrame);</a>
+<a name="ln532">				continue;</a>
+<a name="ln533">			}</a>
+<a name="ln534"> </a>
+<a name="ln535">			case RP_MOVE_CURSOR_TO:</a>
+<a name="ln536">			{</a>
+<a name="ln537">				BPoint position;</a>
+<a name="ln538">				message.Read(position);</a>
+<a name="ln539"> </a>
+<a name="ln540">				if (fCursorVisible)</a>
+<a name="ln541">					Invalidate(fCursorFrame);</a>
+<a name="ln542"> </a>
+<a name="ln543">				fCursorFrame.OffsetTo(position - cursorHotSpot);</a>
+<a name="ln544"> </a>
+<a name="ln545">				Invalidate(fCursorFrame);</a>
+<a name="ln546">				continue;</a>
+<a name="ln547">			}</a>
+<a name="ln548"> </a>
+<a name="ln549">			case RP_INVALIDATE_RECT:</a>
+<a name="ln550">			{</a>
+<a name="ln551">				BRect rect;</a>
+<a name="ln552">				if (message.Read(rect) != B_OK)</a>
+<a name="ln553">					continue;</a>
+<a name="ln554"> </a>
+<a name="ln555">				Invalidate(rect);</a>
+<a name="ln556">				continue;</a>
+<a name="ln557">			}</a>
+<a name="ln558"> </a>
+<a name="ln559">			case RP_INVALIDATE_REGION:</a>
+<a name="ln560">			{</a>
+<a name="ln561">				BRegion region;</a>
+<a name="ln562">				if (message.ReadRegion(region) != B_OK)</a>
+<a name="ln563">					continue;</a>
+<a name="ln564"> </a>
+<a name="ln565">				Invalidate(&amp;region);</a>
+<a name="ln566">				continue;</a>
+<a name="ln567">			}</a>
+<a name="ln568"> </a>
+<a name="ln569">			case RP_FILL_REGION_COLOR_NO_CLIPPING:</a>
+<a name="ln570">			{</a>
+<a name="ln571">				BRegion region;</a>
+<a name="ln572">				rgb_color color;</a>
+<a name="ln573"> </a>
+<a name="ln574">				message.ReadRegion(region);</a>
+<a name="ln575">				if (message.Read(color) != B_OK)</a>
+<a name="ln576">					continue;</a>
+<a name="ln577"> </a>
+<a name="ln578">				fOffscreen-&gt;LockLooper();</a>
+<a name="ln579">				fOffscreen-&gt;SetHighColor(color);</a>
+<a name="ln580">				fOffscreen-&gt;FillRegion(&amp;region);</a>
+<a name="ln581">				fOffscreen-&gt;UnlockLooper();</a>
+<a name="ln582">				Invalidate(&amp;region);</a>
+<a name="ln583">				continue;</a>
+<a name="ln584">			}</a>
+<a name="ln585"> </a>
+<a name="ln586">			case RP_COPY_RECT_NO_CLIPPING:</a>
+<a name="ln587">			{</a>
+<a name="ln588">				int32 xOffset, yOffset;</a>
+<a name="ln589">				BRect rect;</a>
+<a name="ln590"> </a>
+<a name="ln591">				message.Read(xOffset);</a>
+<a name="ln592">				message.Read(yOffset);</a>
+<a name="ln593">				if (message.Read(rect) != B_OK)</a>
+<a name="ln594">					continue;</a>
+<a name="ln595"> </a>
+<a name="ln596">				BRect dest = rect.OffsetByCopy(xOffset, yOffset);</a>
+<a name="ln597">				fOffscreen-&gt;LockLooper();</a>
+<a name="ln598">				fOffscreen-&gt;CopyBits(rect, dest);</a>
+<a name="ln599">				fOffscreen-&gt;UnlockLooper();</a>
+<a name="ln600">				continue;</a>
+<a name="ln601">			}</a>
+<a name="ln602">		}</a>
+<a name="ln603"> </a>
+<a name="ln604">		uint32 token;</a>
+<a name="ln605">		message.Read(token);</a>
+<a name="ln606"> </a>
+<a name="ln607">		engine_state *state = _FindState(token);</a>
+<a name="ln608">		if (state == NULL) {</a>
+<a name="ln609">			TRACE_ERROR(&quot;didn't find state for token %&quot; B_PRIu32 &quot;\n&quot;, token);</a>
+<a name="ln610">			state = _CreateState(token);</a>
+<a name="ln611">			if (state == NULL) {</a>
+<a name="ln612">				TRACE_ERROR(&quot;failed to create state for unknown token\n&quot;);</a>
+<a name="ln613">				continue;</a>
+<a name="ln614">			}</a>
+<a name="ln615">		}</a>
+<a name="ln616"> </a>
+<a name="ln617">		BView *offscreen = state-&gt;view;</a>
+<a name="ln618">		::pattern &amp;pattern = state-&gt;pattern;</a>
+<a name="ln619">		BRegion &amp;clippingRegion = state-&gt;clipping_region;</a>
+<a name="ln620">		float &amp;penSize = state-&gt;pen_size;</a>
+<a name="ln621">		bool &amp;syncDrawing = state-&gt;sync_drawing;</a>
+<a name="ln622">		BRegion invalidRegion;</a>
+<a name="ln623"> </a>
+<a name="ln624">		BAutolock offscreenLocker(offscreen-&gt;Looper());</a>
+<a name="ln625">		if (!offscreenLocker.IsLocked())</a>
+<a name="ln626">			break;</a>
+<a name="ln627"> </a>
+<a name="ln628">		switch (code) {</a>
+<a name="ln629">			case RP_ENABLE_SYNC_DRAWING:</a>
+<a name="ln630">				syncDrawing = true;</a>
+<a name="ln631">				continue;</a>
+<a name="ln632"> </a>
+<a name="ln633">			case RP_DISABLE_SYNC_DRAWING:</a>
+<a name="ln634">				syncDrawing = false;</a>
+<a name="ln635">				continue;</a>
+<a name="ln636"> </a>
+<a name="ln637">			case RP_SET_OFFSETS:</a>
+<a name="ln638">			{</a>
+<a name="ln639">				int32 xOffset, yOffset;</a>
+<a name="ln640">				message.Read(xOffset);</a>
+<a name="ln641">				if (message.Read(yOffset) != B_OK)</a>
+<a name="ln642">					continue;</a>
+<a name="ln643"> </a>
+<a name="ln644">				offscreen-&gt;MovePenTo(xOffset, yOffset);</a>
+<a name="ln645">				break;</a>
+<a name="ln646">			}</a>
+<a name="ln647"> </a>
+<a name="ln648">			case RP_SET_HIGH_COLOR:</a>
+<a name="ln649">			case RP_SET_LOW_COLOR:</a>
+<a name="ln650">			{</a>
+<a name="ln651">				rgb_color color;</a>
+<a name="ln652">				if (message.Read(color) != B_OK)</a>
+<a name="ln653">					continue;</a>
+<a name="ln654"> </a>
+<a name="ln655">				if (code == RP_SET_HIGH_COLOR)</a>
+<a name="ln656">					offscreen-&gt;SetHighColor(color);</a>
+<a name="ln657">				else</a>
+<a name="ln658">					offscreen-&gt;SetLowColor(color);</a>
+<a name="ln659"> </a>
+<a name="ln660">				break;</a>
+<a name="ln661">			}</a>
+<a name="ln662"> </a>
+<a name="ln663">			case RP_SET_PEN_SIZE:</a>
+<a name="ln664">			{</a>
+<a name="ln665">				float newPenSize;</a>
+<a name="ln666">				if (message.Read(newPenSize) != B_OK)</a>
+<a name="ln667">					continue;</a>
+<a name="ln668"> </a>
+<a name="ln669">				offscreen-&gt;SetPenSize(newPenSize);</a>
+<a name="ln670">				penSize = newPenSize / 2;</a>
+<a name="ln671">				break;</a>
+<a name="ln672">			}</a>
+<a name="ln673"> </a>
+<a name="ln674">			case RP_SET_STROKE_MODE:</a>
+<a name="ln675">			{</a>
+<a name="ln676">				cap_mode capMode;</a>
+<a name="ln677">				join_mode joinMode;</a>
+<a name="ln678">				float miterLimit;</a>
+<a name="ln679"> </a>
+<a name="ln680">				message.Read(capMode);</a>
+<a name="ln681">				message.Read(joinMode);</a>
+<a name="ln682">				if (message.Read(miterLimit) != B_OK)</a>
+<a name="ln683">					continue;</a>
+<a name="ln684"> </a>
+<a name="ln685">				offscreen-&gt;SetLineMode(capMode, joinMode, miterLimit);</a>
+<a name="ln686">				break;</a>
+<a name="ln687">			}</a>
+<a name="ln688"> </a>
+<a name="ln689">			case RP_SET_BLENDING_MODE:</a>
+<a name="ln690">			{</a>
+<a name="ln691">				source_alpha sourceAlpha;</a>
+<a name="ln692">				alpha_function alphaFunction;</a>
+<a name="ln693"> </a>
+<a name="ln694">				message.Read(sourceAlpha);</a>
+<a name="ln695">				if (message.Read(alphaFunction) != B_OK)</a>
+<a name="ln696">					continue;</a>
+<a name="ln697"> </a>
+<a name="ln698">				offscreen-&gt;SetBlendingMode(sourceAlpha, alphaFunction);</a>
+<a name="ln699">				break;</a>
+<a name="ln700">			}</a>
+<a name="ln701"> </a>
+<a name="ln702">			case RP_SET_TRANSFORM:</a>
+<a name="ln703">			{</a>
+<a name="ln704">				BAffineTransform transform;</a>
+<a name="ln705">				if (message.ReadTransform(transform) != B_OK)</a>
+<a name="ln706">					continue;</a>
+<a name="ln707"> </a>
+<a name="ln708">				offscreen-&gt;SetTransform(transform);</a>
+<a name="ln709">				break;</a>
+<a name="ln710">			}</a>
+<a name="ln711"> </a>
+<a name="ln712">			case RP_SET_PATTERN:</a>
+<a name="ln713">			{</a>
+<a name="ln714">				if (message.Read(pattern) != B_OK)</a>
+<a name="ln715">					continue;</a>
+<a name="ln716">				break;</a>
+<a name="ln717">			}</a>
+<a name="ln718"> </a>
+<a name="ln719">			case RP_SET_DRAWING_MODE:</a>
+<a name="ln720">			{</a>
+<a name="ln721">				drawing_mode drawingMode;</a>
+<a name="ln722">				if (message.Read(drawingMode) != B_OK)</a>
+<a name="ln723">					continue;</a>
+<a name="ln724"> </a>
+<a name="ln725">				offscreen-&gt;SetDrawingMode(drawingMode);</a>
+<a name="ln726">				break;</a>
+<a name="ln727">			}</a>
+<a name="ln728"> </a>
+<a name="ln729">			case RP_SET_FONT:</a>
+<a name="ln730">			{</a>
+<a name="ln731">				BFont font;</a>
+<a name="ln732">				if (message.ReadFontState(font) != B_OK)</a>
+<a name="ln733">					continue;</a>
+<a name="ln734"> </a>
+<a name="ln735">				offscreen-&gt;SetFont(&amp;font);</a>
+<a name="ln736">				break;</a>
+<a name="ln737">			}</a>
+<a name="ln738"> </a>
+<a name="ln739">			case RP_CONSTRAIN_CLIPPING_REGION:</a>
+<a name="ln740">			{</a>
+<a name="ln741">				if (message.ReadRegion(clippingRegion) != B_OK)</a>
+<a name="ln742">					continue;</a>
+<a name="ln743"> </a>
+<a name="ln744">				offscreen-&gt;ConstrainClippingRegion(&amp;clippingRegion);</a>
+<a name="ln745">				break;</a>
+<a name="ln746">			}</a>
+<a name="ln747"> </a>
+<a name="ln748">			case RP_INVERT_RECT:</a>
+<a name="ln749">			{</a>
+<a name="ln750">				BRect rect;</a>
+<a name="ln751">				if (message.Read(rect) != B_OK)</a>
+<a name="ln752">					continue;</a>
+<a name="ln753"> </a>
+<a name="ln754">				offscreen-&gt;InvertRect(rect);</a>
+<a name="ln755">				invalidRegion.Include(rect);</a>
+<a name="ln756">				break;</a>
+<a name="ln757">			}</a>
+<a name="ln758"> </a>
+<a name="ln759">			case RP_DRAW_BITMAP:</a>
+<a name="ln760">			{</a>
+<a name="ln761">				BBitmap *bitmap;</a>
+<a name="ln762">				BRect bitmapRect, viewRect;</a>
+<a name="ln763">				uint32 options;</a>
+<a name="ln764"> </a>
+<a name="ln765">				message.Read(bitmapRect);</a>
+<a name="ln766">				message.Read(viewRect);</a>
+<a name="ln767">				message.Read(options);</a>
+<a name="ln768">				if (message.ReadBitmap(&amp;bitmap) != B_OK || bitmap == NULL)</a>
+<a name="ln769">					continue;</a>
+<a name="ln770"> </a>
+<a name="ln771">				offscreen-&gt;DrawBitmap(bitmap, bitmapRect, viewRect, options);</a>
+<a name="ln772">				invalidRegion.Include(viewRect);</a>
+<a name="ln773">				delete bitmap;</a>
+<a name="ln774">				break;</a>
+<a name="ln775">			}</a>
+<a name="ln776"> </a>
+<a name="ln777">			case RP_DRAW_BITMAP_RECTS:</a>
+<a name="ln778">			{</a>
+<a name="ln779">				color_space colorSpace;</a>
+<a name="ln780">				int32 rectCount;</a>
+<a name="ln781">				uint32 flags, options;</a>
+<a name="ln782"> </a>
+<a name="ln783">				message.Read(options);</a>
+<a name="ln784">				message.Read(colorSpace);</a>
+<a name="ln785">				message.Read(flags);</a>
+<a name="ln786">				message.Read(rectCount);</a>
+<a name="ln787">				for (int32 i = 0; i &lt; rectCount; i++) {</a>
+<a name="ln788">					BBitmap *bitmap;</a>
+<a name="ln789">					BRect viewRect;</a>
+<a name="ln790"> </a>
+<a name="ln791">					message.Read(viewRect);</a>
+<a name="ln792">					if (message.ReadBitmap(&amp;bitmap, true, colorSpace,</a>
+<a name="ln793">							flags) != B_OK || bitmap == NULL) {</a>
+<a name="ln794">						continue;</a>
+<a name="ln795">					}</a>
+<a name="ln796"> </a>
+<a name="ln797">					offscreen-&gt;DrawBitmap(bitmap, bitmap-&gt;Bounds(), viewRect,</a>
+<a name="ln798">						options);</a>
+<a name="ln799">					invalidRegion.Include(viewRect);</a>
+<a name="ln800">					delete bitmap;</a>
+<a name="ln801">				}</a>
+<a name="ln802"> </a>
+<a name="ln803">				break;</a>
+<a name="ln804">			}</a>
+<a name="ln805"> </a>
+<a name="ln806">			case RP_STROKE_ARC:</a>
+<a name="ln807">			case RP_FILL_ARC:</a>
+<a name="ln808">			case RP_FILL_ARC_GRADIENT:</a>
+<a name="ln809">			{</a>
+<a name="ln810">				BRect rect;</a>
+<a name="ln811">				float angle, span;</a>
+<a name="ln812"> </a>
+<a name="ln813">				message.Read(rect);</a>
+<a name="ln814">				message.Read(angle);</a>
+<a name="ln815">				if (message.Read(span) != B_OK)</a>
+<a name="ln816">					continue;</a>
+<a name="ln817"> </a>
+<a name="ln818">				if (code == RP_STROKE_ARC) {</a>
+<a name="ln819">					offscreen-&gt;StrokeArc(rect, angle, span, pattern);</a>
+<a name="ln820">					rect.InsetBy(-penSize, -penSize);</a>
+<a name="ln821">				} else if (code == RP_FILL_ARC)</a>
+<a name="ln822">					offscreen-&gt;FillArc(rect, angle, span, pattern);</a>
+<a name="ln823">				else {</a>
+<a name="ln824">					BGradient *gradient;</a>
+<a name="ln825">					if (message.ReadGradient(&amp;gradient) != B_OK)</a>
+<a name="ln826">						continue;</a>
+<a name="ln827"> </a>
+<a name="ln828">					offscreen-&gt;FillArc(rect, angle, span, *gradient);</a>
+<a name="ln829">					delete gradient;</a>
+<a name="ln830">				}</a>
+<a name="ln831"> </a>
+<a name="ln832">				invalidRegion.Include(rect);</a>
+<a name="ln833">				break;</a>
+<a name="ln834">			}</a>
+<a name="ln835"> </a>
+<a name="ln836">			case RP_STROKE_BEZIER:</a>
+<a name="ln837">			case RP_FILL_BEZIER:</a>
+<a name="ln838">			case RP_FILL_BEZIER_GRADIENT:</a>
+<a name="ln839">			{</a>
+<a name="ln840">				BPoint points[4];</a>
+<a name="ln841">				if (message.ReadList(points, 4) != B_OK)</a>
+<a name="ln842">					continue;</a>
+<a name="ln843"> </a>
+<a name="ln844">				BRect bounds = _BuildInvalidateRect(points, 4);</a>
+<a name="ln845">				if (code == RP_STROKE_BEZIER) {</a>
+<a name="ln846">					offscreen-&gt;StrokeBezier(points, pattern);</a>
+<a name="ln847">					bounds.InsetBy(-penSize, -penSize);</a>
+<a name="ln848">				} else if (code == RP_FILL_BEZIER)</a>
+<a name="ln849">					offscreen-&gt;FillBezier(points, pattern);</a>
+<a name="ln850">				else {</a>
+<a name="ln851">					BGradient *gradient;</a>
+<a name="ln852">					if (message.ReadGradient(&amp;gradient) != B_OK)</a>
+<a name="ln853">						continue;</a>
+<a name="ln854"> </a>
+<a name="ln855">					offscreen-&gt;FillBezier(points, *gradient);</a>
+<a name="ln856">					delete gradient;</a>
+<a name="ln857">				}</a>
+<a name="ln858"> </a>
+<a name="ln859">				invalidRegion.Include(bounds);</a>
+<a name="ln860">				break;</a>
+<a name="ln861">			}</a>
+<a name="ln862"> </a>
+<a name="ln863">			case RP_STROKE_ELLIPSE:</a>
+<a name="ln864">			case RP_FILL_ELLIPSE:</a>
+<a name="ln865">			case RP_FILL_ELLIPSE_GRADIENT:</a>
+<a name="ln866">			{</a>
+<a name="ln867">				BRect rect;</a>
+<a name="ln868">				if (message.Read(rect) != B_OK)</a>
+<a name="ln869">					continue;</a>
+<a name="ln870"> </a>
+<a name="ln871">				if (code == RP_STROKE_ELLIPSE) {</a>
+<a name="ln872">					offscreen-&gt;StrokeEllipse(rect, pattern);</a>
+<a name="ln873">					rect.InsetBy(-penSize, -penSize);</a>
+<a name="ln874">				} else if (code == RP_FILL_ELLIPSE)</a>
+<a name="ln875">					offscreen-&gt;FillEllipse(rect, pattern);</a>
+<a name="ln876">				else {</a>
+<a name="ln877">					BGradient *gradient;</a>
+<a name="ln878">					if (message.ReadGradient(&amp;gradient) != B_OK)</a>
+<a name="ln879">						continue;</a>
+<a name="ln880"> </a>
+<a name="ln881">					offscreen-&gt;FillEllipse(rect, *gradient);</a>
+<a name="ln882">					delete gradient;</a>
+<a name="ln883">				}</a>
+<a name="ln884"> </a>
+<a name="ln885">				invalidRegion.Include(rect);</a>
+<a name="ln886">				break;</a>
+<a name="ln887">			}</a>
+<a name="ln888"> </a>
+<a name="ln889">			case RP_STROKE_POLYGON:</a>
+<a name="ln890">			case RP_FILL_POLYGON:</a>
+<a name="ln891">			case RP_FILL_POLYGON_GRADIENT:</a>
+<a name="ln892">			{</a>
+<a name="ln893">				BRect bounds;</a>
+<a name="ln894">				bool closed;</a>
+<a name="ln895">				int32 numPoints;</a>
+<a name="ln896"> </a>
+<a name="ln897">				message.Read(bounds);</a>
+<a name="ln898">				message.Read(closed);</a>
+<a name="ln899">				if (message.Read(numPoints) != B_OK)</a>
+<a name="ln900">					continue;</a>
+<a name="ln901"> </a>
+<a name="ln902">				BPoint points[numPoints];</a>
+<a name="ln903">				for (int32 i = 0; i &lt; numPoints; i++)</a>
+<a name="ln904">					message.Read(points[i]);</a>
+<a name="ln905"> </a>
+<a name="ln906">				if (code == RP_STROKE_POLYGON) {</a>
+<a name="ln907">					offscreen-&gt;StrokePolygon(points, numPoints, bounds, closed,</a>
+<a name="ln908">						pattern);</a>
+<a name="ln909">					bounds.InsetBy(-penSize, -penSize);</a>
+<a name="ln910">				} else if (code == RP_FILL_POLYGON)</a>
+<a name="ln911">					offscreen-&gt;FillPolygon(points, numPoints, bounds, pattern);</a>
+<a name="ln912">				else {</a>
+<a name="ln913">					BGradient *gradient;</a>
+<a name="ln914">					if (message.ReadGradient(&amp;gradient) != B_OK)</a>
+<a name="ln915">						continue;</a>
+<a name="ln916"> </a>
+<a name="ln917">					offscreen-&gt;FillPolygon(points, numPoints, bounds,</a>
+<a name="ln918">						*gradient);</a>
+<a name="ln919">					delete gradient;</a>
+<a name="ln920">				}</a>
+<a name="ln921"> </a>
+<a name="ln922">				invalidRegion.Include(bounds);</a>
+<a name="ln923">				break;</a>
+<a name="ln924">			}</a>
+<a name="ln925"> </a>
+<a name="ln926">			case RP_STROKE_RECT:</a>
+<a name="ln927">			case RP_FILL_RECT:</a>
+<a name="ln928">			case RP_FILL_RECT_GRADIENT:</a>
+<a name="ln929">			{</a>
+<a name="ln930">				BRect rect;</a>
+<a name="ln931">				if (message.Read(rect) != B_OK)</a>
+<a name="ln932">					continue;</a>
+<a name="ln933"> </a>
+<a name="ln934">				if (code == RP_STROKE_RECT) {</a>
+<a name="ln935">					offscreen-&gt;StrokeRect(rect, pattern);</a>
+<a name="ln936">					rect.InsetBy(-penSize, -penSize);</a>
+<a name="ln937">				} else if (code == RP_FILL_RECT)</a>
+<a name="ln938">					offscreen-&gt;FillRect(rect, pattern);</a>
+<a name="ln939">				else {</a>
+<a name="ln940">					BGradient *gradient;</a>
+<a name="ln941">					if (message.ReadGradient(&amp;gradient) != B_OK)</a>
+<a name="ln942">						continue;</a>
+<a name="ln943"> </a>
+<a name="ln944">					offscreen-&gt;FillRect(rect, *gradient);</a>
+<a name="ln945">					delete gradient;</a>
+<a name="ln946">				}</a>
+<a name="ln947"> </a>
+<a name="ln948">				invalidRegion.Include(rect);</a>
+<a name="ln949">				break;</a>
+<a name="ln950">			}</a>
+<a name="ln951"> </a>
+<a name="ln952">			case RP_STROKE_ROUND_RECT:</a>
+<a name="ln953">			case RP_FILL_ROUND_RECT:</a>
+<a name="ln954">			case RP_FILL_ROUND_RECT_GRADIENT:</a>
+<a name="ln955">			{</a>
+<a name="ln956">				BRect rect;</a>
+<a name="ln957">				float xRadius, yRadius;</a>
+<a name="ln958"> </a>
+<a name="ln959">				message.Read(rect);</a>
+<a name="ln960">				message.Read(xRadius);</a>
+<a name="ln961">				if (message.Read(yRadius) != B_OK)</a>
+<a name="ln962">					continue;</a>
+<a name="ln963"> </a>
+<a name="ln964">				if (code == RP_STROKE_ROUND_RECT) {</a>
+<a name="ln965">					offscreen-&gt;StrokeRoundRect(rect, xRadius, yRadius,</a>
+<a name="ln966">						pattern);</a>
+<a name="ln967">					rect.InsetBy(-penSize, -penSize);</a>
+<a name="ln968">				} else if (code == RP_FILL_ROUND_RECT)</a>
+<a name="ln969">					offscreen-&gt;FillRoundRect(rect, xRadius, yRadius, pattern);</a>
+<a name="ln970">				else {</a>
+<a name="ln971">					BGradient *gradient;</a>
+<a name="ln972">					if (message.ReadGradient(&amp;gradient) != B_OK)</a>
+<a name="ln973">						continue;</a>
+<a name="ln974"> </a>
+<a name="ln975">					offscreen-&gt;FillRoundRect(rect, xRadius, yRadius,</a>
+<a name="ln976">						*gradient);</a>
+<a name="ln977">					delete gradient;</a>
+<a name="ln978">				}</a>
+<a name="ln979"> </a>
+<a name="ln980">				invalidRegion.Include(rect);</a>
+<a name="ln981">				break;</a>
+<a name="ln982">			}</a>
+<a name="ln983"> </a>
+<a name="ln984">			case RP_STROKE_SHAPE:</a>
+<a name="ln985">			case RP_FILL_SHAPE:</a>
+<a name="ln986">			case RP_FILL_SHAPE_GRADIENT:</a>
+<a name="ln987">			{</a>
+<a name="ln988">				BRect bounds;</a>
+<a name="ln989">				int32 opCount, pointCount;</a>
+<a name="ln990"> </a>
+<a name="ln991">				message.Read(bounds);</a>
+<a name="ln992">				if (message.Read(opCount) != B_OK)</a>
+<a name="ln993">					continue;</a>
+<a name="ln994"> </a>
+<a name="ln995">				BMessage archive;</a>
+<a name="ln996">				for (int32 i = 0; i &lt; opCount; i++) {</a>
+<a name="ln997">					int32 op;</a>
+<a name="ln998">					message.Read(op);</a>
+<a name="ln999">					archive.AddInt32(&quot;ops&quot;, op);</a>
+<a name="ln1000">				}</a>
+<a name="ln1001"> </a>
+<a name="ln1002">				if (message.Read(pointCount) != B_OK)</a>
+<a name="ln1003">					continue;</a>
+<a name="ln1004"> </a>
+<a name="ln1005">				for (int32 i = 0; i &lt; pointCount; i++) {</a>
+<a name="ln1006">					BPoint point;</a>
+<a name="ln1007">					message.Read(point);</a>
+<a name="ln1008">					archive.AddPoint(&quot;pts&quot;, point);</a>
+<a name="ln1009">				}</a>
+<a name="ln1010"> </a>
+<a name="ln1011">				BPoint offset;</a>
+<a name="ln1012">				message.Read(offset);</a>
+<a name="ln1013"> </a>
+<a name="ln1014">				float scale;</a>
+<a name="ln1015">				if (message.Read(scale) != B_OK)</a>
+<a name="ln1016">					continue;</a>
+<a name="ln1017"> </a>
+<a name="ln1018">				offscreen-&gt;PushState();</a>
+<a name="ln1019">				offscreen-&gt;MovePenTo(offset);</a>
+<a name="ln1020">				offscreen-&gt;SetScale(scale);</a>
+<a name="ln1021"> </a>
+<a name="ln1022">				BShape shape(&amp;archive);</a>
+<a name="ln1023">				if (code == RP_STROKE_SHAPE) {</a>
+<a name="ln1024">					offscreen-&gt;StrokeShape(&amp;shape, pattern);</a>
+<a name="ln1025">					bounds.InsetBy(-penSize, -penSize);</a>
+<a name="ln1026">				} else if (code == RP_FILL_SHAPE)</a>
+<a name="ln1027">					offscreen-&gt;FillShape(&amp;shape, pattern);</a>
+<a name="ln1028">				else {</a>
+<a name="ln1029">					BGradient *gradient;</a>
+<a name="ln1030">					if (message.ReadGradient(&amp;gradient) != B_OK) {</a>
+<a name="ln1031">						offscreen-&gt;PopState();</a>
+<a name="ln1032">						continue;</a>
+<a name="ln1033">					}</a>
+<a name="ln1034"> </a>
+<a name="ln1035">					offscreen-&gt;FillShape(&amp;shape, *gradient);</a>
+<a name="ln1036">					delete gradient;</a>
+<a name="ln1037">				}</a>
+<a name="ln1038"> </a>
+<a name="ln1039">				offscreen-&gt;PopState();</a>
+<a name="ln1040">				invalidRegion.Include(bounds);</a>
+<a name="ln1041">				break;</a>
+<a name="ln1042">			}</a>
+<a name="ln1043"> </a>
+<a name="ln1044">			case RP_STROKE_TRIANGLE:</a>
+<a name="ln1045">			case RP_FILL_TRIANGLE:</a>
+<a name="ln1046">			case RP_FILL_TRIANGLE_GRADIENT:</a>
+<a name="ln1047">			{</a>
+<a name="ln1048">				BRect bounds;</a>
+<a name="ln1049">				BPoint points[3];</a>
+<a name="ln1050"> </a>
+<a name="ln1051">				message.ReadList(points, 3);</a>
+<a name="ln1052">				if (message.Read(bounds) != B_OK)</a>
+<a name="ln1053">					continue;</a>
+<a name="ln1054"> </a>
+<a name="ln1055">				if (code == RP_STROKE_TRIANGLE) {</a>
+<a name="ln1056">					offscreen-&gt;StrokeTriangle(points[0], points[1], points[2],</a>
+<a name="ln1057">						bounds, pattern);</a>
+<a name="ln1058">					bounds.InsetBy(-penSize, -penSize);</a>
+<a name="ln1059">				} else if (code == RP_FILL_TRIANGLE) {</a>
+<a name="ln1060">					offscreen-&gt;FillTriangle(points[0], points[1], points[2],</a>
+<a name="ln1061">						bounds, pattern);</a>
+<a name="ln1062">				} else {</a>
+<a name="ln1063">					BGradient *gradient;</a>
+<a name="ln1064">					if (message.ReadGradient(&amp;gradient) != B_OK)</a>
+<a name="ln1065">						continue;</a>
+<a name="ln1066"> </a>
+<a name="ln1067">					offscreen-&gt;FillTriangle(points[0], points[1], points[2],</a>
+<a name="ln1068">						bounds, *gradient);</a>
+<a name="ln1069">					delete gradient;</a>
+<a name="ln1070">				}</a>
+<a name="ln1071"> </a>
+<a name="ln1072">				invalidRegion.Include(bounds);</a>
+<a name="ln1073">				break;</a>
+<a name="ln1074">			}</a>
+<a name="ln1075"> </a>
+<a name="ln1076">			case RP_STROKE_LINE:</a>
+<a name="ln1077">			{</a>
+<a name="ln1078">				BPoint points[2];</a>
+<a name="ln1079">				if (message.ReadList(points, 2) != B_OK)</a>
+<a name="ln1080">					continue;</a>
+<a name="ln1081"> </a>
+<a name="ln1082">				offscreen-&gt;StrokeLine(points[0], points[1], pattern);</a>
+<a name="ln1083"> </a>
+<a name="ln1084">				BRect bounds = _BuildInvalidateRect(points, 2);</a>
+<a name="ln1085">				invalidRegion.Include(bounds.InsetBySelf(-penSize, -penSize));</a>
+<a name="ln1086">				break;</a>
+<a name="ln1087">			}</a>
+<a name="ln1088"> </a>
+<a name="ln1089">			case RP_STROKE_LINE_ARRAY:</a>
+<a name="ln1090">			{</a>
+<a name="ln1091">				int32 numLines;</a>
+<a name="ln1092">				if (message.Read(numLines) != B_OK)</a>
+<a name="ln1093">					continue;</a>
+<a name="ln1094"> </a>
+<a name="ln1095">				BRect bounds;</a>
+<a name="ln1096">				offscreen-&gt;BeginLineArray(numLines);</a>
+<a name="ln1097">				for (int32 i = 0; i &lt; numLines; i++) {</a>
+<a name="ln1098">					rgb_color color;</a>
+<a name="ln1099">					BPoint start, end;</a>
+<a name="ln1100">					message.ReadArrayLine(start, end, color);</a>
+<a name="ln1101">					offscreen-&gt;AddLine(start, end, color);</a>
+<a name="ln1102"> </a>
+<a name="ln1103">					bounds.left = min_c(bounds.left, min_c(start.x, end.x));</a>
+<a name="ln1104">					bounds.top = min_c(bounds.top, min_c(start.y, end.y));</a>
+<a name="ln1105">					bounds.right = max_c(bounds.right, max_c(start.x, end.x));</a>
+<a name="ln1106">					bounds.bottom = max_c(bounds.bottom, max_c(start.y, end.y));</a>
+<a name="ln1107">				}</a>
+<a name="ln1108"> </a>
+<a name="ln1109">				offscreen-&gt;EndLineArray();</a>
+<a name="ln1110">				invalidRegion.Include(bounds);</a>
+<a name="ln1111">				break;</a>
+<a name="ln1112">			}</a>
+<a name="ln1113"> </a>
+<a name="ln1114">			case RP_FILL_REGION:</a>
+<a name="ln1115">			case RP_FILL_REGION_GRADIENT:</a>
+<a name="ln1116">			{</a>
+<a name="ln1117">				BRegion region;</a>
+<a name="ln1118">				if (message.ReadRegion(region) != B_OK)</a>
+<a name="ln1119">					continue;</a>
+<a name="ln1120"> </a>
+<a name="ln1121">				if (code == RP_FILL_REGION)</a>
+<a name="ln1122">					offscreen-&gt;FillRegion(&amp;region, pattern);</a>
+<a name="ln1123">				else {</a>
+<a name="ln1124">					BGradient *gradient;</a>
+<a name="ln1125">					if (message.ReadGradient(&amp;gradient) != B_OK)</a>
+<a name="ln1126">						continue;</a>
+<a name="ln1127"> </a>
+<a name="ln1128">					offscreen-&gt;FillRegion(&amp;region, *gradient);</a>
+<a name="ln1129">					delete gradient;</a>
+<a name="ln1130">				}</a>
+<a name="ln1131"> </a>
+<a name="ln1132">				invalidRegion.Include(&amp;region);</a>
+<a name="ln1133">				break;</a>
+<a name="ln1134">			}</a>
+<a name="ln1135"> </a>
+<a name="ln1136">			case RP_STROKE_POINT_COLOR:</a>
+<a name="ln1137">			{</a>
+<a name="ln1138">				BPoint point;</a>
+<a name="ln1139">				rgb_color color;</a>
+<a name="ln1140"> </a>
+<a name="ln1141">				message.Read(point);</a>
+<a name="ln1142">				if (message.Read(color) != B_OK)</a>
+<a name="ln1143">					continue;</a>
+<a name="ln1144"> </a>
+<a name="ln1145">				rgb_color oldColor = offscreen-&gt;HighColor();</a>
+<a name="ln1146">				offscreen-&gt;SetHighColor(color);</a>
+<a name="ln1147">				offscreen-&gt;StrokeLine(point, point);</a>
+<a name="ln1148">				offscreen-&gt;SetHighColor(oldColor);</a>
+<a name="ln1149"> </a>
+<a name="ln1150">				invalidRegion.Include(</a>
+<a name="ln1151">					BRect(point, point).InsetBySelf(-penSize, -penSize));</a>
+<a name="ln1152">				break;</a>
+<a name="ln1153">			}</a>
+<a name="ln1154"> </a>
+<a name="ln1155">			case RP_STROKE_LINE_1PX_COLOR:</a>
+<a name="ln1156">			{</a>
+<a name="ln1157">				BPoint points[2];</a>
+<a name="ln1158">				rgb_color color;</a>
+<a name="ln1159"> </a>
+<a name="ln1160">				message.ReadList(points, 2);</a>
+<a name="ln1161">				if (message.Read(color) != B_OK)</a>
+<a name="ln1162">					continue;</a>
+<a name="ln1163"> </a>
+<a name="ln1164">				float oldSize = offscreen-&gt;PenSize();</a>
+<a name="ln1165">				rgb_color oldColor = offscreen-&gt;HighColor();</a>
+<a name="ln1166">				drawing_mode oldMode = offscreen-&gt;DrawingMode();</a>
+<a name="ln1167">				offscreen-&gt;SetPenSize(1);</a>
+<a name="ln1168">				offscreen-&gt;SetHighColor(color);</a>
+<a name="ln1169">				offscreen-&gt;SetDrawingMode(B_OP_OVER);</a>
+<a name="ln1170"> </a>
+<a name="ln1171">				offscreen-&gt;StrokeLine(points[0], points[1]);</a>
+<a name="ln1172"> </a>
+<a name="ln1173">				offscreen-&gt;SetDrawingMode(oldMode);</a>
+<a name="ln1174">				offscreen-&gt;SetHighColor(oldColor);</a>
+<a name="ln1175">				offscreen-&gt;SetPenSize(oldSize);</a>
+<a name="ln1176"> </a>
+<a name="ln1177">				invalidRegion.Include(_BuildInvalidateRect(points, 2));</a>
+<a name="ln1178">				break;</a>
+<a name="ln1179">			}</a>
+<a name="ln1180"> </a>
+<a name="ln1181">			case RP_STROKE_RECT_1PX_COLOR:</a>
+<a name="ln1182">			case RP_FILL_RECT_COLOR:</a>
+<a name="ln1183">			{</a>
+<a name="ln1184">				BRect rect;</a>
+<a name="ln1185">				rgb_color color;</a>
+<a name="ln1186"> </a>
+<a name="ln1187">				message.Read(rect);</a>
+<a name="ln1188">				if (message.Read(color) != B_OK)</a>
+<a name="ln1189">					continue;</a>
+<a name="ln1190"> </a>
+<a name="ln1191">				rgb_color oldColor = offscreen-&gt;HighColor();</a>
+<a name="ln1192">				offscreen-&gt;SetHighColor(color);</a>
+<a name="ln1193"> </a>
+<a name="ln1194">				if (code == RP_STROKE_RECT_1PX_COLOR) {</a>
+<a name="ln1195">					float oldSize = PenSize();</a>
+<a name="ln1196">					offscreen-&gt;SetPenSize(1);</a>
+<a name="ln1197">					offscreen-&gt;StrokeRect(rect);</a>
+<a name="ln1198">					offscreen-&gt;SetPenSize(oldSize);</a>
+<a name="ln1199">				} else</a>
+<a name="ln1200">					offscreen-&gt;FillRect(rect);</a>
+<a name="ln1201"> </a>
+<a name="ln1202">				offscreen-&gt;SetHighColor(oldColor);</a>
+<a name="ln1203">				invalidRegion.Include(rect);</a>
+<a name="ln1204">				break;</a>
+<a name="ln1205">			}</a>
+<a name="ln1206"> </a>
+<a name="ln1207">			case RP_DRAW_STRING:</a>
+<a name="ln1208">			{</a>
+<a name="ln1209">				BPoint point;</a>
+<a name="ln1210">				size_t length;</a>
+<a name="ln1211">				char *string;</a>
+<a name="ln1212">				bool hasDelta;</a>
+<a name="ln1213"> </a>
+<a name="ln1214">				message.Read(point);</a>
+<a name="ln1215">				message.ReadString(&amp;string, length);</a>
+<a name="ln1216">				if (message.Read(hasDelta) != B_OK) {</a>
+<a name="ln1217">					free(string);</a>
+<a name="ln1218">					continue;</a>
+<a name="ln1219">				}</a>
+<a name="ln1220"> </a>
+<a name="ln1221">				if (hasDelta) {</a>
+<a name="ln1222">					escapement_delta delta[length];</a>
+<a name="ln1223">					message.ReadList(delta, length);</a>
+<a name="ln1224">					offscreen-&gt;DrawString(string, point, delta);</a>
+<a name="ln1225">				} else</a>
+<a name="ln1226">					offscreen-&gt;DrawString(string, point);</a>
+<a name="ln1227"> </a>
+<a name="ln1228">				free(string);</a>
+<a name="ln1229">				reply.Start(RP_DRAW_STRING_RESULT);</a>
+<a name="ln1230">				reply.Add(token);</a>
+<a name="ln1231">				reply.Add(offscreen-&gt;PenLocation());</a>
+<a name="ln1232">				reply.Flush();</a>
+<a name="ln1233"> </a>
+<a name="ln1234">				font_height height;</a>
+<a name="ln1235">				offscreen-&gt;GetFontHeight(&amp;height);</a>
+<a name="ln1236"> </a>
+<a name="ln1237">				BRect bounds(point, offscreen-&gt;PenLocation());</a>
+<a name="ln1238">				bounds.top -= height.ascent;</a>
+<a name="ln1239">				bounds.bottom += height.descent;</a>
+<a name="ln1240">				invalidRegion.Include(bounds);</a>
+<a name="ln1241">				break;</a>
+<a name="ln1242">			}</a>
+<a name="ln1243"> </a>
+<a name="ln1244">			case RP_DRAW_STRING_WITH_OFFSETS:</a>
+<a name="ln1245">			{</a>
+<a name="ln1246">				size_t length;</a>
+<a name="ln1247">				char *string;</a>
+<a name="ln1248">				message.ReadString(&amp;string, length);</a>
+<a name="ln1249">				int32 count = UTF8CountChars(string, length);</a>
+<a name="ln1250"> </a>
+<a name="ln1251">				BPoint offsets[count];</a>
+<a name="ln1252">				if (message.ReadList(offsets, count) != B_OK) {</a>
+<a name="ln1253">					free(string);</a>
+<a name="ln1254">					continue;</a>
+<a name="ln1255">				}</a>
+<a name="ln1256"> </a>
+<a name="ln1257">				offscreen-&gt;DrawString(string, offsets, count);</a>
+<a name="ln1258"> </a>
+<a name="ln1259">				free(string);</a>
+<a name="ln1260">				reply.Start(RP_DRAW_STRING_RESULT);</a>
+<a name="ln1261">				reply.Add(token);</a>
+<a name="ln1262">				reply.Add(offscreen-&gt;PenLocation());</a>
+<a name="ln1263">				reply.Flush();</a>
+<a name="ln1264"> </a>
+<a name="ln1265">				BFont font;</a>
+<a name="ln1266">				offscreen-&gt;GetFont(&amp;font);</a>
+<a name="ln1267"> </a>
+<a name="ln1268">				BRect boxes[count];</a>
+<a name="ln1269">				font.GetBoundingBoxesAsGlyphs(string, count, B_SCREEN_METRIC,</a>
+<a name="ln1270">					boxes);</a>
+<a name="ln1271"> </a>
+<a name="ln1272">				font_height height;</a>
+<a name="ln1273">				offscreen-&gt;GetFontHeight(&amp;height);</a>
+<a name="ln1274"> </a>
+<a name="ln1275">				for (int32 i = 0; i &lt; count; i++) {</a>
+<a name="ln1276">					// TODO: validate</a>
+<a name="ln1277">					boxes[i].OffsetBy(offsets[i] + BPoint(0, -height.ascent));</a>
+<a name="ln1278">					invalidRegion.Include(boxes[i]);</a>
+<a name="ln1279">				}</a>
+<a name="ln1280"> </a>
+<a name="ln1281">				break;</a>
+<a name="ln1282">			}</a>
+<a name="ln1283"> </a>
+<a name="ln1284">			case RP_READ_BITMAP:</a>
+<a name="ln1285">			{</a>
+<a name="ln1286">				BRect bounds;</a>
+<a name="ln1287">				bool drawCursor;</a>
+<a name="ln1288"> </a>
+<a name="ln1289">				message.Read(bounds);</a>
+<a name="ln1290">				if (message.Read(drawCursor) != B_OK)</a>
+<a name="ln1291">					continue;</a>
+<a name="ln1292"> </a>
+<a name="ln1293">				// TODO: support the drawCursor flag</a>
+<a name="ln1294">				BBitmap bitmap(bounds, B_BITMAP_NO_SERVER_LINK, B_RGB32);</a>
+<a name="ln1295">				bitmap.ImportBits(fOffscreenBitmap, bounds.LeftTop(),</a>
+<a name="ln1296">					BPoint(0, 0), bounds.IntegerWidth() + 1,</a>
+<a name="ln1297">					bounds.IntegerHeight() + 1);</a>
+<a name="ln1298"> </a>
+<a name="ln1299">				reply.Start(RP_READ_BITMAP_RESULT);</a>
+<a name="ln1300">				reply.Add(token);</a>
+<a name="ln1301">				reply.AddBitmap(&amp;bitmap);</a>
+<a name="ln1302">				reply.Flush();</a>
+<a name="ln1303">				break;</a>
+<a name="ln1304">			}</a>
+<a name="ln1305"> </a>
+<a name="ln1306">			default:</a>
+<a name="ln1307">				TRACE_ERROR(&quot;unknown protocol code: %u\n&quot;, code);</a>
+<a name="ln1308">				break;</a>
+<a name="ln1309">		}</a>
+<a name="ln1310"> </a>
+<a name="ln1311">		if (syncDrawing) {</a>
+<a name="ln1312">			offscreen-&gt;Sync();</a>
+<a name="ln1313">			Invalidate(&amp;invalidRegion);</a>
+<a name="ln1314">		}</a>
+<a name="ln1315">	}</a>
+<a name="ln1316">}</a>
+<a name="ln1317"> </a>
+<a name="ln1318"> </a>
+<a name="ln1319">BRect</a>
+<a name="ln1320">RemoteView::_BuildInvalidateRect(BPoint *points, int32 pointCount)</a>
+<a name="ln1321">{</a>
+<a name="ln1322">	BRect bounds(1000000, 1000000, 0, 0);</a>
+<a name="ln1323">	for (int32 i = 0; i &lt; pointCount; i++) {</a>
+<a name="ln1324">		bounds.left = min_c(bounds.left, points[i].x);</a>
+<a name="ln1325">		bounds.top = min_c(bounds.top, points[i].y);</a>
+<a name="ln1326">		bounds.right = max_c(bounds.right, points[i].x);</a>
+<a name="ln1327">		bounds.bottom = max_c(bounds.bottom, points[i].y);</a>
+<a name="ln1328">	}</a>
+<a name="ln1329"> </a>
+<a name="ln1330">	return bounds;</a>
+<a name="ln1331">}</a>
+
+</code></pre>
+<div class="balloon" rel="1269"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v774/" target="_blank">V774</a> The 'string' pointer was used after the memory was released.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

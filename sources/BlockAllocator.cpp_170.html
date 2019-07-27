@@ -1,0 +1,1499 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>BlockAllocator.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2001-2017, Axel Dörfler, axeld@pinc-software.de.</a>
+<a name="ln3"> * This file may be used under the terms of the MIT License.</a>
+<a name="ln4"> */</a>
+<a name="ln5"> </a>
+<a name="ln6"> </a>
+<a name="ln7">//! Block bitmap handling and allocation policies</a>
+<a name="ln8"> </a>
+<a name="ln9"> </a>
+<a name="ln10">#include &quot;BlockAllocator.h&quot;</a>
+<a name="ln11"> </a>
+<a name="ln12">#include &quot;Debug.h&quot;</a>
+<a name="ln13">#include &quot;Inode.h&quot;</a>
+<a name="ln14">#include &quot;Volume.h&quot;</a>
+<a name="ln15"> </a>
+<a name="ln16"> </a>
+<a name="ln17">// Things the BlockAllocator should do:</a>
+<a name="ln18"> </a>
+<a name="ln19">// - find a range of blocks of a certain size nearby a specific position</a>
+<a name="ln20">// - allocating an unsharp range of blocks for pre-allocation</a>
+<a name="ln21">// - free blocks</a>
+<a name="ln22">// - know how to deal with each allocation, special handling for directories,</a>
+<a name="ln23">//   files, symlinks, etc. (type sensitive allocation policies)</a>
+<a name="ln24"> </a>
+<a name="ln25">// What makes the code complicated is the fact that we are not just reading</a>
+<a name="ln26">// in the whole bitmap and operate on that in memory - e.g. a 13 GB partition</a>
+<a name="ln27">// with a block size of 2048 bytes already has a 800kB bitmap, and the size</a>
+<a name="ln28">// of partitions will grow even more - so that's not an option.</a>
+<a name="ln29">// Instead we are reading in every block when it's used - since an allocation</a>
+<a name="ln30">// group can span several blocks in the block bitmap, the AllocationBlock</a>
+<a name="ln31">// class is there to make handling those easier.</a>
+<a name="ln32"> </a>
+<a name="ln33">// The current implementation is only slightly optimized and could probably</a>
+<a name="ln34">// be improved a lot. Furthermore, the allocation policies used here should</a>
+<a name="ln35">// have some real world tests.</a>
+<a name="ln36"> </a>
+<a name="ln37">#if BFS_TRACING &amp;&amp; !defined(FS_SHELL)</a>
+<a name="ln38">namespace BFSBlockTracing {</a>
+<a name="ln39"> </a>
+<a name="ln40"> </a>
+<a name="ln41">class Allocate : public AbstractTraceEntry {</a>
+<a name="ln42">public:</a>
+<a name="ln43">	Allocate(block_run run)</a>
+<a name="ln44">		:</a>
+<a name="ln45">		fRun(run)</a>
+<a name="ln46">	{</a>
+<a name="ln47">		Initialized();</a>
+<a name="ln48">	}</a>
+<a name="ln49"> </a>
+<a name="ln50">	virtual void AddDump(TraceOutput&amp; out)</a>
+<a name="ln51">	{</a>
+<a name="ln52">		out.Print(&quot;bfs:alloc %lu.%u.%u&quot;, fRun.AllocationGroup(),</a>
+<a name="ln53">			fRun.Start(), fRun.Length());</a>
+<a name="ln54">	}</a>
+<a name="ln55"> </a>
+<a name="ln56">	const block_run&amp; Run() const { return fRun; }</a>
+<a name="ln57"> </a>
+<a name="ln58">private:</a>
+<a name="ln59">			block_run			fRun;</a>
+<a name="ln60">};</a>
+<a name="ln61"> </a>
+<a name="ln62"> </a>
+<a name="ln63">class Free : public AbstractTraceEntry {</a>
+<a name="ln64">public:</a>
+<a name="ln65">	Free(block_run run)</a>
+<a name="ln66">		:</a>
+<a name="ln67">		fRun(run)</a>
+<a name="ln68">	{</a>
+<a name="ln69">		Initialized();</a>
+<a name="ln70">	}</a>
+<a name="ln71"> </a>
+<a name="ln72">	virtual void AddDump(TraceOutput&amp; out)</a>
+<a name="ln73">	{</a>
+<a name="ln74">		out.Print(&quot;bfs:free %lu.%u.%u&quot;, fRun.AllocationGroup(),</a>
+<a name="ln75">			fRun.Start(), fRun.Length());</a>
+<a name="ln76">	}</a>
+<a name="ln77"> </a>
+<a name="ln78">	const block_run&amp; Run() const { return fRun; }</a>
+<a name="ln79"> </a>
+<a name="ln80">private:</a>
+<a name="ln81">			block_run			fRun;</a>
+<a name="ln82">};</a>
+<a name="ln83"> </a>
+<a name="ln84"> </a>
+<a name="ln85">static uint32</a>
+<a name="ln86">checksum(const uint8* data, size_t size)</a>
+<a name="ln87">{</a>
+<a name="ln88">	const uint32* data4 = (const uint32*)data;</a>
+<a name="ln89">	uint32 sum = 0;</a>
+<a name="ln90">	while (size &gt;= 4) {</a>
+<a name="ln91">		sum += *data4;</a>
+<a name="ln92">		data4++;</a>
+<a name="ln93">		size -= 4;</a>
+<a name="ln94">	}</a>
+<a name="ln95">	return sum;</a>
+<a name="ln96">}</a>
+<a name="ln97"> </a>
+<a name="ln98"> </a>
+<a name="ln99">class Block : public AbstractTraceEntry {</a>
+<a name="ln100">public:</a>
+<a name="ln101">	Block(const char* label, off_t blockNumber, const uint8* data,</a>
+<a name="ln102">			size_t size, uint32 start = 0, uint32 length = 0)</a>
+<a name="ln103">		:</a>
+<a name="ln104">		fBlock(blockNumber),</a>
+<a name="ln105">		fData(data),</a>
+<a name="ln106">		fStart(start),</a>
+<a name="ln107">		fLength(length),</a>
+<a name="ln108">		fLabel(label)</a>
+<a name="ln109">	{</a>
+<a name="ln110">		fSum = checksum(data, size);</a>
+<a name="ln111">		Initialized();</a>
+<a name="ln112">	}</a>
+<a name="ln113"> </a>
+<a name="ln114">	virtual void AddDump(TraceOutput&amp; out)</a>
+<a name="ln115">	{</a>
+<a name="ln116">		out.Print(&quot;bfs:%s: block %Ld (%p), sum %lu, s/l %lu/%lu&quot;, fLabel,</a>
+<a name="ln117">			fBlock, fData, fSum, fStart, fLength);</a>
+<a name="ln118">	}</a>
+<a name="ln119"> </a>
+<a name="ln120">private:</a>
+<a name="ln121">			off_t				fBlock;</a>
+<a name="ln122">			const uint8*		fData;</a>
+<a name="ln123">			uint32				fStart;</a>
+<a name="ln124">			uint32				fLength;</a>
+<a name="ln125">			uint32				fSum;</a>
+<a name="ln126">			const char*			fLabel;</a>
+<a name="ln127">};</a>
+<a name="ln128"> </a>
+<a name="ln129"> </a>
+<a name="ln130">class BlockChange : public AbstractTraceEntry {</a>
+<a name="ln131">public:</a>
+<a name="ln132">	BlockChange(const char* label, int32 block, uint32 oldData, uint32 newData)</a>
+<a name="ln133">		:</a>
+<a name="ln134">		fBlock(block),</a>
+<a name="ln135">		fOldData(oldData),</a>
+<a name="ln136">		fNewData(newData),</a>
+<a name="ln137">		fLabel(label)</a>
+<a name="ln138">	{</a>
+<a name="ln139">		Initialized();</a>
+<a name="ln140">	}</a>
+<a name="ln141"> </a>
+<a name="ln142">	virtual void AddDump(TraceOutput&amp; out)</a>
+<a name="ln143">	{</a>
+<a name="ln144">		out.Print(&quot;bfs:%s: block %ld, %08lx -&gt; %08lx&quot;, fLabel,</a>
+<a name="ln145">			fBlock, fOldData, fNewData);</a>
+<a name="ln146">	}</a>
+<a name="ln147"> </a>
+<a name="ln148">private:</a>
+<a name="ln149">			int32				fBlock;</a>
+<a name="ln150">			uint32				fOldData;</a>
+<a name="ln151">			uint32				fNewData;</a>
+<a name="ln152">			const char*			fLabel;</a>
+<a name="ln153">};</a>
+<a name="ln154"> </a>
+<a name="ln155"> </a>
+<a name="ln156">}	// namespace BFSBlockTracing</a>
+<a name="ln157"> </a>
+<a name="ln158">#	define T(x) new(std::nothrow) BFSBlockTracing::x;</a>
+<a name="ln159">#else</a>
+<a name="ln160">#	define T(x) ;</a>
+<a name="ln161">#endif</a>
+<a name="ln162"> </a>
+<a name="ln163">#ifdef DEBUG_ALLOCATION_GROUPS</a>
+<a name="ln164">#	define CHECK_ALLOCATION_GROUP(group) _CheckGroup(group)</a>
+<a name="ln165">#else</a>
+<a name="ln166">#	define CHECK_ALLOCATION_GROUP(group) ;</a>
+<a name="ln167">#endif</a>
+<a name="ln168"> </a>
+<a name="ln169"> </a>
+<a name="ln170">class AllocationBlock : public CachedBlock {</a>
+<a name="ln171">public:</a>
+<a name="ln172">	AllocationBlock(Volume* volume);</a>
+<a name="ln173"> </a>
+<a name="ln174">	inline void Allocate(uint16 start, uint16 numBlocks);</a>
+<a name="ln175">	inline void Free(uint16 start, uint16 numBlocks);</a>
+<a name="ln176">	inline bool IsUsed(uint16 block);</a>
+<a name="ln177"> </a>
+<a name="ln178">	status_t SetTo(AllocationGroup&amp; group, uint16 block);</a>
+<a name="ln179">	status_t SetToWritable(Transaction&amp; transaction, AllocationGroup&amp; group,</a>
+<a name="ln180">		uint16 block);</a>
+<a name="ln181"> </a>
+<a name="ln182">	uint32 NumBlockBits() const { return fNumBits; }</a>
+<a name="ln183">	uint32&amp; Block(int32 index) { return ((uint32*)fBlock)[index]; }</a>
+<a name="ln184">	uint8* Block() const { return (uint8*)fBlock; }</a>
+<a name="ln185"> </a>
+<a name="ln186">private:</a>
+<a name="ln187">	uint32	fNumBits;</a>
+<a name="ln188">#ifdef DEBUG</a>
+<a name="ln189">	bool	fWritable;</a>
+<a name="ln190">#endif</a>
+<a name="ln191">};</a>
+<a name="ln192"> </a>
+<a name="ln193"> </a>
+<a name="ln194">class AllocationGroup {</a>
+<a name="ln195">public:</a>
+<a name="ln196">	AllocationGroup();</a>
+<a name="ln197"> </a>
+<a name="ln198">	void AddFreeRange(int32 start, int32 blocks);</a>
+<a name="ln199">	bool IsFull() const { return fFreeBits == 0; }</a>
+<a name="ln200"> </a>
+<a name="ln201">	status_t Allocate(Transaction&amp; transaction, uint16 start, int32 length);</a>
+<a name="ln202">	status_t Free(Transaction&amp; transaction, uint16 start, int32 length);</a>
+<a name="ln203"> </a>
+<a name="ln204">	uint32 NumBits() const { return fNumBits; }</a>
+<a name="ln205">	uint32 NumBlocks() const { return fNumBlocks; }</a>
+<a name="ln206">	int32 Start() const { return fStart; }</a>
+<a name="ln207"> </a>
+<a name="ln208">private:</a>
+<a name="ln209">	friend class BlockAllocator;</a>
+<a name="ln210"> </a>
+<a name="ln211">	uint32	fNumBits;</a>
+<a name="ln212">	uint32	fNumBlocks;</a>
+<a name="ln213">	int32	fStart;</a>
+<a name="ln214">	int32	fFirstFree;</a>
+<a name="ln215">	int32	fFreeBits;</a>
+<a name="ln216"> </a>
+<a name="ln217">	int32	fLargestStart;</a>
+<a name="ln218">	int32	fLargestLength;</a>
+<a name="ln219">	bool	fLargestValid;</a>
+<a name="ln220">};</a>
+<a name="ln221"> </a>
+<a name="ln222"> </a>
+<a name="ln223">AllocationBlock::AllocationBlock(Volume* volume)</a>
+<a name="ln224">	: CachedBlock(volume)</a>
+<a name="ln225">{</a>
+<a name="ln226">}</a>
+<a name="ln227"> </a>
+<a name="ln228"> </a>
+<a name="ln229">status_t</a>
+<a name="ln230">AllocationBlock::SetTo(AllocationGroup&amp; group, uint16 block)</a>
+<a name="ln231">{</a>
+<a name="ln232">	// 8 blocks per byte</a>
+<a name="ln233">	fNumBits = fVolume-&gt;BlockSize() &lt;&lt; 3;</a>
+<a name="ln234">	// the last group may have less bits than the others</a>
+<a name="ln235">	if ((block + 1) * fNumBits &gt; group.NumBits())</a>
+<a name="ln236">		fNumBits = group.NumBits() % fNumBits;</a>
+<a name="ln237"> </a>
+<a name="ln238">#ifdef DEBUG</a>
+<a name="ln239">	fWritable = false;</a>
+<a name="ln240">#endif</a>
+<a name="ln241">	return CachedBlock::SetTo(group.Start() + block) != NULL ? B_OK : B_ERROR;</a>
+<a name="ln242">}</a>
+<a name="ln243"> </a>
+<a name="ln244"> </a>
+<a name="ln245">status_t</a>
+<a name="ln246">AllocationBlock::SetToWritable(Transaction&amp; transaction, AllocationGroup&amp; group,</a>
+<a name="ln247">	uint16 block)</a>
+<a name="ln248">{</a>
+<a name="ln249">	// 8 blocks per byte</a>
+<a name="ln250">	fNumBits = fVolume-&gt;BlockSize() &lt;&lt; 3;</a>
+<a name="ln251">	// the last group may have less bits in the last block</a>
+<a name="ln252">	if ((block + 1) * fNumBits &gt; group.NumBits())</a>
+<a name="ln253">		fNumBits = group.NumBits() % fNumBits;</a>
+<a name="ln254"> </a>
+<a name="ln255">#ifdef DEBUG</a>
+<a name="ln256">	fWritable = true;</a>
+<a name="ln257">#endif</a>
+<a name="ln258">	return CachedBlock::SetToWritable(transaction, group.Start() + block)</a>
+<a name="ln259">		!= NULL ? B_OK : B_ERROR;</a>
+<a name="ln260">}</a>
+<a name="ln261"> </a>
+<a name="ln262"> </a>
+<a name="ln263">bool</a>
+<a name="ln264">AllocationBlock::IsUsed(uint16 block)</a>
+<a name="ln265">{</a>
+<a name="ln266">	if (block &gt; fNumBits)</a>
+<a name="ln267">		return true;</a>
+<a name="ln268"> </a>
+<a name="ln269">	// the block bitmap is accessed in 32-bit blocks</a>
+<a name="ln270">	return Block(block &gt;&gt; 5) &amp; HOST_ENDIAN_TO_BFS_INT32(1UL &lt;&lt; (block % 32));</a>
+<a name="ln271">}</a>
+<a name="ln272"> </a>
+<a name="ln273"> </a>
+<a name="ln274">void</a>
+<a name="ln275">AllocationBlock::Allocate(uint16 start, uint16 numBlocks)</a>
+<a name="ln276">{</a>
+<a name="ln277">	ASSERT(start &lt; fNumBits);</a>
+<a name="ln278">	ASSERT(uint32(start + numBlocks) &lt;= fNumBits);</a>
+<a name="ln279">#ifdef DEBUG</a>
+<a name="ln280">	ASSERT(fWritable);</a>
+<a name="ln281">#endif</a>
+<a name="ln282"> </a>
+<a name="ln283">	T(Block(&quot;b-alloc-in&quot;, fBlockNumber, fBlock, fVolume-&gt;BlockSize(),</a>
+<a name="ln284">		start, numBlocks));</a>
+<a name="ln285"> </a>
+<a name="ln286">	int32 block = start &gt;&gt; 5;</a>
+<a name="ln287"> </a>
+<a name="ln288">	while (numBlocks &gt; 0) {</a>
+<a name="ln289">		uint32 mask = 0;</a>
+<a name="ln290">		for (int32 i = start % 32; i &lt; 32 &amp;&amp; numBlocks; i++, numBlocks--)</a>
+<a name="ln291">			mask |= 1UL &lt;&lt; i;</a>
+<a name="ln292"> </a>
+<a name="ln293">		T(BlockChange(&quot;b-alloc&quot;, block, Block(block),</a>
+<a name="ln294">			Block(block) | HOST_ENDIAN_TO_BFS_INT32(mask)));</a>
+<a name="ln295"> </a>
+<a name="ln296">#if KDEBUG</a>
+<a name="ln297">		// check for already set blocks</a>
+<a name="ln298">		if (HOST_ENDIAN_TO_BFS_INT32(mask) &amp; ((uint32*)fBlock)[block]) {</a>
+<a name="ln299">			FATAL((&quot;AllocationBlock::Allocate(): some blocks are already &quot;</a>
+<a name="ln300">				&quot;allocated, start = %u, numBlocks = %u\n&quot;, start, numBlocks));</a>
+<a name="ln301">			panic(&quot;blocks already set!&quot;);</a>
+<a name="ln302">		}</a>
+<a name="ln303">#endif</a>
+<a name="ln304"> </a>
+<a name="ln305">		Block(block++) |= HOST_ENDIAN_TO_BFS_INT32(mask);</a>
+<a name="ln306">		start = 0;</a>
+<a name="ln307">	}</a>
+<a name="ln308">	T(Block(&quot;b-alloc-out&quot;, fBlockNumber, fBlock, fVolume-&gt;BlockSize(),</a>
+<a name="ln309">		start, numBlocks));</a>
+<a name="ln310">}</a>
+<a name="ln311"> </a>
+<a name="ln312"> </a>
+<a name="ln313">void</a>
+<a name="ln314">AllocationBlock::Free(uint16 start, uint16 numBlocks)</a>
+<a name="ln315">{</a>
+<a name="ln316">	ASSERT(start &lt; fNumBits);</a>
+<a name="ln317">	ASSERT(uint32(start + numBlocks) &lt;= fNumBits);</a>
+<a name="ln318">#ifdef DEBUG</a>
+<a name="ln319">	ASSERT(fWritable);</a>
+<a name="ln320">#endif</a>
+<a name="ln321"> </a>
+<a name="ln322">	int32 block = start &gt;&gt; 5;</a>
+<a name="ln323"> </a>
+<a name="ln324">	while (numBlocks &gt; 0) {</a>
+<a name="ln325">		uint32 mask = 0;</a>
+<a name="ln326">		for (int32 i = start % 32; i &lt; 32 &amp;&amp; numBlocks; i++, numBlocks--)</a>
+<a name="ln327">			mask |= 1UL &lt;&lt; (i % 32);</a>
+<a name="ln328"> </a>
+<a name="ln329">		T(BlockChange(&quot;b-free&quot;, block, Block(block),</a>
+<a name="ln330">			Block(block) &amp; HOST_ENDIAN_TO_BFS_INT32(~mask)));</a>
+<a name="ln331"> </a>
+<a name="ln332">		Block(block++) &amp;= HOST_ENDIAN_TO_BFS_INT32(~mask);</a>
+<a name="ln333">		start = 0;</a>
+<a name="ln334">	}</a>
+<a name="ln335">}</a>
+<a name="ln336"> </a>
+<a name="ln337"> </a>
+<a name="ln338">//	#pragma mark -</a>
+<a name="ln339"> </a>
+<a name="ln340"> </a>
+<a name="ln341">/*!	The allocation groups are created and initialized in</a>
+<a name="ln342">	BlockAllocator::Initialize() and BlockAllocator::InitializeAndClearBitmap()</a>
+<a name="ln343">	respectively.</a>
+<a name="ln344">*/</a>
+<a name="ln345">AllocationGroup::AllocationGroup()</a>
+<a name="ln346">	:</a>
+<a name="ln347">	fFirstFree(-1),</a>
+<a name="ln348">	fFreeBits(0),</a>
+<a name="ln349">	fLargestValid(false)</a>
+<a name="ln350">{</a>
+<a name="ln351">}</a>
+<a name="ln352"> </a>
+<a name="ln353"> </a>
+<a name="ln354">void</a>
+<a name="ln355">AllocationGroup::AddFreeRange(int32 start, int32 blocks)</a>
+<a name="ln356">{</a>
+<a name="ln357">	//D(if (blocks &gt; 512)</a>
+<a name="ln358">	//	PRINT((&quot;range of %ld blocks starting at %ld\n&quot;,blocks,start)));</a>
+<a name="ln359"> </a>
+<a name="ln360">	if (fFirstFree == -1)</a>
+<a name="ln361">		fFirstFree = start;</a>
+<a name="ln362"> </a>
+<a name="ln363">	if (!fLargestValid || fLargestLength &lt; blocks) {</a>
+<a name="ln364">		fLargestStart = start;</a>
+<a name="ln365">		fLargestLength = blocks;</a>
+<a name="ln366">		fLargestValid = true;</a>
+<a name="ln367">	}</a>
+<a name="ln368"> </a>
+<a name="ln369">	fFreeBits += blocks;</a>
+<a name="ln370">}</a>
+<a name="ln371"> </a>
+<a name="ln372"> </a>
+<a name="ln373">/*!	Allocates the specified run in the allocation group.</a>
+<a name="ln374">	Doesn't check if the run is valid or already allocated partially, nor</a>
+<a name="ln375">	does it maintain the free ranges hints or the volume's used blocks count.</a>
+<a name="ln376">	It only does the low-level work of allocating some bits in the block bitmap.</a>
+<a name="ln377">	Assumes that the block bitmap lock is hold.</a>
+<a name="ln378">*/</a>
+<a name="ln379">status_t</a>
+<a name="ln380">AllocationGroup::Allocate(Transaction&amp; transaction, uint16 start, int32 length)</a>
+<a name="ln381">{</a>
+<a name="ln382">	ASSERT(start + length &lt;= (int32)fNumBits);</a>
+<a name="ln383"> </a>
+<a name="ln384">	// Update the allocation group info</a>
+<a name="ln385">	// TODO: this info will be incorrect if something goes wrong later</a>
+<a name="ln386">	// Note, the fFirstFree block doesn't have to be really free</a>
+<a name="ln387">	if (start == fFirstFree)</a>
+<a name="ln388">		fFirstFree = start + length;</a>
+<a name="ln389">	fFreeBits -= length;</a>
+<a name="ln390"> </a>
+<a name="ln391">	if (fLargestValid) {</a>
+<a name="ln392">		bool cut = false;</a>
+<a name="ln393">		if (fLargestStart == start) {</a>
+<a name="ln394">			// cut from start</a>
+<a name="ln395">			fLargestStart += length;</a>
+<a name="ln396">			fLargestLength -= length;</a>
+<a name="ln397">			cut = true;</a>
+<a name="ln398">		} else if (start &gt; fLargestStart</a>
+<a name="ln399">			&amp;&amp; start &lt; fLargestStart + fLargestLength) {</a>
+<a name="ln400">			// cut from end</a>
+<a name="ln401">			fLargestLength = start - fLargestStart;</a>
+<a name="ln402">			cut = true;</a>
+<a name="ln403">		}</a>
+<a name="ln404">		if (cut &amp;&amp; (fLargestLength &lt; fLargestStart</a>
+<a name="ln405">				|| fLargestLength</a>
+<a name="ln406">						&lt; (int32)fNumBits - (fLargestStart + fLargestLength))) {</a>
+<a name="ln407">			// might not be the largest block anymore</a>
+<a name="ln408">			fLargestValid = false;</a>
+<a name="ln409">		}</a>
+<a name="ln410">	}</a>
+<a name="ln411"> </a>
+<a name="ln412">	Volume* volume = transaction.GetVolume();</a>
+<a name="ln413"> </a>
+<a name="ln414">	// calculate block in the block bitmap and position within</a>
+<a name="ln415">	uint32 bitsPerBlock = volume-&gt;BlockSize() &lt;&lt; 3;</a>
+<a name="ln416">	uint32 block = start / bitsPerBlock;</a>
+<a name="ln417">	start = start % bitsPerBlock;</a>
+<a name="ln418"> </a>
+<a name="ln419">	AllocationBlock cached(volume);</a>
+<a name="ln420"> </a>
+<a name="ln421">	while (length &gt; 0) {</a>
+<a name="ln422">		if (cached.SetToWritable(transaction, *this, block) &lt; B_OK) {</a>
+<a name="ln423">			fLargestValid = false;</a>
+<a name="ln424">			RETURN_ERROR(B_IO_ERROR);</a>
+<a name="ln425">		}</a>
+<a name="ln426"> </a>
+<a name="ln427">		uint32 numBlocks = length;</a>
+<a name="ln428">		if (start + numBlocks &gt; cached.NumBlockBits())</a>
+<a name="ln429">			numBlocks = cached.NumBlockBits() - start;</a>
+<a name="ln430"> </a>
+<a name="ln431">		cached.Allocate(start, numBlocks);</a>
+<a name="ln432"> </a>
+<a name="ln433">		length -= numBlocks;</a>
+<a name="ln434">		start = 0;</a>
+<a name="ln435">		block++;</a>
+<a name="ln436">	}</a>
+<a name="ln437"> </a>
+<a name="ln438">	return B_OK;</a>
+<a name="ln439">}</a>
+<a name="ln440"> </a>
+<a name="ln441"> </a>
+<a name="ln442">/*!	Frees the specified run in the allocation group.</a>
+<a name="ln443">	Doesn't check if the run is valid or was not completely allocated, nor</a>
+<a name="ln444">	does it maintain the free ranges hints or the volume's used blocks count.</a>
+<a name="ln445">	It only does the low-level work of freeing some bits in the block bitmap.</a>
+<a name="ln446">	Assumes that the block bitmap lock is hold.</a>
+<a name="ln447">*/</a>
+<a name="ln448">status_t</a>
+<a name="ln449">AllocationGroup::Free(Transaction&amp; transaction, uint16 start, int32 length)</a>
+<a name="ln450">{</a>
+<a name="ln451">	ASSERT(start + length &lt;= (int32)fNumBits);</a>
+<a name="ln452"> </a>
+<a name="ln453">	// Update the allocation group info</a>
+<a name="ln454">	// TODO: this info will be incorrect if something goes wrong later</a>
+<a name="ln455">	if (fFirstFree &gt; start)</a>
+<a name="ln456">		fFirstFree = start;</a>
+<a name="ln457">	fFreeBits += length;</a>
+<a name="ln458"> </a>
+<a name="ln459">	// The range to be freed cannot be part of the valid largest range</a>
+<a name="ln460">	ASSERT(!fLargestValid || start + length &lt;= fLargestStart</a>
+<a name="ln461">		|| start &gt; fLargestStart);</a>
+<a name="ln462"> </a>
+<a name="ln463">	if (fLargestValid</a>
+<a name="ln464">		&amp;&amp; (start + length == fLargestStart</a>
+<a name="ln465">			|| fLargestStart + fLargestLength == start</a>
+<a name="ln466">			|| (start &lt; fLargestStart &amp;&amp; fLargestStart &gt; fLargestLength)</a>
+<a name="ln467">			|| (start &gt; fLargestStart</a>
+<a name="ln468">				&amp;&amp; (int32)fNumBits - (fLargestStart + fLargestLength)</a>
+<a name="ln469">						&gt; fLargestLength))) {</a>
+<a name="ln470">		fLargestValid = false;</a>
+<a name="ln471">	}</a>
+<a name="ln472"> </a>
+<a name="ln473">	Volume* volume = transaction.GetVolume();</a>
+<a name="ln474"> </a>
+<a name="ln475">	// calculate block in the block bitmap and position within</a>
+<a name="ln476">	uint32 bitsPerBlock = volume-&gt;BlockSize() &lt;&lt; 3;</a>
+<a name="ln477">	uint32 block = start / bitsPerBlock;</a>
+<a name="ln478">	start = start % bitsPerBlock;</a>
+<a name="ln479"> </a>
+<a name="ln480">	AllocationBlock cached(volume);</a>
+<a name="ln481"> </a>
+<a name="ln482">	while (length &gt; 0) {</a>
+<a name="ln483">		if (cached.SetToWritable(transaction, *this, block) &lt; B_OK)</a>
+<a name="ln484">			RETURN_ERROR(B_IO_ERROR);</a>
+<a name="ln485"> </a>
+<a name="ln486">		T(Block(&quot;free-1&quot;, block, cached.Block(), volume-&gt;BlockSize()));</a>
+<a name="ln487">		uint16 freeLength = length;</a>
+<a name="ln488">		if (uint32(start + length) &gt; cached.NumBlockBits())</a>
+<a name="ln489">			freeLength = cached.NumBlockBits() - start;</a>
+<a name="ln490"> </a>
+<a name="ln491">		cached.Free(start, freeLength);</a>
+<a name="ln492"> </a>
+<a name="ln493">		length -= freeLength;</a>
+<a name="ln494">		start = 0;</a>
+<a name="ln495">		T(Block(&quot;free-2&quot;, block, cached.Block(), volume-&gt;BlockSize()));</a>
+<a name="ln496">		block++;</a>
+<a name="ln497">	}</a>
+<a name="ln498">	return B_OK;</a>
+<a name="ln499">}</a>
+<a name="ln500"> </a>
+<a name="ln501"> </a>
+<a name="ln502">//	#pragma mark -</a>
+<a name="ln503"> </a>
+<a name="ln504"> </a>
+<a name="ln505">BlockAllocator::BlockAllocator(Volume* volume)</a>
+<a name="ln506">	:</a>
+<a name="ln507">	fVolume(volume),</a>
+<a name="ln508">	fGroups(NULL)</a>
+<a name="ln509">	//fCheckBitmap(NULL),</a>
+<a name="ln510">	//fCheckCookie(NULL)</a>
+<a name="ln511">{</a>
+<a name="ln512">	recursive_lock_init(&amp;fLock, &quot;bfs allocator&quot;);</a>
+<a name="ln513">}</a>
+<a name="ln514"> </a>
+<a name="ln515"> </a>
+<a name="ln516">BlockAllocator::~BlockAllocator()</a>
+<a name="ln517">{</a>
+<a name="ln518">	recursive_lock_destroy(&amp;fLock);</a>
+<a name="ln519">	delete[] fGroups;</a>
+<a name="ln520">}</a>
+<a name="ln521"> </a>
+<a name="ln522"> </a>
+<a name="ln523">status_t</a>
+<a name="ln524">BlockAllocator::Initialize(bool full)</a>
+<a name="ln525">{</a>
+<a name="ln526">	fNumGroups = fVolume-&gt;AllocationGroups();</a>
+<a name="ln527">	fBlocksPerGroup = fVolume-&gt;SuperBlock().BlocksPerAllocationGroup();</a>
+<a name="ln528">	//fNumBlocks = (fVolume-&gt;NumBlocks() + fVolume-&gt;BlockSize() * 8 - 1)</a>
+<a name="ln529">		/// (fVolume-&gt;BlockSize() * 8);</a>
+<a name="ln530">	fNumBlocks = fVolume-&gt;NumBitmapBlocks();</a>
+<a name="ln531"> </a>
+<a name="ln532">	fGroups = new(std::nothrow) AllocationGroup[fNumGroups];</a>
+<a name="ln533">	if (fGroups == NULL)</a>
+<a name="ln534">		return B_NO_MEMORY;</a>
+<a name="ln535"> </a>
+<a name="ln536">	if (!full)</a>
+<a name="ln537">		return B_OK;</a>
+<a name="ln538"> </a>
+<a name="ln539">	recursive_lock_lock(&amp;fLock);</a>
+<a name="ln540">		// the lock will be released by the _Initialize() method</a>
+<a name="ln541"> </a>
+<a name="ln542">	thread_id id = spawn_kernel_thread((thread_func)BlockAllocator::_Initialize,</a>
+<a name="ln543">		&quot;bfs block allocator&quot;, B_LOW_PRIORITY, this);</a>
+<a name="ln544">	if (id &lt; B_OK)</a>
+<a name="ln545">		return _Initialize(this);</a>
+<a name="ln546"> </a>
+<a name="ln547">	recursive_lock_transfer_lock(&amp;fLock, id);</a>
+<a name="ln548"> </a>
+<a name="ln549">	return resume_thread(id);</a>
+<a name="ln550">}</a>
+<a name="ln551"> </a>
+<a name="ln552"> </a>
+<a name="ln553">status_t</a>
+<a name="ln554">BlockAllocator::InitializeAndClearBitmap(Transaction&amp; transaction)</a>
+<a name="ln555">{</a>
+<a name="ln556">	status_t status = Initialize(false);</a>
+<a name="ln557">	if (status != B_OK)</a>
+<a name="ln558">		return status;</a>
+<a name="ln559"> </a>
+<a name="ln560">	uint32 numBits = 8 * fBlocksPerGroup * fVolume-&gt;BlockSize();</a>
+<a name="ln561">	uint32 blockShift = fVolume-&gt;BlockShift();</a>
+<a name="ln562"> </a>
+<a name="ln563">	uint32* buffer = (uint32*)malloc(numBits &gt;&gt; 3);</a>
+<a name="ln564">	if (buffer == NULL)</a>
+<a name="ln565">		RETURN_ERROR(B_NO_MEMORY);</a>
+<a name="ln566"> </a>
+<a name="ln567">	memset(buffer, 0, numBits &gt;&gt; 3);</a>
+<a name="ln568"> </a>
+<a name="ln569">	off_t offset = 1;</a>
+<a name="ln570">		// the bitmap starts directly after the superblock</a>
+<a name="ln571"> </a>
+<a name="ln572">	// initialize the AllocationGroup objects and clear the on-disk bitmap</a>
+<a name="ln573"> </a>
+<a name="ln574">	for (int32 i = 0; i &lt; fNumGroups; i++) {</a>
+<a name="ln575">		if (write_pos(fVolume-&gt;Device(), offset &lt;&lt; blockShift, buffer,</a>
+<a name="ln576">				fBlocksPerGroup &lt;&lt; blockShift) &lt; B_OK) {</a>
+<a name="ln577">			free(buffer);</a>
+<a name="ln578">			return B_ERROR;</a>
+<a name="ln579">		}</a>
+<a name="ln580"> </a>
+<a name="ln581">		// the last allocation group may contain less blocks than the others</a>
+<a name="ln582">		if (i == fNumGroups - 1) {</a>
+<a name="ln583">			fGroups[i].fNumBits = fVolume-&gt;NumBlocks() - i * numBits;</a>
+<a name="ln584">			fGroups[i].fNumBlocks = 1 + ((fGroups[i].NumBits() - 1)</a>
+<a name="ln585">				&gt;&gt; (blockShift + 3));</a>
+<a name="ln586">		} else {</a>
+<a name="ln587">			fGroups[i].fNumBits = numBits;</a>
+<a name="ln588">			fGroups[i].fNumBlocks = fBlocksPerGroup;</a>
+<a name="ln589">		}</a>
+<a name="ln590">		fGroups[i].fStart = offset;</a>
+<a name="ln591">		fGroups[i].fFirstFree = fGroups[i].fLargestStart = 0;</a>
+<a name="ln592">		fGroups[i].fFreeBits = fGroups[i].fLargestLength = fGroups[i].fNumBits;</a>
+<a name="ln593">		fGroups[i].fLargestValid = true;</a>
+<a name="ln594"> </a>
+<a name="ln595">		offset += fBlocksPerGroup;</a>
+<a name="ln596">	}</a>
+<a name="ln597">	free(buffer);</a>
+<a name="ln598"> </a>
+<a name="ln599">	// reserve the boot block, the log area, and the block bitmap itself</a>
+<a name="ln600">	uint32 reservedBlocks = fVolume-&gt;Log().Start() + fVolume-&gt;Log().Length();</a>
+<a name="ln601"> </a>
+<a name="ln602">	if (fGroups[0].Allocate(transaction, 0, reservedBlocks) &lt; B_OK) {</a>
+<a name="ln603">		FATAL((&quot;could not allocate reserved space for block bitmap/log!\n&quot;));</a>
+<a name="ln604">		return B_ERROR;</a>
+<a name="ln605">	}</a>
+<a name="ln606">	fVolume-&gt;SuperBlock().used_blocks</a>
+<a name="ln607">		= HOST_ENDIAN_TO_BFS_INT64(reservedBlocks);</a>
+<a name="ln608"> </a>
+<a name="ln609">	return B_OK;</a>
+<a name="ln610">}</a>
+<a name="ln611"> </a>
+<a name="ln612"> </a>
+<a name="ln613">status_t</a>
+<a name="ln614">BlockAllocator::_Initialize(BlockAllocator* allocator)</a>
+<a name="ln615">{</a>
+<a name="ln616">	// The lock must already be held at this point</a>
+<a name="ln617">	RecursiveLocker locker(allocator-&gt;fLock, true);</a>
+<a name="ln618"> </a>
+<a name="ln619">	Volume* volume = allocator-&gt;fVolume;</a>
+<a name="ln620">	uint32 blocks = allocator-&gt;fBlocksPerGroup;</a>
+<a name="ln621">	uint32 blockShift = volume-&gt;BlockShift();</a>
+<a name="ln622">	off_t freeBlocks = 0;</a>
+<a name="ln623"> </a>
+<a name="ln624">	uint32* buffer = (uint32*)malloc(blocks &lt;&lt; blockShift);</a>
+<a name="ln625">	if (buffer == NULL)</a>
+<a name="ln626">		RETURN_ERROR(B_NO_MEMORY);</a>
+<a name="ln627"> </a>
+<a name="ln628">	AllocationGroup* groups = allocator-&gt;fGroups;</a>
+<a name="ln629">	off_t offset = 1;</a>
+<a name="ln630">	uint32 bitsPerGroup = 8 * (blocks &lt;&lt; blockShift);</a>
+<a name="ln631">	int32 numGroups = allocator-&gt;fNumGroups;</a>
+<a name="ln632"> </a>
+<a name="ln633">	for (int32 i = 0; i &lt; numGroups; i++) {</a>
+<a name="ln634">		if (read_pos(volume-&gt;Device(), offset &lt;&lt; blockShift, buffer,</a>
+<a name="ln635">				blocks &lt;&lt; blockShift) &lt; B_OK)</a>
+<a name="ln636">			break;</a>
+<a name="ln637"> </a>
+<a name="ln638">		// the last allocation group may contain less blocks than the others</a>
+<a name="ln639">		if (i == numGroups - 1) {</a>
+<a name="ln640">			groups[i].fNumBits = volume-&gt;NumBlocks() - i * bitsPerGroup;</a>
+<a name="ln641">			groups[i].fNumBlocks = 1 + ((groups[i].NumBits() - 1)</a>
+<a name="ln642">				&gt;&gt; (blockShift + 3));</a>
+<a name="ln643">		} else {</a>
+<a name="ln644">			groups[i].fNumBits = bitsPerGroup;</a>
+<a name="ln645">			groups[i].fNumBlocks = blocks;</a>
+<a name="ln646">		}</a>
+<a name="ln647">		groups[i].fStart = offset;</a>
+<a name="ln648"> </a>
+<a name="ln649">		// finds all free ranges in this allocation group</a>
+<a name="ln650">		int32 start = -1, range = 0;</a>
+<a name="ln651">		int32 numBits = groups[i].fNumBits, bit = 0;</a>
+<a name="ln652">		int32 count = (numBits + 31) / 32;</a>
+<a name="ln653"> </a>
+<a name="ln654">		for (int32 k = 0; k &lt; count; k++) {</a>
+<a name="ln655">			for (int32 j = 0; j &lt; 32 &amp;&amp; bit &lt; numBits; j++, bit++) {</a>
+<a name="ln656">				if (buffer[k] &amp; (1UL &lt;&lt; j)) {</a>
+<a name="ln657">					// block is in use</a>
+<a name="ln658">					if (range &gt; 0) {</a>
+<a name="ln659">						groups[i].AddFreeRange(start, range);</a>
+<a name="ln660">						range = 0;</a>
+<a name="ln661">					}</a>
+<a name="ln662">				} else if (range++ == 0) {</a>
+<a name="ln663">					// block is free, start new free range</a>
+<a name="ln664">					start = bit;</a>
+<a name="ln665">				}</a>
+<a name="ln666">			}</a>
+<a name="ln667">		}</a>
+<a name="ln668">		if (range)</a>
+<a name="ln669">			groups[i].AddFreeRange(start, range);</a>
+<a name="ln670"> </a>
+<a name="ln671">		freeBlocks += groups[i].fFreeBits;</a>
+<a name="ln672"> </a>
+<a name="ln673">		offset += blocks;</a>
+<a name="ln674">	}</a>
+<a name="ln675">	free(buffer);</a>
+<a name="ln676"> </a>
+<a name="ln677">	// check if block bitmap and log area are reserved</a>
+<a name="ln678">	uint32 reservedBlocks = volume-&gt;Log().Start() + volume-&gt;Log().Length();</a>
+<a name="ln679"> </a>
+<a name="ln680">	if (allocator-&gt;CheckBlocks(0, reservedBlocks) != B_OK) {</a>
+<a name="ln681">		if (volume-&gt;IsReadOnly()) {</a>
+<a name="ln682">			FATAL((&quot;Space for block bitmap or log area is not reserved &quot;</a>
+<a name="ln683">				&quot;(volume is mounted read-only)!\n&quot;));</a>
+<a name="ln684">		} else {</a>
+<a name="ln685">			Transaction transaction(volume, 0);</a>
+<a name="ln686">			if (groups[0].Allocate(transaction, 0, reservedBlocks) != B_OK) {</a>
+<a name="ln687">				FATAL((&quot;Could not allocate reserved space for block &quot;</a>
+<a name="ln688">					&quot;bitmap/log!\n&quot;));</a>
+<a name="ln689">				volume-&gt;Panic();</a>
+<a name="ln690">			} else {</a>
+<a name="ln691">				transaction.Done();</a>
+<a name="ln692">				FATAL((&quot;Space for block bitmap or log area was not &quot;</a>
+<a name="ln693">					&quot;reserved!\n&quot;));</a>
+<a name="ln694">			}</a>
+<a name="ln695">		}</a>
+<a name="ln696">	}</a>
+<a name="ln697"> </a>
+<a name="ln698">	off_t usedBlocks = volume-&gt;NumBlocks() - freeBlocks;</a>
+<a name="ln699">	if (volume-&gt;UsedBlocks() != usedBlocks) {</a>
+<a name="ln700">		// If the disk in a dirty state at mount time, it's</a>
+<a name="ln701">		// normal that the values don't match</a>
+<a name="ln702">		INFORM((&quot;volume reports %&quot; B_PRIdOFF &quot; used blocks, correct is %&quot;</a>
+<a name="ln703">			B_PRIdOFF &quot;\n&quot;, volume-&gt;UsedBlocks(), usedBlocks));</a>
+<a name="ln704">		volume-&gt;SuperBlock().used_blocks = HOST_ENDIAN_TO_BFS_INT64(usedBlocks);</a>
+<a name="ln705">	}</a>
+<a name="ln706"> </a>
+<a name="ln707">	return B_OK;</a>
+<a name="ln708">}</a>
+<a name="ln709"> </a>
+<a name="ln710"> </a>
+<a name="ln711">void</a>
+<a name="ln712">BlockAllocator::Uninitialize()</a>
+<a name="ln713">{</a>
+<a name="ln714">	// We only have to make sure that the initializer thread isn't running</a>
+<a name="ln715">	// anymore.</a>
+<a name="ln716">	recursive_lock_lock(&amp;fLock);</a>
+<a name="ln717">}</a>
+<a name="ln718"> </a>
+<a name="ln719"> </a>
+<a name="ln720">/*!	Tries to allocate between \a minimum, and \a maximum blocks starting</a>
+<a name="ln721">	at group \a groupIndex with offset \a start. The resulting allocation</a>
+<a name="ln722">	is put into \a run.</a>
+<a name="ln723"> </a>
+<a name="ln724">	The number of allocated blocks is always a multiple of \a minimum which</a>
+<a name="ln725">	has to be a power of two value.</a>
+<a name="ln726">*/</a>
+<a name="ln727">status_t</a>
+<a name="ln728">BlockAllocator::AllocateBlocks(Transaction&amp; transaction, int32 groupIndex,</a>
+<a name="ln729">	uint16 start, uint16 maximum, uint16 minimum, block_run&amp; run)</a>
+<a name="ln730">{</a>
+<a name="ln731">	if (maximum == 0)</a>
+<a name="ln732">		return B_BAD_VALUE;</a>
+<a name="ln733"> </a>
+<a name="ln734">	FUNCTION_START((&quot;group = %ld, start = %u, maximum = %u, minimum = %u\n&quot;,</a>
+<a name="ln735">		groupIndex, start, maximum, minimum));</a>
+<a name="ln736"> </a>
+<a name="ln737">	AllocationBlock cached(fVolume);</a>
+<a name="ln738">	RecursiveLocker lock(fLock);</a>
+<a name="ln739"> </a>
+<a name="ln740">	uint32 bitsPerFullBlock = fVolume-&gt;BlockSize() &lt;&lt; 3;</a>
+<a name="ln741"> </a>
+<a name="ln742">	// Find the block_run that can fulfill the request best</a>
+<a name="ln743">	int32 bestGroup = -1;</a>
+<a name="ln744">	int32 bestStart = -1;</a>
+<a name="ln745">	int32 bestLength = -1;</a>
+<a name="ln746"> </a>
+<a name="ln747">	for (int32 i = 0; i &lt; fNumGroups + 1; i++, groupIndex++, start = 0) {</a>
+<a name="ln748">		groupIndex = groupIndex % fNumGroups;</a>
+<a name="ln749">		AllocationGroup&amp; group = fGroups[groupIndex];</a>
+<a name="ln750"> </a>
+<a name="ln751">		CHECK_ALLOCATION_GROUP(groupIndex);</a>
+<a name="ln752"> </a>
+<a name="ln753">		if (start &gt;= group.NumBits() || group.IsFull())</a>
+<a name="ln754">			continue;</a>
+<a name="ln755"> </a>
+<a name="ln756">		// The wanted maximum is smaller than the largest free block in the</a>
+<a name="ln757">		// group or already smaller than the minimum</a>
+<a name="ln758"> </a>
+<a name="ln759">		if (start &lt; group.fFirstFree)</a>
+<a name="ln760">			start = group.fFirstFree;</a>
+<a name="ln761"> </a>
+<a name="ln762">		if (group.fLargestValid) {</a>
+<a name="ln763">			if (group.fLargestLength &lt; bestLength)</a>
+<a name="ln764">				continue;</a>
+<a name="ln765"> </a>
+<a name="ln766">			if (group.fLargestStart &gt;= start) {</a>
+<a name="ln767">				if (group.fLargestLength &gt;= bestLength) {</a>
+<a name="ln768">					bestGroup = groupIndex;</a>
+<a name="ln769">					bestStart = group.fLargestStart;</a>
+<a name="ln770">					bestLength = group.fLargestLength;</a>
+<a name="ln771"> </a>
+<a name="ln772">					if (bestLength &gt;= maximum)</a>
+<a name="ln773">						break;</a>
+<a name="ln774">				}</a>
+<a name="ln775"> </a>
+<a name="ln776">				// We know everything about this group we have to, let's skip</a>
+<a name="ln777">				// to the next</a>
+<a name="ln778">				continue;</a>
+<a name="ln779">			}</a>
+<a name="ln780">		}</a>
+<a name="ln781"> </a>
+<a name="ln782">		// There may be more than one block per allocation group - and</a>
+<a name="ln783">		// we iterate through it to find a place for the allocation.</a>
+<a name="ln784">		// (one allocation can't exceed one allocation group)</a>
+<a name="ln785"> </a>
+<a name="ln786">		uint32 block = start / (fVolume-&gt;BlockSize() &lt;&lt; 3);</a>
+<a name="ln787">		int32 currentStart = 0, currentLength = 0;</a>
+<a name="ln788">		int32 groupLargestStart = -1;</a>
+<a name="ln789">		int32 groupLargestLength = -1;</a>
+<a name="ln790">		int32 currentBit = start;</a>
+<a name="ln791">		bool canFindGroupLargest = start == 0;</a>
+<a name="ln792"> </a>
+<a name="ln793">		for (; block &lt; group.NumBlocks(); block++) {</a>
+<a name="ln794">			if (cached.SetTo(group, block) &lt; B_OK)</a>
+<a name="ln795">				RETURN_ERROR(B_ERROR);</a>
+<a name="ln796"> </a>
+<a name="ln797">			T(Block(&quot;alloc-in&quot;, group.Start() + block, cached.Block(),</a>
+<a name="ln798">				fVolume-&gt;BlockSize(), groupIndex, currentStart));</a>
+<a name="ln799"> </a>
+<a name="ln800">			// find a block large enough to hold the allocation</a>
+<a name="ln801">			for (uint32 bit = start % bitsPerFullBlock;</a>
+<a name="ln802">					bit &lt; cached.NumBlockBits(); bit++) {</a>
+<a name="ln803">				if (!cached.IsUsed(bit)) {</a>
+<a name="ln804">					if (currentLength == 0) {</a>
+<a name="ln805">						// start new range</a>
+<a name="ln806">						currentStart = currentBit;</a>
+<a name="ln807">					}</a>
+<a name="ln808"> </a>
+<a name="ln809">					// have we found a range large enough to hold numBlocks?</a>
+<a name="ln810">					if (++currentLength &gt;= maximum) {</a>
+<a name="ln811">						bestGroup = groupIndex;</a>
+<a name="ln812">						bestStart = currentStart;</a>
+<a name="ln813">						bestLength = currentLength;</a>
+<a name="ln814">						break;</a>
+<a name="ln815">					}</a>
+<a name="ln816">				} else {</a>
+<a name="ln817">					if (currentLength) {</a>
+<a name="ln818">						// end of a range</a>
+<a name="ln819">						if (currentLength &gt; bestLength) {</a>
+<a name="ln820">							bestGroup = groupIndex;</a>
+<a name="ln821">							bestStart = currentStart;</a>
+<a name="ln822">							bestLength = currentLength;</a>
+<a name="ln823">						}</a>
+<a name="ln824">						if (currentLength &gt; groupLargestLength) {</a>
+<a name="ln825">							groupLargestStart = currentStart;</a>
+<a name="ln826">							groupLargestLength = currentLength;</a>
+<a name="ln827">						}</a>
+<a name="ln828">						currentLength = 0;</a>
+<a name="ln829">					}</a>
+<a name="ln830">					if ((int32)group.NumBits() - currentBit</a>
+<a name="ln831">							&lt;= groupLargestLength) {</a>
+<a name="ln832">						// We can't find a bigger block in this group anymore,</a>
+<a name="ln833">						// let's skip the rest.</a>
+<a name="ln834">						block = group.NumBlocks();</a>
+<a name="ln835">						break;</a>
+<a name="ln836">					}</a>
+<a name="ln837">				}</a>
+<a name="ln838">				currentBit++;</a>
+<a name="ln839">			}</a>
+<a name="ln840"> </a>
+<a name="ln841">			T(Block(&quot;alloc-out&quot;, block, cached.Block(),</a>
+<a name="ln842">				fVolume-&gt;BlockSize(), groupIndex, currentStart));</a>
+<a name="ln843"> </a>
+<a name="ln844">			if (bestLength &gt;= maximum) {</a>
+<a name="ln845">				canFindGroupLargest = false;</a>
+<a name="ln846">				break;</a>
+<a name="ln847">			}</a>
+<a name="ln848"> </a>
+<a name="ln849">			// start from the beginning of the next block</a>
+<a name="ln850">			start = 0;</a>
+<a name="ln851">		}</a>
+<a name="ln852"> </a>
+<a name="ln853">		if (currentBit == (int32)group.NumBits()) {</a>
+<a name="ln854">			if (currentLength &gt; bestLength) {</a>
+<a name="ln855">				bestGroup = groupIndex;</a>
+<a name="ln856">				bestStart = currentStart;</a>
+<a name="ln857">				bestLength = currentLength;</a>
+<a name="ln858">			}</a>
+<a name="ln859">			if (canFindGroupLargest &amp;&amp; currentLength &gt; groupLargestLength) {</a>
+<a name="ln860">				groupLargestStart = currentStart;</a>
+<a name="ln861">				groupLargestLength = currentLength;</a>
+<a name="ln862">			}</a>
+<a name="ln863">		}</a>
+<a name="ln864"> </a>
+<a name="ln865">		if (canFindGroupLargest &amp;&amp; !group.fLargestValid</a>
+<a name="ln866">			&amp;&amp; groupLargestLength &gt;= 0) {</a>
+<a name="ln867">			group.fLargestStart = groupLargestStart;</a>
+<a name="ln868">			group.fLargestLength = groupLargestLength;</a>
+<a name="ln869">			group.fLargestValid = true;</a>
+<a name="ln870">		}</a>
+<a name="ln871"> </a>
+<a name="ln872">		if (bestLength &gt;= maximum)</a>
+<a name="ln873">			break;</a>
+<a name="ln874">	}</a>
+<a name="ln875"> </a>
+<a name="ln876">	// If we found a suitable range, mark the blocks as in use, and</a>
+<a name="ln877">	// write the updated block bitmap back to disk</a>
+<a name="ln878">	if (bestLength &lt; minimum)</a>
+<a name="ln879">		return B_DEVICE_FULL;</a>
+<a name="ln880"> </a>
+<a name="ln881">	if (bestLength &gt; maximum)</a>
+<a name="ln882">		bestLength = maximum;</a>
+<a name="ln883">	else if (minimum &gt; 1) {</a>
+<a name="ln884">		// make sure bestLength is a multiple of minimum</a>
+<a name="ln885">		bestLength = round_down(bestLength, minimum);</a>
+<a name="ln886">	}</a>
+<a name="ln887"> </a>
+<a name="ln888">	if (fGroups[bestGroup].Allocate(transaction, bestStart, bestLength) != B_OK)</a>
+<a name="ln889">		RETURN_ERROR(B_IO_ERROR);</a>
+<a name="ln890"> </a>
+<a name="ln891">	CHECK_ALLOCATION_GROUP(bestGroup);</a>
+<a name="ln892"> </a>
+<a name="ln893">	run.allocation_group = HOST_ENDIAN_TO_BFS_INT32(bestGroup);</a>
+<a name="ln894">	run.start = HOST_ENDIAN_TO_BFS_INT16(bestStart);</a>
+<a name="ln895">	run.length = HOST_ENDIAN_TO_BFS_INT16(bestLength);</a>
+<a name="ln896"> </a>
+<a name="ln897">	fVolume-&gt;SuperBlock().used_blocks</a>
+<a name="ln898">		= HOST_ENDIAN_TO_BFS_INT64(fVolume-&gt;UsedBlocks() + bestLength);</a>
+<a name="ln899">		// We are not writing back the disk's superblock - it's</a>
+<a name="ln900">		// either done by the journaling code, or when the disk</a>
+<a name="ln901">		// is unmounted.</a>
+<a name="ln902">		// If the value is not correct at mount time, it will be</a>
+<a name="ln903">		// fixed anyway.</a>
+<a name="ln904"> </a>
+<a name="ln905">	// We need to flush any remaining blocks in the new allocation to make sure</a>
+<a name="ln906">	// they won't interfere with the file cache.</a>
+<a name="ln907">	block_cache_discard(fVolume-&gt;BlockCache(), fVolume-&gt;ToBlock(run),</a>
+<a name="ln908">		run.Length());</a>
+<a name="ln909"> </a>
+<a name="ln910">	T(Allocate(run));</a>
+<a name="ln911">	return B_OK;</a>
+<a name="ln912">}</a>
+<a name="ln913"> </a>
+<a name="ln914"> </a>
+<a name="ln915">status_t</a>
+<a name="ln916">BlockAllocator::AllocateForInode(Transaction&amp; transaction,</a>
+<a name="ln917">	const block_run* parent, mode_t type, block_run&amp; run)</a>
+<a name="ln918">{</a>
+<a name="ln919">	// Apply some allocation policies here (AllocateBlocks() will break them</a>
+<a name="ln920">	// if necessary) - we will start with those described in Dominic Giampaolo's</a>
+<a name="ln921">	// &quot;Practical File System Design&quot;, and see how good they work</a>
+<a name="ln922"> </a>
+<a name="ln923">	// Files are going in the same allocation group as its parent,</a>
+<a name="ln924">	// sub-directories will be inserted 8 allocation groups after</a>
+<a name="ln925">	// the one of the parent</a>
+<a name="ln926">	uint16 group = parent-&gt;AllocationGroup();</a>
+<a name="ln927">	if ((type &amp; (S_DIRECTORY | S_INDEX_DIR | S_ATTR_DIR)) == S_DIRECTORY)</a>
+<a name="ln928">		group += 8;</a>
+<a name="ln929"> </a>
+<a name="ln930">	return AllocateBlocks(transaction, group, 0, 1, 1, run);</a>
+<a name="ln931">}</a>
+<a name="ln932"> </a>
+<a name="ln933"> </a>
+<a name="ln934">status_t</a>
+<a name="ln935">BlockAllocator::Allocate(Transaction&amp; transaction, Inode* inode,</a>
+<a name="ln936">	off_t numBlocks, block_run&amp; run, uint16 minimum)</a>
+<a name="ln937">{</a>
+<a name="ln938">	if (numBlocks &lt;= 0)</a>
+<a name="ln939">		return B_ERROR;</a>
+<a name="ln940"> </a>
+<a name="ln941">	// one block_run can't hold more data than there is in one allocation group</a>
+<a name="ln942">	if (numBlocks &gt; fGroups[0].NumBits())</a>
+<a name="ln943">		numBlocks = fGroups[0].NumBits();</a>
+<a name="ln944"> </a>
+<a name="ln945">	// since block_run.length is uint16, the largest number of blocks that</a>
+<a name="ln946">	// can be covered by a block_run is 65535</a>
+<a name="ln947">	// TODO: if we drop compatibility, couldn't we do this any better?</a>
+<a name="ln948">	// There are basically two possibilities:</a>
+<a name="ln949">	// a) since a length of zero doesn't have any sense, take that for 65536 -</a>
+<a name="ln950">	//    but that could cause many problems (bugs) in other areas</a>
+<a name="ln951">	// b) reduce the maximum amount of blocks per block_run, so that the</a>
+<a name="ln952">	//    remaining number of free blocks can be used in a useful manner</a>
+<a name="ln953">	//    (like 4 blocks) - but that would also reduce the maximum file size</a>
+<a name="ln954">	// c) have BlockRun::Length() return (length + 1).</a>
+<a name="ln955">	if (numBlocks &gt; MAX_BLOCK_RUN_LENGTH)</a>
+<a name="ln956">		numBlocks = MAX_BLOCK_RUN_LENGTH;</a>
+<a name="ln957"> </a>
+<a name="ln958">	// Apply some allocation policies here (AllocateBlocks() will break them</a>
+<a name="ln959">	// if necessary)</a>
+<a name="ln960">	uint16 group = inode-&gt;BlockRun().AllocationGroup();</a>
+<a name="ln961">	uint16 start = 0;</a>
+<a name="ln962"> </a>
+<a name="ln963">	// Are there already allocated blocks? (then just try to allocate near the</a>
+<a name="ln964">	// last one)</a>
+<a name="ln965">	if (inode-&gt;Size() &gt; 0) {</a>
+<a name="ln966">		const data_stream&amp; data = inode-&gt;Node().data;</a>
+<a name="ln967">		// TODO: we currently don't care for when the data stream</a>
+<a name="ln968">		// is already grown into the indirect ranges</a>
+<a name="ln969">		if (data.max_double_indirect_range == 0</a>
+<a name="ln970">			&amp;&amp; data.max_indirect_range == 0) {</a>
+<a name="ln971">			// Since size &gt; 0, there must be a valid block run in this stream</a>
+<a name="ln972">			int32 last = 0;</a>
+<a name="ln973">			for (; last &lt; NUM_DIRECT_BLOCKS - 1; last++)</a>
+<a name="ln974">				if (data.direct[last + 1].IsZero())</a>
+<a name="ln975">					break;</a>
+<a name="ln976"> </a>
+<a name="ln977">			group = data.direct[last].AllocationGroup();</a>
+<a name="ln978">			start = data.direct[last].Start() + data.direct[last].Length();</a>
+<a name="ln979">		}</a>
+<a name="ln980">	} else if (inode-&gt;IsContainer() || inode-&gt;IsSymLink()) {</a>
+<a name="ln981">		// directory and symbolic link data will go in the same allocation</a>
+<a name="ln982">		// group as the inode is in but after the inode data</a>
+<a name="ln983">		start = inode-&gt;BlockRun().Start();</a>
+<a name="ln984">	} else {</a>
+<a name="ln985">		// file data will start in the next allocation group</a>
+<a name="ln986">		group = inode-&gt;BlockRun().AllocationGroup() + 1;</a>
+<a name="ln987">	}</a>
+<a name="ln988"> </a>
+<a name="ln989">	return AllocateBlocks(transaction, group, start, numBlocks, minimum, run);</a>
+<a name="ln990">}</a>
+<a name="ln991"> </a>
+<a name="ln992"> </a>
+<a name="ln993">status_t</a>
+<a name="ln994">BlockAllocator::Free(Transaction&amp; transaction, block_run run)</a>
+<a name="ln995">{</a>
+<a name="ln996">	RecursiveLocker lock(fLock);</a>
+<a name="ln997"> </a>
+<a name="ln998">	int32 group = run.AllocationGroup();</a>
+<a name="ln999">	uint16 start = run.Start();</a>
+<a name="ln1000">	uint16 length = run.Length();</a>
+<a name="ln1001"> </a>
+<a name="ln1002">	FUNCTION_START((&quot;group = %ld, start = %u, length = %u\n&quot;, group, start,</a>
+<a name="ln1003">		length));</a>
+<a name="ln1004">	T(Free(run));</a>
+<a name="ln1005"> </a>
+<a name="ln1006">	// doesn't use Volume::IsValidBlockRun() here because it can check better</a>
+<a name="ln1007">	// against the group size (the last group may have a different length)</a>
+<a name="ln1008">	if (group &lt; 0 || group &gt;= fNumGroups</a>
+<a name="ln1009">		|| start &gt; fGroups[group].NumBits()</a>
+<a name="ln1010">		|| uint32(start + length) &gt; fGroups[group].NumBits()</a>
+<a name="ln1011">		|| length == 0) {</a>
+<a name="ln1012">		FATAL((&quot;tried to free an invalid block_run (%d, %u, %u)\n&quot;, (int)group,</a>
+<a name="ln1013">			start, length));</a>
+<a name="ln1014">		DEBUGGER((&quot;tried to free invalid block_run&quot;));</a>
+<a name="ln1015">		return B_BAD_VALUE;</a>
+<a name="ln1016">	}</a>
+<a name="ln1017">	// check if someone tries to free reserved areas at the beginning of the</a>
+<a name="ln1018">	// drive</a>
+<a name="ln1019">	if (group == 0</a>
+<a name="ln1020">		&amp;&amp; start &lt; uint32(fVolume-&gt;Log().Start() + fVolume-&gt;Log().Length())) {</a>
+<a name="ln1021">		FATAL((&quot;tried to free a reserved block_run (%d, %u, %u)\n&quot;, (int)group,</a>
+<a name="ln1022">			start, length));</a>
+<a name="ln1023">		DEBUGGER((&quot;tried to free reserved block&quot;));</a>
+<a name="ln1024">		return B_BAD_VALUE;</a>
+<a name="ln1025">	}</a>
+<a name="ln1026">#ifdef DEBUG</a>
+<a name="ln1027">	if (CheckBlockRun(run) != B_OK)</a>
+<a name="ln1028">		return B_BAD_DATA;</a>
+<a name="ln1029">#endif</a>
+<a name="ln1030"> </a>
+<a name="ln1031">	CHECK_ALLOCATION_GROUP(group);</a>
+<a name="ln1032"> </a>
+<a name="ln1033">	if (fGroups[group].Free(transaction, start, length) != B_OK)</a>
+<a name="ln1034">		RETURN_ERROR(B_IO_ERROR);</a>
+<a name="ln1035"> </a>
+<a name="ln1036">	CHECK_ALLOCATION_GROUP(group);</a>
+<a name="ln1037"> </a>
+<a name="ln1038">#ifdef DEBUG</a>
+<a name="ln1039">	if (CheckBlockRun(run, NULL, false) != B_OK) {</a>
+<a name="ln1040">		DEBUGGER((&quot;CheckBlockRun() reports allocated blocks (which were just &quot;</a>
+<a name="ln1041">			&quot;freed)\n&quot;));</a>
+<a name="ln1042">	}</a>
+<a name="ln1043">#endif</a>
+<a name="ln1044"> </a>
+<a name="ln1045">	fVolume-&gt;SuperBlock().used_blocks =</a>
+<a name="ln1046">		HOST_ENDIAN_TO_BFS_INT64(fVolume-&gt;UsedBlocks() - run.Length());</a>
+<a name="ln1047">	return B_OK;</a>
+<a name="ln1048">}</a>
+<a name="ln1049"> </a>
+<a name="ln1050"> </a>
+<a name="ln1051">#ifdef DEBUG_FRAGMENTER</a>
+<a name="ln1052">void</a>
+<a name="ln1053">BlockAllocator::Fragment()</a>
+<a name="ln1054">{</a>
+<a name="ln1055">	AllocationBlock cached(fVolume);</a>
+<a name="ln1056">	RecursiveLocker lock(fLock);</a>
+<a name="ln1057"> </a>
+<a name="ln1058">	// only leave 4 block holes</a>
+<a name="ln1059">	static const uint32 kMask = 0x0f0f0f0f;</a>
+<a name="ln1060">	uint32 valuesPerBlock = fVolume-&gt;BlockSize() / 4;</a>
+<a name="ln1061"> </a>
+<a name="ln1062">	for (int32 i = 0; i &lt; fNumGroups; i++) {</a>
+<a name="ln1063">		AllocationGroup&amp; group = fGroups[i];</a>
+<a name="ln1064"> </a>
+<a name="ln1065">		for (uint32 block = 0; block &lt; group.NumBlocks(); block++) {</a>
+<a name="ln1066">			Transaction transaction(fVolume, 0);</a>
+<a name="ln1067"> </a>
+<a name="ln1068">			if (cached.SetToWritable(transaction, group, block) != B_OK)</a>
+<a name="ln1069">				return;</a>
+<a name="ln1070"> </a>
+<a name="ln1071">			for (int32 index = 0; index &lt; valuesPerBlock; index++) {</a>
+<a name="ln1072">				cached.Block(index) |= HOST_ENDIAN_TO_BFS_INT32(kMask);</a>
+<a name="ln1073">			}</a>
+<a name="ln1074"> </a>
+<a name="ln1075">			transaction.Done();</a>
+<a name="ln1076">		}</a>
+<a name="ln1077">	}</a>
+<a name="ln1078">}</a>
+<a name="ln1079">#endif	// DEBUG_FRAGMENTER</a>
+<a name="ln1080"> </a>
+<a name="ln1081"> </a>
+<a name="ln1082">#ifdef DEBUG_ALLOCATION_GROUPS</a>
+<a name="ln1083">void</a>
+<a name="ln1084">BlockAllocator::_CheckGroup(int32 groupIndex) const</a>
+<a name="ln1085">{</a>
+<a name="ln1086">	AllocationBlock cached(fVolume);</a>
+<a name="ln1087">	ASSERT_LOCKED_RECURSIVE(&amp;fLock);</a>
+<a name="ln1088"> </a>
+<a name="ln1089">	AllocationGroup&amp; group = fGroups[groupIndex];</a>
+<a name="ln1090"> </a>
+<a name="ln1091">	int32 currentStart = 0, currentLength = 0;</a>
+<a name="ln1092">	int32 firstFree = -1;</a>
+<a name="ln1093">	int32 largestStart = -1;</a>
+<a name="ln1094">	int32 largestLength = 0;</a>
+<a name="ln1095">	int32 currentBit = 0;</a>
+<a name="ln1096"> </a>
+<a name="ln1097">	for (uint32 block = 0; block &lt; group.NumBlocks(); block++) {</a>
+<a name="ln1098">		if (cached.SetTo(group, block) &lt; B_OK) {</a>
+<a name="ln1099">			panic(&quot;setting group block %d failed\n&quot;, (int)block);</a>
+<a name="ln1100">			return;</a>
+<a name="ln1101">		}</a>
+<a name="ln1102"> </a>
+<a name="ln1103">		for (uint32 bit = 0; bit &lt; cached.NumBlockBits(); bit++) {</a>
+<a name="ln1104">			if (!cached.IsUsed(bit)) {</a>
+<a name="ln1105">				if (firstFree &lt; 0) {</a>
+<a name="ln1106">					firstFree = currentBit;</a>
+<a name="ln1107">					if (!group.fLargestValid) {</a>
+<a name="ln1108">						if (firstFree &gt;= 0 &amp;&amp; firstFree &lt; group.fFirstFree) {</a>
+<a name="ln1109">							// mostly harmless but noteworthy</a>
+<a name="ln1110">							dprintf(&quot;group %d first free too late: should be &quot;</a>
+<a name="ln1111">								&quot;%d, is %d\n&quot;, (int)groupIndex, (int)firstFree,</a>
+<a name="ln1112">								(int)group.fFirstFree);</a>
+<a name="ln1113">						}</a>
+<a name="ln1114">						return;</a>
+<a name="ln1115">					}</a>
+<a name="ln1116">				}</a>
+<a name="ln1117"> </a>
+<a name="ln1118">				if (currentLength == 0) {</a>
+<a name="ln1119">					// start new range</a>
+<a name="ln1120">					currentStart = currentBit;</a>
+<a name="ln1121">				}</a>
+<a name="ln1122">				currentLength++;</a>
+<a name="ln1123">			} else if (currentLength) {</a>
+<a name="ln1124">				// end of a range</a>
+<a name="ln1125">				if (currentLength &gt; largestLength) {</a>
+<a name="ln1126">					largestStart = currentStart;</a>
+<a name="ln1127">					largestLength = currentLength;</a>
+<a name="ln1128">				}</a>
+<a name="ln1129">				currentLength = 0;</a>
+<a name="ln1130">			}</a>
+<a name="ln1131">			currentBit++;</a>
+<a name="ln1132">		}</a>
+<a name="ln1133">	}</a>
+<a name="ln1134"> </a>
+<a name="ln1135">	if (currentLength &gt; largestLength) {</a>
+<a name="ln1136">		largestStart = currentStart;</a>
+<a name="ln1137">		largestLength = currentLength;</a>
+<a name="ln1138">	}</a>
+<a name="ln1139"> </a>
+<a name="ln1140">	if (firstFree &gt;= 0 &amp;&amp; firstFree &lt; group.fFirstFree) {</a>
+<a name="ln1141">		// mostly harmless but noteworthy</a>
+<a name="ln1142">		dprintf(&quot;group %d first free too late: should be %d, is %d\n&quot;,</a>
+<a name="ln1143">			(int)groupIndex, (int)firstFree, (int)group.fFirstFree);</a>
+<a name="ln1144">	}</a>
+<a name="ln1145">	if (group.fLargestValid</a>
+<a name="ln1146">		&amp;&amp; (largestStart != group.fLargestStart</a>
+<a name="ln1147">			|| largestLength != group.fLargestLength)) {</a>
+<a name="ln1148">		panic(&quot;bfs %p: group %d largest differs: %d.%d, checked %d.%d.\n&quot;,</a>
+<a name="ln1149">			fVolume, (int)groupIndex, (int)group.fLargestStart,</a>
+<a name="ln1150">			(int)group.fLargestLength, (int)largestStart, (int)largestLength);</a>
+<a name="ln1151">	}</a>
+<a name="ln1152">}</a>
+<a name="ln1153">#endif	// DEBUG_ALLOCATION_GROUPS</a>
+<a name="ln1154"> </a>
+<a name="ln1155"> </a>
+<a name="ln1156">status_t</a>
+<a name="ln1157">BlockAllocator::Trim(uint64 offset, uint64 size, uint64&amp; trimmedSize)</a>
+<a name="ln1158">{</a>
+<a name="ln1159">	const uint32 kTrimRanges = 128;</a>
+<a name="ln1160">	fs_trim_data* trimData = (fs_trim_data*)malloc(sizeof(fs_trim_data)</a>
+<a name="ln1161">		+ sizeof(uint64) * kTrimRanges);</a>
+<a name="ln1162">	if (trimData == NULL)</a>
+<a name="ln1163">		return B_NO_MEMORY;</a>
+<a name="ln1164"> </a>
+<a name="ln1165">	MemoryDeleter deleter(trimData);</a>
+<a name="ln1166">	RecursiveLocker locker(fLock);</a>
+<a name="ln1167"> </a>
+<a name="ln1168">	// TODO: take given offset and size into account!</a>
+<a name="ln1169">	int32 lastGroup = fNumGroups - 1;</a>
+<a name="ln1170">	uint32 firstBlock = 0;</a>
+<a name="ln1171">	uint32 firstBit = 0;</a>
+<a name="ln1172">	uint64 currentBlock = 0;</a>
+<a name="ln1173">	uint32 blockShift = fVolume-&gt;BlockShift();</a>
+<a name="ln1174"> </a>
+<a name="ln1175">	uint64 firstFree = 0;</a>
+<a name="ln1176">	size_t freeLength = 0;</a>
+<a name="ln1177"> </a>
+<a name="ln1178">	trimData-&gt;range_count = 0;</a>
+<a name="ln1179">	trimmedSize = 0;</a>
+<a name="ln1180"> </a>
+<a name="ln1181">	AllocationBlock cached(fVolume);</a>
+<a name="ln1182">	for (int32 groupIndex = 0; groupIndex &lt;= lastGroup; groupIndex++) {</a>
+<a name="ln1183">		AllocationGroup&amp; group = fGroups[groupIndex];</a>
+<a name="ln1184"> </a>
+<a name="ln1185">		for (uint32 block = firstBlock; block &lt; group.NumBlocks(); block++) {</a>
+<a name="ln1186">			cached.SetTo(group, block);</a>
+<a name="ln1187"> </a>
+<a name="ln1188">			for (uint32 i = firstBit; i &lt; cached.NumBlockBits(); i++) {</a>
+<a name="ln1189">				if (cached.IsUsed(i)) {</a>
+<a name="ln1190">					// Block is in use</a>
+<a name="ln1191">					if (freeLength &gt; 0) {</a>
+<a name="ln1192">						status_t status = _TrimNext(*trimData, kTrimRanges,</a>
+<a name="ln1193">							firstFree &lt;&lt; blockShift, freeLength &lt;&lt; blockShift,</a>
+<a name="ln1194">							false, trimmedSize);</a>
+<a name="ln1195">						if (status != B_OK)</a>
+<a name="ln1196">							return status;</a>
+<a name="ln1197"> </a>
+<a name="ln1198">						freeLength = 0;</a>
+<a name="ln1199">					}</a>
+<a name="ln1200">				} else if (freeLength++ == 0) {</a>
+<a name="ln1201">					// Block is free, start new free range</a>
+<a name="ln1202">					firstFree = currentBlock;</a>
+<a name="ln1203">				}</a>
+<a name="ln1204"> </a>
+<a name="ln1205">				currentBlock++;</a>
+<a name="ln1206">			}</a>
+<a name="ln1207">		}</a>
+<a name="ln1208"> </a>
+<a name="ln1209">		firstBlock = 0;</a>
+<a name="ln1210">		firstBit = 0;</a>
+<a name="ln1211">	}</a>
+<a name="ln1212"> </a>
+<a name="ln1213">	return _TrimNext(*trimData, kTrimRanges, firstFree &lt;&lt; blockShift,</a>
+<a name="ln1214">		freeLength &lt;&lt; blockShift, true, trimmedSize);</a>
+<a name="ln1215">}</a>
+<a name="ln1216"> </a>
+<a name="ln1217"> </a>
+<a name="ln1218">//	#pragma mark -</a>
+<a name="ln1219"> </a>
+<a name="ln1220"> </a>
+<a name="ln1221">/*!	Checks whether or not the specified block range is allocated or not,</a>
+<a name="ln1222">	depending on the \a allocated argument.</a>
+<a name="ln1223">*/</a>
+<a name="ln1224">status_t</a>
+<a name="ln1225">BlockAllocator::CheckBlocks(off_t start, off_t length, bool allocated,</a>
+<a name="ln1226">	off_t* firstError)</a>
+<a name="ln1227">{</a>
+<a name="ln1228">	if (start &lt; 0 || start + length &gt; fVolume-&gt;NumBlocks())</a>
+<a name="ln1229">		return B_BAD_VALUE;</a>
+<a name="ln1230"> </a>
+<a name="ln1231">	off_t block = start;</a>
+<a name="ln1232"> </a>
+<a name="ln1233">	int32 group = start &gt;&gt; fVolume-&gt;AllocationGroupShift();</a>
+<a name="ln1234">	uint32 bitmapBlock = start / (fVolume-&gt;BlockSize() &lt;&lt; 3);</a>
+<a name="ln1235">	uint32 blockOffset = start % (fVolume-&gt;BlockSize() &lt;&lt; 3);</a>
+<a name="ln1236"> </a>
+<a name="ln1237">	uint32 groupBlock = bitmapBlock % fBlocksPerGroup;</a>
+<a name="ln1238"> </a>
+<a name="ln1239">	AllocationBlock cached(fVolume);</a>
+<a name="ln1240"> </a>
+<a name="ln1241">	while (groupBlock &lt; fGroups[group].NumBlocks() &amp;&amp; length &gt; 0) {</a>
+<a name="ln1242">		if (cached.SetTo(fGroups[group], groupBlock) != B_OK)</a>
+<a name="ln1243">			RETURN_ERROR(B_IO_ERROR);</a>
+<a name="ln1244"> </a>
+<a name="ln1245">		for (; blockOffset &lt; cached.NumBlockBits() &amp;&amp; length &gt; 0;</a>
+<a name="ln1246">				blockOffset++, length--, block++) {</a>
+<a name="ln1247">			if (cached.IsUsed(blockOffset) != allocated) {</a>
+<a name="ln1248">				PRINT((&quot;CheckBlocks: Erroneous block (group = %ld, &quot;</a>
+<a name="ln1249">					&quot;groupBlock = %ld, blockOffset = %ld)!\n&quot;,</a>
+<a name="ln1250">					group, groupBlock, blockOffset));</a>
+<a name="ln1251"> </a>
+<a name="ln1252">				if (firstError)</a>
+<a name="ln1253">					*firstError = block;</a>
+<a name="ln1254"> </a>
+<a name="ln1255">				return B_BAD_DATA;</a>
+<a name="ln1256">			}</a>
+<a name="ln1257">		}</a>
+<a name="ln1258"> </a>
+<a name="ln1259">		blockOffset = 0;</a>
+<a name="ln1260"> </a>
+<a name="ln1261">		if (++groupBlock &gt;= fGroups[group].NumBlocks()) {</a>
+<a name="ln1262">			groupBlock = 0;</a>
+<a name="ln1263">			group++;</a>
+<a name="ln1264">		}</a>
+<a name="ln1265">	}</a>
+<a name="ln1266"> </a>
+<a name="ln1267">	return B_OK;</a>
+<a name="ln1268">}</a>
+<a name="ln1269"> </a>
+<a name="ln1270"> </a>
+<a name="ln1271">bool</a>
+<a name="ln1272">BlockAllocator::IsValidBlockRun(block_run run)</a>
+<a name="ln1273">{</a>
+<a name="ln1274">	if (run.AllocationGroup() &lt; 0 || run.AllocationGroup() &gt;= fNumGroups</a>
+<a name="ln1275">		|| run.Start() &gt; fGroups[run.AllocationGroup()].fNumBits</a>
+<a name="ln1276">		|| uint32(run.Start() + run.Length())</a>
+<a name="ln1277">				&gt; fGroups[run.AllocationGroup()].fNumBits</a>
+<a name="ln1278">		|| run.length == 0) {</a>
+<a name="ln1279">		PRINT((&quot;%s: block_run(%ld, %u, %u) is invalid!\n&quot;, type,</a>
+<a name="ln1280">			run.AllocationGroup(), run.Start(), run.Length()));</a>
+<a name="ln1281">		return false;</a>
+<a name="ln1282">	}</a>
+<a name="ln1283">	return true;</a>
+<a name="ln1284">}</a>
+<a name="ln1285"> </a>
+<a name="ln1286"> </a>
+<a name="ln1287">status_t</a>
+<a name="ln1288">BlockAllocator::CheckBlockRun(block_run run, const char* type, bool allocated)</a>
+<a name="ln1289">{</a>
+<a name="ln1290">	if (!IsValidBlockRun(run))</a>
+<a name="ln1291">		return B_BAD_DATA;</a>
+<a name="ln1292"> </a>
+<a name="ln1293">	status_t status = CheckBlocks(fVolume-&gt;ToBlock(run), run.Length(),</a>
+<a name="ln1294">		allocated);</a>
+<a name="ln1295">	if (status != B_OK) {</a>
+<a name="ln1296">		PRINT((&quot;%s: block_run(%ld, %u, %u) is only partially allocated!\n&quot;,</a>
+<a name="ln1297">			type, run.AllocationGroup(), run.Start(), run.Length()));</a>
+<a name="ln1298">	}</a>
+<a name="ln1299"> </a>
+<a name="ln1300">	return status;</a>
+<a name="ln1301">}</a>
+<a name="ln1302"> </a>
+<a name="ln1303"> </a>
+<a name="ln1304">status_t</a>
+<a name="ln1305">BlockAllocator::_AddTrim(fs_trim_data&amp; trimData, uint32 maxRanges,</a>
+<a name="ln1306">	uint64 offset, uint64 size)</a>
+<a name="ln1307">{</a>
+<a name="ln1308">	if (trimData.range_count &lt; maxRanges &amp;&amp; size &gt; 0) {</a>
+<a name="ln1309">		trimData.ranges[trimData.range_count].offset = offset;</a>
+<a name="ln1310">		trimData.ranges[trimData.range_count].size = size;</a>
+<a name="ln1311">		trimData.range_count++;</a>
+<a name="ln1312">		return true;</a>
+<a name="ln1313">	}</a>
+<a name="ln1314"> </a>
+<a name="ln1315">	return false;</a>
+<a name="ln1316">}</a>
+<a name="ln1317"> </a>
+<a name="ln1318"> </a>
+<a name="ln1319">status_t</a>
+<a name="ln1320">BlockAllocator::_TrimNext(fs_trim_data&amp; trimData, uint32 maxRanges,</a>
+<a name="ln1321">	uint64 offset, uint64 size, bool force, uint64&amp; trimmedSize)</a>
+<a name="ln1322">{</a>
+<a name="ln1323">	PRINT((&quot;_TrimNext(index %&quot; B_PRIu32 &quot;, offset %&quot; B_PRIu64 &quot;, size %&quot;</a>
+<a name="ln1324">		B_PRIu64 &quot;)\n&quot;, trimData.range_count, offset, size));</a>
+<a name="ln1325"> </a>
+<a name="ln1326">	bool pushed = _AddTrim(trimData, maxRanges, offset, size);</a>
+<a name="ln1327"> </a>
+<a name="ln1328">	if (!pushed || force) {</a>
+<a name="ln1329">		// Trim now</a>
+<a name="ln1330">		trimData.trimmed_size = 0;</a>
+<a name="ln1331">dprintf(&quot;TRIM FS:\n&quot;);</a>
+<a name="ln1332">for (uint32 i = 0; i &lt; trimData.range_count; i++) {</a>
+<a name="ln1333">	dprintf(&quot;[%3&quot; B_PRIu32 &quot;] %&quot; B_PRIu64 &quot; : %&quot; B_PRIu64 &quot;\n&quot;, i,</a>
+<a name="ln1334">		trimData.ranges[i].offset, trimData.ranges[i].size);</a>
+<a name="ln1335">}</a>
+<a name="ln1336">		if (ioctl(fVolume-&gt;Device(), B_TRIM_DEVICE, &amp;trimData,</a>
+<a name="ln1337">				sizeof(fs_trim_data)) != 0) {</a>
+<a name="ln1338">			return errno;</a>
+<a name="ln1339">		}</a>
+<a name="ln1340"> </a>
+<a name="ln1341">		trimmedSize += trimData.trimmed_size;</a>
+<a name="ln1342">		trimData.range_count = 0;</a>
+<a name="ln1343">	}</a>
+<a name="ln1344"> </a>
+<a name="ln1345">	if (!pushed)</a>
+<a name="ln1346">		_AddTrim(trimData, maxRanges, offset, size);</a>
+<a name="ln1347"> </a>
+<a name="ln1348">	return B_OK;</a>
+<a name="ln1349">}</a>
+<a name="ln1350"> </a>
+<a name="ln1351"> </a>
+<a name="ln1352">//	#pragma mark - debugger commands</a>
+<a name="ln1353"> </a>
+<a name="ln1354"> </a>
+<a name="ln1355">#ifdef BFS_DEBUGGER_COMMANDS</a>
+<a name="ln1356"> </a>
+<a name="ln1357">void</a>
+<a name="ln1358">BlockAllocator::Dump(int32 index)</a>
+<a name="ln1359">{</a>
+<a name="ln1360">	kprintf(&quot;allocation groups: %&quot; B_PRId32 &quot; (base %p)\n&quot;, fNumGroups, fGroups);</a>
+<a name="ln1361">	kprintf(&quot;blocks per group: %&quot; B_PRId32 &quot;\n&quot;, fBlocksPerGroup);</a>
+<a name="ln1362"> </a>
+<a name="ln1363">	for (int32 i = 0; i &lt; fNumGroups; i++) {</a>
+<a name="ln1364">		if (index != -1 &amp;&amp; i != index)</a>
+<a name="ln1365">			continue;</a>
+<a name="ln1366"> </a>
+<a name="ln1367">		AllocationGroup&amp; group = fGroups[i];</a>
+<a name="ln1368"> </a>
+<a name="ln1369">		kprintf(&quot;[%3&quot; B_PRId32 &quot;] num bits:       %&quot; B_PRIu32 &quot;  (%p)\n&quot;, i,</a>
+<a name="ln1370">			group.NumBits(), &amp;group);</a>
+<a name="ln1371">		kprintf(&quot;      num blocks:     %&quot; B_PRIu32 &quot;\n&quot;, group.NumBlocks());</a>
+<a name="ln1372">		kprintf(&quot;      start:          %&quot; B_PRId32 &quot;\n&quot;, group.Start());</a>
+<a name="ln1373">		kprintf(&quot;      first free:     %&quot; B_PRId32 &quot;\n&quot;, group.fFirstFree);</a>
+<a name="ln1374">		kprintf(&quot;      largest start:  %&quot; B_PRId32 &quot;%s\n&quot;, group.fLargestStart,</a>
+<a name="ln1375">			group.fLargestValid ? &quot;&quot; : &quot;  (invalid)&quot;);</a>
+<a name="ln1376">		kprintf(&quot;      largest length: %&quot; B_PRId32 &quot;\n&quot;, group.fLargestLength);</a>
+<a name="ln1377">		kprintf(&quot;      free bits:      %&quot; B_PRId32 &quot;\n&quot;, group.fFreeBits);</a>
+<a name="ln1378">	}</a>
+<a name="ln1379">}</a>
+<a name="ln1380"> </a>
+<a name="ln1381"> </a>
+<a name="ln1382">#if BFS_TRACING</a>
+<a name="ln1383">static char kTraceBuffer[256];</a>
+<a name="ln1384"> </a>
+<a name="ln1385"> </a>
+<a name="ln1386">int</a>
+<a name="ln1387">dump_block_allocator_blocks(int argc, char** argv)</a>
+<a name="ln1388">{</a>
+<a name="ln1389">	if (argc != 3 || !strcmp(argv[1], &quot;--help&quot;)) {</a>
+<a name="ln1390">		kprintf(&quot;usage: %s &lt;ptr-to-volume&gt; &lt;block&gt;\n&quot;, argv[0]);</a>
+<a name="ln1391">		return 0;</a>
+<a name="ln1392">	}</a>
+<a name="ln1393"> </a>
+<a name="ln1394">	Volume* volume = (Volume*)parse_expression(argv[1]);</a>
+<a name="ln1395">	off_t block = parse_expression(argv[2]);</a>
+<a name="ln1396"> </a>
+<a name="ln1397">	// iterate over all tracing entries to find overlapping actions</a>
+<a name="ln1398"> </a>
+<a name="ln1399">	using namespace BFSBlockTracing;</a>
+<a name="ln1400"> </a>
+<a name="ln1401">	LazyTraceOutput out(kTraceBuffer, sizeof(kTraceBuffer), 0);</a>
+<a name="ln1402">	TraceEntryIterator iterator;</a>
+<a name="ln1403">	while (TraceEntry* _entry = iterator.Next()) {</a>
+<a name="ln1404">		if (Allocate* entry = dynamic_cast&lt;Allocate*&gt;(_entry)) {</a>
+<a name="ln1405">			off_t first = volume-&gt;ToBlock(entry-&gt;Run());</a>
+<a name="ln1406">			off_t last = first - 1 + entry-&gt;Run().Length();</a>
+<a name="ln1407">			if (block &gt;= first &amp;&amp; block &lt;= last) {</a>
+<a name="ln1408">				out.Clear();</a>
+<a name="ln1409">				const char* dump = out.DumpEntry(entry);</a>
+<a name="ln1410">				kprintf(&quot;%5ld. %s\n&quot;, iterator.Index(), dump);</a>
+<a name="ln1411">			}</a>
+<a name="ln1412">		} else if (Free* entry = dynamic_cast&lt;Free*&gt;(_entry)) {</a>
+<a name="ln1413">			off_t first = volume-&gt;ToBlock(entry-&gt;Run());</a>
+<a name="ln1414">			off_t last = first - 1 + entry-&gt;Run().Length();</a>
+<a name="ln1415">			if (block &gt;= first &amp;&amp; block &lt;= last) {</a>
+<a name="ln1416">				out.Clear();</a>
+<a name="ln1417">				const char* dump = out.DumpEntry(entry);</a>
+<a name="ln1418">				kprintf(&quot;%5ld. %s\n&quot;, iterator.Index(), dump);</a>
+<a name="ln1419">			}</a>
+<a name="ln1420">		}</a>
+<a name="ln1421">	}</a>
+<a name="ln1422"> </a>
+<a name="ln1423">	return 0;</a>
+<a name="ln1424">}</a>
+<a name="ln1425">#endif</a>
+<a name="ln1426"> </a>
+<a name="ln1427"> </a>
+<a name="ln1428">int</a>
+<a name="ln1429">dump_block_allocator(int argc, char** argv)</a>
+<a name="ln1430">{</a>
+<a name="ln1431">	int32 group = -1;</a>
+<a name="ln1432">	if (argc == 3) {</a>
+<a name="ln1433">		group = parse_expression(argv[2]);</a>
+<a name="ln1434">		argc--;</a>
+<a name="ln1435">	}</a>
+<a name="ln1436"> </a>
+<a name="ln1437">	if (argc != 2 || !strcmp(argv[1], &quot;--help&quot;)) {</a>
+<a name="ln1438">		kprintf(&quot;usage: %s &lt;ptr-to-volume&gt; [group]\n&quot;, argv[0]);</a>
+<a name="ln1439">		return 0;</a>
+<a name="ln1440">	}</a>
+<a name="ln1441"> </a>
+<a name="ln1442">	Volume* volume = (Volume*)parse_expression(argv[1]);</a>
+<a name="ln1443">	BlockAllocator&amp; allocator = volume-&gt;Allocator();</a>
+<a name="ln1444"> </a>
+<a name="ln1445">	allocator.Dump(group);</a>
+<a name="ln1446">	return 0;</a>
+<a name="ln1447">}</a>
+<a name="ln1448"> </a>
+<a name="ln1449">#endif	// BFS_DEBUGGER_COMMANDS</a>
+<a name="ln1450"> </a>
+
+</code></pre>
+<div class="balloon" rel="702"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="505"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fNumGroups, fBlocksPerGroup, fNumBlocks.</p></div>
+<div class="balloon" rel="223"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fNumBits.</p></div>
+<div class="balloon" rel="702"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the third actual argument of the 'fssh_dprintf' function. The memsize type argument is expected.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

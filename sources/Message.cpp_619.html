@@ -1,0 +1,3322 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>Message.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2005-2017 Haiku, Inc. All rights reserved.</a>
+<a name="ln3"> * Distributed under the terms of the MIT License.</a>
+<a name="ln4"> *</a>
+<a name="ln5"> * Authors:</a>
+<a name="ln6"> *		Michael Lotz, mmlr@mlotz.ch</a>
+<a name="ln7"> */</a>
+<a name="ln8"> </a>
+<a name="ln9"> </a>
+<a name="ln10">#include &lt;Message.h&gt;</a>
+<a name="ln11">#include &lt;MessageAdapter.h&gt;</a>
+<a name="ln12">#include &lt;MessagePrivate.h&gt;</a>
+<a name="ln13">#include &lt;MessageUtils.h&gt;</a>
+<a name="ln14"> </a>
+<a name="ln15">#include &lt;DirectMessageTarget.h&gt;</a>
+<a name="ln16">#include &lt;MessengerPrivate.h&gt;</a>
+<a name="ln17">#include &lt;TokenSpace.h&gt;</a>
+<a name="ln18">#include &lt;util/KMessage.h&gt;</a>
+<a name="ln19"> </a>
+<a name="ln20">#include &lt;Alignment.h&gt;</a>
+<a name="ln21">#include &lt;Application.h&gt;</a>
+<a name="ln22">#include &lt;AppMisc.h&gt;</a>
+<a name="ln23">#include &lt;BlockCache.h&gt;</a>
+<a name="ln24">#include &lt;Entry.h&gt;</a>
+<a name="ln25">#include &lt;GraphicsDefs.h&gt;</a>
+<a name="ln26">#include &lt;MessageQueue.h&gt;</a>
+<a name="ln27">#include &lt;Messenger.h&gt;</a>
+<a name="ln28">#include &lt;Path.h&gt;</a>
+<a name="ln29">#include &lt;Point.h&gt;</a>
+<a name="ln30">#include &lt;Rect.h&gt;</a>
+<a name="ln31">#include &lt;String.h&gt;</a>
+<a name="ln32">#include &lt;StringList.h&gt;</a>
+<a name="ln33"> </a>
+<a name="ln34">#include &lt;assert.h&gt;</a>
+<a name="ln35">#include &lt;ctype.h&gt;</a>
+<a name="ln36">#include &lt;stdio.h&gt;</a>
+<a name="ln37">#include &lt;stdlib.h&gt;</a>
+<a name="ln38">#include &lt;string.h&gt;</a>
+<a name="ln39"> </a>
+<a name="ln40">#include &quot;tracing_config.h&quot;</a>
+<a name="ln41">	// kernel tracing configuration</a>
+<a name="ln42"> </a>
+<a name="ln43">//#define VERBOSE_DEBUG_OUTPUT</a>
+<a name="ln44">#ifdef VERBOSE_DEBUG_OUTPUT</a>
+<a name="ln45">#define DEBUG_FUNCTION_ENTER	\</a>
+<a name="ln46">	debug_printf(&quot;msg thread: %ld; this: %p; header: %p; fields: %p;&quot; \</a>
+<a name="ln47">		&quot; data: %p; what: 0x%08lx '%.4s'; line: %d; func: %s\n&quot;, \</a>
+<a name="ln48">		find_thread(NULL), this, fHeader, fFields, fData, what, (char*)&amp;what, \</a>
+<a name="ln49">		__LINE__, __PRETTY_FUNCTION__);</a>
+<a name="ln50"> </a>
+<a name="ln51">#define DEBUG_FUNCTION_ENTER2	\</a>
+<a name="ln52">	debug_printf(&quot;msg thread: %ld; line: %d: func: %s\n&quot;, find_thread(NULL), \</a>
+<a name="ln53">		__LINE__, __PRETTY_FUNCTION__);</a>
+<a name="ln54">#else</a>
+<a name="ln55">#define DEBUG_FUNCTION_ENTER	/* nothing */</a>
+<a name="ln56">#define DEBUG_FUNCTION_ENTER2	/* nothing */</a>
+<a name="ln57">#endif</a>
+<a name="ln58"> </a>
+<a name="ln59">#if BMESSAGE_TRACING</a>
+<a name="ln60">#	define KTRACE(format...)	ktrace_printf(format)</a>
+<a name="ln61">#else</a>
+<a name="ln62">#	define KTRACE(format...)	;</a>
+<a name="ln63">#endif</a>
+<a name="ln64"> </a>
+<a name="ln65"> </a>
+<a name="ln66">const char* B_SPECIFIER_ENTRY = &quot;specifiers&quot;;</a>
+<a name="ln67">const char* B_PROPERTY_ENTRY = &quot;property&quot;;</a>
+<a name="ln68">const char* B_PROPERTY_NAME_ENTRY = &quot;name&quot;;</a>
+<a name="ln69"> </a>
+<a name="ln70"> </a>
+<a name="ln71">static status_t handle_reply(port_id replyPort, int32* pCode,</a>
+<a name="ln72">	bigtime_t timeout, BMessage* reply);</a>
+<a name="ln73"> </a>
+<a name="ln74"> </a>
+<a name="ln75">extern &quot;C&quot; {</a>
+<a name="ln76">	// private os function to set the owning team of an area</a>
+<a name="ln77">	status_t _kern_transfer_area(area_id area, void** _address,</a>
+<a name="ln78">		uint32 addressSpec, team_id target);</a>
+<a name="ln79">}</a>
+<a name="ln80"> </a>
+<a name="ln81"> </a>
+<a name="ln82">BBlockCache* BMessage::sMsgCache = NULL;</a>
+<a name="ln83">port_id BMessage::sReplyPorts[sNumReplyPorts];</a>
+<a name="ln84">int32 BMessage::sReplyPortInUse[sNumReplyPorts];</a>
+<a name="ln85"> </a>
+<a name="ln86"> </a>
+<a name="ln87">template&lt;typename Type&gt;</a>
+<a name="ln88">static void</a>
+<a name="ln89">print_to_stream_type(uint8* pointer)</a>
+<a name="ln90">{</a>
+<a name="ln91">	Type* item = (Type*)pointer;</a>
+<a name="ln92">	item-&gt;PrintToStream();</a>
+<a name="ln93">}</a>
+<a name="ln94"> </a>
+<a name="ln95"> </a>
+<a name="ln96">template&lt;typename Type&gt;</a>
+<a name="ln97">static void</a>
+<a name="ln98">print_type(const char* format, uint8* pointer)</a>
+<a name="ln99">{</a>
+<a name="ln100">	Type* item = (Type*)pointer;</a>
+<a name="ln101">	printf(format,* item,* item);</a>
+<a name="ln102">}</a>
+<a name="ln103"> </a>
+<a name="ln104"> </a>
+<a name="ln105">template&lt;typename Type&gt;</a>
+<a name="ln106">static void</a>
+<a name="ln107">print_type3(const char* format, uint8* pointer)</a>
+<a name="ln108">{</a>
+<a name="ln109">	Type* item = (Type*)pointer;</a>
+<a name="ln110">	printf(format, *item, *item, *item);</a>
+<a name="ln111">}</a>
+<a name="ln112"> </a>
+<a name="ln113"> </a>
+<a name="ln114">static status_t</a>
+<a name="ln115">handle_reply(port_id replyPort, int32* _code, bigtime_t timeout,</a>
+<a name="ln116">	BMessage* reply)</a>
+<a name="ln117">{</a>
+<a name="ln118">	DEBUG_FUNCTION_ENTER2;</a>
+<a name="ln119">	ssize_t size;</a>
+<a name="ln120">	do {</a>
+<a name="ln121">		size = port_buffer_size_etc(replyPort, B_RELATIVE_TIMEOUT, timeout);</a>
+<a name="ln122">	} while (size == B_INTERRUPTED);</a>
+<a name="ln123"> </a>
+<a name="ln124">	if (size &lt; 0)</a>
+<a name="ln125">		return size;</a>
+<a name="ln126"> </a>
+<a name="ln127">	status_t result;</a>
+<a name="ln128">	char* buffer = (char*)malloc(size);</a>
+<a name="ln129">	if (buffer == NULL)</a>
+<a name="ln130">		return B_NO_MEMORY;</a>
+<a name="ln131"> </a>
+<a name="ln132">	do {</a>
+<a name="ln133">		result = read_port(replyPort, _code, buffer, size);</a>
+<a name="ln134">	} while (result == B_INTERRUPTED);</a>
+<a name="ln135"> </a>
+<a name="ln136">	if (result &lt; 0 || *_code != kPortMessageCode) {</a>
+<a name="ln137">		free(buffer);</a>
+<a name="ln138">		return result &lt; 0 ? result : B_ERROR;</a>
+<a name="ln139">	}</a>
+<a name="ln140"> </a>
+<a name="ln141">	result = reply-&gt;Unflatten(buffer);</a>
+<a name="ln142">	free(buffer);</a>
+<a name="ln143">	return result;</a>
+<a name="ln144">}</a>
+<a name="ln145"> </a>
+<a name="ln146"> </a>
+<a name="ln147">//	#pragma mark -</a>
+<a name="ln148"> </a>
+<a name="ln149"> </a>
+<a name="ln150">BMessage::BMessage()</a>
+<a name="ln151">{</a>
+<a name="ln152">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln153">	_InitCommon(true);</a>
+<a name="ln154">}</a>
+<a name="ln155"> </a>
+<a name="ln156"> </a>
+<a name="ln157">BMessage::BMessage(BMessage* other)</a>
+<a name="ln158">{</a>
+<a name="ln159">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln160">	_InitCommon(false);</a>
+<a name="ln161">	*this = *other;</a>
+<a name="ln162">}</a>
+<a name="ln163"> </a>
+<a name="ln164"> </a>
+<a name="ln165">BMessage::BMessage(uint32 _what)</a>
+<a name="ln166">{</a>
+<a name="ln167">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln168">	_InitCommon(true);</a>
+<a name="ln169">	fHeader-&gt;what = what = _what;</a>
+<a name="ln170">}</a>
+<a name="ln171"> </a>
+<a name="ln172"> </a>
+<a name="ln173">BMessage::BMessage(const BMessage&amp; other)</a>
+<a name="ln174">{</a>
+<a name="ln175">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln176">	_InitCommon(false);</a>
+<a name="ln177">	*this = other;</a>
+<a name="ln178">}</a>
+<a name="ln179"> </a>
+<a name="ln180"> </a>
+<a name="ln181">BMessage::~BMessage()</a>
+<a name="ln182">{</a>
+<a name="ln183">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln184">	_Clear();</a>
+<a name="ln185">}</a>
+<a name="ln186"> </a>
+<a name="ln187"> </a>
+<a name="ln188">BMessage&amp;</a>
+<a name="ln189">BMessage::operator=(const BMessage&amp; other)</a>
+<a name="ln190">{</a>
+<a name="ln191">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln192"> </a>
+<a name="ln193">	if (this == &amp;other)</a>
+<a name="ln194">		return *this;</a>
+<a name="ln195"> </a>
+<a name="ln196">	_Clear();</a>
+<a name="ln197"> </a>
+<a name="ln198">	fHeader = (message_header*)malloc(sizeof(message_header));</a>
+<a name="ln199">	if (fHeader == NULL)</a>
+<a name="ln200">		return *this;</a>
+<a name="ln201"> </a>
+<a name="ln202">	if (other.fHeader == NULL)</a>
+<a name="ln203">		return *this;</a>
+<a name="ln204"> </a>
+<a name="ln205">	memcpy(fHeader, other.fHeader, sizeof(message_header));</a>
+<a name="ln206"> </a>
+<a name="ln207">	// Clear some header flags inherited from the original message that don't</a>
+<a name="ln208">	// apply to the clone.</a>
+<a name="ln209">	fHeader-&gt;flags &amp;= ~(MESSAGE_FLAG_REPLY_REQUIRED | MESSAGE_FLAG_REPLY_DONE</a>
+<a name="ln210">		| MESSAGE_FLAG_IS_REPLY | MESSAGE_FLAG_WAS_DELIVERED</a>
+<a name="ln211">		| MESSAGE_FLAG_PASS_BY_AREA);</a>
+<a name="ln212">	// Note, that BeOS R5 seems to keep the reply info.</a>
+<a name="ln213"> </a>
+<a name="ln214">	if (fHeader-&gt;field_count &gt; 0) {</a>
+<a name="ln215">		size_t fieldsSize = fHeader-&gt;field_count * sizeof(field_header);</a>
+<a name="ln216">		if (other.fFields != NULL)</a>
+<a name="ln217">			fFields = (field_header*)malloc(fieldsSize);</a>
+<a name="ln218"> </a>
+<a name="ln219">		if (fFields == NULL) {</a>
+<a name="ln220">			fHeader-&gt;field_count = 0;</a>
+<a name="ln221">			fHeader-&gt;data_size = 0;</a>
+<a name="ln222">		} else if (other.fFields != NULL)</a>
+<a name="ln223">			memcpy(fFields, other.fFields, fieldsSize);</a>
+<a name="ln224">	}</a>
+<a name="ln225"> </a>
+<a name="ln226">	if (fHeader-&gt;data_size &gt; 0) {</a>
+<a name="ln227">		if (other.fData != NULL)</a>
+<a name="ln228">			fData = (uint8*)malloc(fHeader-&gt;data_size);</a>
+<a name="ln229"> </a>
+<a name="ln230">		if (fData == NULL) {</a>
+<a name="ln231">			fHeader-&gt;field_count = 0;</a>
+<a name="ln232">			free(fFields);</a>
+<a name="ln233">			fFields = NULL;</a>
+<a name="ln234">		} else if (other.fData != NULL)</a>
+<a name="ln235">			memcpy(fData, other.fData, fHeader-&gt;data_size);</a>
+<a name="ln236">	}</a>
+<a name="ln237"> </a>
+<a name="ln238">	fHeader-&gt;what = what = other.what;</a>
+<a name="ln239">	fHeader-&gt;message_area = -1;</a>
+<a name="ln240">	fFieldsAvailable = 0;</a>
+<a name="ln241">	fDataAvailable = 0;</a>
+<a name="ln242"> </a>
+<a name="ln243">	return *this;</a>
+<a name="ln244">}</a>
+<a name="ln245"> </a>
+<a name="ln246"> </a>
+<a name="ln247">void*</a>
+<a name="ln248">BMessage::operator new(size_t size)</a>
+<a name="ln249">{</a>
+<a name="ln250">	DEBUG_FUNCTION_ENTER2;</a>
+<a name="ln251">	return sMsgCache-&gt;Get(size);</a>
+<a name="ln252">}</a>
+<a name="ln253"> </a>
+<a name="ln254"> </a>
+<a name="ln255">void*</a>
+<a name="ln256">BMessage::operator new(size_t size, const std::nothrow_t&amp; noThrow)</a>
+<a name="ln257">{</a>
+<a name="ln258">	DEBUG_FUNCTION_ENTER2;</a>
+<a name="ln259">	return sMsgCache-&gt;Get(size);</a>
+<a name="ln260">}</a>
+<a name="ln261"> </a>
+<a name="ln262"> </a>
+<a name="ln263">void*</a>
+<a name="ln264">BMessage::operator new(size_t, void* pointer)</a>
+<a name="ln265">{</a>
+<a name="ln266">	DEBUG_FUNCTION_ENTER2;</a>
+<a name="ln267">	return pointer;</a>
+<a name="ln268">}</a>
+<a name="ln269"> </a>
+<a name="ln270"> </a>
+<a name="ln271">void</a>
+<a name="ln272">BMessage::operator delete(void* pointer, size_t size)</a>
+<a name="ln273">{</a>
+<a name="ln274">	DEBUG_FUNCTION_ENTER2;</a>
+<a name="ln275">	if (pointer == NULL)</a>
+<a name="ln276">		return;</a>
+<a name="ln277">	sMsgCache-&gt;Save(pointer, size);</a>
+<a name="ln278">}</a>
+<a name="ln279"> </a>
+<a name="ln280"> </a>
+<a name="ln281">bool</a>
+<a name="ln282">BMessage::HasSameData(const BMessage&amp; other, bool ignoreFieldOrder,</a>
+<a name="ln283">	bool deep) const</a>
+<a name="ln284">{</a>
+<a name="ln285">	if (this == &amp;other)</a>
+<a name="ln286">		return true;</a>
+<a name="ln287"> </a>
+<a name="ln288">	if (fHeader == NULL)</a>
+<a name="ln289">		return other.fHeader == NULL;</a>
+<a name="ln290"> </a>
+<a name="ln291">	if (fHeader-&gt;field_count != other.fHeader-&gt;field_count)</a>
+<a name="ln292">		return false;</a>
+<a name="ln293"> </a>
+<a name="ln294">	for (uint32 i = 0; i &lt; fHeader-&gt;field_count; i++) {</a>
+<a name="ln295">		field_header* field = &amp;fFields[i];</a>
+<a name="ln296">		field_header* otherField = NULL;</a>
+<a name="ln297"> </a>
+<a name="ln298">		const char* name = (const char*)fData + field-&gt;offset;</a>
+<a name="ln299">		if (ignoreFieldOrder) {</a>
+<a name="ln300">			if (other._FindField(name, B_ANY_TYPE, &amp;otherField) != B_OK)</a>
+<a name="ln301">				return false;</a>
+<a name="ln302">		} else {</a>
+<a name="ln303">			otherField = &amp;other.fFields[i];</a>
+<a name="ln304">			if (otherField-&gt;name_length != field-&gt;name_length)</a>
+<a name="ln305">				return false;</a>
+<a name="ln306"> </a>
+<a name="ln307">			const char* otherName = (const char*)other.fData</a>
+<a name="ln308">				+ otherField-&gt;offset;</a>
+<a name="ln309">			if (strncmp(name, otherName, field-&gt;name_length) != 0)</a>
+<a name="ln310">				return false;</a>
+<a name="ln311">		}</a>
+<a name="ln312"> </a>
+<a name="ln313">		if (otherField-&gt;type != field-&gt;type</a>
+<a name="ln314">			|| otherField-&gt;count != field-&gt;count) {</a>
+<a name="ln315">			return false;</a>
+<a name="ln316">		}</a>
+<a name="ln317"> </a>
+<a name="ln318">		uint8* data = fData + field-&gt;offset + field-&gt;name_length;</a>
+<a name="ln319">		uint8* otherData = other.fData + otherField-&gt;offset</a>
+<a name="ln320">			+ otherField-&gt;name_length;</a>
+<a name="ln321"> </a>
+<a name="ln322">		bool needsMemCompare = true;</a>
+<a name="ln323">		if (deep &amp;&amp; field-&gt;type == B_MESSAGE_TYPE) {</a>
+<a name="ln324">			BMessage message, otherMessage;</a>
+<a name="ln325">			if (message.Unflatten((const char*)data) == B_OK</a>
+<a name="ln326">				&amp;&amp; otherMessage.Unflatten((const char*)otherData) == B_OK) {</a>
+<a name="ln327">				if (!message.HasSameData(ignoreFieldOrder, deep))</a>
+<a name="ln328">					return false;</a>
+<a name="ln329">				needsMemCompare = false;</a>
+<a name="ln330">			}</a>
+<a name="ln331">		}</a>
+<a name="ln332"> </a>
+<a name="ln333">		if (needsMemCompare) {</a>
+<a name="ln334">			if (otherField-&gt;data_size != field-&gt;data_size)</a>
+<a name="ln335">				return false;</a>
+<a name="ln336">			if (memcmp(data, otherData, field-&gt;data_size) != 0)</a>
+<a name="ln337">				return false;</a>
+<a name="ln338">		}</a>
+<a name="ln339">	}</a>
+<a name="ln340"> </a>
+<a name="ln341">	return true;</a>
+<a name="ln342">}</a>
+<a name="ln343"> </a>
+<a name="ln344"> </a>
+<a name="ln345">status_t</a>
+<a name="ln346">BMessage::_InitCommon(bool initHeader)</a>
+<a name="ln347">{</a>
+<a name="ln348">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln349">	what = 0;</a>
+<a name="ln350"> </a>
+<a name="ln351">	fHeader = NULL;</a>
+<a name="ln352">	fFields = NULL;</a>
+<a name="ln353">	fData = NULL;</a>
+<a name="ln354"> </a>
+<a name="ln355">	fFieldsAvailable = 0;</a>
+<a name="ln356">	fDataAvailable = 0;</a>
+<a name="ln357"> </a>
+<a name="ln358">	fOriginal = NULL;</a>
+<a name="ln359">	fQueueLink = NULL;</a>
+<a name="ln360"> </a>
+<a name="ln361">	fArchivingPointer = NULL;</a>
+<a name="ln362"> </a>
+<a name="ln363">	if (initHeader)</a>
+<a name="ln364">		return _InitHeader();</a>
+<a name="ln365"> </a>
+<a name="ln366">	return B_OK;</a>
+<a name="ln367">}</a>
+<a name="ln368"> </a>
+<a name="ln369"> </a>
+<a name="ln370">status_t</a>
+<a name="ln371">BMessage::_InitHeader()</a>
+<a name="ln372">{</a>
+<a name="ln373">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln374">	if (fHeader == NULL) {</a>
+<a name="ln375">		fHeader = (message_header*)malloc(sizeof(message_header));</a>
+<a name="ln376">		if (fHeader == NULL)</a>
+<a name="ln377">			return B_NO_MEMORY;</a>
+<a name="ln378">	}</a>
+<a name="ln379"> </a>
+<a name="ln380">	memset(fHeader, 0, sizeof(message_header) - sizeof(fHeader-&gt;hash_table));</a>
+<a name="ln381"> </a>
+<a name="ln382">	fHeader-&gt;format = MESSAGE_FORMAT_HAIKU;</a>
+<a name="ln383">	fHeader-&gt;flags = MESSAGE_FLAG_VALID;</a>
+<a name="ln384">	fHeader-&gt;what = what;</a>
+<a name="ln385">	fHeader-&gt;current_specifier = -1;</a>
+<a name="ln386">	fHeader-&gt;message_area = -1;</a>
+<a name="ln387"> </a>
+<a name="ln388">	fHeader-&gt;target = B_NULL_TOKEN;</a>
+<a name="ln389">	fHeader-&gt;reply_target = B_NULL_TOKEN;</a>
+<a name="ln390">	fHeader-&gt;reply_port = -1;</a>
+<a name="ln391">	fHeader-&gt;reply_team = -1;</a>
+<a name="ln392"> </a>
+<a name="ln393">	// initializing the hash table to -1 because 0 is a valid index</a>
+<a name="ln394">	fHeader-&gt;hash_table_size = MESSAGE_BODY_HASH_TABLE_SIZE;</a>
+<a name="ln395">	memset(&amp;fHeader-&gt;hash_table, 255, sizeof(fHeader-&gt;hash_table));</a>
+<a name="ln396">	return B_OK;</a>
+<a name="ln397">}</a>
+<a name="ln398"> </a>
+<a name="ln399"> </a>
+<a name="ln400">status_t</a>
+<a name="ln401">BMessage::_Clear()</a>
+<a name="ln402">{</a>
+<a name="ln403">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln404">	if (fHeader != NULL) {</a>
+<a name="ln405">		// We're going to destroy all information of this message. If there's</a>
+<a name="ln406">		// still someone waiting for a reply to this message, we have to send</a>
+<a name="ln407">		// one now.</a>
+<a name="ln408">		if (IsSourceWaiting())</a>
+<a name="ln409">			SendReply(B_NO_REPLY);</a>
+<a name="ln410"> </a>
+<a name="ln411">		if (fHeader-&gt;message_area &gt;= 0)</a>
+<a name="ln412">			_Dereference();</a>
+<a name="ln413"> </a>
+<a name="ln414">		free(fHeader);</a>
+<a name="ln415">		fHeader = NULL;</a>
+<a name="ln416">	}</a>
+<a name="ln417"> </a>
+<a name="ln418">	free(fFields);</a>
+<a name="ln419">	fFields = NULL;</a>
+<a name="ln420">	free(fData);</a>
+<a name="ln421">	fData = NULL;</a>
+<a name="ln422"> </a>
+<a name="ln423">	fArchivingPointer = NULL;</a>
+<a name="ln424"> </a>
+<a name="ln425">	fFieldsAvailable = 0;</a>
+<a name="ln426">	fDataAvailable = 0;</a>
+<a name="ln427"> </a>
+<a name="ln428">	delete fOriginal;</a>
+<a name="ln429">	fOriginal = NULL;</a>
+<a name="ln430"> </a>
+<a name="ln431">	return B_OK;</a>
+<a name="ln432">}</a>
+<a name="ln433"> </a>
+<a name="ln434"> </a>
+<a name="ln435">status_t</a>
+<a name="ln436">BMessage::GetInfo(type_code typeRequested, int32 index, char** nameFound,</a>
+<a name="ln437">	type_code* typeFound, int32* countFound) const</a>
+<a name="ln438">{</a>
+<a name="ln439">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln440">	if (fHeader == NULL)</a>
+<a name="ln441">		return B_NO_INIT;</a>
+<a name="ln442"> </a>
+<a name="ln443">	if (index &lt; 0 || (uint32)index &gt;= fHeader-&gt;field_count)</a>
+<a name="ln444">		return B_BAD_INDEX;</a>
+<a name="ln445"> </a>
+<a name="ln446">	if (typeRequested == B_ANY_TYPE) {</a>
+<a name="ln447">		if (nameFound != NULL)</a>
+<a name="ln448">			*nameFound = (char*)fData + fFields[index].offset;</a>
+<a name="ln449">		if (typeFound != NULL)</a>
+<a name="ln450">			*typeFound = fFields[index].type;</a>
+<a name="ln451">		if (countFound != NULL)</a>
+<a name="ln452">			*countFound = fFields[index].count;</a>
+<a name="ln453">		return B_OK;</a>
+<a name="ln454">	}</a>
+<a name="ln455"> </a>
+<a name="ln456">	int32 counter = -1;</a>
+<a name="ln457">	field_header* field = fFields;</a>
+<a name="ln458">	for (uint32 i = 0; i &lt; fHeader-&gt;field_count; i++, field++) {</a>
+<a name="ln459">		if (field-&gt;type == typeRequested)</a>
+<a name="ln460">			counter++;</a>
+<a name="ln461"> </a>
+<a name="ln462">		if (counter == index) {</a>
+<a name="ln463">			if (nameFound != NULL)</a>
+<a name="ln464">				*nameFound = (char*)fData + field-&gt;offset;</a>
+<a name="ln465">			if (typeFound != NULL)</a>
+<a name="ln466">				*typeFound = field-&gt;type;</a>
+<a name="ln467">			if (countFound != NULL)</a>
+<a name="ln468">				*countFound = field-&gt;count;</a>
+<a name="ln469">			return B_OK;</a>
+<a name="ln470">		}</a>
+<a name="ln471">	}</a>
+<a name="ln472"> </a>
+<a name="ln473">	if (counter == -1)</a>
+<a name="ln474">		return B_BAD_TYPE;</a>
+<a name="ln475"> </a>
+<a name="ln476">	return B_BAD_INDEX;</a>
+<a name="ln477">}</a>
+<a name="ln478"> </a>
+<a name="ln479"> </a>
+<a name="ln480">status_t</a>
+<a name="ln481">BMessage::GetInfo(const char* name, type_code* typeFound,</a>
+<a name="ln482">	int32* countFound) const</a>
+<a name="ln483">{</a>
+<a name="ln484">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln485">	if (countFound != NULL)</a>
+<a name="ln486">		*countFound = 0;</a>
+<a name="ln487"> </a>
+<a name="ln488">	field_header* field = NULL;</a>
+<a name="ln489">	status_t result = _FindField(name, B_ANY_TYPE, &amp;field);</a>
+<a name="ln490">	if (result != B_OK)</a>
+<a name="ln491">		return result;</a>
+<a name="ln492"> </a>
+<a name="ln493">	if (typeFound != NULL)</a>
+<a name="ln494">		*typeFound = field-&gt;type;</a>
+<a name="ln495">	if (countFound != NULL)</a>
+<a name="ln496">		*countFound = field-&gt;count;</a>
+<a name="ln497"> </a>
+<a name="ln498">	return B_OK;</a>
+<a name="ln499">}</a>
+<a name="ln500"> </a>
+<a name="ln501"> </a>
+<a name="ln502">status_t</a>
+<a name="ln503">BMessage::GetInfo(const char* name, type_code* typeFound, bool* fixedSize)</a>
+<a name="ln504">	const</a>
+<a name="ln505">{</a>
+<a name="ln506">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln507">	field_header* field = NULL;</a>
+<a name="ln508">	status_t result = _FindField(name, B_ANY_TYPE, &amp;field);</a>
+<a name="ln509">	if (result != B_OK)</a>
+<a name="ln510">		return result;</a>
+<a name="ln511"> </a>
+<a name="ln512">	if (typeFound != NULL)</a>
+<a name="ln513">		*typeFound = field-&gt;type;</a>
+<a name="ln514">	if (fixedSize != NULL)</a>
+<a name="ln515">		*fixedSize = (field-&gt;flags &amp; FIELD_FLAG_FIXED_SIZE) != 0;</a>
+<a name="ln516"> </a>
+<a name="ln517">	return B_OK;</a>
+<a name="ln518">}</a>
+<a name="ln519"> </a>
+<a name="ln520"> </a>
+<a name="ln521">status_t</a>
+<a name="ln522">BMessage::GetInfo(const char* name, type_code* typeFound, int32* countFound,</a>
+<a name="ln523">	bool* fixedSize) const</a>
+<a name="ln524">{</a>
+<a name="ln525">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln526">	field_header* field = NULL;</a>
+<a name="ln527">	status_t result = _FindField(name, B_ANY_TYPE, &amp;field);</a>
+<a name="ln528">	if (result != B_OK)</a>
+<a name="ln529">		return result;</a>
+<a name="ln530"> </a>
+<a name="ln531">	if (typeFound != NULL)</a>
+<a name="ln532">		*typeFound = field-&gt;type;</a>
+<a name="ln533">	if (countFound != NULL)</a>
+<a name="ln534">		*countFound = field-&gt;count;</a>
+<a name="ln535">	if (fixedSize != NULL)</a>
+<a name="ln536">		*fixedSize = (field-&gt;flags &amp; FIELD_FLAG_FIXED_SIZE) != 0;</a>
+<a name="ln537"> </a>
+<a name="ln538">	return B_OK;</a>
+<a name="ln539">}</a>
+<a name="ln540"> </a>
+<a name="ln541"> </a>
+<a name="ln542">int32</a>
+<a name="ln543">BMessage::CountNames(type_code type) const</a>
+<a name="ln544">{</a>
+<a name="ln545">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln546">	if (fHeader == NULL)</a>
+<a name="ln547">		return 0;</a>
+<a name="ln548"> </a>
+<a name="ln549">	if (type == B_ANY_TYPE)</a>
+<a name="ln550">		return fHeader-&gt;field_count;</a>
+<a name="ln551"> </a>
+<a name="ln552">	int32 count = 0;</a>
+<a name="ln553">	field_header* field = fFields;</a>
+<a name="ln554">	for (uint32 i = 0; i &lt; fHeader-&gt;field_count; i++, field++) {</a>
+<a name="ln555">		if (field-&gt;type == type)</a>
+<a name="ln556">			count++;</a>
+<a name="ln557">	}</a>
+<a name="ln558"> </a>
+<a name="ln559">	return count;</a>
+<a name="ln560">}</a>
+<a name="ln561"> </a>
+<a name="ln562"> </a>
+<a name="ln563">bool</a>
+<a name="ln564">BMessage::IsEmpty() const</a>
+<a name="ln565">{</a>
+<a name="ln566">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln567">	return fHeader == NULL || fHeader-&gt;field_count == 0;</a>
+<a name="ln568">}</a>
+<a name="ln569"> </a>
+<a name="ln570"> </a>
+<a name="ln571">bool</a>
+<a name="ln572">BMessage::IsSystem() const</a>
+<a name="ln573">{</a>
+<a name="ln574">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln575">	char a = char(what &gt;&gt; 24);</a>
+<a name="ln576">	char b = char(what &gt;&gt; 16);</a>
+<a name="ln577">	char c = char(what &gt;&gt; 8);</a>
+<a name="ln578">	char d = char(what);</a>
+<a name="ln579"> </a>
+<a name="ln580">	// The BeBook says:</a>
+<a name="ln581">	//		... we've adopted a strict convention for assigning values to all</a>
+<a name="ln582">	//		Be-defined constants.  The value assigned will always be formed by</a>
+<a name="ln583">	//		combining four characters into a multicharacter constant, with the</a>
+<a name="ln584">	//		characters limited to uppercase letters and the underbar</a>
+<a name="ln585">	// Between that and what's in AppDefs.h, this algo seems like a safe bet:</a>
+<a name="ln586">	if (a == '_' &amp;&amp; isupper(b) &amp;&amp; isupper(c) &amp;&amp; isupper(d))</a>
+<a name="ln587">		return true;</a>
+<a name="ln588"> </a>
+<a name="ln589">	return false;</a>
+<a name="ln590">}</a>
+<a name="ln591"> </a>
+<a name="ln592"> </a>
+<a name="ln593">bool</a>
+<a name="ln594">BMessage::IsReply() const</a>
+<a name="ln595">{</a>
+<a name="ln596">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln597">	return fHeader != NULL &amp;&amp; (fHeader-&gt;flags &amp; MESSAGE_FLAG_IS_REPLY) != 0;</a>
+<a name="ln598">}</a>
+<a name="ln599"> </a>
+<a name="ln600"> </a>
+<a name="ln601">void</a>
+<a name="ln602">BMessage::PrintToStream() const</a>
+<a name="ln603">{</a>
+<a name="ln604">	_PrintToStream(&quot;&quot;);</a>
+<a name="ln605">	printf(&quot;}\n&quot;);</a>
+<a name="ln606">}</a>
+<a name="ln607"> </a>
+<a name="ln608"> </a>
+<a name="ln609">void</a>
+<a name="ln610">BMessage::_PrintToStream(const char* indent) const</a>
+<a name="ln611">{</a>
+<a name="ln612">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln613"> </a>
+<a name="ln614">	int32 value = B_BENDIAN_TO_HOST_INT32(what);</a>
+<a name="ln615">	printf(&quot;BMessage(&quot;);</a>
+<a name="ln616">	if (isprint(*(char*)&amp;value))</a>
+<a name="ln617">		printf(&quot;'%.4s'&quot;, (char*)&amp;value);</a>
+<a name="ln618">	else</a>
+<a name="ln619">		printf(&quot;0x%&quot; B_PRIx32, what);</a>
+<a name="ln620">	printf(&quot;) {\n&quot;);</a>
+<a name="ln621"> </a>
+<a name="ln622">	if (fHeader == NULL || fFields == NULL || fData == NULL)</a>
+<a name="ln623">		return;</a>
+<a name="ln624"> </a>
+<a name="ln625">	field_header* field = fFields;</a>
+<a name="ln626">	for (uint32 i = 0; i &lt; fHeader-&gt;field_count; i++, field++) {</a>
+<a name="ln627">		value = B_BENDIAN_TO_HOST_INT32(field-&gt;type);</a>
+<a name="ln628">		ssize_t size = 0;</a>
+<a name="ln629">		if ((field-&gt;flags &amp; FIELD_FLAG_FIXED_SIZE) != 0 &amp;&amp; field-&gt;count &gt; 0)</a>
+<a name="ln630">			size = field-&gt;data_size / field-&gt;count;</a>
+<a name="ln631"> </a>
+<a name="ln632">		uint8* pointer = fData + field-&gt;offset + field-&gt;name_length;</a>
+<a name="ln633">		for (uint32 j = 0; j &lt; field-&gt;count; j++) {</a>
+<a name="ln634">			if (field-&gt;count == 1) {</a>
+<a name="ln635">				printf(&quot;%s        %s = &quot;, indent,</a>
+<a name="ln636">					(char*)(fData + field-&gt;offset));</a>
+<a name="ln637">			} else {</a>
+<a name="ln638">				printf(&quot;%s        %s[%&quot; B_PRIu32 &quot;] = &quot;, indent,</a>
+<a name="ln639">					(char*)(fData + field-&gt;offset), j);</a>
+<a name="ln640">			}</a>
+<a name="ln641"> </a>
+<a name="ln642">			if ((field-&gt;flags &amp; FIELD_FLAG_FIXED_SIZE) == 0) {</a>
+<a name="ln643">				size = *(uint32*)pointer;</a>
+<a name="ln644">				pointer += sizeof(uint32);</a>
+<a name="ln645">			}</a>
+<a name="ln646"> </a>
+<a name="ln647">			switch (field-&gt;type) {</a>
+<a name="ln648">				case B_RECT_TYPE:</a>
+<a name="ln649">					print_to_stream_type&lt;BRect&gt;(pointer);</a>
+<a name="ln650">					break;</a>
+<a name="ln651"> </a>
+<a name="ln652">				case B_POINT_TYPE:</a>
+<a name="ln653">					print_to_stream_type&lt;BPoint&gt;(pointer);</a>
+<a name="ln654">					break;</a>
+<a name="ln655"> </a>
+<a name="ln656">				case B_STRING_TYPE:</a>
+<a name="ln657">					printf(&quot;string(\&quot;%.*s\&quot;, %ld bytes)\n&quot;, (int)size,</a>
+<a name="ln658">						(char*)pointer, (long)size);</a>
+<a name="ln659">					break;</a>
+<a name="ln660"> </a>
+<a name="ln661">				case B_INT8_TYPE:</a>
+<a name="ln662">					print_type3&lt;int8&gt;(&quot;int8(0x%hx or %d or '%c')\n&quot;,</a>
+<a name="ln663">						pointer);</a>
+<a name="ln664">					break;</a>
+<a name="ln665"> </a>
+<a name="ln666">				case B_UINT8_TYPE:</a>
+<a name="ln667">					print_type3&lt;uint8&gt;(&quot;uint8(0x%hx or %u or '%c')\n&quot;,</a>
+<a name="ln668">						pointer);</a>
+<a name="ln669">					break;</a>
+<a name="ln670"> </a>
+<a name="ln671">				case B_INT16_TYPE:</a>
+<a name="ln672">					print_type&lt;int16&gt;(&quot;int16(0x%x or %d)\n&quot;, pointer);</a>
+<a name="ln673">					break;</a>
+<a name="ln674"> </a>
+<a name="ln675">				case B_UINT16_TYPE:</a>
+<a name="ln676">					print_type&lt;uint16&gt;(&quot;uint16(0x%x or %u\n&quot;, pointer);</a>
+<a name="ln677">					break;</a>
+<a name="ln678"> </a>
+<a name="ln679">				case B_INT32_TYPE:</a>
+<a name="ln680">					print_type&lt;int32&gt;(&quot;int32(0x%lx or %ld)\n&quot;, pointer);</a>
+<a name="ln681">					break;</a>
+<a name="ln682"> </a>
+<a name="ln683">				case B_UINT32_TYPE:</a>
+<a name="ln684">					print_type&lt;uint32&gt;(&quot;uint32(0x%lx or %lu\n&quot;, pointer);</a>
+<a name="ln685">					break;</a>
+<a name="ln686"> </a>
+<a name="ln687">				case B_INT64_TYPE:</a>
+<a name="ln688">					print_type&lt;int64&gt;(&quot;int64(0x%Lx or %Ld)\n&quot;, pointer);</a>
+<a name="ln689">					break;</a>
+<a name="ln690"> </a>
+<a name="ln691">				case B_UINT64_TYPE:</a>
+<a name="ln692">					print_type&lt;uint64&gt;(&quot;uint64(0x%Lx or %Ld\n&quot;, pointer);</a>
+<a name="ln693">					break;</a>
+<a name="ln694"> </a>
+<a name="ln695">				case B_BOOL_TYPE:</a>
+<a name="ln696">					printf(&quot;bool(%s)\n&quot;, *((bool*)pointer) != 0</a>
+<a name="ln697">						? &quot;true&quot; : &quot;false&quot;);</a>
+<a name="ln698">					break;</a>
+<a name="ln699"> </a>
+<a name="ln700">				case B_FLOAT_TYPE:</a>
+<a name="ln701">					print_type&lt;float&gt;(&quot;float(%.4f)\n&quot;, pointer);</a>
+<a name="ln702">					break;</a>
+<a name="ln703"> </a>
+<a name="ln704">				case B_DOUBLE_TYPE:</a>
+<a name="ln705">					print_type&lt;double&gt;(&quot;double(%.8f)\n&quot;, pointer);</a>
+<a name="ln706">					break;</a>
+<a name="ln707"> </a>
+<a name="ln708">				case B_REF_TYPE:</a>
+<a name="ln709">				{</a>
+<a name="ln710">					entry_ref ref;</a>
+<a name="ln711">					BPrivate::entry_ref_unflatten(&amp;ref, (char*)pointer, size);</a>
+<a name="ln712"> </a>
+<a name="ln713">					printf(&quot;entry_ref(device=%d, directory=%&quot; B_PRIdINO</a>
+<a name="ln714">						&quot;, name=\&quot;%s\&quot;, &quot;, (int)ref.device, ref.directory,</a>
+<a name="ln715">						ref.name);</a>
+<a name="ln716"> </a>
+<a name="ln717">					BPath path(&amp;ref);</a>
+<a name="ln718">					printf(&quot;path=\&quot;%s\&quot;)\n&quot;, path.Path());</a>
+<a name="ln719">					break;</a>
+<a name="ln720">				}</a>
+<a name="ln721"> </a>
+<a name="ln722">				case B_MESSAGE_TYPE:</a>
+<a name="ln723">				{</a>
+<a name="ln724">					char buffer[1024];</a>
+<a name="ln725">					snprintf(buffer, sizeof(buffer), &quot;%s        &quot;, indent);</a>
+<a name="ln726"> </a>
+<a name="ln727">					BMessage message;</a>
+<a name="ln728">					status_t result = message.Unflatten((const char*)pointer);</a>
+<a name="ln729">					if (result != B_OK) {</a>
+<a name="ln730">						printf(&quot;failed unflatten: %s\n&quot;, strerror(result));</a>
+<a name="ln731">						break;</a>
+<a name="ln732">					}</a>
+<a name="ln733"> </a>
+<a name="ln734">					message._PrintToStream(buffer);</a>
+<a name="ln735">					printf(&quot;%s        }\n&quot;, indent);</a>
+<a name="ln736">					break;</a>
+<a name="ln737">				}</a>
+<a name="ln738"> </a>
+<a name="ln739">				case B_RGB_32_BIT_TYPE:</a>
+<a name="ln740">				{</a>
+<a name="ln741">					rgb_color* color = (rgb_color*)pointer;</a>
+<a name="ln742">					printf(&quot;rgb_color(%u, %u, %u, %u)\n&quot;, color-&gt;red,</a>
+<a name="ln743">						color-&gt;green, color-&gt;blue, color-&gt;alpha);</a>
+<a name="ln744">					break;</a>
+<a name="ln745">				}</a>
+<a name="ln746"> </a>
+<a name="ln747">				default:</a>
+<a name="ln748">				{</a>
+<a name="ln749">					printf(&quot;(type = '%.4s')(size = %ld)\n&quot;, (char*)&amp;value,</a>
+<a name="ln750">						(long)size);</a>
+<a name="ln751">					break;</a>
+<a name="ln752">				}</a>
+<a name="ln753">			}</a>
+<a name="ln754"> </a>
+<a name="ln755">			pointer += size;</a>
+<a name="ln756">		}</a>
+<a name="ln757">	}</a>
+<a name="ln758">}</a>
+<a name="ln759"> </a>
+<a name="ln760"> </a>
+<a name="ln761">status_t</a>
+<a name="ln762">BMessage::Rename(const char* oldEntry, const char* newEntry)</a>
+<a name="ln763">{</a>
+<a name="ln764">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln765">	if (oldEntry == NULL || newEntry == NULL)</a>
+<a name="ln766">		return B_BAD_VALUE;</a>
+<a name="ln767"> </a>
+<a name="ln768">	if (fHeader == NULL)</a>
+<a name="ln769">		return B_NO_INIT;</a>
+<a name="ln770"> </a>
+<a name="ln771">	status_t result;</a>
+<a name="ln772">	if (fHeader-&gt;message_area &gt;= 0) {</a>
+<a name="ln773">		result = _CopyForWrite();</a>
+<a name="ln774">		if (result != B_OK)</a>
+<a name="ln775">			return result;</a>
+<a name="ln776">	}</a>
+<a name="ln777"> </a>
+<a name="ln778">	uint32 hash = _HashName(oldEntry) % fHeader-&gt;hash_table_size;</a>
+<a name="ln779">	int32* nextField = &amp;fHeader-&gt;hash_table[hash];</a>
+<a name="ln780"> </a>
+<a name="ln781">	while (*nextField &gt;= 0) {</a>
+<a name="ln782">		field_header* field = &amp;fFields[*nextField];</a>
+<a name="ln783"> </a>
+<a name="ln784">		if (strncmp((const char*)(fData + field-&gt;offset), oldEntry,</a>
+<a name="ln785">			field-&gt;name_length) == 0) {</a>
+<a name="ln786">			// nextField points to the field for oldEntry, save it and unlink</a>
+<a name="ln787">			int32 index = *nextField;</a>
+<a name="ln788">			*nextField = field-&gt;next_field;</a>
+<a name="ln789">			field-&gt;next_field = -1;</a>
+<a name="ln790"> </a>
+<a name="ln791">			hash = _HashName(newEntry) % fHeader-&gt;hash_table_size;</a>
+<a name="ln792">			nextField = &amp;fHeader-&gt;hash_table[hash];</a>
+<a name="ln793">			while (*nextField &gt;= 0)</a>
+<a name="ln794">				nextField = &amp;fFields[*nextField].next_field;</a>
+<a name="ln795">			*nextField = index;</a>
+<a name="ln796"> </a>
+<a name="ln797">			int32 newLength = strlen(newEntry) + 1;</a>
+<a name="ln798">			result = _ResizeData(field-&gt;offset + 1,</a>
+<a name="ln799">				newLength - field-&gt;name_length);</a>
+<a name="ln800">			if (result != B_OK)</a>
+<a name="ln801">				return result;</a>
+<a name="ln802"> </a>
+<a name="ln803">			memcpy(fData + field-&gt;offset, newEntry, newLength);</a>
+<a name="ln804">			field-&gt;name_length = newLength;</a>
+<a name="ln805">			return B_OK;</a>
+<a name="ln806">		}</a>
+<a name="ln807"> </a>
+<a name="ln808">		nextField = &amp;field-&gt;next_field;</a>
+<a name="ln809">	}</a>
+<a name="ln810"> </a>
+<a name="ln811">	return B_NAME_NOT_FOUND;</a>
+<a name="ln812">}</a>
+<a name="ln813"> </a>
+<a name="ln814"> </a>
+<a name="ln815">bool</a>
+<a name="ln816">BMessage::WasDelivered() const</a>
+<a name="ln817">{</a>
+<a name="ln818">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln819">	return fHeader != NULL</a>
+<a name="ln820">		&amp;&amp; (fHeader-&gt;flags &amp; MESSAGE_FLAG_WAS_DELIVERED) != 0;</a>
+<a name="ln821">}</a>
+<a name="ln822"> </a>
+<a name="ln823"> </a>
+<a name="ln824">bool</a>
+<a name="ln825">BMessage::IsSourceWaiting() const</a>
+<a name="ln826">{</a>
+<a name="ln827">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln828">	return fHeader != NULL</a>
+<a name="ln829">		&amp;&amp; (fHeader-&gt;flags &amp; MESSAGE_FLAG_REPLY_REQUIRED) != 0</a>
+<a name="ln830">		&amp;&amp; (fHeader-&gt;flags &amp; MESSAGE_FLAG_REPLY_DONE) == 0;</a>
+<a name="ln831">}</a>
+<a name="ln832"> </a>
+<a name="ln833"> </a>
+<a name="ln834">bool</a>
+<a name="ln835">BMessage::IsSourceRemote() const</a>
+<a name="ln836">{</a>
+<a name="ln837">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln838">	return fHeader != NULL</a>
+<a name="ln839">		&amp;&amp; (fHeader-&gt;flags &amp; MESSAGE_FLAG_WAS_DELIVERED) != 0</a>
+<a name="ln840">		&amp;&amp; fHeader-&gt;reply_team != BPrivate::current_team();</a>
+<a name="ln841">}</a>
+<a name="ln842"> </a>
+<a name="ln843"> </a>
+<a name="ln844">BMessenger</a>
+<a name="ln845">BMessage::ReturnAddress() const</a>
+<a name="ln846">{</a>
+<a name="ln847">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln848">	if (fHeader == NULL || (fHeader-&gt;flags &amp; MESSAGE_FLAG_WAS_DELIVERED) == 0)</a>
+<a name="ln849">		return BMessenger();</a>
+<a name="ln850"> </a>
+<a name="ln851">	BMessenger messenger;</a>
+<a name="ln852">	BMessenger::Private(messenger).SetTo(fHeader-&gt;reply_team,</a>
+<a name="ln853">		fHeader-&gt;reply_port, fHeader-&gt;reply_target);</a>
+<a name="ln854">	return messenger;</a>
+<a name="ln855">}</a>
+<a name="ln856"> </a>
+<a name="ln857"> </a>
+<a name="ln858">const BMessage*</a>
+<a name="ln859">BMessage::Previous() const</a>
+<a name="ln860">{</a>
+<a name="ln861">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln862">	/* ToDo: test if the &quot;_previous_&quot; field is used in R5 */</a>
+<a name="ln863">	if (fOriginal == NULL) {</a>
+<a name="ln864">		fOriginal = new BMessage();</a>
+<a name="ln865"> </a>
+<a name="ln866">		if (FindMessage(&quot;_previous_&quot;, fOriginal) != B_OK) {</a>
+<a name="ln867">			delete fOriginal;</a>
+<a name="ln868">			fOriginal = NULL;</a>
+<a name="ln869">		}</a>
+<a name="ln870">	}</a>
+<a name="ln871"> </a>
+<a name="ln872">	return fOriginal;</a>
+<a name="ln873">}</a>
+<a name="ln874"> </a>
+<a name="ln875"> </a>
+<a name="ln876">bool</a>
+<a name="ln877">BMessage::WasDropped() const</a>
+<a name="ln878">{</a>
+<a name="ln879">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln880">	return fHeader != NULL</a>
+<a name="ln881">		&amp;&amp; (fHeader-&gt;flags &amp; MESSAGE_FLAG_WAS_DROPPED) != 0;</a>
+<a name="ln882">}</a>
+<a name="ln883"> </a>
+<a name="ln884"> </a>
+<a name="ln885">BPoint</a>
+<a name="ln886">BMessage::DropPoint(BPoint* offset) const</a>
+<a name="ln887">{</a>
+<a name="ln888">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln889">	if (offset != NULL)</a>
+<a name="ln890">		*offset = FindPoint(&quot;_drop_offset_&quot;);</a>
+<a name="ln891"> </a>
+<a name="ln892">	return FindPoint(&quot;_drop_point_&quot;);</a>
+<a name="ln893">}</a>
+<a name="ln894"> </a>
+<a name="ln895"> </a>
+<a name="ln896">status_t</a>
+<a name="ln897">BMessage::SendReply(uint32 command, BHandler* replyTo)</a>
+<a name="ln898">{</a>
+<a name="ln899">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln900">	BMessage message(command);</a>
+<a name="ln901">	return SendReply(&amp;message, replyTo);</a>
+<a name="ln902">}</a>
+<a name="ln903"> </a>
+<a name="ln904"> </a>
+<a name="ln905">status_t</a>
+<a name="ln906">BMessage::SendReply(BMessage* reply, BHandler* replyTo, bigtime_t timeout)</a>
+<a name="ln907">{</a>
+<a name="ln908">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln909">	BMessenger messenger(replyTo);</a>
+<a name="ln910">	return SendReply(reply, messenger, timeout);</a>
+<a name="ln911">}</a>
+<a name="ln912"> </a>
+<a name="ln913"> </a>
+<a name="ln914">status_t</a>
+<a name="ln915">BMessage::SendReply(BMessage* reply, BMessenger replyTo, bigtime_t timeout)</a>
+<a name="ln916">{</a>
+<a name="ln917">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln918">	if (fHeader == NULL)</a>
+<a name="ln919">		return B_NO_INIT;</a>
+<a name="ln920"> </a>
+<a name="ln921">	BMessenger messenger;</a>
+<a name="ln922">	BMessenger::Private messengerPrivate(messenger);</a>
+<a name="ln923">	messengerPrivate.SetTo(fHeader-&gt;reply_team, fHeader-&gt;reply_port,</a>
+<a name="ln924">		fHeader-&gt;reply_target);</a>
+<a name="ln925">	if ((fHeader-&gt;flags &amp; MESSAGE_FLAG_REPLY_AS_KMESSAGE) != 0)</a>
+<a name="ln926">		reply-&gt;fHeader-&gt;flags |= MESSAGE_FLAG_REPLY_AS_KMESSAGE;</a>
+<a name="ln927"> </a>
+<a name="ln928">	if ((fHeader-&gt;flags &amp; MESSAGE_FLAG_REPLY_REQUIRED) != 0) {</a>
+<a name="ln929">		if ((fHeader-&gt;flags &amp; MESSAGE_FLAG_REPLY_DONE) != 0)</a>
+<a name="ln930">			return B_DUPLICATE_REPLY;</a>
+<a name="ln931"> </a>
+<a name="ln932">		fHeader-&gt;flags |= MESSAGE_FLAG_REPLY_DONE;</a>
+<a name="ln933">		reply-&gt;fHeader-&gt;flags |= MESSAGE_FLAG_IS_REPLY;</a>
+<a name="ln934">		status_t result = messenger.SendMessage(reply, replyTo, timeout);</a>
+<a name="ln935">		reply-&gt;fHeader-&gt;flags &amp;= ~MESSAGE_FLAG_IS_REPLY;</a>
+<a name="ln936"> </a>
+<a name="ln937">		if (result != B_OK &amp;&amp; set_port_owner(messengerPrivate.Port(),</a>
+<a name="ln938">				messengerPrivate.Team()) == B_BAD_TEAM_ID) {</a>
+<a name="ln939">			delete_port(messengerPrivate.Port());</a>
+<a name="ln940">		}</a>
+<a name="ln941"> </a>
+<a name="ln942">		return result;</a>
+<a name="ln943">	}</a>
+<a name="ln944"> </a>
+<a name="ln945">	// no reply required</a>
+<a name="ln946">	if ((fHeader-&gt;flags &amp; MESSAGE_FLAG_WAS_DELIVERED) == 0)</a>
+<a name="ln947">		return B_BAD_REPLY;</a>
+<a name="ln948"> </a>
+<a name="ln949">	reply-&gt;AddMessage(&quot;_previous_&quot;, this);</a>
+<a name="ln950">	reply-&gt;fHeader-&gt;flags |= MESSAGE_FLAG_IS_REPLY;</a>
+<a name="ln951">	status_t result = messenger.SendMessage(reply, replyTo, timeout);</a>
+<a name="ln952">	reply-&gt;fHeader-&gt;flags &amp;= ~MESSAGE_FLAG_IS_REPLY;</a>
+<a name="ln953">	reply-&gt;RemoveName(&quot;_previous_&quot;);</a>
+<a name="ln954">	return result;</a>
+<a name="ln955">}</a>
+<a name="ln956"> </a>
+<a name="ln957"> </a>
+<a name="ln958">status_t</a>
+<a name="ln959">BMessage::SendReply(uint32 command, BMessage* replyToReply)</a>
+<a name="ln960">{</a>
+<a name="ln961">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln962">	BMessage message(command);</a>
+<a name="ln963">	return SendReply(&amp;message, replyToReply);</a>
+<a name="ln964">}</a>
+<a name="ln965"> </a>
+<a name="ln966"> </a>
+<a name="ln967">status_t</a>
+<a name="ln968">BMessage::SendReply(BMessage* reply, BMessage* replyToReply,</a>
+<a name="ln969">	bigtime_t sendTimeout, bigtime_t replyTimeout)</a>
+<a name="ln970">{</a>
+<a name="ln971">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln972">	if (fHeader == NULL)</a>
+<a name="ln973">		return B_NO_INIT;</a>
+<a name="ln974"> </a>
+<a name="ln975">	BMessenger messenger;</a>
+<a name="ln976">	BMessenger::Private messengerPrivate(messenger);</a>
+<a name="ln977">	messengerPrivate.SetTo(fHeader-&gt;reply_team, fHeader-&gt;reply_port,</a>
+<a name="ln978">		fHeader-&gt;reply_target);</a>
+<a name="ln979"> </a>
+<a name="ln980">	if ((fHeader-&gt;flags &amp; MESSAGE_FLAG_REPLY_REQUIRED) != 0) {</a>
+<a name="ln981">		if ((fHeader-&gt;flags &amp; MESSAGE_FLAG_REPLY_DONE) != 0)</a>
+<a name="ln982">			return B_DUPLICATE_REPLY;</a>
+<a name="ln983"> </a>
+<a name="ln984">		fHeader-&gt;flags |= MESSAGE_FLAG_REPLY_DONE;</a>
+<a name="ln985">		reply-&gt;fHeader-&gt;flags |= MESSAGE_FLAG_IS_REPLY;</a>
+<a name="ln986">		status_t result = messenger.SendMessage(reply, replyToReply,</a>
+<a name="ln987">			sendTimeout, replyTimeout);</a>
+<a name="ln988">		reply-&gt;fHeader-&gt;flags &amp;= ~MESSAGE_FLAG_IS_REPLY;</a>
+<a name="ln989"> </a>
+<a name="ln990">		if (result != B_OK) {</a>
+<a name="ln991">			if (set_port_owner(messengerPrivate.Port(),</a>
+<a name="ln992">				messengerPrivate.Team()) == B_BAD_TEAM_ID) {</a>
+<a name="ln993">				delete_port(messengerPrivate.Port());</a>
+<a name="ln994">			}</a>
+<a name="ln995">		}</a>
+<a name="ln996"> </a>
+<a name="ln997">		return result;</a>
+<a name="ln998">	}</a>
+<a name="ln999"> </a>
+<a name="ln1000">	// no reply required</a>
+<a name="ln1001">	if ((fHeader-&gt;flags &amp; MESSAGE_FLAG_WAS_DELIVERED) == 0)</a>
+<a name="ln1002">		return B_BAD_REPLY;</a>
+<a name="ln1003"> </a>
+<a name="ln1004">	reply-&gt;AddMessage(&quot;_previous_&quot;, this);</a>
+<a name="ln1005">	reply-&gt;fHeader-&gt;flags |= MESSAGE_FLAG_IS_REPLY</a>
+<a name="ln1006">		| (fHeader-&gt;flags &amp; MESSAGE_FLAG_REPLY_AS_KMESSAGE);</a>
+<a name="ln1007">	status_t result = messenger.SendMessage(reply, replyToReply, sendTimeout,</a>
+<a name="ln1008">		replyTimeout);</a>
+<a name="ln1009">	reply-&gt;fHeader-&gt;flags &amp;= ~MESSAGE_FLAG_IS_REPLY;</a>
+<a name="ln1010">	reply-&gt;RemoveName(&quot;_previous_&quot;);</a>
+<a name="ln1011">	return result;</a>
+<a name="ln1012">}</a>
+<a name="ln1013"> </a>
+<a name="ln1014"> </a>
+<a name="ln1015">ssize_t</a>
+<a name="ln1016">BMessage::FlattenedSize() const</a>
+<a name="ln1017">{</a>
+<a name="ln1018">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln1019">	if (fHeader == NULL)</a>
+<a name="ln1020">		return B_NO_INIT;</a>
+<a name="ln1021"> </a>
+<a name="ln1022">	return sizeof(message_header) + fHeader-&gt;field_count * sizeof(field_header)</a>
+<a name="ln1023">		+ fHeader-&gt;data_size;</a>
+<a name="ln1024">}</a>
+<a name="ln1025"> </a>
+<a name="ln1026"> </a>
+<a name="ln1027">status_t</a>
+<a name="ln1028">BMessage::Flatten(char* buffer, ssize_t size) const</a>
+<a name="ln1029">{</a>
+<a name="ln1030">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln1031">	if (buffer == NULL || size &lt; 0)</a>
+<a name="ln1032">		return B_BAD_VALUE;</a>
+<a name="ln1033"> </a>
+<a name="ln1034">	if (fHeader == NULL)</a>
+<a name="ln1035">		return B_NO_INIT;</a>
+<a name="ln1036"> </a>
+<a name="ln1037">	if (size &lt; FlattenedSize())</a>
+<a name="ln1038">		return B_BUFFER_OVERFLOW;</a>
+<a name="ln1039"> </a>
+<a name="ln1040">	/* we have to sync the what code as it is a public member */</a>
+<a name="ln1041">	fHeader-&gt;what = what;</a>
+<a name="ln1042"> </a>
+<a name="ln1043">	memcpy(buffer, fHeader, sizeof(message_header));</a>
+<a name="ln1044">	buffer += sizeof(message_header);</a>
+<a name="ln1045"> </a>
+<a name="ln1046">	size_t fieldsSize = fHeader-&gt;field_count * sizeof(field_header);</a>
+<a name="ln1047">	memcpy(buffer, fFields, fieldsSize);</a>
+<a name="ln1048">	buffer += fieldsSize;</a>
+<a name="ln1049"> </a>
+<a name="ln1050">	memcpy(buffer, fData, fHeader-&gt;data_size);</a>
+<a name="ln1051"> </a>
+<a name="ln1052">	return B_OK;</a>
+<a name="ln1053">}</a>
+<a name="ln1054"> </a>
+<a name="ln1055"> </a>
+<a name="ln1056">status_t</a>
+<a name="ln1057">BMessage::Flatten(BDataIO* stream, ssize_t* size) const</a>
+<a name="ln1058">{</a>
+<a name="ln1059">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln1060">	if (stream == NULL)</a>
+<a name="ln1061">		return B_BAD_VALUE;</a>
+<a name="ln1062"> </a>
+<a name="ln1063">	if (fHeader == NULL)</a>
+<a name="ln1064">		return B_NO_INIT;</a>
+<a name="ln1065"> </a>
+<a name="ln1066">	/* we have to sync the what code as it is a public member */</a>
+<a name="ln1067">	fHeader-&gt;what = what;</a>
+<a name="ln1068"> </a>
+<a name="ln1069">	ssize_t result1 = stream-&gt;Write(fHeader, sizeof(message_header));</a>
+<a name="ln1070">	if (result1 != sizeof(message_header))</a>
+<a name="ln1071">		return result1 &lt; 0 ? result1 : B_ERROR;</a>
+<a name="ln1072"> </a>
+<a name="ln1073">	ssize_t result2 = 0;</a>
+<a name="ln1074">	if (fHeader-&gt;field_count &gt; 0) {</a>
+<a name="ln1075">		ssize_t fieldsSize = fHeader-&gt;field_count * sizeof(field_header);</a>
+<a name="ln1076">		result2 = stream-&gt;Write(fFields, fieldsSize);</a>
+<a name="ln1077">		if (result2 != fieldsSize)</a>
+<a name="ln1078">			return result2 &lt; 0 ? result2 : B_ERROR;</a>
+<a name="ln1079">	}</a>
+<a name="ln1080"> </a>
+<a name="ln1081">	ssize_t result3 = 0;</a>
+<a name="ln1082">	if (fHeader-&gt;data_size &gt; 0) {</a>
+<a name="ln1083">		result3 = stream-&gt;Write(fData, fHeader-&gt;data_size);</a>
+<a name="ln1084">		if (result3 != (ssize_t)fHeader-&gt;data_size)</a>
+<a name="ln1085">			return result3 &lt; 0 ? result3 : B_ERROR;</a>
+<a name="ln1086">	}</a>
+<a name="ln1087"> </a>
+<a name="ln1088">	if (size)</a>
+<a name="ln1089">		*size = result1 + result2 + result3;</a>
+<a name="ln1090"> </a>
+<a name="ln1091">	return B_OK;</a>
+<a name="ln1092">}</a>
+<a name="ln1093"> </a>
+<a name="ln1094"> </a>
+<a name="ln1095">/*	The concept of message sending by area:</a>
+<a name="ln1096"> </a>
+<a name="ln1097">	The traditional way of sending a message is to send it by flattening it to</a>
+<a name="ln1098">	a buffer, pushing it through a port, reading it into the outputbuffer and</a>
+<a name="ln1099">	unflattening it from there (copying the data again). While this works ok</a>
+<a name="ln1100">	for small messages it does not make any sense for larger ones and may even</a>
+<a name="ln1101">	hit some port capacity limit.</a>
+<a name="ln1102">	Often in the life of a BMessage, it will be sent to someone. Almost as</a>
+<a name="ln1103">	often the one receiving the message will not need to change the message</a>
+<a name="ln1104">	in any way, but uses it &quot;read only&quot; to get information from it. This means</a>
+<a name="ln1105">	that all that copying is pretty pointless in the first place since we</a>
+<a name="ln1106">	could simply pass the original buffers on.</a>
+<a name="ln1107">	It's obviously not exactly as simple as this, since we cannot just use the</a>
+<a name="ln1108">	memory of one application in another - but we can share areas with</a>
+<a name="ln1109">	eachother.</a>
+<a name="ln1110">	Therefore instead of flattening into a buffer, we copy the message data</a>
+<a name="ln1111">	into an area, put this information into the message header and only push</a>
+<a name="ln1112">	this through the port. The receiving looper then builds a BMessage from</a>
+<a name="ln1113">	the header, that only references the data in the area (not copying it),</a>
+<a name="ln1114">	allowing read only access to it.</a>
+<a name="ln1115">	Only if write access is necessary the message will be copyed from the area</a>
+<a name="ln1116">	to its own buffers (like in the unflatten step before).</a>
+<a name="ln1117">	The double copying is reduced to a single copy in most cases and we safe</a>
+<a name="ln1118">	the slower route of moving the data through a port.</a>
+<a name="ln1119">	Additionally we save us the reference counting with the use of areas that</a>
+<a name="ln1120">	are reference counted internally. So we don't have to worry about leaving</a>
+<a name="ln1121">	an area behind or deleting one that is still in use.</a>
+<a name="ln1122">*/</a>
+<a name="ln1123"> </a>
+<a name="ln1124">status_t</a>
+<a name="ln1125">BMessage::_FlattenToArea(message_header** _header) const</a>
+<a name="ln1126">{</a>
+<a name="ln1127">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln1128">	if (fHeader == NULL)</a>
+<a name="ln1129">		return B_NO_INIT;</a>
+<a name="ln1130"> </a>
+<a name="ln1131">	message_header* header = (message_header*)malloc(sizeof(message_header));</a>
+<a name="ln1132">	if (header == NULL)</a>
+<a name="ln1133">		return B_NO_MEMORY;</a>
+<a name="ln1134"> </a>
+<a name="ln1135">	memcpy(header, fHeader, sizeof(message_header));</a>
+<a name="ln1136"> </a>
+<a name="ln1137">	header-&gt;what = what;</a>
+<a name="ln1138">	header-&gt;message_area = -1;</a>
+<a name="ln1139">	*_header = header;</a>
+<a name="ln1140"> </a>
+<a name="ln1141">	if (header-&gt;field_count == 0 &amp;&amp; header-&gt;data_size == 0)</a>
+<a name="ln1142">		return B_OK;</a>
+<a name="ln1143"> </a>
+<a name="ln1144">	char* address = NULL;</a>
+<a name="ln1145">	size_t fieldsSize = header-&gt;field_count * sizeof(field_header);</a>
+<a name="ln1146">	size_t size = fieldsSize + header-&gt;data_size;</a>
+<a name="ln1147">	size = (size + B_PAGE_SIZE) &amp; ~(B_PAGE_SIZE - 1);</a>
+<a name="ln1148">	area_id area = create_area(&quot;BMessage data&quot;, (void**)&amp;address,</a>
+<a name="ln1149">		B_ANY_ADDRESS, size, B_NO_LOCK, B_READ_AREA | B_WRITE_AREA);</a>
+<a name="ln1150"> </a>
+<a name="ln1151">	if (area &lt; 0) {</a>
+<a name="ln1152">		free(header);</a>
+<a name="ln1153">		*_header = NULL;</a>
+<a name="ln1154">		return area;</a>
+<a name="ln1155">	}</a>
+<a name="ln1156"> </a>
+<a name="ln1157">	memcpy(address, fFields, fieldsSize);</a>
+<a name="ln1158">	memcpy(address + fieldsSize, fData, fHeader-&gt;data_size);</a>
+<a name="ln1159">	header-&gt;flags |= MESSAGE_FLAG_PASS_BY_AREA;</a>
+<a name="ln1160">	header-&gt;message_area = area;</a>
+<a name="ln1161">	return B_OK;</a>
+<a name="ln1162">}</a>
+<a name="ln1163"> </a>
+<a name="ln1164"> </a>
+<a name="ln1165">status_t</a>
+<a name="ln1166">BMessage::_Reference()</a>
+<a name="ln1167">{</a>
+<a name="ln1168">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln1169">	if (fHeader == NULL)</a>
+<a name="ln1170">		return B_NO_INIT;</a>
+<a name="ln1171"> </a>
+<a name="ln1172">	fHeader-&gt;flags &amp;= ~MESSAGE_FLAG_PASS_BY_AREA;</a>
+<a name="ln1173"> </a>
+<a name="ln1174">	/* if there is no data at all we don't need the area */</a>
+<a name="ln1175">	if (fHeader-&gt;field_count == 0 &amp;&amp; fHeader-&gt;data_size == 0)</a>
+<a name="ln1176">		return B_OK;</a>
+<a name="ln1177"> </a>
+<a name="ln1178">	area_info areaInfo;</a>
+<a name="ln1179">	status_t result = get_area_info(fHeader-&gt;message_area, &amp;areaInfo);</a>
+<a name="ln1180">	if (result != B_OK)</a>
+<a name="ln1181">		return result;</a>
+<a name="ln1182"> </a>
+<a name="ln1183">	if (areaInfo.team != BPrivate::current_team())</a>
+<a name="ln1184">		return B_BAD_VALUE;</a>
+<a name="ln1185"> </a>
+<a name="ln1186">	set_area_protection(fHeader-&gt;message_area, B_READ_AREA);</a>
+<a name="ln1187"> </a>
+<a name="ln1188">	uint8* address = (uint8*)areaInfo.address;</a>
+<a name="ln1189"> </a>
+<a name="ln1190">	fFields = (field_header*)address;</a>
+<a name="ln1191">	fData = address + fHeader-&gt;field_count * sizeof(field_header);</a>
+<a name="ln1192">	return B_OK;</a>
+<a name="ln1193">}</a>
+<a name="ln1194"> </a>
+<a name="ln1195"> </a>
+<a name="ln1196">status_t</a>
+<a name="ln1197">BMessage::_Dereference()</a>
+<a name="ln1198">{</a>
+<a name="ln1199">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln1200">	if (fHeader == NULL)</a>
+<a name="ln1201">		return B_NO_INIT;</a>
+<a name="ln1202"> </a>
+<a name="ln1203">	delete_area(fHeader-&gt;message_area);</a>
+<a name="ln1204">	fHeader-&gt;message_area = -1;</a>
+<a name="ln1205">	fFields = NULL;</a>
+<a name="ln1206">	fData = NULL;</a>
+<a name="ln1207">	return B_OK;</a>
+<a name="ln1208">}</a>
+<a name="ln1209"> </a>
+<a name="ln1210"> </a>
+<a name="ln1211">status_t</a>
+<a name="ln1212">BMessage::_CopyForWrite()</a>
+<a name="ln1213">{</a>
+<a name="ln1214">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln1215">	if (fHeader == NULL)</a>
+<a name="ln1216">		return B_NO_INIT;</a>
+<a name="ln1217"> </a>
+<a name="ln1218">	field_header* newFields = NULL;</a>
+<a name="ln1219">	uint8* newData = NULL;</a>
+<a name="ln1220"> </a>
+<a name="ln1221">	if (fHeader-&gt;field_count &gt; 0) {</a>
+<a name="ln1222">		size_t fieldsSize = fHeader-&gt;field_count * sizeof(field_header);</a>
+<a name="ln1223">		newFields = (field_header*)malloc(fieldsSize);</a>
+<a name="ln1224">		if (newFields == NULL)</a>
+<a name="ln1225">			return B_NO_MEMORY;</a>
+<a name="ln1226"> </a>
+<a name="ln1227">		memcpy(newFields, fFields, fieldsSize);</a>
+<a name="ln1228">	}</a>
+<a name="ln1229"> </a>
+<a name="ln1230">	if (fHeader-&gt;data_size &gt; 0) {</a>
+<a name="ln1231">		newData = (uint8*)malloc(fHeader-&gt;data_size);</a>
+<a name="ln1232">		if (newData == NULL) {</a>
+<a name="ln1233">			free(newFields);</a>
+<a name="ln1234">			return B_NO_MEMORY;</a>
+<a name="ln1235">		}</a>
+<a name="ln1236"> </a>
+<a name="ln1237">		memcpy(newData, fData, fHeader-&gt;data_size);</a>
+<a name="ln1238">	}</a>
+<a name="ln1239"> </a>
+<a name="ln1240">	_Dereference();</a>
+<a name="ln1241"> </a>
+<a name="ln1242">	fFieldsAvailable = 0;</a>
+<a name="ln1243">	fDataAvailable = 0;</a>
+<a name="ln1244"> </a>
+<a name="ln1245">	fFields = newFields;</a>
+<a name="ln1246">	fData = newData;</a>
+<a name="ln1247">	return B_OK;</a>
+<a name="ln1248">}</a>
+<a name="ln1249"> </a>
+<a name="ln1250"> </a>
+<a name="ln1251">status_t</a>
+<a name="ln1252">BMessage::_ValidateMessage()</a>
+<a name="ln1253">{</a>
+<a name="ln1254">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln1255">	if (fHeader == NULL)</a>
+<a name="ln1256">		return B_NO_INIT;</a>
+<a name="ln1257"> </a>
+<a name="ln1258">	if (fHeader-&gt;field_count == 0)</a>
+<a name="ln1259">		return B_OK;</a>
+<a name="ln1260"> </a>
+<a name="ln1261">	if (fFields == NULL)</a>
+<a name="ln1262">		return B_NO_INIT;</a>
+<a name="ln1263"> </a>
+<a name="ln1264">	for (uint32 i = 0; i &lt; fHeader-&gt;field_count; i++) {</a>
+<a name="ln1265">		field_header* field = &amp;fFields[i];</a>
+<a name="ln1266">		if ((field-&gt;next_field &gt;= 0</a>
+<a name="ln1267">				&amp;&amp; (uint32)field-&gt;next_field &gt; fHeader-&gt;field_count)</a>
+<a name="ln1268">			|| (field-&gt;offset + field-&gt;name_length + field-&gt;data_size</a>
+<a name="ln1269">				&gt; fHeader-&gt;data_size)) {</a>
+<a name="ln1270">			// the message is corrupt</a>
+<a name="ln1271">			MakeEmpty();</a>
+<a name="ln1272">			return B_BAD_VALUE;</a>
+<a name="ln1273">		}</a>
+<a name="ln1274">	}</a>
+<a name="ln1275"> </a>
+<a name="ln1276">	return B_OK;</a>
+<a name="ln1277">}</a>
+<a name="ln1278"> </a>
+<a name="ln1279"> </a>
+<a name="ln1280">status_t</a>
+<a name="ln1281">BMessage::Unflatten(const char* flatBuffer)</a>
+<a name="ln1282">{</a>
+<a name="ln1283">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln1284">	if (flatBuffer == NULL)</a>
+<a name="ln1285">		return B_BAD_VALUE;</a>
+<a name="ln1286"> </a>
+<a name="ln1287">	uint32 format = *(uint32*)flatBuffer;</a>
+<a name="ln1288">	if (format != MESSAGE_FORMAT_HAIKU)</a>
+<a name="ln1289">		return BPrivate::MessageAdapter::Unflatten(format, this, flatBuffer);</a>
+<a name="ln1290"> </a>
+<a name="ln1291">	BMemoryIO io(flatBuffer, SSIZE_MAX);</a>
+<a name="ln1292">	return Unflatten(&amp;io);</a>
+<a name="ln1293">}</a>
+<a name="ln1294"> </a>
+<a name="ln1295"> </a>
+<a name="ln1296">status_t</a>
+<a name="ln1297">BMessage::Unflatten(BDataIO* stream)</a>
+<a name="ln1298">{</a>
+<a name="ln1299">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln1300">	if (stream == NULL)</a>
+<a name="ln1301">		return B_BAD_VALUE;</a>
+<a name="ln1302"> </a>
+<a name="ln1303">	uint32 format = 0;</a>
+<a name="ln1304">	stream-&gt;Read(&amp;format, sizeof(uint32));</a>
+<a name="ln1305">	if (format != MESSAGE_FORMAT_HAIKU)</a>
+<a name="ln1306">		return BPrivate::MessageAdapter::Unflatten(format, this, stream);</a>
+<a name="ln1307"> </a>
+<a name="ln1308">	// native message unflattening</a>
+<a name="ln1309"> </a>
+<a name="ln1310">	_Clear();</a>
+<a name="ln1311"> </a>
+<a name="ln1312">	fHeader = (message_header*)malloc(sizeof(message_header));</a>
+<a name="ln1313">	if (fHeader == NULL)</a>
+<a name="ln1314">		return B_NO_MEMORY;</a>
+<a name="ln1315"> </a>
+<a name="ln1316">	fHeader-&gt;format = format;</a>
+<a name="ln1317">	uint8* header = (uint8*)fHeader;</a>
+<a name="ln1318">	ssize_t result = stream-&gt;Read(header + sizeof(uint32),</a>
+<a name="ln1319">		sizeof(message_header) - sizeof(uint32));</a>
+<a name="ln1320">	if (result != sizeof(message_header) - sizeof(uint32)</a>
+<a name="ln1321">		|| (fHeader-&gt;flags &amp; MESSAGE_FLAG_VALID) == 0) {</a>
+<a name="ln1322">		_InitHeader();</a>
+<a name="ln1323">		return result &lt; 0 ? result : B_BAD_VALUE;</a>
+<a name="ln1324">	}</a>
+<a name="ln1325"> </a>
+<a name="ln1326">	what = fHeader-&gt;what;</a>
+<a name="ln1327"> </a>
+<a name="ln1328">	if ((fHeader-&gt;flags &amp; MESSAGE_FLAG_PASS_BY_AREA) != 0</a>
+<a name="ln1329">		&amp;&amp; fHeader-&gt;message_area &gt;= 0) {</a>
+<a name="ln1330">		status_t result = _Reference();</a>
+<a name="ln1331">		if (result != B_OK) {</a>
+<a name="ln1332">			_InitHeader();</a>
+<a name="ln1333">			return result;</a>
+<a name="ln1334">		}</a>
+<a name="ln1335">	} else {</a>
+<a name="ln1336">		fHeader-&gt;message_area = -1;</a>
+<a name="ln1337"> </a>
+<a name="ln1338">		if (fHeader-&gt;field_count &gt; 0) {</a>
+<a name="ln1339">			ssize_t fieldsSize = fHeader-&gt;field_count * sizeof(field_header);</a>
+<a name="ln1340">			fFields = (field_header*)malloc(fieldsSize);</a>
+<a name="ln1341">			if (fFields == NULL) {</a>
+<a name="ln1342">				_InitHeader();</a>
+<a name="ln1343">				return B_NO_MEMORY;</a>
+<a name="ln1344">			}</a>
+<a name="ln1345"> </a>
+<a name="ln1346">			result = stream-&gt;Read(fFields, fieldsSize);</a>
+<a name="ln1347">			if (result != fieldsSize)</a>
+<a name="ln1348">				return result &lt; 0 ? result : B_BAD_VALUE;</a>
+<a name="ln1349">		}</a>
+<a name="ln1350"> </a>
+<a name="ln1351">		if (fHeader-&gt;data_size &gt; 0) {</a>
+<a name="ln1352">			fData = (uint8*)malloc(fHeader-&gt;data_size);</a>
+<a name="ln1353">			if (fData == NULL) {</a>
+<a name="ln1354">				free(fFields);</a>
+<a name="ln1355">				fFields = NULL;</a>
+<a name="ln1356">				_InitHeader();</a>
+<a name="ln1357">				return B_NO_MEMORY;</a>
+<a name="ln1358">			}</a>
+<a name="ln1359"> </a>
+<a name="ln1360">			result = stream-&gt;Read(fData, fHeader-&gt;data_size);</a>
+<a name="ln1361">			if (result != (ssize_t)fHeader-&gt;data_size)</a>
+<a name="ln1362">				return result &lt; 0 ? result : B_BAD_VALUE;</a>
+<a name="ln1363">		}</a>
+<a name="ln1364">	}</a>
+<a name="ln1365"> </a>
+<a name="ln1366">	return _ValidateMessage();</a>
+<a name="ln1367">}</a>
+<a name="ln1368"> </a>
+<a name="ln1369"> </a>
+<a name="ln1370">status_t</a>
+<a name="ln1371">BMessage::AddSpecifier(const char* property)</a>
+<a name="ln1372">{</a>
+<a name="ln1373">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln1374">	BMessage message(B_DIRECT_SPECIFIER);</a>
+<a name="ln1375">	status_t result = message.AddString(B_PROPERTY_ENTRY, property);</a>
+<a name="ln1376">	if (result != B_OK)</a>
+<a name="ln1377">		return result;</a>
+<a name="ln1378"> </a>
+<a name="ln1379">	return AddSpecifier(&amp;message);</a>
+<a name="ln1380">}</a>
+<a name="ln1381"> </a>
+<a name="ln1382"> </a>
+<a name="ln1383">status_t</a>
+<a name="ln1384">BMessage::AddSpecifier(const char* property, int32 index)</a>
+<a name="ln1385">{</a>
+<a name="ln1386">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln1387">	BMessage message(B_INDEX_SPECIFIER);</a>
+<a name="ln1388">	status_t result = message.AddString(B_PROPERTY_ENTRY, property);</a>
+<a name="ln1389">	if (result != B_OK)</a>
+<a name="ln1390">		return result;</a>
+<a name="ln1391"> </a>
+<a name="ln1392">	result = message.AddInt32(&quot;index&quot;, index);</a>
+<a name="ln1393">	if (result != B_OK)</a>
+<a name="ln1394">		return result;</a>
+<a name="ln1395"> </a>
+<a name="ln1396">	return AddSpecifier(&amp;message);</a>
+<a name="ln1397">}</a>
+<a name="ln1398"> </a>
+<a name="ln1399"> </a>
+<a name="ln1400">status_t</a>
+<a name="ln1401">BMessage::AddSpecifier(const char* property, int32 index, int32 range)</a>
+<a name="ln1402">{</a>
+<a name="ln1403">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln1404">	if (range &lt; 0)</a>
+<a name="ln1405">		return B_BAD_VALUE;</a>
+<a name="ln1406"> </a>
+<a name="ln1407">	BMessage message(B_RANGE_SPECIFIER);</a>
+<a name="ln1408">	status_t result = message.AddString(B_PROPERTY_ENTRY, property);</a>
+<a name="ln1409">	if (result != B_OK)</a>
+<a name="ln1410">		return result;</a>
+<a name="ln1411"> </a>
+<a name="ln1412">	result = message.AddInt32(&quot;index&quot;, index);</a>
+<a name="ln1413">	if (result != B_OK)</a>
+<a name="ln1414">		return result;</a>
+<a name="ln1415"> </a>
+<a name="ln1416">	result = message.AddInt32(&quot;range&quot;, range);</a>
+<a name="ln1417">	if (result != B_OK)</a>
+<a name="ln1418">		return result;</a>
+<a name="ln1419"> </a>
+<a name="ln1420">	return AddSpecifier(&amp;message);</a>
+<a name="ln1421">}</a>
+<a name="ln1422"> </a>
+<a name="ln1423"> </a>
+<a name="ln1424">status_t</a>
+<a name="ln1425">BMessage::AddSpecifier(const char* property, const char* name)</a>
+<a name="ln1426">{</a>
+<a name="ln1427">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln1428">	BMessage message(B_NAME_SPECIFIER);</a>
+<a name="ln1429">	status_t result = message.AddString(B_PROPERTY_ENTRY, property);</a>
+<a name="ln1430">	if (result != B_OK)</a>
+<a name="ln1431">		return result;</a>
+<a name="ln1432"> </a>
+<a name="ln1433">	result = message.AddString(B_PROPERTY_NAME_ENTRY, name);</a>
+<a name="ln1434">	if (result != B_OK)</a>
+<a name="ln1435">		return result;</a>
+<a name="ln1436"> </a>
+<a name="ln1437">	return AddSpecifier(&amp;message);</a>
+<a name="ln1438">}</a>
+<a name="ln1439"> </a>
+<a name="ln1440"> </a>
+<a name="ln1441">status_t</a>
+<a name="ln1442">BMessage::AddSpecifier(const BMessage* specifier)</a>
+<a name="ln1443">{</a>
+<a name="ln1444">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln1445">	status_t result = AddMessage(B_SPECIFIER_ENTRY, specifier);</a>
+<a name="ln1446">	if (result != B_OK)</a>
+<a name="ln1447">		return result;</a>
+<a name="ln1448"> </a>
+<a name="ln1449">	fHeader-&gt;current_specifier++;</a>
+<a name="ln1450">	fHeader-&gt;flags |= MESSAGE_FLAG_HAS_SPECIFIERS;</a>
+<a name="ln1451">	return B_OK;</a>
+<a name="ln1452">}</a>
+<a name="ln1453"> </a>
+<a name="ln1454"> </a>
+<a name="ln1455">status_t</a>
+<a name="ln1456">BMessage::SetCurrentSpecifier(int32 index)</a>
+<a name="ln1457">{</a>
+<a name="ln1458">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln1459">	if (index &lt; 0)</a>
+<a name="ln1460">		return B_BAD_INDEX;</a>
+<a name="ln1461"> </a>
+<a name="ln1462">	type_code type;</a>
+<a name="ln1463">	int32 count;</a>
+<a name="ln1464">	status_t result = GetInfo(B_SPECIFIER_ENTRY, &amp;type, &amp;count);</a>
+<a name="ln1465">	if (result != B_OK)</a>
+<a name="ln1466">		return result;</a>
+<a name="ln1467"> </a>
+<a name="ln1468">	if (index &gt;= count)</a>
+<a name="ln1469">		return B_BAD_INDEX;</a>
+<a name="ln1470"> </a>
+<a name="ln1471">	fHeader-&gt;current_specifier = index;</a>
+<a name="ln1472">	return B_OK;</a>
+<a name="ln1473">}</a>
+<a name="ln1474"> </a>
+<a name="ln1475"> </a>
+<a name="ln1476">status_t</a>
+<a name="ln1477">BMessage::GetCurrentSpecifier(int32* index, BMessage* specifier, int32* _what,</a>
+<a name="ln1478">	const char** property) const</a>
+<a name="ln1479">{</a>
+<a name="ln1480">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln1481">	if (fHeader == NULL)</a>
+<a name="ln1482">		return B_NO_INIT;</a>
+<a name="ln1483"> </a>
+<a name="ln1484">	if (index != NULL)</a>
+<a name="ln1485">		*index = fHeader-&gt;current_specifier;</a>
+<a name="ln1486"> </a>
+<a name="ln1487">	if (fHeader-&gt;current_specifier &lt; 0</a>
+<a name="ln1488">		|| (fHeader-&gt;flags &amp; MESSAGE_FLAG_WAS_DELIVERED) == 0)</a>
+<a name="ln1489">		return B_BAD_SCRIPT_SYNTAX;</a>
+<a name="ln1490"> </a>
+<a name="ln1491">	if (specifier) {</a>
+<a name="ln1492">		if (FindMessage(B_SPECIFIER_ENTRY, fHeader-&gt;current_specifier,</a>
+<a name="ln1493">			specifier) != B_OK)</a>
+<a name="ln1494">			return B_BAD_SCRIPT_SYNTAX;</a>
+<a name="ln1495"> </a>
+<a name="ln1496">		if (_what != NULL)</a>
+<a name="ln1497">			*_what = specifier-&gt;what;</a>
+<a name="ln1498"> </a>
+<a name="ln1499">		if (property) {</a>
+<a name="ln1500">			if (specifier-&gt;FindString(B_PROPERTY_ENTRY, property) != B_OK)</a>
+<a name="ln1501">				return B_BAD_SCRIPT_SYNTAX;</a>
+<a name="ln1502">		}</a>
+<a name="ln1503">	}</a>
+<a name="ln1504"> </a>
+<a name="ln1505">	return B_OK;</a>
+<a name="ln1506">}</a>
+<a name="ln1507"> </a>
+<a name="ln1508"> </a>
+<a name="ln1509">bool</a>
+<a name="ln1510">BMessage::HasSpecifiers() const</a>
+<a name="ln1511">{</a>
+<a name="ln1512">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln1513">	return fHeader != NULL</a>
+<a name="ln1514">		&amp;&amp; (fHeader-&gt;flags &amp; MESSAGE_FLAG_HAS_SPECIFIERS) != 0;</a>
+<a name="ln1515">}</a>
+<a name="ln1516"> </a>
+<a name="ln1517"> </a>
+<a name="ln1518">status_t</a>
+<a name="ln1519">BMessage::PopSpecifier()</a>
+<a name="ln1520">{</a>
+<a name="ln1521">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln1522">	if (fHeader == NULL)</a>
+<a name="ln1523">		return B_NO_INIT;</a>
+<a name="ln1524"> </a>
+<a name="ln1525">	if (fHeader-&gt;current_specifier &lt; 0 ||</a>
+<a name="ln1526">		(fHeader-&gt;flags &amp; MESSAGE_FLAG_WAS_DELIVERED) == 0)</a>
+<a name="ln1527">		return B_BAD_VALUE;</a>
+<a name="ln1528"> </a>
+<a name="ln1529">	if (fHeader-&gt;current_specifier &gt;= 0)</a>
+<a name="ln1530">		fHeader-&gt;current_specifier--;</a>
+<a name="ln1531"> </a>
+<a name="ln1532">	return B_OK;</a>
+<a name="ln1533">}</a>
+<a name="ln1534"> </a>
+<a name="ln1535"> </a>
+<a name="ln1536">void</a>
+<a name="ln1537">BMessage::_UpdateOffsets(uint32 offset, int32 change)</a>
+<a name="ln1538">{</a>
+<a name="ln1539">	// Update the header to match the new position of the fields</a>
+<a name="ln1540">	if (offset &lt; fHeader-&gt;data_size) {</a>
+<a name="ln1541">		field_header* field = fFields;</a>
+<a name="ln1542">		for (uint32 i = 0; i &lt; fHeader-&gt;field_count; i++, field++) {</a>
+<a name="ln1543">			if (field-&gt;offset &gt;= offset)</a>
+<a name="ln1544">				field-&gt;offset += change;</a>
+<a name="ln1545">		}</a>
+<a name="ln1546">	}</a>
+<a name="ln1547">}</a>
+<a name="ln1548"> </a>
+<a name="ln1549"> </a>
+<a name="ln1550">status_t</a>
+<a name="ln1551">BMessage::_ResizeData(uint32 offset, int32 change)</a>
+<a name="ln1552">{</a>
+<a name="ln1553">	if (change == 0)</a>
+<a name="ln1554">		return B_OK;</a>
+<a name="ln1555"> </a>
+<a name="ln1556">	/* optimize for the most usual case: appending data */</a>
+<a name="ln1557"> </a>
+<a name="ln1558">	if (change &gt; 0) {</a>
+<a name="ln1559">		// We need to make the field bigger</a>
+<a name="ln1560">		// check if there is enough free space allocated</a>
+<a name="ln1561">		if (fDataAvailable &gt;= (uint32)change) {</a>
+<a name="ln1562">			// In this case, we just need to move the data after the growing</a>
+<a name="ln1563">			// field to get the space at the right place</a>
+<a name="ln1564">			if (offset &lt; fHeader-&gt;data_size) {</a>
+<a name="ln1565">				memmove(fData + offset + change, fData + offset,</a>
+<a name="ln1566">					fHeader-&gt;data_size - offset);</a>
+<a name="ln1567">			}</a>
+<a name="ln1568"> </a>
+<a name="ln1569">			_UpdateOffsets(offset, change);</a>
+<a name="ln1570"> </a>
+<a name="ln1571">			fDataAvailable -= change;</a>
+<a name="ln1572">			fHeader-&gt;data_size += change;</a>
+<a name="ln1573">			return B_OK;</a>
+<a name="ln1574">		}</a>
+<a name="ln1575"> </a>
+<a name="ln1576">		// We need to grow the buffer. We try to optimize reallocations by</a>
+<a name="ln1577">		// preallocating space for more fields.</a>
+<a name="ln1578">		size_t size = fHeader-&gt;data_size * 2;</a>
+<a name="ln1579">		size = min_c(size, fHeader-&gt;data_size + MAX_DATA_PREALLOCATION);</a>
+<a name="ln1580">		size = max_c(size, fHeader-&gt;data_size + change);</a>
+<a name="ln1581"> </a>
+<a name="ln1582">		uint8* newData = (uint8*)realloc(fData, size);</a>
+<a name="ln1583">		if (size &gt; 0 &amp;&amp; newData == NULL)</a>
+<a name="ln1584">			return B_NO_MEMORY;</a>
+<a name="ln1585"> </a>
+<a name="ln1586">		fData = newData;</a>
+<a name="ln1587">		if (offset &lt; fHeader-&gt;data_size) {</a>
+<a name="ln1588">			memmove(fData + offset + change, fData + offset,</a>
+<a name="ln1589">				fHeader-&gt;data_size - offset);</a>
+<a name="ln1590">		}</a>
+<a name="ln1591"> </a>
+<a name="ln1592">		fHeader-&gt;data_size += change;</a>
+<a name="ln1593">		fDataAvailable = size - fHeader-&gt;data_size;</a>
+<a name="ln1594">	} else {</a>
+<a name="ln1595">		ssize_t length = fHeader-&gt;data_size - offset + change;</a>
+<a name="ln1596">		if (length &gt; 0)</a>
+<a name="ln1597">			memmove(fData + offset, fData + offset - change, length);</a>
+<a name="ln1598"> </a>
+<a name="ln1599">		// change is negative</a>
+<a name="ln1600">		fHeader-&gt;data_size += change;</a>
+<a name="ln1601">		fDataAvailable -= change;</a>
+<a name="ln1602"> </a>
+<a name="ln1603">		if (fDataAvailable &gt; MAX_DATA_PREALLOCATION) {</a>
+<a name="ln1604">			ssize_t available = MAX_DATA_PREALLOCATION / 2;</a>
+<a name="ln1605">			ssize_t size = fHeader-&gt;data_size + available;</a>
+<a name="ln1606">			uint8* newData = (uint8*)realloc(fData, size);</a>
+<a name="ln1607">			if (size &gt; 0 &amp;&amp; newData == NULL) {</a>
+<a name="ln1608">				// this is strange, but not really fatal</a>
+<a name="ln1609">				_UpdateOffsets(offset, change);</a>
+<a name="ln1610">				return B_OK;</a>
+<a name="ln1611">			}</a>
+<a name="ln1612"> </a>
+<a name="ln1613">			fData = newData;</a>
+<a name="ln1614">			fDataAvailable = available;</a>
+<a name="ln1615">		}</a>
+<a name="ln1616">	}</a>
+<a name="ln1617"> </a>
+<a name="ln1618">	_UpdateOffsets(offset, change);</a>
+<a name="ln1619">	return B_OK;</a>
+<a name="ln1620">}</a>
+<a name="ln1621"> </a>
+<a name="ln1622"> </a>
+<a name="ln1623">uint32</a>
+<a name="ln1624">BMessage::_HashName(const char* name) const</a>
+<a name="ln1625">{</a>
+<a name="ln1626">	char ch;</a>
+<a name="ln1627">	uint32 result = 0;</a>
+<a name="ln1628"> </a>
+<a name="ln1629">	while ((ch = *name++) != 0) {</a>
+<a name="ln1630">		result = (result &lt;&lt; 7) ^ (result &gt;&gt; 24);</a>
+<a name="ln1631">		result ^= ch;</a>
+<a name="ln1632">	}</a>
+<a name="ln1633"> </a>
+<a name="ln1634">	result ^= result &lt;&lt; 12;</a>
+<a name="ln1635">	return result;</a>
+<a name="ln1636">}</a>
+<a name="ln1637"> </a>
+<a name="ln1638"> </a>
+<a name="ln1639">status_t</a>
+<a name="ln1640">BMessage::_FindField(const char* name, type_code type, field_header** result)</a>
+<a name="ln1641">	const</a>
+<a name="ln1642">{</a>
+<a name="ln1643">	if (name == NULL)</a>
+<a name="ln1644">		return B_BAD_VALUE;</a>
+<a name="ln1645"> </a>
+<a name="ln1646">	if (fHeader == NULL)</a>
+<a name="ln1647">		return B_NO_INIT;</a>
+<a name="ln1648"> </a>
+<a name="ln1649">	if (fHeader-&gt;field_count == 0 || fFields == NULL || fData == NULL)</a>
+<a name="ln1650">		return B_NAME_NOT_FOUND;</a>
+<a name="ln1651"> </a>
+<a name="ln1652">	uint32 hash = _HashName(name) % fHeader-&gt;hash_table_size;</a>
+<a name="ln1653">	int32 nextField = fHeader-&gt;hash_table[hash];</a>
+<a name="ln1654"> </a>
+<a name="ln1655">	while (nextField &gt;= 0) {</a>
+<a name="ln1656">		field_header* field = &amp;fFields[nextField];</a>
+<a name="ln1657">		if ((field-&gt;flags &amp; FIELD_FLAG_VALID) == 0)</a>
+<a name="ln1658">			break;</a>
+<a name="ln1659"> </a>
+<a name="ln1660">		if (strncmp((const char*)(fData + field-&gt;offset), name,</a>
+<a name="ln1661">			field-&gt;name_length) == 0) {</a>
+<a name="ln1662">			if (type != B_ANY_TYPE &amp;&amp; field-&gt;type != type)</a>
+<a name="ln1663">				return B_BAD_TYPE;</a>
+<a name="ln1664"> </a>
+<a name="ln1665">			*result = field;</a>
+<a name="ln1666">			return B_OK;</a>
+<a name="ln1667">		}</a>
+<a name="ln1668"> </a>
+<a name="ln1669">		nextField = field-&gt;next_field;</a>
+<a name="ln1670">	}</a>
+<a name="ln1671"> </a>
+<a name="ln1672">	return B_NAME_NOT_FOUND;</a>
+<a name="ln1673">}</a>
+<a name="ln1674"> </a>
+<a name="ln1675"> </a>
+<a name="ln1676">status_t</a>
+<a name="ln1677">BMessage::_AddField(const char* name, type_code type, bool isFixedSize,</a>
+<a name="ln1678">	field_header** result)</a>
+<a name="ln1679">{</a>
+<a name="ln1680">	if (fHeader == NULL)</a>
+<a name="ln1681">		return B_NO_INIT;</a>
+<a name="ln1682"> </a>
+<a name="ln1683">	if (fFieldsAvailable &lt;= 0) {</a>
+<a name="ln1684">		uint32 count = fHeader-&gt;field_count * 2 + 1;</a>
+<a name="ln1685">		count = min_c(count, fHeader-&gt;field_count + MAX_FIELD_PREALLOCATION);</a>
+<a name="ln1686"> </a>
+<a name="ln1687">		field_header* newFields = (field_header*)realloc(fFields,</a>
+<a name="ln1688">			count * sizeof(field_header));</a>
+<a name="ln1689">		if (count &gt; 0 &amp;&amp; newFields == NULL)</a>
+<a name="ln1690">			return B_NO_MEMORY;</a>
+<a name="ln1691"> </a>
+<a name="ln1692">		fFields = newFields;</a>
+<a name="ln1693">		fFieldsAvailable = count - fHeader-&gt;field_count;</a>
+<a name="ln1694">	}</a>
+<a name="ln1695"> </a>
+<a name="ln1696">	uint32 hash = _HashName(name) % fHeader-&gt;hash_table_size;</a>
+<a name="ln1697">	int32* nextField = &amp;fHeader-&gt;hash_table[hash];</a>
+<a name="ln1698">	while (*nextField &gt;= 0)</a>
+<a name="ln1699">		nextField = &amp;fFields[*nextField].next_field;</a>
+<a name="ln1700">	*nextField = fHeader-&gt;field_count;</a>
+<a name="ln1701"> </a>
+<a name="ln1702">	field_header* field = &amp;fFields[fHeader-&gt;field_count];</a>
+<a name="ln1703">	field-&gt;type = type;</a>
+<a name="ln1704">	field-&gt;count = 0;</a>
+<a name="ln1705">	field-&gt;data_size = 0;</a>
+<a name="ln1706">	field-&gt;next_field = -1;</a>
+<a name="ln1707">	field-&gt;offset = fHeader-&gt;data_size;</a>
+<a name="ln1708">	field-&gt;name_length = strlen(name) + 1;</a>
+<a name="ln1709">	status_t status = _ResizeData(field-&gt;offset, field-&gt;name_length);</a>
+<a name="ln1710">	if (status != B_OK)</a>
+<a name="ln1711">		return status;</a>
+<a name="ln1712"> </a>
+<a name="ln1713">	memcpy(fData + field-&gt;offset, name, field-&gt;name_length);</a>
+<a name="ln1714">	field-&gt;flags = FIELD_FLAG_VALID;</a>
+<a name="ln1715">	if (isFixedSize)</a>
+<a name="ln1716">		field-&gt;flags |= FIELD_FLAG_FIXED_SIZE;</a>
+<a name="ln1717"> </a>
+<a name="ln1718">	fFieldsAvailable--;</a>
+<a name="ln1719">	fHeader-&gt;field_count++;</a>
+<a name="ln1720">	*result = field;</a>
+<a name="ln1721">	return B_OK;</a>
+<a name="ln1722">}</a>
+<a name="ln1723"> </a>
+<a name="ln1724"> </a>
+<a name="ln1725">status_t</a>
+<a name="ln1726">BMessage::_RemoveField(field_header* field)</a>
+<a name="ln1727">{</a>
+<a name="ln1728">	status_t result = _ResizeData(field-&gt;offset, -(field-&gt;data_size</a>
+<a name="ln1729">		+ field-&gt;name_length));</a>
+<a name="ln1730">	if (result != B_OK)</a>
+<a name="ln1731">		return result;</a>
+<a name="ln1732"> </a>
+<a name="ln1733">	int32 index = ((uint8*)field - (uint8*)fFields) / sizeof(field_header);</a>
+<a name="ln1734">	int32 nextField = field-&gt;next_field;</a>
+<a name="ln1735">	if (nextField &gt; index)</a>
+<a name="ln1736">		nextField--;</a>
+<a name="ln1737"> </a>
+<a name="ln1738">	int32* value = fHeader-&gt;hash_table;</a>
+<a name="ln1739">	for (uint32 i = 0; i &lt; fHeader-&gt;hash_table_size; i++, value++) {</a>
+<a name="ln1740">		if (*value &gt; index)</a>
+<a name="ln1741">			*value -= 1;</a>
+<a name="ln1742">		else if (*value == index)</a>
+<a name="ln1743">			*value = nextField;</a>
+<a name="ln1744">	}</a>
+<a name="ln1745"> </a>
+<a name="ln1746">	field_header* other = fFields;</a>
+<a name="ln1747">	for (uint32 i = 0; i &lt; fHeader-&gt;field_count; i++, other++) {</a>
+<a name="ln1748">		if (other-&gt;next_field &gt; index)</a>
+<a name="ln1749">			other-&gt;next_field--;</a>
+<a name="ln1750">		else if (other-&gt;next_field == index)</a>
+<a name="ln1751">			other-&gt;next_field = nextField;</a>
+<a name="ln1752">	}</a>
+<a name="ln1753"> </a>
+<a name="ln1754">	size_t size = (fHeader-&gt;field_count - index - 1) * sizeof(field_header);</a>
+<a name="ln1755">	memmove(fFields + index, fFields + index + 1, size);</a>
+<a name="ln1756">	fHeader-&gt;field_count--;</a>
+<a name="ln1757">	fFieldsAvailable++;</a>
+<a name="ln1758"> </a>
+<a name="ln1759">	if (fFieldsAvailable &gt; MAX_FIELD_PREALLOCATION) {</a>
+<a name="ln1760">		ssize_t available = MAX_FIELD_PREALLOCATION / 2;</a>
+<a name="ln1761">		size = (fHeader-&gt;field_count + available) * sizeof(field_header);</a>
+<a name="ln1762">		field_header* newFields = (field_header*)realloc(fFields, size);</a>
+<a name="ln1763">		if (size &gt; 0 &amp;&amp; newFields == NULL) {</a>
+<a name="ln1764">			// this is strange, but not really fatal</a>
+<a name="ln1765">			return B_OK;</a>
+<a name="ln1766">		}</a>
+<a name="ln1767"> </a>
+<a name="ln1768">		fFields = newFields;</a>
+<a name="ln1769">		fFieldsAvailable = available;</a>
+<a name="ln1770">	}</a>
+<a name="ln1771"> </a>
+<a name="ln1772">	return B_OK;</a>
+<a name="ln1773">}</a>
+<a name="ln1774"> </a>
+<a name="ln1775"> </a>
+<a name="ln1776">status_t</a>
+<a name="ln1777">BMessage::AddData(const char* name, type_code type, const void* data,</a>
+<a name="ln1778">	ssize_t numBytes, bool isFixedSize, int32 count)</a>
+<a name="ln1779">{</a>
+<a name="ln1780">	// Note that the &quot;count&quot; argument is only a hint at how many items</a>
+<a name="ln1781">	// the caller expects to add to this field. Since we do no item pre-</a>
+<a name="ln1782">	// allocation, we ignore this argument.</a>
+<a name="ln1783">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln1784">	if (numBytes &lt;= 0 || data == NULL)</a>
+<a name="ln1785">		return B_BAD_VALUE;</a>
+<a name="ln1786"> </a>
+<a name="ln1787">	if (fHeader == NULL)</a>
+<a name="ln1788">		return B_NO_INIT;</a>
+<a name="ln1789"> </a>
+<a name="ln1790">	status_t result;</a>
+<a name="ln1791">	if (fHeader-&gt;message_area &gt;= 0) {</a>
+<a name="ln1792">		result = _CopyForWrite();</a>
+<a name="ln1793">		if (result != B_OK)</a>
+<a name="ln1794">			return result;</a>
+<a name="ln1795">	}</a>
+<a name="ln1796"> </a>
+<a name="ln1797">	field_header* field = NULL;</a>
+<a name="ln1798">	result = _FindField(name, type, &amp;field);</a>
+<a name="ln1799">	if (result == B_NAME_NOT_FOUND)</a>
+<a name="ln1800">		result = _AddField(name, type, isFixedSize, &amp;field);</a>
+<a name="ln1801"> </a>
+<a name="ln1802">	if (result != B_OK)</a>
+<a name="ln1803">		return result;</a>
+<a name="ln1804"> </a>
+<a name="ln1805">	if (field == NULL)</a>
+<a name="ln1806">		return B_ERROR;</a>
+<a name="ln1807"> </a>
+<a name="ln1808">	uint32 offset = field-&gt;offset + field-&gt;name_length + field-&gt;data_size;</a>
+<a name="ln1809">	if ((field-&gt;flags &amp; FIELD_FLAG_FIXED_SIZE) != 0) {</a>
+<a name="ln1810">		if (field-&gt;count) {</a>
+<a name="ln1811">			ssize_t size = field-&gt;data_size / field-&gt;count;</a>
+<a name="ln1812">			if (size != numBytes)</a>
+<a name="ln1813">				return B_BAD_VALUE;</a>
+<a name="ln1814">		}</a>
+<a name="ln1815"> </a>
+<a name="ln1816">		result = _ResizeData(offset, numBytes);</a>
+<a name="ln1817">		if (result != B_OK) {</a>
+<a name="ln1818">			if (field-&gt;count == 0)</a>
+<a name="ln1819">				_RemoveField(field);</a>
+<a name="ln1820">			return result;</a>
+<a name="ln1821">		}</a>
+<a name="ln1822"> </a>
+<a name="ln1823">		memcpy(fData + offset, data, numBytes);</a>
+<a name="ln1824">		field-&gt;data_size += numBytes;</a>
+<a name="ln1825">	} else {</a>
+<a name="ln1826">		int32 change = numBytes + sizeof(uint32);</a>
+<a name="ln1827">		result = _ResizeData(offset, change);</a>
+<a name="ln1828">		if (result != B_OK) {</a>
+<a name="ln1829">			if (field-&gt;count == 0)</a>
+<a name="ln1830">				_RemoveField(field);</a>
+<a name="ln1831">			return result;</a>
+<a name="ln1832">		}</a>
+<a name="ln1833"> </a>
+<a name="ln1834">		uint32 size = (uint32)numBytes;</a>
+<a name="ln1835">		memcpy(fData + offset, &amp;size, sizeof(uint32));</a>
+<a name="ln1836">		memcpy(fData + offset + sizeof(uint32), data, size);</a>
+<a name="ln1837">		field-&gt;data_size += change;</a>
+<a name="ln1838">	}</a>
+<a name="ln1839"> </a>
+<a name="ln1840">	field-&gt;count++;</a>
+<a name="ln1841">	return B_OK;</a>
+<a name="ln1842">}</a>
+<a name="ln1843"> </a>
+<a name="ln1844"> </a>
+<a name="ln1845">status_t</a>
+<a name="ln1846">BMessage::RemoveData(const char* name, int32 index)</a>
+<a name="ln1847">{</a>
+<a name="ln1848">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln1849">	if (index &lt; 0)</a>
+<a name="ln1850">		return B_BAD_INDEX;</a>
+<a name="ln1851"> </a>
+<a name="ln1852">	if (fHeader == NULL)</a>
+<a name="ln1853">		return B_NO_INIT;</a>
+<a name="ln1854"> </a>
+<a name="ln1855">	status_t result;</a>
+<a name="ln1856">	if (fHeader-&gt;message_area &gt;= 0) {</a>
+<a name="ln1857">		result = _CopyForWrite();</a>
+<a name="ln1858">		if (result != B_OK)</a>
+<a name="ln1859">			return result;</a>
+<a name="ln1860">	}</a>
+<a name="ln1861"> </a>
+<a name="ln1862">	field_header* field = NULL;</a>
+<a name="ln1863">	result = _FindField(name, B_ANY_TYPE, &amp;field);</a>
+<a name="ln1864">	if (result != B_OK)</a>
+<a name="ln1865">		return result;</a>
+<a name="ln1866"> </a>
+<a name="ln1867">	if ((uint32)index &gt;= field-&gt;count)</a>
+<a name="ln1868">		return B_BAD_INDEX;</a>
+<a name="ln1869"> </a>
+<a name="ln1870">	if (field-&gt;count == 1)</a>
+<a name="ln1871">		return _RemoveField(field);</a>
+<a name="ln1872"> </a>
+<a name="ln1873">	uint32 offset = field-&gt;offset + field-&gt;name_length;</a>
+<a name="ln1874">	if ((field-&gt;flags &amp; FIELD_FLAG_FIXED_SIZE) != 0) {</a>
+<a name="ln1875">		ssize_t size = field-&gt;data_size / field-&gt;count;</a>
+<a name="ln1876">		result = _ResizeData(offset + index * size, -size);</a>
+<a name="ln1877">		if (result != B_OK)</a>
+<a name="ln1878">			return result;</a>
+<a name="ln1879"> </a>
+<a name="ln1880">		field-&gt;data_size -= size;</a>
+<a name="ln1881">	} else {</a>
+<a name="ln1882">		uint8* pointer = fData + offset;</a>
+<a name="ln1883">		for (int32 i = 0; i &lt; index; i++) {</a>
+<a name="ln1884">			offset += *(uint32*)pointer + sizeof(uint32);</a>
+<a name="ln1885">			pointer = fData + offset;</a>
+<a name="ln1886">		}</a>
+<a name="ln1887"> </a>
+<a name="ln1888">		size_t currentSize = *(uint32*)pointer + sizeof(uint32);</a>
+<a name="ln1889">		result = _ResizeData(offset, -currentSize);</a>
+<a name="ln1890">		if (result != B_OK)</a>
+<a name="ln1891">			return result;</a>
+<a name="ln1892"> </a>
+<a name="ln1893">		field-&gt;data_size -= currentSize;</a>
+<a name="ln1894">	}</a>
+<a name="ln1895"> </a>
+<a name="ln1896">	field-&gt;count--;</a>
+<a name="ln1897">	return B_OK;</a>
+<a name="ln1898">}</a>
+<a name="ln1899"> </a>
+<a name="ln1900"> </a>
+<a name="ln1901">status_t</a>
+<a name="ln1902">BMessage::RemoveName(const char* name)</a>
+<a name="ln1903">{</a>
+<a name="ln1904">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln1905">	if (fHeader == NULL)</a>
+<a name="ln1906">		return B_NO_INIT;</a>
+<a name="ln1907"> </a>
+<a name="ln1908">	status_t result;</a>
+<a name="ln1909">	if (fHeader-&gt;message_area &gt;= 0) {</a>
+<a name="ln1910">		result = _CopyForWrite();</a>
+<a name="ln1911">		if (result != B_OK)</a>
+<a name="ln1912">			return result;</a>
+<a name="ln1913">	}</a>
+<a name="ln1914"> </a>
+<a name="ln1915">	field_header* field = NULL;</a>
+<a name="ln1916">	result = _FindField(name, B_ANY_TYPE, &amp;field);</a>
+<a name="ln1917">	if (result != B_OK)</a>
+<a name="ln1918">		return result;</a>
+<a name="ln1919"> </a>
+<a name="ln1920">	return _RemoveField(field);</a>
+<a name="ln1921">}</a>
+<a name="ln1922"> </a>
+<a name="ln1923"> </a>
+<a name="ln1924">status_t</a>
+<a name="ln1925">BMessage::MakeEmpty()</a>
+<a name="ln1926">{</a>
+<a name="ln1927">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln1928">	_Clear();</a>
+<a name="ln1929">	return _InitHeader();</a>
+<a name="ln1930">}</a>
+<a name="ln1931"> </a>
+<a name="ln1932"> </a>
+<a name="ln1933">status_t</a>
+<a name="ln1934">BMessage::FindData(const char* name, type_code type, int32 index,</a>
+<a name="ln1935">	const void** data, ssize_t* numBytes) const</a>
+<a name="ln1936">{</a>
+<a name="ln1937">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln1938">	if (data == NULL)</a>
+<a name="ln1939">		return B_BAD_VALUE;</a>
+<a name="ln1940"> </a>
+<a name="ln1941">	*data = NULL;</a>
+<a name="ln1942">	field_header* field = NULL;</a>
+<a name="ln1943">	status_t result = _FindField(name, type, &amp;field);</a>
+<a name="ln1944">	if (result != B_OK)</a>
+<a name="ln1945">		return result;</a>
+<a name="ln1946"> </a>
+<a name="ln1947">	if (index &lt; 0 || (uint32)index &gt;= field-&gt;count)</a>
+<a name="ln1948">		return B_BAD_INDEX;</a>
+<a name="ln1949"> </a>
+<a name="ln1950">	if ((field-&gt;flags &amp; FIELD_FLAG_FIXED_SIZE) != 0) {</a>
+<a name="ln1951">		size_t bytes = field-&gt;data_size / field-&gt;count;</a>
+<a name="ln1952">		*data = fData + field-&gt;offset + field-&gt;name_length + index * bytes;</a>
+<a name="ln1953">		if (numBytes != NULL)</a>
+<a name="ln1954">			*numBytes = bytes;</a>
+<a name="ln1955">	} else {</a>
+<a name="ln1956">		uint8* pointer = fData + field-&gt;offset + field-&gt;name_length;</a>
+<a name="ln1957">		for (int32 i = 0; i &lt; index; i++)</a>
+<a name="ln1958">			pointer += *(uint32*)pointer + sizeof(uint32);</a>
+<a name="ln1959"> </a>
+<a name="ln1960">		*data = pointer + sizeof(uint32);</a>
+<a name="ln1961">		if (numBytes != NULL)</a>
+<a name="ln1962">			*numBytes = *(uint32*)pointer;</a>
+<a name="ln1963">	}</a>
+<a name="ln1964"> </a>
+<a name="ln1965">	return B_OK;</a>
+<a name="ln1966">}</a>
+<a name="ln1967"> </a>
+<a name="ln1968"> </a>
+<a name="ln1969">status_t</a>
+<a name="ln1970">BMessage::ReplaceData(const char* name, type_code type, int32 index,</a>
+<a name="ln1971">	const void* data, ssize_t numBytes)</a>
+<a name="ln1972">{</a>
+<a name="ln1973">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln1974">	if (numBytes &lt;= 0 || data == NULL)</a>
+<a name="ln1975">		return B_BAD_VALUE;</a>
+<a name="ln1976"> </a>
+<a name="ln1977">	status_t result;</a>
+<a name="ln1978">	if (fHeader-&gt;message_area &gt;= 0) {</a>
+<a name="ln1979">		result = _CopyForWrite();</a>
+<a name="ln1980">		if (result != B_OK)</a>
+<a name="ln1981">			return result;</a>
+<a name="ln1982">	}</a>
+<a name="ln1983"> </a>
+<a name="ln1984">	field_header* field = NULL;</a>
+<a name="ln1985">	result = _FindField(name, type, &amp;field);</a>
+<a name="ln1986">	if (result != B_OK)</a>
+<a name="ln1987">		return result;</a>
+<a name="ln1988"> </a>
+<a name="ln1989">	if (index &lt; 0 || (uint32)index &gt;= field-&gt;count)</a>
+<a name="ln1990">		return B_BAD_INDEX;</a>
+<a name="ln1991"> </a>
+<a name="ln1992">	if ((field-&gt;flags &amp; FIELD_FLAG_FIXED_SIZE) != 0) {</a>
+<a name="ln1993">		ssize_t size = field-&gt;data_size / field-&gt;count;</a>
+<a name="ln1994">		if (size != numBytes)</a>
+<a name="ln1995">			return B_BAD_VALUE;</a>
+<a name="ln1996"> </a>
+<a name="ln1997">		memcpy(fData + field-&gt;offset + field-&gt;name_length + index * size, data,</a>
+<a name="ln1998">			size);</a>
+<a name="ln1999">	} else {</a>
+<a name="ln2000">		uint32 offset = field-&gt;offset + field-&gt;name_length;</a>
+<a name="ln2001">		uint8* pointer = fData + offset;</a>
+<a name="ln2002"> </a>
+<a name="ln2003">		for (int32 i = 0; i &lt; index; i++) {</a>
+<a name="ln2004">			offset += *(uint32*)pointer + sizeof(uint32);</a>
+<a name="ln2005">			pointer = fData + offset;</a>
+<a name="ln2006">		}</a>
+<a name="ln2007"> </a>
+<a name="ln2008">		size_t currentSize = *(uint32*)pointer;</a>
+<a name="ln2009">		int32 change = numBytes - currentSize;</a>
+<a name="ln2010">		result = _ResizeData(offset, change);</a>
+<a name="ln2011">		if (result != B_OK)</a>
+<a name="ln2012">			return result;</a>
+<a name="ln2013"> </a>
+<a name="ln2014">		uint32 newSize = (uint32)numBytes;</a>
+<a name="ln2015">		memcpy(fData + offset, &amp;newSize, sizeof(uint32));</a>
+<a name="ln2016">		memcpy(fData + offset + sizeof(uint32), data, newSize);</a>
+<a name="ln2017">		field-&gt;data_size += change;</a>
+<a name="ln2018">	}</a>
+<a name="ln2019"> </a>
+<a name="ln2020">	return B_OK;</a>
+<a name="ln2021">}</a>
+<a name="ln2022"> </a>
+<a name="ln2023"> </a>
+<a name="ln2024">bool</a>
+<a name="ln2025">BMessage::HasData(const char* name, type_code type, int32 index) const</a>
+<a name="ln2026">{</a>
+<a name="ln2027">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln2028">	field_header* field = NULL;</a>
+<a name="ln2029">	status_t result = _FindField(name, type, &amp;field);</a>
+<a name="ln2030">	if (result != B_OK)</a>
+<a name="ln2031">		return false;</a>
+<a name="ln2032"> </a>
+<a name="ln2033">	if (index &lt; 0 || (uint32)index &gt;= field-&gt;count)</a>
+<a name="ln2034">		return false;</a>
+<a name="ln2035"> </a>
+<a name="ln2036">	return true;</a>
+<a name="ln2037">}</a>
+<a name="ln2038"> </a>
+<a name="ln2039"> </a>
+<a name="ln2040">/* Static functions for cache initialization and cleanup */</a>
+<a name="ln2041">void</a>
+<a name="ln2042">BMessage::_StaticInit()</a>
+<a name="ln2043">{</a>
+<a name="ln2044">	DEBUG_FUNCTION_ENTER2;</a>
+<a name="ln2045">	sReplyPorts[0] = create_port(1, &quot;tmp_rport0&quot;);</a>
+<a name="ln2046">	sReplyPorts[1] = create_port(1, &quot;tmp_rport1&quot;);</a>
+<a name="ln2047">	sReplyPorts[2] = create_port(1, &quot;tmp_rport2&quot;);</a>
+<a name="ln2048"> </a>
+<a name="ln2049">	sReplyPortInUse[0] = 0;</a>
+<a name="ln2050">	sReplyPortInUse[1] = 0;</a>
+<a name="ln2051">	sReplyPortInUse[2] = 0;</a>
+<a name="ln2052"> </a>
+<a name="ln2053">	sMsgCache = new BBlockCache(20, sizeof(BMessage), B_OBJECT_CACHE);</a>
+<a name="ln2054">}</a>
+<a name="ln2055"> </a>
+<a name="ln2056"> </a>
+<a name="ln2057">void</a>
+<a name="ln2058">BMessage::_StaticReInitForkedChild()</a>
+<a name="ln2059">{</a>
+<a name="ln2060">	DEBUG_FUNCTION_ENTER2;</a>
+<a name="ln2061"> </a>
+<a name="ln2062">	// overwrite the inherited ports with a set of our own</a>
+<a name="ln2063">	sReplyPorts[0] = create_port(1, &quot;tmp_rport0&quot;);</a>
+<a name="ln2064">	sReplyPorts[1] = create_port(1, &quot;tmp_rport1&quot;);</a>
+<a name="ln2065">	sReplyPorts[2] = create_port(1, &quot;tmp_rport2&quot;);</a>
+<a name="ln2066"> </a>
+<a name="ln2067">	sReplyPortInUse[0] = 0;</a>
+<a name="ln2068">	sReplyPortInUse[1] = 0;</a>
+<a name="ln2069">	sReplyPortInUse[2] = 0;</a>
+<a name="ln2070">}</a>
+<a name="ln2071"> </a>
+<a name="ln2072"> </a>
+<a name="ln2073">void</a>
+<a name="ln2074">BMessage::_StaticCleanup()</a>
+<a name="ln2075">{</a>
+<a name="ln2076">	DEBUG_FUNCTION_ENTER2;</a>
+<a name="ln2077">	delete_port(sReplyPorts[0]);</a>
+<a name="ln2078">	sReplyPorts[0] = -1;</a>
+<a name="ln2079">	delete_port(sReplyPorts[1]);</a>
+<a name="ln2080">	sReplyPorts[1] = -1;</a>
+<a name="ln2081">	delete_port(sReplyPorts[2]);</a>
+<a name="ln2082">	sReplyPorts[2] = -1;</a>
+<a name="ln2083">}</a>
+<a name="ln2084"> </a>
+<a name="ln2085"> </a>
+<a name="ln2086">void</a>
+<a name="ln2087">BMessage::_StaticCacheCleanup()</a>
+<a name="ln2088">{</a>
+<a name="ln2089">	DEBUG_FUNCTION_ENTER2;</a>
+<a name="ln2090">	delete sMsgCache;</a>
+<a name="ln2091">	sMsgCache = NULL;</a>
+<a name="ln2092">}</a>
+<a name="ln2093"> </a>
+<a name="ln2094"> </a>
+<a name="ln2095">int32</a>
+<a name="ln2096">BMessage::_StaticGetCachedReplyPort()</a>
+<a name="ln2097">{</a>
+<a name="ln2098">	DEBUG_FUNCTION_ENTER2;</a>
+<a name="ln2099">	int index = -1;</a>
+<a name="ln2100">	for (int32 i = 0; i &lt; sNumReplyPorts; i++) {</a>
+<a name="ln2101">		int32 old = atomic_add(&amp;(sReplyPortInUse[i]), 1);</a>
+<a name="ln2102">		if (old == 0) {</a>
+<a name="ln2103">			// This entry is free</a>
+<a name="ln2104">			index = i;</a>
+<a name="ln2105">			break;</a>
+<a name="ln2106">		} else {</a>
+<a name="ln2107">			// This entry is being used.</a>
+<a name="ln2108">			atomic_add(&amp;(sReplyPortInUse[i]), -1);</a>
+<a name="ln2109">		}</a>
+<a name="ln2110">	}</a>
+<a name="ln2111"> </a>
+<a name="ln2112">	return index;</a>
+<a name="ln2113">}</a>
+<a name="ln2114"> </a>
+<a name="ln2115"> </a>
+<a name="ln2116">status_t</a>
+<a name="ln2117">BMessage::_SendMessage(port_id port, team_id portOwner, int32 token,</a>
+<a name="ln2118">	bigtime_t timeout, bool replyRequired, BMessenger&amp; replyTo) const</a>
+<a name="ln2119">{</a>
+<a name="ln2120">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln2121">	ssize_t size = 0;</a>
+<a name="ln2122">	char* buffer = NULL;</a>
+<a name="ln2123">	message_header* header = NULL;</a>
+<a name="ln2124">	status_t result = B_OK;</a>
+<a name="ln2125"> </a>
+<a name="ln2126">	BPrivate::BDirectMessageTarget* direct = NULL;</a>
+<a name="ln2127">	BMessage* copy = NULL;</a>
+<a name="ln2128">	if (portOwner == BPrivate::current_team())</a>
+<a name="ln2129">		BPrivate::gDefaultTokens.AcquireHandlerTarget(token, &amp;direct);</a>
+<a name="ln2130"> </a>
+<a name="ln2131">	if (direct != NULL) {</a>
+<a name="ln2132">		// We have a direct local message target - we can just enqueue the</a>
+<a name="ln2133">		// message in its message queue. This will also prevent possible</a>
+<a name="ln2134">		// deadlocks when the queue is full.</a>
+<a name="ln2135">		copy = new BMessage(*this);</a>
+<a name="ln2136">		if (copy != NULL) {</a>
+<a name="ln2137">			header = copy-&gt;fHeader;</a>
+<a name="ln2138">			header-&gt;flags = fHeader-&gt;flags;</a>
+<a name="ln2139">		} else {</a>
+<a name="ln2140">			direct-&gt;Release();</a>
+<a name="ln2141">			return B_NO_MEMORY;</a>
+<a name="ln2142">		}</a>
+<a name="ln2143">#ifndef HAIKU_TARGET_PLATFORM_LIBBE_TEST</a>
+<a name="ln2144">	} else if ((fHeader-&gt;flags &amp; MESSAGE_FLAG_REPLY_AS_KMESSAGE) != 0) {</a>
+<a name="ln2145">		KMessage toMessage;</a>
+<a name="ln2146">		result = BPrivate::MessageAdapter::ConvertToKMessage(this, toMessage);</a>
+<a name="ln2147">		if (result != B_OK)</a>
+<a name="ln2148">			return result;</a>
+<a name="ln2149"> </a>
+<a name="ln2150">		return toMessage.SendTo(port, token);</a>
+<a name="ln2151">	} else if (fHeader-&gt;data_size &gt; B_PAGE_SIZE * 10) {</a>
+<a name="ln2152">		// ToDo: bind the above size to the max port message size</a>
+<a name="ln2153">		// use message passing by area for such a large message</a>
+<a name="ln2154">		result = _FlattenToArea(&amp;header);</a>
+<a name="ln2155">		if (result != B_OK)</a>
+<a name="ln2156">			return result;</a>
+<a name="ln2157"> </a>
+<a name="ln2158">		buffer = (char*)header;</a>
+<a name="ln2159">		size = sizeof(message_header);</a>
+<a name="ln2160"> </a>
+<a name="ln2161">		if (header-&gt;message_area &gt;= 0) {</a>
+<a name="ln2162">			team_id target = portOwner;</a>
+<a name="ln2163">			if (target &lt; 0) {</a>
+<a name="ln2164">				port_info info;</a>
+<a name="ln2165">				result = get_port_info(port, &amp;info);</a>
+<a name="ln2166">				if (result != B_OK) {</a>
+<a name="ln2167">					free(header);</a>
+<a name="ln2168">					return result;</a>
+<a name="ln2169">				}</a>
+<a name="ln2170">				target = info.team;</a>
+<a name="ln2171">			}</a>
+<a name="ln2172"> </a>
+<a name="ln2173">			void* address = NULL;</a>
+<a name="ln2174">			area_id transfered = _kern_transfer_area(header-&gt;message_area,</a>
+<a name="ln2175">				&amp;address, B_ANY_ADDRESS, target);</a>
+<a name="ln2176">			if (transfered &lt; 0) {</a>
+<a name="ln2177">				delete_area(header-&gt;message_area);</a>
+<a name="ln2178">				free(header);</a>
+<a name="ln2179">				return transfered;</a>
+<a name="ln2180">			}</a>
+<a name="ln2181"> </a>
+<a name="ln2182">			header-&gt;message_area = transfered;</a>
+<a name="ln2183">		}</a>
+<a name="ln2184">#endif</a>
+<a name="ln2185">	} else {</a>
+<a name="ln2186">		size = FlattenedSize();</a>
+<a name="ln2187">		buffer = (char*)malloc(size);</a>
+<a name="ln2188">		if (buffer == NULL)</a>
+<a name="ln2189">			return B_NO_MEMORY;</a>
+<a name="ln2190"> </a>
+<a name="ln2191">		result = Flatten(buffer, size);</a>
+<a name="ln2192">		if (result != B_OK) {</a>
+<a name="ln2193">			free(buffer);</a>
+<a name="ln2194">			return result;</a>
+<a name="ln2195">		}</a>
+<a name="ln2196"> </a>
+<a name="ln2197">		header = (message_header*)buffer;</a>
+<a name="ln2198">	}</a>
+<a name="ln2199"> </a>
+<a name="ln2200">	if (!replyTo.IsValid()) {</a>
+<a name="ln2201">		BMessenger::Private(replyTo).SetTo(fHeader-&gt;reply_team,</a>
+<a name="ln2202">			fHeader-&gt;reply_port, fHeader-&gt;reply_target);</a>
+<a name="ln2203"> </a>
+<a name="ln2204">		if (!replyTo.IsValid())</a>
+<a name="ln2205">			replyTo = be_app_messenger;</a>
+<a name="ln2206">	}</a>
+<a name="ln2207"> </a>
+<a name="ln2208">	BMessenger::Private replyToPrivate(replyTo);</a>
+<a name="ln2209"> </a>
+<a name="ln2210">	if (replyRequired) {</a>
+<a name="ln2211">		header-&gt;flags |= MESSAGE_FLAG_REPLY_REQUIRED;</a>
+<a name="ln2212">		header-&gt;flags &amp;= ~MESSAGE_FLAG_REPLY_DONE;</a>
+<a name="ln2213">	}</a>
+<a name="ln2214"> </a>
+<a name="ln2215">	header-&gt;target = token;</a>
+<a name="ln2216">	header-&gt;reply_team = replyToPrivate.Team();</a>
+<a name="ln2217">	header-&gt;reply_port = replyToPrivate.Port();</a>
+<a name="ln2218">	header-&gt;reply_target = replyToPrivate.Token();</a>
+<a name="ln2219">	header-&gt;flags |= MESSAGE_FLAG_WAS_DELIVERED;</a>
+<a name="ln2220"> </a>
+<a name="ln2221">	if (direct == NULL) {</a>
+<a name="ln2222">		KTRACE(&quot;BMessage send remote: team: %ld, port: %ld, token: %ld, &quot;</a>
+<a name="ln2223">			&quot;message: '%c%c%c%c'&quot;, portOwner, port, token,</a>
+<a name="ln2224">			char(what &gt;&gt; 24), char(what &gt;&gt; 16), char(what &gt;&gt; 8), (char)what);</a>
+<a name="ln2225"> </a>
+<a name="ln2226">		do {</a>
+<a name="ln2227">			result = write_port_etc(port, kPortMessageCode, (void*)buffer,</a>
+<a name="ln2228">				size, B_RELATIVE_TIMEOUT, timeout);</a>
+<a name="ln2229">		} while (result == B_INTERRUPTED);</a>
+<a name="ln2230">	}</a>
+<a name="ln2231"> </a>
+<a name="ln2232">	if (result == B_OK &amp;&amp; IsSourceWaiting()) {</a>
+<a name="ln2233">		// the forwarded message will handle the reply - we must not do</a>
+<a name="ln2234">		// this anymore</a>
+<a name="ln2235">		fHeader-&gt;flags |= MESSAGE_FLAG_REPLY_DONE;</a>
+<a name="ln2236">	}</a>
+<a name="ln2237"> </a>
+<a name="ln2238">	// we need to do this last because it is possible our</a>
+<a name="ln2239">	// message might be destroyed after it's enqueued in the</a>
+<a name="ln2240">	// target looper. Thus we don't want to do any ops that depend on</a>
+<a name="ln2241">	// members of this after the enqueue.</a>
+<a name="ln2242">	if (direct != NULL) {</a>
+<a name="ln2243">		KTRACE(&quot;BMessage send direct: port: %ld, token: %ld, &quot;</a>
+<a name="ln2244">			&quot;message: '%c%c%c%c'&quot;, port, token,</a>
+<a name="ln2245">			char(what &gt;&gt; 24), char(what &gt;&gt; 16), char(what &gt;&gt; 8), (char)what);</a>
+<a name="ln2246"> </a>
+<a name="ln2247">		// this is a local message transmission</a>
+<a name="ln2248">		direct-&gt;AddMessage(copy);</a>
+<a name="ln2249">		if (direct-&gt;Queue()-&gt;IsNextMessage(copy) &amp;&amp; port_count(port) &lt;= 0) {</a>
+<a name="ln2250">			// there is currently no message waiting, and we need to wakeup the</a>
+<a name="ln2251">			// looper</a>
+<a name="ln2252">			write_port_etc(port, 0, NULL, 0, B_RELATIVE_TIMEOUT, 0);</a>
+<a name="ln2253">		}</a>
+<a name="ln2254">		direct-&gt;Release();</a>
+<a name="ln2255">	}</a>
+<a name="ln2256"> </a>
+<a name="ln2257">	free(buffer);</a>
+<a name="ln2258">	return result;</a>
+<a name="ln2259">}</a>
+<a name="ln2260"> </a>
+<a name="ln2261"> </a>
+<a name="ln2262">// Sends a message and waits synchronously for a reply.</a>
+<a name="ln2263">status_t</a>
+<a name="ln2264">BMessage::_SendMessage(port_id port, team_id portOwner, int32 token,</a>
+<a name="ln2265">	BMessage* reply, bigtime_t sendTimeout, bigtime_t replyTimeout) const</a>
+<a name="ln2266">{</a>
+<a name="ln2267">	if (IsSourceWaiting()) {</a>
+<a name="ln2268">		// we can't forward this message synchronously when it's already</a>
+<a name="ln2269">		// waiting for a reply</a>
+<a name="ln2270">		return B_ERROR;</a>
+<a name="ln2271">	}</a>
+<a name="ln2272"> </a>
+<a name="ln2273">	DEBUG_FUNCTION_ENTER;</a>
+<a name="ln2274">	const int32 cachedReplyPort = _StaticGetCachedReplyPort();</a>
+<a name="ln2275">	port_id replyPort = B_BAD_PORT_ID;</a>
+<a name="ln2276">	status_t result = B_OK;</a>
+<a name="ln2277"> </a>
+<a name="ln2278">	if (cachedReplyPort &lt; 0) {</a>
+<a name="ln2279">		// All the cached reply ports are in use; create a new one</a>
+<a name="ln2280">		replyPort = create_port(1 /* for one message */, &quot;tmp_reply_port&quot;);</a>
+<a name="ln2281">		if (replyPort &lt; 0)</a>
+<a name="ln2282">			return replyPort;</a>
+<a name="ln2283">	} else {</a>
+<a name="ln2284">		assert(cachedReplyPort &lt; sNumReplyPorts);</a>
+<a name="ln2285">		replyPort = sReplyPorts[cachedReplyPort];</a>
+<a name="ln2286">	}</a>
+<a name="ln2287"> </a>
+<a name="ln2288">	bool recreateCachedPort = false;</a>
+<a name="ln2289"> </a>
+<a name="ln2290">	team_id team = B_BAD_TEAM_ID;</a>
+<a name="ln2291">	if (be_app != NULL)</a>
+<a name="ln2292">		team = be_app-&gt;Team();</a>
+<a name="ln2293">	else {</a>
+<a name="ln2294">		port_info portInfo;</a>
+<a name="ln2295">		result = get_port_info(replyPort, &amp;portInfo);</a>
+<a name="ln2296">		if (result != B_OK)</a>
+<a name="ln2297">			goto error;</a>
+<a name="ln2298"> </a>
+<a name="ln2299">		team = portInfo.team;</a>
+<a name="ln2300">	}</a>
+<a name="ln2301"> </a>
+<a name="ln2302">	result = set_port_owner(replyPort, portOwner);</a>
+<a name="ln2303">	if (result != B_OK)</a>
+<a name="ln2304">		goto error;</a>
+<a name="ln2305"> </a>
+<a name="ln2306">	// tests if the queue of the reply port is really empty</a>
+<a name="ln2307">#if 0</a>
+<a name="ln2308">	port_info portInfo;</a>
+<a name="ln2309">	if (get_port_info(replyPort, &amp;portInfo) == B_OK</a>
+<a name="ln2310">		&amp;&amp; portInfo.queue_count &gt; 0) {</a>
+<a name="ln2311">		debugger(&quot;reply port not empty!&quot;);</a>
+<a name="ln2312">		printf(&quot;  reply port not empty! %ld message(s) in queue\n&quot;,</a>
+<a name="ln2313">			portInfo.queue_count);</a>
+<a name="ln2314"> </a>
+<a name="ln2315">		// fetch and print the messages</a>
+<a name="ln2316">		for (int32 i = 0; i &lt; portInfo.queue_count; i++) {</a>
+<a name="ln2317">			char buffer[1024];</a>
+<a name="ln2318">			int32 code;</a>
+<a name="ln2319">			ssize_t size = read_port(replyPort, &amp;code, buffer, sizeof(buffer));</a>
+<a name="ln2320">			if (size &lt; 0) {</a>
+<a name="ln2321">				printf(&quot;failed to read message from reply port\n&quot;);</a>
+<a name="ln2322">				continue;</a>
+<a name="ln2323">			}</a>
+<a name="ln2324">			if (size &gt;= (ssize_t)sizeof(buffer)) {</a>
+<a name="ln2325">				printf(&quot;message from reply port too big\n&quot;);</a>
+<a name="ln2326">				continue;</a>
+<a name="ln2327">			}</a>
+<a name="ln2328"> </a>
+<a name="ln2329">			BMemoryIO stream(buffer, size);</a>
+<a name="ln2330">			BMessage reply;</a>
+<a name="ln2331">			if (reply.Unflatten(&amp;stream) != B_OK) {</a>
+<a name="ln2332">				printf(&quot;failed to unflatten message from reply port\n&quot;);</a>
+<a name="ln2333">				continue;</a>
+<a name="ln2334">			}</a>
+<a name="ln2335"> </a>
+<a name="ln2336">			printf(&quot;message %ld from reply port:\n&quot;, i);</a>
+<a name="ln2337">			reply.PrintToStream();</a>
+<a name="ln2338">		}</a>
+<a name="ln2339">	}</a>
+<a name="ln2340">#endif</a>
+<a name="ln2341"> </a>
+<a name="ln2342">	{</a>
+<a name="ln2343">		BMessenger replyTarget;</a>
+<a name="ln2344">		BMessenger::Private(replyTarget).SetTo(team, replyPort,</a>
+<a name="ln2345">			B_PREFERRED_TOKEN);</a>
+<a name="ln2346">		// TODO: replying could also use a BDirectMessageTarget like mechanism</a>
+<a name="ln2347">		// for local targets</a>
+<a name="ln2348">		result = _SendMessage(port, -1, token, sendTimeout, true,</a>
+<a name="ln2349">			replyTarget);</a>
+<a name="ln2350">	}</a>
+<a name="ln2351"> </a>
+<a name="ln2352">	if (result != B_OK)</a>
+<a name="ln2353">		goto error;</a>
+<a name="ln2354"> </a>
+<a name="ln2355">	int32 code;</a>
+<a name="ln2356">	result = handle_reply(replyPort, &amp;code, replyTimeout, reply);</a>
+<a name="ln2357">	if (result != B_OK &amp;&amp; cachedReplyPort &gt;= 0) {</a>
+<a name="ln2358">		delete_port(replyPort);</a>
+<a name="ln2359">		recreateCachedPort = true;</a>
+<a name="ln2360">	}</a>
+<a name="ln2361"> </a>
+<a name="ln2362">error:</a>
+<a name="ln2363">	if (cachedReplyPort &gt;= 0) {</a>
+<a name="ln2364">		// Reclaim ownership of cached port, if possible</a>
+<a name="ln2365">		if (!recreateCachedPort &amp;&amp; set_port_owner(replyPort, team) == B_OK) {</a>
+<a name="ln2366">			// Flag as available</a>
+<a name="ln2367">			atomic_add(&amp;sReplyPortInUse[cachedReplyPort], -1);</a>
+<a name="ln2368">		} else</a>
+<a name="ln2369">			sReplyPorts[cachedReplyPort] = create_port(1, &quot;tmp_rport&quot;);</a>
+<a name="ln2370"> </a>
+<a name="ln2371">		return result;</a>
+<a name="ln2372">	}</a>
+<a name="ln2373"> </a>
+<a name="ln2374">	delete_port(replyPort);</a>
+<a name="ln2375">	return result;</a>
+<a name="ln2376">}</a>
+<a name="ln2377"> </a>
+<a name="ln2378"> </a>
+<a name="ln2379">status_t</a>
+<a name="ln2380">BMessage::_SendFlattenedMessage(void* data, int32 size, port_id port,</a>
+<a name="ln2381">	int32 token, bigtime_t timeout)</a>
+<a name="ln2382">{</a>
+<a name="ln2383">	DEBUG_FUNCTION_ENTER2;</a>
+<a name="ln2384">	if (data == NULL)</a>
+<a name="ln2385">		return B_BAD_VALUE;</a>
+<a name="ln2386"> </a>
+<a name="ln2387">	uint32 magic = *(uint32*)data;</a>
+<a name="ln2388"> </a>
+<a name="ln2389">	if (magic == MESSAGE_FORMAT_HAIKU</a>
+<a name="ln2390">		|| magic == MESSAGE_FORMAT_HAIKU_SWAPPED) {</a>
+<a name="ln2391">		message_header* header = (message_header*)data;</a>
+<a name="ln2392">		header-&gt;target = token;</a>
+<a name="ln2393">		header-&gt;flags |= MESSAGE_FLAG_WAS_DELIVERED;</a>
+<a name="ln2394">	} else if (magic == MESSAGE_FORMAT_R5) {</a>
+<a name="ln2395">		uint8* header = (uint8*)data;</a>
+<a name="ln2396">		header += sizeof(uint32) /* magic */ + sizeof(uint32) /* checksum */</a>
+<a name="ln2397">			+ sizeof(ssize_t) /* flattenedSize */ + sizeof(int32) /* what */</a>
+<a name="ln2398">			+ sizeof(uint8) /* flags */;</a>
+<a name="ln2399">		*(int32*)header = token;</a>
+<a name="ln2400">	} else if (((KMessage::Header*)data)-&gt;magic</a>
+<a name="ln2401">			== KMessage::kMessageHeaderMagic) {</a>
+<a name="ln2402">		KMessage::Header* header = (KMessage::Header*)data;</a>
+<a name="ln2403">		header-&gt;targetToken = token;</a>
+<a name="ln2404">	} else {</a>
+<a name="ln2405">		return B_NOT_A_MESSAGE;</a>
+<a name="ln2406">	}</a>
+<a name="ln2407"> </a>
+<a name="ln2408">	// send the message</a>
+<a name="ln2409">	status_t result;</a>
+<a name="ln2410"> </a>
+<a name="ln2411">	do {</a>
+<a name="ln2412">		result = write_port_etc(port, kPortMessageCode, data, size,</a>
+<a name="ln2413">			B_RELATIVE_TIMEOUT, timeout);</a>
+<a name="ln2414">	} while (result == B_INTERRUPTED);</a>
+<a name="ln2415"> </a>
+<a name="ln2416">	return result;</a>
+<a name="ln2417">}</a>
+<a name="ln2418"> </a>
+<a name="ln2419"> </a>
+<a name="ln2420">void BMessage::_ReservedMessage1() {}</a>
+<a name="ln2421">void BMessage::_ReservedMessage2() {}</a>
+<a name="ln2422">void BMessage::_ReservedMessage3() {}</a>
+<a name="ln2423"> </a>
+<a name="ln2424"> </a>
+<a name="ln2425">// #pragma mark - Macro definitions for data access methods</a>
+<a name="ln2426"> </a>
+<a name="ln2427"> </a>
+<a name="ln2428">/* Relay functions from here on (Add... -&gt; AddData, Find... -&gt; FindData) */</a>
+<a name="ln2429"> </a>
+<a name="ln2430">#define DEFINE_FUNCTIONS(type, typeName, typeCode)							\</a>
+<a name="ln2431">status_t																	\</a>
+<a name="ln2432">BMessage::Add##typeName(const char* name, type val)							\</a>
+<a name="ln2433">{																			\</a>
+<a name="ln2434">	return AddData(name, typeCode, &amp;val, sizeof(type), true);				\</a>
+<a name="ln2435">}																			\</a>
+<a name="ln2436">																			\</a>
+<a name="ln2437">																			\</a>
+<a name="ln2438">status_t																	\</a>
+<a name="ln2439">BMessage::Find##typeName(const char* name, type* p) const					\</a>
+<a name="ln2440">{																			\</a>
+<a name="ln2441">	return Find##typeName(name, 0, p);										\</a>
+<a name="ln2442">}																			\</a>
+<a name="ln2443">																			\</a>
+<a name="ln2444">																			\</a>
+<a name="ln2445">status_t																	\</a>
+<a name="ln2446">BMessage::Find##typeName(const char* name, int32 index, type* p) const		\</a>
+<a name="ln2447">{																			\</a>
+<a name="ln2448">	type* ptr = NULL;														\</a>
+<a name="ln2449">	ssize_t bytes = 0;														\</a>
+<a name="ln2450">	status_t error = B_OK;													\</a>
+<a name="ln2451">																			\</a>
+<a name="ln2452">	*p = type();															\</a>
+<a name="ln2453">	error = FindData(name, typeCode, index, (const void**)&amp;ptr, &amp;bytes);	\</a>
+<a name="ln2454">																			\</a>
+<a name="ln2455">	if (error == B_OK)														\</a>
+<a name="ln2456">		*p = *ptr;															\</a>
+<a name="ln2457">																			\</a>
+<a name="ln2458">	return error;															\</a>
+<a name="ln2459">}																			\</a>
+<a name="ln2460">																			\</a>
+<a name="ln2461">																			\</a>
+<a name="ln2462">status_t																	\</a>
+<a name="ln2463">BMessage::Replace##typeName(const char* name, type value)					\</a>
+<a name="ln2464">{																			\</a>
+<a name="ln2465">	return ReplaceData(name, typeCode, 0, &amp;value, sizeof(type));			\</a>
+<a name="ln2466">}																			\</a>
+<a name="ln2467">																			\</a>
+<a name="ln2468">																			\</a>
+<a name="ln2469">status_t																	\</a>
+<a name="ln2470">BMessage::Replace##typeName(const char* name, int32 index, type value)		\</a>
+<a name="ln2471">{																			\</a>
+<a name="ln2472">	return ReplaceData(name, typeCode, index, &amp;value, sizeof(type));		\</a>
+<a name="ln2473">}																			\</a>
+<a name="ln2474">																			\</a>
+<a name="ln2475">																			\</a>
+<a name="ln2476">bool																		\</a>
+<a name="ln2477">BMessage::Has##typeName(const char* name, int32 index) const				\</a>
+<a name="ln2478">{																			\</a>
+<a name="ln2479">	return HasData(name, typeCode, index);									\</a>
+<a name="ln2480">}</a>
+<a name="ln2481"> </a>
+<a name="ln2482">DEFINE_FUNCTIONS(BPoint, Point, B_POINT_TYPE);</a>
+<a name="ln2483">DEFINE_FUNCTIONS(BRect, Rect, B_RECT_TYPE);</a>
+<a name="ln2484">DEFINE_FUNCTIONS(BSize, Size, B_SIZE_TYPE);</a>
+<a name="ln2485">DEFINE_FUNCTIONS(int8, Int8, B_INT8_TYPE);</a>
+<a name="ln2486">DEFINE_FUNCTIONS(uint8, UInt8, B_UINT8_TYPE);</a>
+<a name="ln2487">DEFINE_FUNCTIONS(int16, Int16, B_INT16_TYPE);</a>
+<a name="ln2488">DEFINE_FUNCTIONS(uint16, UInt16, B_UINT16_TYPE);</a>
+<a name="ln2489">DEFINE_FUNCTIONS(int32, Int32, B_INT32_TYPE);</a>
+<a name="ln2490">DEFINE_FUNCTIONS(uint32, UInt32, B_UINT32_TYPE);</a>
+<a name="ln2491">DEFINE_FUNCTIONS(int64, Int64, B_INT64_TYPE);</a>
+<a name="ln2492">DEFINE_FUNCTIONS(uint64, UInt64, B_UINT64_TYPE);</a>
+<a name="ln2493">DEFINE_FUNCTIONS(bool, Bool, B_BOOL_TYPE);</a>
+<a name="ln2494">DEFINE_FUNCTIONS(float, Float, B_FLOAT_TYPE);</a>
+<a name="ln2495">DEFINE_FUNCTIONS(double, Double, B_DOUBLE_TYPE);</a>
+<a name="ln2496">DEFINE_FUNCTIONS(rgb_color, Color, B_RGB_32_BIT_TYPE);</a>
+<a name="ln2497"> </a>
+<a name="ln2498">#undef DEFINE_FUNCTIONS</a>
+<a name="ln2499"> </a>
+<a name="ln2500">#define DEFINE_HAS_FUNCTION(typeName, typeCode)								\</a>
+<a name="ln2501">bool																		\</a>
+<a name="ln2502">BMessage::Has##typeName(const char* name, int32 index) const				\</a>
+<a name="ln2503">{																			\</a>
+<a name="ln2504">	return HasData(name, typeCode, index);									\</a>
+<a name="ln2505">}</a>
+<a name="ln2506"> </a>
+<a name="ln2507"> </a>
+<a name="ln2508">DEFINE_HAS_FUNCTION(Alignment, B_ALIGNMENT_TYPE);</a>
+<a name="ln2509">DEFINE_HAS_FUNCTION(String, B_STRING_TYPE);</a>
+<a name="ln2510">DEFINE_HAS_FUNCTION(Pointer, B_POINTER_TYPE);</a>
+<a name="ln2511">DEFINE_HAS_FUNCTION(Messenger, B_MESSENGER_TYPE);</a>
+<a name="ln2512">DEFINE_HAS_FUNCTION(Ref, B_REF_TYPE);</a>
+<a name="ln2513">DEFINE_HAS_FUNCTION(Message, B_MESSAGE_TYPE);</a>
+<a name="ln2514"> </a>
+<a name="ln2515">#undef DEFINE_HAS_FUNCTION</a>
+<a name="ln2516"> </a>
+<a name="ln2517"> </a>
+<a name="ln2518">#define DEFINE_LAZY_FIND_FUNCTION(type, typeName, initialize)				\</a>
+<a name="ln2519">type																		\</a>
+<a name="ln2520">BMessage::Find##typeName(const char* name, int32 index) const				\</a>
+<a name="ln2521">{																			\</a>
+<a name="ln2522">	type val = initialize;													\</a>
+<a name="ln2523">	Find##typeName(name, index, &amp;val);										\</a>
+<a name="ln2524">	return val;																\</a>
+<a name="ln2525">}</a>
+<a name="ln2526"> </a>
+<a name="ln2527"> </a>
+<a name="ln2528">DEFINE_LAZY_FIND_FUNCTION(BRect, Rect, BRect());</a>
+<a name="ln2529">DEFINE_LAZY_FIND_FUNCTION(BPoint, Point, BPoint());</a>
+<a name="ln2530">DEFINE_LAZY_FIND_FUNCTION(const char*, String, NULL);</a>
+<a name="ln2531">DEFINE_LAZY_FIND_FUNCTION(int8, Int8, 0);</a>
+<a name="ln2532">DEFINE_LAZY_FIND_FUNCTION(int16, Int16, 0);</a>
+<a name="ln2533">DEFINE_LAZY_FIND_FUNCTION(int32, Int32, 0);</a>
+<a name="ln2534">DEFINE_LAZY_FIND_FUNCTION(int64, Int64, 0);</a>
+<a name="ln2535">DEFINE_LAZY_FIND_FUNCTION(bool, Bool, false);</a>
+<a name="ln2536">DEFINE_LAZY_FIND_FUNCTION(float, Float, 0);</a>
+<a name="ln2537">DEFINE_LAZY_FIND_FUNCTION(double, Double, 0);</a>
+<a name="ln2538"> </a>
+<a name="ln2539">#undef DEFINE_LAZY_FIND_FUNCTION</a>
+<a name="ln2540"> </a>
+<a name="ln2541"> </a>
+<a name="ln2542">#define DEFINE_SET_GET_FUNCTIONS(type, typeName, typeCode)					\</a>
+<a name="ln2543">type																		\</a>
+<a name="ln2544">BMessage::Get##typeName(const char* name, type defaultValue) const			\</a>
+<a name="ln2545">{																			\</a>
+<a name="ln2546">	return Get##typeName(name, 0, defaultValue);							\</a>
+<a name="ln2547">}																			\</a>
+<a name="ln2548">																			\</a>
+<a name="ln2549">																			\</a>
+<a name="ln2550">type																		\</a>
+<a name="ln2551">BMessage::Get##typeName(const char* name, int32 index,						\</a>
+<a name="ln2552">	type defaultValue) const												\</a>
+<a name="ln2553">{																			\</a>
+<a name="ln2554">	type value;																\</a>
+<a name="ln2555">	if (Find##typeName(name, index, &amp;value) == B_OK)						\</a>
+<a name="ln2556">		return value;														\</a>
+<a name="ln2557">																			\</a>
+<a name="ln2558">	return defaultValue;													\</a>
+<a name="ln2559">}																			\</a>
+<a name="ln2560">																			\</a>
+<a name="ln2561">																			\</a>
+<a name="ln2562">status_t																	\</a>
+<a name="ln2563">BMessage::Set##typeName(const char* name, type value)						\</a>
+<a name="ln2564">{																			\</a>
+<a name="ln2565">	return SetData(name, typeCode, &amp;value, sizeof(type));					\</a>
+<a name="ln2566">}																			\</a>
+<a name="ln2567"> </a>
+<a name="ln2568"> </a>
+<a name="ln2569">DEFINE_SET_GET_FUNCTIONS(int8, Int8, B_INT8_TYPE);</a>
+<a name="ln2570">DEFINE_SET_GET_FUNCTIONS(uint8, UInt8, B_UINT8_TYPE);</a>
+<a name="ln2571">DEFINE_SET_GET_FUNCTIONS(int16, Int16, B_INT16_TYPE);</a>
+<a name="ln2572">DEFINE_SET_GET_FUNCTIONS(uint16, UInt16, B_UINT16_TYPE);</a>
+<a name="ln2573">DEFINE_SET_GET_FUNCTIONS(int32, Int32, B_INT32_TYPE);</a>
+<a name="ln2574">DEFINE_SET_GET_FUNCTIONS(uint32, UInt32, B_UINT32_TYPE);</a>
+<a name="ln2575">DEFINE_SET_GET_FUNCTIONS(int64, Int64, B_INT64_TYPE);</a>
+<a name="ln2576">DEFINE_SET_GET_FUNCTIONS(uint64, UInt64, B_UINT64_TYPE);</a>
+<a name="ln2577">DEFINE_SET_GET_FUNCTIONS(bool, Bool, B_BOOL_TYPE);</a>
+<a name="ln2578">DEFINE_SET_GET_FUNCTIONS(float, Float, B_FLOAT_TYPE);</a>
+<a name="ln2579">DEFINE_SET_GET_FUNCTIONS(double, Double, B_DOUBLE_TYPE);</a>
+<a name="ln2580">DEFINE_SET_GET_FUNCTIONS(rgb_color, Color, B_RGB_32_BIT_TYPE);</a>
+<a name="ln2581"> </a>
+<a name="ln2582">#undef DEFINE_SET_GET_FUNCTION</a>
+<a name="ln2583"> </a>
+<a name="ln2584"> </a>
+<a name="ln2585">const void*</a>
+<a name="ln2586">BMessage::GetPointer(const char* name, const void* defaultValue) const</a>
+<a name="ln2587">{</a>
+<a name="ln2588">	return GetPointer(name, 0, defaultValue);</a>
+<a name="ln2589">}</a>
+<a name="ln2590"> </a>
+<a name="ln2591"> </a>
+<a name="ln2592">const void*</a>
+<a name="ln2593">BMessage::GetPointer(const char* name, int32 index,</a>
+<a name="ln2594">	const void* defaultValue) const</a>
+<a name="ln2595">{</a>
+<a name="ln2596">	void* value;</a>
+<a name="ln2597">	if (FindPointer(name, index, &amp;value) == B_OK)</a>
+<a name="ln2598">		return value;</a>
+<a name="ln2599"> </a>
+<a name="ln2600">	return defaultValue;</a>
+<a name="ln2601">}</a>
+<a name="ln2602"> </a>
+<a name="ln2603"> </a>
+<a name="ln2604">status_t</a>
+<a name="ln2605">BMessage::SetPointer(const char* name, const void* value)</a>
+<a name="ln2606">{</a>
+<a name="ln2607">	return SetData(name, B_POINTER_TYPE, &amp;value, sizeof(void*));</a>
+<a name="ln2608">}</a>
+<a name="ln2609"> </a>
+<a name="ln2610"> </a>
+<a name="ln2611">#define DEFINE_SET_GET_BY_REFERENCE_FUNCTIONS(type, typeName, typeCode)		\</a>
+<a name="ln2612">type																		\</a>
+<a name="ln2613">BMessage::Get##typeName(const char* name, const type&amp; defaultValue) const	\</a>
+<a name="ln2614">{																			\</a>
+<a name="ln2615">	return Get##typeName(name, 0, defaultValue);							\</a>
+<a name="ln2616">}																			\</a>
+<a name="ln2617">																			\</a>
+<a name="ln2618">																			\</a>
+<a name="ln2619">type																		\</a>
+<a name="ln2620">BMessage::Get##typeName(const char* name, int32 index,						\</a>
+<a name="ln2621">	const type&amp; defaultValue) const											\</a>
+<a name="ln2622">{																			\</a>
+<a name="ln2623">	type value;																\</a>
+<a name="ln2624">	if (Find##typeName(name, index, &amp;value) == B_OK)						\</a>
+<a name="ln2625">		return value;														\</a>
+<a name="ln2626">																			\</a>
+<a name="ln2627">	return defaultValue;													\</a>
+<a name="ln2628">}																			\</a>
+<a name="ln2629">																			\</a>
+<a name="ln2630">																			\</a>
+<a name="ln2631">status_t																	\</a>
+<a name="ln2632">BMessage::Set##typeName(const char* name, const type&amp; value)				\</a>
+<a name="ln2633">{																			\</a>
+<a name="ln2634">	return SetData(name, typeCode, &amp;value, sizeof(type));					\</a>
+<a name="ln2635">}																			\</a>
+<a name="ln2636"> </a>
+<a name="ln2637"> </a>
+<a name="ln2638">DEFINE_SET_GET_BY_REFERENCE_FUNCTIONS(BPoint, Point, B_POINT_TYPE);</a>
+<a name="ln2639">DEFINE_SET_GET_BY_REFERENCE_FUNCTIONS(BRect, Rect, B_RECT_TYPE);</a>
+<a name="ln2640">DEFINE_SET_GET_BY_REFERENCE_FUNCTIONS(BSize, Size, B_SIZE_TYPE);</a>
+<a name="ln2641"> </a>
+<a name="ln2642">#undef DEFINE_SET_GET_BY_REFERENCE_FUNCTIONS</a>
+<a name="ln2643"> </a>
+<a name="ln2644"> </a>
+<a name="ln2645">status_t</a>
+<a name="ln2646">BMessage::AddAlignment(const char* name, const BAlignment&amp; alignment)</a>
+<a name="ln2647">{</a>
+<a name="ln2648">	int32 data[2] = { alignment.horizontal, alignment.vertical };</a>
+<a name="ln2649">	return AddData(name, B_ALIGNMENT_TYPE, data, sizeof(data));</a>
+<a name="ln2650">}</a>
+<a name="ln2651"> </a>
+<a name="ln2652"> </a>
+<a name="ln2653">status_t</a>
+<a name="ln2654">BMessage::AddString(const char* name, const char* string)</a>
+<a name="ln2655">{</a>
+<a name="ln2656">	return AddData(name, B_STRING_TYPE, string, string ? strlen(string) + 1 : 0,</a>
+<a name="ln2657">		false);</a>
+<a name="ln2658">}</a>
+<a name="ln2659"> </a>
+<a name="ln2660"> </a>
+<a name="ln2661">status_t</a>
+<a name="ln2662">BMessage::AddString(const char* name, const BString&amp; string)</a>
+<a name="ln2663">{</a>
+<a name="ln2664">	return AddData(name, B_STRING_TYPE, string.String(), string.Length() + 1,</a>
+<a name="ln2665">		false);</a>
+<a name="ln2666">}</a>
+<a name="ln2667"> </a>
+<a name="ln2668"> </a>
+<a name="ln2669">status_t</a>
+<a name="ln2670">BMessage::AddStrings(const char* name, const BStringList&amp; list)</a>
+<a name="ln2671">{</a>
+<a name="ln2672">	int32 count = list.CountStrings();</a>
+<a name="ln2673">	for (int32 i = 0; i &lt; count; i++) {</a>
+<a name="ln2674">		status_t error = AddString(name, list.StringAt(i));</a>
+<a name="ln2675">		if (error != B_OK)</a>
+<a name="ln2676">			return error;</a>
+<a name="ln2677">	}</a>
+<a name="ln2678"> </a>
+<a name="ln2679">	return B_OK;</a>
+<a name="ln2680">}</a>
+<a name="ln2681"> </a>
+<a name="ln2682"> </a>
+<a name="ln2683">status_t</a>
+<a name="ln2684">BMessage::AddPointer(const char* name, const void* pointer)</a>
+<a name="ln2685">{</a>
+<a name="ln2686">	return AddData(name, B_POINTER_TYPE, &amp;pointer, sizeof(pointer), true);</a>
+<a name="ln2687">}</a>
+<a name="ln2688"> </a>
+<a name="ln2689"> </a>
+<a name="ln2690">status_t</a>
+<a name="ln2691">BMessage::AddMessenger(const char* name, BMessenger messenger)</a>
+<a name="ln2692">{</a>
+<a name="ln2693">	return AddData(name, B_MESSENGER_TYPE, &amp;messenger, sizeof(messenger), true);</a>
+<a name="ln2694">}</a>
+<a name="ln2695"> </a>
+<a name="ln2696"> </a>
+<a name="ln2697">status_t</a>
+<a name="ln2698">BMessage::AddRef(const char* name, const entry_ref* ref)</a>
+<a name="ln2699">{</a>
+<a name="ln2700">	size_t size = sizeof(entry_ref) + B_PATH_NAME_LENGTH;</a>
+<a name="ln2701">	char buffer[size];</a>
+<a name="ln2702"> </a>
+<a name="ln2703">	status_t error = BPrivate::entry_ref_flatten(buffer, &amp;size, ref);</a>
+<a name="ln2704"> </a>
+<a name="ln2705">	if (error &gt;= B_OK)</a>
+<a name="ln2706">		error = AddData(name, B_REF_TYPE, buffer, size, false);</a>
+<a name="ln2707"> </a>
+<a name="ln2708">	return error;</a>
+<a name="ln2709">}</a>
+<a name="ln2710"> </a>
+<a name="ln2711"> </a>
+<a name="ln2712">status_t</a>
+<a name="ln2713">BMessage::AddMessage(const char* name, const BMessage* message)</a>
+<a name="ln2714">{</a>
+<a name="ln2715">	if (message == NULL)</a>
+<a name="ln2716">		return B_BAD_VALUE;</a>
+<a name="ln2717"> </a>
+<a name="ln2718">	// TODO: This and the following functions waste time by allocating and</a>
+<a name="ln2719">	// copying an extra buffer. Functions can be added that return a direct</a>
+<a name="ln2720">	// pointer into the message.</a>
+<a name="ln2721"> </a>
+<a name="ln2722">	char stackBuffer[16384];</a>
+<a name="ln2723">	ssize_t size = message-&gt;FlattenedSize();</a>
+<a name="ln2724"> </a>
+<a name="ln2725">	char* buffer;</a>
+<a name="ln2726">	if (size &gt; (ssize_t)sizeof(stackBuffer)) {</a>
+<a name="ln2727">		buffer = (char*)malloc(size);</a>
+<a name="ln2728">		if (buffer == NULL)</a>
+<a name="ln2729">			return B_NO_MEMORY;</a>
+<a name="ln2730">	} else</a>
+<a name="ln2731">		buffer = stackBuffer;</a>
+<a name="ln2732"> </a>
+<a name="ln2733">	status_t error = message-&gt;Flatten(buffer, size);</a>
+<a name="ln2734"> </a>
+<a name="ln2735">	if (error &gt;= B_OK)</a>
+<a name="ln2736">		error = AddData(name, B_MESSAGE_TYPE, buffer, size, false);</a>
+<a name="ln2737"> </a>
+<a name="ln2738">	if (buffer != stackBuffer)</a>
+<a name="ln2739">		free(buffer);</a>
+<a name="ln2740"> </a>
+<a name="ln2741">	return error;</a>
+<a name="ln2742">}</a>
+<a name="ln2743"> </a>
+<a name="ln2744"> </a>
+<a name="ln2745">status_t</a>
+<a name="ln2746">BMessage::AddFlat(const char* name, BFlattenable* object, int32 count)</a>
+<a name="ln2747">{</a>
+<a name="ln2748">	return AddFlat(name, (const BFlattenable*)object, count);</a>
+<a name="ln2749">}</a>
+<a name="ln2750"> </a>
+<a name="ln2751"> </a>
+<a name="ln2752">status_t</a>
+<a name="ln2753">BMessage::AddFlat(const char* name, const BFlattenable* object, int32 count)</a>
+<a name="ln2754">{</a>
+<a name="ln2755">	if (object == NULL)</a>
+<a name="ln2756">		return B_BAD_VALUE;</a>
+<a name="ln2757"> </a>
+<a name="ln2758">	char stackBuffer[16384];</a>
+<a name="ln2759">	ssize_t size = object-&gt;FlattenedSize();</a>
+<a name="ln2760"> </a>
+<a name="ln2761">	char* buffer;</a>
+<a name="ln2762">	if (size &gt; (ssize_t)sizeof(stackBuffer)) {</a>
+<a name="ln2763">		buffer = (char*)malloc(size);</a>
+<a name="ln2764">		if (buffer == NULL)</a>
+<a name="ln2765">			return B_NO_MEMORY;</a>
+<a name="ln2766">	} else</a>
+<a name="ln2767">		buffer = stackBuffer;</a>
+<a name="ln2768"> </a>
+<a name="ln2769">	status_t error = object-&gt;Flatten(buffer, size);</a>
+<a name="ln2770"> </a>
+<a name="ln2771">	if (error &gt;= B_OK)</a>
+<a name="ln2772">		error = AddData(name, object-&gt;TypeCode(), buffer, size, false);</a>
+<a name="ln2773"> </a>
+<a name="ln2774">	if (buffer != stackBuffer)</a>
+<a name="ln2775">		free(buffer);</a>
+<a name="ln2776"> </a>
+<a name="ln2777">	return error;</a>
+<a name="ln2778">}</a>
+<a name="ln2779"> </a>
+<a name="ln2780"> </a>
+<a name="ln2781">status_t</a>
+<a name="ln2782">BMessage::Append(const BMessage&amp; other)</a>
+<a name="ln2783">{</a>
+<a name="ln2784">	field_header* field = other.fFields;</a>
+<a name="ln2785">	for (uint32 i = 0; i &lt; other.fHeader-&gt;field_count; i++, field++) {</a>
+<a name="ln2786">		const char* name = (const char*)(other.fData + field-&gt;offset);</a>
+<a name="ln2787">		const void* data = (const void*)(other.fData + field-&gt;offset</a>
+<a name="ln2788">			+ field-&gt;name_length);</a>
+<a name="ln2789">		bool isFixed = (field-&gt;flags &amp; FIELD_FLAG_FIXED_SIZE) != 0;</a>
+<a name="ln2790">		size_t size = field-&gt;data_size / field-&gt;count;</a>
+<a name="ln2791"> </a>
+<a name="ln2792">		for (uint32 j = 0; j &lt; field-&gt;count; j++) {</a>
+<a name="ln2793">			if (!isFixed) {</a>
+<a name="ln2794">				size = *(uint32*)data;</a>
+<a name="ln2795">				data = (const void*)((const char*)data + sizeof(uint32));</a>
+<a name="ln2796">			}</a>
+<a name="ln2797"> </a>
+<a name="ln2798">			status_t status = AddData(name, field-&gt;type, data, size,</a>
+<a name="ln2799">				isFixed, 1);</a>
+<a name="ln2800">			if (status != B_OK)</a>
+<a name="ln2801">				return status;</a>
+<a name="ln2802"> </a>
+<a name="ln2803">			data = (const void*)((const char*)data + size);</a>
+<a name="ln2804">		}</a>
+<a name="ln2805">	}</a>
+<a name="ln2806">	return B_OK;</a>
+<a name="ln2807">}</a>
+<a name="ln2808"> </a>
+<a name="ln2809"> </a>
+<a name="ln2810">status_t</a>
+<a name="ln2811">BMessage::FindAlignment(const char* name, BAlignment* alignment) const</a>
+<a name="ln2812">{</a>
+<a name="ln2813">	return FindAlignment(name, 0, alignment);</a>
+<a name="ln2814">}</a>
+<a name="ln2815"> </a>
+<a name="ln2816"> </a>
+<a name="ln2817">status_t</a>
+<a name="ln2818">BMessage::FindAlignment(const char* name, int32 index, BAlignment* alignment)</a>
+<a name="ln2819">	const</a>
+<a name="ln2820">{</a>
+<a name="ln2821">	if (!alignment)</a>
+<a name="ln2822">		return B_BAD_VALUE;</a>
+<a name="ln2823"> </a>
+<a name="ln2824">	int32* data;</a>
+<a name="ln2825">	ssize_t bytes;</a>
+<a name="ln2826"> </a>
+<a name="ln2827">	status_t err = FindData(name, B_ALIGNMENT_TYPE, index,</a>
+<a name="ln2828">		(const void**)&amp;data, &amp;bytes);</a>
+<a name="ln2829"> </a>
+<a name="ln2830">	if (err == B_OK) {</a>
+<a name="ln2831">		if (bytes != sizeof(int32[2]))</a>
+<a name="ln2832">			return B_ERROR;</a>
+<a name="ln2833"> </a>
+<a name="ln2834">		alignment-&gt;horizontal = (enum alignment)(*data);</a>
+<a name="ln2835">		alignment-&gt;vertical = (vertical_alignment)*(data + 1);</a>
+<a name="ln2836">	}</a>
+<a name="ln2837"> </a>
+<a name="ln2838">	return err;</a>
+<a name="ln2839">}</a>
+<a name="ln2840"> </a>
+<a name="ln2841"> </a>
+<a name="ln2842">status_t</a>
+<a name="ln2843">BMessage::FindString(const char* name, const char** string) const</a>
+<a name="ln2844">{</a>
+<a name="ln2845">	return FindString(name, 0, string);</a>
+<a name="ln2846">}</a>
+<a name="ln2847"> </a>
+<a name="ln2848"> </a>
+<a name="ln2849">status_t</a>
+<a name="ln2850">BMessage::FindString(const char* name, int32 index, const char** string) const</a>
+<a name="ln2851">{</a>
+<a name="ln2852">	ssize_t bytes;</a>
+<a name="ln2853">	return FindData(name, B_STRING_TYPE, index, (const void**)string, &amp;bytes);</a>
+<a name="ln2854">}</a>
+<a name="ln2855"> </a>
+<a name="ln2856"> </a>
+<a name="ln2857">status_t</a>
+<a name="ln2858">BMessage::FindString(const char* name, BString* string) const</a>
+<a name="ln2859">{</a>
+<a name="ln2860">	return FindString(name, 0, string);</a>
+<a name="ln2861">}</a>
+<a name="ln2862"> </a>
+<a name="ln2863"> </a>
+<a name="ln2864">status_t</a>
+<a name="ln2865">BMessage::FindString(const char* name, int32 index, BString* string) const</a>
+<a name="ln2866">{</a>
+<a name="ln2867">	if (string == NULL)</a>
+<a name="ln2868">		return B_BAD_VALUE;</a>
+<a name="ln2869"> </a>
+<a name="ln2870">	const char* value;</a>
+<a name="ln2871">	status_t error = FindString(name, index, &amp;value);</a>
+<a name="ln2872"> </a>
+<a name="ln2873">	// Find*() clobbers the object even on failure</a>
+<a name="ln2874">	string-&gt;SetTo(value);</a>
+<a name="ln2875">	return error;</a>
+<a name="ln2876">}</a>
+<a name="ln2877"> </a>
+<a name="ln2878"> </a>
+<a name="ln2879">status_t</a>
+<a name="ln2880">BMessage::FindStrings(const char* name, BStringList* list) const</a>
+<a name="ln2881">{</a>
+<a name="ln2882">	if (list == NULL)</a>
+<a name="ln2883">		return B_BAD_VALUE;</a>
+<a name="ln2884"> </a>
+<a name="ln2885">	list-&gt;MakeEmpty();</a>
+<a name="ln2886"> </a>
+<a name="ln2887">	// get the number of items</a>
+<a name="ln2888">	type_code type;</a>
+<a name="ln2889">	int32 count;</a>
+<a name="ln2890">	if (GetInfo(name, &amp;type, &amp;count) != B_OK)</a>
+<a name="ln2891">		return B_NAME_NOT_FOUND;</a>
+<a name="ln2892"> </a>
+<a name="ln2893">	if (type != B_STRING_TYPE)</a>
+<a name="ln2894">		return B_BAD_DATA;</a>
+<a name="ln2895"> </a>
+<a name="ln2896">	for (int32 i = 0; i &lt; count; i++) {</a>
+<a name="ln2897">		BString string;</a>
+<a name="ln2898">		status_t error = FindString(name, i, &amp;string);</a>
+<a name="ln2899">		if (error != B_OK)</a>
+<a name="ln2900">			return error;</a>
+<a name="ln2901">		if (!list-&gt;Add(string))</a>
+<a name="ln2902">			return B_NO_MEMORY;</a>
+<a name="ln2903">	}</a>
+<a name="ln2904"> </a>
+<a name="ln2905">	return B_OK;</a>
+<a name="ln2906">}</a>
+<a name="ln2907"> </a>
+<a name="ln2908"> </a>
+<a name="ln2909">status_t</a>
+<a name="ln2910">BMessage::FindPointer(const char* name, void** pointer) const</a>
+<a name="ln2911">{</a>
+<a name="ln2912">	return FindPointer(name, 0, pointer);</a>
+<a name="ln2913">}</a>
+<a name="ln2914"> </a>
+<a name="ln2915"> </a>
+<a name="ln2916">status_t</a>
+<a name="ln2917">BMessage::FindPointer(const char* name, int32 index, void** pointer) const</a>
+<a name="ln2918">{</a>
+<a name="ln2919">	if (pointer == NULL)</a>
+<a name="ln2920">		return B_BAD_VALUE;</a>
+<a name="ln2921"> </a>
+<a name="ln2922">	void** data = NULL;</a>
+<a name="ln2923">	ssize_t size = 0;</a>
+<a name="ln2924">	status_t error = FindData(name, B_POINTER_TYPE, index,</a>
+<a name="ln2925">		(const void**)&amp;data, &amp;size);</a>
+<a name="ln2926"> </a>
+<a name="ln2927">	if (error == B_OK)</a>
+<a name="ln2928">		*pointer = *data;</a>
+<a name="ln2929">	else</a>
+<a name="ln2930">		*pointer = NULL;</a>
+<a name="ln2931"> </a>
+<a name="ln2932">	return error;</a>
+<a name="ln2933">}</a>
+<a name="ln2934"> </a>
+<a name="ln2935"> </a>
+<a name="ln2936">status_t</a>
+<a name="ln2937">BMessage::FindMessenger(const char* name, BMessenger* messenger) const</a>
+<a name="ln2938">{</a>
+<a name="ln2939">	return FindMessenger(name, 0, messenger);</a>
+<a name="ln2940">}</a>
+<a name="ln2941"> </a>
+<a name="ln2942"> </a>
+<a name="ln2943">status_t</a>
+<a name="ln2944">BMessage::FindMessenger(const char* name, int32 index,</a>
+<a name="ln2945">	BMessenger* messenger) const</a>
+<a name="ln2946">{</a>
+<a name="ln2947">	if (messenger == NULL)</a>
+<a name="ln2948">		return B_BAD_VALUE;</a>
+<a name="ln2949"> </a>
+<a name="ln2950">	BMessenger* data = NULL;</a>
+<a name="ln2951">	ssize_t size = 0;</a>
+<a name="ln2952">	status_t error = FindData(name, B_MESSENGER_TYPE, index,</a>
+<a name="ln2953">		(const void**)&amp;data, &amp;size);</a>
+<a name="ln2954"> </a>
+<a name="ln2955">	if (error == B_OK)</a>
+<a name="ln2956">		*messenger = *data;</a>
+<a name="ln2957">	else</a>
+<a name="ln2958">		*messenger = BMessenger();</a>
+<a name="ln2959"> </a>
+<a name="ln2960">	return error;</a>
+<a name="ln2961">}</a>
+<a name="ln2962"> </a>
+<a name="ln2963"> </a>
+<a name="ln2964">status_t</a>
+<a name="ln2965">BMessage::FindRef(const char* name, entry_ref* ref) const</a>
+<a name="ln2966">{</a>
+<a name="ln2967">	return FindRef(name, 0, ref);</a>
+<a name="ln2968">}</a>
+<a name="ln2969"> </a>
+<a name="ln2970"> </a>
+<a name="ln2971">status_t</a>
+<a name="ln2972">BMessage::FindRef(const char* name, int32 index, entry_ref* ref) const</a>
+<a name="ln2973">{</a>
+<a name="ln2974">	if (ref == NULL)</a>
+<a name="ln2975">		return B_BAD_VALUE;</a>
+<a name="ln2976"> </a>
+<a name="ln2977">	void* data = NULL;</a>
+<a name="ln2978">	ssize_t size = 0;</a>
+<a name="ln2979">	status_t error = FindData(name, B_REF_TYPE, index,</a>
+<a name="ln2980">		(const void**)&amp;data, &amp;size);</a>
+<a name="ln2981"> </a>
+<a name="ln2982">	if (error == B_OK)</a>
+<a name="ln2983">		error = BPrivate::entry_ref_unflatten(ref, (char*)data, size);</a>
+<a name="ln2984">	else</a>
+<a name="ln2985">		*ref = entry_ref();</a>
+<a name="ln2986"> </a>
+<a name="ln2987">	return error;</a>
+<a name="ln2988">}</a>
+<a name="ln2989"> </a>
+<a name="ln2990"> </a>
+<a name="ln2991">status_t</a>
+<a name="ln2992">BMessage::FindMessage(const char* name, BMessage* message) const</a>
+<a name="ln2993">{</a>
+<a name="ln2994">	return FindMessage(name, 0, message);</a>
+<a name="ln2995">}</a>
+<a name="ln2996"> </a>
+<a name="ln2997"> </a>
+<a name="ln2998">status_t</a>
+<a name="ln2999">BMessage::FindMessage(const char* name, int32 index, BMessage* message) const</a>
+<a name="ln3000">{</a>
+<a name="ln3001">	if (message == NULL)</a>
+<a name="ln3002">		return B_BAD_VALUE;</a>
+<a name="ln3003"> </a>
+<a name="ln3004">	void* data = NULL;</a>
+<a name="ln3005">	ssize_t size = 0;</a>
+<a name="ln3006">	status_t error = FindData(name, B_MESSAGE_TYPE, index,</a>
+<a name="ln3007">		(const void**)&amp;data, &amp;size);</a>
+<a name="ln3008"> </a>
+<a name="ln3009">	if (error == B_OK)</a>
+<a name="ln3010">		error = message-&gt;Unflatten((const char*)data);</a>
+<a name="ln3011">	else</a>
+<a name="ln3012">		*message = BMessage();</a>
+<a name="ln3013"> </a>
+<a name="ln3014">	return error;</a>
+<a name="ln3015">}</a>
+<a name="ln3016"> </a>
+<a name="ln3017"> </a>
+<a name="ln3018">status_t</a>
+<a name="ln3019">BMessage::FindFlat(const char* name, BFlattenable* object) const</a>
+<a name="ln3020">{</a>
+<a name="ln3021">	return FindFlat(name, 0, object);</a>
+<a name="ln3022">}</a>
+<a name="ln3023"> </a>
+<a name="ln3024"> </a>
+<a name="ln3025">status_t</a>
+<a name="ln3026">BMessage::FindFlat(const char* name, int32 index, BFlattenable* object) const</a>
+<a name="ln3027">{</a>
+<a name="ln3028">	if (object == NULL)</a>
+<a name="ln3029">		return B_BAD_VALUE;</a>
+<a name="ln3030"> </a>
+<a name="ln3031">	void* data = NULL;</a>
+<a name="ln3032">	ssize_t numBytes = 0;</a>
+<a name="ln3033">	status_t error = FindData(name, object-&gt;TypeCode(), index,</a>
+<a name="ln3034">		(const void**)&amp;data, &amp;numBytes);</a>
+<a name="ln3035"> </a>
+<a name="ln3036">	if (error == B_OK)</a>
+<a name="ln3037">		error = object-&gt;Unflatten(object-&gt;TypeCode(), data, numBytes);</a>
+<a name="ln3038"> </a>
+<a name="ln3039">	return error;</a>
+<a name="ln3040">}</a>
+<a name="ln3041"> </a>
+<a name="ln3042"> </a>
+<a name="ln3043">status_t</a>
+<a name="ln3044">BMessage::FindData(const char* name, type_code type, const void** data,</a>
+<a name="ln3045">	ssize_t* numBytes) const</a>
+<a name="ln3046">{</a>
+<a name="ln3047">	return FindData(name, type, 0, data, numBytes);</a>
+<a name="ln3048">}</a>
+<a name="ln3049"> </a>
+<a name="ln3050"> </a>
+<a name="ln3051">status_t</a>
+<a name="ln3052">BMessage::ReplaceAlignment(const char* name, const BAlignment&amp; alignment)</a>
+<a name="ln3053">{</a>
+<a name="ln3054">	int32 data[2] = {alignment.horizontal, alignment.vertical};</a>
+<a name="ln3055">	return ReplaceData(name, B_ALIGNMENT_TYPE, 0, data, sizeof(data));</a>
+<a name="ln3056">}</a>
+<a name="ln3057"> </a>
+<a name="ln3058"> </a>
+<a name="ln3059">status_t</a>
+<a name="ln3060">BMessage::ReplaceAlignment(const char* name, int32 index,</a>
+<a name="ln3061">	const BAlignment&amp; alignment)</a>
+<a name="ln3062">{</a>
+<a name="ln3063">	int32 data[2] = {alignment.horizontal, alignment.vertical};</a>
+<a name="ln3064">	return ReplaceData(name, B_ALIGNMENT_TYPE, index, data, sizeof(data));</a>
+<a name="ln3065">}</a>
+<a name="ln3066"> </a>
+<a name="ln3067"> </a>
+<a name="ln3068">status_t</a>
+<a name="ln3069">BMessage::ReplaceString(const char* name, const char* string)</a>
+<a name="ln3070">{</a>
+<a name="ln3071">	if (string == NULL)</a>
+<a name="ln3072">		return B_BAD_VALUE;</a>
+<a name="ln3073"> </a>
+<a name="ln3074">	return ReplaceData(name, B_STRING_TYPE, 0, string, strlen(string) + 1);</a>
+<a name="ln3075">}</a>
+<a name="ln3076"> </a>
+<a name="ln3077"> </a>
+<a name="ln3078">status_t</a>
+<a name="ln3079">BMessage::ReplaceString(const char* name, int32 index, const char* string)</a>
+<a name="ln3080">{</a>
+<a name="ln3081">	if (string == NULL)</a>
+<a name="ln3082">		return B_BAD_VALUE;</a>
+<a name="ln3083"> </a>
+<a name="ln3084">	return ReplaceData(name, B_STRING_TYPE, index, string, strlen(string) + 1);</a>
+<a name="ln3085">}</a>
+<a name="ln3086"> </a>
+<a name="ln3087"> </a>
+<a name="ln3088">status_t</a>
+<a name="ln3089">BMessage::ReplaceString(const char* name, const BString&amp; string)</a>
+<a name="ln3090">{</a>
+<a name="ln3091">	return ReplaceData(name, B_STRING_TYPE, 0, string.String(),</a>
+<a name="ln3092">		string.Length() + 1);</a>
+<a name="ln3093">}</a>
+<a name="ln3094"> </a>
+<a name="ln3095"> </a>
+<a name="ln3096">status_t</a>
+<a name="ln3097">BMessage::ReplaceString(const char* name, int32 index, const BString&amp; string)</a>
+<a name="ln3098">{</a>
+<a name="ln3099">	return ReplaceData(name, B_STRING_TYPE, index, string.String(),</a>
+<a name="ln3100">		string.Length() + 1);</a>
+<a name="ln3101">}</a>
+<a name="ln3102"> </a>
+<a name="ln3103"> </a>
+<a name="ln3104">status_t</a>
+<a name="ln3105">BMessage::ReplacePointer(const char* name, const void* pointer)</a>
+<a name="ln3106">{</a>
+<a name="ln3107">	return ReplaceData(name, B_POINTER_TYPE, 0, &amp;pointer, sizeof(pointer));</a>
+<a name="ln3108">}</a>
+<a name="ln3109"> </a>
+<a name="ln3110"> </a>
+<a name="ln3111">status_t</a>
+<a name="ln3112">BMessage::ReplacePointer(const char* name, int32 index, const void* pointer)</a>
+<a name="ln3113">{</a>
+<a name="ln3114">	return ReplaceData(name, B_POINTER_TYPE, index, &amp;pointer, sizeof(pointer));</a>
+<a name="ln3115">}</a>
+<a name="ln3116"> </a>
+<a name="ln3117"> </a>
+<a name="ln3118">status_t</a>
+<a name="ln3119">BMessage::ReplaceMessenger(const char* name, BMessenger messenger)</a>
+<a name="ln3120">{</a>
+<a name="ln3121">	return ReplaceData(name, B_MESSENGER_TYPE, 0, &amp;messenger,</a>
+<a name="ln3122">		sizeof(BMessenger));</a>
+<a name="ln3123">}</a>
+<a name="ln3124"> </a>
+<a name="ln3125"> </a>
+<a name="ln3126">status_t</a>
+<a name="ln3127">BMessage::ReplaceMessenger(const char* name, int32 index, BMessenger messenger)</a>
+<a name="ln3128">{</a>
+<a name="ln3129">	return ReplaceData(name, B_MESSENGER_TYPE, index, &amp;messenger,</a>
+<a name="ln3130">		sizeof(BMessenger));</a>
+<a name="ln3131">}</a>
+<a name="ln3132"> </a>
+<a name="ln3133"> </a>
+<a name="ln3134">status_t</a>
+<a name="ln3135">BMessage::ReplaceRef(const char* name, const entry_ref* ref)</a>
+<a name="ln3136">{</a>
+<a name="ln3137">	return ReplaceRef(name, 0, ref);</a>
+<a name="ln3138">}</a>
+<a name="ln3139"> </a>
+<a name="ln3140"> </a>
+<a name="ln3141">status_t</a>
+<a name="ln3142">BMessage::ReplaceRef(const char* name, int32 index, const entry_ref* ref)</a>
+<a name="ln3143">{</a>
+<a name="ln3144">	size_t size = sizeof(entry_ref) + B_PATH_NAME_LENGTH;</a>
+<a name="ln3145">	char buffer[size];</a>
+<a name="ln3146"> </a>
+<a name="ln3147">	status_t error = BPrivate::entry_ref_flatten(buffer, &amp;size, ref);</a>
+<a name="ln3148"> </a>
+<a name="ln3149">	if (error &gt;= B_OK)</a>
+<a name="ln3150">		error = ReplaceData(name, B_REF_TYPE, index, buffer, size);</a>
+<a name="ln3151"> </a>
+<a name="ln3152">	return error;</a>
+<a name="ln3153">}</a>
+<a name="ln3154"> </a>
+<a name="ln3155"> </a>
+<a name="ln3156">status_t</a>
+<a name="ln3157">BMessage::ReplaceMessage(const char* name, const BMessage* message)</a>
+<a name="ln3158">{</a>
+<a name="ln3159">	return ReplaceMessage(name, 0, message);</a>
+<a name="ln3160">}</a>
+<a name="ln3161"> </a>
+<a name="ln3162"> </a>
+<a name="ln3163">status_t</a>
+<a name="ln3164">BMessage::ReplaceMessage(const char* name, int32 index, const BMessage* message)</a>
+<a name="ln3165">{</a>
+<a name="ln3166">	if (message == NULL)</a>
+<a name="ln3167">		return B_BAD_VALUE;</a>
+<a name="ln3168"> </a>
+<a name="ln3169">	ssize_t size = message-&gt;FlattenedSize();</a>
+<a name="ln3170">	char buffer[size];</a>
+<a name="ln3171"> </a>
+<a name="ln3172">	status_t error = message-&gt;Flatten(buffer, size);</a>
+<a name="ln3173"> </a>
+<a name="ln3174">	if (error &gt;= B_OK)</a>
+<a name="ln3175">		error = ReplaceData(name, B_MESSAGE_TYPE, index, &amp;buffer, size);</a>
+<a name="ln3176"> </a>
+<a name="ln3177">	return error;</a>
+<a name="ln3178">}</a>
+<a name="ln3179"> </a>
+<a name="ln3180"> </a>
+<a name="ln3181">status_t</a>
+<a name="ln3182">BMessage::ReplaceFlat(const char* name, BFlattenable* object)</a>
+<a name="ln3183">{</a>
+<a name="ln3184">	return ReplaceFlat(name, 0, object);</a>
+<a name="ln3185">}</a>
+<a name="ln3186"> </a>
+<a name="ln3187"> </a>
+<a name="ln3188">status_t</a>
+<a name="ln3189">BMessage::ReplaceFlat(const char* name, int32 index, BFlattenable* object)</a>
+<a name="ln3190">{</a>
+<a name="ln3191">	if (object == NULL)</a>
+<a name="ln3192">		return B_BAD_VALUE;</a>
+<a name="ln3193"> </a>
+<a name="ln3194">	ssize_t size = object-&gt;FlattenedSize();</a>
+<a name="ln3195">	char buffer[size];</a>
+<a name="ln3196"> </a>
+<a name="ln3197">	status_t error = object-&gt;Flatten(buffer, size);</a>
+<a name="ln3198"> </a>
+<a name="ln3199">	if (error &gt;= B_OK)</a>
+<a name="ln3200">		error = ReplaceData(name, object-&gt;TypeCode(), index, &amp;buffer, size);</a>
+<a name="ln3201"> </a>
+<a name="ln3202">	return error;</a>
+<a name="ln3203">}</a>
+<a name="ln3204"> </a>
+<a name="ln3205"> </a>
+<a name="ln3206">status_t</a>
+<a name="ln3207">BMessage::ReplaceData(const char* name, type_code type, const void* data,</a>
+<a name="ln3208">	ssize_t numBytes)</a>
+<a name="ln3209">{</a>
+<a name="ln3210">	return ReplaceData(name, type, 0, data, numBytes);</a>
+<a name="ln3211">}</a>
+<a name="ln3212"> </a>
+<a name="ln3213"> </a>
+<a name="ln3214">bool</a>
+<a name="ln3215">BMessage::HasFlat(const char* name, const BFlattenable* object) const</a>
+<a name="ln3216">{</a>
+<a name="ln3217">	return HasFlat(name, 0, object);</a>
+<a name="ln3218">}</a>
+<a name="ln3219"> </a>
+<a name="ln3220"> </a>
+<a name="ln3221">bool</a>
+<a name="ln3222">BMessage::HasFlat(const char* name, int32 index, const BFlattenable* object)</a>
+<a name="ln3223">	const</a>
+<a name="ln3224">{</a>
+<a name="ln3225">	return HasData(name, object-&gt;TypeCode(), index);</a>
+<a name="ln3226">}</a>
+<a name="ln3227"> </a>
+<a name="ln3228"> </a>
+<a name="ln3229">const char*</a>
+<a name="ln3230">BMessage::GetString(const char* name, const char* defaultValue) const</a>
+<a name="ln3231">{</a>
+<a name="ln3232">	return GetString(name, 0, defaultValue);</a>
+<a name="ln3233">}</a>
+<a name="ln3234"> </a>
+<a name="ln3235"> </a>
+<a name="ln3236">const char*</a>
+<a name="ln3237">BMessage::GetString(const char* name, int32 index,</a>
+<a name="ln3238">	const char* defaultValue) const</a>
+<a name="ln3239">{</a>
+<a name="ln3240">	const char* value;</a>
+<a name="ln3241">	if (FindString(name, index, &amp;value) == B_OK)</a>
+<a name="ln3242">		return value;</a>
+<a name="ln3243"> </a>
+<a name="ln3244">	return defaultValue;</a>
+<a name="ln3245">}</a>
+<a name="ln3246"> </a>
+<a name="ln3247"> </a>
+<a name="ln3248">status_t</a>
+<a name="ln3249">BMessage::SetString(const char* name, const BString&amp; value)</a>
+<a name="ln3250">{</a>
+<a name="ln3251">	return SetData(name, B_STRING_TYPE, value.String(), value.Length() + 1,</a>
+<a name="ln3252">		false);</a>
+<a name="ln3253">}</a>
+<a name="ln3254"> </a>
+<a name="ln3255"> </a>
+<a name="ln3256">status_t</a>
+<a name="ln3257">BMessage::SetString(const char* name, const char* value)</a>
+<a name="ln3258">{</a>
+<a name="ln3259">	return SetData(name, B_STRING_TYPE, value, strlen(value) + 1, false);</a>
+<a name="ln3260">}</a>
+<a name="ln3261"> </a>
+<a name="ln3262"> </a>
+<a name="ln3263">status_t</a>
+<a name="ln3264">BMessage::SetData(const char* name, type_code type, const void* data,</a>
+<a name="ln3265">	ssize_t numBytes, bool fixedSize, int count)</a>
+<a name="ln3266">{</a>
+<a name="ln3267">	if (numBytes &lt;= 0 || data == NULL)</a>
+<a name="ln3268">		return B_BAD_VALUE;</a>
+<a name="ln3269"> </a>
+<a name="ln3270">	if (ReplaceData(name, type, data, numBytes) == B_OK)</a>
+<a name="ln3271">		return B_OK;</a>
+<a name="ln3272"> </a>
+<a name="ln3273">	return AddData(name, type, data, numBytes, fixedSize, count);</a>
+<a name="ln3274">}</a>
+
+</code></pre>
+<div class="balloon" rel="1811"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v781/" target="_blank">V781</a> The value of the 'field->count' variable is checked after it was used. Perhaps there is a mistake in program logic. Check lines: 1811, 1818.</p></div>
+<div class="balloon" rel="380"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v512/" target="_blank">V512</a> A call of the 'memset' function will lead to underflow of the buffer 'fHeader'.</p></div>
+<div class="balloon" rel="1606"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v781/" target="_blank">V781</a> The value of the 'size' variable is checked after it was used. Perhaps there is a mistake in program logic. Check lines: 1606, 1607.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

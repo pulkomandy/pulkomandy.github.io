@@ -1,0 +1,2515 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>fs_cache.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2">   This file contains the global device cache for the BeOS.  All</a>
+<a name="ln3">   file system I/O comes through here.  The cache can handle blocks</a>
+<a name="ln4">   of different sizes for multiple different underlying physical</a>
+<a name="ln5">   devices.</a>
+<a name="ln6"> </a>
+<a name="ln7">   The cache is organized as a hash table (for lookups by device</a>
+<a name="ln8">   and block number) and two doubly-linked lists.  The normal</a>
+<a name="ln9">   list is for &quot;normal&quot; blocks which are either clean or dirty.</a>
+<a name="ln10">   The locked list is for blocks that are locked in the cache by</a>
+<a name="ln11">   BFS.  The lists are LRU ordered.</a>
+<a name="ln12"> </a>
+<a name="ln13">   Most of the work happens in the function cache_block_io() which</a>
+<a name="ln14">   is quite lengthy.  The other functions of interest are get_ents()</a>
+<a name="ln15">   which picks victims to be kicked out of the cache; flush_ents()</a>
+<a name="ln16">   which does the work of flushing them; and set_blocks_info() which</a>
+<a name="ln17">   handles cloning blocks and setting callbacks so that the BFS</a>
+<a name="ln18">   journal will work properly.  If you want to modify this code it</a>
+<a name="ln19">   will take some study but it's not too bad.  Do not think about</a>
+<a name="ln20">   separating the list of clean and dirty blocks into two lists as</a>
+<a name="ln21">   I did that already and it's slower.</a>
+<a name="ln22"> </a>
+<a name="ln23">   Originally this cache code was written while listening to the album</a>
+<a name="ln24">   &quot;Ride the Lightning&quot; by Metallica.  The current version was written</a>
+<a name="ln25">   while listening to &quot;Welcome to SkyValley&quot; by Kyuss as well as an</a>
+<a name="ln26">   ambient collection on the German label FAX.  Music helps a lot when</a>
+<a name="ln27">   writing code.</a>
+<a name="ln28"> </a>
+<a name="ln29">   THIS CODE COPYRIGHT DOMINIC GIAMPAOLO.  NO WARRANTY IS EXPRESSED</a>
+<a name="ln30">   OR IMPLIED.  YOU MAY USE THIS CODE AND FREELY DISTRIBUTE IT FOR</a>
+<a name="ln31">   NON-COMMERCIAL USE AS LONG AS THIS NOTICE REMAINS ATTACHED.</a>
+<a name="ln32"> </a>
+<a name="ln33">   FOR COMMERCIAL USE, CONTACT DOMINIC GIAMPAOLO (dbg@be.com).</a>
+<a name="ln34"> </a>
+<a name="ln35">   Dominic Giampaolo</a>
+<a name="ln36">   dbg@be.com</a>
+<a name="ln37">*/</a>
+<a name="ln38"> </a>
+<a name="ln39">#include &lt;stdio.h&gt;</a>
+<a name="ln40">#include &lt;stdlib.h&gt;</a>
+<a name="ln41">#include &lt;memory.h&gt;</a>
+<a name="ln42">#include &lt;string.h&gt;</a>
+<a name="ln43">#include &lt;errno.h&gt;</a>
+<a name="ln44">#include &lt;fcntl.h&gt;</a>
+<a name="ln45">#include &lt;sys/types.h&gt;</a>
+<a name="ln46">#include &lt;sys/uio.h&gt;</a>
+<a name="ln47">#include &lt;unistd.h&gt;</a>
+<a name="ln48"> </a>
+<a name="ln49"> </a>
+<a name="ln50">#include &lt;OS.h&gt;</a>
+<a name="ln51">#include &lt;KernelExport.h&gt;</a>
+<a name="ln52"> </a>
+<a name="ln53">#include &quot;fs_cache.h&quot;</a>
+<a name="ln54">#include &quot;fs_cache_priv.h&quot;</a>
+<a name="ln55">#include &quot;lock.h&quot;</a>
+<a name="ln56"> </a>
+<a name="ln57"> </a>
+<a name="ln58"> </a>
+<a name="ln59">#ifndef USER</a>
+<a name="ln60">#define printf dprintf</a>
+<a name="ln61">#endif</a>
+<a name="ln62">#ifdef USER</a>
+<a name="ln63">#define kprintf printf</a>
+<a name="ln64">#endif</a>
+<a name="ln65"> </a>
+<a name="ln66"> </a>
+<a name="ln67">typedef off_t fs_off_t;</a>
+<a name="ln68"> </a>
+<a name="ln69">/* forward prototypes */</a>
+<a name="ln70">static int   flush_ents(cache_ent **ents, int n_ents);</a>
+<a name="ln71"> </a>
+<a name="ln72">//static int   do_dump(int argc, char **argv);</a>
+<a name="ln73">//static int   do_find_block(int argc, char **argv);</a>
+<a name="ln74">//static int   do_find_data(int argc, char **argv);</a>
+<a name="ln75">//static void  cache_flusher(void *arg, int phase);</a>
+<a name="ln76"> </a>
+<a name="ln77"> </a>
+<a name="ln78">int chatty_io = 0;</a>
+<a name="ln79"> </a>
+<a name="ln80">#define CHUNK (512 * 1024)   /* a hack to work around scsi driver bugs */</a>
+<a name="ln81"> </a>
+<a name="ln82">static void</a>
+<a name="ln83">beos_panic(const char *format, ...)</a>
+<a name="ln84">{</a>
+<a name="ln85">    va_list     ap;</a>
+<a name="ln86"> </a>
+<a name="ln87">    va_start(ap, format);</a>
+<a name="ln88">    vfprintf(stderr, format, ap);</a>
+<a name="ln89">    va_end(ap);</a>
+<a name="ln90"> </a>
+<a name="ln91">    while (TRUE)</a>
+<a name="ln92">        ;</a>
+<a name="ln93">}</a>
+<a name="ln94"> </a>
+<a name="ln95">size_t</a>
+<a name="ln96">beos_read_phys_blocks(int fd, fs_off_t bnum, void *data, uint num_blocks, int bsize)</a>
+<a name="ln97">{</a>
+<a name="ln98">    size_t ret = 0;</a>
+<a name="ln99">    size_t sum;</a>
+<a name="ln100"> </a>
+<a name="ln101">    if (chatty_io)</a>
+<a name="ln102">        printf(&quot;R: %8Ld : %3d\n&quot;, bnum, num_blocks);</a>
+<a name="ln103"> </a>
+<a name="ln104">    if (num_blocks * bsize &lt; CHUNK)</a>
+<a name="ln105">        ret = read_pos(fd, bnum * bsize, data, num_blocks * bsize);</a>
+<a name="ln106">    else {</a>
+<a name="ln107">        for(sum=0; (sum + CHUNK) &lt;= (num_blocks * bsize); sum += CHUNK) {</a>
+<a name="ln108">            ret = read_pos(fd, (bnum * bsize) + sum, data, CHUNK);</a>
+<a name="ln109">            if (ret != CHUNK)</a>
+<a name="ln110">                break;</a>
+<a name="ln111"> </a>
+<a name="ln112">            data = (void *)((char *)data + CHUNK);</a>
+<a name="ln113">        }</a>
+<a name="ln114"> </a>
+<a name="ln115">        if (ret == CHUNK &amp;&amp; ((num_blocks * bsize) - sum) &gt; 0) {</a>
+<a name="ln116">            ret = read_pos(fd, (bnum * bsize) + sum, data,</a>
+<a name="ln117">                           (num_blocks * bsize) - sum);</a>
+<a name="ln118"> </a>
+<a name="ln119">            if (ret == (num_blocks * bsize) - sum)</a>
+<a name="ln120">                ret = num_blocks * bsize;</a>
+<a name="ln121">        } else if (ret == CHUNK) {</a>
+<a name="ln122">            ret = num_blocks * bsize;</a>
+<a name="ln123">        }</a>
+<a name="ln124">    }</a>
+<a name="ln125"> </a>
+<a name="ln126">    if (ret == num_blocks * bsize)</a>
+<a name="ln127">        return 0;</a>
+<a name="ln128">    else</a>
+<a name="ln129">        return EBADF;</a>
+<a name="ln130">}</a>
+<a name="ln131"> </a>
+<a name="ln132">size_t</a>
+<a name="ln133">beos_write_phys_blocks(int fd, fs_off_t bnum, void *data, uint num_blocks, int bsize)</a>
+<a name="ln134">{</a>
+<a name="ln135">    size_t ret = 0;</a>
+<a name="ln136">    size_t sum;</a>
+<a name="ln137"> </a>
+<a name="ln138">    if (chatty_io)</a>
+<a name="ln139">        printf(&quot;W: %8Ld : %3d\n&quot;, bnum, num_blocks);</a>
+<a name="ln140"> </a>
+<a name="ln141">    if (num_blocks * bsize &lt; CHUNK)</a>
+<a name="ln142">        ret = write_pos(fd, bnum * bsize, data, num_blocks * bsize);</a>
+<a name="ln143">    else {</a>
+<a name="ln144">        for(sum=0; (sum + CHUNK) &lt;= (num_blocks * bsize); sum += CHUNK) {</a>
+<a name="ln145">            ret = write_pos(fd, (bnum * bsize) + sum, data, CHUNK);</a>
+<a name="ln146">            if (ret != CHUNK)</a>
+<a name="ln147">                break;</a>
+<a name="ln148"> </a>
+<a name="ln149">            data = (void *)((char *)data + CHUNK);</a>
+<a name="ln150">        }</a>
+<a name="ln151"> </a>
+<a name="ln152">        if (ret == CHUNK &amp;&amp; ((num_blocks * bsize) - sum) &gt; 0) {</a>
+<a name="ln153">            ret = write_pos(fd, (bnum * bsize) + sum, data,</a>
+<a name="ln154">                            (num_blocks * bsize) - sum);</a>
+<a name="ln155"> </a>
+<a name="ln156">            if (ret == (num_blocks * bsize) - sum)</a>
+<a name="ln157">                ret = num_blocks * bsize;</a>
+<a name="ln158">        } else if (ret == CHUNK) {</a>
+<a name="ln159">            ret = num_blocks * bsize;</a>
+<a name="ln160">        }</a>
+<a name="ln161">    }</a>
+<a name="ln162"> </a>
+<a name="ln163"> </a>
+<a name="ln164">    if (ret == num_blocks * bsize)</a>
+<a name="ln165">        return 0;</a>
+<a name="ln166">    else</a>
+<a name="ln167">        return EBADF;</a>
+<a name="ln168">}</a>
+<a name="ln169"> </a>
+<a name="ln170">//	#pragma mark -</a>
+<a name="ln171"> </a>
+<a name="ln172">static int</a>
+<a name="ln173">init_hash_table(hash_table *ht)</a>
+<a name="ln174">{</a>
+<a name="ln175">    ht-&gt;max   = HT_DEFAULT_MAX;</a>
+<a name="ln176">    ht-&gt;mask  = ht-&gt;max - 1;</a>
+<a name="ln177">    ht-&gt;num_elements = 0;</a>
+<a name="ln178"> </a>
+<a name="ln179">    ht-&gt;table = (hash_ent **)calloc(ht-&gt;max, sizeof(hash_ent *));</a>
+<a name="ln180">    if (ht-&gt;table == NULL)</a>
+<a name="ln181">        return ENOMEM;</a>
+<a name="ln182"> </a>
+<a name="ln183">    return 0;</a>
+<a name="ln184">}</a>
+<a name="ln185"> </a>
+<a name="ln186"> </a>
+<a name="ln187">static void</a>
+<a name="ln188">shutdown_hash_table(hash_table *ht)</a>
+<a name="ln189">{</a>
+<a name="ln190">    int       i, hash_len;</a>
+<a name="ln191">    hash_ent *he, *next;</a>
+<a name="ln192"> </a>
+<a name="ln193">    for(i=0; i &lt; ht-&gt;max; i++) {</a>
+<a name="ln194">        he = ht-&gt;table[i];</a>
+<a name="ln195"> </a>
+<a name="ln196">        for(hash_len=0; he; hash_len++, he=next) {</a>
+<a name="ln197">            next = he-&gt;next;</a>
+<a name="ln198">            free(he);</a>
+<a name="ln199">        }</a>
+<a name="ln200">    }</a>
+<a name="ln201"> </a>
+<a name="ln202">    if (ht-&gt;table)</a>
+<a name="ln203">        free(ht-&gt;table);</a>
+<a name="ln204">    ht-&gt;table = NULL;</a>
+<a name="ln205">}</a>
+<a name="ln206"> </a>
+<a name="ln207">#if 0</a>
+<a name="ln208">static void</a>
+<a name="ln209">print_hash_stats(hash_table *ht)</a>
+<a name="ln210">{</a>
+<a name="ln211">    int       i, hash_len, max = -1, sum = 0;</a>
+<a name="ln212">    hash_ent *he, *next;</a>
+<a name="ln213"> </a>
+<a name="ln214">    for(i=0; i &lt; ht-&gt;max; i++) {</a>
+<a name="ln215">        he = ht-&gt;table[i];</a>
+<a name="ln216"> </a>
+<a name="ln217">        for(hash_len=0; he; hash_len++, he=next) {</a>
+<a name="ln218">            next = he-&gt;next;</a>
+<a name="ln219">        }</a>
+<a name="ln220">        if (hash_len)</a>
+<a name="ln221">            printf(&quot;bucket %3d : %3d\n&quot;, i, hash_len);</a>
+<a name="ln222"> </a>
+<a name="ln223">        sum += hash_len;</a>
+<a name="ln224">        if (hash_len &gt; max)</a>
+<a name="ln225">            max = hash_len;</a>
+<a name="ln226">    }</a>
+<a name="ln227"> </a>
+<a name="ln228">    printf(&quot;max # of chains: %d,  average chain length %d\n&quot;, max,sum/ht-&gt;max);</a>
+<a name="ln229">}</a>
+<a name="ln230">#endif</a>
+<a name="ln231"> </a>
+<a name="ln232">#define HASH(d, b)   ((((fs_off_t)d) &lt;&lt; (sizeof(fs_off_t)*8 - 6)) | (b))</a>
+<a name="ln233"> </a>
+<a name="ln234">static hash_ent *</a>
+<a name="ln235">new_hash_ent(int dev, fs_off_t bnum, void *data)</a>
+<a name="ln236">{</a>
+<a name="ln237">    hash_ent *he;</a>
+<a name="ln238"> </a>
+<a name="ln239">    he = (hash_ent *)malloc(sizeof(*he));</a>
+<a name="ln240">    if (he == NULL)</a>
+<a name="ln241">        return NULL;</a>
+<a name="ln242"> </a>
+<a name="ln243">    he-&gt;hash_val = HASH(dev, bnum);</a>
+<a name="ln244">    he-&gt;dev      = dev;</a>
+<a name="ln245">    he-&gt;bnum     = bnum;</a>
+<a name="ln246">    he-&gt;data     = data;</a>
+<a name="ln247">    he-&gt;next     = NULL;</a>
+<a name="ln248"> </a>
+<a name="ln249">    return he;</a>
+<a name="ln250">}</a>
+<a name="ln251"> </a>
+<a name="ln252"> </a>
+<a name="ln253">static int</a>
+<a name="ln254">grow_hash_table(hash_table *ht)</a>
+<a name="ln255">{</a>
+<a name="ln256">    int        i, omax, newsize, newmask;</a>
+<a name="ln257">    fs_off_t      hash;</a>
+<a name="ln258">    hash_ent **new_table, *he, *next;</a>
+<a name="ln259"> </a>
+<a name="ln260">    if (ht-&gt;max &amp; ht-&gt;mask) {</a>
+<a name="ln261">        printf(&quot;*** hashtable size %d or mask %d looks weird!\n&quot;, ht-&gt;max,</a>
+<a name="ln262">               ht-&gt;mask);</a>
+<a name="ln263">    }</a>
+<a name="ln264"> </a>
+<a name="ln265">    omax    = ht-&gt;max;</a>
+<a name="ln266">    newsize = omax * 2;        /* have to grow in powers of two */</a>
+<a name="ln267">    newmask = newsize - 1;</a>
+<a name="ln268"> </a>
+<a name="ln269">    new_table = (hash_ent **)calloc(newsize, sizeof(hash_ent *));</a>
+<a name="ln270">    if (new_table == NULL)</a>
+<a name="ln271">        return ENOMEM;</a>
+<a name="ln272"> </a>
+<a name="ln273">    for(i=0; i &lt; omax; i++) {</a>
+<a name="ln274">        for(he=ht-&gt;table[i]; he; he=next) {</a>
+<a name="ln275">            hash = he-&gt;hash_val &amp; newmask;</a>
+<a name="ln276">            next = he-&gt;next;</a>
+<a name="ln277"> </a>
+<a name="ln278">            he-&gt;next        = new_table[hash];</a>
+<a name="ln279">            new_table[hash] = he;</a>
+<a name="ln280">        }</a>
+<a name="ln281">    }</a>
+<a name="ln282"> </a>
+<a name="ln283">    free(ht-&gt;table);</a>
+<a name="ln284">    ht-&gt;table = new_table;</a>
+<a name="ln285">    ht-&gt;max   = newsize;</a>
+<a name="ln286">    ht-&gt;mask  = newmask;</a>
+<a name="ln287"> </a>
+<a name="ln288">    return 0;</a>
+<a name="ln289">}</a>
+<a name="ln290"> </a>
+<a name="ln291"> </a>
+<a name="ln292"> </a>
+<a name="ln293"> </a>
+<a name="ln294">static int</a>
+<a name="ln295">hash_insert(hash_table *ht, int dev, fs_off_t bnum, void *data)</a>
+<a name="ln296">{</a>
+<a name="ln297">    fs_off_t    hash;</a>
+<a name="ln298">    hash_ent *he, *curr;</a>
+<a name="ln299"> </a>
+<a name="ln300">    hash = HASH(dev, bnum) &amp; ht-&gt;mask;</a>
+<a name="ln301"> </a>
+<a name="ln302">    curr = ht-&gt;table[hash];</a>
+<a name="ln303">    for(; curr != NULL; curr=curr-&gt;next)</a>
+<a name="ln304">        if (curr-&gt;dev == dev &amp;&amp; curr-&gt;bnum == bnum)</a>
+<a name="ln305">            break;</a>
+<a name="ln306"> </a>
+<a name="ln307">    if (curr &amp;&amp; curr-&gt;dev == dev &amp;&amp; curr-&gt;bnum == bnum) {</a>
+<a name="ln308">        printf(&quot;entry %d:%Ld already in the hash table!\n&quot;, dev, bnum);</a>
+<a name="ln309">        return EEXIST;</a>
+<a name="ln310">    }</a>
+<a name="ln311"> </a>
+<a name="ln312">    he = new_hash_ent(dev, bnum, data);</a>
+<a name="ln313">    if (he == NULL)</a>
+<a name="ln314">        return ENOMEM;</a>
+<a name="ln315"> </a>
+<a name="ln316">    he-&gt;next        = ht-&gt;table[hash];</a>
+<a name="ln317">    ht-&gt;table[hash] = he;</a>
+<a name="ln318"> </a>
+<a name="ln319">    ht-&gt;num_elements++;</a>
+<a name="ln320">    if (ht-&gt;num_elements &gt;= ((ht-&gt;max * 3) / 4)) {</a>
+<a name="ln321">        if (grow_hash_table(ht) != 0)</a>
+<a name="ln322">            return ENOMEM;</a>
+<a name="ln323">    }</a>
+<a name="ln324"> </a>
+<a name="ln325">    return 0;</a>
+<a name="ln326">}</a>
+<a name="ln327"> </a>
+<a name="ln328">static void *</a>
+<a name="ln329">hash_lookup(hash_table *ht, int dev, fs_off_t bnum)</a>
+<a name="ln330">{</a>
+<a name="ln331">    hash_ent *he;</a>
+<a name="ln332"> </a>
+<a name="ln333">    he = ht-&gt;table[HASH(dev, bnum) &amp; ht-&gt;mask];</a>
+<a name="ln334"> </a>
+<a name="ln335">    for(; he != NULL; he=he-&gt;next) {</a>
+<a name="ln336">        if (he-&gt;dev == dev &amp;&amp; he-&gt;bnum == bnum)</a>
+<a name="ln337">            break;</a>
+<a name="ln338">    }</a>
+<a name="ln339"> </a>
+<a name="ln340">    if (he)</a>
+<a name="ln341">        return he-&gt;data;</a>
+<a name="ln342">    else</a>
+<a name="ln343">        return NULL;</a>
+<a name="ln344">}</a>
+<a name="ln345"> </a>
+<a name="ln346"> </a>
+<a name="ln347">static void *</a>
+<a name="ln348">hash_delete(hash_table *ht, int dev, fs_off_t bnum)</a>
+<a name="ln349">{</a>
+<a name="ln350">    void     *data;</a>
+<a name="ln351">    fs_off_t     hash;</a>
+<a name="ln352">    hash_ent *he, *prev = NULL;</a>
+<a name="ln353"> </a>
+<a name="ln354">    hash = HASH(dev, bnum) &amp; ht-&gt;mask;</a>
+<a name="ln355">    he = ht-&gt;table[hash];</a>
+<a name="ln356"> </a>
+<a name="ln357">    for(; he != NULL; prev=he,he=he-&gt;next) {</a>
+<a name="ln358">        if (he-&gt;dev == dev &amp;&amp; he-&gt;bnum == bnum)</a>
+<a name="ln359">            break;</a>
+<a name="ln360">    }</a>
+<a name="ln361"> </a>
+<a name="ln362">    if (he == NULL) {</a>
+<a name="ln363">        printf(&quot;*** hash_delete: tried to delete non-existent block %d:%Ld\n&quot;,</a>
+<a name="ln364">               dev, bnum);</a>
+<a name="ln365">        return NULL;</a>
+<a name="ln366">    }</a>
+<a name="ln367"> </a>
+<a name="ln368">    data = he-&gt;data;</a>
+<a name="ln369"> </a>
+<a name="ln370">    if (ht-&gt;table[hash] == he)</a>
+<a name="ln371">        ht-&gt;table[hash] = he-&gt;next;</a>
+<a name="ln372">    else if (prev)</a>
+<a name="ln373">        prev-&gt;next = he-&gt;next;</a>
+<a name="ln374">    else</a>
+<a name="ln375">        beos_panic(&quot;hash table is inconsistent\n&quot;);</a>
+<a name="ln376"> </a>
+<a name="ln377">    free(he);</a>
+<a name="ln378">    ht-&gt;num_elements--;</a>
+<a name="ln379"> </a>
+<a name="ln380">    return data;</a>
+<a name="ln381">}</a>
+<a name="ln382"> </a>
+<a name="ln383">//	#pragma mark -</a>
+<a name="ln384"> </a>
+<a name="ln385">/*</a>
+<a name="ln386">  These are the global variables for the cache.</a>
+<a name="ln387">*/</a>
+<a name="ln388">static block_cache  bc;</a>
+<a name="ln389"> </a>
+<a name="ln390">#define       MAX_IOVECS  64           /* # of iovecs for use by cache code */</a>
+<a name="ln391">static beos_lock   iovec_lock;</a>
+<a name="ln392">static struct iovec *iovec_pool[MAX_IOVECS];  /* each ptr is to an array of iovecs */</a>
+<a name="ln393">static int    iovec_used[MAX_IOVECS];  /* non-zero == iovec is in use */</a>
+<a name="ln394"> </a>
+<a name="ln395">#define NUM_FLUSH_BLOCKS 64    /* size of the iovec array pointed by each ptr */</a>
+<a name="ln396"> </a>
+<a name="ln397"> </a>
+<a name="ln398">#define DEFAULT_READ_AHEAD_SIZE  (32 * 1024)</a>
+<a name="ln399">static int read_ahead_size = DEFAULT_READ_AHEAD_SIZE;</a>
+<a name="ln400"> </a>
+<a name="ln401">/* this array stores the size of each device so we can error check requests */</a>
+<a name="ln402">#define MAX_DEVICES  256</a>
+<a name="ln403">fs_off_t max_device_blocks[MAX_DEVICES];</a>
+<a name="ln404"> </a>
+<a name="ln405"> </a>
+<a name="ln406">/* has the time of the last cache access so cache flushing doesn't interfere */</a>
+<a name="ln407">static bigtime_t last_cache_access = 0;</a>
+<a name="ln408"> </a>
+<a name="ln409"> </a>
+<a name="ln410">int</a>
+<a name="ln411">beos_init_block_cache(int max_blocks, int flags)</a>
+<a name="ln412">{</a>
+<a name="ln413">    memset(&amp;bc, 0, sizeof(bc));</a>
+<a name="ln414">    memset(iovec_pool, 0, sizeof(iovec_pool));</a>
+<a name="ln415">    memset(iovec_used, 0, sizeof(iovec_used));</a>
+<a name="ln416">    memset(&amp;max_device_blocks, 0, sizeof(max_device_blocks));</a>
+<a name="ln417"> </a>
+<a name="ln418">    if (init_hash_table(&amp;bc.ht) != 0)</a>
+<a name="ln419">        return ENOMEM;</a>
+<a name="ln420"> </a>
+<a name="ln421">    bc.lock.s = iovec_lock.s = -1;</a>
+<a name="ln422"> </a>
+<a name="ln423">    bc.max_blocks = max_blocks;</a>
+<a name="ln424">    bc.flags      = flags;</a>
+<a name="ln425">    if (beos_new_lock(&amp;bc.lock, &quot;bollockcache&quot;) != 0)</a>
+<a name="ln426">        goto err;</a>
+<a name="ln427"> </a>
+<a name="ln428">    if (beos_new_lock(&amp;iovec_lock, &quot;iovec_lock&quot;) != 0)</a>
+<a name="ln429">        goto err;</a>
+<a name="ln430"> </a>
+<a name="ln431">    /* allocate two of these up front so vm won't accidently re-enter itself */</a>
+<a name="ln432">    iovec_pool[0] = (struct iovec *)malloc(sizeof(struct iovec)*NUM_FLUSH_BLOCKS);</a>
+<a name="ln433">    iovec_pool[1] = (struct iovec *)malloc(sizeof(struct iovec)*NUM_FLUSH_BLOCKS);</a>
+<a name="ln434"> </a>
+<a name="ln435">#ifndef USER</a>
+<a name="ln436">#ifdef DEBUG</a>
+<a name="ln437">    add_debugger_command(&quot;bcache&quot;, do_dump, &quot;dump the block cache list&quot;);</a>
+<a name="ln438">    add_debugger_command(&quot;fblock&quot;, do_find_block, &quot;find a block in the cache&quot;);</a>
+<a name="ln439">    add_debugger_command(&quot;fdata&quot;,  do_find_data, &quot;find a data block ptr in the cache&quot;);</a>
+<a name="ln440">#endif</a>
+<a name="ln441">    register_kernel_daemon(cache_flusher, NULL, 3);</a>
+<a name="ln442">#endif</a>
+<a name="ln443"> </a>
+<a name="ln444">    return 0;</a>
+<a name="ln445"> </a>
+<a name="ln446"> err:</a>
+<a name="ln447">    if (bc.lock.s &gt;= 0)</a>
+<a name="ln448">        beos_free_lock(&amp;bc.lock);</a>
+<a name="ln449"> </a>
+<a name="ln450">    if (iovec_lock.s &gt;= 0)</a>
+<a name="ln451">        beos_free_lock(&amp;iovec_lock);</a>
+<a name="ln452"> </a>
+<a name="ln453">    shutdown_hash_table(&amp;bc.ht);</a>
+<a name="ln454">    memset((void *)&amp;bc, 0, sizeof(bc));</a>
+<a name="ln455">    return ENOMEM;</a>
+<a name="ln456">}</a>
+<a name="ln457"> </a>
+<a name="ln458"> </a>
+<a name="ln459">static struct iovec *</a>
+<a name="ln460">get_iovec_array(void)</a>
+<a name="ln461">{</a>
+<a name="ln462">    int i;</a>
+<a name="ln463">    struct iovec *iov;</a>
+<a name="ln464"> </a>
+<a name="ln465">    LOCK(iovec_lock);</a>
+<a name="ln466"> </a>
+<a name="ln467">    for(i = 0; i &lt; MAX_IOVECS; i++) {</a>
+<a name="ln468">        if (iovec_used[i] == 0)</a>
+<a name="ln469">            break;</a>
+<a name="ln470">    }</a>
+<a name="ln471"> </a>
+<a name="ln472">    if (i &gt;= MAX_IOVECS)       /* uh-oh */</a>
+<a name="ln473">        beos_panic(&quot;cache: ran out of iovecs (pool 0x%x, used 0x%x)!\n&quot;,</a>
+<a name="ln474">              &amp;iovec_pool[0], &amp;iovec_used[0]);</a>
+<a name="ln475"> </a>
+<a name="ln476">    if (iovec_pool[i] == NULL) {</a>
+<a name="ln477">        iovec_pool[i] = (struct iovec *)malloc(sizeof(struct iovec)*NUM_FLUSH_BLOCKS);</a>
+<a name="ln478">        if (iovec_pool[i] == NULL)</a>
+<a name="ln479">            beos_panic(&quot;can't allocate an iovec!\n&quot;);</a>
+<a name="ln480">    }</a>
+<a name="ln481"> </a>
+<a name="ln482">    iov = iovec_pool[i];</a>
+<a name="ln483">    iovec_used[i] = 1;</a>
+<a name="ln484"> </a>
+<a name="ln485">    UNLOCK(iovec_lock);</a>
+<a name="ln486"> </a>
+<a name="ln487">    return iov;</a>
+<a name="ln488">}</a>
+<a name="ln489"> </a>
+<a name="ln490"> </a>
+<a name="ln491">static void</a>
+<a name="ln492">release_iovec_array(struct iovec *iov)</a>
+<a name="ln493">{</a>
+<a name="ln494">    int i;</a>
+<a name="ln495"> </a>
+<a name="ln496">    LOCK(iovec_lock);</a>
+<a name="ln497"> </a>
+<a name="ln498">    for(i=0; i &lt; MAX_IOVECS; i++) {</a>
+<a name="ln499">        if (iov == iovec_pool[i])</a>
+<a name="ln500">            break;</a>
+<a name="ln501">    }</a>
+<a name="ln502"> </a>
+<a name="ln503">    if (i &lt; MAX_IOVECS)</a>
+<a name="ln504">        iovec_used[i] = 0;</a>
+<a name="ln505">    else                     /* uh-oh */</a>
+<a name="ln506">        printf(&quot;cache: released an iovec I don't own (iov %p)\n&quot;, iov);</a>
+<a name="ln507"> </a>
+<a name="ln508"> </a>
+<a name="ln509">    UNLOCK(iovec_lock);</a>
+<a name="ln510">}</a>
+<a name="ln511"> </a>
+<a name="ln512"> </a>
+<a name="ln513"> </a>
+<a name="ln514"> </a>
+<a name="ln515">static void</a>
+<a name="ln516">real_dump_cache_list(cache_ent_list *cel)</a>
+<a name="ln517">{</a>
+<a name="ln518">    cache_ent *ce;</a>
+<a name="ln519"> </a>
+<a name="ln520">    kprintf(&quot;starting from LRU end:\n&quot;);</a>
+<a name="ln521"> </a>
+<a name="ln522">    for (ce = cel-&gt;lru; ce; ce = ce-&gt;next) {</a>
+<a name="ln523">        kprintf(&quot;ce %p dev %2d bnum %6Ld lock %d flag %d arg %p &quot;</a>
+<a name="ln524">               &quot;clone %p\n&quot;, ce, ce-&gt;dev, ce-&gt;block_num, ce-&gt;lock,</a>
+<a name="ln525">               ce-&gt;flags, ce-&gt;arg, ce-&gt;clone);</a>
+<a name="ln526">    }</a>
+<a name="ln527">    kprintf(&quot;MRU end\n&quot;);</a>
+<a name="ln528">}</a>
+<a name="ln529"> </a>
+<a name="ln530">static void</a>
+<a name="ln531">dump_cache_list(void)</a>
+<a name="ln532">{</a>
+<a name="ln533">    kprintf(&quot;NORMAL BLOCKS\n&quot;);</a>
+<a name="ln534">    real_dump_cache_list(&amp;bc.normal);</a>
+<a name="ln535"> </a>
+<a name="ln536">    kprintf(&quot;LOCKED BLOCKS\n&quot;);</a>
+<a name="ln537">    real_dump_cache_list(&amp;bc.locked);</a>
+<a name="ln538"> </a>
+<a name="ln539">    kprintf(&quot;cur blocks %d, max blocks %d ht @ %p\n&quot;, bc.cur_blocks,</a>
+<a name="ln540">           bc.max_blocks, &amp;bc.ht);</a>
+<a name="ln541">}</a>
+<a name="ln542"> </a>
+<a name="ln543">#if 0</a>
+<a name="ln544">static void</a>
+<a name="ln545">check_bcache(char *str)</a>
+<a name="ln546">{</a>
+<a name="ln547">    int count = 0;</a>
+<a name="ln548">    cache_ent *ce, *prev = NULL;</a>
+<a name="ln549"> </a>
+<a name="ln550">    LOCK(bc.lock);</a>
+<a name="ln551"> </a>
+<a name="ln552">    for(ce=bc.normal.lru; ce; prev=ce, ce=ce-&gt;next) {</a>
+<a name="ln553">        count++;</a>
+<a name="ln554">    }</a>
+<a name="ln555"> </a>
+<a name="ln556">    for(ce=bc.locked.lru; ce; prev=ce, ce=ce-&gt;next) {</a>
+<a name="ln557">        count++;</a>
+<a name="ln558">    }</a>
+<a name="ln559"> </a>
+<a name="ln560">    if (count != bc.cur_blocks) {</a>
+<a name="ln561">        if (count &lt; bc.cur_blocks - 16)</a>
+<a name="ln562">            beos_panic(&quot;%s: count == %d, cur_blocks %d, prev 0x%x\n&quot;,</a>
+<a name="ln563">                    str, count, bc.cur_blocks, prev);</a>
+<a name="ln564">        else</a>
+<a name="ln565">            printf(&quot;%s: count == %d, cur_blocks %d, prev 0x%x\n&quot;,</a>
+<a name="ln566">                    str, count, bc.cur_blocks, prev);</a>
+<a name="ln567">    }</a>
+<a name="ln568"> </a>
+<a name="ln569">    UNLOCK(bc.lock);</a>
+<a name="ln570">}</a>
+<a name="ln571"> </a>
+<a name="ln572"> </a>
+<a name="ln573">static void</a>
+<a name="ln574">dump_lists(void)</a>
+<a name="ln575">{</a>
+<a name="ln576">    cache_ent *nce;</a>
+<a name="ln577"> </a>
+<a name="ln578">    printf(&quot;LOCKED 0x%x  (tail 0x%x, head 0x%x)\n&quot;, &amp;bc.locked,</a>
+<a name="ln579">           bc.locked.lru, bc.locked.mru);</a>
+<a name="ln580">    for(nce=bc.locked.lru; nce; nce=nce-&gt;next)</a>
+<a name="ln581">        printf(&quot;nce @ 0x%x dev %d bnum %ld flags %d lock %d clone 0x%x func 0x%x\n&quot;,</a>
+<a name="ln582">               nce, nce-&gt;dev, nce-&gt;block_num, nce-&gt;flags, nce-&gt;lock, nce-&gt;clone,</a>
+<a name="ln583">               nce-&gt;func);</a>
+<a name="ln584"> </a>
+<a name="ln585">    printf(&quot;NORMAL 0x%x  (tail 0x%x, head 0x%x)\n&quot;, &amp;bc.normal,</a>
+<a name="ln586">           bc.normal.lru, bc.normal.mru);</a>
+<a name="ln587">    for(nce=bc.normal.lru; nce; nce=nce-&gt;next)</a>
+<a name="ln588">        printf(&quot;nce @ 0x%x dev %d bnum %ld flags %d lock %d clone 0x%x func 0x%x\n&quot;,</a>
+<a name="ln589">               nce, nce-&gt;dev, nce-&gt;block_num, nce-&gt;flags, nce-&gt;lock, nce-&gt;clone,</a>
+<a name="ln590">               nce-&gt;func);</a>
+<a name="ln591">}</a>
+<a name="ln592"> </a>
+<a name="ln593"> </a>
+<a name="ln594">static void</a>
+<a name="ln595">check_lists(void)</a>
+<a name="ln596">{</a>
+<a name="ln597">    cache_ent *ce, *prev, *oce;</a>
+<a name="ln598">    cache_ent_list *cel;</a>
+<a name="ln599"> </a>
+<a name="ln600">    cel = &amp;bc.normal;</a>
+<a name="ln601">    for(ce=cel-&gt;lru,prev=NULL; ce; prev=ce, ce=ce-&gt;next) {</a>
+<a name="ln602">        for(oce=bc.locked.lru; oce; oce=oce-&gt;next) {</a>
+<a name="ln603">            if (oce == ce) {</a>
+<a name="ln604">                dump_lists();</a>
+<a name="ln605">                beos_panic(&quot;1:ce @ 0x%x is in two lists(cel 0x%x &amp;LOCKED)\n&quot;,ce,cel);</a>
+<a name="ln606">            }</a>
+<a name="ln607">        }</a>
+<a name="ln608">    }</a>
+<a name="ln609">    if (prev &amp;&amp; prev != cel-&gt;mru) {</a>
+<a name="ln610">        dump_lists();</a>
+<a name="ln611">        beos_panic(&quot;*** last element in list != cel mru (ce 0x%x, cel 0x%x)\n&quot;,</a>
+<a name="ln612">              prev, cel);</a>
+<a name="ln613">    }</a>
+<a name="ln614"> </a>
+<a name="ln615">    cel = &amp;bc.locked;</a>
+<a name="ln616">    for(ce=cel-&gt;lru,prev=NULL; ce; prev=ce, ce=ce-&gt;next) {</a>
+<a name="ln617">        for(oce=bc.normal.lru; oce; oce=oce-&gt;next) {</a>
+<a name="ln618">            if (oce == ce) {</a>
+<a name="ln619">                dump_lists();</a>
+<a name="ln620">                beos_panic(&quot;3:ce @ 0x%x is in two lists(cel 0x%x &amp; DIRTY)\n&quot;,ce,cel);</a>
+<a name="ln621">            }</a>
+<a name="ln622">        }</a>
+<a name="ln623">    }</a>
+<a name="ln624">    if (prev &amp;&amp; prev != cel-&gt;mru) {</a>
+<a name="ln625">        dump_lists();</a>
+<a name="ln626">        beos_panic(&quot;*** last element in list != cel mru (ce 0x%x, cel 0x%x)\n&quot;,</a>
+<a name="ln627">              prev, cel);</a>
+<a name="ln628">    }</a>
+<a name="ln629">}</a>
+<a name="ln630">#endif</a>
+<a name="ln631"> </a>
+<a name="ln632"> </a>
+<a name="ln633">#ifdef DEBUG</a>
+<a name="ln634">#if 0</a>
+<a name="ln635">static int</a>
+<a name="ln636">do_dump(int argc, char **argv)</a>
+<a name="ln637">{</a>
+<a name="ln638">    dump_cache_list();</a>
+<a name="ln639">    return 1;</a>
+<a name="ln640">}</a>
+<a name="ln641"> </a>
+<a name="ln642"> </a>
+<a name="ln643">static int</a>
+<a name="ln644">do_find_block(int argc, char **argv)</a>
+<a name="ln645">{</a>
+<a name="ln646">    int        i;</a>
+<a name="ln647">    fs_off_t  bnum;</a>
+<a name="ln648">    cache_ent *ce;</a>
+<a name="ln649"> </a>
+<a name="ln650">    if (argc &lt; 2) {</a>
+<a name="ln651">        kprintf(&quot;%s: needs a block # argument\n&quot;, argv[0]);</a>
+<a name="ln652">        return 1;</a>
+<a name="ln653">    }</a>
+<a name="ln654"> </a>
+<a name="ln655">    for(i=1; i &lt; argc; i++) {</a>
+<a name="ln656">        bnum = strtoul(argv[i], NULL, 0);</a>
+<a name="ln657"> </a>
+<a name="ln658">        for(ce=bc.normal.lru; ce; ce=ce-&gt;next) {</a>
+<a name="ln659">            if (ce-&gt;block_num == bnum) {</a>
+<a name="ln660">                kprintf(&quot;found clean bnum %ld @ 0x%lx (data @ 0x%lx)\n&quot;,</a>
+<a name="ln661">                        bnum, ce, ce-&gt;data);</a>
+<a name="ln662">            }</a>
+<a name="ln663">        }</a>
+<a name="ln664"> </a>
+<a name="ln665">        for(ce=bc.locked.lru; ce; ce=ce-&gt;next) {</a>
+<a name="ln666">            if (ce-&gt;block_num == bnum) {</a>
+<a name="ln667">                kprintf(&quot;found locked bnum %ld @ 0x%lx (data @ 0x%lx)\n&quot;,</a>
+<a name="ln668">                        bnum, ce, ce-&gt;data);</a>
+<a name="ln669">            }</a>
+<a name="ln670">        }</a>
+<a name="ln671">    }</a>
+<a name="ln672"> </a>
+<a name="ln673">    return 0;</a>
+<a name="ln674">}</a>
+<a name="ln675"> </a>
+<a name="ln676">static int</a>
+<a name="ln677">do_find_data(int argc, char **argv)</a>
+<a name="ln678">{</a>
+<a name="ln679">    int        i;</a>
+<a name="ln680">    void      *data;</a>
+<a name="ln681">    cache_ent *ce;</a>
+<a name="ln682"> </a>
+<a name="ln683">    if (argc &lt; 2) {</a>
+<a name="ln684">        kprintf(&quot;%s: needs a block # argument\n&quot;, argv[0]);</a>
+<a name="ln685">        return 1;</a>
+<a name="ln686">    }</a>
+<a name="ln687"> </a>
+<a name="ln688">    for(i=1; i &lt; argc; i++) {</a>
+<a name="ln689">        data = (void *)strtoul(argv[i], NULL, 0);</a>
+<a name="ln690"> </a>
+<a name="ln691">        for(ce=bc.normal.lru; ce; ce=ce-&gt;next) {</a>
+<a name="ln692">            if (ce-&gt;data == data) {</a>
+<a name="ln693">                kprintf(&quot;found normal data ptr for bnum %ld @ ce 0x%lx\n&quot;,</a>
+<a name="ln694">                        ce-&gt;block_num, ce);</a>
+<a name="ln695">            }</a>
+<a name="ln696">        }</a>
+<a name="ln697"> </a>
+<a name="ln698">        for(ce=bc.locked.lru; ce; ce=ce-&gt;next) {</a>
+<a name="ln699">            if (ce-&gt;data == data) {</a>
+<a name="ln700">                kprintf(&quot;found locked data ptr for bnum %ld @ ce 0x%lx\n&quot;,</a>
+<a name="ln701">                        ce-&gt;block_num, ce);</a>
+<a name="ln702">            }</a>
+<a name="ln703">        }</a>
+<a name="ln704">    }</a>
+<a name="ln705"> </a>
+<a name="ln706">    return 0;</a>
+<a name="ln707">}</a>
+<a name="ln708">#endif</a>
+<a name="ln709">#endif /* DEBUG */</a>
+<a name="ln710"> </a>
+<a name="ln711"> </a>
+<a name="ln712"> </a>
+<a name="ln713">/*</a>
+<a name="ln714">  this function detaches the cache_ent from the list.</a>
+<a name="ln715">*/</a>
+<a name="ln716">static void</a>
+<a name="ln717">delete_from_list(cache_ent_list *cel, cache_ent *ce)</a>
+<a name="ln718">{</a>
+<a name="ln719">    if (ce-&gt;next)</a>
+<a name="ln720">        ce-&gt;next-&gt;prev = ce-&gt;prev;</a>
+<a name="ln721">    if (ce-&gt;prev)</a>
+<a name="ln722">        ce-&gt;prev-&gt;next = ce-&gt;next;</a>
+<a name="ln723"> </a>
+<a name="ln724">    if (cel-&gt;lru == ce)</a>
+<a name="ln725">        cel-&gt;lru = ce-&gt;next;</a>
+<a name="ln726">    if (cel-&gt;mru == ce)</a>
+<a name="ln727">        cel-&gt;mru = ce-&gt;prev;</a>
+<a name="ln728"> </a>
+<a name="ln729">    ce-&gt;next = NULL;</a>
+<a name="ln730">    ce-&gt;prev = NULL;</a>
+<a name="ln731">}</a>
+<a name="ln732"> </a>
+<a name="ln733"> </a>
+<a name="ln734"> </a>
+<a name="ln735">/*</a>
+<a name="ln736">  this function adds the cache_ent ce to the head of the</a>
+<a name="ln737">  list (i.e. the MRU end).  the cache_ent should *not*</a>
+<a name="ln738">  be in any lists.</a>
+<a name="ln739">*/</a>
+<a name="ln740">static void</a>
+<a name="ln741">add_to_head(cache_ent_list *cel, cache_ent *ce)</a>
+<a name="ln742">{</a>
+<a name="ln743">if (ce-&gt;next != NULL || ce-&gt;prev != NULL) {</a>
+<a name="ln744">    beos_panic(&quot;*** ath: ce has non-null next/prev ptr (ce 0x%x nxt 0x%x, prv 0x%x)\n&quot;,</a>
+<a name="ln745">           ce, ce-&gt;next, ce-&gt;prev);</a>
+<a name="ln746">}</a>
+<a name="ln747"> </a>
+<a name="ln748">    ce-&gt;next = NULL;</a>
+<a name="ln749">    ce-&gt;prev = cel-&gt;mru;</a>
+<a name="ln750"> </a>
+<a name="ln751">    if (cel-&gt;mru)</a>
+<a name="ln752">        cel-&gt;mru-&gt;next = ce;</a>
+<a name="ln753">    cel-&gt;mru = ce;</a>
+<a name="ln754"> </a>
+<a name="ln755">    if (cel-&gt;lru == NULL)</a>
+<a name="ln756">        cel-&gt;lru = ce;</a>
+<a name="ln757">}</a>
+<a name="ln758"> </a>
+<a name="ln759"> </a>
+<a name="ln760">/*</a>
+<a name="ln761">  this function adds the cache_ent ce to the tail of the</a>
+<a name="ln762">  list (i.e. the MRU end).  the cache_ent should *not*</a>
+<a name="ln763">  be in any lists.</a>
+<a name="ln764">*/</a>
+<a name="ln765">static void</a>
+<a name="ln766">add_to_tail(cache_ent_list *cel, cache_ent *ce)</a>
+<a name="ln767">{</a>
+<a name="ln768">if (ce-&gt;next != NULL || ce-&gt;prev != NULL) {</a>
+<a name="ln769">    beos_panic(&quot;*** att: ce has non-null next/prev ptr (ce 0x%x nxt 0x%x, prv 0x%x)\n&quot;,</a>
+<a name="ln770">           ce, ce-&gt;next, ce-&gt;prev);</a>
+<a name="ln771">}</a>
+<a name="ln772"> </a>
+<a name="ln773">    ce-&gt;next = cel-&gt;lru;</a>
+<a name="ln774">    ce-&gt;prev = NULL;</a>
+<a name="ln775"> </a>
+<a name="ln776">    if (cel-&gt;lru)</a>
+<a name="ln777">        cel-&gt;lru-&gt;prev = ce;</a>
+<a name="ln778">    cel-&gt;lru = ce;</a>
+<a name="ln779"> </a>
+<a name="ln780">    if (cel-&gt;mru == NULL)</a>
+<a name="ln781">        cel-&gt;mru = ce;</a>
+<a name="ln782">}</a>
+<a name="ln783"> </a>
+<a name="ln784"> </a>
+<a name="ln785">static int</a>
+<a name="ln786">cache_ent_cmp(const void *a, const void *b)</a>
+<a name="ln787">{</a>
+<a name="ln788">    fs_off_t  diff;</a>
+<a name="ln789">    cache_ent *p1 = *(cache_ent **)a, *p2 = *(cache_ent **)b;</a>
+<a name="ln790"> </a>
+<a name="ln791">    if (p1 == NULL || p2 == NULL)</a>
+<a name="ln792">        beos_panic(&quot;cache_ent pointers are null?!? (a 0x%lx, b 0x%lx\n)\n&quot;, a, b);</a>
+<a name="ln793"> </a>
+<a name="ln794">    if (p1-&gt;dev == p2-&gt;dev) {</a>
+<a name="ln795">        diff = p1-&gt;block_num - p2-&gt;block_num;</a>
+<a name="ln796">        return (int)diff;</a>
+<a name="ln797">    } else {</a>
+<a name="ln798">        return p1-&gt;dev - p2-&gt;dev;</a>
+<a name="ln799">    }</a>
+<a name="ln800">}</a>
+<a name="ln801"> </a>
+<a name="ln802">#if 0</a>
+<a name="ln803">// ToDo: add this to the fsh (as a background thread)?</a>
+<a name="ln804">static void</a>
+<a name="ln805">cache_flusher(void *arg, int phase)</a>
+<a name="ln806">{</a>
+<a name="ln807">    int    i, num_ents, err;</a>
+<a name="ln808">    bigtime_t now = system_time();</a>
+<a name="ln809">    static cache_ent *ce = NULL;</a>
+<a name="ln810">    static cache_ent *ents[NUM_FLUSH_BLOCKS];</a>
+<a name="ln811"> </a>
+<a name="ln812">    /*</a>
+<a name="ln813">       if someone else was in the cache recently then just bail out so</a>
+<a name="ln814">       we don't lock them out unnecessarily</a>
+<a name="ln815">    */</a>
+<a name="ln816">    if ((now - last_cache_access) &lt; 1000000)</a>
+<a name="ln817">        return;</a>
+<a name="ln818"> </a>
+<a name="ln819">    LOCK(bc.lock);</a>
+<a name="ln820"> </a>
+<a name="ln821">    ce = bc.normal.lru;</a>
+<a name="ln822"> </a>
+<a name="ln823">    for(num_ents=0; ce &amp;&amp; num_ents &lt; NUM_FLUSH_BLOCKS; ce=ce-&gt;next) {</a>
+<a name="ln824">        if (ce-&gt;flags &amp; CE_BUSY)</a>
+<a name="ln825">            continue;</a>
+<a name="ln826"> </a>
+<a name="ln827">        if ((ce-&gt;flags &amp; CE_DIRTY) == 0 &amp;&amp; ce-&gt;clone == NULL)</a>
+<a name="ln828">            continue;</a>
+<a name="ln829"> </a>
+<a name="ln830">        ents[num_ents] = ce;</a>
+<a name="ln831">        ents[num_ents]-&gt;flags |= CE_BUSY;</a>
+<a name="ln832">        num_ents++;</a>
+<a name="ln833">    }</a>
+<a name="ln834"> </a>
+<a name="ln835">    /* if we've got some room left over, look for cloned locked blocks */</a>
+<a name="ln836">    if (num_ents &lt; NUM_FLUSH_BLOCKS) {</a>
+<a name="ln837">        ce = bc.locked.lru;</a>
+<a name="ln838"> </a>
+<a name="ln839">        for(; num_ents &lt; NUM_FLUSH_BLOCKS;) {</a>
+<a name="ln840">            for(;</a>
+<a name="ln841">                ce &amp;&amp; ((ce-&gt;flags &amp; CE_BUSY) || ce-&gt;clone == NULL);</a>
+<a name="ln842">                ce=ce-&gt;next)</a>
+<a name="ln843">                /* skip ents that meet the above criteria */;</a>
+<a name="ln844"> </a>
+<a name="ln845">            if (ce == NULL)</a>
+<a name="ln846">                break;</a>
+<a name="ln847"> </a>
+<a name="ln848">            ents[num_ents] = ce;</a>
+<a name="ln849">            ents[num_ents]-&gt;flags |= CE_BUSY;</a>
+<a name="ln850">            ce = ce-&gt;next;</a>
+<a name="ln851">            num_ents++;</a>
+<a name="ln852">        }</a>
+<a name="ln853">    }</a>
+<a name="ln854"> </a>
+<a name="ln855">    UNLOCK(bc.lock);</a>
+<a name="ln856"> </a>
+<a name="ln857">    if (num_ents == 0)</a>
+<a name="ln858">        return;</a>
+<a name="ln859"> </a>
+<a name="ln860">    qsort(ents, num_ents, sizeof(cache_ent **), cache_ent_cmp);</a>
+<a name="ln861"> </a>
+<a name="ln862">    if ((err = flush_ents(ents, num_ents)) != 0) {</a>
+<a name="ln863">        printf(&quot;flush ents failed (ents @ 0x%lx, num_ents %d!\n&quot;,</a>
+<a name="ln864">               (ulong)ents, num_ents);</a>
+<a name="ln865">    }</a>
+<a name="ln866"> </a>
+<a name="ln867">    for(i=0; i &lt; num_ents; i++) {       /* clear the busy bit on each of ent */</a>
+<a name="ln868">        ents[i]-&gt;flags &amp;= ~CE_BUSY;</a>
+<a name="ln869">    }</a>
+<a name="ln870">}</a>
+<a name="ln871">#endif</a>
+<a name="ln872"> </a>
+<a name="ln873"> </a>
+<a name="ln874">static int</a>
+<a name="ln875">flush_cache_ent(cache_ent *ce)</a>
+<a name="ln876">{</a>
+<a name="ln877">    int   ret = 0;</a>
+<a name="ln878">    void *data;</a>
+<a name="ln879"> </a>
+<a name="ln880">    /* if true, then there's nothing to flush */</a>
+<a name="ln881">    if ((ce-&gt;flags &amp; CE_DIRTY) == 0 &amp;&amp; ce-&gt;clone == NULL)</a>
+<a name="ln882">        return 0;</a>
+<a name="ln883"> </a>
+<a name="ln884">    /* same thing here */</a>
+<a name="ln885">    if (ce-&gt;clone == NULL &amp;&amp; ce-&gt;lock != 0)</a>
+<a name="ln886">        return 0;</a>
+<a name="ln887"> </a>
+<a name="ln888"> restart:</a>
+<a name="ln889">	if (ce-&gt;clone)</a>
+<a name="ln890">		data = ce-&gt;clone;</a>
+<a name="ln891">	else</a>
+<a name="ln892">		data = ce-&gt;data;</a>
+<a name="ln893"> </a>
+<a name="ln894">	if (chatty_io &gt; 2) printf(&quot;flush: %7Ld\n&quot;, ce-&gt;block_num);</a>
+<a name="ln895">	ret = beos_write_phys_blocks(ce-&gt;dev, ce-&gt;block_num, data, 1, ce-&gt;bsize);</a>
+<a name="ln896"> </a>
+<a name="ln897">    if (ce-&gt;func) {</a>
+<a name="ln898">        ce-&gt;func(ce-&gt;logged_bnum, 1, ce-&gt;arg);</a>
+<a name="ln899">        ce-&gt;func = NULL;</a>
+<a name="ln900">    }</a>
+<a name="ln901"> </a>
+<a name="ln902">    if (ce-&gt;clone) {</a>
+<a name="ln903">        free(ce-&gt;clone);</a>
+<a name="ln904">        ce-&gt;clone = NULL;</a>
+<a name="ln905"> </a>
+<a name="ln906">        if (ce-&gt;lock == 0 &amp;&amp; (ce-&gt;flags &amp; CE_DIRTY))</a>
+<a name="ln907">            goto restart;     /* also write the real data ptr */</a>
+<a name="ln908">    } else {</a>
+<a name="ln909">        ce-&gt;flags &amp;= ~CE_DIRTY;</a>
+<a name="ln910">    }</a>
+<a name="ln911"> </a>
+<a name="ln912">    return ret;</a>
+<a name="ln913">}</a>
+<a name="ln914"> </a>
+<a name="ln915"> </a>
+<a name="ln916">static int</a>
+<a name="ln917">flush_ents(cache_ent **ents, int n_ents)</a>
+<a name="ln918">{</a>
+<a name="ln919">    int    i, j, k, ret = 0, bsize, iocnt, do_again = 0;</a>
+<a name="ln920">    fs_off_t  start_bnum;</a>
+<a name="ln921">    struct iovec *iov;</a>
+<a name="ln922"> </a>
+<a name="ln923">    iov = get_iovec_array();</a>
+<a name="ln924">    if (iov == NULL)</a>
+<a name="ln925">        return ENOMEM;</a>
+<a name="ln926"> </a>
+<a name="ln927">restart:</a>
+<a name="ln928">    for(i=0; i &lt; n_ents; i++) {</a>
+<a name="ln929">        /* if true, then there's nothing to flush */</a>
+<a name="ln930">        if ((ents[i]-&gt;flags &amp; CE_DIRTY) == 0 &amp;&amp; ents[i]-&gt;clone == NULL)</a>
+<a name="ln931">            continue;</a>
+<a name="ln932"> </a>
+<a name="ln933">        /* if true we can't touch the dirty data yet because it's locked */</a>
+<a name="ln934">        if (ents[i]-&gt;clone == NULL &amp;&amp; ents[i]-&gt;lock != 0)</a>
+<a name="ln935">            continue;</a>
+<a name="ln936"> </a>
+<a name="ln937"> </a>
+<a name="ln938">        bsize      = ents[i]-&gt;bsize;</a>
+<a name="ln939">        start_bnum = ents[i]-&gt;block_num;</a>
+<a name="ln940"> </a>
+<a name="ln941">        for(j=i+1; j &lt; n_ents &amp;&amp; (j - i) &lt; NUM_FLUSH_BLOCKS; j++) {</a>
+<a name="ln942">            if (ents[j]-&gt;dev != ents[i]-&gt;dev ||</a>
+<a name="ln943">                ents[j]-&gt;block_num != start_bnum + (j - i))</a>
+<a name="ln944">                break;</a>
+<a name="ln945"> </a>
+<a name="ln946">            if (ents[j]-&gt;clone == NULL &amp;&amp; ents[j]-&gt;lock != 0)</a>
+<a name="ln947">                break;</a>
+<a name="ln948">        }</a>
+<a name="ln949"> </a>
+<a name="ln950">        if (j == i+1) {           /* only one block, just flush it directly */</a>
+<a name="ln951">            if ((ret = flush_cache_ent(ents[i])) != 0)</a>
+<a name="ln952">                break;</a>
+<a name="ln953">            continue;</a>
+<a name="ln954">        }</a>
+<a name="ln955"> </a>
+<a name="ln956"> </a>
+<a name="ln957">        for(k=i,iocnt=0; k &lt; j; k++,iocnt++) {</a>
+<a name="ln958">            if (ents[k]-&gt;clone)</a>
+<a name="ln959">                iov[iocnt].iov_base = ents[k]-&gt;clone;</a>
+<a name="ln960">            else</a>
+<a name="ln961">                iov[iocnt].iov_base = ents[k]-&gt;data;</a>
+<a name="ln962"> </a>
+<a name="ln963">            iov[iocnt].iov_len = bsize;</a>
+<a name="ln964">        }</a>
+<a name="ln965"> </a>
+<a name="ln966">		if (chatty_io)</a>
+<a name="ln967">	        printf(&quot;writev @ %Ld for %d blocks\n&quot;, start_bnum, iocnt);</a>
+<a name="ln968"> </a>
+<a name="ln969">        ret = writev_pos(ents[i]-&gt;dev, start_bnum * (fs_off_t)bsize,</a>
+<a name="ln970">                         &amp;iov[0], iocnt);</a>
+<a name="ln971">        if (ret != iocnt*bsize) {</a>
+<a name="ln972">            int idx;</a>
+<a name="ln973"> </a>
+<a name="ln974">            printf(&quot;flush_ents: writev failed: iocnt %d start bnum %Ld &quot;</a>
+<a name="ln975">                   &quot;bsize %d, ret %d\n&quot;, iocnt, start_bnum, bsize, ret);</a>
+<a name="ln976"> </a>
+<a name="ln977">            for(idx=0; idx &lt; iocnt; idx++)</a>
+<a name="ln978">                printf(&quot;iov[%2d] = %p :: %ld\n&quot;, idx, iov[idx].iov_base,</a>
+<a name="ln979">                       iov[idx].iov_len);</a>
+<a name="ln980"> </a>
+<a name="ln981">            printf(&quot;error %s writing blocks %Ld:%d (%d != %d)\n&quot;,</a>
+<a name="ln982">                   strerror(errno), start_bnum, iocnt, ret, iocnt*bsize);</a>
+<a name="ln983">            ret = EINVAL;</a>
+<a name="ln984">            break;</a>
+<a name="ln985">        }</a>
+<a name="ln986">        ret = 0;</a>
+<a name="ln987"> </a>
+<a name="ln988"> </a>
+<a name="ln989">        for(k=i; k &lt; j; k++) {</a>
+<a name="ln990">            if (ents[k]-&gt;func) {</a>
+<a name="ln991">                ents[k]-&gt;func(ents[k]-&gt;logged_bnum, 1, ents[k]-&gt;arg);</a>
+<a name="ln992">                ents[k]-&gt;func = NULL;</a>
+<a name="ln993">            }</a>
+<a name="ln994"> </a>
+<a name="ln995">            if (ents[k]-&gt;clone) {</a>
+<a name="ln996">                free(ents[k]-&gt;clone);</a>
+<a name="ln997">                ents[k]-&gt;clone = NULL;</a>
+<a name="ln998">            } else {</a>
+<a name="ln999">                ents[k]-&gt;flags &amp;= ~CE_DIRTY;</a>
+<a name="ln1000">            }</a>
+<a name="ln1001">        }</a>
+<a name="ln1002"> </a>
+<a name="ln1003"> </a>
+<a name="ln1004">        i = j - 1;  /* i gets incremented by the outer for loop */</a>
+<a name="ln1005">    }</a>
+<a name="ln1006"> </a>
+<a name="ln1007">    /*</a>
+<a name="ln1008">       here we have to go back through and flush any blocks that are</a>
+<a name="ln1009">       still dirty.  with an arched brow you astutely ask, &quot;but how</a>
+<a name="ln1010">       could this happen given the above loop?&quot;  Ahhh young grasshopper</a>
+<a name="ln1011">       I say, the path through the cache is long and twisty and fraught</a>
+<a name="ln1012">       with peril.  The reason it can happen is that a block can be both</a>
+<a name="ln1013">       cloned and dirty.  The above loop would only flush the cloned half</a>
+<a name="ln1014">       of the data, not the main dirty block.  So we have to go back</a>
+<a name="ln1015">       through and see if there are any blocks that are still dirty.  If</a>
+<a name="ln1016">       there are we go back to the top of the function and do the whole</a>
+<a name="ln1017">       thing over.  Kind of grody but it is necessary to insure the</a>
+<a name="ln1018">       correctness of the log for the Be file system.</a>
+<a name="ln1019">    */</a>
+<a name="ln1020">    if (do_again == 0) {</a>
+<a name="ln1021">        for(i=0; i &lt; n_ents; i++) {</a>
+<a name="ln1022">            if ((ents[i]-&gt;flags &amp; CE_DIRTY) == 0 || ents[i]-&gt;lock)</a>
+<a name="ln1023">                continue;</a>
+<a name="ln1024"> </a>
+<a name="ln1025">            do_again = 1;</a>
+<a name="ln1026">            break;</a>
+<a name="ln1027">        }</a>
+<a name="ln1028"> </a>
+<a name="ln1029">        if (do_again)</a>
+<a name="ln1030">            goto restart;</a>
+<a name="ln1031">    }</a>
+<a name="ln1032"> </a>
+<a name="ln1033">    release_iovec_array(iov);</a>
+<a name="ln1034"> </a>
+<a name="ln1035"> </a>
+<a name="ln1036">    return ret;</a>
+<a name="ln1037">}</a>
+<a name="ln1038"> </a>
+<a name="ln1039">static void</a>
+<a name="ln1040">delete_cache_list(cache_ent_list *cel)</a>
+<a name="ln1041">{</a>
+<a name="ln1042">    void      *junk;</a>
+<a name="ln1043">    cache_ent *ce, *next;</a>
+<a name="ln1044"> </a>
+<a name="ln1045">    for (ce = cel-&gt;lru; ce; ce = next) {</a>
+<a name="ln1046">        next = ce-&gt;next;</a>
+<a name="ln1047">        if (ce-&gt;lock != 0) {</a>
+<a name="ln1048">            if (ce-&gt;func)</a>
+<a name="ln1049">                printf(&quot;*** shutdown_block_cache: block %Ld, lock == %d &quot;</a>
+<a name="ln1050">                       &quot;(arg %p)!\n&quot;, ce-&gt;block_num, ce-&gt;lock, ce-&gt;arg);</a>
+<a name="ln1051">            else</a>
+<a name="ln1052">                printf(&quot;*** shutdown_block_cache: block %Ld, lock == %d!\n&quot;,</a>
+<a name="ln1053">                       ce-&gt;block_num, ce-&gt;lock);</a>
+<a name="ln1054">        }</a>
+<a name="ln1055"> </a>
+<a name="ln1056">        if (ce-&gt;flags &amp; CE_BUSY) {</a>
+<a name="ln1057">            printf(&quot;* shutdown block cache: bnum %Ld is busy? ce %p\n&quot;,</a>
+<a name="ln1058">                   ce-&gt;block_num, ce);</a>
+<a name="ln1059">        }</a>
+<a name="ln1060"> </a>
+<a name="ln1061">        if ((ce-&gt;flags &amp; CE_DIRTY) || ce-&gt;clone) {</a>
+<a name="ln1062">            flush_cache_ent(ce);</a>
+<a name="ln1063">        }</a>
+<a name="ln1064"> </a>
+<a name="ln1065">        if (ce-&gt;clone)</a>
+<a name="ln1066">            free(ce-&gt;clone);</a>
+<a name="ln1067">        ce-&gt;clone = NULL;</a>
+<a name="ln1068"> </a>
+<a name="ln1069">        if (ce-&gt;data)</a>
+<a name="ln1070">            free(ce-&gt;data);</a>
+<a name="ln1071">        ce-&gt;data = NULL;</a>
+<a name="ln1072"> </a>
+<a name="ln1073">        if ((junk = hash_delete(&amp;bc.ht, ce-&gt;dev, ce-&gt;block_num)) != ce) {</a>
+<a name="ln1074">            printf(&quot;*** free_device_cache: bad hash table entry %Ld &quot;</a>
+<a name="ln1075">                   &quot;%p != %p\n&quot;, ce-&gt;block_num, junk, ce);</a>
+<a name="ln1076">        }</a>
+<a name="ln1077"> </a>
+<a name="ln1078">        memset(ce, 0xfd, sizeof(*ce));</a>
+<a name="ln1079">        free(ce);</a>
+<a name="ln1080"> </a>
+<a name="ln1081">        bc.cur_blocks--;</a>
+<a name="ln1082">    }</a>
+<a name="ln1083">}</a>
+<a name="ln1084"> </a>
+<a name="ln1085"> </a>
+<a name="ln1086">void</a>
+<a name="ln1087">beos_shutdown_block_cache(void)</a>
+<a name="ln1088">{</a>
+<a name="ln1089">    /* print_hash_stats(&amp;bc.ht); */</a>
+<a name="ln1090"> </a>
+<a name="ln1091">    if (bc.lock.s &gt; 0)</a>
+<a name="ln1092">        LOCK(bc.lock);</a>
+<a name="ln1093"> </a>
+<a name="ln1094">#ifndef USER</a>
+<a name="ln1095">    unregister_kernel_daemon(cache_flusher, NULL);</a>
+<a name="ln1096">#endif</a>
+<a name="ln1097"> </a>
+<a name="ln1098">    delete_cache_list(&amp;bc.normal);</a>
+<a name="ln1099">    delete_cache_list(&amp;bc.locked);</a>
+<a name="ln1100"> </a>
+<a name="ln1101">    bc.normal.lru = bc.normal.mru = NULL;</a>
+<a name="ln1102">    bc.locked.lru = bc.locked.mru = NULL;</a>
+<a name="ln1103"> </a>
+<a name="ln1104">    shutdown_hash_table(&amp;bc.ht);</a>
+<a name="ln1105"> </a>
+<a name="ln1106">    if (bc.lock.s &gt; 0)</a>
+<a name="ln1107">        beos_free_lock(&amp;bc.lock);</a>
+<a name="ln1108">    bc.lock.s = -1;</a>
+<a name="ln1109"> </a>
+<a name="ln1110">    if (iovec_lock.s &gt;= 0)</a>
+<a name="ln1111">        beos_free_lock(&amp;iovec_lock);</a>
+<a name="ln1112">}</a>
+<a name="ln1113"> </a>
+<a name="ln1114"> </a>
+<a name="ln1115"> </a>
+<a name="ln1116">int</a>
+<a name="ln1117">beos_init_cache_for_device(int fd, fs_off_t max_blocks)</a>
+<a name="ln1118">{</a>
+<a name="ln1119">    int ret = 0;</a>
+<a name="ln1120"> </a>
+<a name="ln1121">    if (fd &gt;= MAX_DEVICES)</a>
+<a name="ln1122">        return -1;</a>
+<a name="ln1123"> </a>
+<a name="ln1124">    LOCK(bc.lock);</a>
+<a name="ln1125"> </a>
+<a name="ln1126">    if (max_device_blocks[fd] != 0) {</a>
+<a name="ln1127">        printf(&quot;device %d is already initialized!\n&quot;, fd);</a>
+<a name="ln1128">        ret = -1;</a>
+<a name="ln1129">    } else {</a>
+<a name="ln1130">        max_device_blocks[fd] = max_blocks;</a>
+<a name="ln1131">    }</a>
+<a name="ln1132"> </a>
+<a name="ln1133">    UNLOCK(bc.lock);</a>
+<a name="ln1134"> </a>
+<a name="ln1135">    return ret;</a>
+<a name="ln1136">}</a>
+<a name="ln1137"> </a>
+<a name="ln1138"> </a>
+<a name="ln1139"> </a>
+<a name="ln1140">/*</a>
+<a name="ln1141">   this routine assumes that bc.lock has been acquired</a>
+<a name="ln1142">*/</a>
+<a name="ln1143">static cache_ent *</a>
+<a name="ln1144">block_lookup(int dev, fs_off_t bnum)</a>
+<a name="ln1145">{</a>
+<a name="ln1146">    int        count = 0;</a>
+<a name="ln1147">    cache_ent *ce;</a>
+<a name="ln1148"> </a>
+<a name="ln1149">    while (1) {</a>
+<a name="ln1150">        ce = hash_lookup(&amp;bc.ht, dev, bnum);</a>
+<a name="ln1151">        if (ce == NULL)</a>
+<a name="ln1152">            return NULL;</a>
+<a name="ln1153"> </a>
+<a name="ln1154">        if ((ce-&gt;flags &amp; CE_BUSY) == 0) /* it's ok, break out and return it */</a>
+<a name="ln1155">            break;</a>
+<a name="ln1156"> </a>
+<a name="ln1157">        /* else, it's busy and we need to retry our lookup */</a>
+<a name="ln1158">        UNLOCK(bc.lock);</a>
+<a name="ln1159"> </a>
+<a name="ln1160">        snooze(5000);</a>
+<a name="ln1161">        if (count++ == 5000) {  /* then a lot of time has elapsed */</a>
+<a name="ln1162">            printf(&quot;block %Ld isn't coming un-busy (ce @ %p)\n&quot;,</a>
+<a name="ln1163">                   ce-&gt;block_num, ce);</a>
+<a name="ln1164">        }</a>
+<a name="ln1165"> </a>
+<a name="ln1166">        LOCK(bc.lock);</a>
+<a name="ln1167">    }</a>
+<a name="ln1168"> </a>
+<a name="ln1169">    if (ce-&gt;flags &amp; CE_BUSY)</a>
+<a name="ln1170">        beos_panic(&quot;block lookup: returning a busy block @ 0x%lx?!?\n&quot;,(ulong)ce);</a>
+<a name="ln1171"> </a>
+<a name="ln1172">    return ce;</a>
+<a name="ln1173">}</a>
+<a name="ln1174"> </a>
+<a name="ln1175"> </a>
+<a name="ln1176"> </a>
+<a name="ln1177">int</a>
+<a name="ln1178">beos_set_blocks_info(int dev, fs_off_t *blocks, int nblocks,</a>
+<a name="ln1179">               void (*func)(fs_off_t bnum, size_t nblocks, void *arg), void *arg)</a>
+<a name="ln1180">{</a>
+<a name="ln1181">    int        i, j, cur;</a>
+<a name="ln1182">    cache_ent *ce;</a>
+<a name="ln1183">    cache_ent *ents[NUM_FLUSH_BLOCKS];</a>
+<a name="ln1184"> </a>
+<a name="ln1185">    LOCK(bc.lock);</a>
+<a name="ln1186"> </a>
+<a name="ln1187"> </a>
+<a name="ln1188">    for(i=0, cur=0; i &lt; nblocks; i++) {</a>
+<a name="ln1189"> </a>
+<a name="ln1190">        /* printf(&quot;sbi:   %ld (arg 0x%x)\n&quot;, blocks[i], arg); */</a>
+<a name="ln1191">        ce = block_lookup(dev, blocks[i]);</a>
+<a name="ln1192">        if (ce == NULL) {</a>
+<a name="ln1193">            beos_panic(&quot;*** set_block_info can't find bnum %ld!\n&quot;, blocks[i]);</a>
+<a name="ln1194">            UNLOCK(bc.lock);</a>
+<a name="ln1195">            return ENOENT;   /* hopefully this doesn't happen... */</a>
+<a name="ln1196">        }</a>
+<a name="ln1197"> </a>
+<a name="ln1198"> </a>
+<a name="ln1199">        if (blocks[i] != ce-&gt;block_num || dev != ce-&gt;dev) {</a>
+<a name="ln1200">            UNLOCK(bc.lock);</a>
+<a name="ln1201">            beos_panic(&quot;** error1: looked up dev %d block %ld but found dev %d &quot;</a>
+<a name="ln1202">                    &quot;bnum %ld\n&quot;, dev, blocks[i], ce-&gt;dev, ce-&gt;block_num);</a>
+<a name="ln1203">            return EBADF;</a>
+<a name="ln1204">        }</a>
+<a name="ln1205"> </a>
+<a name="ln1206">        if (ce-&gt;lock == 0) {</a>
+<a name="ln1207">            beos_panic(&quot;* set_block_info on bnum %ld (%d) but it's not locked!\n&quot;,</a>
+<a name="ln1208">                    blocks[i], nblocks);</a>
+<a name="ln1209">        }</a>
+<a name="ln1210"> </a>
+<a name="ln1211"> </a>
+<a name="ln1212">        if ((ce-&gt;flags &amp; CE_DIRTY) == 0) {</a>
+<a name="ln1213">            beos_panic(&quot;*** set_block_info on non-dirty block bnum %ld (%d)!\n&quot;,</a>
+<a name="ln1214">                    blocks[i], nblocks);</a>
+<a name="ln1215">        }</a>
+<a name="ln1216"> </a>
+<a name="ln1217">        ce-&gt;flags |= CE_BUSY;     /* mark all blocks as busy till we're done */</a>
+<a name="ln1218"> </a>
+<a name="ln1219">        /* if there is cloned data, it needs to be flushed now */</a>
+<a name="ln1220">        if (ce-&gt;clone &amp;&amp; ce-&gt;func) {</a>
+<a name="ln1221">            ents[cur++] = ce;</a>
+<a name="ln1222"> </a>
+<a name="ln1223">            if (cur &gt;= NUM_FLUSH_BLOCKS) {</a>
+<a name="ln1224">                UNLOCK(bc.lock);</a>
+<a name="ln1225"> </a>
+<a name="ln1226">                qsort(ents, cur, sizeof(cache_ent **), cache_ent_cmp);</a>
+<a name="ln1227"> </a>
+<a name="ln1228">                flush_ents(ents, cur);</a>
+<a name="ln1229"> </a>
+<a name="ln1230">                LOCK(bc.lock);</a>
+<a name="ln1231">                for(j=0; j &lt; cur; j++)</a>
+<a name="ln1232">                    ents[j]-&gt;flags &amp;= ~CE_BUSY;</a>
+<a name="ln1233">                cur = 0;</a>
+<a name="ln1234">            }</a>
+<a name="ln1235">        }</a>
+<a name="ln1236">    }</a>
+<a name="ln1237"> </a>
+<a name="ln1238"> </a>
+<a name="ln1239">    if (cur != 0) {</a>
+<a name="ln1240">        UNLOCK(bc.lock);</a>
+<a name="ln1241"> </a>
+<a name="ln1242">        qsort(ents, cur, sizeof(cache_ent **), cache_ent_cmp);</a>
+<a name="ln1243"> </a>
+<a name="ln1244">        flush_ents(ents, cur);</a>
+<a name="ln1245"> </a>
+<a name="ln1246">        LOCK(bc.lock);</a>
+<a name="ln1247">        for(j=0; j &lt; cur; j++)</a>
+<a name="ln1248">            ents[j]-&gt;flags &amp;= ~CE_BUSY;</a>
+<a name="ln1249">        cur = 0;</a>
+<a name="ln1250">    }</a>
+<a name="ln1251"> </a>
+<a name="ln1252"> </a>
+<a name="ln1253">    /* now go through and set the info that we were asked to */</a>
+<a name="ln1254">    for (i = 0; i &lt; nblocks; i++) {</a>
+<a name="ln1255">        /* we can call hash_lookup() here because we know it's around */</a>
+<a name="ln1256">        ce = hash_lookup(&amp;bc.ht, dev, blocks[i]);</a>
+<a name="ln1257">        if (ce == NULL) {</a>
+<a name="ln1258">            beos_panic(&quot;*** set_block_info can't find bnum %Ld!\n&quot;, blocks[i]);</a>
+<a name="ln1259">            UNLOCK(bc.lock);</a>
+<a name="ln1260">            return ENOENT;   /* hopefully this doesn't happen... */</a>
+<a name="ln1261">        }</a>
+<a name="ln1262"> </a>
+<a name="ln1263">        ce-&gt;flags &amp;= ~(CE_DIRTY | CE_BUSY);</a>
+<a name="ln1264"> </a>
+<a name="ln1265">        if (ce-&gt;func != NULL) {</a>
+<a name="ln1266">            beos_panic(&quot;*** set_block_info non-null callback on bnum %Ld\n&quot;,</a>
+<a name="ln1267">                    ce-&gt;block_num);</a>
+<a name="ln1268">        }</a>
+<a name="ln1269"> </a>
+<a name="ln1270">        if (ce-&gt;clone != NULL) {</a>
+<a name="ln1271">            beos_panic(&quot;*** ce-&gt;clone == %p, not NULL in set_block_info\n&quot;,</a>
+<a name="ln1272">                    ce-&gt;clone);</a>
+<a name="ln1273">        }</a>
+<a name="ln1274"> </a>
+<a name="ln1275">        ce-&gt;clone = (void *)malloc(ce-&gt;bsize);</a>
+<a name="ln1276">        if (ce-&gt;clone == NULL)</a>
+<a name="ln1277">            beos_panic(&quot;*** can't clone bnum %Ld (bsize %d)\n&quot;,</a>
+<a name="ln1278">                    ce-&gt;block_num, ce-&gt;bsize);</a>
+<a name="ln1279"> </a>
+<a name="ln1280"> </a>
+<a name="ln1281">        memcpy(ce-&gt;clone, ce-&gt;data, ce-&gt;bsize);</a>
+<a name="ln1282"> </a>
+<a name="ln1283">        ce-&gt;func   = func;</a>
+<a name="ln1284">        ce-&gt;arg    = arg;</a>
+<a name="ln1285"> </a>
+<a name="ln1286">        ce-&gt;logged_bnum = blocks[i];</a>
+<a name="ln1287"> </a>
+<a name="ln1288">        ce-&gt;lock--;</a>
+<a name="ln1289">        if (ce-&gt;lock &lt; 0) {</a>
+<a name="ln1290">            printf(&quot;sbi: whoa nellie! ce @ %p (%Ld) has lock == %d\n&quot;,</a>
+<a name="ln1291">                   ce, ce-&gt;block_num, ce-&gt;lock);</a>
+<a name="ln1292">        }</a>
+<a name="ln1293"> </a>
+<a name="ln1294">        if (ce-&gt;lock == 0) {</a>
+<a name="ln1295">            delete_from_list(&amp;bc.locked, ce);</a>
+<a name="ln1296">            add_to_head(&amp;bc.normal, ce);</a>
+<a name="ln1297">        }</a>
+<a name="ln1298">    }</a>
+<a name="ln1299"> </a>
+<a name="ln1300">    UNLOCK(bc.lock);</a>
+<a name="ln1301"> </a>
+<a name="ln1302">    return 0;</a>
+<a name="ln1303">}</a>
+<a name="ln1304"> </a>
+<a name="ln1305"> </a>
+<a name="ln1306">/* this function is only for use by flush_device() */</a>
+<a name="ln1307">static void</a>
+<a name="ln1308">do_flush(cache_ent **ents, int max)</a>
+<a name="ln1309">{</a>
+<a name="ln1310">    int i;</a>
+<a name="ln1311"> </a>
+<a name="ln1312">    for(i=0; i &lt; max; i++) {</a>
+<a name="ln1313">        ents[i]-&gt;flags |= CE_BUSY;</a>
+<a name="ln1314">    }</a>
+<a name="ln1315"> </a>
+<a name="ln1316">    UNLOCK(bc.lock);</a>
+<a name="ln1317"> </a>
+<a name="ln1318">    qsort(ents, max, sizeof(cache_ent **), cache_ent_cmp);</a>
+<a name="ln1319">    flush_ents(ents, max);</a>
+<a name="ln1320"> </a>
+<a name="ln1321">    LOCK(bc.lock);</a>
+<a name="ln1322">    for(i=0; i &lt; max; i++) {</a>
+<a name="ln1323">        ents[i]-&gt;flags &amp;= ~CE_BUSY;</a>
+<a name="ln1324">    }</a>
+<a name="ln1325">}</a>
+<a name="ln1326"> </a>
+<a name="ln1327">int</a>
+<a name="ln1328">beos_flush_device(int dev, int warn_locked)</a>
+<a name="ln1329">{</a>
+<a name="ln1330">    int cur;</a>
+<a name="ln1331">    cache_ent *ce;</a>
+<a name="ln1332">    cache_ent *ents[NUM_FLUSH_BLOCKS];</a>
+<a name="ln1333"> </a>
+<a name="ln1334">    LOCK(bc.lock);</a>
+<a name="ln1335"> </a>
+<a name="ln1336">    cur = 0;</a>
+<a name="ln1337">    ce = bc.normal.lru;</a>
+<a name="ln1338">    while (ce) {</a>
+<a name="ln1339">        if (ce-&gt;dev != dev || (ce-&gt;flags &amp; CE_BUSY)) {</a>
+<a name="ln1340">            ce = ce-&gt;next;</a>
+<a name="ln1341">            continue;</a>
+<a name="ln1342">        }</a>
+<a name="ln1343"> </a>
+<a name="ln1344">        if ((ce-&gt;flags &amp; CE_DIRTY) || ce-&gt;clone) {</a>
+<a name="ln1345">            ents[cur++] = ce;</a>
+<a name="ln1346">            if (cur &gt;= NUM_FLUSH_BLOCKS) {</a>
+<a name="ln1347">                do_flush(ents, cur);</a>
+<a name="ln1348"> </a>
+<a name="ln1349">                ce = bc.normal.lru;</a>
+<a name="ln1350">                cur = 0;</a>
+<a name="ln1351">                continue;</a>
+<a name="ln1352">            }</a>
+<a name="ln1353">        }</a>
+<a name="ln1354"> </a>
+<a name="ln1355">        ce = ce-&gt;next;</a>
+<a name="ln1356">    }</a>
+<a name="ln1357"> </a>
+<a name="ln1358">    if (cur != 0)</a>
+<a name="ln1359">        do_flush(ents, cur);</a>
+<a name="ln1360"> </a>
+<a name="ln1361">    cur = 0;</a>
+<a name="ln1362">    ce = bc.locked.lru;</a>
+<a name="ln1363">    while (ce) {</a>
+<a name="ln1364">        if (ce-&gt;dev != dev || (ce-&gt;flags &amp; CE_BUSY)) {</a>
+<a name="ln1365">            ce = ce-&gt;next;</a>
+<a name="ln1366">            continue;</a>
+<a name="ln1367">        }</a>
+<a name="ln1368"> </a>
+<a name="ln1369">        if (ce-&gt;clone) {</a>
+<a name="ln1370">            ents[cur++] = ce;</a>
+<a name="ln1371">            if (cur &gt;= NUM_FLUSH_BLOCKS) {</a>
+<a name="ln1372">                do_flush(ents, cur);</a>
+<a name="ln1373"> </a>
+<a name="ln1374">                ce = bc.locked.lru;</a>
+<a name="ln1375">                cur = 0;</a>
+<a name="ln1376">                continue;</a>
+<a name="ln1377">            }</a>
+<a name="ln1378">        }</a>
+<a name="ln1379"> </a>
+<a name="ln1380">        ce = ce-&gt;next;</a>
+<a name="ln1381">    }</a>
+<a name="ln1382"> </a>
+<a name="ln1383">    if (cur != 0)</a>
+<a name="ln1384">        do_flush(ents, cur);</a>
+<a name="ln1385"> </a>
+<a name="ln1386">    UNLOCK(bc.lock);</a>
+<a name="ln1387"> </a>
+<a name="ln1388">    return 0;</a>
+<a name="ln1389">}</a>
+<a name="ln1390"> </a>
+<a name="ln1391"> </a>
+<a name="ln1392">static void</a>
+<a name="ln1393">real_remove_cached_blocks(int dev, int allow_writes, cache_ent_list *cel)</a>
+<a name="ln1394">{</a>
+<a name="ln1395">    void      *junk;</a>
+<a name="ln1396">    cache_ent *ce, *next = NULL;</a>
+<a name="ln1397"> </a>
+<a name="ln1398">    for(ce=cel-&gt;lru; ce; ce=next) {</a>
+<a name="ln1399">        next = ce-&gt;next;</a>
+<a name="ln1400"> </a>
+<a name="ln1401">        if (ce-&gt;dev != dev) {</a>
+<a name="ln1402">            continue;</a>
+<a name="ln1403">        }</a>
+<a name="ln1404"> </a>
+<a name="ln1405">        if (ce-&gt;lock != 0 || (ce-&gt;flags &amp; CE_BUSY)) {</a>
+<a name="ln1406">            printf(&quot;*** remove_cached_dev: block %Ld has lock = %d, flags &quot;</a>
+<a name="ln1407">                   &quot;0x%x! ce @ 0x%lx\n&quot;, ce-&gt;block_num, ce-&gt;lock, ce-&gt;flags,</a>
+<a name="ln1408">                   (ulong)ce);</a>
+<a name="ln1409">        }</a>
+<a name="ln1410"> </a>
+<a name="ln1411">        if (allow_writes == ALLOW_WRITES &amp;&amp;</a>
+<a name="ln1412">            ((ce-&gt;flags &amp; CE_DIRTY) || ce-&gt;clone)) {</a>
+<a name="ln1413">            ce-&gt;flags |= CE_BUSY;</a>
+<a name="ln1414">            flush_cache_ent(ce);</a>
+<a name="ln1415">            ce-&gt;flags &amp;= ~CE_BUSY;</a>
+<a name="ln1416">        }</a>
+<a name="ln1417"> </a>
+<a name="ln1418">        /* unlink this guy */</a>
+<a name="ln1419">        if (cel-&gt;lru == ce)</a>
+<a name="ln1420">            cel-&gt;lru = ce-&gt;next;</a>
+<a name="ln1421"> </a>
+<a name="ln1422">        if (cel-&gt;mru == ce)</a>
+<a name="ln1423">            cel-&gt;mru = ce-&gt;prev;</a>
+<a name="ln1424"> </a>
+<a name="ln1425">        if (ce-&gt;prev)</a>
+<a name="ln1426">            ce-&gt;prev-&gt;next = ce-&gt;next;</a>
+<a name="ln1427">        if (ce-&gt;next)</a>
+<a name="ln1428">            ce-&gt;next-&gt;prev = ce-&gt;prev;</a>
+<a name="ln1429"> </a>
+<a name="ln1430">        if (ce-&gt;clone)</a>
+<a name="ln1431">            free(ce-&gt;clone);</a>
+<a name="ln1432">        ce-&gt;clone = NULL;</a>
+<a name="ln1433"> </a>
+<a name="ln1434">        if (ce-&gt;data)</a>
+<a name="ln1435">            free(ce-&gt;data);</a>
+<a name="ln1436">        ce-&gt;data = NULL;</a>
+<a name="ln1437"> </a>
+<a name="ln1438">        if ((junk = hash_delete(&amp;bc.ht, ce-&gt;dev, ce-&gt;block_num)) != ce) {</a>
+<a name="ln1439">            beos_panic(&quot;*** remove_cached_device: bad hash table entry %ld &quot;</a>
+<a name="ln1440">                   &quot;0x%lx != 0x%lx\n&quot;, ce-&gt;block_num, (ulong)junk, (ulong)ce);</a>
+<a name="ln1441">        }</a>
+<a name="ln1442"> </a>
+<a name="ln1443">        free(ce);</a>
+<a name="ln1444"> </a>
+<a name="ln1445">        bc.cur_blocks--;</a>
+<a name="ln1446">    }</a>
+<a name="ln1447"> </a>
+<a name="ln1448">}</a>
+<a name="ln1449"> </a>
+<a name="ln1450">int</a>
+<a name="ln1451">beos_remove_cached_device_blocks(int dev, int allow_writes)</a>
+<a name="ln1452">{</a>
+<a name="ln1453">    LOCK(bc.lock);</a>
+<a name="ln1454"> </a>
+<a name="ln1455">    real_remove_cached_blocks(dev, allow_writes, &amp;bc.normal);</a>
+<a name="ln1456">    real_remove_cached_blocks(dev, allow_writes, &amp;bc.locked);</a>
+<a name="ln1457"> </a>
+<a name="ln1458">    max_device_blocks[dev] = 0;</a>
+<a name="ln1459"> </a>
+<a name="ln1460">    UNLOCK(bc.lock);</a>
+<a name="ln1461"> </a>
+<a name="ln1462">    return 0;</a>
+<a name="ln1463">}</a>
+<a name="ln1464"> </a>
+<a name="ln1465"> </a>
+<a name="ln1466"> </a>
+<a name="ln1467">int</a>
+<a name="ln1468">beos_flush_blocks(int dev, fs_off_t bnum, int nblocks)</a>
+<a name="ln1469">{</a>
+<a name="ln1470">    int        cur, i;</a>
+<a name="ln1471">    cache_ent *ce;</a>
+<a name="ln1472">    cache_ent *ents[NUM_FLUSH_BLOCKS];</a>
+<a name="ln1473"> </a>
+<a name="ln1474">    if (nblocks == 0)   /* might as well check for this */</a>
+<a name="ln1475">        return 0;</a>
+<a name="ln1476"> </a>
+<a name="ln1477">    LOCK(bc.lock);</a>
+<a name="ln1478"> </a>
+<a name="ln1479">    cur = 0;</a>
+<a name="ln1480">    for(; nblocks &gt; 0; nblocks--, bnum++) {</a>
+<a name="ln1481">        ce = block_lookup(dev, bnum);</a>
+<a name="ln1482">        if (ce == NULL)</a>
+<a name="ln1483">            continue;</a>
+<a name="ln1484"> </a>
+<a name="ln1485">        if (bnum != ce-&gt;block_num || dev != ce-&gt;dev) {</a>
+<a name="ln1486">            UNLOCK(bc.lock);</a>
+<a name="ln1487">            beos_panic(&quot;error2: looked up dev %d block %ld but found %d %ld\n&quot;,</a>
+<a name="ln1488">                  dev, bnum, ce-&gt;dev, ce-&gt;block_num);</a>
+<a name="ln1489">            return EBADF;</a>
+<a name="ln1490">        }</a>
+<a name="ln1491"> </a>
+<a name="ln1492">        if ((ce-&gt;flags &amp; CE_DIRTY) == 0 &amp;&amp; ce-&gt;clone == NULL)</a>
+<a name="ln1493">            continue;</a>
+<a name="ln1494"> </a>
+<a name="ln1495">        ce-&gt;flags |= CE_BUSY;</a>
+<a name="ln1496">        ents[cur++] = ce;</a>
+<a name="ln1497"> </a>
+<a name="ln1498">        if (cur &gt;= NUM_FLUSH_BLOCKS) {</a>
+<a name="ln1499">            UNLOCK(bc.lock);</a>
+<a name="ln1500"> </a>
+<a name="ln1501">            qsort(ents, cur, sizeof(cache_ent **), cache_ent_cmp);</a>
+<a name="ln1502">            flush_ents(ents, cur);</a>
+<a name="ln1503"> </a>
+<a name="ln1504">            LOCK(bc.lock);</a>
+<a name="ln1505">            for(i=0; i &lt; cur; i++) {</a>
+<a name="ln1506">                ents[i]-&gt;flags &amp;= ~CE_BUSY;</a>
+<a name="ln1507">            }</a>
+<a name="ln1508">            cur = 0;</a>
+<a name="ln1509">        }</a>
+<a name="ln1510">    }</a>
+<a name="ln1511"> </a>
+<a name="ln1512">    UNLOCK(bc.lock);</a>
+<a name="ln1513"> </a>
+<a name="ln1514">    if (cur == 0)     /* nothing more to do */</a>
+<a name="ln1515">        return 0;</a>
+<a name="ln1516"> </a>
+<a name="ln1517">    /* flush out the last few buggers */</a>
+<a name="ln1518">    qsort(ents, cur, sizeof(cache_ent **), cache_ent_cmp);</a>
+<a name="ln1519">    flush_ents(ents, cur);</a>
+<a name="ln1520"> </a>
+<a name="ln1521">    for(i=0; i &lt; cur; i++) {</a>
+<a name="ln1522">        ents[i]-&gt;flags &amp;= ~CE_BUSY;</a>
+<a name="ln1523">    }</a>
+<a name="ln1524"> </a>
+<a name="ln1525">    return 0;</a>
+<a name="ln1526">}</a>
+<a name="ln1527"> </a>
+<a name="ln1528"> </a>
+<a name="ln1529">int</a>
+<a name="ln1530">beos_mark_blocks_dirty(int dev, fs_off_t bnum, int nblocks)</a>
+<a name="ln1531">{</a>
+<a name="ln1532">    int        ret = 0;</a>
+<a name="ln1533">    cache_ent *ce;</a>
+<a name="ln1534"> </a>
+<a name="ln1535">    LOCK(bc.lock);</a>
+<a name="ln1536"> </a>
+<a name="ln1537">    while(nblocks &gt; 0) {</a>
+<a name="ln1538">        ce = block_lookup(dev, bnum);</a>
+<a name="ln1539">        if (ce) {</a>
+<a name="ln1540">            ce-&gt;flags |= CE_DIRTY;</a>
+<a name="ln1541">            bnum      += 1;</a>
+<a name="ln1542">            nblocks   -= 1;</a>
+<a name="ln1543">        } else {     /* hmmm, that's odd, didn't find it */</a>
+<a name="ln1544">            printf(&quot;** mark_blocks_diry couldn't find block %Ld (len %d)\n&quot;,</a>
+<a name="ln1545">                   bnum, nblocks);</a>
+<a name="ln1546">            ret = ENOENT;</a>
+<a name="ln1547">            break;</a>
+<a name="ln1548">        }</a>
+<a name="ln1549">    }</a>
+<a name="ln1550"> </a>
+<a name="ln1551">    UNLOCK(bc.lock);</a>
+<a name="ln1552"> </a>
+<a name="ln1553">    return ret;</a>
+<a name="ln1554">}</a>
+<a name="ln1555"> </a>
+<a name="ln1556"> </a>
+<a name="ln1557"> </a>
+<a name="ln1558">int</a>
+<a name="ln1559">beos_release_block(int dev, fs_off_t bnum)</a>
+<a name="ln1560">{</a>
+<a name="ln1561">    cache_ent *ce;</a>
+<a name="ln1562"> </a>
+<a name="ln1563">    /* printf(&quot;rlsb: %ld\n&quot;, bnum); */</a>
+<a name="ln1564">    LOCK(bc.lock);</a>
+<a name="ln1565"> </a>
+<a name="ln1566">    ce = block_lookup(dev, bnum);</a>
+<a name="ln1567">    if (ce) {</a>
+<a name="ln1568">        if (bnum != ce-&gt;block_num || dev != ce-&gt;dev) {</a>
+<a name="ln1569">            beos_panic(&quot;*** error3: looked up dev %d block %ld but found %d %ld\n&quot;,</a>
+<a name="ln1570">                    dev, bnum, ce-&gt;dev, ce-&gt;block_num);</a>
+<a name="ln1571">            UNLOCK(bc.lock);</a>
+<a name="ln1572">            return EBADF;</a>
+<a name="ln1573">        }</a>
+<a name="ln1574"> </a>
+<a name="ln1575">        ce-&gt;lock--;</a>
+<a name="ln1576"> </a>
+<a name="ln1577">        if (ce-&gt;lock &lt; 0) {</a>
+<a name="ln1578">            printf(&quot;rlsb: whoa nellie! ce %Ld has lock == %d\n&quot;,</a>
+<a name="ln1579">                   ce-&gt;block_num, ce-&gt;lock);</a>
+<a name="ln1580">        }</a>
+<a name="ln1581"> </a>
+<a name="ln1582">        if (ce-&gt;lock == 0) {</a>
+<a name="ln1583">            delete_from_list(&amp;bc.locked, ce);</a>
+<a name="ln1584">            add_to_head(&amp;bc.normal, ce);</a>
+<a name="ln1585">        }</a>
+<a name="ln1586"> </a>
+<a name="ln1587">    } else {     /* hmmm, that's odd, didn't find it */</a>
+<a name="ln1588">        beos_panic(&quot;** release_block asked to find %ld but it's not here\n&quot;,</a>
+<a name="ln1589">               bnum);</a>
+<a name="ln1590">    }</a>
+<a name="ln1591"> </a>
+<a name="ln1592">    UNLOCK(bc.lock);</a>
+<a name="ln1593"> </a>
+<a name="ln1594">    return 0;</a>
+<a name="ln1595">}</a>
+<a name="ln1596"> </a>
+<a name="ln1597"> </a>
+<a name="ln1598">static cache_ent *</a>
+<a name="ln1599">new_cache_ent(int bsize)</a>
+<a name="ln1600">{</a>
+<a name="ln1601">    cache_ent *ce;</a>
+<a name="ln1602"> </a>
+<a name="ln1603">    ce = (cache_ent *)calloc(1, sizeof(cache_ent));</a>
+<a name="ln1604">    if (ce == NULL) {</a>
+<a name="ln1605">        beos_panic(&quot;*** error: cache can't allocate memory!\n&quot;);</a>
+<a name="ln1606">        return NULL;</a>
+<a name="ln1607">    }</a>
+<a name="ln1608"> </a>
+<a name="ln1609">    ce-&gt;data = malloc(bsize);</a>
+<a name="ln1610">    if (ce-&gt;data == NULL) {</a>
+<a name="ln1611">        free(ce);</a>
+<a name="ln1612">        beos_panic(&quot;** error cache can't allocate data memory\n&quot;);</a>
+<a name="ln1613">        UNLOCK(bc.lock);</a>
+<a name="ln1614">        return NULL;</a>
+<a name="ln1615">    }</a>
+<a name="ln1616"> </a>
+<a name="ln1617">    ce-&gt;dev       = -1;</a>
+<a name="ln1618">    ce-&gt;block_num = -1;</a>
+<a name="ln1619"> </a>
+<a name="ln1620">    return ce;</a>
+<a name="ln1621">}</a>
+<a name="ln1622"> </a>
+<a name="ln1623"> </a>
+<a name="ln1624">static void</a>
+<a name="ln1625">get_ents(cache_ent **ents, int num_needed, int max, int *num_gotten, int bsize)</a>
+<a name="ln1626">{</a>
+<a name="ln1627">    int        cur, retry_counter = 0, max_retry = num_needed * 256;</a>
+<a name="ln1628">    cache_ent *ce;</a>
+<a name="ln1629"> </a>
+<a name="ln1630">    if (num_needed &gt; max)</a>
+<a name="ln1631">        beos_panic(&quot;get_ents: num_needed %d but max %d (doh!)\n&quot;, num_needed, max);</a>
+<a name="ln1632"> </a>
+<a name="ln1633">    /* if the cache isn't full yet, just allocate the blocks */</a>
+<a name="ln1634">    for(cur=0; bc.cur_blocks &lt; bc.max_blocks &amp;&amp; cur &lt; num_needed; cur++) {</a>
+<a name="ln1635">        ents[cur] = new_cache_ent(bsize);</a>
+<a name="ln1636">        if (ents[cur] == NULL)</a>
+<a name="ln1637">            break;</a>
+<a name="ln1638">        bc.cur_blocks++;</a>
+<a name="ln1639">    }</a>
+<a name="ln1640"> </a>
+<a name="ln1641">    /* pluck off blocks from the LRU end of the normal list, keep trying too */</a>
+<a name="ln1642">    while(cur &lt; num_needed &amp;&amp; retry_counter &lt; max_retry) {</a>
+<a name="ln1643">        for(ce=bc.normal.lru; ce &amp;&amp; cur &lt; num_needed; ce=ce-&gt;next) {</a>
+<a name="ln1644">            if (ce-&gt;lock)</a>
+<a name="ln1645">                beos_panic(&quot;get_ents: normal list has locked blocks (ce 0x%x)\n&quot;,ce);</a>
+<a name="ln1646"> </a>
+<a name="ln1647">            if (ce-&gt;flags &amp; CE_BUSY)   /* don't touch busy blocks */</a>
+<a name="ln1648">                continue;</a>
+<a name="ln1649"> </a>
+<a name="ln1650">            ce-&gt;flags   |= CE_BUSY;</a>
+<a name="ln1651">            ents[cur++]  = ce;</a>
+<a name="ln1652">        }</a>
+<a name="ln1653"> </a>
+<a name="ln1654">        if (cur &lt; num_needed) {</a>
+<a name="ln1655">            UNLOCK(bc.lock);</a>
+<a name="ln1656">            snooze(10000);</a>
+<a name="ln1657">            LOCK(bc.lock);</a>
+<a name="ln1658">            retry_counter++;</a>
+<a name="ln1659">        }</a>
+<a name="ln1660">    }</a>
+<a name="ln1661"> </a>
+<a name="ln1662">    if (cur &lt; num_needed &amp;&amp; retry_counter &gt;= max_retry) {  /* oh shit! */</a>
+<a name="ln1663">        dump_cache_list();</a>
+<a name="ln1664">        UNLOCK(bc.lock);</a>
+<a name="ln1665">        beos_panic(&quot;get_ents: waited too long; can't get enough ce's (c %d n %d)\n&quot;,</a>
+<a name="ln1666">              cur, num_needed);</a>
+<a name="ln1667">    }</a>
+<a name="ln1668"> </a>
+<a name="ln1669">    /*</a>
+<a name="ln1670">      If the last block is a dirty one, try to get more of 'em so</a>
+<a name="ln1671">      that we can flush a bunch of blocks at once.</a>
+<a name="ln1672">    */</a>
+<a name="ln1673">    if (cur &amp;&amp; cur &lt; max &amp;&amp;</a>
+<a name="ln1674">        ((ents[cur-1]-&gt;flags &amp; CE_DIRTY) || ents[cur-1]-&gt;clone)) {</a>
+<a name="ln1675"> </a>
+<a name="ln1676">        for(ce=ents[cur-1]-&gt;next; ce &amp;&amp; cur &lt; max; ce=ce-&gt;next) {</a>
+<a name="ln1677">            if (ce-&gt;flags &amp; CE_BUSY)   /* don't touch busy blocks */</a>
+<a name="ln1678">                continue;</a>
+<a name="ln1679"> </a>
+<a name="ln1680">            if (ce-&gt;lock)</a>
+<a name="ln1681">                beos_panic(&quot;get_ents:2 dirty list has locked blocks (ce 0x%x)\n&quot;,ce);</a>
+<a name="ln1682"> </a>
+<a name="ln1683">            ce-&gt;flags   |= CE_BUSY;</a>
+<a name="ln1684">            ents[cur++]  = ce;</a>
+<a name="ln1685">        }</a>
+<a name="ln1686">    }</a>
+<a name="ln1687"> </a>
+<a name="ln1688">    *num_gotten = cur;</a>
+<a name="ln1689">}</a>
+<a name="ln1690"> </a>
+<a name="ln1691"> </a>
+<a name="ln1692">static int</a>
+<a name="ln1693">read_into_ents(int dev, fs_off_t bnum, cache_ent **ents, int num, int bsize)</a>
+<a name="ln1694">{</a>
+<a name="ln1695">    int    i, ret;</a>
+<a name="ln1696">    struct iovec *iov;</a>
+<a name="ln1697"> </a>
+<a name="ln1698">    iov = get_iovec_array();</a>
+<a name="ln1699"> </a>
+<a name="ln1700">    for (i = 0; i &lt; num; i++) {</a>
+<a name="ln1701">        iov[i].iov_base = ents[i]-&gt;data;</a>
+<a name="ln1702">        iov[i].iov_len  = bsize;</a>
+<a name="ln1703">    }</a>
+<a name="ln1704"> </a>
+<a name="ln1705">	if (chatty_io &gt; 2)</a>
+<a name="ln1706">		printf(&quot;readv @ %Ld for %d blocks (at %Ld, block_size = %d)\n&quot;, bnum, num, bnum*bsize, bsize);</a>
+<a name="ln1707">    ret = readv_pos(dev, bnum*bsize, iov, num);</a>
+<a name="ln1708"> </a>
+<a name="ln1709">    release_iovec_array(iov);</a>
+<a name="ln1710"> </a>
+<a name="ln1711">    if (ret != num*bsize) {</a>
+<a name="ln1712">        printf(&quot;read_into_ents: asked to read %d bytes but got %d\n&quot;,</a>
+<a name="ln1713">               num*bsize, ret);</a>
+<a name="ln1714">        printf(&quot;*** iov @ %p (num %d)\n&quot;, iov, num);</a>
+<a name="ln1715">        return EINVAL;</a>
+<a name="ln1716">    } else</a>
+<a name="ln1717">        return 0;</a>
+<a name="ln1718">}</a>
+<a name="ln1719"> </a>
+<a name="ln1720"> </a>
+<a name="ln1721"> </a>
+<a name="ln1722">#define CACHE_READ          0x0001</a>
+<a name="ln1723">#define CACHE_WRITE         0x0002</a>
+<a name="ln1724">#define CACHE_NOOP          0x0004     /* for getting empty blocks */</a>
+<a name="ln1725">#define CACHE_LOCKED        0x0008</a>
+<a name="ln1726">#define CACHE_READ_AHEAD_OK 0x0010     /* it's ok to do read-ahead */</a>
+<a name="ln1727"> </a>
+<a name="ln1728"> </a>
+<a name="ln1729">static char *</a>
+<a name="ln1730">op_to_str(int op)</a>
+<a name="ln1731">{</a>
+<a name="ln1732">    static char buff[128];</a>
+<a name="ln1733"> </a>
+<a name="ln1734">    if (op &amp; CACHE_READ)</a>
+<a name="ln1735">        strcpy(buff, &quot;READ&quot;);</a>
+<a name="ln1736">    else if (op &amp; CACHE_WRITE)</a>
+<a name="ln1737">        strcpy(buff, &quot;WRITE&quot;);</a>
+<a name="ln1738">    else if (op &amp; CACHE_NOOP)</a>
+<a name="ln1739">        strcpy(buff, &quot;NOP&quot;);</a>
+<a name="ln1740"> </a>
+<a name="ln1741">    if (op &amp; CACHE_LOCKED)</a>
+<a name="ln1742">        strcat(buff, &quot; LOCKED&quot;);</a>
+<a name="ln1743"> </a>
+<a name="ln1744">    if (op &amp; CACHE_READ_AHEAD_OK)</a>
+<a name="ln1745">        strcat(buff, &quot; (AHEAD)&quot;);</a>
+<a name="ln1746"> </a>
+<a name="ln1747">    return buff;</a>
+<a name="ln1748">}</a>
+<a name="ln1749"> </a>
+<a name="ln1750">static int</a>
+<a name="ln1751">cache_block_io(int dev, fs_off_t bnum, void *data, fs_off_t num_blocks, int bsize,</a>
+<a name="ln1752">               int op, void **dataptr)</a>
+<a name="ln1753">{</a>
+<a name="ln1754">    size_t          err = 0;</a>
+<a name="ln1755">    cache_ent      *ce;</a>
+<a name="ln1756">    cache_ent_list *cel;</a>
+<a name="ln1757"> </a>
+<a name="ln1758">    if (chatty_io &gt; 1)</a>
+<a name="ln1759">        printf(&quot;cbio: bnum = %Ld, num_blocks = %Ld, bsize = %d, op = %s\n&quot;, bnum, num_blocks,</a>
+<a name="ln1760">               bsize, op_to_str(op));</a>
+<a name="ln1761"> </a>
+<a name="ln1762">    /* some sanity checks first */</a>
+<a name="ln1763">    if (bsize == 0)</a>
+<a name="ln1764">        beos_panic(&quot;cache_io: block size == 0 for bnum %Ld?!?\n&quot;, bnum);</a>
+<a name="ln1765"> </a>
+<a name="ln1766">    if (num_blocks == 0)</a>
+<a name="ln1767">        beos_panic(&quot;cache_io: bnum %Ld has num_blocks == 0!\n&quot;, bnum);</a>
+<a name="ln1768"> </a>
+<a name="ln1769">    if (data == NULL &amp;&amp; dataptr == NULL) {</a>
+<a name="ln1770">        printf(&quot;major butthead move: null data and dataptr! bnum %Ld:%Ld\n&quot;,</a>
+<a name="ln1771">                bnum, num_blocks);</a>
+<a name="ln1772">        return ENOMEM;</a>
+<a name="ln1773">    }</a>
+<a name="ln1774"> </a>
+<a name="ln1775">    if (data == NULL) {</a>
+<a name="ln1776">        if (num_blocks != 1)    /* get_block() should never do that */</a>
+<a name="ln1777">            beos_panic(&quot;cache_io: num_blocks %Ld but should be 1\n&quot;,</a>
+<a name="ln1778">                  num_blocks);</a>
+<a name="ln1779"> </a>
+<a name="ln1780">        if (op &amp; CACHE_WRITE)</a>
+<a name="ln1781">            beos_panic(&quot;cache_io: get_block() asked to write?!?\n&quot;);</a>
+<a name="ln1782">    }</a>
+<a name="ln1783"> </a>
+<a name="ln1784">    if (bnum + num_blocks &gt; max_device_blocks[dev]) {</a>
+<a name="ln1785">        printf(&quot;dev %d: access to blocks %Ld:%Ld but max_dev_blocks is %Ld\n&quot;,</a>
+<a name="ln1786">               dev, bnum, num_blocks, max_device_blocks[dev]);</a>
+<a name="ln1787"> </a>
+<a name="ln1788">		// let the app crash here</a>
+<a name="ln1789">		*(int *)0x3100 = 0xc0debabe;</a>
+<a name="ln1790">        return EINVAL;</a>
+<a name="ln1791">    }</a>
+<a name="ln1792"> </a>
+<a name="ln1793">    last_cache_access = system_time();</a>
+<a name="ln1794"> </a>
+<a name="ln1795">    /* if the i/o is greater than 64k, do it directly */</a>
+<a name="ln1796">    if (num_blocks * bsize &gt;= 64 * 1024) {</a>
+<a name="ln1797">        char  *ptr;</a>
+<a name="ln1798">        fs_off_t  tmp;</a>
+<a name="ln1799"> </a>
+<a name="ln1800">        if (data == NULL || (op &amp; CACHE_LOCKED)) {</a>
+<a name="ln1801">            beos_panic(&quot;*** asked to do a large locked io that's too hard!\n&quot;);</a>
+<a name="ln1802">        }</a>
+<a name="ln1803"> </a>
+<a name="ln1804"> </a>
+<a name="ln1805">        if (op &amp; CACHE_READ) {</a>
+<a name="ln1806">            if (beos_read_phys_blocks(dev, bnum, data, num_blocks, bsize) != 0) {</a>
+<a name="ln1807">                printf(&quot;cache read:read_phys_blocks failed (%s on blocks %Ld:%Ld)!\n&quot;,</a>
+<a name="ln1808">                        strerror(errno), bnum, num_blocks);</a>
+<a name="ln1809">                return EINVAL;</a>
+<a name="ln1810">            }</a>
+<a name="ln1811"> </a>
+<a name="ln1812">            LOCK(bc.lock);</a>
+<a name="ln1813"> </a>
+<a name="ln1814">            /* if any of the blocks are in the cache, grab them instead */</a>
+<a name="ln1815">            ptr = data;</a>
+<a name="ln1816">            for(tmp=bnum; tmp &lt; bnum+num_blocks; tmp++, ptr+=bsize) {</a>
+<a name="ln1817">                ce = block_lookup(dev, tmp);</a>
+<a name="ln1818">                /*</a>
+<a name="ln1819">                    if we find a block in the cache we have to copy its</a>
+<a name="ln1820">                    data just in case it is more recent than what we just</a>
+<a name="ln1821">                    read from disk (which could happen if someone wrote</a>
+<a name="ln1822">                    these blocks after we did the read but before we locked</a>
+<a name="ln1823">                    the cache and entered this loop).</a>
+<a name="ln1824">                */</a>
+<a name="ln1825">                if (ce) {</a>
+<a name="ln1826">                    if (tmp != ce-&gt;block_num || dev != ce-&gt;dev) {</a>
+<a name="ln1827">                        UNLOCK(bc.lock);</a>
+<a name="ln1828">                        beos_panic(&quot;*** error4: looked up dev %d block %Ld but &quot;</a>
+<a name="ln1829">                                &quot;found %d %Ld\n&quot;, dev, tmp, ce-&gt;dev,</a>
+<a name="ln1830">                                ce-&gt;block_num);</a>
+<a name="ln1831">                    }</a>
+<a name="ln1832"> </a>
+<a name="ln1833">                    memcpy(ptr, ce-&gt;data, bsize);</a>
+<a name="ln1834">                }</a>
+<a name="ln1835">            }</a>
+<a name="ln1836"> </a>
+<a name="ln1837">            UNLOCK(bc.lock);</a>
+<a name="ln1838">        } else if (op &amp; CACHE_WRITE) {</a>
+<a name="ln1839">            LOCK(bc.lock);</a>
+<a name="ln1840"> </a>
+<a name="ln1841">            /* if any of the blocks are in the cache, update them too */</a>
+<a name="ln1842">            ptr = data;</a>
+<a name="ln1843">            for(tmp=bnum; tmp &lt; bnum+num_blocks; tmp++, ptr+=bsize) {</a>
+<a name="ln1844">                ce = block_lookup(dev, tmp);</a>
+<a name="ln1845">                if (ce) {</a>
+<a name="ln1846">                    if (tmp != ce-&gt;block_num || dev != ce-&gt;dev) {</a>
+<a name="ln1847">                        UNLOCK(bc.lock);</a>
+<a name="ln1848">                        beos_panic(&quot;*** error5: looked up dev %d block %Ld but &quot;</a>
+<a name="ln1849">                                &quot;found %d %Ld\n&quot;, dev, tmp, ce-&gt;dev,</a>
+<a name="ln1850">                                ce-&gt;block_num);</a>
+<a name="ln1851">                        return EBADF;</a>
+<a name="ln1852">                    }</a>
+<a name="ln1853"> </a>
+<a name="ln1854">                    /* XXXdbg -- this isn't strictly necessary */</a>
+<a name="ln1855">                    if (ce-&gt;clone) {</a>
+<a name="ln1856">                        printf(&quot;over-writing cloned data (ce %p bnum %Ld)...\n&quot;, ce, tmp);</a>
+<a name="ln1857">                        flush_cache_ent(ce);</a>
+<a name="ln1858">                    }</a>
+<a name="ln1859"> </a>
+<a name="ln1860">                    /* copy the data into the cache */</a>
+<a name="ln1861">                    memcpy(ce-&gt;data, ptr, bsize);</a>
+<a name="ln1862">                }</a>
+<a name="ln1863">            }</a>
+<a name="ln1864"> </a>
+<a name="ln1865">            UNLOCK(bc.lock);</a>
+<a name="ln1866"> </a>
+<a name="ln1867">            if (beos_write_phys_blocks(dev, bnum, data, num_blocks, bsize) != 0) {</a>
+<a name="ln1868">                printf(&quot;cache write: write_phys_blocks failed (%s on blocks &quot;</a>
+<a name="ln1869">                       &quot;%Ld:%Ld)!\n&quot;, strerror(errno), bnum, num_blocks);</a>
+<a name="ln1870">                return EINVAL;</a>
+<a name="ln1871">            }</a>
+<a name="ln1872">        } else {</a>
+<a name="ln1873">            printf(&quot;bad cache op %d (bnum %Ld nblocks %Ld)\n&quot;, op, bnum, num_blocks);</a>
+<a name="ln1874">            return EINVAL;</a>
+<a name="ln1875">        }</a>
+<a name="ln1876"> </a>
+<a name="ln1877">        return 0;</a>
+<a name="ln1878">    }</a>
+<a name="ln1879"> </a>
+<a name="ln1880"> </a>
+<a name="ln1881">    LOCK(bc.lock);</a>
+<a name="ln1882">    while(num_blocks) {</a>
+<a name="ln1883"> </a>
+<a name="ln1884">        ce = block_lookup(dev, bnum);</a>
+<a name="ln1885">        if (ce) {</a>
+<a name="ln1886">            if (bnum != ce-&gt;block_num || dev != ce-&gt;dev) {</a>
+<a name="ln1887">                UNLOCK(bc.lock);</a>
+<a name="ln1888">                beos_panic(&quot;*** error6: looked up dev %d block %ld but found &quot;</a>
+<a name="ln1889">                        &quot;%d %ld\n&quot;, dev, bnum, ce-&gt;dev, ce-&gt;block_num);</a>
+<a name="ln1890">                return EBADF;</a>
+<a name="ln1891">            }</a>
+<a name="ln1892"> </a>
+<a name="ln1893">            if (bsize != ce-&gt;bsize) {</a>
+<a name="ln1894">                beos_panic(&quot;*** requested bsize %d but ce-&gt;bsize %d ce @ 0x%x\n&quot;,</a>
+<a name="ln1895">                        bsize, ce-&gt;bsize, ce);</a>
+<a name="ln1896">            }</a>
+<a name="ln1897"> </a>
+<a name="ln1898">            /* delete this ent from the list it is in because it may change */</a>
+<a name="ln1899">            if (ce-&gt;lock)</a>
+<a name="ln1900">                cel = &amp;bc.locked;</a>
+<a name="ln1901">            else</a>
+<a name="ln1902">                cel = &amp;bc.normal;</a>
+<a name="ln1903"> </a>
+<a name="ln1904">            delete_from_list(cel, ce);</a>
+<a name="ln1905"> </a>
+<a name="ln1906">            if (op &amp; CACHE_READ) {</a>
+<a name="ln1907">                if (data &amp;&amp; data != ce-&gt;data) {</a>
+<a name="ln1908">                    memcpy(data, ce-&gt;data, bsize);</a>
+<a name="ln1909">                } else if (dataptr) {</a>
+<a name="ln1910">                    *dataptr = ce-&gt;data;</a>
+<a name="ln1911">                } else {</a>
+<a name="ln1912">                    printf(&quot;cbio:data %p dptr %p ce @ %p ce-&gt;data %p\n&quot;,</a>
+<a name="ln1913">                           data, dataptr, ce, ce-&gt;data);</a>
+<a name="ln1914">                }</a>
+<a name="ln1915">            } else if (op &amp; CACHE_WRITE) {</a>
+<a name="ln1916">                if (data &amp;&amp; data != ce-&gt;data)</a>
+<a name="ln1917">                    memcpy(ce-&gt;data, data, bsize);</a>
+<a name="ln1918"> </a>
+<a name="ln1919">                ce-&gt;flags |= CE_DIRTY;</a>
+<a name="ln1920">            } else if (op &amp; CACHE_NOOP) {</a>
+<a name="ln1921">                memset(ce-&gt;data, 0, bsize);</a>
+<a name="ln1922">                if (data)</a>
+<a name="ln1923">                    memset(data, 0, bsize);</a>
+<a name="ln1924"> </a>
+<a name="ln1925">                if (dataptr)</a>
+<a name="ln1926">                    *dataptr = ce-&gt;data;</a>
+<a name="ln1927"> </a>
+<a name="ln1928">                ce-&gt;flags |= CE_DIRTY;</a>
+<a name="ln1929">            } else {</a>
+<a name="ln1930">                beos_panic(&quot;cached_block_io: bogus op %d\n&quot;, op);</a>
+<a name="ln1931">            }</a>
+<a name="ln1932"> </a>
+<a name="ln1933">            if (op &amp; CACHE_LOCKED)</a>
+<a name="ln1934">                ce-&gt;lock++;</a>
+<a name="ln1935"> </a>
+<a name="ln1936">            if (ce-&gt;lock)</a>
+<a name="ln1937">                cel = &amp;bc.locked;</a>
+<a name="ln1938">            else</a>
+<a name="ln1939">                cel = &amp;bc.normal;</a>
+<a name="ln1940"> </a>
+<a name="ln1941">            /* now put this ent at the head of the appropriate list */</a>
+<a name="ln1942">            add_to_head(cel, ce);</a>
+<a name="ln1943"> </a>
+<a name="ln1944">            if (data != NULL)</a>
+<a name="ln1945">                data = (void *)((char *)data + bsize);</a>
+<a name="ln1946"> </a>
+<a name="ln1947">            bnum       += 1;</a>
+<a name="ln1948">            num_blocks -= 1;</a>
+<a name="ln1949"> </a>
+<a name="ln1950">            continue;</a>
+<a name="ln1951">        } else {                                  /* it's not in the cache */</a>
+<a name="ln1952">            int        cur, cur_nblocks, num_dirty, real_nblocks, num_needed;</a>
+<a name="ln1953">            cache_ent *ents[NUM_FLUSH_BLOCKS];</a>
+<a name="ln1954"> </a>
+<a name="ln1955">            /*</a>
+<a name="ln1956">               here we find out how many additional blocks in this request</a>
+<a name="ln1957">               are not in the cache.  the idea is that then we can do one</a>
+<a name="ln1958">               big i/o on that many blocks at once.</a>
+<a name="ln1959">            */</a>
+<a name="ln1960">            for(cur_nblocks=1;</a>
+<a name="ln1961">                cur_nblocks &lt; num_blocks &amp;&amp; cur_nblocks &lt; NUM_FLUSH_BLOCKS;</a>
+<a name="ln1962">                cur_nblocks++) {</a>
+<a name="ln1963"> </a>
+<a name="ln1964">                /* we can call hash_lookup() directly instead of</a>
+<a name="ln1965">                   block_lookup() because we don't care about the</a>
+<a name="ln1966">                   state of the busy bit of the block at this point</a>
+<a name="ln1967">                */</a>
+<a name="ln1968">                if (hash_lookup(&amp;bc.ht, dev, bnum + cur_nblocks))</a>
+<a name="ln1969">                    break;</a>
+<a name="ln1970">            }</a>
+<a name="ln1971"> </a>
+<a name="ln1972">            /*</a>
+<a name="ln1973">              here we try to figure out how many extra blocks we should read</a>
+<a name="ln1974">              for read-ahead.  we want to read as many as possible that are</a>
+<a name="ln1975">              not already in the cache and that don't cause us to try and</a>
+<a name="ln1976">              read beyond the end of the disk.</a>
+<a name="ln1977">            */</a>
+<a name="ln1978">            if ((op &amp; CACHE_READ) &amp;&amp; (op &amp; CACHE_READ_AHEAD_OK) &amp;&amp;</a>
+<a name="ln1979">                (cur_nblocks * bsize) &lt; read_ahead_size) {</a>
+<a name="ln1980"> </a>
+<a name="ln1981">                for(num_needed=cur_nblocks;</a>
+<a name="ln1982">                    num_needed &lt; (read_ahead_size / bsize);</a>
+<a name="ln1983">                    num_needed++) {</a>
+<a name="ln1984"> </a>
+<a name="ln1985">                    if ((bnum + num_needed) &gt;= max_device_blocks[dev])</a>
+<a name="ln1986">                        break;</a>
+<a name="ln1987"> </a>
+<a name="ln1988">                    if (hash_lookup(&amp;bc.ht, dev, bnum + num_needed))</a>
+<a name="ln1989">                        break;</a>
+<a name="ln1990">                }</a>
+<a name="ln1991">            } else {</a>
+<a name="ln1992">                num_needed = cur_nblocks;</a>
+<a name="ln1993">            }</a>
+<a name="ln1994"> </a>
+<a name="ln1995">            /* this will get us pointers to a bunch of cache_ents we can use */</a>
+<a name="ln1996">            get_ents(ents, num_needed, NUM_FLUSH_BLOCKS, &amp;real_nblocks, bsize);</a>
+<a name="ln1997"> </a>
+<a name="ln1998">            if (real_nblocks &lt; num_needed) {</a>
+<a name="ln1999">                beos_panic(&quot;don't have enough cache ents (need %d got %d %ld::%d)\n&quot;,</a>
+<a name="ln2000">                      num_needed, real_nblocks, bnum, num_blocks);</a>
+<a name="ln2001">            }</a>
+<a name="ln2002"> </a>
+<a name="ln2003">            /*</a>
+<a name="ln2004">              There are now three variables used as limits within the ents</a>
+<a name="ln2005">              array.  This is how they are related:</a>
+<a name="ln2006"> </a>
+<a name="ln2007">                 cur_nblocks &lt;= num_needed &lt;= real_nblocks</a>
+<a name="ln2008"> </a>
+<a name="ln2009">              Ents from 0 to cur_nblocks-1 are going to be used to fulfill</a>
+<a name="ln2010">              this IO request.  Ents from cur_nblocks to num_needed-1 are</a>
+<a name="ln2011">              for read-ahead.  Ents from num_needed to real_nblocks are</a>
+<a name="ln2012">              extra blocks that get_ents() asked us to flush.  Often (and</a>
+<a name="ln2013">              always on writes) cur_nblocks == num_needed.</a>
+<a name="ln2014"> </a>
+<a name="ln2015">              Below, we sort the list of ents so that when we flush them</a>
+<a name="ln2016">              they go out in order.</a>
+<a name="ln2017">            */</a>
+<a name="ln2018"> </a>
+<a name="ln2019">            qsort(ents, real_nblocks, sizeof(cache_ent **), cache_ent_cmp);</a>
+<a name="ln2020"> </a>
+<a name="ln2021">            /*</a>
+<a name="ln2022">              delete each ent from its list because it will change.  also</a>
+<a name="ln2023">              count up how many dirty blocks there are and insert into the</a>
+<a name="ln2024">              hash table any new blocks so that no one else will try to</a>
+<a name="ln2025">              read them in when we release the cache semaphore to do our I/O.</a>
+<a name="ln2026">            */</a>
+<a name="ln2027">            for(cur=0,num_dirty=0; cur &lt; real_nblocks; cur++) {</a>
+<a name="ln2028">                ce = ents[cur];</a>
+<a name="ln2029">                ce-&gt;flags |= CE_BUSY;</a>
+<a name="ln2030"> </a>
+<a name="ln2031">                /*</a>
+<a name="ln2032">                   insert the new block into the hash table with its new block</a>
+<a name="ln2033">                   number. note that the block is still in the hash table for</a>
+<a name="ln2034">                   its old block number -- and it has to be until we are done</a>
+<a name="ln2035">                   flushing it from the cache (to prevent someone else from</a>
+<a name="ln2036">                   sneaking in in front of us and trying to read the same</a>
+<a name="ln2037">                   block that we're flushing).</a>
+<a name="ln2038">                */</a>
+<a name="ln2039">                if (cur &lt; num_needed) {</a>
+<a name="ln2040">                    if (hash_insert(&amp;bc.ht, dev, bnum + cur, ce) != 0)</a>
+<a name="ln2041">                        beos_panic(&quot;could not insert cache ent for %d %ld (0x%lx)\n&quot;,</a>
+<a name="ln2042">                              dev, bnum + cur, (ulong)ents[cur]);</a>
+<a name="ln2043">                }</a>
+<a name="ln2044"> </a>
+<a name="ln2045">                if (ce-&gt;dev == -1)</a>
+<a name="ln2046">                    continue;</a>
+<a name="ln2047"> </a>
+<a name="ln2048">                if ((ce-&gt;flags &amp; CE_DIRTY) || ce-&gt;clone)</a>
+<a name="ln2049">                    num_dirty++;</a>
+<a name="ln2050"> </a>
+<a name="ln2051">                if (ce-&gt;lock) {</a>
+<a name="ln2052">                    beos_panic(&quot;cbio: can't use locked blocks here ce @ 0x%x\n&quot;,ce);</a>
+<a name="ln2053">                } else {</a>
+<a name="ln2054">                    cel = &amp;bc.normal;</a>
+<a name="ln2055">	                delete_from_list(cel, ce);</a>
+<a name="ln2056">				}</a>
+<a name="ln2057">            }</a>
+<a name="ln2058">            ce = NULL;</a>
+<a name="ln2059"> </a>
+<a name="ln2060"> </a>
+<a name="ln2061">            /*</a>
+<a name="ln2062">               we release the block cache semaphore here so that we can</a>
+<a name="ln2063">               go do all the i/o we need to do (flushing dirty blocks</a>
+<a name="ln2064">               that we're kicking out as well as reading any new data).</a>
+<a name="ln2065"> </a>
+<a name="ln2066">               because all the blocks we're touching are marked busy</a>
+<a name="ln2067">               no one else should mess with them while we're doing this.</a>
+<a name="ln2068">            */</a>
+<a name="ln2069">            if (num_dirty || (op &amp; CACHE_READ)) {</a>
+<a name="ln2070">                UNLOCK(bc.lock);</a>
+<a name="ln2071"> </a>
+<a name="ln2072">                /* this flushes any blocks we're kicking out that are dirty */</a>
+<a name="ln2073">                if (num_dirty &amp;&amp; (err = flush_ents(ents, real_nblocks)) != 0) {</a>
+<a name="ln2074">                    printf(&quot;flush ents failed (ents @ 0x%lx, nblocks %d!\n&quot;,</a>
+<a name="ln2075">                           (ulong)ents, cur_nblocks);</a>
+<a name="ln2076">                    goto handle_err;</a>
+<a name="ln2077">                }</a>
+<a name="ln2078"> </a>
+<a name="ln2079">            }</a>
+<a name="ln2080"> </a>
+<a name="ln2081">            /*</a>
+<a name="ln2082">               now that everything is flushed to disk, go through and</a>
+<a name="ln2083">               make sure that the data blocks we're going to use are</a>
+<a name="ln2084">               the right block size for this current request (it's</a>
+<a name="ln2085">               possible we're kicking out some smaller blocks and need</a>
+<a name="ln2086">               to reallocate the data block pointer). We do this in two</a>
+<a name="ln2087">               steps, first free'ing everything and then going through</a>
+<a name="ln2088">               and doing the malloc's to try and be nice to the memory</a>
+<a name="ln2089">               system (i.e. allow it to coalesce stuff, etc).</a>
+<a name="ln2090">            */</a>
+<a name="ln2091">            err = 0;</a>
+<a name="ln2092">            for(cur=0; cur &lt; num_needed; cur++) {</a>
+<a name="ln2093">                if (ents[cur]-&gt;bsize != bsize) {</a>
+<a name="ln2094">                    free(ents[cur]-&gt;data);</a>
+<a name="ln2095">                    ents[cur]-&gt;data = NULL;</a>
+<a name="ln2096"> </a>
+<a name="ln2097">                    if (ents[cur]-&gt;clone) {</a>
+<a name="ln2098">                        free(ents[cur]-&gt;clone);</a>
+<a name="ln2099">                        ents[cur]-&gt;clone = NULL;</a>
+<a name="ln2100">                    }</a>
+<a name="ln2101">                }</a>
+<a name="ln2102">            }</a>
+<a name="ln2103"> </a>
+<a name="ln2104">            for(cur=0; cur &lt; num_needed; cur++) {</a>
+<a name="ln2105">                if (ents[cur]-&gt;data == NULL) {</a>
+<a name="ln2106">                    ents[cur]-&gt;data  = (void *)malloc(bsize);</a>
+<a name="ln2107">                    ents[cur]-&gt;bsize = bsize;</a>
+<a name="ln2108">                }</a>
+<a name="ln2109"> </a>
+<a name="ln2110">                if (ents[cur]-&gt;data == NULL) {</a>
+<a name="ln2111">                    printf(&quot;cache: no memory for block (bsize %d)!\n&quot;,</a>
+<a name="ln2112">                           bsize);</a>
+<a name="ln2113">                    err = ENOMEM;</a>
+<a name="ln2114">                    break;</a>
+<a name="ln2115">                }</a>
+<a name="ln2116">            }</a>
+<a name="ln2117"> </a>
+<a name="ln2118">            /*</a>
+<a name="ln2119">               if this condition is true it's a pretty serious error.</a>
+<a name="ln2120">               we'll try and back out gracefully but we're in pretty</a>
+<a name="ln2121">               deep at this point and it ain't going to be easy.</a>
+<a name="ln2122">            */</a>
+<a name="ln2123">  handle_err:</a>
+<a name="ln2124">            if (err) {</a>
+<a name="ln2125">                for(cur=0; cur &lt; num_needed; cur++) {</a>
+<a name="ln2126">                    cache_ent *tmp_ce;</a>
+<a name="ln2127"> </a>
+<a name="ln2128">                    tmp_ce = (cache_ent *)hash_delete(&amp;bc.ht,dev,bnum+cur);</a>
+<a name="ln2129">                    if (tmp_ce != ents[cur]) {</a>
+<a name="ln2130">                        beos_panic(&quot;hash_del0: %d %ld got 0x%lx, not 0x%lx\n&quot;,</a>
+<a name="ln2131">                                dev, bnum+cur, (ulong)tmp_ce,</a>
+<a name="ln2132">                                (ulong)ents[cur]);</a>
+<a name="ln2133">                    }</a>
+<a name="ln2134"> </a>
+<a name="ln2135">                    tmp_ce = (cache_ent *)hash_delete(&amp;bc.ht,ents[cur]-&gt;dev,</a>
+<a name="ln2136">                                                        ents[cur]-&gt;block_num);</a>
+<a name="ln2137">                    if (tmp_ce != ents[cur]) {</a>
+<a name="ln2138">                        beos_panic(&quot;hash_del1: %d %ld got 0x%lx, not 0x%lx\n&quot;,</a>
+<a name="ln2139">                                ents[cur]-&gt;dev, ents[cur]-&gt;block_num, (ulong)tmp_ce,</a>
+<a name="ln2140">                                (ulong)ents[cur]);</a>
+<a name="ln2141">                    }</a>
+<a name="ln2142"> </a>
+<a name="ln2143">                    ents[cur]-&gt;flags &amp;= ~CE_BUSY;</a>
+<a name="ln2144">                    if (ents[cur]-&gt;data)</a>
+<a name="ln2145">                        free(ents[cur]-&gt;data);</a>
+<a name="ln2146">                    free(ents[cur]);</a>
+<a name="ln2147">                    ents[cur] = NULL;</a>
+<a name="ln2148"> </a>
+<a name="ln2149">                    bc.cur_blocks--;</a>
+<a name="ln2150">                }</a>
+<a name="ln2151"> </a>
+<a name="ln2152">                if (cur &lt; real_nblocks) {</a>
+<a name="ln2153">                    LOCK(bc.lock);</a>
+<a name="ln2154">                    for(; cur &lt; real_nblocks; cur++) {</a>
+<a name="ln2155">                        ents[cur]-&gt;flags &amp;= ~CE_BUSY;</a>
+<a name="ln2156"> </a>
+<a name="ln2157">                        /* we have to put them back here */</a>
+<a name="ln2158">                        add_to_tail(&amp;bc.normal, ents[cur]);</a>
+<a name="ln2159">                    }</a>
+<a name="ln2160">                    UNLOCK(bc.lock);</a>
+<a name="ln2161">                }</a>
+<a name="ln2162"> </a>
+<a name="ln2163">                return ENOMEM;</a>
+<a name="ln2164">            }</a>
+<a name="ln2165"> </a>
+<a name="ln2166"> </a>
+<a name="ln2167">            /*</a>
+<a name="ln2168">               If we go into this if statement, the block cache lock</a>
+<a name="ln2169">               has *already been released* up above when we flushed the</a>
+<a name="ln2170">               dirty entries.  As always, since the blocks we're mucking</a>
+<a name="ln2171">               with are marked busy, they shouldn't get messed with.</a>
+<a name="ln2172">            */</a>
+<a name="ln2173">            err = 0;</a>
+<a name="ln2174">            if (num_dirty || (op &amp; CACHE_READ)) {</a>
+<a name="ln2175">                /* this section performs the i/o that we need to do */</a>
+<a name="ln2176">                if (op &amp; CACHE_READ) {</a>
+<a name="ln2177">                    err = read_into_ents(dev, bnum, ents, num_needed, bsize);</a>
+<a name="ln2178">                } else {</a>
+<a name="ln2179">                    err = 0;</a>
+<a name="ln2180">                }</a>
+<a name="ln2181"> </a>
+<a name="ln2182">                if (err != 0) {</a>
+<a name="ln2183">                    printf(&quot;err %s on dev %d block %Ld:%d (%d) &quot;</a>
+<a name="ln2184">                           &quot;data %p, ents[0] %p\n&quot;,</a>
+<a name="ln2185">                           strerror(errno), dev, bnum, cur_nblocks,</a>
+<a name="ln2186">                           bsize, data, ents[0]);</a>
+<a name="ln2187">                }</a>
+<a name="ln2188"> </a>
+<a name="ln2189">                /*</a>
+<a name="ln2190">                   acquire the semaphore here so that we can go on mucking</a>
+<a name="ln2191">                   with the cache data structures.  We need to delete old</a>
+<a name="ln2192">                   block numbers from the hash table and set the new block</a>
+<a name="ln2193">                   number's for the blocks we just read in.  We also put the</a>
+<a name="ln2194">                   read-ahead blocks at the head of mru list.</a>
+<a name="ln2195">                */</a>
+<a name="ln2196"> </a>
+<a name="ln2197">                LOCK(bc.lock);</a>
+<a name="ln2198">            }</a>
+<a name="ln2199"> </a>
+<a name="ln2200">            for(cur=0; cur &lt; num_needed; cur++) {</a>
+<a name="ln2201">                cache_ent *tmp_ce;</a>
+<a name="ln2202"> </a>
+<a name="ln2203">                ce = ents[cur];</a>
+<a name="ln2204">                if (ce-&gt;dev != -1) {</a>
+<a name="ln2205">                    tmp_ce = hash_delete(&amp;bc.ht, ce-&gt;dev, ce-&gt;block_num);</a>
+<a name="ln2206">                    if (tmp_ce == NULL || tmp_ce != ce) {</a>
+<a name="ln2207">                        beos_panic(&quot;*** hash_delete failure (ce 0x%x tce 0x%x)\n&quot;,</a>
+<a name="ln2208">                              ce, tmp_ce);</a>
+<a name="ln2209">                    }</a>
+<a name="ln2210">                }</a>
+<a name="ln2211"> </a>
+<a name="ln2212">                if (err == 0 &amp;&amp; cur &gt;= cur_nblocks) {</a>
+<a name="ln2213">                    ce-&gt;dev       = dev;</a>
+<a name="ln2214">                    ce-&gt;block_num = bnum + cur;</a>
+<a name="ln2215">                    ce-&gt;flags    &amp;= ~CE_BUSY;</a>
+<a name="ln2216">                    add_to_head(&amp;bc.normal, ce);</a>
+<a name="ln2217">                }</a>
+<a name="ln2218">            }</a>
+<a name="ln2219">            ce = NULL;</a>
+<a name="ln2220"> </a>
+<a name="ln2221">            /*</a>
+<a name="ln2222">              clear the busy bit on the blocks we force-flushed and</a>
+<a name="ln2223">              put them on the normal list since they're now clean.</a>
+<a name="ln2224">            */</a>
+<a name="ln2225">            for(; cur &lt; real_nblocks; cur++) {</a>
+<a name="ln2226">                ents[cur]-&gt;flags &amp;= ~CE_BUSY;</a>
+<a name="ln2227"> </a>
+<a name="ln2228">                if (ents[cur]-&gt;lock)</a>
+<a name="ln2229">                    beos_panic(&quot;should not have locked blocks here (ce 0x%x)\n&quot;,</a>
+<a name="ln2230">                          ents[cur]);</a>
+<a name="ln2231"> </a>
+<a name="ln2232">                add_to_tail(&amp;bc.normal, ents[cur]);</a>
+<a name="ln2233">            }</a>
+<a name="ln2234"> </a>
+<a name="ln2235">            if (err) {   /* then we have some cleanup to do */</a>
+<a name="ln2236">                for(cur=0; cur &lt; num_needed; cur++) {</a>
+<a name="ln2237">                    cache_ent *tmp_ce;</a>
+<a name="ln2238"> </a>
+<a name="ln2239">                    /* we delete all blocks from the cache so we don't</a>
+<a name="ln2240">                       leave partially written blocks in the cache */</a>
+<a name="ln2241"> </a>
+<a name="ln2242">                    tmp_ce = (cache_ent *)hash_delete(&amp;bc.ht,dev,bnum+cur);</a>
+<a name="ln2243">                    if (tmp_ce != ents[cur]) {</a>
+<a name="ln2244">                        beos_panic(&quot;hash_del: %d %ld got 0x%lx, not 0x%lx\n&quot;,</a>
+<a name="ln2245">                                dev, bnum+cur, (ulong)tmp_ce,</a>
+<a name="ln2246">                                (ulong)ents[cur]);</a>
+<a name="ln2247">                    }</a>
+<a name="ln2248"> </a>
+<a name="ln2249">                    ce = ents[cur];</a>
+<a name="ln2250">                    ce-&gt;flags &amp;= ~CE_BUSY;</a>
+<a name="ln2251"> </a>
+<a name="ln2252">                    free(ce-&gt;data);</a>
+<a name="ln2253">                    ce-&gt;data = NULL;</a>
+<a name="ln2254"> </a>
+<a name="ln2255">                    free(ce);</a>
+<a name="ln2256">                    ents[cur] = NULL;</a>
+<a name="ln2257"> </a>
+<a name="ln2258">                    bc.cur_blocks--;</a>
+<a name="ln2259">                }</a>
+<a name="ln2260">                ce = NULL;</a>
+<a name="ln2261"> </a>
+<a name="ln2262">                UNLOCK(bc.lock);</a>
+<a name="ln2263">                return err;</a>
+<a name="ln2264">            }</a>
+<a name="ln2265"> </a>
+<a name="ln2266"> </a>
+<a name="ln2267">            /*</a>
+<a name="ln2268">               last step: go through and make sure all the cache_ent</a>
+<a name="ln2269">               structures have the right data in them, delete old guys, etc.</a>
+<a name="ln2270">            */</a>
+<a name="ln2271">            for(cur=0; cur &lt; cur_nblocks; cur++) {</a>
+<a name="ln2272">                ce = ents[cur];</a>
+<a name="ln2273"> </a>
+<a name="ln2274">                if (ce-&gt;dev != -1) {   /* then clean this guy up */</a>
+<a name="ln2275">                    if (ce-&gt;next || ce-&gt;prev)</a>
+<a name="ln2276">                        beos_panic(&quot;ce @ 0x%x should not be in a list yet!\n&quot;, ce);</a>
+<a name="ln2277"> </a>
+<a name="ln2278">                    if (ce-&gt;clone)</a>
+<a name="ln2279">                        free(ce-&gt;clone);</a>
+<a name="ln2280"> </a>
+<a name="ln2281">                    if (ce-&gt;data == NULL)</a>
+<a name="ln2282">                        beos_panic(&quot;ce @ 0x%lx has a null data ptr\n&quot;, (ulong)ce);</a>
+<a name="ln2283">                }</a>
+<a name="ln2284"> </a>
+<a name="ln2285">                ce-&gt;dev        = dev;</a>
+<a name="ln2286">                ce-&gt;block_num  = bnum + cur;</a>
+<a name="ln2287">                ce-&gt;bsize      = bsize;</a>
+<a name="ln2288">                ce-&gt;flags      = CE_NORMAL;</a>
+<a name="ln2289">                ce-&gt;lock       = 0;</a>
+<a name="ln2290">                ce-&gt;clone      = NULL;</a>
+<a name="ln2291">                ce-&gt;func = ce-&gt;arg  = NULL;</a>
+<a name="ln2292">                ce-&gt;next = ce-&gt;prev = NULL;</a>
+<a name="ln2293"> </a>
+<a name="ln2294">                if (op &amp; CACHE_READ) {</a>
+<a name="ln2295">                    if (data)</a>
+<a name="ln2296">                        memcpy(data, ce-&gt;data, bsize);</a>
+<a name="ln2297">                } else if (op &amp; CACHE_WRITE) {</a>
+<a name="ln2298">                    ce-&gt;flags  |= CE_DIRTY;</a>
+<a name="ln2299">                    memcpy(ce-&gt;data, data, bsize);</a>
+<a name="ln2300">                } else if (op &amp; CACHE_NOOP) {</a>
+<a name="ln2301">                    memset(ce-&gt;data, 0, bsize);</a>
+<a name="ln2302">                    if (data)</a>
+<a name="ln2303">                        memset(data, 0, bsize);</a>
+<a name="ln2304"> </a>
+<a name="ln2305">                    ce-&gt;flags |= CE_DIRTY;</a>
+<a name="ln2306">                }</a>
+<a name="ln2307"> </a>
+<a name="ln2308">                if (op &amp; CACHE_LOCKED) {</a>
+<a name="ln2309">                    ce-&gt;lock++;</a>
+<a name="ln2310">                    cel = &amp;bc.locked;</a>
+<a name="ln2311">                } else {</a>
+<a name="ln2312">                    cel = &amp;bc.normal;</a>
+<a name="ln2313">                }</a>
+<a name="ln2314"> </a>
+<a name="ln2315">                /* now stick this puppy at the head of the mru list */</a>
+<a name="ln2316">                add_to_head(cel, ce);</a>
+<a name="ln2317"> </a>
+<a name="ln2318"> </a>
+<a name="ln2319">                if (dataptr) {</a>
+<a name="ln2320">                    *dataptr = ce-&gt;data;</a>
+<a name="ln2321">                }</a>
+<a name="ln2322"> </a>
+<a name="ln2323">                if (data != NULL)</a>
+<a name="ln2324">                    data = (void *)((char *)data + bsize);</a>
+<a name="ln2325">                else if (cur_nblocks != 1)</a>
+<a name="ln2326">                    beos_panic(&quot;cache can't handle setting data_ptr twice!\n&quot;);</a>
+<a name="ln2327">            }  /* end of for(cur=0; cur &lt; cur_nblocks; cur++) */</a>
+<a name="ln2328"> </a>
+<a name="ln2329">            bnum       += cur_nblocks;</a>
+<a name="ln2330">            num_blocks -= cur_nblocks;</a>
+<a name="ln2331"> </a>
+<a name="ln2332">        }   /* end of else it's not in the cache */</a>
+<a name="ln2333"> </a>
+<a name="ln2334">    }   /* end of while(num_blocks) */</a>
+<a name="ln2335"> </a>
+<a name="ln2336">    UNLOCK(bc.lock);</a>
+<a name="ln2337"> </a>
+<a name="ln2338">    return 0;</a>
+<a name="ln2339">}</a>
+<a name="ln2340"> </a>
+<a name="ln2341"> </a>
+<a name="ln2342">void *</a>
+<a name="ln2343">beos_get_block(int dev, fs_off_t bnum, int bsize)</a>
+<a name="ln2344">{</a>
+<a name="ln2345">    void *data;</a>
+<a name="ln2346"> </a>
+<a name="ln2347">    if (cache_block_io(dev, bnum, NULL, 1, bsize, CACHE_READ|CACHE_LOCKED|CACHE_READ_AHEAD_OK,</a>
+<a name="ln2348">                       &amp;data) != 0)</a>
+<a name="ln2349">        return NULL;</a>
+<a name="ln2350"> </a>
+<a name="ln2351">    return data;</a>
+<a name="ln2352">}</a>
+<a name="ln2353"> </a>
+<a name="ln2354">void *</a>
+<a name="ln2355">beos_get_empty_block(int dev, fs_off_t bnum, int bsize)</a>
+<a name="ln2356">{</a>
+<a name="ln2357">    void *data;</a>
+<a name="ln2358"> </a>
+<a name="ln2359">    if (cache_block_io(dev, bnum, NULL, 1, bsize, CACHE_NOOP|CACHE_LOCKED,</a>
+<a name="ln2360">                       &amp;data) != 0)</a>
+<a name="ln2361">        return NULL;</a>
+<a name="ln2362"> </a>
+<a name="ln2363">    return data;</a>
+<a name="ln2364">}</a>
+<a name="ln2365"> </a>
+<a name="ln2366">int</a>
+<a name="ln2367">beos_cached_read(int dev, fs_off_t bnum, void *data, fs_off_t num_blocks, int bsize)</a>
+<a name="ln2368">{</a>
+<a name="ln2369">    return cache_block_io(dev, bnum, data, num_blocks, bsize,</a>
+<a name="ln2370">                          CACHE_READ | CACHE_READ_AHEAD_OK, NULL);</a>
+<a name="ln2371">}</a>
+<a name="ln2372"> </a>
+<a name="ln2373"> </a>
+<a name="ln2374">int</a>
+<a name="ln2375">beos_cached_write(int dev, fs_off_t bnum, const void *data, fs_off_t num_blocks,int bsize)</a>
+<a name="ln2376">{</a>
+<a name="ln2377">    return cache_block_io(dev, bnum, (void *)data, num_blocks, bsize,</a>
+<a name="ln2378">                          CACHE_WRITE, NULL);</a>
+<a name="ln2379">}</a>
+<a name="ln2380"> </a>
+<a name="ln2381">int</a>
+<a name="ln2382">beos_cached_write_locked(int dev, fs_off_t bnum, const void *data,</a>
+<a name="ln2383">                    fs_off_t num_blocks, int bsize)</a>
+<a name="ln2384">{</a>
+<a name="ln2385">    return cache_block_io(dev, bnum, (void *)data, num_blocks, bsize,</a>
+<a name="ln2386">                          CACHE_WRITE | CACHE_LOCKED, NULL);</a>
+<a name="ln2387">}</a>
+<a name="ln2388"> </a>
+<a name="ln2389"> </a>
+<a name="ln2390">void</a>
+<a name="ln2391">beos_force_cache_flush(int dev, int prefer_log_blocks)</a>
+<a name="ln2392">{</a>
+<a name="ln2393">    int        i, count = 0;</a>
+<a name="ln2394">    cache_ent *ce;</a>
+<a name="ln2395">    cache_ent *ents[NUM_FLUSH_BLOCKS];</a>
+<a name="ln2396"> </a>
+<a name="ln2397"> </a>
+<a name="ln2398">    LOCK(bc.lock);</a>
+<a name="ln2399"> </a>
+<a name="ln2400">    for(ce=bc.normal.lru; ce; ce=ce-&gt;next) {</a>
+<a name="ln2401">        if ((ce-&gt;dev == dev) &amp;&amp;</a>
+<a name="ln2402">            (ce-&gt;flags &amp; CE_BUSY) == 0 &amp;&amp;</a>
+<a name="ln2403">            ((ce-&gt;flags &amp; CE_DIRTY) || ce-&gt;clone) &amp;&amp;</a>
+<a name="ln2404">            ((prefer_log_blocks &amp;&amp; ce-&gt;func) || (prefer_log_blocks == 0))) {</a>
+<a name="ln2405"> </a>
+<a name="ln2406">            ce-&gt;flags |= CE_BUSY;</a>
+<a name="ln2407">            ents[count++] = ce;</a>
+<a name="ln2408"> </a>
+<a name="ln2409">            if (count &gt;= NUM_FLUSH_BLOCKS) {</a>
+<a name="ln2410">                break;</a>
+<a name="ln2411">            }</a>
+<a name="ln2412">        }</a>
+<a name="ln2413">    }</a>
+<a name="ln2414"> </a>
+<a name="ln2415">    /* if we've got some room left, try and grab any cloned blocks */</a>
+<a name="ln2416">    if (count &lt; NUM_FLUSH_BLOCKS) {</a>
+<a name="ln2417">        for(ce=bc.locked.lru; ce; ce=ce-&gt;next) {</a>
+<a name="ln2418">            if ((ce-&gt;dev == dev) &amp;&amp;</a>
+<a name="ln2419">                (ce-&gt;flags &amp; CE_BUSY) == 0 &amp;&amp;</a>
+<a name="ln2420">                (ce-&gt;clone)) {</a>
+<a name="ln2421"> </a>
+<a name="ln2422">                ce-&gt;flags |= CE_BUSY;</a>
+<a name="ln2423">                ents[count++] = ce;</a>
+<a name="ln2424"> </a>
+<a name="ln2425">                if (count &gt;= NUM_FLUSH_BLOCKS) {</a>
+<a name="ln2426">                    break;</a>
+<a name="ln2427">                }</a>
+<a name="ln2428">            }</a>
+<a name="ln2429">        }</a>
+<a name="ln2430">    }</a>
+<a name="ln2431"> </a>
+<a name="ln2432">    UNLOCK(bc.lock);</a>
+<a name="ln2433"> </a>
+<a name="ln2434">    if (count != 0) {</a>
+<a name="ln2435">        qsort(ents, count, sizeof(cache_ent **), cache_ent_cmp);</a>
+<a name="ln2436">        flush_ents(ents, count);</a>
+<a name="ln2437"> </a>
+<a name="ln2438">        for(i=0; i &lt; count; i++)</a>
+<a name="ln2439">            ents[i]-&gt;flags &amp;= ~CE_BUSY;</a>
+<a name="ln2440">    }</a>
+<a name="ln2441">}</a>
+
+</code></pre>
+<div class="balloon" rel="894"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Potentially incorrect format string is passed to the 'printf' function. Prefix 'L' is not applicable to conversion specifier 'd'.</p></div>
+<div class="balloon" rel="967"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Potentially incorrect format string is passed to the 'printf' function. Prefix 'L' is not applicable to conversion specifier 'd'.</p></div>
+<div class="balloon" rel="974"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Potentially incorrect format string is passed to the 'printf' function. Prefix 'L' is not applicable to conversion specifier 'd'.</p></div>
+<div class="balloon" rel="981"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Potentially incorrect format string is passed to the 'printf' function. Prefix 'L' is not applicable to conversion specifier 'd'.</p></div>
+<div class="balloon" rel="1052"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Potentially incorrect format string is passed to the 'printf' function. Prefix 'L' is not applicable to conversion specifier 'd'.</p></div>
+<div class="balloon" rel="1057"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Potentially incorrect format string is passed to the 'printf' function. Prefix 'L' is not applicable to conversion specifier 'd'.</p></div>
+<div class="balloon" rel="1074"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Potentially incorrect format string is passed to the 'printf' function. Prefix 'L' is not applicable to conversion specifier 'd'.</p></div>
+<div class="balloon" rel="1162"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Potentially incorrect format string is passed to the 'printf' function. Prefix 'L' is not applicable to conversion specifier 'd'.</p></div>
+<div class="balloon" rel="1290"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Potentially incorrect format string is passed to the 'printf' function. Prefix 'L' is not applicable to conversion specifier 'd'.</p></div>
+<div class="balloon" rel="1406"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Potentially incorrect format string is passed to the 'printf' function. Prefix 'L' is not applicable to conversion specifier 'd'.</p></div>
+<div class="balloon" rel="1049"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Potentially incorrect format string is passed to the 'printf' function. Prefix 'L' is not applicable to conversion specifier 'd'.</p></div>
+<div class="balloon" rel="1785"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Potentially incorrect format string is passed to the 'printf' function. Prefix 'L' is not applicable to conversion specifier 'd'.</p></div>
+<div class="balloon" rel="1578"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Potentially incorrect format string is passed to the 'printf' function. Prefix 'L' is not applicable to conversion specifier 'd'.</p></div>
+<div class="balloon" rel="1706"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Potentially incorrect format string is passed to the 'printf' function. Prefix 'L' is not applicable to conversion specifier 'd'.</p></div>
+<div class="balloon" rel="1759"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Potentially incorrect format string is passed to the 'printf' function. Prefix 'L' is not applicable to conversion specifier 'd'.</p></div>
+<div class="balloon" rel="1770"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Potentially incorrect format string is passed to the 'printf' function. Prefix 'L' is not applicable to conversion specifier 'd'.</p></div>
+<div class="balloon" rel="363"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Potentially incorrect format string is passed to the 'printf' function. Prefix 'L' is not applicable to conversion specifier 'd'.</p></div>
+<div class="balloon" rel="1807"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Potentially incorrect format string is passed to the 'printf' function. Prefix 'L' is not applicable to conversion specifier 'd'.</p></div>
+<div class="balloon" rel="1856"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Potentially incorrect format string is passed to the 'printf' function. Prefix 'L' is not applicable to conversion specifier 'd'.</p></div>
+<div class="balloon" rel="1868"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Potentially incorrect format string is passed to the 'printf' function. Prefix 'L' is not applicable to conversion specifier 'd'.</p></div>
+<div class="balloon" rel="1873"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Potentially incorrect format string is passed to the 'printf' function. Prefix 'L' is not applicable to conversion specifier 'd'.</p></div>
+<div class="balloon" rel="2183"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Potentially incorrect format string is passed to the 'printf' function. Prefix 'L' is not applicable to conversion specifier 'd'.</p></div>
+<div class="balloon" rel="1078"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v597/" target="_blank">V597</a> The compiler could delete the 'memset' function call, which is used to flush 'ce' object. The memset_s() function should be used to erase the private data.</p></div>
+<div class="balloon" rel="194"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v595/" target="_blank">V595</a> The 'ht->table' pointer was utilized before it was verified against nullptr. Check lines: 194, 202.</p></div>
+<div class="balloon" rel="1544"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Potentially incorrect format string is passed to the 'printf' function. Prefix 'L' is not applicable to conversion specifier 'd'.</p></div>
+<div class="balloon" rel="308"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Potentially incorrect format string is passed to the 'printf' function. Prefix 'L' is not applicable to conversion specifier 'd'.</p></div>
+<div class="balloon" rel="523"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Potentially incorrect format string is passed to the 'printf' function. Prefix 'L' is not applicable to conversion specifier 'd'.</p></div>
+<div class="balloon" rel="102"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Potentially incorrect format string is passed to the 'printf' function. Prefix 'L' is not applicable to conversion specifier 'd'.</p></div>
+<div class="balloon" rel="139"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Potentially incorrect format string is passed to the 'printf' function. Prefix 'L' is not applicable to conversion specifier 'd'.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

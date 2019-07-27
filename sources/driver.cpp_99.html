@@ -1,0 +1,740 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>driver.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2007-2012 Haiku, Inc.  All rights reserved.</a>
+<a name="ln3"> * Distributed under the terms of the MIT license.</a>
+<a name="ln4"> *</a>
+<a name="ln5"> * Authors:</a>
+<a name="ln6"> *		Gerald Zajac</a>
+<a name="ln7"> */</a>
+<a name="ln8"> </a>
+<a name="ln9"> </a>
+<a name="ln10">#include &lt;AGP.h&gt;</a>
+<a name="ln11">#include &lt;KernelExport.h&gt;</a>
+<a name="ln12">#include &lt;PCI.h&gt;</a>
+<a name="ln13">#include &lt;drivers/bios.h&gt;</a>
+<a name="ln14">#include &lt;malloc.h&gt;</a>
+<a name="ln15">#include &lt;stdio.h&gt;</a>
+<a name="ln16">#include &lt;string.h&gt;</a>
+<a name="ln17">#include &lt;graphic_driver.h&gt;</a>
+<a name="ln18">#include &lt;boot_item.h&gt;</a>
+<a name="ln19"> </a>
+<a name="ln20">#include &quot;DriverInterface.h&quot;</a>
+<a name="ln21"> </a>
+<a name="ln22"> </a>
+<a name="ln23">#undef TRACE</a>
+<a name="ln24"> </a>
+<a name="ln25">#ifdef ENABLE_DEBUG_TRACE</a>
+<a name="ln26">#	define TRACE(x...) dprintf(&quot;i810: &quot; x)</a>
+<a name="ln27">#else</a>
+<a name="ln28">#	define TRACE(x...) ;</a>
+<a name="ln29">#endif</a>
+<a name="ln30"> </a>
+<a name="ln31"> </a>
+<a name="ln32">#define ACCELERANT_NAME    &quot;intel_810.accelerant&quot;</a>
+<a name="ln33"> </a>
+<a name="ln34">#define ROUND_TO_PAGE_SIZE(x) (((x) + (B_PAGE_SIZE) - 1) &amp; ~((B_PAGE_SIZE) - 1))</a>
+<a name="ln35"> </a>
+<a name="ln36">#define MAX_DEVICES		4</a>
+<a name="ln37">#define DEVICE_FORMAT	&quot;%04X_%04X_%02X%02X%02X&quot;</a>
+<a name="ln38"> </a>
+<a name="ln39">#define VENDOR_ID	0x8086	// Intel vendor ID</a>
+<a name="ln40"> </a>
+<a name="ln41"> </a>
+<a name="ln42">struct ChipInfo {</a>
+<a name="ln43">	uint16		chipID;		// PCI device id of the chip</a>
+<a name="ln44">	const char*	chipName;	// user recognizable name (must be &lt; 32 chars)</a>
+<a name="ln45">};</a>
+<a name="ln46"> </a>
+<a name="ln47"> </a>
+<a name="ln48">// This table maps a PCI device ID to a chip type identifier and the chip name.</a>
+<a name="ln49"> </a>
+<a name="ln50">static const ChipInfo chipTable[] = {</a>
+<a name="ln51">	{ 0x7121, &quot;i810&quot; },</a>
+<a name="ln52">	{ 0x7123, &quot;i810-dc100&quot; },</a>
+<a name="ln53">	{ 0x7125, &quot;i810e&quot; },</a>
+<a name="ln54">	{ 0x1132, &quot;i815&quot; },</a>
+<a name="ln55">	{ 0, NULL }</a>
+<a name="ln56">};</a>
+<a name="ln57"> </a>
+<a name="ln58"> </a>
+<a name="ln59">struct DeviceInfo {</a>
+<a name="ln60">	uint32			openCount;		// how many times device has been opened</a>
+<a name="ln61">	int32			flags;</a>
+<a name="ln62">	area_id 		sharedArea;		// shared between driver and accelerants</a>
+<a name="ln63">	SharedInfo* 	sharedInfo;		// pointer to shared info area memory</a>
+<a name="ln64">	vuint8*	 		regs;			// pointer to memory mapped registers</a>
+<a name="ln65">	const ChipInfo*	pChipInfo;		// info about the selected chip</a>
+<a name="ln66">	pci_info		pciInfo;		// copy of pci info for this device</a>
+<a name="ln67">	area_id			gttArea;		// area used for GTT</a>
+<a name="ln68">	addr_t			gttAddr;		// virtual address of GTT</a>
+<a name="ln69">	char			name[B_OS_NAME_LENGTH]; // name of device</a>
+<a name="ln70">};</a>
+<a name="ln71"> </a>
+<a name="ln72"> </a>
+<a name="ln73">static Benaphore		gLock;</a>
+<a name="ln74">static DeviceInfo		gDeviceInfo[MAX_DEVICES];</a>
+<a name="ln75">static char*			gDeviceNames[MAX_DEVICES + 1];</a>
+<a name="ln76">static pci_module_info*	gPCI;</a>
+<a name="ln77"> </a>
+<a name="ln78"> </a>
+<a name="ln79">// Prototypes for device hook functions.</a>
+<a name="ln80">static status_t device_open(const char* name, uint32 flags, void** cookie);</a>
+<a name="ln81">static status_t device_close(void* dev);</a>
+<a name="ln82">static status_t device_free(void* dev);</a>
+<a name="ln83">static status_t device_read(void* dev, off_t pos, void* buf, size_t* len);</a>
+<a name="ln84">static status_t device_write(void* dev, off_t pos, const void* buf,</a>
+<a name="ln85">	size_t* len);</a>
+<a name="ln86">static status_t device_ioctl(void* dev, uint32 msg, void* buf, size_t len);</a>
+<a name="ln87"> </a>
+<a name="ln88">static device_hooks gDeviceHooks =</a>
+<a name="ln89">{</a>
+<a name="ln90">	device_open,</a>
+<a name="ln91">	device_close,</a>
+<a name="ln92">	device_free,</a>
+<a name="ln93">	device_ioctl,</a>
+<a name="ln94">	device_read,</a>
+<a name="ln95">	device_write,</a>
+<a name="ln96">	NULL,</a>
+<a name="ln97">	NULL,</a>
+<a name="ln98">	NULL,</a>
+<a name="ln99">	NULL</a>
+<a name="ln100">};</a>
+<a name="ln101"> </a>
+<a name="ln102"> </a>
+<a name="ln103">// Video chip register definitions.</a>
+<a name="ln104">// =================================</a>
+<a name="ln105"> </a>
+<a name="ln106">#define INTERRUPT_ENABLED		0x020a0</a>
+<a name="ln107">#define INTERRUPT_MASK			0x020a8</a>
+<a name="ln108"> </a>
+<a name="ln109">// Graphics address translation table.</a>
+<a name="ln110">#define PAGE_TABLE_CONTROL		0x02020</a>
+<a name="ln111">#define PAGE_TABLE_ENABLED		0x01</a>
+<a name="ln112"> </a>
+<a name="ln113">#define PTE_BASE				0x10000</a>
+<a name="ln114">#define PTE_VALID				0x01</a>
+<a name="ln115"> </a>
+<a name="ln116"> </a>
+<a name="ln117">// Macros for memory mapped I/O.</a>
+<a name="ln118">// ==============================</a>
+<a name="ln119"> </a>
+<a name="ln120">#define INREG16(addr)		(*((vuint16*)(di.regs + (addr))))</a>
+<a name="ln121">#define INREG32(addr)		(*((vuint32*)(di.regs + (addr))))</a>
+<a name="ln122"> </a>
+<a name="ln123">#define OUTREG16(addr, val)	(*((vuint16*)(di.regs + (addr))) = (val))</a>
+<a name="ln124">#define OUTREG32(addr, val)	(*((vuint32*)(di.regs + (addr))) = (val))</a>
+<a name="ln125"> </a>
+<a name="ln126"> </a>
+<a name="ln127">static inline uint32</a>
+<a name="ln128">GetPCI(pci_info&amp; info, uint8 offset, uint8 size)</a>
+<a name="ln129">{</a>
+<a name="ln130">	return gPCI-&gt;read_pci_config(info.bus, info.device, info.function, offset,</a>
+<a name="ln131">		size);</a>
+<a name="ln132">}</a>
+<a name="ln133"> </a>
+<a name="ln134"> </a>
+<a name="ln135">static inline void</a>
+<a name="ln136">SetPCI(pci_info&amp; info, uint8 offset, uint8 size, uint32 value)</a>
+<a name="ln137">{</a>
+<a name="ln138">	gPCI-&gt;write_pci_config(info.bus, info.device, info.function, offset, size,</a>
+<a name="ln139">		value);</a>
+<a name="ln140">}</a>
+<a name="ln141"> </a>
+<a name="ln142"> </a>
+<a name="ln143">static status_t</a>
+<a name="ln144">GetEdidFromBIOS(edid1_raw&amp; edidRaw)</a>
+<a name="ln145">{</a>
+<a name="ln146">	// Get the EDID info from the video BIOS, and return B_OK if successful.</a>
+<a name="ln147"> </a>
+<a name="ln148">	#define ADDRESS_SEGMENT(address) ((addr_t)(address) &gt;&gt; 4)</a>
+<a name="ln149">	#define ADDRESS_OFFSET(address) ((addr_t)(address) &amp; 0xf)</a>
+<a name="ln150"> </a>
+<a name="ln151">	bios_module_info* biosModule;</a>
+<a name="ln152">	status_t status = get_module(B_BIOS_MODULE_NAME, (module_info**)&amp;biosModule);</a>
+<a name="ln153">	if (status != B_OK) {</a>
+<a name="ln154">		TRACE(&quot;GetEdidFromBIOS(): failed to get BIOS module: 0x%&quot; B_PRIx32 &quot;\n&quot;,</a>
+<a name="ln155">			status);</a>
+<a name="ln156">		return status;</a>
+<a name="ln157">	}</a>
+<a name="ln158"> </a>
+<a name="ln159">	bios_state* state;</a>
+<a name="ln160">	status = biosModule-&gt;prepare(&amp;state);</a>
+<a name="ln161">	if (status != B_OK) {</a>
+<a name="ln162">		TRACE(&quot;GetEdidFromBIOS(): bios_prepare() failed: 0x%&quot; B_PRIx32 &quot;\n&quot;,</a>
+<a name="ln163">			status);</a>
+<a name="ln164">		put_module(B_BIOS_MODULE_NAME);</a>
+<a name="ln165">		return status;</a>
+<a name="ln166">	}</a>
+<a name="ln167"> </a>
+<a name="ln168">	bios_regs regs = {};</a>
+<a name="ln169">	regs.eax = 0x4f15;</a>
+<a name="ln170">	regs.ebx = 0;			// 0 = report DDC service</a>
+<a name="ln171">	regs.ecx = 0;</a>
+<a name="ln172">	regs.es = 0;</a>
+<a name="ln173">	regs.edi = 0;</a>
+<a name="ln174"> </a>
+<a name="ln175">	status = biosModule-&gt;interrupt(state, 0x10, &amp;regs);</a>
+<a name="ln176">	if (status == B_OK) {</a>
+<a name="ln177">		// AH contains the error code, and AL determines whether or not the</a>
+<a name="ln178">		// function is supported.</a>
+<a name="ln179">		if (regs.eax != 0x4f)</a>
+<a name="ln180">			status = B_NOT_SUPPORTED;</a>
+<a name="ln181"> </a>
+<a name="ln182">		// Test if DDC is supported by the monitor.</a>
+<a name="ln183">		if ((regs.ebx &amp; 3) == 0)</a>
+<a name="ln184">			status = B_NOT_SUPPORTED;</a>
+<a name="ln185">	}</a>
+<a name="ln186"> </a>
+<a name="ln187">	if (status == B_OK) {</a>
+<a name="ln188">		edid1_raw* edid = (edid1_raw*)biosModule-&gt;allocate_mem(state,</a>
+<a name="ln189">			sizeof(edid1_raw));</a>
+<a name="ln190">		if (edid == NULL) {</a>
+<a name="ln191">			status = B_NO_MEMORY;</a>
+<a name="ln192">			goto out;</a>
+<a name="ln193">		}</a>
+<a name="ln194"> </a>
+<a name="ln195">		regs.eax = 0x4f15;</a>
+<a name="ln196">		regs.ebx = 1;		// 1 = read EDID</a>
+<a name="ln197">		regs.ecx = 0;</a>
+<a name="ln198">		regs.edx = 0;</a>
+<a name="ln199">		regs.es  = ADDRESS_SEGMENT(edid);</a>
+<a name="ln200">		regs.edi = ADDRESS_OFFSET(edid);</a>
+<a name="ln201"> </a>
+<a name="ln202">		status = biosModule-&gt;interrupt(state, 0x10, &amp;regs);</a>
+<a name="ln203">		if (status == B_OK) {</a>
+<a name="ln204">			if (regs.eax != 0x4f) {</a>
+<a name="ln205">				status = B_NOT_SUPPORTED;</a>
+<a name="ln206">			} else {</a>
+<a name="ln207">				// Copy the EDID info to the caller's location, and compute the</a>
+<a name="ln208">				// checksum of the EDID info while copying.</a>
+<a name="ln209"> </a>
+<a name="ln210">				uint8 sum = 0;</a>
+<a name="ln211">				uint8 allOr = 0;</a>
+<a name="ln212">				uint8* dest = (uint8*)&amp;edidRaw;</a>
+<a name="ln213">				uint8* src = (uint8*)edid;</a>
+<a name="ln214"> </a>
+<a name="ln215">				for (uint32 j = 0; j &lt; sizeof(edidRaw); j++) {</a>
+<a name="ln216">					sum += *src;</a>
+<a name="ln217">					allOr |= *src;</a>
+<a name="ln218">					*dest++ = *src++;</a>
+<a name="ln219">				}</a>
+<a name="ln220"> </a>
+<a name="ln221">				if (allOr == 0) {</a>
+<a name="ln222">					TRACE(&quot;GetEdidFromBIOS(); EDID info contains only zeros\n&quot;);</a>
+<a name="ln223">					status = B_ERROR;</a>
+<a name="ln224">				} else if (sum != 0) {</a>
+<a name="ln225">					TRACE(&quot;GetEdidFromBIOS(); Checksum error in EDID info\n&quot;);</a>
+<a name="ln226">					status = B_ERROR;</a>
+<a name="ln227">				}</a>
+<a name="ln228">			}</a>
+<a name="ln229">		}</a>
+<a name="ln230">	}</a>
+<a name="ln231"> </a>
+<a name="ln232">out:</a>
+<a name="ln233">	biosModule-&gt;finish(state);</a>
+<a name="ln234">	put_module(B_BIOS_MODULE_NAME);</a>
+<a name="ln235"> </a>
+<a name="ln236">	TRACE(&quot;GetEdidFromBIOS() status: 0x%&quot; B_PRIx32 &quot;\n&quot;, status);</a>
+<a name="ln237">	return status;</a>
+<a name="ln238">}</a>
+<a name="ln239"> </a>
+<a name="ln240"> </a>
+<a name="ln241">static status_t</a>
+<a name="ln242">InitDevice(DeviceInfo&amp; di)</a>
+<a name="ln243">{</a>
+<a name="ln244">	// Perform initialization and mapping of the device, and return B_OK if</a>
+<a name="ln245">	// sucessful;  else, return error code.</a>
+<a name="ln246"> </a>
+<a name="ln247">	TRACE(&quot;enter InitDevice()\n&quot;);</a>
+<a name="ln248"> </a>
+<a name="ln249">	// Create the area for shared info with NO user-space read or write</a>
+<a name="ln250">	// permissions, to prevent accidental damage.</a>
+<a name="ln251"> </a>
+<a name="ln252">	size_t sharedSize = (sizeof(SharedInfo) + 7) &amp; ~7;</a>
+<a name="ln253"> </a>
+<a name="ln254">	di.sharedArea = create_area(&quot;i810 shared info&quot;,</a>
+<a name="ln255">		(void**) &amp;(di.sharedInfo),</a>
+<a name="ln256">		B_ANY_KERNEL_ADDRESS,</a>
+<a name="ln257">		ROUND_TO_PAGE_SIZE(sharedSize),</a>
+<a name="ln258">		B_FULL_LOCK,</a>
+<a name="ln259">		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA | B_USER_CLONEABLE_AREA);</a>
+<a name="ln260">	if (di.sharedArea &lt; 0)</a>
+<a name="ln261">		return di.sharedArea;	// return error code</a>
+<a name="ln262"> </a>
+<a name="ln263">	SharedInfo&amp; si = *(di.sharedInfo);</a>
+<a name="ln264">	memset(&amp;si, 0, sharedSize);</a>
+<a name="ln265">	si.regsArea = -1;			// indicate area has not yet been created</a>
+<a name="ln266">	si.videoMemArea = -1;</a>
+<a name="ln267"> </a>
+<a name="ln268">	pci_info&amp; pciInfo = di.pciInfo;</a>
+<a name="ln269"> </a>
+<a name="ln270">	si.vendorID = pciInfo.vendor_id;</a>
+<a name="ln271">	si.deviceID = pciInfo.device_id;</a>
+<a name="ln272">	si.revision = pciInfo.revision;</a>
+<a name="ln273">	strcpy(si.chipName, di.pChipInfo-&gt;chipName);</a>
+<a name="ln274"> </a>
+<a name="ln275">	// Enable memory mapped IO and bus master.</a>
+<a name="ln276"> </a>
+<a name="ln277">	SetPCI(pciInfo, PCI_command, 2, GetPCI(pciInfo, PCI_command, 2)</a>
+<a name="ln278">		| PCI_command_io | PCI_command_memory | PCI_command_master);</a>
+<a name="ln279"> </a>
+<a name="ln280">	// Map the MMIO register area.</a>
+<a name="ln281"> </a>
+<a name="ln282">	phys_addr_t regsBase = pciInfo.u.h0.base_registers[1];</a>
+<a name="ln283">	uint32 regAreaSize = pciInfo.u.h0.base_register_sizes[1];</a>
+<a name="ln284"> </a>
+<a name="ln285">	si.regsArea = map_physical_memory(&quot;i810 mmio registers&quot;,</a>
+<a name="ln286">		regsBase,</a>
+<a name="ln287">		regAreaSize,</a>
+<a name="ln288">		B_ANY_KERNEL_ADDRESS,</a>
+<a name="ln289">		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA | B_USER_CLONEABLE_AREA,</a>
+<a name="ln290">		(void**)&amp;di.regs);</a>
+<a name="ln291"> </a>
+<a name="ln292">	if (si.regsArea &lt; 0) {</a>
+<a name="ln293">		TRACE(&quot;Unable to map MMIO, error: 0x%lx\n&quot;, si.regsArea);</a>
+<a name="ln294">		return si.regsArea;</a>
+<a name="ln295">	}</a>
+<a name="ln296"> </a>
+<a name="ln297">	// Allocate memory for the GTT which must be 64K for the 810/815 chips.</a>
+<a name="ln298"> </a>
+<a name="ln299">	uint32 gttSize = 64 * 1024;</a>
+<a name="ln300">	di.gttArea = create_area(&quot;GTT memory&quot;, (void**) &amp;(di.gttAddr),</a>
+<a name="ln301">		B_ANY_KERNEL_ADDRESS, gttSize, B_FULL_LOCK | B_CONTIGUOUS,</a>
+<a name="ln302">		B_READ_AREA | B_WRITE_AREA);</a>
+<a name="ln303"> </a>
+<a name="ln304">	if (di.gttArea &lt; B_OK) {</a>
+<a name="ln305">		TRACE(&quot;Unable to create GTT, error: 0x%lx\n&quot;, di.gttArea);</a>
+<a name="ln306">		return B_NO_MEMORY;</a>
+<a name="ln307">	}</a>
+<a name="ln308"> </a>
+<a name="ln309">	memset((void*)(di.gttAddr), 0, gttSize);</a>
+<a name="ln310"> </a>
+<a name="ln311">	// Get the physical address of the GTT, and set GTT address in the chip.</a>
+<a name="ln312"> </a>
+<a name="ln313">	physical_entry entry;</a>
+<a name="ln314">	status_t status = get_memory_map((void *)(di.gttAddr),</a>
+<a name="ln315">		B_PAGE_SIZE, &amp;entry, 1);</a>
+<a name="ln316">	if (status &lt; B_OK) {</a>
+<a name="ln317">		TRACE(&quot;Unable to get physical address of GTT, error: 0x%lx\n&quot;, status);</a>
+<a name="ln318">		return status;</a>
+<a name="ln319">	}</a>
+<a name="ln320"> </a>
+<a name="ln321">	OUTREG32(PAGE_TABLE_CONTROL, entry.address | PAGE_TABLE_ENABLED);</a>
+<a name="ln322">	INREG32(PAGE_TABLE_CONTROL);</a>
+<a name="ln323"> </a>
+<a name="ln324">	// Allocate video memory to be used for the frame buffer.</a>
+<a name="ln325"> </a>
+<a name="ln326">	si.videoMemSize = 4 * 1024 * 1024;</a>
+<a name="ln327">	si.videoMemArea = create_area(&quot;video memory&quot;, (void**)&amp;(si.videoMemAddr),</a>
+<a name="ln328">		B_ANY_ADDRESS, si.videoMemSize, B_FULL_LOCK,</a>
+<a name="ln329">		B_READ_AREA | B_WRITE_AREA);</a>
+<a name="ln330">	if (si.videoMemArea &lt; B_OK) {</a>
+<a name="ln331">		TRACE(&quot;Unable to create video memory, error: 0x%lx\n&quot;, si.videoMemArea);</a>
+<a name="ln332">		return B_NO_MEMORY;</a>
+<a name="ln333">	}</a>
+<a name="ln334"> </a>
+<a name="ln335">	// Get the physical address of each page of the video memory, and put</a>
+<a name="ln336">	// the physical address of each page into the GTT table.</a>
+<a name="ln337"> </a>
+<a name="ln338">	for (uint32 offset = 0; offset &lt; si.videoMemSize; offset += B_PAGE_SIZE) {</a>
+<a name="ln339">		status = get_memory_map((void *)(si.videoMemAddr + offset),</a>
+<a name="ln340">			B_PAGE_SIZE, &amp;entry, 1);</a>
+<a name="ln341">		if (status &lt; B_OK) {</a>
+<a name="ln342">			TRACE(&quot;Unable to get physical address of video memory page, error:&quot;</a>
+<a name="ln343">				&quot; 0x%lx  offset: %ld\n&quot;, status, offset);</a>
+<a name="ln344">			return status;</a>
+<a name="ln345">		}</a>
+<a name="ln346"> </a>
+<a name="ln347">		if (offset == 0)</a>
+<a name="ln348">			si.videoMemPCI = entry.address;</a>
+<a name="ln349"> </a>
+<a name="ln350">		OUTREG32(PTE_BASE + ((offset / B_PAGE_SIZE) * 4),</a>
+<a name="ln351">			entry.address | PTE_VALID);</a>
+<a name="ln352">	}</a>
+<a name="ln353"> </a>
+<a name="ln354">	TRACE(&quot;InitDevice() exit OK\n&quot;);</a>
+<a name="ln355">	return B_OK;</a>
+<a name="ln356">}</a>
+<a name="ln357"> </a>
+<a name="ln358"> </a>
+<a name="ln359">static void</a>
+<a name="ln360">DeleteAreas(DeviceInfo&amp; di)</a>
+<a name="ln361">{</a>
+<a name="ln362">	// Delete all areas that were created.</a>
+<a name="ln363"> </a>
+<a name="ln364">	if (di.sharedArea &gt;= 0 &amp;&amp; di.sharedInfo != NULL) {</a>
+<a name="ln365">		SharedInfo&amp; si = *(di.sharedInfo);</a>
+<a name="ln366">		if (si.regsArea &gt;= 0)</a>
+<a name="ln367">			delete_area(si.regsArea);</a>
+<a name="ln368">		if (si.videoMemArea &gt;= 0)</a>
+<a name="ln369">			delete_area(si.videoMemArea);</a>
+<a name="ln370">	}</a>
+<a name="ln371"> </a>
+<a name="ln372">	if (di.gttArea &gt;= 0)</a>
+<a name="ln373">		delete_area(di.gttArea);</a>
+<a name="ln374">	di.gttArea = -1;</a>
+<a name="ln375">	di.gttAddr = (addr_t)NULL;</a>
+<a name="ln376"> </a>
+<a name="ln377">	if (di.sharedArea &gt;= 0)</a>
+<a name="ln378">		delete_area(di.sharedArea);</a>
+<a name="ln379">	di.sharedArea = -1;</a>
+<a name="ln380">	di.sharedInfo = NULL;</a>
+<a name="ln381">}</a>
+<a name="ln382"> </a>
+<a name="ln383"> </a>
+<a name="ln384">static const ChipInfo*</a>
+<a name="ln385">GetNextSupportedDevice(uint32&amp; pciIndex, pci_info&amp; pciInfo)</a>
+<a name="ln386">{</a>
+<a name="ln387">	// Search the PCI devices for a device that is supported by this driver.</a>
+<a name="ln388">	// The search starts at the device specified by argument pciIndex, and</a>
+<a name="ln389">	// continues until a supported device is found or there are no more devices</a>
+<a name="ln390">	// to examine.  Argument pciIndex is incremented after each device is</a>
+<a name="ln391">	// examined.</a>
+<a name="ln392"> </a>
+<a name="ln393">	// If a supported device is found, return a pointer to the struct containing</a>
+<a name="ln394">	// the chip info; else return NULL.</a>
+<a name="ln395"> </a>
+<a name="ln396">	while (gPCI-&gt;get_nth_pci_info(pciIndex, &amp;pciInfo) == B_OK) {</a>
+<a name="ln397"> </a>
+<a name="ln398">		if (pciInfo.vendor_id == VENDOR_ID) {</a>
+<a name="ln399"> </a>
+<a name="ln400">			// Search the table of supported devices to find a chip/device that</a>
+<a name="ln401">			// matches device ID of the current PCI device.</a>
+<a name="ln402"> </a>
+<a name="ln403">			const ChipInfo* pDevice = chipTable;</a>
+<a name="ln404"> </a>
+<a name="ln405">			while (pDevice-&gt;chipID != 0) {	// end of table?</a>
+<a name="ln406">				if (pDevice-&gt;chipID == pciInfo.device_id)</a>
+<a name="ln407">					return pDevice; // matching device/chip found</a>
+<a name="ln408"> </a>
+<a name="ln409">				pDevice++;</a>
+<a name="ln410">			}</a>
+<a name="ln411">		}</a>
+<a name="ln412"> </a>
+<a name="ln413">		pciIndex++;</a>
+<a name="ln414">	}</a>
+<a name="ln415"> </a>
+<a name="ln416">	return NULL; // no supported device found</a>
+<a name="ln417">}</a>
+<a name="ln418"> </a>
+<a name="ln419"> </a>
+<a name="ln420">//	#pragma mark - Kernel Interface</a>
+<a name="ln421"> </a>
+<a name="ln422"> </a>
+<a name="ln423">status_t</a>
+<a name="ln424">init_hardware(void)</a>
+<a name="ln425">{</a>
+<a name="ln426">	// Return B_OK if a device supported by this driver is found; otherwise,</a>
+<a name="ln427">	// return B_ERROR so the driver will be unloaded.</a>
+<a name="ln428"> </a>
+<a name="ln429">	status_t status = get_module(B_PCI_MODULE_NAME, (module_info**)&amp;gPCI);</a>
+<a name="ln430">	if (status != B_OK) {</a>
+<a name="ln431">		TRACE(&quot;PCI module unavailable, error 0x%lx\n&quot;, status);</a>
+<a name="ln432">		return status;</a>
+<a name="ln433">	}</a>
+<a name="ln434"> </a>
+<a name="ln435">	// Check pci devices for a device supported by this driver.</a>
+<a name="ln436"> </a>
+<a name="ln437">	uint32 pciIndex = 0;</a>
+<a name="ln438">	pci_info pciInfo;</a>
+<a name="ln439">	const ChipInfo* pDevice = GetNextSupportedDevice(pciIndex, pciInfo);</a>
+<a name="ln440"> </a>
+<a name="ln441">	TRACE(&quot;init_hardware() - %s\n&quot;,</a>
+<a name="ln442">		pDevice == NULL ? &quot;no supported devices&quot; : &quot;device supported&quot;);</a>
+<a name="ln443"> </a>
+<a name="ln444">	put_module(B_PCI_MODULE_NAME);		// put away the module manager</a>
+<a name="ln445"> </a>
+<a name="ln446">	return (pDevice == NULL ? B_ERROR : B_OK);</a>
+<a name="ln447">}</a>
+<a name="ln448"> </a>
+<a name="ln449"> </a>
+<a name="ln450">status_t</a>
+<a name="ln451">init_driver(void)</a>
+<a name="ln452">{</a>
+<a name="ln453">	// Get handle for the pci bus.</a>
+<a name="ln454"> </a>
+<a name="ln455">	status_t status = get_module(B_PCI_MODULE_NAME, (module_info**)&amp;gPCI);</a>
+<a name="ln456">	if (status != B_OK) {</a>
+<a name="ln457">		TRACE(&quot;PCI module unavailable, error 0x%lx\n&quot;, status);</a>
+<a name="ln458">		return status;</a>
+<a name="ln459">	}</a>
+<a name="ln460"> </a>
+<a name="ln461">	status = gLock.Init(&quot;i810 driver lock&quot;);</a>
+<a name="ln462">	if (status &lt; B_OK) {</a>
+<a name="ln463">		put_module(B_AGP_GART_MODULE_NAME);</a>
+<a name="ln464">		put_module(B_PCI_MODULE_NAME);</a>
+<a name="ln465">		return status;</a>
+<a name="ln466">	}</a>
+<a name="ln467"> </a>
+<a name="ln468">	// Get info about all the devices supported by this driver.</a>
+<a name="ln469"> </a>
+<a name="ln470">	uint32 pciIndex = 0;</a>
+<a name="ln471">	uint32 count = 0;</a>
+<a name="ln472"> </a>
+<a name="ln473">	while (count &lt; MAX_DEVICES) {</a>
+<a name="ln474">		DeviceInfo&amp; di = gDeviceInfo[count];</a>
+<a name="ln475"> </a>
+<a name="ln476">		const ChipInfo* pDevice = GetNextSupportedDevice(pciIndex, di.pciInfo);</a>
+<a name="ln477">		if (pDevice == NULL)</a>
+<a name="ln478">			break;			// all supported devices have been obtained</a>
+<a name="ln479"> </a>
+<a name="ln480">		// Compose device name.</a>
+<a name="ln481">		sprintf(di.name, &quot;graphics/&quot; DEVICE_FORMAT,</a>
+<a name="ln482">			di.pciInfo.vendor_id, di.pciInfo.device_id,</a>
+<a name="ln483">			di.pciInfo.bus, di.pciInfo.device, di.pciInfo.function);</a>
+<a name="ln484">		TRACE(&quot;init_driver() match found; name: %s\n&quot;, di.name);</a>
+<a name="ln485"> </a>
+<a name="ln486">		gDeviceNames[count] = di.name;</a>
+<a name="ln487">		di.openCount = 0;		// mark driver as available for R/W open</a>
+<a name="ln488">		di.sharedArea = -1;		// indicate shared area not yet created</a>
+<a name="ln489">		di.sharedInfo = NULL;</a>
+<a name="ln490">		di.gttArea = -1;		// indicate GTT area not yet created</a>
+<a name="ln491">		di.gttAddr = (addr_t)NULL;</a>
+<a name="ln492">		di.pChipInfo = pDevice;</a>
+<a name="ln493">		count++;</a>
+<a name="ln494">		pciIndex++;</a>
+<a name="ln495">	}</a>
+<a name="ln496"> </a>
+<a name="ln497">	gDeviceNames[count] = NULL;	// terminate list with null pointer</a>
+<a name="ln498"> </a>
+<a name="ln499">	TRACE(&quot;init_driver() %ld supported devices\n&quot;, count);</a>
+<a name="ln500"> </a>
+<a name="ln501">	return B_OK;</a>
+<a name="ln502">}</a>
+<a name="ln503"> </a>
+<a name="ln504"> </a>
+<a name="ln505">void</a>
+<a name="ln506">uninit_driver(void)</a>
+<a name="ln507">{</a>
+<a name="ln508">	// Free the driver data.</a>
+<a name="ln509"> </a>
+<a name="ln510">	gLock.Delete();</a>
+<a name="ln511">	put_module(B_AGP_GART_MODULE_NAME);</a>
+<a name="ln512">	put_module(B_PCI_MODULE_NAME);	// put the pci module away</a>
+<a name="ln513">}</a>
+<a name="ln514"> </a>
+<a name="ln515"> </a>
+<a name="ln516">const char**</a>
+<a name="ln517">publish_devices(void)</a>
+<a name="ln518">{</a>
+<a name="ln519">	return (const char**)gDeviceNames;	// return list of supported devices</a>
+<a name="ln520">}</a>
+<a name="ln521"> </a>
+<a name="ln522"> </a>
+<a name="ln523">device_hooks*</a>
+<a name="ln524">find_device(const char* name)</a>
+<a name="ln525">{</a>
+<a name="ln526">	int i = 0;</a>
+<a name="ln527">	while (gDeviceNames[i] != NULL) {</a>
+<a name="ln528">		if (strcmp(name, gDeviceNames[i]) == 0)</a>
+<a name="ln529">			return &amp;gDeviceHooks;</a>
+<a name="ln530">		i++;</a>
+<a name="ln531">	}</a>
+<a name="ln532"> </a>
+<a name="ln533">	return NULL;</a>
+<a name="ln534">}</a>
+<a name="ln535"> </a>
+<a name="ln536"> </a>
+<a name="ln537">//	#pragma mark - Device Hooks</a>
+<a name="ln538"> </a>
+<a name="ln539"> </a>
+<a name="ln540">static status_t</a>
+<a name="ln541">device_open(const char* name, uint32 /*flags*/, void** cookie)</a>
+<a name="ln542">{</a>
+<a name="ln543">	status_t status = B_OK;</a>
+<a name="ln544"> </a>
+<a name="ln545">	TRACE(&quot;device_open() - name: %s, cookie: 0x%&quot; B_PRIXADDR &quot;\n&quot;, name,</a>
+<a name="ln546">		(addr_t)cookie);</a>
+<a name="ln547"> </a>
+<a name="ln548">	// Find the device name in the list of devices.</a>
+<a name="ln549"> </a>
+<a name="ln550">	int32 i = 0;</a>
+<a name="ln551">	while (gDeviceNames[i] != NULL &amp;&amp; (strcmp(name, gDeviceNames[i]) != 0))</a>
+<a name="ln552">		i++;</a>
+<a name="ln553"> </a>
+<a name="ln554">	if (gDeviceNames[i] == NULL)</a>
+<a name="ln555">		return B_BAD_VALUE;		// device name not found in list of devices</a>
+<a name="ln556"> </a>
+<a name="ln557">	DeviceInfo&amp; di = gDeviceInfo[i];</a>
+<a name="ln558"> </a>
+<a name="ln559">	gLock.Acquire();	// make sure no one else has write access to common data</a>
+<a name="ln560"> </a>
+<a name="ln561">	if (di.openCount == 0) {</a>
+<a name="ln562">		status = InitDevice(di);</a>
+<a name="ln563">		if (status &lt; B_OK)</a>
+<a name="ln564">			DeleteAreas(di);	// error occurred; delete any areas created</a>
+<a name="ln565">	}</a>
+<a name="ln566"> </a>
+<a name="ln567">	gLock.Release();</a>
+<a name="ln568"> </a>
+<a name="ln569">	if (status == B_OK) {</a>
+<a name="ln570">		di.openCount++;		// mark device open</a>
+<a name="ln571">		*cookie = &amp;di;		// send cookie to opener</a>
+<a name="ln572">	}</a>
+<a name="ln573"> </a>
+<a name="ln574">	TRACE(&quot;device_open() returning 0x%lx,  open count: %ld\n&quot;, status,</a>
+<a name="ln575">		di.openCount);</a>
+<a name="ln576">	return status;</a>
+<a name="ln577">}</a>
+<a name="ln578"> </a>
+<a name="ln579"> </a>
+<a name="ln580">static status_t</a>
+<a name="ln581">device_read(void* dev, off_t pos, void* buf, size_t* len)</a>
+<a name="ln582">{</a>
+<a name="ln583">	// Following 3 lines of code are here to eliminate &quot;unused parameter&quot;</a>
+<a name="ln584">	// warnings.</a>
+<a name="ln585">	(void)dev;</a>
+<a name="ln586">	(void)pos;</a>
+<a name="ln587">	(void)buf;</a>
+<a name="ln588"> </a>
+<a name="ln589">	*len = 0;</a>
+<a name="ln590">	return B_NOT_ALLOWED;</a>
+<a name="ln591">}</a>
+<a name="ln592"> </a>
+<a name="ln593"> </a>
+<a name="ln594">static status_t</a>
+<a name="ln595">device_write(void* dev, off_t pos, const void* buf, size_t* len)</a>
+<a name="ln596">{</a>
+<a name="ln597">	// Following 3 lines of code are here to eliminate &quot;unused parameter&quot;</a>
+<a name="ln598">	// warnings.</a>
+<a name="ln599">	(void)dev;</a>
+<a name="ln600">	(void)pos;</a>
+<a name="ln601">	(void)buf;</a>
+<a name="ln602"> </a>
+<a name="ln603">	*len = 0;</a>
+<a name="ln604">	return B_NOT_ALLOWED;</a>
+<a name="ln605">}</a>
+<a name="ln606"> </a>
+<a name="ln607"> </a>
+<a name="ln608">static status_t</a>
+<a name="ln609">device_close(void* dev)</a>
+<a name="ln610">{</a>
+<a name="ln611">	(void)dev;		// avoid compiler warning for unused arg</a>
+<a name="ln612"> </a>
+<a name="ln613">	TRACE(&quot;device_close()\n&quot;);</a>
+<a name="ln614">	return B_NO_ERROR;</a>
+<a name="ln615">}</a>
+<a name="ln616"> </a>
+<a name="ln617"> </a>
+<a name="ln618">static status_t</a>
+<a name="ln619">device_free(void* dev)</a>
+<a name="ln620">{</a>
+<a name="ln621">	DeviceInfo&amp; di = *((DeviceInfo*)dev);</a>
+<a name="ln622"> </a>
+<a name="ln623">	TRACE(&quot;enter device_free()\n&quot;);</a>
+<a name="ln624"> </a>
+<a name="ln625">	gLock.Acquire();		// lock driver</a>
+<a name="ln626"> </a>
+<a name="ln627">	// If opened multiple times, merely decrement the open count and exit.</a>
+<a name="ln628"> </a>
+<a name="ln629">	if (di.openCount &lt;= 1)</a>
+<a name="ln630">		DeleteAreas(di);</a>
+<a name="ln631"> </a>
+<a name="ln632">	if (di.openCount &gt; 0)</a>
+<a name="ln633">		di.openCount--;		// mark device available</a>
+<a name="ln634"> </a>
+<a name="ln635">	gLock.Release();	// unlock driver</a>
+<a name="ln636"> </a>
+<a name="ln637">	TRACE(&quot;exit device_free() openCount: %ld\n&quot;, di.openCount);</a>
+<a name="ln638">	return B_OK;</a>
+<a name="ln639">}</a>
+<a name="ln640"> </a>
+<a name="ln641"> </a>
+<a name="ln642">static status_t</a>
+<a name="ln643">device_ioctl(void* dev, uint32 msg, void* buffer, size_t bufferLength)</a>
+<a name="ln644">{</a>
+<a name="ln645">	DeviceInfo&amp; di = *((DeviceInfo*)dev);</a>
+<a name="ln646"> </a>
+<a name="ln647">	TRACE(&quot;device_ioctl(); ioctl: %lu, buffer: 0x%&quot; B_PRIXADDR &quot;, &quot;</a>
+<a name="ln648">		&quot;bufLen: %lu\n&quot;, msg, (addr_t)buffer, bufferLength);</a>
+<a name="ln649"> </a>
+<a name="ln650">	switch (msg) {</a>
+<a name="ln651">		case B_GET_ACCELERANT_SIGNATURE:</a>
+<a name="ln652">			strcpy((char*)buffer, ACCELERANT_NAME);</a>
+<a name="ln653">			TRACE(&quot;Intel 810 accelerant: %s\n&quot;, ACCELERANT_NAME);</a>
+<a name="ln654">			return B_OK;</a>
+<a name="ln655"> </a>
+<a name="ln656">		case INTEL_DEVICE_NAME:</a>
+<a name="ln657">			strncpy((char*)buffer, di.name, B_OS_NAME_LENGTH);</a>
+<a name="ln658">			((char*)buffer)[B_OS_NAME_LENGTH -1] = '\0';</a>
+<a name="ln659">			return B_OK;</a>
+<a name="ln660"> </a>
+<a name="ln661">		case INTEL_GET_SHARED_DATA:</a>
+<a name="ln662">			if (bufferLength != sizeof(area_id))</a>
+<a name="ln663">				return B_BAD_DATA;</a>
+<a name="ln664"> </a>
+<a name="ln665">			*((area_id*)buffer) = di.sharedArea;</a>
+<a name="ln666">			return B_OK;</a>
+<a name="ln667"> </a>
+<a name="ln668">		case INTEL_GET_EDID:</a>
+<a name="ln669">		{</a>
+<a name="ln670">			if (bufferLength != sizeof(edid1_raw))</a>
+<a name="ln671">				return B_BAD_DATA;</a>
+<a name="ln672"> </a>
+<a name="ln673">			edid1_raw rawEdid;</a>
+<a name="ln674">			status_t status = GetEdidFromBIOS(rawEdid);</a>
+<a name="ln675">			if (status == B_OK)</a>
+<a name="ln676">				user_memcpy((edid1_raw*)buffer, &amp;rawEdid, sizeof(rawEdid));</a>
+<a name="ln677">			return status;</a>
+<a name="ln678">		}</a>
+<a name="ln679">	}</a>
+<a name="ln680"> </a>
+<a name="ln681">	return B_DEV_INVALID_IOCTL;</a>
+<a name="ln682">}</a>
+
+</code></pre>
+<div class="balloon" rel="647"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="637"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="574"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the third actual argument of the 'dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="342"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the third actual argument of the 'dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="574"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="317"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="305"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="293"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="431"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="331"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="342"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="457"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="499"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'dprintf' function. The memsize type argument is expected.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

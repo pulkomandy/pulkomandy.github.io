@@ -1,0 +1,377 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>debug_heap.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2009-2010, Ingo Weinhold, ingo_weinhold@gmx.de</a>
+<a name="ln3"> * Distributed under the terms of the MIT License.</a>
+<a name="ln4"> */</a>
+<a name="ln5"> </a>
+<a name="ln6"> </a>
+<a name="ln7">#include &lt;debug_heap.h&gt;</a>
+<a name="ln8"> </a>
+<a name="ln9">#include &lt;new&gt;</a>
+<a name="ln10"> </a>
+<a name="ln11">#include &lt;util/AutoLock.h&gt;</a>
+<a name="ln12">#include &lt;vm/vm.h&gt;</a>
+<a name="ln13"> </a>
+<a name="ln14"> </a>
+<a name="ln15">#define INITIAL_DEBUG_HEAP_SIZE	B_PAGE_SIZE</a>
+<a name="ln16"> </a>
+<a name="ln17">static char sInitialHeap[INITIAL_DEBUG_HEAP_SIZE] __attribute__ ((aligned (8)));</a>
+<a name="ln18">static void* sHeapBase = sInitialHeap;</a>
+<a name="ln19">static size_t sHeapSize = INITIAL_DEBUG_HEAP_SIZE;</a>
+<a name="ln20"> </a>
+<a name="ln21">const kdebug_alloc_t kdebug_alloc = {};</a>
+<a name="ln22"> </a>
+<a name="ln23"> </a>
+<a name="ln24">struct allocation_header {</a>
+<a name="ln25">	uint32	size : 31;	// size in allocation_header units</a>
+<a name="ln26">	bool	free : 1;</a>
+<a name="ln27">	uint32	previous;</a>
+<a name="ln28">};</a>
+<a name="ln29"> </a>
+<a name="ln30">struct free_entry : allocation_header {</a>
+<a name="ln31">	uint32	previous_free;</a>
+<a name="ln32">	uint32	next_free;</a>
+<a name="ln33">};</a>
+<a name="ln34"> </a>
+<a name="ln35"> </a>
+<a name="ln36">struct DebugAllocPool {</a>
+<a name="ln37">	void Init(void* heap, size_t heapSize)</a>
+<a name="ln38">	{</a>
+<a name="ln39">		fParent = NULL;</a>
+<a name="ln40">		fChild = NULL;</a>
+<a name="ln41"> </a>
+<a name="ln42">		uint32 size = heapSize / 8;</a>
+<a name="ln43">		fBase = (allocation_header*)heap - 1;</a>
+<a name="ln44">		fEnd = size + 1;</a>
+<a name="ln45">		fFirstFree = 0;</a>
+<a name="ln46">		fLastFree = 0;</a>
+<a name="ln47"> </a>
+<a name="ln48">		// add free entry spanning the whole area</a>
+<a name="ln49">		fBase[1].size = size - 1;</a>
+<a name="ln50">		fBase[1].previous = 0;</a>
+<a name="ln51">		_InsertFreeEntry(1);</a>
+<a name="ln52">	}</a>
+<a name="ln53"> </a>
+<a name="ln54">	DebugAllocPool* CreateChildPool()</a>
+<a name="ln55">	{</a>
+<a name="ln56">		// do we already have a child pool?</a>
+<a name="ln57">		if (fChild != NULL)</a>
+<a name="ln58">			return NULL;</a>
+<a name="ln59"> </a>
+<a name="ln60">		// create the pool object</a>
+<a name="ln61">		DebugAllocPool* pool</a>
+<a name="ln62">			= (DebugAllocPool*)Allocate(sizeof(DebugAllocPool));</a>
+<a name="ln63">		if (pool == NULL)</a>
+<a name="ln64">			return NULL;</a>
+<a name="ln65"> </a>
+<a name="ln66">		// do we have enough free space?</a>
+<a name="ln67">		if (fLastFree == 0 || fBase[fLastFree].size &lt; 2) {</a>
+<a name="ln68">			Free(pool);</a>
+<a name="ln69">			return NULL;</a>
+<a name="ln70">		}</a>
+<a name="ln71"> </a>
+<a name="ln72">		allocation_header* header = &amp;fBase[fLastFree];</a>
+<a name="ln73">		_RemoveFreeEntry(fLastFree);</a>
+<a name="ln74"> </a>
+<a name="ln75">		pool-&gt;Init(header + 1, header-&gt;size * 8);</a>
+<a name="ln76">		pool-&gt;fParent = this;</a>
+<a name="ln77"> </a>
+<a name="ln78">		return fChild = pool;</a>
+<a name="ln79">	}</a>
+<a name="ln80"> </a>
+<a name="ln81">	void Destroy()</a>
+<a name="ln82">	{</a>
+<a name="ln83">		if (fParent != NULL) {</a>
+<a name="ln84">			fParent-&gt;fChild = NULL;</a>
+<a name="ln85">			fParent-&gt;Free(fBase + 1);</a>
+<a name="ln86">		}</a>
+<a name="ln87">	}</a>
+<a name="ln88"> </a>
+<a name="ln89">	DebugAllocPool* Parent() const</a>
+<a name="ln90">	{</a>
+<a name="ln91">		return fParent;</a>
+<a name="ln92">	}</a>
+<a name="ln93"> </a>
+<a name="ln94">	void* Allocate(size_t size)</a>
+<a name="ln95">	{</a>
+<a name="ln96">		size = (size + 7) / 8;</a>
+<a name="ln97">		uint32 index = fFirstFree;</a>
+<a name="ln98">		while (index != 0 &amp;&amp; fBase[index].size &lt; size)</a>
+<a name="ln99">			index = ((free_entry*)&amp;fBase[index])-&gt;next_free;</a>
+<a name="ln100"> </a>
+<a name="ln101">		if (index == 0)</a>
+<a name="ln102">			return NULL;</a>
+<a name="ln103"> </a>
+<a name="ln104">		_RemoveFreeEntry(index);</a>
+<a name="ln105"> </a>
+<a name="ln106">		// if the entry is big enough, we split it</a>
+<a name="ln107">		if (fBase[index].size - size &gt;= 2) {</a>
+<a name="ln108">			uint32 next = index + 1 + size;</a>
+<a name="ln109">			uint32 nextNext = index + 1 + fBase[index].size;</a>
+<a name="ln110">			fBase[next].size = fBase[index].size - size - 1;</a>
+<a name="ln111">			fBase[next].previous = index;</a>
+<a name="ln112">			fBase[index].size = size;</a>
+<a name="ln113">			_InsertFreeEntry(next);</a>
+<a name="ln114"> </a>
+<a name="ln115">			if (nextNext &lt; fEnd)</a>
+<a name="ln116">				fBase[nextNext].previous = next;</a>
+<a name="ln117">		}</a>
+<a name="ln118"> </a>
+<a name="ln119">		return &amp;fBase[index + 1];</a>
+<a name="ln120">	}</a>
+<a name="ln121"> </a>
+<a name="ln122">	void Free(void* address)</a>
+<a name="ln123">	{</a>
+<a name="ln124">		// check address</a>
+<a name="ln125">		if (((addr_t)address &amp; 7) != 0 || address &lt;= fBase + 1</a>
+<a name="ln126">			|| address &gt;= fBase + fEnd) {</a>
+<a name="ln127">			kprintf(&quot;DebugAllocPool::Free(%p): bad address\n&quot;, address);</a>
+<a name="ln128">			return;</a>
+<a name="ln129">		}</a>
+<a name="ln130"> </a>
+<a name="ln131">		// get header</a>
+<a name="ln132">		allocation_header* header = (allocation_header*)address - 1;</a>
+<a name="ln133">		uint32 index = header - fBase;</a>
+<a name="ln134">		if (header-&gt;free) {</a>
+<a name="ln135">			kprintf(&quot;DebugAllocPool::Free(%p): double free\n&quot;, address);</a>
+<a name="ln136">			return;</a>
+<a name="ln137">		}</a>
+<a name="ln138"> </a>
+<a name="ln139">		uint32 next = index + 1 + header-&gt;size;</a>
+<a name="ln140"> </a>
+<a name="ln141">		// join with previous, if possible</a>
+<a name="ln142">		if (index &gt; 1 &amp;&amp; fBase[header-&gt;previous].free) {</a>
+<a name="ln143">			uint32 previous = header-&gt;previous;</a>
+<a name="ln144">			_RemoveFreeEntry(previous);</a>
+<a name="ln145"> </a>
+<a name="ln146">			fBase[previous].size += 1 + header-&gt;size;</a>
+<a name="ln147">			fBase[next].previous = previous;</a>
+<a name="ln148"> </a>
+<a name="ln149">			index = previous;</a>
+<a name="ln150">			header = fBase + index;</a>
+<a name="ln151">		}</a>
+<a name="ln152"> </a>
+<a name="ln153">		// join with next, if possible</a>
+<a name="ln154">		if (next &lt; fEnd &amp;&amp; fBase[next].free) {</a>
+<a name="ln155">			_RemoveFreeEntry(next);</a>
+<a name="ln156"> </a>
+<a name="ln157">			header-&gt;size += 1 + fBase[next].size;</a>
+<a name="ln158"> </a>
+<a name="ln159">			uint32 nextNext = index + 1 + header-&gt;size;</a>
+<a name="ln160">			if (nextNext &lt; fEnd)</a>
+<a name="ln161">				fBase[nextNext].previous = index;</a>
+<a name="ln162">		}</a>
+<a name="ln163"> </a>
+<a name="ln164">		_InsertFreeEntry(index);</a>
+<a name="ln165">	}</a>
+<a name="ln166"> </a>
+<a name="ln167">private:</a>
+<a name="ln168">	void _InsertFreeEntry(uint32 index)</a>
+<a name="ln169">	{</a>
+<a name="ln170">		// find the insertion point -- list is sorted by ascending size</a>
+<a name="ln171">		uint32 size = fBase[index].size;</a>
+<a name="ln172">		uint32 next = fFirstFree;</a>
+<a name="ln173">		while (next != 0 &amp;&amp; size &gt; fBase[next].size)</a>
+<a name="ln174">			next = ((free_entry*)&amp;fBase[next])-&gt;next_free;</a>
+<a name="ln175"> </a>
+<a name="ln176">		// insert</a>
+<a name="ln177">		uint32 previous;</a>
+<a name="ln178">		if (next != 0) {</a>
+<a name="ln179">			previous = ((free_entry*)&amp;fBase[next])-&gt;previous_free;</a>
+<a name="ln180">			((free_entry*)&amp;fBase[next])-&gt;previous_free = index;</a>
+<a name="ln181">		} else {</a>
+<a name="ln182">			previous = fLastFree;</a>
+<a name="ln183">			fLastFree = index;</a>
+<a name="ln184">		}</a>
+<a name="ln185"> </a>
+<a name="ln186">		if (previous != 0)</a>
+<a name="ln187">			((free_entry*)&amp;fBase[previous])-&gt;next_free = index;</a>
+<a name="ln188">		else</a>
+<a name="ln189">			fFirstFree = index;</a>
+<a name="ln190"> </a>
+<a name="ln191">		((free_entry*)&amp;fBase[index])-&gt;previous_free = previous;</a>
+<a name="ln192">		((free_entry*)&amp;fBase[index])-&gt;next_free = next;</a>
+<a name="ln193"> </a>
+<a name="ln194">		fBase[index].free = true;</a>
+<a name="ln195">	}</a>
+<a name="ln196"> </a>
+<a name="ln197">	void _RemoveFreeEntry(uint32 index)</a>
+<a name="ln198">	{</a>
+<a name="ln199">		uint32 previous = ((free_entry*)&amp;fBase[index])-&gt;previous_free;</a>
+<a name="ln200">		uint32 next = ((free_entry*)&amp;fBase[index])-&gt;next_free;</a>
+<a name="ln201"> </a>
+<a name="ln202">		if (previous != 0)</a>
+<a name="ln203">			((free_entry*)&amp;fBase[previous])-&gt;next_free = next;</a>
+<a name="ln204">		else</a>
+<a name="ln205">			fFirstFree = next;</a>
+<a name="ln206"> </a>
+<a name="ln207">		if (next != 0)</a>
+<a name="ln208">			((free_entry*)&amp;fBase[next])-&gt;previous_free = previous;</a>
+<a name="ln209">		else</a>
+<a name="ln210">			fLastFree = previous;</a>
+<a name="ln211"> </a>
+<a name="ln212">		fBase[index].free = false;</a>
+<a name="ln213">	}</a>
+<a name="ln214"> </a>
+<a name="ln215">private:</a>
+<a name="ln216">	DebugAllocPool*		fParent;</a>
+<a name="ln217">	DebugAllocPool*		fChild;</a>
+<a name="ln218">	allocation_header*	fBase;		// actually base - 1, so that index 0 is</a>
+<a name="ln219">									// invalid</a>
+<a name="ln220">	uint32				fEnd;</a>
+<a name="ln221">	uint32				fFirstFree;</a>
+<a name="ln222">	uint32				fLastFree;</a>
+<a name="ln223">};</a>
+<a name="ln224"> </a>
+<a name="ln225"> </a>
+<a name="ln226">static DebugAllocPool* sCurrentPool;</a>
+<a name="ln227">static DebugAllocPool sInitialPool;</a>
+<a name="ln228"> </a>
+<a name="ln229"> </a>
+<a name="ln230">debug_alloc_pool*</a>
+<a name="ln231">create_debug_alloc_pool()</a>
+<a name="ln232">{</a>
+<a name="ln233">	if (sCurrentPool == NULL) {</a>
+<a name="ln234">		sInitialPool.Init(sHeapBase, sHeapSize);</a>
+<a name="ln235">		sCurrentPool = &amp;sInitialPool;</a>
+<a name="ln236">		return sCurrentPool;</a>
+<a name="ln237">	}</a>
+<a name="ln238"> </a>
+<a name="ln239">	DebugAllocPool* pool = sCurrentPool-&gt;CreateChildPool();</a>
+<a name="ln240">	if (pool == NULL)</a>
+<a name="ln241">		return NULL;</a>
+<a name="ln242"> </a>
+<a name="ln243">	sCurrentPool = pool;</a>
+<a name="ln244">	return sCurrentPool;</a>
+<a name="ln245">}</a>
+<a name="ln246"> </a>
+<a name="ln247"> </a>
+<a name="ln248">void</a>
+<a name="ln249">delete_debug_alloc_pool(debug_alloc_pool* pool)</a>
+<a name="ln250">{</a>
+<a name="ln251">	if (pool == NULL || sCurrentPool == NULL)</a>
+<a name="ln252">		return;</a>
+<a name="ln253"> </a>
+<a name="ln254">	// find the pool in the hierarchy</a>
+<a name="ln255">	DebugAllocPool* otherPool = sCurrentPool;</a>
+<a name="ln256">	while (otherPool != NULL &amp;&amp; otherPool != pool)</a>
+<a name="ln257">		otherPool = otherPool-&gt;Parent();</a>
+<a name="ln258"> </a>
+<a name="ln259">	if (otherPool == NULL)</a>
+<a name="ln260">		return;</a>
+<a name="ln261"> </a>
+<a name="ln262">	// destroy the pool</a>
+<a name="ln263">	sCurrentPool = pool-&gt;Parent();</a>
+<a name="ln264">	pool-&gt;Destroy();</a>
+<a name="ln265"> </a>
+<a name="ln266">	if (pool != &amp;sInitialPool)</a>
+<a name="ln267">		debug_free(pool);</a>
+<a name="ln268">}</a>
+<a name="ln269"> </a>
+<a name="ln270"> </a>
+<a name="ln271">void*</a>
+<a name="ln272">debug_malloc(size_t size)</a>
+<a name="ln273">{</a>
+<a name="ln274">	if (sCurrentPool == NULL)</a>
+<a name="ln275">		return NULL;</a>
+<a name="ln276"> </a>
+<a name="ln277">	return sCurrentPool-&gt;Allocate(size);</a>
+<a name="ln278">}</a>
+<a name="ln279"> </a>
+<a name="ln280"> </a>
+<a name="ln281">void*</a>
+<a name="ln282">debug_calloc(size_t num, size_t size)</a>
+<a name="ln283">{</a>
+<a name="ln284">	size_t allocationSize = num * size;</a>
+<a name="ln285">	void* allocation = debug_malloc(allocationSize);</a>
+<a name="ln286">	if (allocation == NULL)</a>
+<a name="ln287">		return NULL;</a>
+<a name="ln288"> </a>
+<a name="ln289">	memset(allocation, 0, allocationSize);</a>
+<a name="ln290">	return allocation;</a>
+<a name="ln291">}</a>
+<a name="ln292"> </a>
+<a name="ln293"> </a>
+<a name="ln294">void</a>
+<a name="ln295">debug_free(void* address)</a>
+<a name="ln296">{</a>
+<a name="ln297">	if (address != NULL &amp;&amp; sCurrentPool != NULL)</a>
+<a name="ln298">		sCurrentPool-&gt;Free(address);</a>
+<a name="ln299">}</a>
+<a name="ln300"> </a>
+<a name="ln301"> </a>
+<a name="ln302">void</a>
+<a name="ln303">debug_heap_init()</a>
+<a name="ln304">{</a>
+<a name="ln305">	// create the heap area</a>
+<a name="ln306">	void* base;</a>
+<a name="ln307">	virtual_address_restrictions virtualRestrictions = {};</a>
+<a name="ln308">	virtualRestrictions.address_specification = B_ANY_KERNEL_ADDRESS;</a>
+<a name="ln309">	physical_address_restrictions physicalRestrictions = {};</a>
+<a name="ln310">	area_id area = create_area_etc(B_SYSTEM_TEAM, &quot;kdebug heap&quot;, KDEBUG_HEAP,</a>
+<a name="ln311">		B_FULL_LOCK, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,</a>
+<a name="ln312">		CREATE_AREA_DONT_WAIT, 0, &amp;virtualRestrictions, &amp;physicalRestrictions,</a>
+<a name="ln313">		(void**)&amp;base);</a>
+<a name="ln314">	if (area &lt; 0)</a>
+<a name="ln315">		return;</a>
+<a name="ln316"> </a>
+<a name="ln317">	// switch from the small static buffer to the area</a>
+<a name="ln318">	InterruptsLocker locker;</a>
+<a name="ln319">	sHeapBase = base;</a>
+<a name="ln320">	sHeapSize = KDEBUG_HEAP;</a>
+<a name="ln321">}</a>
+
+</code></pre>
+<div class="balloon" rel="99"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v717/" target="_blank">V717</a> It is suspicious to cast object of base class 'allocation_header' to derived class 'free_entry'.</p></div>
+<div class="balloon" rel="208"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v717/" target="_blank">V717</a> It is suspicious to cast object of base class 'allocation_header' to derived class 'free_entry'.</p></div>
+<div class="balloon" rel="203"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v717/" target="_blank">V717</a> It is suspicious to cast object of base class 'allocation_header' to derived class 'free_entry'.</p></div>
+<div class="balloon" rel="200"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v717/" target="_blank">V717</a> It is suspicious to cast object of base class 'allocation_header' to derived class 'free_entry'.</p></div>
+<div class="balloon" rel="199"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v717/" target="_blank">V717</a> It is suspicious to cast object of base class 'allocation_header' to derived class 'free_entry'.</p></div>
+<div class="balloon" rel="179"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v717/" target="_blank">V717</a> It is suspicious to cast object of base class 'allocation_header' to derived class 'free_entry'.</p></div>
+<div class="balloon" rel="174"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v717/" target="_blank">V717</a> It is suspicious to cast object of base class 'allocation_header' to derived class 'free_entry'.</p></div>
+<div class="balloon" rel="192"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v717/" target="_blank">V717</a> It is suspicious to cast object of base class 'allocation_header' to derived class 'free_entry'.</p></div>
+<div class="balloon" rel="191"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v717/" target="_blank">V717</a> It is suspicious to cast object of base class 'allocation_header' to derived class 'free_entry'.</p></div>
+<div class="balloon" rel="187"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v717/" target="_blank">V717</a> It is suspicious to cast object of base class 'allocation_header' to derived class 'free_entry'.</p></div>
+<div class="balloon" rel="180"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v717/" target="_blank">V717</a> It is suspicious to cast object of base class 'allocation_header' to derived class 'free_entry'.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

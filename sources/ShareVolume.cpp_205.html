@@ -1,0 +1,3170 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>ShareVolume.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// ShareVolume.cpp</a>
+<a name="ln2"> </a>
+<a name="ln3">#include &quot;ShareVolume.h&quot;</a>
+<a name="ln4"> </a>
+<a name="ln5">#include &lt;new&gt;</a>
+<a name="ln6">#include &lt;unistd.h&gt;</a>
+<a name="ln7"> </a>
+<a name="ln8">#include &lt;AppDefs.h&gt;	// for B_QUERY_UPDATE</a>
+<a name="ln9">#include &lt;AutoDeleter.h&gt;</a>
+<a name="ln10">#include &lt;AutoLocker.h&gt;</a>
+<a name="ln11">#include &lt;HashMap.h&gt;</a>
+<a name="ln12"> </a>
+<a name="ln13">#include &quot;AuthenticationServer.h&quot;</a>
+<a name="ln14">#include &quot;Compatibility.h&quot;</a>
+<a name="ln15">#include &quot;Connection.h&quot;</a>
+<a name="ln16">#include &quot;ConnectionFactory.h&quot;</a>
+<a name="ln17">#include &quot;DebugSupport.h&quot;</a>
+<a name="ln18">#include &quot;ExtendedServerInfo.h&quot;</a>
+<a name="ln19">#include &quot;Permissions.h&quot;</a>
+<a name="ln20">#include &quot;Node.h&quot;</a>
+<a name="ln21">#include &quot;QueryManager.h&quot;</a>
+<a name="ln22">#include &quot;RequestChannel.h&quot;</a>
+<a name="ln23">#include &quot;RequestConnection.h&quot;</a>
+<a name="ln24">#include &quot;Requests.h&quot;</a>
+<a name="ln25">#include &quot;RootVolume.h&quot;</a>
+<a name="ln26">#include &quot;SendReceiveRequest.h&quot;</a>
+<a name="ln27">#include &quot;ServerConnection.h&quot;</a>
+<a name="ln28">#include &quot;ServerConnectionProvider.h&quot;</a>
+<a name="ln29">#include &quot;ShareAttrDir.h&quot;</a>
+<a name="ln30">#include &quot;ShareAttrDirIterator.h&quot;</a>
+<a name="ln31">#include &quot;ShareNode.h&quot;</a>
+<a name="ln32">#include &quot;Utils.h&quot;</a>
+<a name="ln33">#include &quot;VolumeManager.h&quot;</a>
+<a name="ln34">#include &quot;VolumeSupport.h&quot;</a>
+<a name="ln35"> </a>
+<a name="ln36">// TODO: Request timeouts!</a>
+<a name="ln37"> </a>
+<a name="ln38">static const int32 kMaxWriteBufferSize	= 64 * 1024;	// 64 KB</a>
+<a name="ln39">static const int32 kUserBufferSize = 256;</a>
+<a name="ln40">static const int32 kPasswordBufferSize = 256;</a>
+<a name="ln41"> </a>
+<a name="ln42">// connection states</a>
+<a name="ln43">enum {</a>
+<a name="ln44">	CONNECTION_NOT_INITIALIZED,</a>
+<a name="ln45">	CONNECTION_READY,</a>
+<a name="ln46">	CONNECTION_CLOSED,</a>
+<a name="ln47">};</a>
+<a name="ln48"> </a>
+<a name="ln49">// NodeMap</a>
+<a name="ln50">struct ShareVolume::NodeMap : HashMap&lt;HashKey64&lt;ino_t&gt;, ShareNode*&gt; {</a>
+<a name="ln51">};</a>
+<a name="ln52"> </a>
+<a name="ln53">// EntryKey</a>
+<a name="ln54">//</a>
+<a name="ln55">// NOTE: This class doesn't make a copy of the name string it is constructed</a>
+<a name="ln56">// with. So, when entering the key in a map, one must make sure, that the</a>
+<a name="ln57">// string stays valid as long as the entry is in the map.</a>
+<a name="ln58">struct ShareVolume::EntryKey {</a>
+<a name="ln59">	EntryKey() {}</a>
+<a name="ln60"> </a>
+<a name="ln61">	EntryKey(ino_t directoryID, const char* name)</a>
+<a name="ln62">		: directoryID(directoryID),</a>
+<a name="ln63">		  name(name)</a>
+<a name="ln64">	{</a>
+<a name="ln65">	}</a>
+<a name="ln66"> </a>
+<a name="ln67">	EntryKey(const EntryKey&amp; other)</a>
+<a name="ln68">		: directoryID(other.directoryID),</a>
+<a name="ln69">		  name(other.name)</a>
+<a name="ln70">	{</a>
+<a name="ln71">	}</a>
+<a name="ln72"> </a>
+<a name="ln73">	uint32 GetHashCode() const</a>
+<a name="ln74">	{</a>
+<a name="ln75">		uint32 hash = (uint32)directoryID;</a>
+<a name="ln76">		hash = 31 * hash + (uint32)(directoryID &gt;&gt; 32);</a>
+<a name="ln77">		hash = 31 * hash + string_hash(name);</a>
+<a name="ln78">		return hash;</a>
+<a name="ln79">	}</a>
+<a name="ln80"> </a>
+<a name="ln81">	EntryKey&amp; operator=(const EntryKey&amp; other)</a>
+<a name="ln82">	{</a>
+<a name="ln83">		directoryID = other.directoryID;</a>
+<a name="ln84">		name = other.name;</a>
+<a name="ln85">		return *this;</a>
+<a name="ln86">	}</a>
+<a name="ln87"> </a>
+<a name="ln88">	bool operator==(const EntryKey&amp; other) const</a>
+<a name="ln89">	{</a>
+<a name="ln90">		if (directoryID != other.directoryID)</a>
+<a name="ln91">			return false;</a>
+<a name="ln92"> </a>
+<a name="ln93">		if (name)</a>
+<a name="ln94">			return (other.name &amp;&amp; strcmp(name, other.name) == 0);</a>
+<a name="ln95"> </a>
+<a name="ln96">		return !other.name;</a>
+<a name="ln97">	}</a>
+<a name="ln98"> </a>
+<a name="ln99">	bool operator!=(const EntryKey&amp; other) const</a>
+<a name="ln100">	{</a>
+<a name="ln101">		return !(*this == other);</a>
+<a name="ln102">	}</a>
+<a name="ln103"> </a>
+<a name="ln104">	ino_t		directoryID;</a>
+<a name="ln105">	const char*	name;</a>
+<a name="ln106">};</a>
+<a name="ln107"> </a>
+<a name="ln108">// EntryMap</a>
+<a name="ln109">struct ShareVolume::EntryMap : HashMap&lt;EntryKey, ShareDirEntry*&gt; {</a>
+<a name="ln110">};</a>
+<a name="ln111"> </a>
+<a name="ln112">// LocalNodeIDMap</a>
+<a name="ln113">struct ShareVolume::LocalNodeIDMap : HashMap&lt;NodeID, ino_t&gt; {</a>
+<a name="ln114">};</a>
+<a name="ln115"> </a>
+<a name="ln116">// RemoteNodeIDMap</a>
+<a name="ln117">struct ShareVolume::RemoteNodeIDMap : HashMap&lt;HashKey64&lt;ino_t&gt;, NodeID&gt; {</a>
+<a name="ln118">};</a>
+<a name="ln119"> </a>
+<a name="ln120">// DirCookie</a>
+<a name="ln121">struct ShareVolume::DirCookie {</a>
+<a name="ln122">	ShareDirIterator*	iterator;</a>
+<a name="ln123">};</a>
+<a name="ln124"> </a>
+<a name="ln125">// AttrDirCookie</a>
+<a name="ln126">struct ShareVolume::AttrDirCookie {</a>
+<a name="ln127">	AttrDirCookie()</a>
+<a name="ln128">		: iterator(NULL),</a>
+<a name="ln129">		  cookie(-1),</a>
+<a name="ln130">		  rewind(false)</a>
+<a name="ln131">	{</a>
+<a name="ln132">	}</a>
+<a name="ln133"> </a>
+<a name="ln134">	ShareAttrDirIterator*	iterator;</a>
+<a name="ln135">	intptr_t				cookie;</a>
+<a name="ln136">	bool					rewind;</a>
+<a name="ln137">};</a>
+<a name="ln138"> </a>
+<a name="ln139">// AttrDirIteratorMap</a>
+<a name="ln140">struct ShareVolume::AttrDirIteratorMap</a>
+<a name="ln141">	: HashMap&lt;HashKey64&lt;ino_t&gt;, DoublyLinkedList&lt;ShareAttrDirIterator&gt;*&gt; {</a>
+<a name="ln142">};</a>
+<a name="ln143"> </a>
+<a name="ln144"> </a>
+<a name="ln145">// #pragma mark -</a>
+<a name="ln146"> </a>
+<a name="ln147">// constructor</a>
+<a name="ln148">ShareVolume::ShareVolume(VolumeManager* volumeManager,</a>
+<a name="ln149">	ServerConnectionProvider* connectionProvider,</a>
+<a name="ln150">	ExtendedServerInfo* serverInfo, ExtendedShareInfo* shareInfo)</a>
+<a name="ln151">	: Volume(volumeManager),</a>
+<a name="ln152">	  fID(-1),</a>
+<a name="ln153">	  fFlags(0),</a>
+<a name="ln154">	  fMountLock(&quot;share mount lock&quot;),</a>
+<a name="ln155">	  fNodes(NULL),</a>
+<a name="ln156">	  fEntries(NULL),</a>
+<a name="ln157">	  fAttrDirIterators(NULL),</a>
+<a name="ln158">	  fLocalNodeIDs(NULL),</a>
+<a name="ln159">	  fRemoteNodeIDs(NULL),</a>
+<a name="ln160">	  fServerConnectionProvider(connectionProvider),</a>
+<a name="ln161">	  fServerInfo(serverInfo),</a>
+<a name="ln162">	  fShareInfo(shareInfo),</a>
+<a name="ln163">	  fServerConnection(NULL),</a>
+<a name="ln164">	  fConnection(NULL),</a>
+<a name="ln165">	  fSharePermissions(0),</a>
+<a name="ln166">	  fConnectionState(CONNECTION_NOT_INITIALIZED)</a>
+<a name="ln167">{</a>
+<a name="ln168">	fFlags = fVolumeManager-&gt;GetMountFlags();</a>
+<a name="ln169">	if (fServerConnectionProvider)</a>
+<a name="ln170">		fServerConnectionProvider-&gt;AcquireReference();</a>
+<a name="ln171">	if (fServerInfo)</a>
+<a name="ln172">		fServerInfo-&gt;AcquireReference();</a>
+<a name="ln173">	if (fShareInfo)</a>
+<a name="ln174">		fShareInfo-&gt;AcquireReference();</a>
+<a name="ln175">}</a>
+<a name="ln176"> </a>
+<a name="ln177">// destructor</a>
+<a name="ln178">ShareVolume::~ShareVolume()</a>
+<a name="ln179">{</a>
+<a name="ln180">PRINT((&quot;ShareVolume::~ShareVolume()\n&quot;));</a>
+<a name="ln181">	// delete the root node</a>
+<a name="ln182">	if (fRootNode) {</a>
+<a name="ln183">		if (fNodes)</a>
+<a name="ln184">			fNodes-&gt;Remove(fRootNode-&gt;GetID());</a>
+<a name="ln185">		delete fRootNode;</a>
+<a name="ln186">		fRootNode = NULL;</a>
+<a name="ln187">	}</a>
+<a name="ln188"> </a>
+<a name="ln189">	// delete the nodes</a>
+<a name="ln190">	if (fNodes) {</a>
+<a name="ln191">		// there shouldn't be any more nodes</a>
+<a name="ln192">		if (fNodes-&gt;Size() &gt; 0) {</a>
+<a name="ln193">			WARN(&quot;ShareVolume::~ShareVolume(): WARNING: There are still &quot;</a>
+<a name="ln194">				&quot;%&quot; B_PRId32 &quot; nodes\n&quot;, fNodes-&gt;Size());</a>
+<a name="ln195">		}</a>
+<a name="ln196">		for (NodeMap::Iterator it = fNodes-&gt;GetIterator(); it.HasNext();)</a>
+<a name="ln197">			delete it.Next().value;</a>
+<a name="ln198">		delete fNodes;</a>
+<a name="ln199">	}</a>
+<a name="ln200"> </a>
+<a name="ln201">	// delete the entries</a>
+<a name="ln202">	if (fEntries) {</a>
+<a name="ln203">		// there shouldn't be any more entries</a>
+<a name="ln204">		if (fEntries-&gt;Size() &gt; 0) {</a>
+<a name="ln205">			WARN(&quot;ShareVolume::~ShareVolume(): WARNING: There are still &quot;</a>
+<a name="ln206">				&quot;%&quot; B_PRId32 &quot; entries\n&quot;, fEntries-&gt;Size());</a>
+<a name="ln207">		}</a>
+<a name="ln208">		for (EntryMap::Iterator it = fEntries-&gt;GetIterator(); it.HasNext();)</a>
+<a name="ln209">			delete it.Next().value;</a>
+<a name="ln210">		delete fEntries;</a>
+<a name="ln211">	}</a>
+<a name="ln212"> </a>
+<a name="ln213">	delete fLocalNodeIDs;</a>
+<a name="ln214">	delete fRemoteNodeIDs;</a>
+<a name="ln215"> </a>
+<a name="ln216">	if (fShareInfo)</a>
+<a name="ln217">		fShareInfo-&gt;ReleaseReference();</a>
+<a name="ln218">	if (fServerInfo)</a>
+<a name="ln219">		fServerInfo-&gt;ReleaseReference();</a>
+<a name="ln220">	if (fServerConnection)</a>
+<a name="ln221">		fServerConnection-&gt;ReleaseReference();</a>
+<a name="ln222">	if (fServerConnectionProvider)</a>
+<a name="ln223">		fServerConnectionProvider-&gt;ReleaseReference();</a>
+<a name="ln224">}</a>
+<a name="ln225"> </a>
+<a name="ln226">// GetID</a>
+<a name="ln227">nspace_id</a>
+<a name="ln228">ShareVolume::GetID() const</a>
+<a name="ln229">{</a>
+<a name="ln230">	return fID;</a>
+<a name="ln231">}</a>
+<a name="ln232"> </a>
+<a name="ln233">// IsReadOnly</a>
+<a name="ln234">bool</a>
+<a name="ln235">ShareVolume::IsReadOnly() const</a>
+<a name="ln236">{</a>
+<a name="ln237">	return (fFlags &amp; B_MOUNT_READ_ONLY);</a>
+<a name="ln238">}</a>
+<a name="ln239"> </a>
+<a name="ln240">// SupportsQueries</a>
+<a name="ln241">bool</a>
+<a name="ln242">ShareVolume::SupportsQueries() const</a>
+<a name="ln243">{</a>
+<a name="ln244">	return (fSharePermissions &amp; QUERY_SHARE_PERMISSION);</a>
+<a name="ln245">}</a>
+<a name="ln246"> </a>
+<a name="ln247">// Init</a>
+<a name="ln248">status_t</a>
+<a name="ln249">ShareVolume::Init(const char* name)</a>
+<a name="ln250">{</a>
+<a name="ln251">	status_t error = Volume::Init(name);</a>
+<a name="ln252">	if (error != B_OK)</a>
+<a name="ln253">		return error;</a>
+<a name="ln254"> </a>
+<a name="ln255">	// create node map</a>
+<a name="ln256">	fNodes = new(std::nothrow) NodeMap;</a>
+<a name="ln257">	if (!fNodes)</a>
+<a name="ln258">		RETURN_ERROR(B_NO_MEMORY);</a>
+<a name="ln259">	error = fNodes-&gt;InitCheck();</a>
+<a name="ln260">	if (error != B_OK)</a>
+<a name="ln261">		return error;</a>
+<a name="ln262"> </a>
+<a name="ln263">	// create entry map</a>
+<a name="ln264">	fEntries = new(std::nothrow) EntryMap;</a>
+<a name="ln265">	if (!fEntries)</a>
+<a name="ln266">		RETURN_ERROR(B_NO_MEMORY);</a>
+<a name="ln267">	error = fEntries-&gt;InitCheck();</a>
+<a name="ln268">	if (error != B_OK)</a>
+<a name="ln269">		return error;</a>
+<a name="ln270"> </a>
+<a name="ln271">	// create attribute iterator map</a>
+<a name="ln272">	fAttrDirIterators = new(std::nothrow) AttrDirIteratorMap;</a>
+<a name="ln273">	if (!fAttrDirIterators)</a>
+<a name="ln274">		RETURN_ERROR(B_NO_MEMORY);</a>
+<a name="ln275">	error = fAttrDirIterators-&gt;InitCheck();</a>
+<a name="ln276">	if (error != B_OK)</a>
+<a name="ln277">		return error;</a>
+<a name="ln278"> </a>
+<a name="ln279">	// create local node ID map</a>
+<a name="ln280">	fLocalNodeIDs = new(std::nothrow) LocalNodeIDMap;</a>
+<a name="ln281">	if (!fLocalNodeIDs)</a>
+<a name="ln282">		RETURN_ERROR(B_NO_MEMORY);</a>
+<a name="ln283">	error = fLocalNodeIDs-&gt;InitCheck();</a>
+<a name="ln284">	if (error != B_OK)</a>
+<a name="ln285">		return error;</a>
+<a name="ln286"> </a>
+<a name="ln287">	// create remote node ID map</a>
+<a name="ln288">	fRemoteNodeIDs = new(std::nothrow) RemoteNodeIDMap;</a>
+<a name="ln289">	if (!fRemoteNodeIDs)</a>
+<a name="ln290">		RETURN_ERROR(B_NO_MEMORY);</a>
+<a name="ln291">	error = fRemoteNodeIDs-&gt;InitCheck();</a>
+<a name="ln292">	if (error != B_OK)</a>
+<a name="ln293">		return error;</a>
+<a name="ln294"> </a>
+<a name="ln295">	// get a local node ID for our root node</a>
+<a name="ln296">	vnode_id localID = fVolumeManager-&gt;NewNodeID(this);</a>
+<a name="ln297">	if (localID &lt; 0)</a>
+<a name="ln298">		return localID;</a>
+<a name="ln299"> </a>
+<a name="ln300">	// create the root node</a>
+<a name="ln301">	fRootNode = new(std::nothrow) ShareDir(this, localID, NULL);</a>
+<a name="ln302">	if (!fRootNode) {</a>
+<a name="ln303">		fVolumeManager-&gt;RemoveNodeID(localID);</a>
+<a name="ln304">		return B_NO_MEMORY;</a>
+<a name="ln305">	}</a>
+<a name="ln306"> </a>
+<a name="ln307">	// add the root node to the node map</a>
+<a name="ln308">	error = fNodes-&gt;Put(localID, fRootNode);</a>
+<a name="ln309">	if (error != B_OK)</a>
+<a name="ln310">		return error;</a>
+<a name="ln311"> </a>
+<a name="ln312">	return B_OK;</a>
+<a name="ln313">}</a>
+<a name="ln314"> </a>
+<a name="ln315">// Uninit</a>
+<a name="ln316">void</a>
+<a name="ln317">ShareVolume::Uninit()</a>
+<a name="ln318">{</a>
+<a name="ln319">	Volume::Uninit();</a>
+<a name="ln320">}</a>
+<a name="ln321"> </a>
+<a name="ln322">// GetRootNode</a>
+<a name="ln323">Node*</a>
+<a name="ln324">ShareVolume::GetRootNode() const</a>
+<a name="ln325">{</a>
+<a name="ln326">	return fRootNode;</a>
+<a name="ln327">}</a>
+<a name="ln328"> </a>
+<a name="ln329">// PrepareToUnmount</a>
+<a name="ln330">void</a>
+<a name="ln331">ShareVolume::PrepareToUnmount()</a>
+<a name="ln332">{</a>
+<a name="ln333">PRINT((&quot;ShareVolume::PrepareToUnmount()\n&quot;));</a>
+<a name="ln334">	Volume::PrepareToUnmount();</a>
+<a name="ln335"> </a>
+<a name="ln336">	ConnectionClosed();</a>
+<a name="ln337"> </a>
+<a name="ln338">	AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln339"> </a>
+<a name="ln340">	// remove all entries and send respective &quot;entry removed&quot; events</a>
+<a name="ln341">	for (EntryMap::Iterator it = fEntries-&gt;GetIterator(); it.HasNext();) {</a>
+<a name="ln342">		ShareDirEntry* entry = it.Next().value;</a>
+<a name="ln343"> </a>
+<a name="ln344">		NotifyListener(B_ENTRY_REMOVED, fVolumeManager-&gt;GetID(),</a>
+<a name="ln345">			entry-&gt;GetDirectory()-&gt;GetID(), 0, entry-&gt;GetNode()-&gt;GetID(),</a>
+<a name="ln346">			entry-&gt;GetName());</a>
+<a name="ln347"> </a>
+<a name="ln348">		_RemoveEntry(entry);</a>
+<a name="ln349">	}</a>
+<a name="ln350">	fEntries-&gt;Clear();</a>
+<a name="ln351"> </a>
+<a name="ln352">	// get all IDs</a>
+<a name="ln353">	int32 count = fNodes-&gt;Size();</a>
+<a name="ln354">	if (count == 0)</a>
+<a name="ln355">		return;</a>
+<a name="ln356">	PRINT(&quot;  %&quot; B_PRId32 &quot; nodes to remove\n&quot;, count);</a>
+<a name="ln357">	vnode_id* ids = new(std::nothrow) vnode_id[count];</a>
+<a name="ln358">	if (!ids) {</a>
+<a name="ln359">		ERROR(&quot;ShareVolume::PrepareToUnmount(): ERROR: Insufficient memory to &quot;</a>
+<a name="ln360">			&quot;allocate the node ID array!\n&quot;);</a>
+<a name="ln361">		return;</a>
+<a name="ln362">	}</a>
+<a name="ln363">	ArrayDeleter&lt;vnode_id&gt; _(ids);</a>
+<a name="ln364">	count = 0;</a>
+<a name="ln365">	for (NodeMap::Iterator it = fNodes-&gt;GetIterator(); it.HasNext();) {</a>
+<a name="ln366">		ShareNode* node = it.Next().value;</a>
+<a name="ln367">		ids[count++] = node-&gt;GetID();</a>
+<a name="ln368">	}</a>
+<a name="ln369"> </a>
+<a name="ln370">	// Remove all nodes that are not known to the VFS right away.</a>
+<a name="ln371">	// If the netfs is already in the process of being unmounted, GetVNode()</a>
+<a name="ln372">	// will fail and the GetVNode(), RemoveVNode(), PutVNode() method won't</a>
+<a name="ln373">	// work for removing them.</a>
+<a name="ln374">	int32 remainingCount = 0;</a>
+<a name="ln375">	for (int32 i = 0; i &lt; count; i++) {</a>
+<a name="ln376">		if (Node* node = fNodes-&gt;Get(ids[i])) {</a>
+<a name="ln377">			if (node-&gt;IsKnownToVFS()) {</a>
+<a name="ln378">				// node is known to VFS; we need to use the GetVNode(),</a>
+<a name="ln379">				// RemoveVNode(), PutVNode() method</a>
+<a name="ln380">				ids[remainingCount++] = ids[i];</a>
+<a name="ln381">			} else {</a>
+<a name="ln382">				// node is not known to VFS; just remove and delete it</a>
+<a name="ln383">				fNodes-&gt;Remove(node-&gt;GetID());</a>
+<a name="ln384">				_RemoveLocalNodeID(node-&gt;GetID());</a>
+<a name="ln385">				if (node != fRootNode)</a>
+<a name="ln386">					delete node;</a>
+<a name="ln387">			}</a>
+<a name="ln388">		}</a>
+<a name="ln389">	}</a>
+<a name="ln390">	count = remainingCount;</a>
+<a name="ln391"> </a>
+<a name="ln392">	locker.Unlock();</a>
+<a name="ln393"> </a>
+<a name="ln394">	// remove the nodes</a>
+<a name="ln395">	for (int32 i = 0; i &lt; count; i++) {</a>
+<a name="ln396">		Node* node;</a>
+<a name="ln397">		if (GetVNode(ids[i], &amp;node) == B_OK) {</a>
+<a name="ln398">			PRINT(&quot;  removing node %&quot; B_PRIdINO &quot;\n&quot;, ids[i]);</a>
+<a name="ln399">			Volume::RemoveVNode(ids[i]);</a>
+<a name="ln400">			PutVNode(ids[i]);</a>
+<a name="ln401">		}</a>
+<a name="ln402">	}</a>
+<a name="ln403"> </a>
+<a name="ln404">	// remove ourselves for the server connection</a>
+<a name="ln405">	if (fServerConnection)</a>
+<a name="ln406">		fServerConnection-&gt;RemoveVolume(this);</a>
+<a name="ln407"> </a>
+<a name="ln408">	// delete all entries</a>
+<a name="ln409"> </a>
+<a name="ln410">PRINT((&quot;ShareVolume::PrepareToUnmount() done\n&quot;));</a>
+<a name="ln411">}</a>
+<a name="ln412"> </a>
+<a name="ln413">// RemoveChildVolume</a>
+<a name="ln414">void</a>
+<a name="ln415">ShareVolume::RemoveChildVolume(Volume* volume)</a>
+<a name="ln416">{</a>
+<a name="ln417">	// should never be called</a>
+<a name="ln418">	WARN(&quot;WARNING: ShareVolume::RemoveChildVolume(%p) invoked!\n&quot;, volume);</a>
+<a name="ln419">}</a>
+<a name="ln420"> </a>
+<a name="ln421"> </a>
+<a name="ln422">// #pragma mark -</a>
+<a name="ln423">// #pragma mark ----- FS -----</a>
+<a name="ln424"> </a>
+<a name="ln425">// Unmount</a>
+<a name="ln426">status_t</a>
+<a name="ln427">ShareVolume::Unmount()</a>
+<a name="ln428">{</a>
+<a name="ln429">	if (_IsConnected()) {</a>
+<a name="ln430">		// send the request</a>
+<a name="ln431">		UnmountRequest request;</a>
+<a name="ln432">		request.volumeID = fID;</a>
+<a name="ln433">		fConnection-&gt;SendRequest(&amp;request);</a>
+<a name="ln434">	}</a>
+<a name="ln435">	return B_OK;</a>
+<a name="ln436">}</a>
+<a name="ln437"> </a>
+<a name="ln438">// Sync</a>
+<a name="ln439">status_t</a>
+<a name="ln440">ShareVolume::Sync()</a>
+<a name="ln441">{</a>
+<a name="ln442">	// TODO: Implement?</a>
+<a name="ln443">	// We can't implement this without risking an endless recursion. The server</a>
+<a name="ln444">	// could only invoke sync(), which would sync all FSs, including a NetFS</a>
+<a name="ln445">	// which might be connected with a server running alongside this client.</a>
+<a name="ln446">	// We could introduce a sync flag to break the recursion. This might be</a>
+<a name="ln447">	// risky though.</a>
+<a name="ln448">	return B_OK;</a>
+<a name="ln449">}</a>
+<a name="ln450"> </a>
+<a name="ln451"> </a>
+<a name="ln452">// #pragma mark -</a>
+<a name="ln453">// #pragma mark ----- vnodes -----</a>
+<a name="ln454"> </a>
+<a name="ln455">// ReadVNode</a>
+<a name="ln456">status_t</a>
+<a name="ln457">ShareVolume::ReadVNode(vnode_id vnid, char reenter, Node** _node)</a>
+<a name="ln458">{</a>
+<a name="ln459">	// check the map, maybe it's already loaded</a>
+<a name="ln460">	ShareNode* node = NULL;</a>
+<a name="ln461">	{</a>
+<a name="ln462">		AutoLocker&lt;Locker&gt; _(fLock);</a>
+<a name="ln463">		node = _GetNodeByLocalID(vnid);</a>
+<a name="ln464">		if (node) {</a>
+<a name="ln465">			node-&gt;SetKnownToVFS(true);</a>
+<a name="ln466">			*_node = node;</a>
+<a name="ln467"> </a>
+<a name="ln468">			// add a volume reference for the node</a>
+<a name="ln469">			AcquireReference();</a>
+<a name="ln470"> </a>
+<a name="ln471">			return B_OK;</a>
+<a name="ln472">		}</a>
+<a name="ln473">	}</a>
+<a name="ln474"> </a>
+<a name="ln475">	// not yet loaded: send a request to the server</a>
+<a name="ln476">	if (!_EnsureShareMounted())</a>
+<a name="ln477">		return ERROR_NOT_CONNECTED;</a>
+<a name="ln478"> </a>
+<a name="ln479">	// get the remote ID</a>
+<a name="ln480">	NodeID remoteID;</a>
+<a name="ln481">	status_t error = _GetRemoteNodeID(vnid, &amp;remoteID);</a>
+<a name="ln482">	if (error != B_OK)</a>
+<a name="ln483">		return error;</a>
+<a name="ln484"> </a>
+<a name="ln485">	// prepare the request</a>
+<a name="ln486">	ReadVNodeRequest request;</a>
+<a name="ln487">	request.volumeID = fID;</a>
+<a name="ln488">	request.nodeID = remoteID;</a>
+<a name="ln489"> </a>
+<a name="ln490">	// send the request</a>
+<a name="ln491">	ReadVNodeReply* reply;</a>
+<a name="ln492">	error = SendRequest(fConnection, &amp;request, &amp;reply);</a>
+<a name="ln493">	if (error != B_OK)</a>
+<a name="ln494">		RETURN_ERROR(error);</a>
+<a name="ln495">	ObjectDeleter&lt;Request&gt; replyDeleter(reply);</a>
+<a name="ln496">	if (reply-&gt;error != B_OK)</a>
+<a name="ln497">		RETURN_ERROR(reply-&gt;error);</a>
+<a name="ln498"> </a>
+<a name="ln499">	// add the node</a>
+<a name="ln500">	AutoLocker&lt;Locker&gt; _(fLock);</a>
+<a name="ln501">	error = _LoadNode(reply-&gt;nodeInfo, &amp;node);</a>
+<a name="ln502">	if (error != B_OK)</a>
+<a name="ln503">		RETURN_ERROR(error);</a>
+<a name="ln504">	node-&gt;SetKnownToVFS(true);</a>
+<a name="ln505">	*_node = node;</a>
+<a name="ln506"> </a>
+<a name="ln507">	// add a volume reference for the node</a>
+<a name="ln508">	AcquireReference();</a>
+<a name="ln509"> </a>
+<a name="ln510">	return B_OK;</a>
+<a name="ln511">}</a>
+<a name="ln512"> </a>
+<a name="ln513">// WriteVNode</a>
+<a name="ln514">status_t</a>
+<a name="ln515">ShareVolume::WriteVNode(Node* node, char reenter)</a>
+<a name="ln516">{</a>
+<a name="ln517">	AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln518">	node-&gt;SetKnownToVFS(false);</a>
+<a name="ln519"> </a>
+<a name="ln520">	// surrender the node's volume reference</a>
+<a name="ln521">	locker.Unlock();</a>
+<a name="ln522">	PutVolume();</a>
+<a name="ln523"> </a>
+<a name="ln524">	return B_OK;</a>
+<a name="ln525">}</a>
+<a name="ln526"> </a>
+<a name="ln527">// RemoveVNode</a>
+<a name="ln528">status_t</a>
+<a name="ln529">ShareVolume::RemoveVNode(Node* node, char reenter)</a>
+<a name="ln530">{</a>
+<a name="ln531">	AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln532">	node-&gt;SetKnownToVFS(false);</a>
+<a name="ln533">	fNodes-&gt;Remove(node-&gt;GetID());</a>
+<a name="ln534">	_RemoveLocalNodeID(node-&gt;GetID());</a>
+<a name="ln535">	if (node != fRootNode)</a>
+<a name="ln536">		delete node;</a>
+<a name="ln537"> </a>
+<a name="ln538">	// surrender the node's volume reference</a>
+<a name="ln539">	locker.Unlock();</a>
+<a name="ln540">	PutVolume();</a>
+<a name="ln541"> </a>
+<a name="ln542">	return B_OK;</a>
+<a name="ln543">}</a>
+<a name="ln544"> </a>
+<a name="ln545"> </a>
+<a name="ln546">// #pragma mark -</a>
+<a name="ln547">// #pragma mark ----- nodes -----</a>
+<a name="ln548"> </a>
+<a name="ln549">// FSync</a>
+<a name="ln550">status_t</a>
+<a name="ln551">ShareVolume::FSync(Node* _node)</a>
+<a name="ln552">{</a>
+<a name="ln553">	// TODO: Implement!</a>
+<a name="ln554">	return B_BAD_VALUE;</a>
+<a name="ln555">}</a>
+<a name="ln556"> </a>
+<a name="ln557">// ReadStat</a>
+<a name="ln558">status_t</a>
+<a name="ln559">ShareVolume::ReadStat(Node* _node, struct stat* st)</a>
+<a name="ln560">{</a>
+<a name="ln561">	ShareNode* node = dynamic_cast&lt;ShareNode*&gt;(_node);</a>
+<a name="ln562"> </a>
+<a name="ln563">	AutoLocker&lt;Locker&gt; _(fLock);</a>
+<a name="ln564">	*st = node-&gt;GetNodeInfo().st;</a>
+<a name="ln565">	st-&gt;st_dev = fVolumeManager-&gt;GetID();</a>
+<a name="ln566">	st-&gt;st_ino = node-&gt;GetID();</a>
+<a name="ln567">	// we set the UID/GID fields to the one who mounted the FS</a>
+<a name="ln568">	st-&gt;st_uid = fVolumeManager-&gt;GetMountUID();</a>
+<a name="ln569">	st-&gt;st_gid = fVolumeManager-&gt;GetMountGID();</a>
+<a name="ln570">	return B_OK;</a>
+<a name="ln571">}</a>
+<a name="ln572"> </a>
+<a name="ln573">// WriteStat</a>
+<a name="ln574">status_t</a>
+<a name="ln575">ShareVolume::WriteStat(Node* _node, struct stat *st, uint32 mask)</a>
+<a name="ln576">{</a>
+<a name="ln577">	ShareNode* node = dynamic_cast&lt;ShareNode*&gt;(_node);</a>
+<a name="ln578"> </a>
+<a name="ln579">	if (!_EnsureShareMounted())</a>
+<a name="ln580">		return ERROR_NOT_CONNECTED;</a>
+<a name="ln581"> </a>
+<a name="ln582">	// check read-only</a>
+<a name="ln583">	if (IsReadOnly())</a>
+<a name="ln584">		return B_PERMISSION_DENIED;</a>
+<a name="ln585">	// prepare the request</a>
+<a name="ln586">	WriteStatRequest request;</a>
+<a name="ln587">	request.volumeID = fID;</a>
+<a name="ln588">	request.nodeID = node-&gt;GetRemoteID();</a>
+<a name="ln589">	request.nodeInfo.st = *st;</a>
+<a name="ln590">	request.mask = mask;</a>
+<a name="ln591">	// send the request</a>
+<a name="ln592">	WriteStatReply* reply;</a>
+<a name="ln593">	status_t error = SendRequest(fConnection, &amp;request, &amp;reply);</a>
+<a name="ln594">	if (error != B_OK)</a>
+<a name="ln595">		RETURN_ERROR(error);</a>
+<a name="ln596">	ObjectDeleter&lt;Request&gt; replyDeleter(reply);</a>
+<a name="ln597">	// update the node</a>
+<a name="ln598">	if (reply-&gt;nodeInfoValid)</a>
+<a name="ln599">		_UpdateNode(reply-&gt;nodeInfo);</a>
+<a name="ln600">	if (reply-&gt;error != B_OK)</a>
+<a name="ln601">		RETURN_ERROR(reply-&gt;error);</a>
+<a name="ln602">	return B_OK;</a>
+<a name="ln603">}</a>
+<a name="ln604"> </a>
+<a name="ln605">// Access</a>
+<a name="ln606">status_t</a>
+<a name="ln607">ShareVolume::Access(Node* _node, int mode)</a>
+<a name="ln608">{</a>
+<a name="ln609">	// TODO: Implement.</a>
+<a name="ln610">	return B_OK;</a>
+<a name="ln611">}</a>
+<a name="ln612"> </a>
+<a name="ln613"> </a>
+<a name="ln614">// #pragma mark -</a>
+<a name="ln615">// #pragma mark ----- files -----</a>
+<a name="ln616"> </a>
+<a name="ln617">// Create</a>
+<a name="ln618">status_t</a>
+<a name="ln619">ShareVolume::Create(Node* _dir, const char* name, int openMode, int mode,</a>
+<a name="ln620">	vnode_id* vnid, void** cookie)</a>
+<a name="ln621">{</a>
+<a name="ln622">	ShareDir* dir = dynamic_cast&lt;ShareDir*&gt;(_dir);</a>
+<a name="ln623">	if (!dir)</a>
+<a name="ln624">		return B_BAD_VALUE;</a>
+<a name="ln625"> </a>
+<a name="ln626">	if (!_EnsureShareMounted())</a>
+<a name="ln627">		return ERROR_NOT_CONNECTED;</a>
+<a name="ln628"> </a>
+<a name="ln629">	// check permissions</a>
+<a name="ln630">	if (IsReadOnly())</a>
+<a name="ln631">		return B_PERMISSION_DENIED;</a>
+<a name="ln632">	if (IsVNodeRemoved(dir-&gt;GetID()) &gt; 0)</a>
+<a name="ln633">		RETURN_ERROR(B_NOT_ALLOWED);</a>
+<a name="ln634"> </a>
+<a name="ln635">	// prepare the request</a>
+<a name="ln636">	CreateFileRequest request;</a>
+<a name="ln637">	request.volumeID = fID;</a>
+<a name="ln638">	request.directoryID = dir-&gt;GetRemoteID();</a>
+<a name="ln639">	request.name.SetTo(name);</a>
+<a name="ln640">	request.openMode = openMode;</a>
+<a name="ln641">	request.mode = mode;</a>
+<a name="ln642"> </a>
+<a name="ln643">	// send the request</a>
+<a name="ln644">	CreateFileReply* reply;</a>
+<a name="ln645">	status_t error = SendRequest(fConnection, &amp;request, &amp;reply);</a>
+<a name="ln646">	if (error != B_OK)</a>
+<a name="ln647">		RETURN_ERROR(error);</a>
+<a name="ln648">	ObjectDeleter&lt;Request&gt; replyDeleter(reply);</a>
+<a name="ln649">	if (reply-&gt;error != B_OK)</a>
+<a name="ln650">		RETURN_ERROR(reply-&gt;error);</a>
+<a name="ln651"> </a>
+<a name="ln652">	// add/update the entry</a>
+<a name="ln653">	vnode_id localID = -1;</a>
+<a name="ln654">	EntryInfo* entryInfo = &amp;reply-&gt;entryInfo;</a>
+<a name="ln655">	while (true) {</a>
+<a name="ln656">		// get an up to date entry info</a>
+<a name="ln657">		WalkReply* walkReply = NULL;</a>
+<a name="ln658">		if (!entryInfo) {</a>
+<a name="ln659">			error = _Walk(reply-&gt;entryInfo.directoryID,</a>
+<a name="ln660">				reply-&gt;entryInfo.name.GetString(), false, &amp;walkReply);</a>
+<a name="ln661">			if (error != B_OK)</a>
+<a name="ln662">				break;</a>
+<a name="ln663"> </a>
+<a name="ln664">			entryInfo = &amp;walkReply-&gt;entryInfo;</a>
+<a name="ln665">		}</a>
+<a name="ln666">		ObjectDeleter&lt;Request&gt; walkReplyDeleter(walkReply);</a>
+<a name="ln667"> </a>
+<a name="ln668">		AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln669"> </a>
+<a name="ln670">		// check, if the info is obsolete</a>
+<a name="ln671">		if (_IsObsoleteEntryInfo(*entryInfo)) {</a>
+<a name="ln672">			entryInfo = NULL;</a>
+<a name="ln673">			continue;</a>
+<a name="ln674">		}</a>
+<a name="ln675"> </a>
+<a name="ln676">		// load the entry</a>
+<a name="ln677">		ShareDirEntry* entry;</a>
+<a name="ln678">		error = _LoadEntry(dir, *entryInfo, &amp;entry);</a>
+<a name="ln679">		if (error == B_OK)</a>
+<a name="ln680">			localID = entry-&gt;GetNode()-&gt;GetID();</a>
+<a name="ln681"> </a>
+<a name="ln682">		break;</a>
+<a name="ln683">	}</a>
+<a name="ln684"> </a>
+<a name="ln685">	if (error == B_OK) {</a>
+<a name="ln686">		Node* _node;</a>
+<a name="ln687">		error = GetVNode(localID, &amp;_node);</a>
+<a name="ln688">	}</a>
+<a name="ln689"> </a>
+<a name="ln690">	// set the results / close the handle on error</a>
+<a name="ln691">	if (error == B_OK) {</a>
+<a name="ln692">		*vnid = localID;</a>
+<a name="ln693">		*cookie = (void*)reply-&gt;cookie;</a>
+<a name="ln694">	} else</a>
+<a name="ln695">		_Close(reply-&gt;cookie);</a>
+<a name="ln696"> </a>
+<a name="ln697">	RETURN_ERROR(error);</a>
+<a name="ln698">}</a>
+<a name="ln699"> </a>
+<a name="ln700">// Open</a>
+<a name="ln701">status_t</a>
+<a name="ln702">ShareVolume::Open(Node* _node, int openMode, void** cookie)</a>
+<a name="ln703">{</a>
+<a name="ln704">	ShareNode* node = dynamic_cast&lt;ShareNode*&gt;(_node);</a>
+<a name="ln705"> </a>
+<a name="ln706">// TODO: Allow opening the root node?</a>
+<a name="ln707">	if (!_EnsureShareMounted())</a>
+<a name="ln708">		return ERROR_NOT_CONNECTED;</a>
+<a name="ln709"> </a>
+<a name="ln710">	// check the open mode</a>
+<a name="ln711">	if (IsReadOnly()) {</a>
+<a name="ln712">		if ((openMode &amp; O_RWMASK) == O_WRONLY)</a>
+<a name="ln713">			return B_PERMISSION_DENIED;</a>
+<a name="ln714">		if (openMode &amp; O_TRUNC)</a>
+<a name="ln715">			return B_PERMISSION_DENIED;</a>
+<a name="ln716">		if ((openMode &amp; O_RWMASK) == O_RDWR)</a>
+<a name="ln717">			openMode = (openMode &amp; ~O_RWMASK) | O_RDONLY;</a>
+<a name="ln718">	}</a>
+<a name="ln719">	// prepare the request</a>
+<a name="ln720">	OpenRequest request;</a>
+<a name="ln721">	request.volumeID = fID;</a>
+<a name="ln722">	request.nodeID = node-&gt;GetRemoteID();</a>
+<a name="ln723">	request.openMode = openMode;</a>
+<a name="ln724">	// send the request</a>
+<a name="ln725">	OpenReply* reply;</a>
+<a name="ln726">	status_t error = SendRequest(fConnection, &amp;request, &amp;reply);</a>
+<a name="ln727">	if (error != B_OK)</a>
+<a name="ln728">		RETURN_ERROR(error);</a>
+<a name="ln729">	ObjectDeleter&lt;Request&gt; replyDeleter(reply);</a>
+<a name="ln730">	if (reply-&gt;error != B_OK)</a>
+<a name="ln731">		RETURN_ERROR(reply-&gt;error);</a>
+<a name="ln732">	// update the node</a>
+<a name="ln733">	_UpdateNode(reply-&gt;nodeInfo);</a>
+<a name="ln734">	*cookie = (void*)reply-&gt;cookie;</a>
+<a name="ln735">	return B_OK;</a>
+<a name="ln736">}</a>
+<a name="ln737"> </a>
+<a name="ln738">// Close</a>
+<a name="ln739">status_t</a>
+<a name="ln740">ShareVolume::Close(Node* _node, void* cookie)</a>
+<a name="ln741">{</a>
+<a name="ln742">	// no-op: FreeCookie does the job</a>
+<a name="ln743">	return B_OK;</a>
+<a name="ln744">}</a>
+<a name="ln745"> </a>
+<a name="ln746">// FreeCookie</a>
+<a name="ln747">status_t</a>
+<a name="ln748">ShareVolume::FreeCookie(Node* _node, void* cookie)</a>
+<a name="ln749">{</a>
+<a name="ln750">	return _Close((intptr_t)cookie);</a>
+<a name="ln751">}</a>
+<a name="ln752"> </a>
+<a name="ln753">// Read</a>
+<a name="ln754">status_t</a>
+<a name="ln755">ShareVolume::Read(Node* _node, void* cookie, off_t pos, void* _buffer,</a>
+<a name="ln756">	size_t bufferSize, size_t* _bytesRead)</a>
+<a name="ln757">{</a>
+<a name="ln758">	if (!_EnsureShareMounted())</a>
+<a name="ln759">		return ERROR_NOT_CONNECTED;</a>
+<a name="ln760"> </a>
+<a name="ln761">	*_bytesRead = 0;</a>
+<a name="ln762">	if (bufferSize == 0)</a>
+<a name="ln763">		return B_OK;</a>
+<a name="ln764">	uint8* buffer = (uint8*)_buffer;</a>
+<a name="ln765">	// prepare the request</a>
+<a name="ln766">	ReadRequest request;</a>
+<a name="ln767">	request.volumeID = fID;</a>
+<a name="ln768">	request.cookie = (intptr_t)cookie;</a>
+<a name="ln769">	request.pos = pos;</a>
+<a name="ln770">	request.size = bufferSize;</a>
+<a name="ln771"> </a>
+<a name="ln772">	struct ReadRequestHandler : public RequestHandler {</a>
+<a name="ln773">		uint8*	buffer;</a>
+<a name="ln774">		off_t	pos;</a>
+<a name="ln775">		int32	bufferSize;</a>
+<a name="ln776">		int32	bytesRead;</a>
+<a name="ln777"> </a>
+<a name="ln778">		ReadRequestHandler(uint8* buffer, off_t pos, int32 bufferSize)</a>
+<a name="ln779">			: buffer(buffer),</a>
+<a name="ln780">			  pos(pos),</a>
+<a name="ln781">			  bufferSize(bufferSize),</a>
+<a name="ln782">			  bytesRead(0)</a>
+<a name="ln783">		{</a>
+<a name="ln784">		}</a>
+<a name="ln785"> </a>
+<a name="ln786">		virtual status_t HandleRequest(Request* _reply, RequestChannel* channel)</a>
+<a name="ln787">		{</a>
+<a name="ln788">			// the passed request is deleted by the request port</a>
+<a name="ln789">			ReadReply* reply = dynamic_cast&lt;ReadReply*&gt;(_reply);</a>
+<a name="ln790">			if (!reply)</a>
+<a name="ln791">				RETURN_ERROR(B_BAD_DATA);</a>
+<a name="ln792">			// process the reply</a>
+<a name="ln793">			status_t error = ProcessReply(reply);</a>
+<a name="ln794">			if (error != B_OK)</a>
+<a name="ln795">				return error;</a>
+<a name="ln796">			bool moreToCome = reply-&gt;moreToCome;</a>
+<a name="ln797">			while (moreToCome) {</a>
+<a name="ln798">				// receive a reply</a>
+<a name="ln799">				error = ReceiveRequest(channel, &amp;reply);</a>
+<a name="ln800">				if (error != B_OK)</a>
+<a name="ln801">					RETURN_ERROR(error);</a>
+<a name="ln802">				moreToCome = reply-&gt;moreToCome;</a>
+<a name="ln803">				ObjectDeleter&lt;Request&gt; replyDeleter(reply);</a>
+<a name="ln804">				// process the reply</a>
+<a name="ln805">				error = ProcessReply(reply);</a>
+<a name="ln806">				if (error != B_OK)</a>
+<a name="ln807">					return error;</a>
+<a name="ln808">			}</a>
+<a name="ln809">			return B_OK;</a>
+<a name="ln810">		}</a>
+<a name="ln811"> </a>
+<a name="ln812">		status_t ProcessReply(ReadReply* reply)</a>
+<a name="ln813">		{</a>
+<a name="ln814">			if (reply-&gt;error != B_OK)</a>
+<a name="ln815">				RETURN_ERROR(reply-&gt;error);</a>
+<a name="ln816">			// check the fields</a>
+<a name="ln817">			if (reply-&gt;pos != pos)</a>
+<a name="ln818">				RETURN_ERROR(B_BAD_DATA);</a>
+<a name="ln819">			int32 bytesRead = reply-&gt;data.GetSize();</a>
+<a name="ln820">			if (bytesRead &gt; (int32)bufferSize)</a>
+<a name="ln821">				RETURN_ERROR(B_BAD_DATA);</a>
+<a name="ln822">			// copy the data into the buffer</a>
+<a name="ln823">			if (bytesRead &gt; 0)</a>
+<a name="ln824">				memcpy(buffer, reply-&gt;data.GetData(), bytesRead);</a>
+<a name="ln825">			pos += bytesRead;</a>
+<a name="ln826">			buffer += bytesRead;</a>
+<a name="ln827">			bufferSize -= bytesRead;</a>
+<a name="ln828">			this-&gt;bytesRead += bytesRead;</a>
+<a name="ln829">			return B_OK;</a>
+<a name="ln830">		}</a>
+<a name="ln831">	} requestHandler(buffer, pos, bufferSize);</a>
+<a name="ln832"> </a>
+<a name="ln833">	// send the request</a>
+<a name="ln834">	status_t error = fConnection-&gt;SendRequest(&amp;request, &amp;requestHandler);</a>
+<a name="ln835">	if (error != B_OK)</a>
+<a name="ln836">		RETURN_ERROR(error);</a>
+<a name="ln837">	*_bytesRead = requestHandler.bytesRead;</a>
+<a name="ln838">	return B_OK;</a>
+<a name="ln839">}</a>
+<a name="ln840"> </a>
+<a name="ln841">// Write</a>
+<a name="ln842">status_t</a>
+<a name="ln843">ShareVolume::Write(Node* _node, void* cookie, off_t pos, const void* _buffer,</a>
+<a name="ln844">	size_t bufferSize, size_t* bytesWritten)</a>
+<a name="ln845">{</a>
+<a name="ln846">	if (!_EnsureShareMounted())</a>
+<a name="ln847">		return ERROR_NOT_CONNECTED;</a>
+<a name="ln848"> </a>
+<a name="ln849">	// check permissions</a>
+<a name="ln850">	if (IsReadOnly())</a>
+<a name="ln851">		return B_PERMISSION_DENIED;</a>
+<a name="ln852"> </a>
+<a name="ln853">	*bytesWritten = 0;</a>
+<a name="ln854">	off_t bytesLeft = bufferSize;</a>
+<a name="ln855">	const char* buffer = (const char*)_buffer;</a>
+<a name="ln856">	while (bytesLeft &gt; 0) {</a>
+<a name="ln857">		off_t toWrite = bytesLeft;</a>
+<a name="ln858">		if (toWrite &gt; kMaxWriteBufferSize)</a>
+<a name="ln859">			toWrite = kMaxWriteBufferSize;</a>
+<a name="ln860"> </a>
+<a name="ln861">		// prepare the request</a>
+<a name="ln862">		WriteRequest request;</a>
+<a name="ln863">		request.volumeID = fID;</a>
+<a name="ln864">		request.cookie = (intptr_t)cookie;</a>
+<a name="ln865">		request.pos = pos;</a>
+<a name="ln866">		request.data.SetTo(buffer, toWrite);</a>
+<a name="ln867"> </a>
+<a name="ln868">		// send the request</a>
+<a name="ln869">		WriteReply* reply;</a>
+<a name="ln870">		status_t error = SendRequest(fConnection, &amp;request, &amp;reply);</a>
+<a name="ln871">		if (error != B_OK)</a>
+<a name="ln872">			RETURN_ERROR(error);</a>
+<a name="ln873">		ObjectDeleter&lt;Request&gt; replyDeleter(reply);</a>
+<a name="ln874">		if (reply-&gt;error != B_OK)</a>
+<a name="ln875">			RETURN_ERROR(reply-&gt;error);</a>
+<a name="ln876"> </a>
+<a name="ln877">		bytesLeft -= toWrite;</a>
+<a name="ln878">		pos += toWrite;</a>
+<a name="ln879">		buffer += toWrite;</a>
+<a name="ln880"> </a>
+<a name="ln881">// TODO: We should probably add an &quot;up to date&quot; flag for ShareNode (just as</a>
+<a name="ln882">// done for ShareAttrDir) and clear it at this point. Currently continuity</a>
+<a name="ln883">// inconsistencies could occur (e.g. a stat() after a write() returns</a>
+<a name="ln884">// obsolete data), depending on when the node monitoring update arrives.</a>
+<a name="ln885">	}</a>
+<a name="ln886"> </a>
+<a name="ln887">	*bytesWritten = bufferSize;</a>
+<a name="ln888">	return B_OK;</a>
+<a name="ln889">}</a>
+<a name="ln890"> </a>
+<a name="ln891"> </a>
+<a name="ln892">// #pragma mark -</a>
+<a name="ln893">// #pragma mark ----- hard links / symlinks -----</a>
+<a name="ln894"> </a>
+<a name="ln895">// Link</a>
+<a name="ln896">status_t</a>
+<a name="ln897">ShareVolume::Link(Node* _dir, const char* name, Node* _node)</a>
+<a name="ln898">{</a>
+<a name="ln899">	ShareNode* dir = dynamic_cast&lt;ShareNode*&gt;(_dir);</a>
+<a name="ln900">	ShareNode* node = dynamic_cast&lt;ShareNode*&gt;(_node);</a>
+<a name="ln901"> </a>
+<a name="ln902">	if (!node || node-&gt;GetVolume() != this)</a>
+<a name="ln903">		return B_NOT_ALLOWED;</a>
+<a name="ln904"> </a>
+<a name="ln905">	if (!_EnsureShareMounted())</a>
+<a name="ln906">		return ERROR_NOT_CONNECTED;</a>
+<a name="ln907"> </a>
+<a name="ln908">	// check permissions</a>
+<a name="ln909">	if (IsReadOnly())</a>
+<a name="ln910">		return B_PERMISSION_DENIED;</a>
+<a name="ln911">	if (IsVNodeRemoved(dir-&gt;GetID()) &gt; 0)</a>
+<a name="ln912">		RETURN_ERROR(B_NOT_ALLOWED);</a>
+<a name="ln913">	if (IsVNodeRemoved(node-&gt;GetID()) &gt; 0)</a>
+<a name="ln914">		RETURN_ERROR(B_NOT_ALLOWED);</a>
+<a name="ln915">	// prepare the request</a>
+<a name="ln916">	CreateLinkRequest request;</a>
+<a name="ln917">	request.volumeID = fID;</a>
+<a name="ln918">	request.directoryID = dir-&gt;GetRemoteID();</a>
+<a name="ln919">	request.name.SetTo(name);</a>
+<a name="ln920">	request.nodeID = node-&gt;GetRemoteID();</a>
+<a name="ln921">	// send the request</a>
+<a name="ln922">	CreateLinkReply* reply;</a>
+<a name="ln923">	status_t error = SendRequest(fConnection, &amp;request, &amp;reply);</a>
+<a name="ln924">	if (error != B_OK)</a>
+<a name="ln925">		RETURN_ERROR(error);</a>
+<a name="ln926">	ObjectDeleter&lt;Request&gt; replyDeleter(reply);</a>
+<a name="ln927">	RETURN_ERROR(reply-&gt;error);</a>
+<a name="ln928">}</a>
+<a name="ln929"> </a>
+<a name="ln930">// Unlink</a>
+<a name="ln931">status_t</a>
+<a name="ln932">ShareVolume::Unlink(Node* _dir, const char* name)</a>
+<a name="ln933">{</a>
+<a name="ln934">	ShareNode* dir = dynamic_cast&lt;ShareNode*&gt;(_dir);</a>
+<a name="ln935"> </a>
+<a name="ln936">	if (!_EnsureShareMounted())</a>
+<a name="ln937">		return ERROR_NOT_CONNECTED;</a>
+<a name="ln938"> </a>
+<a name="ln939">	// check permissions</a>
+<a name="ln940">	if (IsReadOnly())</a>
+<a name="ln941">		return B_PERMISSION_DENIED;</a>
+<a name="ln942">	// prepare the request</a>
+<a name="ln943">	UnlinkRequest request;</a>
+<a name="ln944">	request.volumeID = fID;</a>
+<a name="ln945">	request.directoryID = dir-&gt;GetRemoteID();</a>
+<a name="ln946">	request.name.SetTo(name);</a>
+<a name="ln947">	// send the request</a>
+<a name="ln948">	UnlinkReply* reply;</a>
+<a name="ln949">	status_t error = SendRequest(fConnection, &amp;request, &amp;reply);</a>
+<a name="ln950">	if (error != B_OK)</a>
+<a name="ln951">		RETURN_ERROR(error);</a>
+<a name="ln952">	ObjectDeleter&lt;Request&gt; replyDeleter(reply);</a>
+<a name="ln953">	RETURN_ERROR(reply-&gt;error);</a>
+<a name="ln954">}</a>
+<a name="ln955"> </a>
+<a name="ln956">// Symlink</a>
+<a name="ln957">status_t</a>
+<a name="ln958">ShareVolume::Symlink(Node* _dir, const char* name, const char* target)</a>
+<a name="ln959">{</a>
+<a name="ln960">	ShareNode* dir = dynamic_cast&lt;ShareNode*&gt;(_dir);</a>
+<a name="ln961"> </a>
+<a name="ln962">	if (!_EnsureShareMounted())</a>
+<a name="ln963">		return ERROR_NOT_CONNECTED;</a>
+<a name="ln964"> </a>
+<a name="ln965">	// check permissions</a>
+<a name="ln966">	if (IsReadOnly())</a>
+<a name="ln967">		return B_PERMISSION_DENIED;</a>
+<a name="ln968">	if (IsVNodeRemoved(dir-&gt;GetID()) &gt; 0)</a>
+<a name="ln969">		RETURN_ERROR(B_NOT_ALLOWED);</a>
+<a name="ln970">	// prepare the request</a>
+<a name="ln971">	CreateSymlinkRequest request;</a>
+<a name="ln972">	request.volumeID = fID;</a>
+<a name="ln973">	request.directoryID = dir-&gt;GetRemoteID();</a>
+<a name="ln974">	request.name.SetTo(name);</a>
+<a name="ln975">	request.target.SetTo(target);</a>
+<a name="ln976">	// send the request</a>
+<a name="ln977">	CreateSymlinkReply* reply;</a>
+<a name="ln978">	status_t error = SendRequest(fConnection, &amp;request, &amp;reply);</a>
+<a name="ln979">	if (error != B_OK)</a>
+<a name="ln980">		RETURN_ERROR(error);</a>
+<a name="ln981">	ObjectDeleter&lt;Request&gt; replyDeleter(reply);</a>
+<a name="ln982">	RETURN_ERROR(reply-&gt;error);</a>
+<a name="ln983">}</a>
+<a name="ln984"> </a>
+<a name="ln985">// ReadLink</a>
+<a name="ln986">status_t</a>
+<a name="ln987">ShareVolume::ReadLink(Node* _node, char* buffer, size_t bufferSize,</a>
+<a name="ln988">	size_t* bytesRead)</a>
+<a name="ln989">{</a>
+<a name="ln990">	ShareNode* node = dynamic_cast&lt;ShareNode*&gt;(_node);</a>
+<a name="ln991"> </a>
+<a name="ln992">	if (!_EnsureShareMounted())</a>
+<a name="ln993">		return ERROR_NOT_CONNECTED;</a>
+<a name="ln994"> </a>
+<a name="ln995">	*bytesRead = 0;</a>
+<a name="ln996">	// prepare the request</a>
+<a name="ln997">	ReadLinkRequest request;</a>
+<a name="ln998">	request.volumeID = fID;</a>
+<a name="ln999">	request.nodeID = node-&gt;GetRemoteID();</a>
+<a name="ln1000">	request.maxSize = bufferSize;</a>
+<a name="ln1001">	// send the request</a>
+<a name="ln1002">	ReadLinkReply* reply;</a>
+<a name="ln1003">	status_t error = SendRequest(fConnection, &amp;request, &amp;reply);</a>
+<a name="ln1004">	if (error != B_OK)</a>
+<a name="ln1005">		RETURN_ERROR(error);</a>
+<a name="ln1006">	ObjectDeleter&lt;Request&gt; replyDeleter(reply);</a>
+<a name="ln1007">	if (reply-&gt;error != B_OK)</a>
+<a name="ln1008">		RETURN_ERROR(reply-&gt;error);</a>
+<a name="ln1009">	if (reply-&gt;data.GetSize() &gt; (int32)bufferSize)</a>
+<a name="ln1010">		RETURN_ERROR(B_BAD_DATA);</a>
+<a name="ln1011">	*bytesRead = reply-&gt;data.GetSize();</a>
+<a name="ln1012">	if (*bytesRead &gt; 0)</a>
+<a name="ln1013">		memcpy(buffer, reply-&gt;data.GetData(), *bytesRead);</a>
+<a name="ln1014">	_UpdateNode(reply-&gt;nodeInfo);</a>
+<a name="ln1015">	return B_OK;</a>
+<a name="ln1016">}</a>
+<a name="ln1017"> </a>
+<a name="ln1018">// Rename</a>
+<a name="ln1019">status_t</a>
+<a name="ln1020">ShareVolume::Rename(Node* _oldDir, const char* oldName, Node* _newDir,</a>
+<a name="ln1021">	const char* newName)</a>
+<a name="ln1022">{</a>
+<a name="ln1023">	ShareNode* oldDir = dynamic_cast&lt;ShareNode*&gt;(_oldDir);</a>
+<a name="ln1024">	ShareNode* newDir = dynamic_cast&lt;ShareNode*&gt;(_newDir);</a>
+<a name="ln1025"> </a>
+<a name="ln1026">	if (!newDir || newDir-&gt;GetVolume() != this)</a>
+<a name="ln1027">		return B_NOT_ALLOWED;</a>
+<a name="ln1028"> </a>
+<a name="ln1029">	if (!_EnsureShareMounted())</a>
+<a name="ln1030">		return ERROR_NOT_CONNECTED;</a>
+<a name="ln1031"> </a>
+<a name="ln1032">	// check permissions</a>
+<a name="ln1033">	if (IsReadOnly())</a>
+<a name="ln1034">		return B_PERMISSION_DENIED;</a>
+<a name="ln1035">	if (IsVNodeRemoved(newDir-&gt;GetID()) &gt; 0)</a>
+<a name="ln1036">		RETURN_ERROR(B_NOT_ALLOWED);</a>
+<a name="ln1037">	// prepare the request</a>
+<a name="ln1038">	RenameRequest request;</a>
+<a name="ln1039">	request.volumeID = fID;</a>
+<a name="ln1040">	request.oldDirectoryID = oldDir-&gt;GetRemoteID();</a>
+<a name="ln1041">	request.oldName.SetTo(oldName);</a>
+<a name="ln1042">	request.newDirectoryID = newDir-&gt;GetRemoteID();</a>
+<a name="ln1043">	request.newName.SetTo(newName);</a>
+<a name="ln1044">	// send the request</a>
+<a name="ln1045">	RenameReply* reply;</a>
+<a name="ln1046">	status_t error = SendRequest(fConnection, &amp;request, &amp;reply);</a>
+<a name="ln1047">	if (error != B_OK)</a>
+<a name="ln1048">		RETURN_ERROR(error);</a>
+<a name="ln1049">	ObjectDeleter&lt;Request&gt; replyDeleter(reply);</a>
+<a name="ln1050">	RETURN_ERROR(reply-&gt;error);</a>
+<a name="ln1051">}</a>
+<a name="ln1052"> </a>
+<a name="ln1053"> </a>
+<a name="ln1054">// #pragma mark -</a>
+<a name="ln1055">// #pragma mark ----- directories -----</a>
+<a name="ln1056"> </a>
+<a name="ln1057">// MkDir</a>
+<a name="ln1058">status_t</a>
+<a name="ln1059">ShareVolume::MkDir(Node* _dir, const char* name, int mode)</a>
+<a name="ln1060">{</a>
+<a name="ln1061">	ShareNode* dir = dynamic_cast&lt;ShareNode*&gt;(_dir);</a>
+<a name="ln1062"> </a>
+<a name="ln1063">	if (!_EnsureShareMounted())</a>
+<a name="ln1064">		return ERROR_NOT_CONNECTED;</a>
+<a name="ln1065"> </a>
+<a name="ln1066">	// check permissions</a>
+<a name="ln1067">	if (IsReadOnly())</a>
+<a name="ln1068">		return B_PERMISSION_DENIED;</a>
+<a name="ln1069">	if (IsVNodeRemoved(dir-&gt;GetID()) &gt; 0)</a>
+<a name="ln1070">		RETURN_ERROR(B_NOT_ALLOWED);</a>
+<a name="ln1071">	// prepare the request</a>
+<a name="ln1072">	MakeDirRequest request;</a>
+<a name="ln1073">	request.volumeID = fID;</a>
+<a name="ln1074">	request.directoryID = dir-&gt;GetRemoteID();</a>
+<a name="ln1075">	request.name.SetTo(name);</a>
+<a name="ln1076">	request.mode = mode;</a>
+<a name="ln1077">	// send the request</a>
+<a name="ln1078">	MakeDirReply* reply;</a>
+<a name="ln1079">	status_t error = SendRequest(fConnection, &amp;request, &amp;reply);</a>
+<a name="ln1080">	if (error != B_OK)</a>
+<a name="ln1081">		RETURN_ERROR(error);</a>
+<a name="ln1082">	ObjectDeleter&lt;Request&gt; replyDeleter(reply);</a>
+<a name="ln1083">	RETURN_ERROR(reply-&gt;error);</a>
+<a name="ln1084">}</a>
+<a name="ln1085"> </a>
+<a name="ln1086">// RmDir</a>
+<a name="ln1087">status_t</a>
+<a name="ln1088">ShareVolume::RmDir(Node* _dir, const char* name)</a>
+<a name="ln1089">{</a>
+<a name="ln1090">	ShareNode* dir = dynamic_cast&lt;ShareNode*&gt;(_dir);</a>
+<a name="ln1091"> </a>
+<a name="ln1092">	if (!_EnsureShareMounted())</a>
+<a name="ln1093">		return ERROR_NOT_CONNECTED;</a>
+<a name="ln1094"> </a>
+<a name="ln1095">	// check permissions</a>
+<a name="ln1096">	if (IsReadOnly())</a>
+<a name="ln1097">		return B_PERMISSION_DENIED;</a>
+<a name="ln1098">	// prepare the request</a>
+<a name="ln1099">	RemoveDirRequest request;</a>
+<a name="ln1100">	request.volumeID = fID;</a>
+<a name="ln1101">	request.directoryID = dir-&gt;GetRemoteID();</a>
+<a name="ln1102">	request.name.SetTo(name);</a>
+<a name="ln1103">	// send the request</a>
+<a name="ln1104">	RemoveDirReply* reply;</a>
+<a name="ln1105">	status_t error = SendRequest(fConnection, &amp;request, &amp;reply);</a>
+<a name="ln1106">	if (error != B_OK)</a>
+<a name="ln1107">		RETURN_ERROR(error);</a>
+<a name="ln1108">	ObjectDeleter&lt;Request&gt; replyDeleter(reply);</a>
+<a name="ln1109">	RETURN_ERROR(reply-&gt;error);</a>
+<a name="ln1110">}</a>
+<a name="ln1111"> </a>
+<a name="ln1112">// OpenDir</a>
+<a name="ln1113">status_t</a>
+<a name="ln1114">ShareVolume::OpenDir(Node* _node, void** _cookie)</a>
+<a name="ln1115">{</a>
+<a name="ln1116">	// we opendir() only directories</a>
+<a name="ln1117">	ShareDir* node = dynamic_cast&lt;ShareDir*&gt;(_node);</a>
+<a name="ln1118">	if (!node)</a>
+<a name="ln1119">		return B_NOT_ALLOWED;</a>
+<a name="ln1120"> </a>
+<a name="ln1121">// TODO: Allow opening the root node?</a>
+<a name="ln1122">	if (!_EnsureShareMounted())</a>
+<a name="ln1123">		return ERROR_NOT_CONNECTED;</a>
+<a name="ln1124"> </a>
+<a name="ln1125">	// allocate a dir cookie</a>
+<a name="ln1126">	DirCookie* cookie = new(std::nothrow) DirCookie;</a>
+<a name="ln1127">	if (!cookie)</a>
+<a name="ln1128">		RETURN_ERROR(B_NO_MEMORY);</a>
+<a name="ln1129">	ObjectDeleter&lt;DirCookie&gt; cookieDeleter(cookie);</a>
+<a name="ln1130"> </a>
+<a name="ln1131">	// if the directory is fully cached, we allocate a local iterator</a>
+<a name="ln1132">	{</a>
+<a name="ln1133">		AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln1134">		if (node-&gt;IsComplete()) {</a>
+<a name="ln1135">			// create a local dir iterator</a>
+<a name="ln1136">			LocalShareDirIterator* iterator</a>
+<a name="ln1137">				= new(std::nothrow) LocalShareDirIterator();</a>
+<a name="ln1138">			if (!iterator)</a>
+<a name="ln1139">				RETURN_ERROR(B_NO_MEMORY);</a>
+<a name="ln1140">			iterator-&gt;SetDirectory(node);</a>
+<a name="ln1141"> </a>
+<a name="ln1142">			// init the cookie</a>
+<a name="ln1143">			cookie-&gt;iterator = iterator;</a>
+<a name="ln1144">			*_cookie = cookie;</a>
+<a name="ln1145">			cookieDeleter.Detach();</a>
+<a name="ln1146">			return B_OK;</a>
+<a name="ln1147">		}</a>
+<a name="ln1148">	}</a>
+<a name="ln1149"> </a>
+<a name="ln1150">	// allocate a remote dir iterator</a>
+<a name="ln1151">	RemoteShareDirIterator* iterator = new(std::nothrow) RemoteShareDirIterator;</a>
+<a name="ln1152">	if (!iterator)</a>
+<a name="ln1153">		RETURN_ERROR(B_NO_MEMORY);</a>
+<a name="ln1154">	ObjectDeleter&lt;RemoteShareDirIterator&gt; iteratorDeleter(iterator);</a>
+<a name="ln1155"> </a>
+<a name="ln1156">	// prepare the request</a>
+<a name="ln1157">	OpenDirRequest request;</a>
+<a name="ln1158">	request.volumeID = fID;</a>
+<a name="ln1159">	request.nodeID = node-&gt;GetRemoteID();</a>
+<a name="ln1160"> </a>
+<a name="ln1161">	// send the request</a>
+<a name="ln1162">	OpenDirReply* reply;</a>
+<a name="ln1163">	status_t error = SendRequest(fConnection, &amp;request, &amp;reply);</a>
+<a name="ln1164">	if (error != B_OK)</a>
+<a name="ln1165">		RETURN_ERROR(error);</a>
+<a name="ln1166">	ObjectDeleter&lt;Request&gt; replyDeleter(reply);</a>
+<a name="ln1167">	if (reply-&gt;error != B_OK)</a>
+<a name="ln1168">{</a>
+<a name="ln1169">		PRINT(&quot;OpenDir() failed: node: %&quot; B_PRIdINO &quot;, remote: (%&quot; B_PRIdDEV</a>
+<a name="ln1170">			&quot;, %&quot; B_PRIdINO &quot;)\n&quot;, node-&gt;GetID(), node-&gt;GetRemoteID().volumeID,</a>
+<a name="ln1171">			node-&gt;GetRemoteID().nodeID);</a>
+<a name="ln1172">		RETURN_ERROR(reply-&gt;error);</a>
+<a name="ln1173">}</a>
+<a name="ln1174"> </a>
+<a name="ln1175">	// update the node</a>
+<a name="ln1176">	_UpdateNode(reply-&gt;nodeInfo);</a>
+<a name="ln1177"> </a>
+<a name="ln1178">	// init the cookie</a>
+<a name="ln1179">	iterator-&gt;SetCookie(reply-&gt;cookie);</a>
+<a name="ln1180">	cookie-&gt;iterator = iterator;</a>
+<a name="ln1181"> </a>
+<a name="ln1182">	*_cookie = cookie;</a>
+<a name="ln1183">	cookieDeleter.Detach();</a>
+<a name="ln1184">	iteratorDeleter.Detach();</a>
+<a name="ln1185">	return B_OK;</a>
+<a name="ln1186">}</a>
+<a name="ln1187"> </a>
+<a name="ln1188">// CloseDir</a>
+<a name="ln1189">status_t</a>
+<a name="ln1190">ShareVolume::CloseDir(Node* _node, void* cookie)</a>
+<a name="ln1191">{</a>
+<a name="ln1192">	// no-op: FreeDirCookie does the job</a>
+<a name="ln1193">	return B_OK;</a>
+<a name="ln1194">}</a>
+<a name="ln1195"> </a>
+<a name="ln1196">// FreeDirCookie</a>
+<a name="ln1197">status_t</a>
+<a name="ln1198">ShareVolume::FreeDirCookie(Node* _node, void* _cookie)</a>
+<a name="ln1199">{</a>
+<a name="ln1200">	DirCookie* cookie = (DirCookie*)_cookie;</a>
+<a name="ln1201">	ObjectDeleter&lt;DirCookie&gt; _(cookie);</a>
+<a name="ln1202">	ShareDirIterator* iterator = cookie-&gt;iterator;</a>
+<a name="ln1203"> </a>
+<a name="ln1204">	status_t error = B_OK;</a>
+<a name="ln1205">	if (RemoteShareDirIterator* remoteIterator</a>
+<a name="ln1206">		= dynamic_cast&lt;RemoteShareDirIterator*&gt;(iterator)) {</a>
+<a name="ln1207">		// prepare the request</a>
+<a name="ln1208">		CloseRequest request;</a>
+<a name="ln1209">		request.volumeID = fID;</a>
+<a name="ln1210">		request.cookie = remoteIterator-&gt;GetCookie();</a>
+<a name="ln1211"> </a>
+<a name="ln1212">		// send the request</a>
+<a name="ln1213">		if (!_EnsureShareMounted())</a>
+<a name="ln1214">			error = ERROR_NOT_CONNECTED;</a>
+<a name="ln1215"> </a>
+<a name="ln1216">		if (error == B_OK) {</a>
+<a name="ln1217">			CloseReply* reply;</a>
+<a name="ln1218">			error = SendRequest(fConnection, &amp;request, &amp;reply);</a>
+<a name="ln1219">			if (error == B_OK) {</a>
+<a name="ln1220">				error = reply-&gt;error;</a>
+<a name="ln1221">				delete reply;</a>
+<a name="ln1222">			}</a>
+<a name="ln1223">		}</a>
+<a name="ln1224">	}</a>
+<a name="ln1225"> </a>
+<a name="ln1226">	// delete the iterator</a>
+<a name="ln1227">	AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln1228">	delete iterator;</a>
+<a name="ln1229"> </a>
+<a name="ln1230">	return error;</a>
+<a name="ln1231">}</a>
+<a name="ln1232"> </a>
+<a name="ln1233">// ReadDir</a>
+<a name="ln1234">status_t</a>
+<a name="ln1235">ShareVolume::ReadDir(Node* _dir, void* _cookie, struct dirent* buffer,</a>
+<a name="ln1236">	size_t bufferSize, int32 count, int32* countRead)</a>
+<a name="ln1237">{</a>
+<a name="ln1238">	ShareDir* directory = dynamic_cast&lt;ShareDir*&gt;(_dir);</a>
+<a name="ln1239"> </a>
+<a name="ln1240">	if (!_EnsureShareMounted())</a>
+<a name="ln1241">		return ERROR_NOT_CONNECTED;</a>
+<a name="ln1242"> </a>
+<a name="ln1243">	*countRead = 0;</a>
+<a name="ln1244">	if (count &lt;= 0)</a>
+<a name="ln1245">		return B_OK;</a>
+<a name="ln1246"> </a>
+<a name="ln1247">	DirCookie* cookie = (DirCookie*)_cookie;</a>
+<a name="ln1248">	ShareDirIterator* iterator = cookie-&gt;iterator;</a>
+<a name="ln1249"> </a>
+<a name="ln1250">	while (true) {</a>
+<a name="ln1251">		status_t error;</a>
+<a name="ln1252">		AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln1253">		while (ShareDirEntry* entry = iterator-&gt;GetCurrentEntry()) {</a>
+<a name="ln1254">			// re-get the entry -- it might already have been removed</a>
+<a name="ln1255">			const char* name = entry-&gt;GetName();</a>
+<a name="ln1256">			entry = _GetEntryByLocalID(directory-&gt;GetID(), name);</a>
+<a name="ln1257">			if (entry) {</a>
+<a name="ln1258">				// set the name: this also checks the size of the buffer</a>
+<a name="ln1259">				error = set_dirent_name(buffer, bufferSize, name,</a>
+<a name="ln1260">					strlen(name));</a>
+<a name="ln1261">				if (error != B_OK) {</a>
+<a name="ln1262">					// if something has been read at all, we're content</a>
+<a name="ln1263">					if (*countRead &gt; 0)</a>
+<a name="ln1264">						return B_OK;</a>
+<a name="ln1265">					RETURN_ERROR(error);</a>
+<a name="ln1266">				}</a>
+<a name="ln1267"> </a>
+<a name="ln1268">				// fill in the other fields</a>
+<a name="ln1269">				buffer-&gt;d_pdev = fVolumeManager-&gt;GetID();</a>
+<a name="ln1270">				buffer-&gt;d_pino = directory-&gt;GetID();</a>
+<a name="ln1271">				buffer-&gt;d_dev = fVolumeManager-&gt;GetID();</a>
+<a name="ln1272">				buffer-&gt;d_ino = entry-&gt;GetNode()-&gt;GetID();</a>
+<a name="ln1273"> </a>
+<a name="ln1274">				// if the entry is the parent of the share root, we need to</a>
+<a name="ln1275">				// fix the node ID</a>
+<a name="ln1276">				if (directory == fRootNode &amp;&amp; strcmp(name, &quot;..&quot;) == 0) {</a>
+<a name="ln1277">					if (Volume* parentVolume = GetParentVolume())</a>
+<a name="ln1278">						buffer-&gt;d_ino = parentVolume-&gt;GetRootID();</a>
+<a name="ln1279">				}</a>
+<a name="ln1280"> </a>
+<a name="ln1281">				iterator-&gt;NextEntry();</a>
+<a name="ln1282">				(*countRead)++;</a>
+<a name="ln1283">				if (*countRead &gt;= count || !next_dirent(buffer, bufferSize))</a>
+<a name="ln1284">					return B_OK;</a>
+<a name="ln1285">			} else</a>
+<a name="ln1286">				iterator-&gt;NextEntry();</a>
+<a name="ln1287">		}</a>
+<a name="ln1288"> </a>
+<a name="ln1289">		// no more entries: check, if we're completely through</a>
+<a name="ln1290">		if (iterator-&gt;IsDone())</a>
+<a name="ln1291">			return B_OK;</a>
+<a name="ln1292"> </a>
+<a name="ln1293">		// we need to actually get entries from the server</a>
+<a name="ln1294">		locker.Unlock();</a>
+<a name="ln1295">		if (RemoteShareDirIterator* remoteIterator</a>
+<a name="ln1296">				= dynamic_cast&lt;RemoteShareDirIterator*&gt;(iterator)) {</a>
+<a name="ln1297">			error = _ReadRemoteDir(directory, remoteIterator);</a>
+<a name="ln1298">			if (error != B_OK)</a>
+<a name="ln1299">				return error;</a>
+<a name="ln1300">		}</a>
+<a name="ln1301">	}</a>
+<a name="ln1302">}</a>
+<a name="ln1303"> </a>
+<a name="ln1304">// RewindDir</a>
+<a name="ln1305">status_t</a>
+<a name="ln1306">ShareVolume::RewindDir(Node* _node, void* _cookie)</a>
+<a name="ln1307">{</a>
+<a name="ln1308">	DirCookie* cookie = (DirCookie*)_cookie;</a>
+<a name="ln1309">	ShareDirIterator* iterator = cookie-&gt;iterator;</a>
+<a name="ln1310">	AutoLocker&lt;Locker&gt; _(fLock);</a>
+<a name="ln1311">	iterator-&gt;Rewind();</a>
+<a name="ln1312">	return B_OK;</a>
+<a name="ln1313">}</a>
+<a name="ln1314"> </a>
+<a name="ln1315">// Walk</a>
+<a name="ln1316">status_t</a>
+<a name="ln1317">ShareVolume::Walk(Node* _dir, const char* entryName, char** resolvedPath,</a>
+<a name="ln1318">	vnode_id* vnid)</a>
+<a name="ln1319">{</a>
+<a name="ln1320">	ShareDir* dir = dynamic_cast&lt;ShareDir*&gt;(_dir);</a>
+<a name="ln1321">	if (!dir)</a>
+<a name="ln1322">		return B_BAD_VALUE;</a>
+<a name="ln1323"> </a>
+<a name="ln1324">	// we always resolve &quot;.&quot; and &quot;..&quot; of the root node</a>
+<a name="ln1325">	if (dir == fRootNode) {</a>
+<a name="ln1326">		if (strcmp(entryName, &quot;.&quot;) == 0 || strcmp(entryName, &quot;..&quot;) == 0) {</a>
+<a name="ln1327">			AutoLocker&lt;Locker&gt; _(fLock);</a>
+<a name="ln1328">			if (strcmp(entryName, &quot;.&quot;) == 0) {</a>
+<a name="ln1329">				*vnid = fRootNode-&gt;GetID();</a>
+<a name="ln1330">			} else if (Volume* parentVolume = GetParentVolume()) {</a>
+<a name="ln1331">				*vnid = parentVolume-&gt;GetRootID();</a>
+<a name="ln1332">			} else</a>
+<a name="ln1333">				*vnid = fRootNode-&gt;GetID();</a>
+<a name="ln1334">			Node* node;</a>
+<a name="ln1335">			return GetVNode(*vnid, &amp;node);</a>
+<a name="ln1336">		}</a>
+<a name="ln1337">	}</a>
+<a name="ln1338"> </a>
+<a name="ln1339">	if (!_EnsureShareMounted())</a>
+<a name="ln1340">		return ERROR_NOT_CONNECTED;</a>
+<a name="ln1341"> </a>
+<a name="ln1342">	// check, if the entry is already known</a>
+<a name="ln1343">	{</a>
+<a name="ln1344">		AutoLocker&lt;Locker&gt; _(fLock);</a>
+<a name="ln1345">		ShareDirEntry* entry = _GetEntryByLocalID(dir-&gt;GetID(), entryName);</a>
+<a name="ln1346">		if (entry) {</a>
+<a name="ln1347">			*vnid = entry-&gt;GetNode()-&gt;GetID();</a>
+<a name="ln1348">			Node* node;</a>
+<a name="ln1349">			return GetVNode(*vnid, &amp;node);</a>
+<a name="ln1350">		} else if (dir-&gt;IsComplete())</a>
+<a name="ln1351">			return B_ENTRY_NOT_FOUND;</a>
+<a name="ln1352">	}</a>
+<a name="ln1353"> </a>
+<a name="ln1354">	WalkReply* reply;</a>
+<a name="ln1355">	while (true) {</a>
+<a name="ln1356">		// send the request</a>
+<a name="ln1357">		status_t error = _Walk(dir-&gt;GetRemoteID(), entryName, resolvedPath,</a>
+<a name="ln1358">			&amp;reply);</a>
+<a name="ln1359">		if (error != B_OK)</a>
+<a name="ln1360">			RETURN_ERROR(error);</a>
+<a name="ln1361">		ObjectDeleter&lt;Request&gt; replyDeleter(reply);</a>
+<a name="ln1362"> </a>
+<a name="ln1363">		AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln1364"> </a>
+<a name="ln1365">		// check, if the returned info is obsolete</a>
+<a name="ln1366">		if (_IsObsoleteEntryInfo(reply-&gt;entryInfo))</a>
+<a name="ln1367">			continue;</a>
+<a name="ln1368"> </a>
+<a name="ln1369">		// load the entry</a>
+<a name="ln1370">		ShareDirEntry* entry;</a>
+<a name="ln1371">		error = _LoadEntry(dir, reply-&gt;entryInfo, &amp;entry);</a>
+<a name="ln1372">		if (error != B_OK)</a>
+<a name="ln1373">			RETURN_ERROR(error);</a>
+<a name="ln1374">		*vnid = entry-&gt;GetNode()-&gt;GetID();</a>
+<a name="ln1375"> </a>
+<a name="ln1376">		// deal with symlinks</a>
+<a name="ln1377">		if (reply-&gt;linkPath.GetString() &amp;&amp; resolvedPath) {</a>
+<a name="ln1378">			*resolvedPath = strdup(reply-&gt;linkPath.GetString());</a>
+<a name="ln1379">			if (!*resolvedPath)</a>
+<a name="ln1380">				RETURN_ERROR(B_NO_MEMORY);</a>
+<a name="ln1381">			return B_OK;</a>
+<a name="ln1382">		}</a>
+<a name="ln1383"> </a>
+<a name="ln1384">		break;</a>
+<a name="ln1385">	}</a>
+<a name="ln1386"> </a>
+<a name="ln1387">	// no symlink or we shall not resolve it: get the node</a>
+<a name="ln1388">	Node* _node;</a>
+<a name="ln1389">	RETURN_ERROR(GetVNode(*vnid, &amp;_node));</a>
+<a name="ln1390">}</a>
+<a name="ln1391"> </a>
+<a name="ln1392"> </a>
+<a name="ln1393">// #pragma mark -</a>
+<a name="ln1394">// #pragma mark ----- attributes -----</a>
+<a name="ln1395"> </a>
+<a name="ln1396">// OpenAttrDir</a>
+<a name="ln1397">status_t</a>
+<a name="ln1398">ShareVolume::OpenAttrDir(Node* _node, void** _cookie)</a>
+<a name="ln1399">{</a>
+<a name="ln1400">	ShareNode* node = dynamic_cast&lt;ShareNode*&gt;(_node);</a>
+<a name="ln1401"> </a>
+<a name="ln1402">// TODO: Allow opening the root node?</a>
+<a name="ln1403">	if (!_EnsureShareMounted())</a>
+<a name="ln1404">		return ERROR_NOT_CONNECTED;</a>
+<a name="ln1405"> </a>
+<a name="ln1406">	// allocate a dir cookie</a>
+<a name="ln1407">	AttrDirCookie* cookie = new(std::nothrow) AttrDirCookie;</a>
+<a name="ln1408">	if (!cookie)</a>
+<a name="ln1409">		RETURN_ERROR(B_NO_MEMORY);</a>
+<a name="ln1410">	ObjectDeleter&lt;AttrDirCookie&gt; cookieDeleter(cookie);</a>
+<a name="ln1411"> </a>
+<a name="ln1412">	AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln1413"> </a>
+<a name="ln1414">	if (!node-&gt;GetAttrDir() || !node-&gt;GetAttrDir()-&gt;IsUpToDate()) {</a>
+<a name="ln1415">		// prepare the request</a>
+<a name="ln1416">		OpenAttrDirRequest request;</a>
+<a name="ln1417">		request.volumeID = fID;</a>
+<a name="ln1418">		request.nodeID = node-&gt;GetRemoteID();</a>
+<a name="ln1419"> </a>
+<a name="ln1420">		locker.Unlock();</a>
+<a name="ln1421"> </a>
+<a name="ln1422">		// send the request</a>
+<a name="ln1423">		OpenAttrDirReply* reply;</a>
+<a name="ln1424">		status_t error = SendRequest(fConnection, &amp;request, &amp;reply);</a>
+<a name="ln1425">		if (error != B_OK)</a>
+<a name="ln1426">			RETURN_ERROR(error);</a>
+<a name="ln1427">		ObjectDeleter&lt;Request&gt; replyDeleter(reply);</a>
+<a name="ln1428">		if (reply-&gt;error != B_OK)</a>
+<a name="ln1429">			RETURN_ERROR(reply-&gt;error);</a>
+<a name="ln1430"> </a>
+<a name="ln1431">		// If no AttrDirInfo was supplied, we just save the cookie and be done.</a>
+<a name="ln1432">		// This usually happens when the attr dir is too big to be cached.</a>
+<a name="ln1433">		if (!reply-&gt;attrDirInfo.isValid) {</a>
+<a name="ln1434">			cookie-&gt;cookie = reply-&gt;cookie;</a>
+<a name="ln1435">			cookie-&gt;rewind = false;</a>
+<a name="ln1436">			*_cookie = cookie;</a>
+<a name="ln1437">			cookieDeleter.Detach();</a>
+<a name="ln1438">			return B_OK;</a>
+<a name="ln1439">		}</a>
+<a name="ln1440"> </a>
+<a name="ln1441">		locker.SetTo(fLock, false);</a>
+<a name="ln1442"> </a>
+<a name="ln1443">		// a AttrDirInfo has been supplied: load the attr dir</a>
+<a name="ln1444">		error = _LoadAttrDir(node, reply-&gt;attrDirInfo);</a>
+<a name="ln1445">		if (error != B_OK)</a>
+<a name="ln1446">			return error;</a>
+<a name="ln1447">	}</a>
+<a name="ln1448"> </a>
+<a name="ln1449">	// we have a valid attr dir: create an attr dir iterator</a>
+<a name="ln1450">	ShareAttrDirIterator* iterator = new(std::nothrow) ShareAttrDirIterator;</a>
+<a name="ln1451">	if (!iterator)</a>
+<a name="ln1452">		return B_NO_MEMORY;</a>
+<a name="ln1453">	iterator-&gt;SetAttrDir(node-&gt;GetAttrDir());</a>
+<a name="ln1454"> </a>
+<a name="ln1455">	// add the iterator</a>
+<a name="ln1456">	status_t error = _AddAttrDirIterator(node, iterator);</a>
+<a name="ln1457">	if (error != B_OK) {</a>
+<a name="ln1458">		delete iterator;</a>
+<a name="ln1459">		return error;</a>
+<a name="ln1460">	}</a>
+<a name="ln1461"> </a>
+<a name="ln1462">	cookie-&gt;iterator = iterator;</a>
+<a name="ln1463">	*_cookie = cookie;</a>
+<a name="ln1464">	cookieDeleter.Detach();</a>
+<a name="ln1465">	return B_OK;</a>
+<a name="ln1466">}</a>
+<a name="ln1467"> </a>
+<a name="ln1468">// CloseAttrDir</a>
+<a name="ln1469">status_t</a>
+<a name="ln1470">ShareVolume::CloseAttrDir(Node* _node, void* cookie)</a>
+<a name="ln1471">{</a>
+<a name="ln1472">	// no-op: FreeAttrDirCookie does the job</a>
+<a name="ln1473">	return B_OK;</a>
+<a name="ln1474">}</a>
+<a name="ln1475"> </a>
+<a name="ln1476">// FreeAttrDirCookie</a>
+<a name="ln1477">status_t</a>
+<a name="ln1478">ShareVolume::FreeAttrDirCookie(Node* _node, void* _cookie)</a>
+<a name="ln1479">{</a>
+<a name="ln1480">	ShareNode* node = dynamic_cast&lt;ShareNode*&gt;(_node);</a>
+<a name="ln1481">	AttrDirCookie* cookie = (AttrDirCookie*)_cookie;</a>
+<a name="ln1482">	ObjectDeleter&lt;AttrDirCookie&gt; _(cookie);</a>
+<a name="ln1483"> </a>
+<a name="ln1484">	// if this is a local iterator, we just delete it and be done</a>
+<a name="ln1485">	if (cookie-&gt;iterator) {</a>
+<a name="ln1486">		AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln1487"> </a>
+<a name="ln1488">		// remove and delete the iterator</a>
+<a name="ln1489">		_RemoveAttrDirIterator(node, cookie-&gt;iterator);</a>
+<a name="ln1490">		delete cookie-&gt;iterator;</a>
+<a name="ln1491"> </a>
+<a name="ln1492">		return B_OK;</a>
+<a name="ln1493">	}</a>
+<a name="ln1494"> </a>
+<a name="ln1495">	// prepare the request</a>
+<a name="ln1496">	CloseRequest request;</a>
+<a name="ln1497">	request.volumeID = fID;</a>
+<a name="ln1498">	request.cookie = cookie-&gt;cookie;</a>
+<a name="ln1499"> </a>
+<a name="ln1500">	// send the request</a>
+<a name="ln1501">	if (!_EnsureShareMounted())</a>
+<a name="ln1502">		return ERROR_NOT_CONNECTED;</a>
+<a name="ln1503">	CloseReply* reply;</a>
+<a name="ln1504">	status_t error = SendRequest(fConnection, &amp;request, &amp;reply);</a>
+<a name="ln1505">	if (error != B_OK)</a>
+<a name="ln1506">		RETURN_ERROR(error);</a>
+<a name="ln1507">	ObjectDeleter&lt;Request&gt; replyDeleter(reply);</a>
+<a name="ln1508">	if (reply-&gt;error != B_OK)</a>
+<a name="ln1509">		RETURN_ERROR(reply-&gt;error);</a>
+<a name="ln1510"> </a>
+<a name="ln1511">	return B_OK;</a>
+<a name="ln1512">}</a>
+<a name="ln1513"> </a>
+<a name="ln1514">// ReadAttrDir</a>
+<a name="ln1515">status_t</a>
+<a name="ln1516">ShareVolume::ReadAttrDir(Node* _node, void* _cookie, struct dirent* buffer,</a>
+<a name="ln1517">	size_t bufferSize, int32 count, int32* countRead)</a>
+<a name="ln1518">{</a>
+<a name="ln1519">	if (!_EnsureShareMounted())</a>
+<a name="ln1520">		return ERROR_NOT_CONNECTED;</a>
+<a name="ln1521"> </a>
+<a name="ln1522">	*countRead = 0;</a>
+<a name="ln1523">	AttrDirCookie* cookie = (AttrDirCookie*)_cookie;</a>
+<a name="ln1524"> </a>
+<a name="ln1525">	// if we have a local iterator, things are easy</a>
+<a name="ln1526">	if (ShareAttrDirIterator* iterator = cookie-&gt;iterator) {</a>
+<a name="ln1527">		AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln1528"> </a>
+<a name="ln1529">		// get the current attribute</a>
+<a name="ln1530">		Attribute* attribute = iterator-&gt;GetCurrentAttribute();</a>
+<a name="ln1531">		if (!attribute)</a>
+<a name="ln1532">			return B_OK;</a>
+<a name="ln1533"> </a>
+<a name="ln1534">		// set the name: this also checks the size of the buffer</a>
+<a name="ln1535">		const char* name = attribute-&gt;GetName();</a>
+<a name="ln1536">		status_t error = set_dirent_name(buffer, bufferSize, name,</a>
+<a name="ln1537">			strlen(name));</a>
+<a name="ln1538">		if (error != B_OK)</a>
+<a name="ln1539">			RETURN_ERROR(error);</a>
+<a name="ln1540"> </a>
+<a name="ln1541">		// fill in the other fields</a>
+<a name="ln1542">		buffer-&gt;d_dev = fVolumeManager-&gt;GetID();</a>
+<a name="ln1543">		buffer-&gt;d_ino = -1;</a>
+<a name="ln1544">		*countRead = 1;</a>
+<a name="ln1545"> </a>
+<a name="ln1546">		iterator-&gt;NextAttribute();</a>
+<a name="ln1547">		return B_OK;</a>
+<a name="ln1548">	}</a>
+<a name="ln1549"> </a>
+<a name="ln1550">	// prepare the request</a>
+<a name="ln1551">	ReadAttrDirRequest request;</a>
+<a name="ln1552">	request.volumeID = fID;</a>
+<a name="ln1553">	request.cookie = cookie-&gt;cookie;</a>
+<a name="ln1554">	request.count = 1;</a>
+<a name="ln1555">	request.rewind = cookie-&gt;rewind;</a>
+<a name="ln1556"> </a>
+<a name="ln1557">	// send the request</a>
+<a name="ln1558">	ReadAttrDirReply* reply;</a>
+<a name="ln1559">	status_t error = SendRequest(fConnection, &amp;request, &amp;reply);</a>
+<a name="ln1560">	if (error != B_OK)</a>
+<a name="ln1561">		RETURN_ERROR(error);</a>
+<a name="ln1562">	ObjectDeleter&lt;Request&gt; replyDeleter(reply);</a>
+<a name="ln1563">	if (reply-&gt;error != B_OK)</a>
+<a name="ln1564">		RETURN_ERROR(reply-&gt;error);</a>
+<a name="ln1565">	cookie-&gt;rewind = false;</a>
+<a name="ln1566"> </a>
+<a name="ln1567">	// check, if anything has been read at all</a>
+<a name="ln1568">	if (reply-&gt;count == 0) {</a>
+<a name="ln1569">		*countRead = 0;</a>
+<a name="ln1570">		return B_OK;</a>
+<a name="ln1571">	}</a>
+<a name="ln1572">	const char* name = reply-&gt;name.GetString();</a>
+<a name="ln1573">	int32 nameLen = reply-&gt;name.GetSize();</a>
+<a name="ln1574">	if (!name || nameLen &lt; 2)</a>
+<a name="ln1575">		return B_BAD_DATA;</a>
+<a name="ln1576"> </a>
+<a name="ln1577">	// set the name: this also checks the size of the buffer</a>
+<a name="ln1578">	error = set_dirent_name(buffer, bufferSize, name, nameLen - 1);</a>
+<a name="ln1579">	if (error != B_OK)</a>
+<a name="ln1580">		RETURN_ERROR(error);</a>
+<a name="ln1581"> </a>
+<a name="ln1582">	// fill in the other fields</a>
+<a name="ln1583">	buffer-&gt;d_dev = fVolumeManager-&gt;GetID();</a>
+<a name="ln1584">	buffer-&gt;d_ino = -1;</a>
+<a name="ln1585">	*countRead = 1;</a>
+<a name="ln1586">	return B_OK;</a>
+<a name="ln1587">}</a>
+<a name="ln1588"> </a>
+<a name="ln1589">// RewindAttrDir</a>
+<a name="ln1590">status_t</a>
+<a name="ln1591">ShareVolume::RewindAttrDir(Node* _node, void* _cookie)</a>
+<a name="ln1592">{</a>
+<a name="ln1593">	AttrDirCookie* cookie = (AttrDirCookie*)_cookie;</a>
+<a name="ln1594"> </a>
+<a name="ln1595">	// if we have a local iterator, rewind it</a>
+<a name="ln1596">	if (ShareAttrDirIterator* iterator = cookie-&gt;iterator) {</a>
+<a name="ln1597">		AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln1598"> </a>
+<a name="ln1599">		iterator-&gt;Rewind();</a>
+<a name="ln1600">	} else</a>
+<a name="ln1601">		cookie-&gt;rewind = true;</a>
+<a name="ln1602"> </a>
+<a name="ln1603">	return B_OK;</a>
+<a name="ln1604">}</a>
+<a name="ln1605"> </a>
+<a name="ln1606">// ReadAttr</a>
+<a name="ln1607">status_t</a>
+<a name="ln1608">ShareVolume::ReadAttr(Node* _node, const char* name, int type, off_t pos,</a>
+<a name="ln1609">	void* _buffer, size_t bufferSize, size_t* _bytesRead)</a>
+<a name="ln1610">{</a>
+<a name="ln1611">	ShareNode* node = dynamic_cast&lt;ShareNode*&gt;(_node);</a>
+<a name="ln1612"> </a>
+<a name="ln1613">	if (!_EnsureShareMounted())</a>
+<a name="ln1614">		return ERROR_NOT_CONNECTED;</a>
+<a name="ln1615"> </a>
+<a name="ln1616">	*_bytesRead = 0;</a>
+<a name="ln1617">	if (bufferSize == 0)</a>
+<a name="ln1618">		return B_OK;</a>
+<a name="ln1619">	uint8* buffer = (uint8*)_buffer;</a>
+<a name="ln1620"> </a>
+<a name="ln1621">	// if we have the attribute directory cached, we can first check, if the</a>
+<a name="ln1622">	// attribute exists at all -- maybe its data are cached, too</a>
+<a name="ln1623">	{</a>
+<a name="ln1624">		AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln1625"> </a>
+<a name="ln1626">		ShareAttrDir* attrDir = node-&gt;GetAttrDir();</a>
+<a name="ln1627">		if (attrDir &amp;&amp; attrDir-&gt;IsUpToDate()) {</a>
+<a name="ln1628">			// get the attribute</a>
+<a name="ln1629">			Attribute* attribute = attrDir-&gt;GetAttribute(name);</a>
+<a name="ln1630">			if (!attribute)</a>
+<a name="ln1631">				return B_ENTRY_NOT_FOUND;</a>
+<a name="ln1632"> </a>
+<a name="ln1633">			// get the data</a>
+<a name="ln1634">			if (const void* data = attribute-&gt;GetData()) {</a>
+<a name="ln1635">				// first check, if we can read anything at all</a>
+<a name="ln1636">				if (pos &lt; 0)</a>
+<a name="ln1637">					pos = 0;</a>
+<a name="ln1638">				int32 size = attribute-&gt;GetSize();</a>
+<a name="ln1639">				if (pos &gt;= size)</a>
+<a name="ln1640">					return B_OK;</a>
+<a name="ln1641"> </a>
+<a name="ln1642">				// get the data</a>
+<a name="ln1643">				bufferSize = min(bufferSize, size_t(size - pos));</a>
+<a name="ln1644">				memcpy(buffer, data, bufferSize);</a>
+<a name="ln1645">				*_bytesRead = bufferSize;</a>
+<a name="ln1646">				return B_OK;</a>
+<a name="ln1647">			}</a>
+<a name="ln1648">		}</a>
+<a name="ln1649">	}</a>
+<a name="ln1650"> </a>
+<a name="ln1651">	// prepare the request</a>
+<a name="ln1652">	ReadAttrRequest request;</a>
+<a name="ln1653">	request.volumeID = fID;</a>
+<a name="ln1654">	request.nodeID = node-&gt;GetRemoteID();</a>
+<a name="ln1655">	request.name.SetTo(name);</a>
+<a name="ln1656">	request.type = type;</a>
+<a name="ln1657">	request.pos = pos;</a>
+<a name="ln1658">	request.size = bufferSize;</a>
+<a name="ln1659"> </a>
+<a name="ln1660">	struct ReadRequestHandler : public RequestHandler {</a>
+<a name="ln1661">		uint8*	buffer;</a>
+<a name="ln1662">		off_t	pos;</a>
+<a name="ln1663">		int32	bufferSize;</a>
+<a name="ln1664">		int32	bytesRead;</a>
+<a name="ln1665"> </a>
+<a name="ln1666">		ReadRequestHandler(uint8* buffer, off_t pos, int32 bufferSize)</a>
+<a name="ln1667">			: buffer(buffer),</a>
+<a name="ln1668">			  pos(pos),</a>
+<a name="ln1669">			  bufferSize(bufferSize),</a>
+<a name="ln1670">			  bytesRead(0)</a>
+<a name="ln1671">		{</a>
+<a name="ln1672">		}</a>
+<a name="ln1673"> </a>
+<a name="ln1674">		virtual status_t HandleRequest(Request* _reply, RequestChannel* channel)</a>
+<a name="ln1675">		{</a>
+<a name="ln1676">			// the passed request is deleted by the request port</a>
+<a name="ln1677">			ReadAttrReply* reply = dynamic_cast&lt;ReadAttrReply*&gt;(_reply);</a>
+<a name="ln1678">			if (!reply)</a>
+<a name="ln1679">				RETURN_ERROR(B_BAD_DATA);</a>
+<a name="ln1680">			// process the reply</a>
+<a name="ln1681">			status_t error = ProcessReply(reply);</a>
+<a name="ln1682">			if (error != B_OK)</a>
+<a name="ln1683">				return error;</a>
+<a name="ln1684">			bool moreToCome = reply-&gt;moreToCome;</a>
+<a name="ln1685">			while (moreToCome) {</a>
+<a name="ln1686">				// receive a reply</a>
+<a name="ln1687">				error = ReceiveRequest(channel, &amp;reply);</a>
+<a name="ln1688">				if (error != B_OK)</a>
+<a name="ln1689">					RETURN_ERROR(error);</a>
+<a name="ln1690">				moreToCome = reply-&gt;moreToCome;</a>
+<a name="ln1691">				ObjectDeleter&lt;Request&gt; replyDeleter(reply);</a>
+<a name="ln1692">				// process the reply</a>
+<a name="ln1693">				error = ProcessReply(reply);</a>
+<a name="ln1694">				if (error != B_OK)</a>
+<a name="ln1695">					return error;</a>
+<a name="ln1696">			}</a>
+<a name="ln1697">			return B_OK;</a>
+<a name="ln1698">		}</a>
+<a name="ln1699"> </a>
+<a name="ln1700">		status_t ProcessReply(ReadAttrReply* reply)</a>
+<a name="ln1701">		{</a>
+<a name="ln1702">			if (reply-&gt;error != B_OK)</a>
+<a name="ln1703">				RETURN_ERROR(reply-&gt;error);</a>
+<a name="ln1704">			// check the fields</a>
+<a name="ln1705">			if (reply-&gt;pos != pos)</a>
+<a name="ln1706">				RETURN_ERROR(B_BAD_DATA);</a>
+<a name="ln1707">			int32 bytesRead = reply-&gt;data.GetSize();</a>
+<a name="ln1708">			if (bytesRead &gt; (int32)bufferSize)</a>
+<a name="ln1709">				RETURN_ERROR(B_BAD_DATA);</a>
+<a name="ln1710">			// copy the data into the buffer</a>
+<a name="ln1711">			if (bytesRead &gt; 0)</a>
+<a name="ln1712">				memcpy(buffer, reply-&gt;data.GetData(), bytesRead);</a>
+<a name="ln1713">			pos += bytesRead;</a>
+<a name="ln1714">			buffer += bytesRead;</a>
+<a name="ln1715">			bufferSize -= bytesRead;</a>
+<a name="ln1716">			this-&gt;bytesRead += bytesRead;</a>
+<a name="ln1717">			return B_OK;</a>
+<a name="ln1718">		}</a>
+<a name="ln1719">	} requestHandler(buffer, pos, bufferSize);</a>
+<a name="ln1720"> </a>
+<a name="ln1721">	// send the request</a>
+<a name="ln1722">	status_t error = fConnection-&gt;SendRequest(&amp;request, &amp;requestHandler);</a>
+<a name="ln1723">	if (error != B_OK)</a>
+<a name="ln1724">		RETURN_ERROR(error);</a>
+<a name="ln1725">	*_bytesRead = requestHandler.bytesRead;</a>
+<a name="ln1726">	return B_OK;</a>
+<a name="ln1727">}</a>
+<a name="ln1728"> </a>
+<a name="ln1729">// WriteAttr</a>
+<a name="ln1730">status_t</a>
+<a name="ln1731">ShareVolume::WriteAttr(Node* _node, const char* name, int type, off_t pos,</a>
+<a name="ln1732">	const void* _buffer, size_t bufferSize, size_t* bytesWritten)</a>
+<a name="ln1733">{</a>
+<a name="ln1734">	ShareNode* node = dynamic_cast&lt;ShareNode*&gt;(_node);</a>
+<a name="ln1735"> </a>
+<a name="ln1736">	if (!_EnsureShareMounted())</a>
+<a name="ln1737">		return ERROR_NOT_CONNECTED;</a>
+<a name="ln1738"> </a>
+<a name="ln1739">	// check permissions</a>
+<a name="ln1740">	if (IsReadOnly())</a>
+<a name="ln1741">		return B_PERMISSION_DENIED;</a>
+<a name="ln1742"> </a>
+<a name="ln1743">	*bytesWritten = 0;</a>
+<a name="ln1744">	off_t bytesLeft = bufferSize;</a>
+<a name="ln1745">	const char* buffer = (const char*)_buffer;</a>
+<a name="ln1746">	while (bytesLeft &gt; 0) {</a>
+<a name="ln1747">		// store the current attibute dir revision for reference below</a>
+<a name="ln1748">		int64 attrDirRevision = -1;</a>
+<a name="ln1749">		{</a>
+<a name="ln1750">			AutoLocker&lt;Locker&gt; _(fLock);</a>
+<a name="ln1751">			if (ShareAttrDir* attrDir = node-&gt;GetAttrDir()) {</a>
+<a name="ln1752">				if (attrDir-&gt;IsUpToDate())</a>
+<a name="ln1753">					attrDirRevision = attrDir-&gt;GetRevision();</a>
+<a name="ln1754">			}</a>
+<a name="ln1755">		}</a>
+<a name="ln1756"> </a>
+<a name="ln1757">		off_t toWrite = bytesLeft;</a>
+<a name="ln1758">		if (toWrite &gt; kMaxWriteBufferSize)</a>
+<a name="ln1759">			toWrite = kMaxWriteBufferSize;</a>
+<a name="ln1760"> </a>
+<a name="ln1761">		// prepare the request</a>
+<a name="ln1762">		WriteAttrRequest request;</a>
+<a name="ln1763">		request.volumeID = fID;</a>
+<a name="ln1764">		request.nodeID = node-&gt;GetRemoteID();</a>
+<a name="ln1765">		request.name.SetTo(name);</a>
+<a name="ln1766">		request.type = type;</a>
+<a name="ln1767">		request.pos = pos;</a>
+<a name="ln1768">		request.data.SetTo(buffer, toWrite);</a>
+<a name="ln1769"> </a>
+<a name="ln1770">		// send the request</a>
+<a name="ln1771">		WriteAttrReply* reply;</a>
+<a name="ln1772">		status_t error = SendRequest(fConnection, &amp;request, &amp;reply);</a>
+<a name="ln1773">		if (error != B_OK)</a>
+<a name="ln1774">			RETURN_ERROR(error);</a>
+<a name="ln1775"> </a>
+<a name="ln1776">		ObjectDeleter&lt;Request&gt; replyDeleter(reply);</a>
+<a name="ln1777">		if (reply-&gt;error != B_OK)</a>
+<a name="ln1778">			RETURN_ERROR(reply-&gt;error);</a>
+<a name="ln1779"> </a>
+<a name="ln1780">		bytesLeft -= toWrite;</a>
+<a name="ln1781">		pos += toWrite;</a>
+<a name="ln1782">		buffer += toWrite;</a>
+<a name="ln1783"> </a>
+<a name="ln1784">		// If the request was successful, we consider the cached attr dir</a>
+<a name="ln1785">		// no longer up to date.</a>
+<a name="ln1786">		if (attrDirRevision &gt;= 0) {</a>
+<a name="ln1787">			AutoLocker&lt;Locker&gt; _(fLock);</a>
+<a name="ln1788">			ShareAttrDir* attrDir = node-&gt;GetAttrDir();</a>
+<a name="ln1789">			if (attrDir &amp;&amp; attrDir-&gt;GetRevision() == attrDirRevision)</a>
+<a name="ln1790">				attrDir-&gt;SetUpToDate(false);</a>
+<a name="ln1791">		}</a>
+<a name="ln1792">	}</a>
+<a name="ln1793"> </a>
+<a name="ln1794">	*bytesWritten = bufferSize;</a>
+<a name="ln1795">	return B_OK;</a>
+<a name="ln1796">}</a>
+<a name="ln1797"> </a>
+<a name="ln1798">// RemoveAttr</a>
+<a name="ln1799">status_t</a>
+<a name="ln1800">ShareVolume::RemoveAttr(Node* _node, const char* name)</a>
+<a name="ln1801">{</a>
+<a name="ln1802">	ShareNode* node = dynamic_cast&lt;ShareNode*&gt;(_node);</a>
+<a name="ln1803"> </a>
+<a name="ln1804">	if (!_EnsureShareMounted())</a>
+<a name="ln1805">		return ERROR_NOT_CONNECTED;</a>
+<a name="ln1806"> </a>
+<a name="ln1807">	// check permissions</a>
+<a name="ln1808">	if (IsReadOnly())</a>
+<a name="ln1809">		return B_PERMISSION_DENIED;</a>
+<a name="ln1810"> </a>
+<a name="ln1811">	// store the current attibute dir revision for reference below</a>
+<a name="ln1812">	int64 attrDirRevision = -1;</a>
+<a name="ln1813">	{</a>
+<a name="ln1814">		AutoLocker&lt;Locker&gt; _(fLock);</a>
+<a name="ln1815">		if (ShareAttrDir* attrDir = node-&gt;GetAttrDir()) {</a>
+<a name="ln1816">			if (attrDir-&gt;IsUpToDate())</a>
+<a name="ln1817">				attrDirRevision = attrDir-&gt;GetRevision();</a>
+<a name="ln1818">		}</a>
+<a name="ln1819">	}</a>
+<a name="ln1820"> </a>
+<a name="ln1821">	// prepare the request</a>
+<a name="ln1822">	RemoveAttrRequest request;</a>
+<a name="ln1823">	request.volumeID = fID;</a>
+<a name="ln1824">	request.nodeID = node-&gt;GetRemoteID();</a>
+<a name="ln1825">	request.name.SetTo(name);</a>
+<a name="ln1826"> </a>
+<a name="ln1827">	// send the request</a>
+<a name="ln1828">	RemoveAttrReply* reply;</a>
+<a name="ln1829">	status_t error = SendRequest(fConnection, &amp;request, &amp;reply);</a>
+<a name="ln1830">	if (error != B_OK)</a>
+<a name="ln1831">		RETURN_ERROR(error);</a>
+<a name="ln1832">	ObjectDeleter&lt;Request&gt; replyDeleter(reply);</a>
+<a name="ln1833"> </a>
+<a name="ln1834">	// If the request was successful, we consider the cached attr dir</a>
+<a name="ln1835">	// no longer up to date.</a>
+<a name="ln1836">	if (reply-&gt;error == B_OK &amp;&amp; attrDirRevision &gt;= 0) {</a>
+<a name="ln1837">		AutoLocker&lt;Locker&gt; _(fLock);</a>
+<a name="ln1838">		ShareAttrDir* attrDir = node-&gt;GetAttrDir();</a>
+<a name="ln1839">		if (attrDir &amp;&amp; attrDir-&gt;GetRevision() == attrDirRevision)</a>
+<a name="ln1840">			attrDir-&gt;SetUpToDate(false);</a>
+<a name="ln1841">	}</a>
+<a name="ln1842"> </a>
+<a name="ln1843">	RETURN_ERROR(reply-&gt;error);</a>
+<a name="ln1844">}</a>
+<a name="ln1845"> </a>
+<a name="ln1846">// RenameAttr</a>
+<a name="ln1847">status_t</a>
+<a name="ln1848">ShareVolume::RenameAttr(Node* _node, const char* oldName, const char* newName)</a>
+<a name="ln1849">{</a>
+<a name="ln1850">	ShareNode* node = dynamic_cast&lt;ShareNode*&gt;(_node);</a>
+<a name="ln1851"> </a>
+<a name="ln1852">	if (!_EnsureShareMounted())</a>
+<a name="ln1853">		return ERROR_NOT_CONNECTED;</a>
+<a name="ln1854"> </a>
+<a name="ln1855">	// check permissions</a>
+<a name="ln1856">	if (IsReadOnly())</a>
+<a name="ln1857">		return B_PERMISSION_DENIED;</a>
+<a name="ln1858"> </a>
+<a name="ln1859">	// store the current attibute dir revision for reference below</a>
+<a name="ln1860">	int64 attrDirRevision = -1;</a>
+<a name="ln1861">	{</a>
+<a name="ln1862">		AutoLocker&lt;Locker&gt; _(fLock);</a>
+<a name="ln1863">		if (ShareAttrDir* attrDir = node-&gt;GetAttrDir()) {</a>
+<a name="ln1864">			if (attrDir-&gt;IsUpToDate())</a>
+<a name="ln1865">				attrDirRevision = attrDir-&gt;GetRevision();</a>
+<a name="ln1866">		}</a>
+<a name="ln1867">	}</a>
+<a name="ln1868"> </a>
+<a name="ln1869">	// prepare the request</a>
+<a name="ln1870">	RenameAttrRequest request;</a>
+<a name="ln1871">	request.volumeID = fID;</a>
+<a name="ln1872">	request.nodeID = node-&gt;GetRemoteID();</a>
+<a name="ln1873">	request.oldName.SetTo(oldName);</a>
+<a name="ln1874">	request.newName.SetTo(newName);</a>
+<a name="ln1875"> </a>
+<a name="ln1876">	// send the request</a>
+<a name="ln1877">	RenameAttrReply* reply;</a>
+<a name="ln1878">	status_t error = SendRequest(fConnection, &amp;request, &amp;reply);</a>
+<a name="ln1879">	if (error != B_OK)</a>
+<a name="ln1880">		RETURN_ERROR(error);</a>
+<a name="ln1881">	ObjectDeleter&lt;Request&gt; replyDeleter(reply);</a>
+<a name="ln1882"> </a>
+<a name="ln1883">	// If the request was successful, we consider the cached attr dir</a>
+<a name="ln1884">	// no longer up to date.</a>
+<a name="ln1885">	if (reply-&gt;error == B_OK &amp;&amp; attrDirRevision &gt;= 0) {</a>
+<a name="ln1886">		AutoLocker&lt;Locker&gt; _(fLock);</a>
+<a name="ln1887">		ShareAttrDir* attrDir = node-&gt;GetAttrDir();</a>
+<a name="ln1888">		if (attrDir &amp;&amp; attrDir-&gt;GetRevision() == attrDirRevision)</a>
+<a name="ln1889">			attrDir-&gt;SetUpToDate(false);</a>
+<a name="ln1890">	}</a>
+<a name="ln1891"> </a>
+<a name="ln1892">	RETURN_ERROR(reply-&gt;error);</a>
+<a name="ln1893">}</a>
+<a name="ln1894"> </a>
+<a name="ln1895">// StatAttr</a>
+<a name="ln1896">status_t</a>
+<a name="ln1897">ShareVolume::StatAttr(Node* _node, const char* name, struct attr_info* attrInfo)</a>
+<a name="ln1898">{</a>
+<a name="ln1899">	ShareNode* node = dynamic_cast&lt;ShareNode*&gt;(_node);</a>
+<a name="ln1900"> </a>
+<a name="ln1901">	if (!_EnsureShareMounted())</a>
+<a name="ln1902">		return ERROR_NOT_CONNECTED;</a>
+<a name="ln1903"> </a>
+<a name="ln1904">	// if we have the attribute directory cached, get the info from there</a>
+<a name="ln1905">	{</a>
+<a name="ln1906">		AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln1907"> </a>
+<a name="ln1908">		ShareAttrDir* attrDir = node-&gt;GetAttrDir();</a>
+<a name="ln1909">		if (attrDir &amp;&amp; attrDir-&gt;IsUpToDate()) {</a>
+<a name="ln1910">			// get the attribute</a>
+<a name="ln1911">			Attribute* attribute = attrDir-&gt;GetAttribute(name);</a>
+<a name="ln1912">			if (!attribute)</a>
+<a name="ln1913">				return B_ENTRY_NOT_FOUND;</a>
+<a name="ln1914"> </a>
+<a name="ln1915">			attribute-&gt;GetInfo(attrInfo);</a>
+<a name="ln1916">			return B_OK;</a>
+<a name="ln1917">		}</a>
+<a name="ln1918">	}</a>
+<a name="ln1919"> </a>
+<a name="ln1920">	// prepare the request</a>
+<a name="ln1921">	StatAttrRequest request;</a>
+<a name="ln1922">	request.volumeID = fID;</a>
+<a name="ln1923">	request.nodeID = node-&gt;GetRemoteID();</a>
+<a name="ln1924">	request.name.SetTo(name);</a>
+<a name="ln1925"> </a>
+<a name="ln1926">	// send the request</a>
+<a name="ln1927">	StatAttrReply* reply;</a>
+<a name="ln1928">	status_t error = SendRequest(fConnection, &amp;request, &amp;reply);</a>
+<a name="ln1929">	if (error != B_OK)</a>
+<a name="ln1930">		RETURN_ERROR(error);</a>
+<a name="ln1931">	ObjectDeleter&lt;Request&gt; replyDeleter(reply);</a>
+<a name="ln1932">	if (reply-&gt;error != B_OK)</a>
+<a name="ln1933">		RETURN_ERROR(reply-&gt;error);</a>
+<a name="ln1934"> </a>
+<a name="ln1935">	// set the result</a>
+<a name="ln1936">	*attrInfo = reply-&gt;attrInfo.info;</a>
+<a name="ln1937">	return B_OK;</a>
+<a name="ln1938">}</a>
+<a name="ln1939"> </a>
+<a name="ln1940"> </a>
+<a name="ln1941">// #pragma mark -</a>
+<a name="ln1942">// #pragma mark ----- queries -----</a>
+<a name="ln1943"> </a>
+<a name="ln1944">// GetQueryEntry</a>
+<a name="ln1945">status_t</a>
+<a name="ln1946">ShareVolume::GetQueryEntry(const EntryInfo&amp; entryInfo,</a>
+<a name="ln1947">	const NodeInfo&amp; dirInfo, struct dirent* buffer, size_t bufferSize,</a>
+<a name="ln1948">	int32* countRead)</a>
+<a name="ln1949">{</a>
+<a name="ln1950">	status_t error = B_OK;</a>
+<a name="ln1951"> </a>
+<a name="ln1952">	const char* name = entryInfo.name.GetString();</a>
+<a name="ln1953">	int32 nameLen = entryInfo.name.GetSize();</a>
+<a name="ln1954">	if (!name || nameLen &lt; 2)</a>
+<a name="ln1955">		RETURN_ERROR(B_BAD_DATA);</a>
+<a name="ln1956"> </a>
+<a name="ln1957">	// load the directory</a>
+<a name="ln1958">	vnode_id localDirID = -1;</a>
+<a name="ln1959">	{</a>
+<a name="ln1960">		AutoLocker&lt;Locker&gt; _(fLock);</a>
+<a name="ln1961">		ShareNode* node;</a>
+<a name="ln1962">		error = _LoadNode(dirInfo, &amp;node);</a>
+<a name="ln1963">		if (error != B_OK)</a>
+<a name="ln1964">			RETURN_ERROR(error);</a>
+<a name="ln1965">		ShareDir* directory = dynamic_cast&lt;ShareDir*&gt;(node);</a>
+<a name="ln1966">		if (!directory)</a>
+<a name="ln1967">			RETURN_ERROR(B_ENTRY_NOT_FOUND);</a>
+<a name="ln1968">		localDirID = directory-&gt;GetID();</a>
+<a name="ln1969">	}</a>
+<a name="ln1970"> </a>
+<a name="ln1971">	// add/update the entry</a>
+<a name="ln1972">	vnode_id localNodeID = -1;</a>
+<a name="ln1973">	const EntryInfo* resolvedEntryInfo = &amp;entryInfo;</a>
+<a name="ln1974">	while (error == B_OK) {</a>
+<a name="ln1975">		// get an up to date entry info</a>
+<a name="ln1976">		WalkReply* walkReply = NULL;</a>
+<a name="ln1977">		if (!resolvedEntryInfo) {</a>
+<a name="ln1978">			error = _Walk(entryInfo.directoryID, name, false,</a>
+<a name="ln1979">				&amp;walkReply);</a>
+<a name="ln1980">			if (error != B_OK)</a>
+<a name="ln1981">				RETURN_ERROR(error);</a>
+<a name="ln1982"> </a>
+<a name="ln1983">			resolvedEntryInfo = &amp;walkReply-&gt;entryInfo;</a>
+<a name="ln1984">		}</a>
+<a name="ln1985">		ObjectDeleter&lt;Request&gt; walkReplyDeleter(walkReply);</a>
+<a name="ln1986"> </a>
+<a name="ln1987">		AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln1988"> </a>
+<a name="ln1989">		// check, if the info is obsolete</a>
+<a name="ln1990">		if (_IsObsoleteEntryInfo(*resolvedEntryInfo)) {</a>
+<a name="ln1991">			resolvedEntryInfo = NULL;</a>
+<a name="ln1992">			continue;</a>
+<a name="ln1993">		}</a>
+<a name="ln1994"> </a>
+<a name="ln1995">		// get the directory</a>
+<a name="ln1996">		ShareDir* dir = dynamic_cast&lt;ShareDir*&gt;(_GetNodeByLocalID(localDirID));</a>
+<a name="ln1997">		if (!dir)</a>
+<a name="ln1998">			RETURN_ERROR(B_ERROR);</a>
+<a name="ln1999"> </a>
+<a name="ln2000">		// load the entry</a>
+<a name="ln2001">		ShareDirEntry* entry;</a>
+<a name="ln2002">		error = _LoadEntry(dir, *resolvedEntryInfo, &amp;entry);</a>
+<a name="ln2003">		if (error == B_OK)</a>
+<a name="ln2004">			localNodeID = entry-&gt;GetNode()-&gt;GetID();</a>
+<a name="ln2005"> </a>
+<a name="ln2006">		break;</a>
+<a name="ln2007">	}</a>
+<a name="ln2008"> </a>
+<a name="ln2009">	// set the name: this also checks the size of the buffer</a>
+<a name="ln2010">	error = set_dirent_name(buffer, bufferSize, name, nameLen - 1);</a>
+<a name="ln2011">	if (error != B_OK)</a>
+<a name="ln2012">		RETURN_ERROR(error);</a>
+<a name="ln2013"> </a>
+<a name="ln2014">	// fill in the other fields</a>
+<a name="ln2015">	buffer-&gt;d_pdev = fVolumeManager-&gt;GetID();</a>
+<a name="ln2016">	buffer-&gt;d_pino = localDirID;</a>
+<a name="ln2017">	buffer-&gt;d_dev = fVolumeManager-&gt;GetID();</a>
+<a name="ln2018">	buffer-&gt;d_ino = localNodeID;</a>
+<a name="ln2019"> </a>
+<a name="ln2020">	*countRead = 1;</a>
+<a name="ln2021">	PRINT(&quot;  entry: d_dev: %&quot; B_PRIdDEV &quot;, d_pdev: %&quot; B_PRIdDEV &quot;, d_ino: %&quot;</a>
+<a name="ln2022">		B_PRIdINO &quot;, d_pino: %&quot; B_PRIdINO &quot;, d_reclen: %hu, d_name: `%s'\n&quot;,</a>
+<a name="ln2023">		buffer-&gt;d_dev, buffer-&gt;d_pdev, buffer-&gt;d_ino, buffer-&gt;d_pino,</a>
+<a name="ln2024">		buffer-&gt;d_reclen, buffer-&gt;d_name);</a>
+<a name="ln2025">	return B_OK;</a>
+<a name="ln2026">}</a>
+<a name="ln2027"> </a>
+<a name="ln2028"> </a>
+<a name="ln2029">// #pragma mark -</a>
+<a name="ln2030"> </a>
+<a name="ln2031">// ProcessNodeMonitoringRequest</a>
+<a name="ln2032">void</a>
+<a name="ln2033">ShareVolume::ProcessNodeMonitoringRequest(NodeMonitoringRequest* request)</a>
+<a name="ln2034">{</a>
+<a name="ln2035">	switch (request-&gt;opcode) {</a>
+<a name="ln2036">		case B_ENTRY_CREATED:</a>
+<a name="ln2037">			_HandleEntryCreatedRequest(</a>
+<a name="ln2038">				dynamic_cast&lt;EntryCreatedRequest*&gt;(request));</a>
+<a name="ln2039">			break;</a>
+<a name="ln2040">		case B_ENTRY_REMOVED:</a>
+<a name="ln2041">			_HandleEntryRemovedRequest(</a>
+<a name="ln2042">				dynamic_cast&lt;EntryRemovedRequest*&gt;(request));</a>
+<a name="ln2043">			break;</a>
+<a name="ln2044">		case B_ENTRY_MOVED:</a>
+<a name="ln2045">			_HandleEntryMovedRequest(</a>
+<a name="ln2046">				dynamic_cast&lt;EntryMovedRequest*&gt;(request));</a>
+<a name="ln2047">			break;</a>
+<a name="ln2048">		case B_STAT_CHANGED:</a>
+<a name="ln2049">			_HandleStatChangedRequest(</a>
+<a name="ln2050">				dynamic_cast&lt;StatChangedRequest*&gt;(request));</a>
+<a name="ln2051">			break;</a>
+<a name="ln2052">		case B_ATTR_CHANGED:</a>
+<a name="ln2053">			_HandleAttributeChangedRequest(</a>
+<a name="ln2054">				dynamic_cast&lt;AttributeChangedRequest*&gt;(request));</a>
+<a name="ln2055">			break;</a>
+<a name="ln2056">	}</a>
+<a name="ln2057">}</a>
+<a name="ln2058"> </a>
+<a name="ln2059">// ConnectionClosed</a>
+<a name="ln2060">void</a>
+<a name="ln2061">ShareVolume::ConnectionClosed()</a>
+<a name="ln2062">{</a>
+<a name="ln2063">	AutoLocker&lt;Locker&gt; _(fMountLock);</a>
+<a name="ln2064">	fConnectionState = CONNECTION_CLOSED;</a>
+<a name="ln2065">}</a>
+<a name="ln2066"> </a>
+<a name="ln2067"> </a>
+<a name="ln2068">// #pragma mark -</a>
+<a name="ln2069"> </a>
+<a name="ln2070">// _ReadRemoteDir</a>
+<a name="ln2071">status_t</a>
+<a name="ln2072">ShareVolume::_ReadRemoteDir(ShareDir* directory,</a>
+<a name="ln2073">	RemoteShareDirIterator* iterator)</a>
+<a name="ln2074">{</a>
+<a name="ln2075">	// prepare the request</a>
+<a name="ln2076">	fLock.Lock();</a>
+<a name="ln2077">	ReadDirRequest request;</a>
+<a name="ln2078">	request.volumeID = fID;</a>
+<a name="ln2079">	request.cookie = iterator-&gt;GetCookie();</a>
+<a name="ln2080">	request.count = iterator-&gt;GetCapacity();</a>
+<a name="ln2081">	request.rewind = iterator-&gt;GetRewind();</a>
+<a name="ln2082">	fLock.Unlock();</a>
+<a name="ln2083"> </a>
+<a name="ln2084">	// send the request</a>
+<a name="ln2085">	ReadDirReply* reply;</a>
+<a name="ln2086">	status_t error = SendRequest(fConnection, &amp;request, &amp;reply);</a>
+<a name="ln2087">	if (error != B_OK)</a>
+<a name="ln2088">		RETURN_ERROR(error);</a>
+<a name="ln2089">	ObjectDeleter&lt;Request&gt; replyDeleter(reply);</a>
+<a name="ln2090">	if (reply-&gt;error != B_OK)</a>
+<a name="ln2091">		RETURN_ERROR(reply-&gt;error);</a>
+<a name="ln2092"> </a>
+<a name="ln2093">	RequestMemberArray&lt;EntryInfo&gt;* entryInfos = &amp;reply-&gt;entryInfos;</a>
+<a name="ln2094">	while (true) {</a>
+<a name="ln2095">		// get up to date entry infos</a>
+<a name="ln2096">		MultiWalkReply* walkReply = NULL;</a>
+<a name="ln2097">		if (!entryInfos) {</a>
+<a name="ln2098">			error = _MultiWalk(reply-&gt;entryInfos, &amp;walkReply);</a>
+<a name="ln2099">			if (error != B_OK)</a>
+<a name="ln2100">				RETURN_ERROR(error);</a>
+<a name="ln2101"> </a>
+<a name="ln2102">			entryInfos = &amp;walkReply-&gt;entryInfos;</a>
+<a name="ln2103">		}</a>
+<a name="ln2104">		ObjectDeleter&lt;Request&gt; walkReplyDeleter(walkReply);</a>
+<a name="ln2105"> </a>
+<a name="ln2106">		AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln2107"> </a>
+<a name="ln2108">		// check, if any info is obsolete</a>
+<a name="ln2109">		int32 count = entryInfos-&gt;CountElements();</a>
+<a name="ln2110">		for (int32 i = 0; i &lt; count; i++) {</a>
+<a name="ln2111">			const EntryInfo&amp; entryInfo = entryInfos-&gt;GetElements()[i];</a>
+<a name="ln2112">			if (_IsObsoleteEntryInfo(entryInfo)) {</a>
+<a name="ln2113">				entryInfos = NULL;</a>
+<a name="ln2114">				continue;</a>
+<a name="ln2115">			}</a>
+<a name="ln2116">		}</a>
+<a name="ln2117"> </a>
+<a name="ln2118">		// init the iterator's revision, if it's new or has been rewinded</a>
+<a name="ln2119">		if (request.rewind || iterator-&gt;GetRevision() &lt; 0)</a>
+<a name="ln2120">			iterator-&gt;SetRevision(reply-&gt;revision);</a>
+<a name="ln2121"> </a>
+<a name="ln2122">		iterator-&gt;Clear();</a>
+<a name="ln2123">		iterator-&gt;SetDone(reply-&gt;done);</a>
+<a name="ln2124"> </a>
+<a name="ln2125">		// iterate through the entries</a>
+<a name="ln2126">		for (int32 i = 0; i &lt; count; i++) {</a>
+<a name="ln2127">			const EntryInfo&amp; entryInfo = entryInfos-&gt;GetElements()[i];</a>
+<a name="ln2128">			const char* name = entryInfo.name.GetString();</a>
+<a name="ln2129">			int32 nameLen = entryInfo.name.GetSize();</a>
+<a name="ln2130">			if (!name || nameLen &lt; 2)</a>
+<a name="ln2131">				return B_BAD_DATA;</a>
+<a name="ln2132"> </a>
+<a name="ln2133">			// load the node/entry</a>
+<a name="ln2134">			ShareDirEntry* entry;</a>
+<a name="ln2135">			error = _LoadEntry(directory, entryInfo, &amp;entry);</a>
+<a name="ln2136">			if (error != B_OK)</a>
+<a name="ln2137">				RETURN_ERROR(error);</a>
+<a name="ln2138"> </a>
+<a name="ln2139">			// add the entry</a>
+<a name="ln2140">			if (!iterator-&gt;AddEntry(entry)) {</a>
+<a name="ln2141">				ERROR(&quot;ShareVolume::_ReadRemoteDir(): ERROR: Failed to add &quot;</a>
+<a name="ln2142">					&quot;entry to remote iterator!\n&quot;);</a>
+<a name="ln2143">			}</a>
+<a name="ln2144">		}</a>
+<a name="ln2145"> </a>
+<a name="ln2146">		// directory now complete?</a>
+<a name="ln2147">		if (reply-&gt;done &amp;&amp; directory-&gt;GetEntryRemovedEventRevision()</a>
+<a name="ln2148">				&lt; iterator-&gt;GetRevision()) {</a>
+<a name="ln2149">			directory-&gt;SetComplete(true);</a>
+<a name="ln2150">		}</a>
+<a name="ln2151"> </a>
+<a name="ln2152">		break;</a>
+<a name="ln2153">	}</a>
+<a name="ln2154"> </a>
+<a name="ln2155">	return B_OK;</a>
+<a name="ln2156">}</a>
+<a name="ln2157"> </a>
+<a name="ln2158">// _HandleEntryCreatedRequest</a>
+<a name="ln2159">void</a>
+<a name="ln2160">ShareVolume::_HandleEntryCreatedRequest(EntryCreatedRequest* request)</a>
+<a name="ln2161">{</a>
+<a name="ln2162">	if (!request)</a>
+<a name="ln2163">		return;</a>
+<a name="ln2164"> </a>
+<a name="ln2165">	nspace_id nsid = fVolumeManager-&gt;GetID();</a>
+<a name="ln2166">	const char* name = request-&gt;name.GetString();</a>
+<a name="ln2167"> </a>
+<a name="ln2168">	// translate the node IDs</a>
+<a name="ln2169">	vnode_id vnida = 0;</a>
+<a name="ln2170">	vnode_id vnidb = 0;</a>
+<a name="ln2171">	vnode_id vnidc = 0;</a>
+<a name="ln2172">	status_t error = _GetLocalNodeID(request-&gt;directoryID, &amp;vnida, true);</a>
+<a name="ln2173">	if (error == B_OK)</a>
+<a name="ln2174">		error = _GetLocalNodeID(request-&gt;nodeID, &amp;vnidc, true);</a>
+<a name="ln2175">		PRINT(&quot;ShareVolume::_HandleEntryCreatedRequest(): error: 0x%&quot; B_PRIx32</a>
+<a name="ln2176">			&quot;, name: \&quot;%s\&quot;, dir: %&quot; B_PRIdINO &quot; (remote: (%&quot; B_PRIdDEV &quot;, %&quot;</a>
+<a name="ln2177">			B_PRIdINO &quot;)), node: %&quot; B_PRIdINO &quot; (remote: (%&quot; B_PRIdDEV &quot;, %&quot;</a>
+<a name="ln2178">			B_PRIdINO &quot;))\n&quot;, error, name, vnida,</a>
+<a name="ln2179">			request-&gt;directoryID.volumeID, request-&gt;directoryID.nodeID, vnidc,</a>
+<a name="ln2180">			request-&gt;nodeID.volumeID, request-&gt;nodeID.nodeID);</a>
+<a name="ln2181"> </a>
+<a name="ln2182">	// send notifications / do additional processing</a>
+<a name="ln2183">	if (request-&gt;queryUpdate) {</a>
+<a name="ln2184">		if (error == B_OK) {</a>
+<a name="ln2185">			SendNotification(request-&gt;port, request-&gt;token,</a>
+<a name="ln2186">				B_QUERY_UPDATE, request-&gt;opcode, nsid, 0, vnida, vnidb,</a>
+<a name="ln2187">				vnidc, name);</a>
+<a name="ln2188">		}</a>
+<a name="ln2189">	} else {</a>
+<a name="ln2190">		_EntryCreated(request-&gt;directoryID, name,</a>
+<a name="ln2191">			(request-&gt;entryInfoValid ? &amp;request-&gt;entryInfo : NULL),</a>
+<a name="ln2192">			request-&gt;revision);</a>
+<a name="ln2193">		if (error == B_OK)</a>
+<a name="ln2194">			NotifyListener(request-&gt;opcode, nsid, vnida, vnidb, vnidc, name);</a>
+<a name="ln2195">	}</a>
+<a name="ln2196">}</a>
+<a name="ln2197"> </a>
+<a name="ln2198">// _HandleEntryRemovedRequest</a>
+<a name="ln2199">void</a>
+<a name="ln2200">ShareVolume::_HandleEntryRemovedRequest(EntryRemovedRequest* request)</a>
+<a name="ln2201">{</a>
+<a name="ln2202">	if (!request)</a>
+<a name="ln2203">		return;</a>
+<a name="ln2204"> </a>
+<a name="ln2205">	nspace_id nsid = fVolumeManager-&gt;GetID();</a>
+<a name="ln2206">	const char* name = request-&gt;name.GetString();</a>
+<a name="ln2207"> </a>
+<a name="ln2208">	// translate the node IDs</a>
+<a name="ln2209">	vnode_id vnida = 0;</a>
+<a name="ln2210">	vnode_id vnidb = 0;</a>
+<a name="ln2211">	vnode_id vnidc = 0;</a>
+<a name="ln2212">	status_t error = _GetLocalNodeID(request-&gt;directoryID, &amp;vnida, true);</a>
+<a name="ln2213">	if (error == B_OK)</a>
+<a name="ln2214">		error = _GetLocalNodeID(request-&gt;nodeID, &amp;vnidc, false);</a>
+<a name="ln2215">			// TODO: We don't enter a node ID mapping here, which might cause</a>
+<a name="ln2216">			// undesired behavior in some cases. Queries should usually be</a>
+<a name="ln2217">			// fine, since, if the entry was in the query set, then the</a>
+<a name="ln2218">			// respective node ID should definately be known at this point.</a>
+<a name="ln2219">			// If an entry is removed and the node monitoring event comes</a>
+<a name="ln2220">			// before a live query event for the same entry, the former one</a>
+<a name="ln2221">			// will cause the ID to be removed, so that it is already gone</a>
+<a name="ln2222">			// when the latter one arrives. I haven't observed this yet,</a>
+<a name="ln2223">			// though. The query events always seem to be sent before the</a>
+<a name="ln2224">			// node monitoring events (and the server processes them in a</a>
+<a name="ln2225">			// single-threaded way). I guess, this is FS implementation</a>
+<a name="ln2226">			// dependent, though.</a>
+<a name="ln2227">			// A node monitoring event that will always get lost, is when the</a>
+<a name="ln2228">			// FS user watches a directory that hasn't been read before. Its</a>
+<a name="ln2229">			// entries will not be known yet and thus &quot;entry removed&quot; events</a>
+<a name="ln2230">			// will be dropped here. I guess, it's arguable whether this is</a>
+<a name="ln2231">			// a practical problem (why should the watcher care that an entry</a>
+<a name="ln2232">			// has been removed, when they didn't know what entries were in</a>
+<a name="ln2233">			// the directory in the first place?).</a>
+<a name="ln2234">			// A possible solution would be to never remove node ID mappings.</a>
+<a name="ln2235">			// We would only need to take care that the cached node info is</a>
+<a name="ln2236">			// correctly flushed, so that e.g. a subsequent ReadVNode() has to</a>
+<a name="ln2237">			// ask the server and doesn't work with obsolete data. We would</a>
+<a name="ln2238">			// also enter a yet unknown ID into the node ID map here. The only</a>
+<a name="ln2239">			// problem is that the ID maps will keep growing, especially when</a>
+<a name="ln2240">			// there's a lot of FS activity on the server.</a>
+<a name="ln2241"> </a>
+<a name="ln2242">	// send notifications / do additional processing</a>
+<a name="ln2243">	if (request-&gt;queryUpdate) {</a>
+<a name="ln2244">		if (error == B_OK) {</a>
+<a name="ln2245">			SendNotification(request-&gt;port, request-&gt;token,</a>
+<a name="ln2246">				B_QUERY_UPDATE, request-&gt;opcode, nsid, 0, vnida, vnidb,</a>
+<a name="ln2247">				vnidc, name);</a>
+<a name="ln2248">		}</a>
+<a name="ln2249">	} else {</a>
+<a name="ln2250">		_EntryRemoved(request-&gt;directoryID, name, request-&gt;revision);</a>
+<a name="ln2251">		_NodeRemoved(request-&gt;nodeID);</a>
+<a name="ln2252">		if (error == B_OK)</a>
+<a name="ln2253">			NotifyListener(request-&gt;opcode, nsid, vnida, vnidb, vnidc, name);</a>
+<a name="ln2254">	}</a>
+<a name="ln2255">}</a>
+<a name="ln2256"> </a>
+<a name="ln2257">// _HandleEntryMovedRequest</a>
+<a name="ln2258">void</a>
+<a name="ln2259">ShareVolume::_HandleEntryMovedRequest(EntryMovedRequest* request)</a>
+<a name="ln2260">{</a>
+<a name="ln2261">	if (!request)</a>
+<a name="ln2262">		return;</a>
+<a name="ln2263"> </a>
+<a name="ln2264">	nspace_id nsid = fVolumeManager-&gt;GetID();</a>
+<a name="ln2265">	const char* oldName = request-&gt;fromName.GetString();</a>
+<a name="ln2266">	const char* name = request-&gt;toName.GetString();</a>
+<a name="ln2267"> </a>
+<a name="ln2268">	// translate the node IDs</a>
+<a name="ln2269">	vnode_id vnida = 0;</a>
+<a name="ln2270">	vnode_id vnidb = 0;</a>
+<a name="ln2271">	vnode_id vnidc = 0;</a>
+<a name="ln2272">	status_t error = _GetLocalNodeID(request-&gt;fromDirectoryID, &amp;vnida, true);</a>
+<a name="ln2273">	if (error == B_OK)</a>
+<a name="ln2274">		error = _GetLocalNodeID(request-&gt;toDirectoryID, &amp;vnidb, true);</a>
+<a name="ln2275">	if (error == B_OK)</a>
+<a name="ln2276">		error = _GetLocalNodeID(request-&gt;nodeID, &amp;vnidc, true);</a>
+<a name="ln2277"> </a>
+<a name="ln2278">	// send notifications / do additional processing</a>
+<a name="ln2279">	if (!request-&gt;queryUpdate) {</a>
+<a name="ln2280">		_EntryMoved(request-&gt;fromDirectoryID, oldName, request-&gt;toDirectoryID,</a>
+<a name="ln2281">			name, (request-&gt;entryInfoValid ? &amp;request-&gt;entryInfo : NULL),</a>
+<a name="ln2282">			request-&gt;revision);</a>
+<a name="ln2283">		if (error == B_OK)</a>
+<a name="ln2284">			NotifyListener(request-&gt;opcode, nsid, vnida, vnidb, vnidc, name);</a>
+<a name="ln2285">	}</a>
+<a name="ln2286">}</a>
+<a name="ln2287"> </a>
+<a name="ln2288">// _HandleStatChangedRequest</a>
+<a name="ln2289">void</a>
+<a name="ln2290">ShareVolume::_HandleStatChangedRequest(StatChangedRequest* request)</a>
+<a name="ln2291">{</a>
+<a name="ln2292">	if (!request)</a>
+<a name="ln2293">		return;</a>
+<a name="ln2294"> </a>
+<a name="ln2295">	nspace_id nsid = fVolumeManager-&gt;GetID();</a>
+<a name="ln2296"> </a>
+<a name="ln2297">	// translate the node IDs</a>
+<a name="ln2298">	vnode_id vnida = 0;</a>
+<a name="ln2299">	vnode_id vnidb = 0;</a>
+<a name="ln2300">	vnode_id vnidc = 0;</a>
+<a name="ln2301">	status_t error = _GetLocalNodeID(request-&gt;nodeID, &amp;vnidc, true);</a>
+<a name="ln2302"> </a>
+<a name="ln2303">	// send notifications / do additional processing</a>
+<a name="ln2304">	if (!request-&gt;queryUpdate) {</a>
+<a name="ln2305">		_UpdateNode(request-&gt;nodeInfo);</a>
+<a name="ln2306">		if (error == B_OK)</a>
+<a name="ln2307">			NotifyListener(request-&gt;opcode, nsid, vnida, vnidb, vnidc, NULL);</a>
+<a name="ln2308">	}</a>
+<a name="ln2309">}</a>
+<a name="ln2310"> </a>
+<a name="ln2311">// _HandleAttributeChangedRequest</a>
+<a name="ln2312">void</a>
+<a name="ln2313">ShareVolume::_HandleAttributeChangedRequest(AttributeChangedRequest* request)</a>
+<a name="ln2314">{</a>
+<a name="ln2315">	if (!request)</a>
+<a name="ln2316">		return;</a>
+<a name="ln2317"> </a>
+<a name="ln2318">	nspace_id nsid = fVolumeManager-&gt;GetID();</a>
+<a name="ln2319">	const char* name = request-&gt;attrInfo.name.GetString();</a>
+<a name="ln2320"> </a>
+<a name="ln2321">	// translate the node IDs</a>
+<a name="ln2322">	vnode_id vnida = 0;</a>
+<a name="ln2323">	vnode_id vnidb = 0;</a>
+<a name="ln2324">	vnode_id vnidc = 0;</a>
+<a name="ln2325">	status_t error = _GetLocalNodeID(request-&gt;nodeID, &amp;vnidc, true);</a>
+<a name="ln2326"> </a>
+<a name="ln2327">	// send notifications / do additional processing</a>
+<a name="ln2328">	if (!request-&gt;queryUpdate) {</a>
+<a name="ln2329">		_UpdateAttrDir(request-&gt;nodeID, request-&gt;attrDirInfo);</a>
+<a name="ln2330">		if (error == B_OK)</a>
+<a name="ln2331">			NotifyListener(request-&gt;opcode, nsid, vnida, vnidb, vnidc, name);</a>
+<a name="ln2332">	}</a>
+<a name="ln2333">}</a>
+<a name="ln2334"> </a>
+<a name="ln2335">// _GetLocalNodeID</a>
+<a name="ln2336">status_t</a>
+<a name="ln2337">ShareVolume::_GetLocalNodeID(NodeID remoteID, ino_t* _localID, bool enter)</a>
+<a name="ln2338">{</a>
+<a name="ln2339">	AutoLocker&lt;Locker&gt; _(fLock);</a>
+<a name="ln2340">	// if the ID is already know, just return it</a>
+<a name="ln2341">	if (fLocalNodeIDs-&gt;ContainsKey(remoteID)) {</a>
+<a name="ln2342">		*_localID = fLocalNodeIDs-&gt;Get(remoteID);</a>
+<a name="ln2343">		return B_OK;</a>
+<a name="ln2344">	}</a>
+<a name="ln2345"> </a>
+<a name="ln2346">	// ID not yet known</a>
+<a name="ln2347">	// enter it? Do this only, if requested and we're not already unmounting.</a>
+<a name="ln2348">	if (!enter)</a>
+<a name="ln2349">		return B_ENTRY_NOT_FOUND;</a>
+<a name="ln2350">	if (fUnmounting)</a>
+<a name="ln2351">		return ERROR_NOT_CONNECTED;</a>
+<a name="ln2352"> </a>
+<a name="ln2353">	// get a fresh ID from the volume manager</a>
+<a name="ln2354">	vnode_id localID = fVolumeManager-&gt;NewNodeID(this);</a>
+<a name="ln2355">	if (localID &lt; 0)</a>
+<a name="ln2356">		return localID;</a>
+<a name="ln2357"> </a>
+<a name="ln2358">	// put the IDs into local map</a>
+<a name="ln2359">	status_t error = fLocalNodeIDs-&gt;Put(remoteID, localID);</a>
+<a name="ln2360">	if (error != B_OK) {</a>
+<a name="ln2361">		fVolumeManager-&gt;RemoveNodeID(localID);</a>
+<a name="ln2362">		return error;</a>
+<a name="ln2363">	}</a>
+<a name="ln2364"> </a>
+<a name="ln2365">	// put the IDs into remote map</a>
+<a name="ln2366">	error = fRemoteNodeIDs-&gt;Put(localID, remoteID);</a>
+<a name="ln2367">	if (error != B_OK) {</a>
+<a name="ln2368">		fLocalNodeIDs-&gt;Remove(remoteID);</a>
+<a name="ln2369">		fVolumeManager-&gt;RemoveNodeID(localID);</a>
+<a name="ln2370">		return error;</a>
+<a name="ln2371">	}</a>
+<a name="ln2372">	PRINT(&quot;ShareVolume(%&quot; B_PRId32 &quot;): added node ID mapping: local: %&quot;</a>
+<a name="ln2373">		B_PRIdINO &quot; -&gt; remote: (%&quot; B_PRIdDEV &quot;, %&quot; B_PRIdINO &quot;)\n&quot;, fID,</a>
+<a name="ln2374">		localID, remoteID.volumeID, remoteID.nodeID);</a>
+<a name="ln2375"> </a>
+<a name="ln2376">	*_localID = localID;</a>
+<a name="ln2377">	return B_OK;</a>
+<a name="ln2378">}</a>
+<a name="ln2379"> </a>
+<a name="ln2380">// _GetRemoteNodeID</a>
+<a name="ln2381">status_t</a>
+<a name="ln2382">ShareVolume::_GetRemoteNodeID(ino_t localID, NodeID* remoteID)</a>
+<a name="ln2383">{</a>
+<a name="ln2384">	AutoLocker&lt;Locker&gt; _(fLock);</a>
+<a name="ln2385"> </a>
+<a name="ln2386">	// check, if the ID is known</a>
+<a name="ln2387">	if (!fRemoteNodeIDs-&gt;ContainsKey(localID))</a>
+<a name="ln2388">		return B_ENTRY_NOT_FOUND;</a>
+<a name="ln2389"> </a>
+<a name="ln2390">	*remoteID = fRemoteNodeIDs-&gt;Get(localID);</a>
+<a name="ln2391">	return B_OK;</a>
+<a name="ln2392">}</a>
+<a name="ln2393"> </a>
+<a name="ln2394">// _RemoveLocalNodeID</a>
+<a name="ln2395">void</a>
+<a name="ln2396">ShareVolume::_RemoveLocalNodeID(ino_t localID)</a>
+<a name="ln2397">{</a>
+<a name="ln2398">	AutoLocker&lt;Locker&gt; _(fLock);</a>
+<a name="ln2399"> </a>
+<a name="ln2400">	// check, if the ID is known</a>
+<a name="ln2401">	if (!fRemoteNodeIDs-&gt;ContainsKey(localID))</a>
+<a name="ln2402">		return;</a>
+<a name="ln2403"> </a>
+<a name="ln2404">	// remove from ID maps</a>
+<a name="ln2405">	NodeID remoteID = fRemoteNodeIDs-&gt;Get(localID);</a>
+<a name="ln2406">	PRINT(&quot;ShareVolume::_RemoveLocalNodeID(%&quot; B_PRIdINO &quot;): remote: (%&quot;</a>
+<a name="ln2407">		B_PRIdDEV &quot;, %&quot; B_PRIdINO &quot;)\n&quot;, localID, remoteID.volumeID,</a>
+<a name="ln2408">		remoteID.nodeID);</a>
+<a name="ln2409">	fRemoteNodeIDs-&gt;Remove(localID);</a>
+<a name="ln2410">	fLocalNodeIDs-&gt;Remove(remoteID);</a>
+<a name="ln2411"> </a>
+<a name="ln2412">	// remove from volume manager</a>
+<a name="ln2413">	fVolumeManager-&gt;RemoveNodeID(localID);</a>
+<a name="ln2414">}</a>
+<a name="ln2415"> </a>
+<a name="ln2416">// _GetNodeByLocalID</a>
+<a name="ln2417">ShareNode*</a>
+<a name="ln2418">ShareVolume::_GetNodeByLocalID(ino_t localID)</a>
+<a name="ln2419">{</a>
+<a name="ln2420">	AutoLocker&lt;Locker&gt; _(fLock);</a>
+<a name="ln2421">	return fNodes-&gt;Get(localID);</a>
+<a name="ln2422">}</a>
+<a name="ln2423"> </a>
+<a name="ln2424">// _GetNodeByRemoteID</a>
+<a name="ln2425">ShareNode*</a>
+<a name="ln2426">ShareVolume::_GetNodeByRemoteID(NodeID remoteID)</a>
+<a name="ln2427">{</a>
+<a name="ln2428">	AutoLocker&lt;Locker&gt; _(fLock);</a>
+<a name="ln2429"> </a>
+<a name="ln2430">	ino_t localID;</a>
+<a name="ln2431">	if (_GetLocalNodeID(remoteID, &amp;localID, false) == B_OK)</a>
+<a name="ln2432">		return fNodes-&gt;Get(localID);</a>
+<a name="ln2433"> </a>
+<a name="ln2434">	return NULL;</a>
+<a name="ln2435">}</a>
+<a name="ln2436"> </a>
+<a name="ln2437">// _LoadNode</a>
+<a name="ln2438">status_t</a>
+<a name="ln2439">ShareVolume::_LoadNode(const NodeInfo&amp; nodeInfo, ShareNode** _node)</a>
+<a name="ln2440">{</a>
+<a name="ln2441">	AutoLocker&lt;Locker&gt; _(fLock);</a>
+<a name="ln2442"> </a>
+<a name="ln2443">	// check, if the node is already known</a>
+<a name="ln2444">	ShareNode* node = _GetNodeByRemoteID(nodeInfo.GetID());</a>
+<a name="ln2445">	if (node) {</a>
+<a name="ln2446">		node-&gt;Update(nodeInfo);</a>
+<a name="ln2447">	} else {</a>
+<a name="ln2448">		// don't load the node when already unmounting</a>
+<a name="ln2449">		if (fUnmounting)</a>
+<a name="ln2450">			return B_ERROR;</a>
+<a name="ln2451"> </a>
+<a name="ln2452">		// get a local node ID</a>
+<a name="ln2453">		vnode_id localID;</a>
+<a name="ln2454">		status_t error = _GetLocalNodeID(nodeInfo.GetID(), &amp;localID, true);</a>
+<a name="ln2455">		if (error != B_OK)</a>
+<a name="ln2456">			return error;</a>
+<a name="ln2457"> </a>
+<a name="ln2458">		// create a new node</a>
+<a name="ln2459">		if (S_ISDIR(nodeInfo.st.st_mode))</a>
+<a name="ln2460">			node = new(std::nothrow) ShareDir(this, localID, &amp;nodeInfo);</a>
+<a name="ln2461">		else</a>
+<a name="ln2462">			node = new(std::nothrow) ShareNode(this, localID, &amp;nodeInfo);</a>
+<a name="ln2463">		if (!node) {</a>
+<a name="ln2464">			_RemoveLocalNodeID(localID);</a>
+<a name="ln2465">			return B_NO_MEMORY;</a>
+<a name="ln2466">		}</a>
+<a name="ln2467"> </a>
+<a name="ln2468">		// add it</a>
+<a name="ln2469">		error = fNodes-&gt;Put(node-&gt;GetID(), node);</a>
+<a name="ln2470">		if (error != B_OK) {</a>
+<a name="ln2471">			_RemoveLocalNodeID(localID);</a>
+<a name="ln2472">			delete node;</a>
+<a name="ln2473">			return error;</a>
+<a name="ln2474">		}</a>
+<a name="ln2475">		PRINT(&quot;ShareVolume: added node: %&quot; B_PRIdINO &quot;: remote: (%&quot; B_PRIdDEV</a>
+<a name="ln2476">			&quot;, %&quot; B_PRIdINO &quot;), localID: %&quot; B_PRIdINO &quot;\n&quot;, node-&gt;GetID(),</a>
+<a name="ln2477">			node-&gt;GetRemoteID().volumeID,</a>
+<a name="ln2478">			node-&gt;GetRemoteID().nodeID, localID);</a>
+<a name="ln2479">	}</a>
+<a name="ln2480"> </a>
+<a name="ln2481">	if (_node)</a>
+<a name="ln2482">		*_node = node;</a>
+<a name="ln2483">	return B_OK;</a>
+<a name="ln2484">}</a>
+<a name="ln2485"> </a>
+<a name="ln2486">// _UpdateNode</a>
+<a name="ln2487">status_t</a>
+<a name="ln2488">ShareVolume::_UpdateNode(const NodeInfo&amp; nodeInfo)</a>
+<a name="ln2489">{</a>
+<a name="ln2490">	AutoLocker&lt;Locker&gt; _(fLock);</a>
+<a name="ln2491"> </a>
+<a name="ln2492">	if (fUnmounting)</a>
+<a name="ln2493">		return ERROR_NOT_CONNECTED;</a>
+<a name="ln2494"> </a>
+<a name="ln2495">	ShareNode* node = _GetNodeByRemoteID(nodeInfo.GetID());</a>
+<a name="ln2496">	if (node) {</a>
+<a name="ln2497">		node-&gt;Update(nodeInfo);</a>
+<a name="ln2498">		return B_OK;</a>
+<a name="ln2499">	}</a>
+<a name="ln2500">	return B_ENTRY_NOT_FOUND;</a>
+<a name="ln2501">}</a>
+<a name="ln2502"> </a>
+<a name="ln2503">// _GetEntryByLocalID</a>
+<a name="ln2504">ShareDirEntry*</a>
+<a name="ln2505">ShareVolume::_GetEntryByLocalID(ino_t localDirID, const char* name)</a>
+<a name="ln2506">{</a>
+<a name="ln2507">	if (!name)</a>
+<a name="ln2508">		return NULL;</a>
+<a name="ln2509"> </a>
+<a name="ln2510">	AutoLocker&lt;Locker&gt; _(fLock);</a>
+<a name="ln2511">	return fEntries-&gt;Get(EntryKey(localDirID, name));</a>
+<a name="ln2512">}</a>
+<a name="ln2513"> </a>
+<a name="ln2514">// _GetEntryByRemoteID</a>
+<a name="ln2515">ShareDirEntry*</a>
+<a name="ln2516">ShareVolume::_GetEntryByRemoteID(NodeID remoteDirID, const char* name)</a>
+<a name="ln2517">{</a>
+<a name="ln2518">	if (!name)</a>
+<a name="ln2519">		return NULL;</a>
+<a name="ln2520"> </a>
+<a name="ln2521">	AutoLocker&lt;Locker&gt; _(fLock);</a>
+<a name="ln2522"> </a>
+<a name="ln2523">	ino_t localDirID;</a>
+<a name="ln2524">	if (_GetLocalNodeID(remoteDirID, &amp;localDirID, false) == B_OK)</a>
+<a name="ln2525">		return fEntries-&gt;Get(EntryKey(localDirID, name));</a>
+<a name="ln2526"> </a>
+<a name="ln2527">	return NULL;</a>
+<a name="ln2528">}</a>
+<a name="ln2529"> </a>
+<a name="ln2530">// _LoadEntry</a>
+<a name="ln2531">//</a>
+<a name="ln2532">// If _entry is supplied, fLock should be held, otherwise the returned entry</a>
+<a name="ln2533">// might as well be deleted.</a>
+<a name="ln2534">status_t</a>
+<a name="ln2535">ShareVolume::_LoadEntry(ShareDir* directory, const EntryInfo&amp; entryInfo,</a>
+<a name="ln2536">	ShareDirEntry** _entry)</a>
+<a name="ln2537">{</a>
+<a name="ln2538">	const char* name = entryInfo.name.GetString();</a>
+<a name="ln2539">	if (!directory || !name)</a>
+<a name="ln2540">		return B_BAD_VALUE;</a>
+<a name="ln2541"> </a>
+<a name="ln2542">	AutoLocker&lt;Locker&gt; _(fLock);</a>
+<a name="ln2543"> </a>
+<a name="ln2544">	ShareDirEntry* entry = _GetEntryByLocalID(directory-&gt;GetID(), name);</a>
+<a name="ln2545">	if (entry) {</a>
+<a name="ln2546">		if (entryInfo.nodeInfo.revision &gt; entry-&gt;GetRevision()) {</a>
+<a name="ln2547">			if (entryInfo.nodeInfo.GetID() != entry-&gt;GetNode()-&gt;GetRemoteID()) {</a>
+<a name="ln2548">				// The node the existing entry refers to is not the node it</a>
+<a name="ln2549">				// should refer to. Remove the old entry and create a new one.</a>
+<a name="ln2550">				_EntryRemoved(directory-&gt;GetRemoteID(), name,</a>
+<a name="ln2551">					entryInfo.nodeInfo.revision);</a>
+<a name="ln2552">				_EntryCreated(directory-&gt;GetRemoteID(), name, &amp;entryInfo,</a>
+<a name="ln2553">					entryInfo.nodeInfo.revision);</a>
+<a name="ln2554"> </a>
+<a name="ln2555">				// re-get the entry and check, if everything is fine</a>
+<a name="ln2556">				entry = _GetEntryByLocalID(directory-&gt;GetID(), name);</a>
+<a name="ln2557">				if (!entry)</a>
+<a name="ln2558">					return B_ERROR;</a>
+<a name="ln2559">				if (entryInfo.nodeInfo.GetID()</a>
+<a name="ln2560">					!= entry-&gt;GetNode()-&gt;GetRemoteID()) {</a>
+<a name="ln2561">					return B_ERROR;</a>
+<a name="ln2562">				}</a>
+<a name="ln2563">			} else {</a>
+<a name="ln2564">				entry-&gt;SetRevision(entryInfo.nodeInfo.revision);</a>
+<a name="ln2565">				_UpdateNode(entryInfo.nodeInfo);</a>
+<a name="ln2566">			}</a>
+<a name="ln2567">		}</a>
+<a name="ln2568">	} else {</a>
+<a name="ln2569">		// entry not known yet: create it</a>
+<a name="ln2570"> </a>
+<a name="ln2571">		// don't load the entry when already unmounting</a>
+<a name="ln2572">		if (fUnmounting)</a>
+<a name="ln2573">			return B_ERROR;</a>
+<a name="ln2574"> </a>
+<a name="ln2575">		// load the node</a>
+<a name="ln2576">		ShareNode* node;</a>
+<a name="ln2577">		status_t error = _LoadNode(entryInfo.nodeInfo, &amp;node);</a>
+<a name="ln2578">		if (error != B_OK)</a>
+<a name="ln2579">			return error;</a>
+<a name="ln2580"> </a>
+<a name="ln2581">		// if the directory or the node are marked remove, we don't create the</a>
+<a name="ln2582">		// entry</a>
+<a name="ln2583">		if (IsVNodeRemoved(directory-&gt;GetID()) &gt; 0</a>
+<a name="ln2584">			|| IsVNodeRemoved(node-&gt;GetID()) &gt; 0) {</a>
+<a name="ln2585">			return B_NOT_ALLOWED;</a>
+<a name="ln2586">		}</a>
+<a name="ln2587"> </a>
+<a name="ln2588">		// create the entry</a>
+<a name="ln2589">		entry = new(std::nothrow) ShareDirEntry(directory, name, node);</a>
+<a name="ln2590">		if (!entry)</a>
+<a name="ln2591">			return B_NO_MEMORY;</a>
+<a name="ln2592">		ObjectDeleter&lt;ShareDirEntry&gt; entryDeleter(entry);</a>
+<a name="ln2593">		error = entry-&gt;InitCheck();</a>
+<a name="ln2594">		if (error != B_OK)</a>
+<a name="ln2595">			return error;</a>
+<a name="ln2596"> </a>
+<a name="ln2597">		// add the entry</a>
+<a name="ln2598">		error = fEntries-&gt;Put(EntryKey(directory-&gt;GetID(), entry-&gt;GetName()),</a>
+<a name="ln2599">			entry);</a>
+<a name="ln2600">		if (error != B_OK)</a>
+<a name="ln2601">			return error;</a>
+<a name="ln2602"> </a>
+<a name="ln2603">		// set the entry revision</a>
+<a name="ln2604">		entry-&gt;SetRevision(entryInfo.nodeInfo.revision);</a>
+<a name="ln2605"> </a>
+<a name="ln2606">		// add the entry to the directory and the node</a>
+<a name="ln2607">		directory-&gt;AddEntry(entry);</a>
+<a name="ln2608">		entry-&gt;GetNode()-&gt;AddReferringEntry(entry);</a>
+<a name="ln2609"> </a>
+<a name="ln2610">		// everything went fine</a>
+<a name="ln2611">		entryDeleter.Detach();</a>
+<a name="ln2612">	}</a>
+<a name="ln2613"> </a>
+<a name="ln2614">	if (_entry)</a>
+<a name="ln2615">		*_entry = entry;</a>
+<a name="ln2616">	return B_OK;</a>
+<a name="ln2617">}</a>
+<a name="ln2618"> </a>
+<a name="ln2619">// _RemoveEntry</a>
+<a name="ln2620">//</a>
+<a name="ln2621">// fLock must be held.</a>
+<a name="ln2622">void</a>
+<a name="ln2623">ShareVolume::_RemoveEntry(ShareDirEntry* entry)</a>
+<a name="ln2624">{</a>
+<a name="ln2625">	fEntries-&gt;Remove(EntryKey(entry-&gt;GetDirectory()-&gt;GetID(),</a>
+<a name="ln2626">		entry-&gt;GetName()));</a>
+<a name="ln2627">	entry-&gt;GetDirectory()-&gt;RemoveEntry(entry);</a>
+<a name="ln2628">	entry-&gt;GetNode()-&gt;RemoveReferringEntry(entry);</a>
+<a name="ln2629">	entry-&gt;ReleaseReference();</a>
+<a name="ln2630">}</a>
+<a name="ln2631"> </a>
+<a name="ln2632">// _IsObsoleteEntryInfo</a>
+<a name="ln2633">//</a>
+<a name="ln2634">// fLock must be held.</a>
+<a name="ln2635">bool</a>
+<a name="ln2636">ShareVolume::_IsObsoleteEntryInfo(const EntryInfo&amp; entryInfo)</a>
+<a name="ln2637">{</a>
+<a name="ln2638">	// get the directory</a>
+<a name="ln2639">	ShareDir* dir</a>
+<a name="ln2640">		= dynamic_cast&lt;ShareDir*&gt;(_GetNodeByRemoteID(entryInfo.directoryID));</a>
+<a name="ln2641">	if (!dir)</a>
+<a name="ln2642">		return false;</a>
+<a name="ln2643"> </a>
+<a name="ln2644">	return (entryInfo.nodeInfo.revision &lt;= dir-&gt;GetEntryRemovedEventRevision());</a>
+<a name="ln2645">}</a>
+<a name="ln2646"> </a>
+<a name="ln2647">// _LoadAttrDir</a>
+<a name="ln2648">status_t</a>
+<a name="ln2649">ShareVolume::_LoadAttrDir(ShareNode* node, const AttrDirInfo&amp; attrDirInfo)</a>
+<a name="ln2650">{</a>
+<a name="ln2651">	if (!node || !attrDirInfo.isValid)</a>
+<a name="ln2652">		return B_BAD_VALUE;</a>
+<a name="ln2653"> </a>
+<a name="ln2654">	AutoLocker&lt;Locker&gt; _(fLock);</a>
+<a name="ln2655"> </a>
+<a name="ln2656">	if (fUnmounting)</a>
+<a name="ln2657">		return ERROR_NOT_CONNECTED;</a>
+<a name="ln2658"> </a>
+<a name="ln2659">	ShareAttrDir* attrDir = node-&gt;GetAttrDir();</a>
+<a name="ln2660">	if (attrDir) {</a>
+<a name="ln2661">		if (attrDir-&gt;GetRevision() &gt; attrDirInfo.revision)</a>
+<a name="ln2662">			return B_OK;</a>
+<a name="ln2663"> </a>
+<a name="ln2664">		// update the attr dir</a>
+<a name="ln2665">		return attrDir-&gt;Update(attrDirInfo,</a>
+<a name="ln2666">			fAttrDirIterators-&gt;Get(node-&gt;GetID()));</a>
+<a name="ln2667">	} else {</a>
+<a name="ln2668">		// no attribute directory yet: create one</a>
+<a name="ln2669">		attrDir = new(std::nothrow) ShareAttrDir;</a>
+<a name="ln2670">		if (!attrDir)</a>
+<a name="ln2671">			return B_NO_MEMORY;</a>
+<a name="ln2672">		ObjectDeleter&lt;ShareAttrDir&gt; attrDirDeleter(attrDir);</a>
+<a name="ln2673"> </a>
+<a name="ln2674">		// initialize it</a>
+<a name="ln2675">		status_t error = attrDir-&gt;Init(attrDirInfo);</a>
+<a name="ln2676">		if (error != B_OK)</a>
+<a name="ln2677">			return error;</a>
+<a name="ln2678"> </a>
+<a name="ln2679">		// set it</a>
+<a name="ln2680">		node-&gt;SetAttrDir(attrDir);</a>
+<a name="ln2681">		attrDirDeleter.Detach();</a>
+<a name="ln2682">		return B_OK;</a>
+<a name="ln2683">	}</a>
+<a name="ln2684">}</a>
+<a name="ln2685"> </a>
+<a name="ln2686">// _UpdateAttrDir</a>
+<a name="ln2687">status_t</a>
+<a name="ln2688">ShareVolume::_UpdateAttrDir(NodeID remoteID, const AttrDirInfo&amp; attrDirInfo)</a>
+<a name="ln2689">{</a>
+<a name="ln2690">	AutoLocker&lt;Locker&gt; _(fLock);</a>
+<a name="ln2691"> </a>
+<a name="ln2692">	// get the node</a>
+<a name="ln2693">	ShareNode* node = _GetNodeByRemoteID(remoteID);</a>
+<a name="ln2694">	if (!node)</a>
+<a name="ln2695">		return B_ENTRY_NOT_FOUND;</a>
+<a name="ln2696"> </a>
+<a name="ln2697">	if (!attrDirInfo.isValid || _LoadAttrDir(node, attrDirInfo) != B_OK) {</a>
+<a name="ln2698">		// updating/creating the attr dir failed; if existing, we mark it</a>
+<a name="ln2699">		// obsolete</a>
+<a name="ln2700">		if (ShareAttrDir* attrDir = node-&gt;GetAttrDir())</a>
+<a name="ln2701">			attrDir-&gt;SetUpToDate(false);</a>
+<a name="ln2702">	}</a>
+<a name="ln2703"> </a>
+<a name="ln2704">	return B_OK;</a>
+<a name="ln2705">}</a>
+<a name="ln2706"> </a>
+<a name="ln2707">// _AddAttrDirIterator</a>
+<a name="ln2708">status_t</a>
+<a name="ln2709">ShareVolume::_AddAttrDirIterator(ShareNode* node,</a>
+<a name="ln2710">	ShareAttrDirIterator* iterator)</a>
+<a name="ln2711">{</a>
+<a name="ln2712">	if (!node || !iterator)</a>
+<a name="ln2713">		return B_BAD_VALUE;</a>
+<a name="ln2714"> </a>
+<a name="ln2715">	AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln2716"> </a>
+<a name="ln2717">	// get the iterator list</a>
+<a name="ln2718">	DoublyLinkedList&lt;ShareAttrDirIterator&gt;* iteratorList</a>
+<a name="ln2719">		= fAttrDirIterators-&gt;Get(node-&gt;GetID());</a>
+<a name="ln2720">	if (!iteratorList) {</a>
+<a name="ln2721">		// no list for the node yet: create one</a>
+<a name="ln2722">		iteratorList = new(std::nothrow) DoublyLinkedList&lt;ShareAttrDirIterator&gt;;</a>
+<a name="ln2723">		if (!iteratorList)</a>
+<a name="ln2724">			return B_NO_MEMORY;</a>
+<a name="ln2725"> </a>
+<a name="ln2726">		// add it</a>
+<a name="ln2727">		status_t error = fAttrDirIterators-&gt;Put(node-&gt;GetID(), iteratorList);</a>
+<a name="ln2728">		if (error != B_OK) {</a>
+<a name="ln2729">			delete iteratorList;</a>
+<a name="ln2730">			return error;</a>
+<a name="ln2731">		}</a>
+<a name="ln2732">	}</a>
+<a name="ln2733"> </a>
+<a name="ln2734">	// add the iterator</a>
+<a name="ln2735">	iteratorList-&gt;Insert(iterator);</a>
+<a name="ln2736"> </a>
+<a name="ln2737">	return B_OK;</a>
+<a name="ln2738">}</a>
+<a name="ln2739"> </a>
+<a name="ln2740">// _RemoveAttrDirIterator</a>
+<a name="ln2741">void</a>
+<a name="ln2742">ShareVolume::_RemoveAttrDirIterator(ShareNode* node,</a>
+<a name="ln2743">	ShareAttrDirIterator* iterator)</a>
+<a name="ln2744">{</a>
+<a name="ln2745">	if (!node || !iterator)</a>
+<a name="ln2746">		return;</a>
+<a name="ln2747"> </a>
+<a name="ln2748">	AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln2749"> </a>
+<a name="ln2750">	// get the iterator list</a>
+<a name="ln2751">	DoublyLinkedList&lt;ShareAttrDirIterator&gt;* iteratorList</a>
+<a name="ln2752">		= fAttrDirIterators-&gt;Get(node-&gt;GetID());</a>
+<a name="ln2753">	if (!iteratorList) {</a>
+<a name="ln2754">		WARN(&quot;ShareVolume::_RemoveAttrDirIterator(): Iterator list not &quot;</a>
+<a name="ln2755">			&quot;found: node: %&quot; B_PRIdINO &quot;\n&quot;, node-&gt;GetID());</a>
+<a name="ln2756">		return;</a>
+<a name="ln2757">	}</a>
+<a name="ln2758"> </a>
+<a name="ln2759">	// remove the iterator</a>
+<a name="ln2760">	iteratorList-&gt;Remove(iterator);</a>
+<a name="ln2761"> </a>
+<a name="ln2762">	// if the list is empty now, discard it</a>
+<a name="ln2763">	if (!iteratorList-&gt;First()) {</a>
+<a name="ln2764">		fAttrDirIterators-&gt;Remove(node-&gt;GetID());</a>
+<a name="ln2765">		delete iteratorList;</a>
+<a name="ln2766">	}</a>
+<a name="ln2767">}</a>
+<a name="ln2768"> </a>
+<a name="ln2769">// _NodeRemoved</a>
+<a name="ln2770">void</a>
+<a name="ln2771">ShareVolume::_NodeRemoved(NodeID remoteID)</a>
+<a name="ln2772">{</a>
+<a name="ln2773">	AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln2774"> </a>
+<a name="ln2775">	ShareNode* node = _GetNodeByRemoteID(remoteID);</a>
+<a name="ln2776">	if (!node)</a>
+<a name="ln2777">		return;</a>
+<a name="ln2778"> </a>
+<a name="ln2779">	// if the node still has referring entries, we do nothing</a>
+<a name="ln2780">	if (node-&gt;GetActualReferringEntry())</a>
+<a name="ln2781">		return;</a>
+<a name="ln2782"> </a>
+<a name="ln2783">	// if the node is a directory, we remove its entries first</a>
+<a name="ln2784">	if (ShareDir* dir = dynamic_cast&lt;ShareDir*&gt;(node)) {</a>
+<a name="ln2785">		while (ShareDirEntry* entry = dir-&gt;GetFirstEntry())</a>
+<a name="ln2786">			_RemoveEntry(entry);</a>
+<a name="ln2787">	}</a>
+<a name="ln2788"> </a>
+<a name="ln2789">	// remove all entries still referring to the node</a>
+<a name="ln2790">	while (ShareDirEntry* entry = node-&gt;GetFirstReferringEntry())</a>
+<a name="ln2791">		_RemoveEntry(entry);</a>
+<a name="ln2792"> </a>
+<a name="ln2793">	ino_t localID = node-&gt;GetID();</a>
+<a name="ln2794"> </a>
+<a name="ln2795">	// Remove the node ID in all cases -- even, if the node is still</a>
+<a name="ln2796">	// known to the VFS. Otherwise there could be a race condition, that the</a>
+<a name="ln2797">	// server re-uses the remote ID and we have it still associated with an</a>
+<a name="ln2798">	// obsolete local ID.</a>
+<a name="ln2799">	_RemoveLocalNodeID(localID);</a>
+<a name="ln2800"> </a>
+<a name="ln2801">	if (node-&gt;IsKnownToVFS()) {</a>
+<a name="ln2802">		Node* _node;</a>
+<a name="ln2803">		if (GetVNode(localID, &amp;_node) != B_OK)</a>
+<a name="ln2804">			return;</a>
+<a name="ln2805">		Volume::RemoveVNode(localID);</a>
+<a name="ln2806">		locker.Unlock();</a>
+<a name="ln2807">		PutVNode(localID);</a>
+<a name="ln2808"> </a>
+<a name="ln2809">	} else {</a>
+<a name="ln2810">		fNodes-&gt;Remove(localID);</a>
+<a name="ln2811">		delete node;</a>
+<a name="ln2812">	}</a>
+<a name="ln2813">}</a>
+<a name="ln2814"> </a>
+<a name="ln2815">// _EntryCreated</a>
+<a name="ln2816">void</a>
+<a name="ln2817">ShareVolume::_EntryCreated(NodeID remoteDirID, const char* name,</a>
+<a name="ln2818">	const EntryInfo* entryInfo, int64 revision)</a>
+<a name="ln2819">{</a>
+<a name="ln2820">	if (!name)</a>
+<a name="ln2821">		return;</a>
+<a name="ln2822"> </a>
+<a name="ln2823">	AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln2824"> </a>
+<a name="ln2825">	// get the directory</a>
+<a name="ln2826">	ShareDir* dir = dynamic_cast&lt;ShareDir*&gt;(_GetNodeByRemoteID(remoteDirID));</a>
+<a name="ln2827">	if (!dir)</a>
+<a name="ln2828">		return;</a>
+<a name="ln2829"> </a>
+<a name="ln2830">	// load the entry, if possible</a>
+<a name="ln2831">	ShareDirEntry* entry;</a>
+<a name="ln2832">	bool entryLoaded = false;</a>
+<a name="ln2833">	if (entryInfo &amp;&amp; _LoadEntry(dir, *entryInfo, &amp;entry) == B_OK)</a>
+<a name="ln2834">		entryLoaded = true;</a>
+<a name="ln2835"> </a>
+<a name="ln2836">	// if the entry could not be loaded, we have to mark the dir incomplete</a>
+<a name="ln2837">	// and update its revision counter</a>
+<a name="ln2838">	if (!entryLoaded) {</a>
+<a name="ln2839">		dir-&gt;UpdateEntryCreatedEventRevision(revision);</a>
+<a name="ln2840">		dir-&gt;SetComplete(false);</a>
+<a name="ln2841">	}</a>
+<a name="ln2842">}</a>
+<a name="ln2843"> </a>
+<a name="ln2844">// _EntryRemoved</a>
+<a name="ln2845">void</a>
+<a name="ln2846">ShareVolume::_EntryRemoved(NodeID remoteDirID, const char* name, int64 revision)</a>
+<a name="ln2847">{</a>
+<a name="ln2848">	if (!name)</a>
+<a name="ln2849">		return;</a>
+<a name="ln2850"> </a>
+<a name="ln2851">	AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln2852"> </a>
+<a name="ln2853">	// get the directory</a>
+<a name="ln2854">	ShareDir* dir = dynamic_cast&lt;ShareDir*&gt;(_GetNodeByRemoteID(remoteDirID));</a>
+<a name="ln2855">	if (!dir)</a>
+<a name="ln2856">		return;</a>
+<a name="ln2857"> </a>
+<a name="ln2858">	// update the directory's &quot;entry removed&quot; event revision</a>
+<a name="ln2859">	dir-&gt;UpdateEntryRemovedEventRevision(revision);</a>
+<a name="ln2860"> </a>
+<a name="ln2861">	// get the entry</a>
+<a name="ln2862">	ShareDirEntry* entry = _GetEntryByRemoteID(remoteDirID, name);</a>
+<a name="ln2863">	if (!entry)</a>
+<a name="ln2864">		return;</a>
+<a name="ln2865"> </a>
+<a name="ln2866">	// check the entry revision</a>
+<a name="ln2867">	if (entry-&gt;GetRevision() &gt; revision)</a>
+<a name="ln2868">		return;</a>
+<a name="ln2869"> </a>
+<a name="ln2870">	// remove the entry</a>
+<a name="ln2871">	_RemoveEntry(entry);</a>
+<a name="ln2872">}</a>
+<a name="ln2873"> </a>
+<a name="ln2874">// _EntryMoved</a>
+<a name="ln2875">void</a>
+<a name="ln2876">ShareVolume::_EntryMoved(NodeID remoteOldDirID, const char* oldName,</a>
+<a name="ln2877">	NodeID remoteNewDirID, const char* name, const EntryInfo* entryInfo,</a>
+<a name="ln2878">	int64 revision)</a>
+<a name="ln2879">{</a>
+<a name="ln2880">	AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln2881"> </a>
+<a name="ln2882">	_EntryRemoved(remoteOldDirID, oldName, revision);</a>
+<a name="ln2883">	_EntryCreated(remoteNewDirID, name, entryInfo, revision);</a>
+<a name="ln2884">}</a>
+<a name="ln2885"> </a>
+<a name="ln2886">// _Walk</a>
+<a name="ln2887">status_t</a>
+<a name="ln2888">ShareVolume::_Walk(NodeID remoteDirID, const char* entryName, bool resolveLink,</a>
+<a name="ln2889">	WalkReply** _reply)</a>
+<a name="ln2890">{</a>
+<a name="ln2891">	// prepare the request</a>
+<a name="ln2892">	WalkRequest request;</a>
+<a name="ln2893">	request.volumeID = fID;</a>
+<a name="ln2894">	request.nodeID = remoteDirID;</a>
+<a name="ln2895">	request.name.SetTo(entryName);</a>
+<a name="ln2896">	request.resolveLink = resolveLink;</a>
+<a name="ln2897"> </a>
+<a name="ln2898">	// send the request</a>
+<a name="ln2899">	WalkReply* reply;</a>
+<a name="ln2900">	status_t error = SendRequest(fConnection, &amp;request, &amp;reply);</a>
+<a name="ln2901">	if (error != B_OK)</a>
+<a name="ln2902">		RETURN_ERROR(error);</a>
+<a name="ln2903">	ObjectDeleter&lt;Request&gt; replyDeleter(reply);</a>
+<a name="ln2904">	if (reply-&gt;error != B_OK)</a>
+<a name="ln2905">		RETURN_ERROR(reply-&gt;error);</a>
+<a name="ln2906"> </a>
+<a name="ln2907">	replyDeleter.Detach();</a>
+<a name="ln2908">	*_reply = reply;</a>
+<a name="ln2909">	return B_OK;</a>
+<a name="ln2910">}</a>
+<a name="ln2911"> </a>
+<a name="ln2912">// _MultiWalk</a>
+<a name="ln2913">status_t</a>
+<a name="ln2914">ShareVolume::_MultiWalk(RequestMemberArray&lt;EntryInfo&gt;&amp; _entryInfos,</a>
+<a name="ln2915">	MultiWalkReply** _reply)</a>
+<a name="ln2916">{</a>
+<a name="ln2917">	int32 count = _entryInfos.CountElements();</a>
+<a name="ln2918">	if (!_reply || count == 0)</a>
+<a name="ln2919">		return B_BAD_VALUE;</a>
+<a name="ln2920"> </a>
+<a name="ln2921">	EntryInfo* entryInfos = _entryInfos.GetElements();</a>
+<a name="ln2922"> </a>
+<a name="ln2923">	// prepare the request</a>
+<a name="ln2924">	MultiWalkRequest request;</a>
+<a name="ln2925">	request.volumeID = fID;</a>
+<a name="ln2926">	request.nodeID = entryInfos[0].directoryID;</a>
+<a name="ln2927"> </a>
+<a name="ln2928">	// add the names</a>
+<a name="ln2929">	for (int32 i = 0; i &lt; count; i++) {</a>
+<a name="ln2930">		StringData name;</a>
+<a name="ln2931">		name.SetTo(entryInfos[i].name.GetString());</a>
+<a name="ln2932"> </a>
+<a name="ln2933">		status_t error = request.names.Append(name);</a>
+<a name="ln2934">		if (error != B_OK)</a>
+<a name="ln2935">			return error;</a>
+<a name="ln2936">	}</a>
+<a name="ln2937"> </a>
+<a name="ln2938">	// send the request</a>
+<a name="ln2939">	MultiWalkReply* reply;</a>
+<a name="ln2940">	status_t error = SendRequest(fConnection, &amp;request, &amp;reply);</a>
+<a name="ln2941">	if (error != B_OK)</a>
+<a name="ln2942">		RETURN_ERROR(error);</a>
+<a name="ln2943">	ObjectDeleter&lt;Request&gt; replyDeleter(reply);</a>
+<a name="ln2944">	if (reply-&gt;error != B_OK)</a>
+<a name="ln2945">		RETURN_ERROR(reply-&gt;error);</a>
+<a name="ln2946"> </a>
+<a name="ln2947">	replyDeleter.Detach();</a>
+<a name="ln2948">	*_reply = reply;</a>
+<a name="ln2949">	return B_OK;</a>
+<a name="ln2950">}</a>
+<a name="ln2951"> </a>
+<a name="ln2952">// _Close</a>
+<a name="ln2953">status_t</a>
+<a name="ln2954">ShareVolume::_Close(intptr_t cookie)</a>
+<a name="ln2955">{</a>
+<a name="ln2956">	if (!_EnsureShareMounted())</a>
+<a name="ln2957">		return ERROR_NOT_CONNECTED;</a>
+<a name="ln2958"> </a>
+<a name="ln2959">	// prepare the request</a>
+<a name="ln2960">	CloseRequest request;</a>
+<a name="ln2961">	request.volumeID = fID;</a>
+<a name="ln2962">	request.cookie = cookie;</a>
+<a name="ln2963">	// send the request</a>
+<a name="ln2964">	CloseReply* reply;</a>
+<a name="ln2965">	status_t error = SendRequest(fConnection, &amp;request, &amp;reply);</a>
+<a name="ln2966">	if (error != B_OK)</a>
+<a name="ln2967">		RETURN_ERROR(error);</a>
+<a name="ln2968">	ObjectDeleter&lt;Request&gt; replyDeleter(reply);</a>
+<a name="ln2969">	if (reply-&gt;error != B_OK)</a>
+<a name="ln2970">		RETURN_ERROR(reply-&gt;error);</a>
+<a name="ln2971">	return B_OK;</a>
+<a name="ln2972">}</a>
+<a name="ln2973"> </a>
+<a name="ln2974">// _GetConnectionState</a>
+<a name="ln2975">//</a>
+<a name="ln2976">// Must not be called with fLock being held!</a>
+<a name="ln2977">uint32</a>
+<a name="ln2978">ShareVolume::_GetConnectionState()</a>
+<a name="ln2979">{</a>
+<a name="ln2980">	AutoLocker&lt;Locker&gt; _(fMountLock);</a>
+<a name="ln2981">	return fConnectionState;</a>
+<a name="ln2982">}</a>
+<a name="ln2983"> </a>
+<a name="ln2984">// _IsConnected</a>
+<a name="ln2985">//</a>
+<a name="ln2986">// Must not be called with fLock being held!</a>
+<a name="ln2987">bool</a>
+<a name="ln2988">ShareVolume::_IsConnected()</a>
+<a name="ln2989">{</a>
+<a name="ln2990">	return (_GetConnectionState() == CONNECTION_READY);</a>
+<a name="ln2991">}</a>
+<a name="ln2992"> </a>
+<a name="ln2993">// _EnsureShareMounted</a>
+<a name="ln2994">//</a>
+<a name="ln2995">// Must not be called with fLock being held!</a>
+<a name="ln2996">bool</a>
+<a name="ln2997">ShareVolume::_EnsureShareMounted()</a>
+<a name="ln2998">{</a>
+<a name="ln2999">	AutoLocker&lt;Locker&gt; _(fMountLock);</a>
+<a name="ln3000">	if (fConnectionState == CONNECTION_NOT_INITIALIZED)</a>
+<a name="ln3001">		_MountShare();</a>
+<a name="ln3002"> </a>
+<a name="ln3003">	return (fConnectionState == CONNECTION_READY);</a>
+<a name="ln3004">}</a>
+<a name="ln3005"> </a>
+<a name="ln3006">// _MountShare</a>
+<a name="ln3007">//</a>
+<a name="ln3008">// fMountLock must be held.</a>
+<a name="ln3009">status_t</a>
+<a name="ln3010">ShareVolume::_MountShare()</a>
+<a name="ln3011">{</a>
+<a name="ln3012">	// get references to the server and share info</a>
+<a name="ln3013">	AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln3014">	BReference&lt;ExtendedServerInfo&gt; serverInfoReference(fServerInfo);</a>
+<a name="ln3015">	BReference&lt;ExtendedShareInfo&gt; shareInfoReference(fShareInfo);</a>
+<a name="ln3016">	ExtendedServerInfo* serverInfo = fServerInfo;</a>
+<a name="ln3017">	ExtendedShareInfo* shareInfo = fShareInfo;</a>
+<a name="ln3018">	locker.Unlock();</a>
+<a name="ln3019"> </a>
+<a name="ln3020">	// get server address as string</a>
+<a name="ln3021">	HashString serverAddressString;</a>
+<a name="ln3022">	status_t error = serverInfo-&gt;GetAddress().GetString(&amp;serverAddressString,</a>
+<a name="ln3023">		false);</a>
+<a name="ln3024">	if (error != B_OK)</a>
+<a name="ln3025">		return error;</a>
+<a name="ln3026">	const char* server = serverAddressString.GetString();</a>
+<a name="ln3027"> </a>
+<a name="ln3028">	// get the server name</a>
+<a name="ln3029">	const char* serverName = serverInfo-&gt;GetServerName();</a>
+<a name="ln3030">	if (serverName &amp;&amp; strlen(serverName) == 0)</a>
+<a name="ln3031">		serverName = NULL;</a>
+<a name="ln3032"> </a>
+<a name="ln3033">	// get the share name</a>
+<a name="ln3034">	const char* share = shareInfo-&gt;GetShareName();</a>
+<a name="ln3035"> </a>
+<a name="ln3036">	PRINT(&quot;ShareVolume::_MountShare(%s, %s)\n&quot;, server, share);</a>
+<a name="ln3037">	// init a connection to the authentication server</a>
+<a name="ln3038">	AuthenticationServer authenticationServer;</a>
+<a name="ln3039">	error = authenticationServer.InitCheck();</a>
+<a name="ln3040">	if (error != B_OK)</a>
+<a name="ln3041">		RETURN_ERROR(error);</a>
+<a name="ln3042"> </a>
+<a name="ln3043">	// get the server connection</a>
+<a name="ln3044">	fConnectionState = CONNECTION_CLOSED;</a>
+<a name="ln3045">	if (!fServerConnection) {</a>
+<a name="ln3046">		status_t error = fServerConnectionProvider-&gt;GetServerConnection(</a>
+<a name="ln3047">			&amp;fServerConnection);</a>
+<a name="ln3048">		if (error != B_OK)</a>
+<a name="ln3049">			return error;</a>
+<a name="ln3050">		fConnection = fServerConnection-&gt;GetRequestConnection();</a>
+<a name="ln3051">	}</a>
+<a name="ln3052"> </a>
+<a name="ln3053">	// the mount loop</a>
+<a name="ln3054">	bool badPassword = false;</a>
+<a name="ln3055">	MountReply* reply = NULL;</a>
+<a name="ln3056">	do {</a>
+<a name="ln3057">		// get the user and password from the authentication server</a>
+<a name="ln3058">		char user[kUserBufferSize];</a>
+<a name="ln3059">		char password[kPasswordBufferSize];</a>
+<a name="ln3060">		bool cancelled;</a>
+<a name="ln3061">		error = authenticationServer.GetAuthentication(&quot;netfs&quot;,</a>
+<a name="ln3062">			(serverName ? serverName : server), share,</a>
+<a name="ln3063">			fVolumeManager-&gt;GetMountUID(), badPassword,</a>
+<a name="ln3064">			&amp;cancelled, user, sizeof(user), password, sizeof(password));</a>
+<a name="ln3065">		if (cancelled || error != B_OK)</a>
+<a name="ln3066">			RETURN_ERROR(error);</a>
+<a name="ln3067"> </a>
+<a name="ln3068">		// prepare the request</a>
+<a name="ln3069">		MountRequest request;</a>
+<a name="ln3070">		request.share.SetTo(share);</a>
+<a name="ln3071">		request.user.SetTo(user);</a>
+<a name="ln3072">		request.password.SetTo(password);</a>
+<a name="ln3073"> </a>
+<a name="ln3074">		// send the request</a>
+<a name="ln3075">		error = SendRequest(fConnection, &amp;request, &amp;reply);</a>
+<a name="ln3076">		if (error != B_OK)</a>
+<a name="ln3077">			RETURN_ERROR(error);</a>
+<a name="ln3078">		ObjectDeleter&lt;Request&gt; replyDeleter(reply);</a>
+<a name="ln3079"> </a>
+<a name="ln3080">		// if no permission, try again</a>
+<a name="ln3081">		badPassword = reply-&gt;noPermission;</a>
+<a name="ln3082">		if (!badPassword) {</a>
+<a name="ln3083">			if (reply-&gt;error != B_OK)</a>
+<a name="ln3084">				RETURN_ERROR(reply-&gt;error);</a>
+<a name="ln3085">			fSharePermissions = reply-&gt;sharePermissions;</a>
+<a name="ln3086">		}</a>
+<a name="ln3087">	} while (badPassword);</a>
+<a name="ln3088"> </a>
+<a name="ln3089">	AutoLocker&lt;Locker&gt; _(fLock);</a>
+<a name="ln3090"> </a>
+<a name="ln3091">	fID = reply-&gt;volumeID;</a>
+<a name="ln3092"> </a>
+<a name="ln3093">	// update the root node and enter its ID</a>
+<a name="ln3094">	fRootNode-&gt;Update(reply-&gt;nodeInfo);</a>
+<a name="ln3095"> </a>
+<a name="ln3096">	// put the IDs into local map</a>
+<a name="ln3097">	error = fLocalNodeIDs-&gt;Put(fRootNode-&gt;GetRemoteID(), fRootNode-&gt;GetID());</a>
+<a name="ln3098">	if (error != B_OK)</a>
+<a name="ln3099">		RETURN_ERROR(error);</a>
+<a name="ln3100"> </a>
+<a name="ln3101">	// put the IDs into remote map</a>
+<a name="ln3102">	error = fRemoteNodeIDs-&gt;Put(fRootNode-&gt;GetID(), fRootNode-&gt;GetRemoteID());</a>
+<a name="ln3103">	if (error != B_OK) {</a>
+<a name="ln3104">		fLocalNodeIDs-&gt;Remove(fRootNode-&gt;GetRemoteID());</a>
+<a name="ln3105">		RETURN_ERROR(error);</a>
+<a name="ln3106">	}</a>
+<a name="ln3107">	PRINT(&quot;ShareVolume::_MountShare(): root node: local: %&quot; B_PRIdINO</a>
+<a name="ln3108">		&quot;, remote: (%&quot; B_PRIdDEV &quot;, %&quot; B_PRIdINO &quot;)\n&quot;, fRootNode-&gt;GetID(),</a>
+<a name="ln3109">		fRootNode-&gt;GetRemoteID().volumeID,</a>
+<a name="ln3110">		fRootNode-&gt;GetRemoteID().nodeID);</a>
+<a name="ln3111"> </a>
+<a name="ln3112">	// Add ourselves to the server connection, so that we can receive</a>
+<a name="ln3113">	// node monitoring events. There a race condition: We might already</a>
+<a name="ln3114">	// have missed events for the root node.</a>
+<a name="ln3115">	error = fServerConnection-&gt;AddVolume(this);</a>
+<a name="ln3116">	if (error != B_OK) {</a>
+<a name="ln3117">		_RemoveLocalNodeID(fRootNode-&gt;GetID());</a>
+<a name="ln3118">		return error;</a>
+<a name="ln3119">	}</a>
+<a name="ln3120"> </a>
+<a name="ln3121">	fConnectionState = CONNECTION_READY;</a>
+<a name="ln3122">	return B_OK;</a>
+<a name="ln3123">}</a>
+<a name="ln3124"> </a>
+
+</code></pre>
+<div class="balloon" rel="148"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fRootNode.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,3173 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>FUSEVolume.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2001-2009, Ingo Weinhold, ingo_weinhold@gmx.de.</a>
+<a name="ln3"> * Distributed under the terms of the MIT License.</a>
+<a name="ln4"> */</a>
+<a name="ln5"> </a>
+<a name="ln6">#include &quot;FUSEVolume.h&quot;</a>
+<a name="ln7"> </a>
+<a name="ln8">#include &lt;dirent.h&gt;</a>
+<a name="ln9">#include &lt;file_systems/mime_ext_table.h&gt;</a>
+<a name="ln10"> </a>
+<a name="ln11">#include &lt;algorithm&gt;</a>
+<a name="ln12"> </a>
+<a name="ln13">#include &lt;fs_info.h&gt;</a>
+<a name="ln14">#include &lt;NodeMonitor.h&gt;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &lt;AutoDeleter.h&gt;</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &quot;FUSEFileSystem.h&quot;</a>
+<a name="ln19"> </a>
+<a name="ln20">#include &quot;../kernel_emu.h&quot;</a>
+<a name="ln21">#include &quot;../RequestThread.h&quot;</a>
+<a name="ln22"> </a>
+<a name="ln23"> </a>
+<a name="ln24">// TODO: For remote/shared file systems (sshfs, nfs, etc.) we need to notice</a>
+<a name="ln25">// that entries have been added/removed, so that we can (1) update our</a>
+<a name="ln26">// FUSEEntry/FUSENode objects and (2) send out node monitoring messages.</a>
+<a name="ln27"> </a>
+<a name="ln28"> </a>
+<a name="ln29">// The maximal node tree hierarchy levels we support.</a>
+<a name="ln30">static const uint32 kMaxNodeTreeDepth = 1024;</a>
+<a name="ln31"> </a>
+<a name="ln32"> </a>
+<a name="ln33">struct FUSEVolume::DirEntryCache {</a>
+<a name="ln34">	DirEntryCache()</a>
+<a name="ln35">		:</a>
+<a name="ln36">		fEntries(NULL),</a>
+<a name="ln37">		fNames(NULL),</a>
+<a name="ln38">		fEntryCount(0),</a>
+<a name="ln39">		fEntryCapacity(0),</a>
+<a name="ln40">		fNamesSize(0),</a>
+<a name="ln41">		fNamesCapacity(0)</a>
+<a name="ln42">	{</a>
+<a name="ln43">	}</a>
+<a name="ln44"> </a>
+<a name="ln45">	~DirEntryCache()</a>
+<a name="ln46">	{</a>
+<a name="ln47">		free(fEntries);</a>
+<a name="ln48">		free(fNames);</a>
+<a name="ln49">	}</a>
+<a name="ln50"> </a>
+<a name="ln51">	status_t AddEntry(ino_t nodeID, const char* name)</a>
+<a name="ln52">	{</a>
+<a name="ln53">		// resize entries array, if full</a>
+<a name="ln54">		if (fEntryCount == fEntryCapacity) {</a>
+<a name="ln55">			// entries array full -- resize</a>
+<a name="ln56">			uint32 newCapacity = std::max(fEntryCapacity * 2, (uint32)8);</a>
+<a name="ln57">			Entry* newEntries = (Entry*)realloc(fEntries,</a>
+<a name="ln58">				newCapacity * sizeof(Entry));</a>
+<a name="ln59">			if (newEntries == NULL)</a>
+<a name="ln60">				return B_NO_MEMORY;</a>
+<a name="ln61"> </a>
+<a name="ln62">			fEntries = newEntries;</a>
+<a name="ln63">			fEntryCapacity = newCapacity;</a>
+<a name="ln64">		}</a>
+<a name="ln65"> </a>
+<a name="ln66">		// resize names buffer, if full</a>
+<a name="ln67">		size_t nameSize = strlen(name) + 1;</a>
+<a name="ln68">		if (fNamesSize + nameSize &gt; fNamesCapacity) {</a>
+<a name="ln69">			size_t newCapacity = std::max(fNamesCapacity * 2, (size_t)256);</a>
+<a name="ln70">			while (newCapacity &lt; fNamesSize + nameSize)</a>
+<a name="ln71">				newCapacity *= 2;</a>
+<a name="ln72"> </a>
+<a name="ln73">			char* names = (char*)realloc(fNames, newCapacity);</a>
+<a name="ln74">			if (names == NULL)</a>
+<a name="ln75">				return B_NO_MEMORY;</a>
+<a name="ln76"> </a>
+<a name="ln77">			fNames = names;</a>
+<a name="ln78">			fNamesCapacity = newCapacity;</a>
+<a name="ln79">		}</a>
+<a name="ln80"> </a>
+<a name="ln81">		// add the entry</a>
+<a name="ln82">		fEntries[fEntryCount].nodeID = nodeID;</a>
+<a name="ln83">		fEntries[fEntryCount].nameOffset = fNamesSize;</a>
+<a name="ln84">		fEntries[fEntryCount].nameSize = nameSize;</a>
+<a name="ln85">		fEntryCount++;</a>
+<a name="ln86"> </a>
+<a name="ln87">		memcpy(fNames + fNamesSize, name, nameSize);</a>
+<a name="ln88">		fNamesSize += nameSize;</a>
+<a name="ln89"> </a>
+<a name="ln90">		return B_OK;</a>
+<a name="ln91">	}</a>
+<a name="ln92"> </a>
+<a name="ln93">	uint32 CountEntries() const</a>
+<a name="ln94">	{</a>
+<a name="ln95">		return fEntryCount;</a>
+<a name="ln96">	}</a>
+<a name="ln97"> </a>
+<a name="ln98">	size_t DirentLength(uint32 index) const</a>
+<a name="ln99">	{</a>
+<a name="ln100">		const Entry&amp; entry = fEntries[index];</a>
+<a name="ln101">		return sizeof(dirent) + entry.nameSize - 1;</a>
+<a name="ln102">	}</a>
+<a name="ln103"> </a>
+<a name="ln104">	bool ReadDirent(uint32 index, dev_t volumeID, bool align, dirent* buffer,</a>
+<a name="ln105">		size_t bufferSize) const</a>
+<a name="ln106">	{</a>
+<a name="ln107">		if (index &gt;= fEntryCount)</a>
+<a name="ln108">			return false;</a>
+<a name="ln109"> </a>
+<a name="ln110">		const Entry&amp; entry = fEntries[index];</a>
+<a name="ln111"> </a>
+<a name="ln112">		// get and check the size</a>
+<a name="ln113">		size_t size = sizeof(dirent) + entry.nameSize - 1;</a>
+<a name="ln114">		if (size &gt; bufferSize)</a>
+<a name="ln115">			return false;</a>
+<a name="ln116"> </a>
+<a name="ln117">		// align the size, if requested</a>
+<a name="ln118">		if (align)</a>
+<a name="ln119">			size = std::min(bufferSize, (size + 7) / 8 * 8);</a>
+<a name="ln120"> </a>
+<a name="ln121">		// fill in the dirent</a>
+<a name="ln122">		buffer-&gt;d_dev = volumeID;</a>
+<a name="ln123">		buffer-&gt;d_ino = entry.nodeID;</a>
+<a name="ln124">		memcpy(buffer-&gt;d_name, fNames + entry.nameOffset, entry.nameSize);</a>
+<a name="ln125">		buffer-&gt;d_reclen = size;</a>
+<a name="ln126"> </a>
+<a name="ln127">		return true;</a>
+<a name="ln128">	}</a>
+<a name="ln129"> </a>
+<a name="ln130">private:</a>
+<a name="ln131">	struct Entry {</a>
+<a name="ln132">		ino_t	nodeID;</a>
+<a name="ln133">		uint32	nameOffset;</a>
+<a name="ln134">		uint32	nameSize;</a>
+<a name="ln135">	};</a>
+<a name="ln136"> </a>
+<a name="ln137">private:</a>
+<a name="ln138">	Entry*	fEntries;</a>
+<a name="ln139">	char*	fNames;</a>
+<a name="ln140">	uint32	fEntryCount;</a>
+<a name="ln141">	uint32	fEntryCapacity;</a>
+<a name="ln142">	size_t	fNamesSize;</a>
+<a name="ln143">	size_t	fNamesCapacity;</a>
+<a name="ln144">};</a>
+<a name="ln145"> </a>
+<a name="ln146"> </a>
+<a name="ln147">struct FUSEVolume::DirCookie : fuse_file_info, RWLockable {</a>
+<a name="ln148">	union {</a>
+<a name="ln149">		off_t		currentEntryOffset;</a>
+<a name="ln150">		uint32		currentEntryIndex;</a>
+<a name="ln151">	};</a>
+<a name="ln152">	DirEntryCache*	entryCache;</a>
+<a name="ln153">	bool			getdirInterface;</a>
+<a name="ln154"> </a>
+<a name="ln155">	DirCookie()</a>
+<a name="ln156">		:</a>
+<a name="ln157">		currentEntryOffset(0),</a>
+<a name="ln158">		entryCache(NULL),</a>
+<a name="ln159">		getdirInterface(false)</a>
+<a name="ln160">	{</a>
+<a name="ln161">		flags = 0;</a>
+<a name="ln162">		fh_old = 0;</a>
+<a name="ln163">		writepage = 0;</a>
+<a name="ln164">		direct_io = 0;</a>
+<a name="ln165">		keep_cache = 0;</a>
+<a name="ln166">		flush = 0;</a>
+<a name="ln167">		fh = 0;</a>
+<a name="ln168">		lock_owner = 0;</a>
+<a name="ln169">	}</a>
+<a name="ln170"> </a>
+<a name="ln171">	~DirCookie()</a>
+<a name="ln172">	{</a>
+<a name="ln173">		delete entryCache;</a>
+<a name="ln174">	}</a>
+<a name="ln175">};</a>
+<a name="ln176"> </a>
+<a name="ln177"> </a>
+<a name="ln178">struct FUSEVolume::FileCookie : fuse_file_info, RWLockable {</a>
+<a name="ln179">	FileCookie(int openMode)</a>
+<a name="ln180">	{</a>
+<a name="ln181">		flags = openMode;</a>
+<a name="ln182">		fh_old = 0;</a>
+<a name="ln183">		writepage = 0;</a>
+<a name="ln184">		direct_io = 0;</a>
+<a name="ln185">		keep_cache = 0;</a>
+<a name="ln186">		flush = 0;</a>
+<a name="ln187">		fh = 0;</a>
+<a name="ln188">		lock_owner = 0;</a>
+<a name="ln189">	}</a>
+<a name="ln190">};</a>
+<a name="ln191"> </a>
+<a name="ln192"> </a>
+<a name="ln193">struct FUSEVolume::AttrDirCookie : RWLockable {</a>
+<a name="ln194">	AttrDirCookie()</a>
+<a name="ln195">		:</a>
+<a name="ln196">		fAttributes(NULL),</a>
+<a name="ln197">		fAttributesSize(0),</a>
+<a name="ln198">		fCurrentOffset(0),</a>
+<a name="ln199">		fValid(false)</a>
+<a name="ln200">	{</a>
+<a name="ln201">	}</a>
+<a name="ln202"> </a>
+<a name="ln203">	~AttrDirCookie()</a>
+<a name="ln204">	{</a>
+<a name="ln205">		Clear();</a>
+<a name="ln206">	}</a>
+<a name="ln207"> </a>
+<a name="ln208">	void Clear()</a>
+<a name="ln209">	{</a>
+<a name="ln210">		free(fAttributes);</a>
+<a name="ln211">		fAttributes = NULL;</a>
+<a name="ln212">		fAttributesSize = 0;</a>
+<a name="ln213">		fCurrentOffset = 0;</a>
+<a name="ln214">		fValid = false;</a>
+<a name="ln215">	}</a>
+<a name="ln216"> </a>
+<a name="ln217">	status_t Allocate(size_t size)</a>
+<a name="ln218">	{</a>
+<a name="ln219">		Clear();</a>
+<a name="ln220"> </a>
+<a name="ln221">		if (size == 0)</a>
+<a name="ln222">			return B_OK;</a>
+<a name="ln223"> </a>
+<a name="ln224">		fAttributes = (char*)malloc(size);</a>
+<a name="ln225">		if (fAttributes == NULL)</a>
+<a name="ln226">			return B_NO_MEMORY;</a>
+<a name="ln227"> </a>
+<a name="ln228">		fAttributesSize = size;</a>
+<a name="ln229">		return B_OK;</a>
+<a name="ln230">	}</a>
+<a name="ln231"> </a>
+<a name="ln232">	bool IsValid() const</a>
+<a name="ln233">	{</a>
+<a name="ln234">		return fValid;</a>
+<a name="ln235">	}</a>
+<a name="ln236"> </a>
+<a name="ln237">	void SetValid(bool valid)</a>
+<a name="ln238">	{</a>
+<a name="ln239">		fValid = valid;</a>
+<a name="ln240">	}</a>
+<a name="ln241"> </a>
+<a name="ln242">	char* AttributesBuffer() const</a>
+<a name="ln243">	{</a>
+<a name="ln244">		return fAttributes;</a>
+<a name="ln245">	}</a>
+<a name="ln246"> </a>
+<a name="ln247">	bool ReadNextEntry(dev_t volumeID, ino_t nodeID, bool align,</a>
+<a name="ln248">		dirent* buffer, size_t bufferSize)</a>
+<a name="ln249">	{</a>
+<a name="ln250">		if (fCurrentOffset &gt;= fAttributesSize)</a>
+<a name="ln251">			return false;</a>
+<a name="ln252"> </a>
+<a name="ln253">		const char* name = fAttributes + fCurrentOffset;</a>
+<a name="ln254">		size_t nameLen = strlen(name);</a>
+<a name="ln255"> </a>
+<a name="ln256">		// get and check the size</a>
+<a name="ln257">		size_t size = sizeof(dirent) + nameLen;</a>
+<a name="ln258">		if (size &gt; bufferSize)</a>
+<a name="ln259">			return false;</a>
+<a name="ln260"> </a>
+<a name="ln261">		// align the size, if requested</a>
+<a name="ln262">		if (align)</a>
+<a name="ln263">			size = std::min(bufferSize, (size + 7) / 8 * 8);</a>
+<a name="ln264"> </a>
+<a name="ln265">		// fill in the dirent</a>
+<a name="ln266">		buffer-&gt;d_dev = volumeID;</a>
+<a name="ln267">		buffer-&gt;d_ino = nodeID;</a>
+<a name="ln268">		memcpy(buffer-&gt;d_name, name, nameLen + 1);</a>
+<a name="ln269">		buffer-&gt;d_reclen = size;</a>
+<a name="ln270"> </a>
+<a name="ln271">		fCurrentOffset += nameLen + 1;</a>
+<a name="ln272"> </a>
+<a name="ln273">		return true;</a>
+<a name="ln274">	}</a>
+<a name="ln275"> </a>
+<a name="ln276">private:</a>
+<a name="ln277">	char*	fAttributes;</a>
+<a name="ln278">	size_t	fAttributesSize;</a>
+<a name="ln279">	size_t	fCurrentOffset;</a>
+<a name="ln280">	bool	fValid;</a>
+<a name="ln281">};</a>
+<a name="ln282"> </a>
+<a name="ln283"> </a>
+<a name="ln284">struct FUSEVolume::AttrCookie : RWLockable {</a>
+<a name="ln285">public:</a>
+<a name="ln286">	AttrCookie(const char* name)</a>
+<a name="ln287">		:</a>
+<a name="ln288">		fValue(NULL),</a>
+<a name="ln289">		fSize(0),</a>
+<a name="ln290">		fType(0)</a>
+<a name="ln291">	{</a>
+<a name="ln292">		_SetType(name);</a>
+<a name="ln293">	}</a>
+<a name="ln294"> </a>
+<a name="ln295">	AttrCookie(const char* name, const char* value)</a>
+<a name="ln296">		:</a>
+<a name="ln297">		fValue(strdup(value)),</a>
+<a name="ln298">		fSize(strlen(value) + 1),</a>
+<a name="ln299">		fType(0)</a>
+<a name="ln300">	{</a>
+<a name="ln301">		_SetType(name);</a>
+<a name="ln302">	}</a>
+<a name="ln303"> </a>
+<a name="ln304">	~AttrCookie()</a>
+<a name="ln305">	{</a>
+<a name="ln306">		free(fValue);</a>
+<a name="ln307">	}</a>
+<a name="ln308"> </a>
+<a name="ln309">	bool IsValid() const</a>
+<a name="ln310">	{</a>
+<a name="ln311">		return fValue != NULL;</a>
+<a name="ln312">	}</a>
+<a name="ln313"> </a>
+<a name="ln314">	uint32 Type() const</a>
+<a name="ln315">	{</a>
+<a name="ln316">		return fType;</a>
+<a name="ln317">	}</a>
+<a name="ln318"> </a>
+<a name="ln319">	status_t Allocate(size_t size)</a>
+<a name="ln320">	{</a>
+<a name="ln321">		fValue = (char*)malloc(size);</a>
+<a name="ln322">		if (fValue == NULL) {</a>
+<a name="ln323">			fSize = 0;</a>
+<a name="ln324">			return B_NO_MEMORY;</a>
+<a name="ln325">		}</a>
+<a name="ln326">		fSize = size;</a>
+<a name="ln327">		return B_OK;</a>
+<a name="ln328">	}</a>
+<a name="ln329"> </a>
+<a name="ln330">	void Read(void* buffer, size_t bufferSize, off_t pos,</a>
+<a name="ln331">		size_t* bytesRead) const</a>
+<a name="ln332">	{</a>
+<a name="ln333">		if (pos &lt; 0 || (uint64)pos &gt; SIZE_MAX || (size_t)pos &gt; fSize - 1) {</a>
+<a name="ln334">			*bytesRead = 0;</a>
+<a name="ln335">			return;</a>
+<a name="ln336">		}</a>
+<a name="ln337">		size_t copySize = fSize - pos;</a>
+<a name="ln338">		if (copySize &gt; bufferSize)</a>
+<a name="ln339">			copySize = bufferSize;</a>
+<a name="ln340">		strlcpy((char*)buffer, &amp;fValue[pos], bufferSize);</a>
+<a name="ln341">		*bytesRead = copySize;</a>
+<a name="ln342">	}</a>
+<a name="ln343"> </a>
+<a name="ln344">	char* Buffer()</a>
+<a name="ln345">	{</a>
+<a name="ln346">		return fValue;</a>
+<a name="ln347">	}</a>
+<a name="ln348"> </a>
+<a name="ln349">	size_t Size() const</a>
+<a name="ln350">	{</a>
+<a name="ln351">		return fSize;</a>
+<a name="ln352">	}</a>
+<a name="ln353"> </a>
+<a name="ln354">private:</a>
+<a name="ln355">	void _SetType(const char* name)</a>
+<a name="ln356">	{</a>
+<a name="ln357">		if (strcmp(name, kAttrMimeTypeName) == 0)</a>
+<a name="ln358">			fType = B_MIME_STRING_TYPE;</a>
+<a name="ln359">		else</a>
+<a name="ln360">			fType = B_RAW_TYPE;</a>
+<a name="ln361">	}</a>
+<a name="ln362"> </a>
+<a name="ln363">private:</a>
+<a name="ln364">	char*	fValue;</a>
+<a name="ln365">	size_t	fSize;</a>
+<a name="ln366">	uint32	fType;</a>
+<a name="ln367">};</a>
+<a name="ln368"> </a>
+<a name="ln369"> </a>
+<a name="ln370">struct FUSEVolume::ReadDirBuffer {</a>
+<a name="ln371">	FUSEVolume*	volume;</a>
+<a name="ln372">	FUSENode*	directory;</a>
+<a name="ln373">	DirCookie*	cookie;</a>
+<a name="ln374">	void*		buffer;</a>
+<a name="ln375">	size_t		bufferSize;</a>
+<a name="ln376">	size_t		usedSize;</a>
+<a name="ln377">	uint32		entriesRead;</a>
+<a name="ln378">	uint32		maxEntries;</a>
+<a name="ln379">	status_t	error;</a>
+<a name="ln380"> </a>
+<a name="ln381">	ReadDirBuffer(FUSEVolume* volume, FUSENode* directory, DirCookie* cookie,</a>
+<a name="ln382">		void* buffer, size_t bufferSize, uint32 maxEntries)</a>
+<a name="ln383">		:</a>
+<a name="ln384">		volume(volume),</a>
+<a name="ln385">		directory(directory),</a>
+<a name="ln386">		cookie(cookie),</a>
+<a name="ln387">		buffer(buffer),</a>
+<a name="ln388">		bufferSize(bufferSize),</a>
+<a name="ln389">		usedSize(0),</a>
+<a name="ln390">		entriesRead(0),</a>
+<a name="ln391">		maxEntries(maxEntries),</a>
+<a name="ln392">		error(B_OK)</a>
+<a name="ln393">	{</a>
+<a name="ln394">	}</a>
+<a name="ln395">};</a>
+<a name="ln396"> </a>
+<a name="ln397"> </a>
+<a name="ln398">struct FUSEVolume::LockIterator {</a>
+<a name="ln399">	FUSEVolume*	volume;</a>
+<a name="ln400">	FUSENode*	firstNode;</a>
+<a name="ln401">	FUSENode*	lastLockedNode;</a>
+<a name="ln402">	FUSENode*	nextNode;</a>
+<a name="ln403">	FUSENode*	stopBeforeNode;</a>
+<a name="ln404">	bool		writeLock;</a>
+<a name="ln405"> </a>
+<a name="ln406">	LockIterator(FUSEVolume* volume, FUSENode* node, bool writeLock,</a>
+<a name="ln407">		FUSENode* stopBeforeNode)</a>
+<a name="ln408">		:</a>
+<a name="ln409">		volume(volume),</a>
+<a name="ln410">		firstNode(node),</a>
+<a name="ln411">		lastLockedNode(NULL),</a>
+<a name="ln412">		nextNode(node),</a>
+<a name="ln413">		stopBeforeNode(stopBeforeNode),</a>
+<a name="ln414">		writeLock(writeLock)</a>
+<a name="ln415">	{</a>
+<a name="ln416">	}</a>
+<a name="ln417"> </a>
+<a name="ln418">	~LockIterator()</a>
+<a name="ln419">	{</a>
+<a name="ln420">		Unlock();</a>
+<a name="ln421">	}</a>
+<a name="ln422"> </a>
+<a name="ln423">	void SetTo(FUSEVolume* volume, FUSENode* node, bool writeLock,</a>
+<a name="ln424">		FUSENode* stopBeforeNode)</a>
+<a name="ln425">	{</a>
+<a name="ln426">		Unlock();</a>
+<a name="ln427"> </a>
+<a name="ln428">		this-&gt;volume = volume;</a>
+<a name="ln429">		this-&gt;firstNode = node;</a>
+<a name="ln430">		this-&gt;lastLockedNode = NULL;</a>
+<a name="ln431">		this-&gt;nextNode = node;</a>
+<a name="ln432">		this-&gt;stopBeforeNode = stopBeforeNode;</a>
+<a name="ln433">		this-&gt;writeLock = writeLock;</a>
+<a name="ln434">	}</a>
+<a name="ln435"> </a>
+<a name="ln436">	status_t LockNext(bool* _done, bool* _volumeUnlocked)</a>
+<a name="ln437">	{</a>
+<a name="ln438">		// increment the ref count first</a>
+<a name="ln439">		nextNode-&gt;refCount++;</a>
+<a name="ln440"> </a>
+<a name="ln441">		if (volume-&gt;fLockManager.TryGenericLock(</a>
+<a name="ln442">				nextNode == firstNode &amp;&amp; writeLock, nextNode)) {</a>
+<a name="ln443">			// got the lock</a>
+<a name="ln444">			*_volumeUnlocked = false;</a>
+<a name="ln445">		} else {</a>
+<a name="ln446">			// node is locked -- we need to unlock the volume and wait for</a>
+<a name="ln447">			// the lock</a>
+<a name="ln448">			volume-&gt;fLock.Unlock();</a>
+<a name="ln449">			status_t error = volume-&gt;fLockManager.GenericLock(</a>
+<a name="ln450">				nextNode == firstNode &amp;&amp; writeLock, nextNode);</a>
+<a name="ln451">			volume-&gt;fLock.Lock();</a>
+<a name="ln452"> </a>
+<a name="ln453">			*_volumeUnlocked = false;</a>
+<a name="ln454"> </a>
+<a name="ln455">			if (error != B_OK) {</a>
+<a name="ln456">				volume-&gt;_PutNode(nextNode);</a>
+<a name="ln457">				return error;</a>
+<a name="ln458">			}</a>
+<a name="ln459">		}</a>
+<a name="ln460"> </a>
+<a name="ln461">		lastLockedNode = nextNode;</a>
+<a name="ln462"> </a>
+<a name="ln463">		// get the parent node</a>
+<a name="ln464">		FUSENode* parent = nextNode-&gt;Parent();</a>
+<a name="ln465">		if (parent == stopBeforeNode || parent == nextNode) {</a>
+<a name="ln466">			if (parent == nextNode)</a>
+<a name="ln467">				parent = NULL;</a>
+<a name="ln468">			*_done = true;</a>
+<a name="ln469">		} else</a>
+<a name="ln470">			*_done = false;</a>
+<a name="ln471"> </a>
+<a name="ln472">		nextNode = parent;</a>
+<a name="ln473"> </a>
+<a name="ln474">		return B_OK;</a>
+<a name="ln475">	}</a>
+<a name="ln476"> </a>
+<a name="ln477">	void Unlock()</a>
+<a name="ln478">	{</a>
+<a name="ln479">		if (lastLockedNode == NULL)</a>
+<a name="ln480">			return;</a>
+<a name="ln481"> </a>
+<a name="ln482">		volume-&gt;_UnlockNodeChainInternal(firstNode, writeLock, lastLockedNode,</a>
+<a name="ln483">			NULL);</a>
+<a name="ln484"> </a>
+<a name="ln485">		lastLockedNode = NULL;</a>
+<a name="ln486">		nextNode = firstNode;</a>
+<a name="ln487">	}</a>
+<a name="ln488"> </a>
+<a name="ln489">	void SetStopBeforeNode(FUSENode* stopBeforeNode)</a>
+<a name="ln490">	{</a>
+<a name="ln491">		this-&gt;stopBeforeNode = stopBeforeNode;</a>
+<a name="ln492">	}</a>
+<a name="ln493"> </a>
+<a name="ln494">	void Detach()</a>
+<a name="ln495">	{</a>
+<a name="ln496">		lastLockedNode = NULL;</a>
+<a name="ln497">		nextNode = firstNode;</a>
+<a name="ln498">	}</a>
+<a name="ln499">};</a>
+<a name="ln500"> </a>
+<a name="ln501"> </a>
+<a name="ln502">struct FUSEVolume::RWLockableReadLocking {</a>
+<a name="ln503">	RWLockableReadLocking(FUSEVolume* volume)</a>
+<a name="ln504">		:</a>
+<a name="ln505">		fLockManager(volume != NULL ? &amp;volume-&gt;fLockManager : NULL)</a>
+<a name="ln506">	{</a>
+<a name="ln507">	}</a>
+<a name="ln508"> </a>
+<a name="ln509">	RWLockableReadLocking(RWLockManager* lockManager)</a>
+<a name="ln510">		:</a>
+<a name="ln511">		fLockManager(lockManager)</a>
+<a name="ln512">	{</a>
+<a name="ln513">	}</a>
+<a name="ln514"> </a>
+<a name="ln515">	RWLockableReadLocking(const RWLockableReadLocking&amp; other)</a>
+<a name="ln516">		:</a>
+<a name="ln517">		fLockManager(other.fLockManager)</a>
+<a name="ln518">	{</a>
+<a name="ln519">	}</a>
+<a name="ln520"> </a>
+<a name="ln521">	inline bool Lock(RWLockable* lockable)</a>
+<a name="ln522">	{</a>
+<a name="ln523">		return fLockManager != NULL &amp;&amp; fLockManager-&gt;ReadLock(lockable);</a>
+<a name="ln524">	}</a>
+<a name="ln525"> </a>
+<a name="ln526">	inline void Unlock(RWLockable* lockable)</a>
+<a name="ln527">	{</a>
+<a name="ln528">		if (fLockManager != NULL)</a>
+<a name="ln529">			fLockManager-&gt;ReadUnlock(lockable);</a>
+<a name="ln530">	}</a>
+<a name="ln531"> </a>
+<a name="ln532">private:</a>
+<a name="ln533">	RWLockManager*	fLockManager;</a>
+<a name="ln534">};</a>
+<a name="ln535"> </a>
+<a name="ln536"> </a>
+<a name="ln537">struct FUSEVolume::RWLockableWriteLocking {</a>
+<a name="ln538">	RWLockableWriteLocking(FUSEVolume* volume)</a>
+<a name="ln539">		:</a>
+<a name="ln540">		fLockManager(volume != NULL ? &amp;volume-&gt;fLockManager : NULL)</a>
+<a name="ln541">	{</a>
+<a name="ln542">	}</a>
+<a name="ln543"> </a>
+<a name="ln544">	RWLockableWriteLocking(RWLockManager* lockManager)</a>
+<a name="ln545">		:</a>
+<a name="ln546">		fLockManager(lockManager)</a>
+<a name="ln547">	{</a>
+<a name="ln548">	}</a>
+<a name="ln549"> </a>
+<a name="ln550">	RWLockableWriteLocking(const RWLockableWriteLocking&amp; other)</a>
+<a name="ln551">		:</a>
+<a name="ln552">		fLockManager(other.fLockManager)</a>
+<a name="ln553">	{</a>
+<a name="ln554">	}</a>
+<a name="ln555"> </a>
+<a name="ln556">	inline bool Lock(RWLockable* lockable)</a>
+<a name="ln557">	{</a>
+<a name="ln558">		return fLockManager != NULL &amp;&amp; fLockManager-&gt;WriteLock(lockable);</a>
+<a name="ln559">	}</a>
+<a name="ln560"> </a>
+<a name="ln561">	inline void Unlock(RWLockable* lockable)</a>
+<a name="ln562">	{</a>
+<a name="ln563">		if (fLockManager != NULL)</a>
+<a name="ln564">			fLockManager-&gt;WriteUnlock(lockable);</a>
+<a name="ln565">	}</a>
+<a name="ln566"> </a>
+<a name="ln567">private:</a>
+<a name="ln568">	RWLockManager*	fLockManager;</a>
+<a name="ln569">};</a>
+<a name="ln570"> </a>
+<a name="ln571"> </a>
+<a name="ln572">struct FUSEVolume::RWLockableReadLocker</a>
+<a name="ln573">	: public AutoLocker&lt;RWLockable, RWLockableReadLocking&gt; {</a>
+<a name="ln574"> </a>
+<a name="ln575">	RWLockableReadLocker(FUSEVolume* volume, RWLockable* lockable)</a>
+<a name="ln576">		:</a>
+<a name="ln577">		AutoLocker&lt;RWLockable, RWLockableReadLocking&gt;(</a>
+<a name="ln578">			RWLockableReadLocking(volume))</a>
+<a name="ln579">	{</a>
+<a name="ln580">		SetTo(lockable, false);</a>
+<a name="ln581">	}</a>
+<a name="ln582">};</a>
+<a name="ln583"> </a>
+<a name="ln584"> </a>
+<a name="ln585">struct FUSEVolume::RWLockableWriteLocker</a>
+<a name="ln586">	: public AutoLocker&lt;RWLockable, RWLockableWriteLocking&gt; {</a>
+<a name="ln587"> </a>
+<a name="ln588">	RWLockableWriteLocker(FUSEVolume* volume, RWLockable* lockable)</a>
+<a name="ln589">		:</a>
+<a name="ln590">		AutoLocker&lt;RWLockable, RWLockableWriteLocking&gt;(</a>
+<a name="ln591">			RWLockableWriteLocking(volume))</a>
+<a name="ln592">	{</a>
+<a name="ln593">		SetTo(lockable, false);</a>
+<a name="ln594">	}</a>
+<a name="ln595">};</a>
+<a name="ln596"> </a>
+<a name="ln597"> </a>
+<a name="ln598">struct FUSEVolume::NodeLocker {</a>
+<a name="ln599">	NodeLocker(FUSEVolume* volume, FUSENode* node, bool parent, bool writeLock)</a>
+<a name="ln600">		:</a>
+<a name="ln601">		fVolume(volume),</a>
+<a name="ln602">		fNode(NULL),</a>
+<a name="ln603">		fParent(parent),</a>
+<a name="ln604">		fWriteLock(writeLock)</a>
+<a name="ln605">	{</a>
+<a name="ln606">		fStatus = volume-&gt;_LockNodeChain(node, parent, writeLock);</a>
+<a name="ln607">		if (fStatus == B_OK)</a>
+<a name="ln608">			fNode = node;</a>
+<a name="ln609">	}</a>
+<a name="ln610"> </a>
+<a name="ln611">	~NodeLocker()</a>
+<a name="ln612">	{</a>
+<a name="ln613">		if (fNode != NULL)</a>
+<a name="ln614">			fVolume-&gt;_UnlockNodeChain(fNode, fParent, fWriteLock);</a>
+<a name="ln615">	}</a>
+<a name="ln616"> </a>
+<a name="ln617">	status_t Status() const</a>
+<a name="ln618">	{</a>
+<a name="ln619">		return fStatus;</a>
+<a name="ln620">	}</a>
+<a name="ln621"> </a>
+<a name="ln622">private:</a>
+<a name="ln623">	FUSEVolume*	fVolume;</a>
+<a name="ln624">	FUSENode*	fNode;</a>
+<a name="ln625">	status_t	fStatus;</a>
+<a name="ln626">	bool		fParent;</a>
+<a name="ln627">	bool		fWriteLock;</a>
+<a name="ln628">};</a>
+<a name="ln629"> </a>
+<a name="ln630"> </a>
+<a name="ln631">struct FUSEVolume::NodeReadLocker : NodeLocker {</a>
+<a name="ln632">	NodeReadLocker(FUSEVolume* volume, FUSENode* node, bool parent)</a>
+<a name="ln633">		:</a>
+<a name="ln634">		NodeLocker(volume, node, parent, false)</a>
+<a name="ln635">	{</a>
+<a name="ln636">	}</a>
+<a name="ln637">};</a>
+<a name="ln638"> </a>
+<a name="ln639"> </a>
+<a name="ln640">struct FUSEVolume::NodeWriteLocker : NodeLocker {</a>
+<a name="ln641">	NodeWriteLocker(FUSEVolume* volume, FUSENode* node, bool parent)</a>
+<a name="ln642">		:</a>
+<a name="ln643">		NodeLocker(volume, node, parent, true)</a>
+<a name="ln644">	{</a>
+<a name="ln645">	}</a>
+<a name="ln646">};</a>
+<a name="ln647"> </a>
+<a name="ln648"> </a>
+<a name="ln649">struct FUSEVolume::MultiNodeLocker {</a>
+<a name="ln650">	MultiNodeLocker(FUSEVolume* volume, FUSENode* node1, bool lockParent1,</a>
+<a name="ln651">		bool writeLock1, FUSENode* node2, bool lockParent2, bool writeLock2)</a>
+<a name="ln652">		:</a>
+<a name="ln653">		fVolume(volume),</a>
+<a name="ln654">		fNode1(NULL),</a>
+<a name="ln655">		fNode2(NULL),</a>
+<a name="ln656">		fLockParent1(lockParent1),</a>
+<a name="ln657">		fWriteLock1(writeLock1),</a>
+<a name="ln658">		fLockParent2(lockParent2),</a>
+<a name="ln659">		fWriteLock2(writeLock2)</a>
+<a name="ln660">	{</a>
+<a name="ln661">		fStatus = volume-&gt;_LockNodeChains(node1, lockParent1, writeLock1, node2,</a>
+<a name="ln662">			lockParent2, writeLock2);</a>
+<a name="ln663">		if (fStatus == B_OK) {</a>
+<a name="ln664">			fNode1 = node1;</a>
+<a name="ln665">			fNode2 = node2;</a>
+<a name="ln666">		}</a>
+<a name="ln667">	}</a>
+<a name="ln668"> </a>
+<a name="ln669">	~MultiNodeLocker()</a>
+<a name="ln670">	{</a>
+<a name="ln671">		if (fNode1 != NULL) {</a>
+<a name="ln672">			fVolume-&gt;_UnlockNodeChains(fNode1, fLockParent1, fWriteLock1,</a>
+<a name="ln673">				fNode2, fLockParent2, fWriteLock2);</a>
+<a name="ln674">		}</a>
+<a name="ln675">	}</a>
+<a name="ln676"> </a>
+<a name="ln677">	status_t Status() const</a>
+<a name="ln678">	{</a>
+<a name="ln679">		return fStatus;</a>
+<a name="ln680">	}</a>
+<a name="ln681"> </a>
+<a name="ln682">private:</a>
+<a name="ln683">	FUSEVolume*	fVolume;</a>
+<a name="ln684">	FUSENode*	fNode1;</a>
+<a name="ln685">	FUSENode*	fNode2;</a>
+<a name="ln686">	bool		fLockParent1;</a>
+<a name="ln687">	bool		fWriteLock1;</a>
+<a name="ln688">	bool		fLockParent2;</a>
+<a name="ln689">	bool		fWriteLock2;</a>
+<a name="ln690">	status_t	fStatus;</a>
+<a name="ln691">};</a>
+<a name="ln692"> </a>
+<a name="ln693"> </a>
+<a name="ln694">// #pragma mark -</a>
+<a name="ln695"> </a>
+<a name="ln696"> </a>
+<a name="ln697">inline FUSEFileSystem*</a>
+<a name="ln698">FUSEVolume::_FileSystem() const</a>
+<a name="ln699">{</a>
+<a name="ln700">	return static_cast&lt;FUSEFileSystem*&gt;(fFileSystem);</a>
+<a name="ln701">}</a>
+<a name="ln702"> </a>
+<a name="ln703"> </a>
+<a name="ln704">FUSEVolume::FUSEVolume(FUSEFileSystem* fileSystem, dev_t id)</a>
+<a name="ln705">	:</a>
+<a name="ln706">	Volume(fileSystem, id),</a>
+<a name="ln707">	fFS(NULL),</a>
+<a name="ln708">	fRootNode(NULL),</a>
+<a name="ln709">	fNextNodeID(FUSE_ROOT_ID + 1),</a>
+<a name="ln710">	fUseNodeIDs(false)</a>
+<a name="ln711">{</a>
+<a name="ln712">}</a>
+<a name="ln713"> </a>
+<a name="ln714"> </a>
+<a name="ln715">FUSEVolume::~FUSEVolume()</a>
+<a name="ln716">{</a>
+<a name="ln717">}</a>
+<a name="ln718"> </a>
+<a name="ln719"> </a>
+<a name="ln720">status_t</a>
+<a name="ln721">FUSEVolume::Init()</a>
+<a name="ln722">{</a>
+<a name="ln723">	// init lock manager</a>
+<a name="ln724">	status_t error = fLockManager.Init();</a>
+<a name="ln725">	if (error != B_OK)</a>
+<a name="ln726">		return error;</a>
+<a name="ln727"> </a>
+<a name="ln728">	// init entry and node tables</a>
+<a name="ln729">	error = fEntries.Init();</a>
+<a name="ln730">	if (error != B_OK)</a>
+<a name="ln731">		return error;</a>
+<a name="ln732"> </a>
+<a name="ln733">	error = fNodes.Init();</a>
+<a name="ln734">	if (error != B_OK)</a>
+<a name="ln735">		return error;</a>
+<a name="ln736"> </a>
+<a name="ln737">	// check lock</a>
+<a name="ln738">	error = fLock.InitCheck();</a>
+<a name="ln739">	if (error != B_OK)</a>
+<a name="ln740">		return error;</a>
+<a name="ln741"> </a>
+<a name="ln742">	return B_OK;</a>
+<a name="ln743">}</a>
+<a name="ln744"> </a>
+<a name="ln745"> </a>
+<a name="ln746">// #pragma mark - FS</a>
+<a name="ln747"> </a>
+<a name="ln748"> </a>
+<a name="ln749">status_t</a>
+<a name="ln750">FUSEVolume::Mount(const char* device, uint32 flags, const char* parameters,</a>
+<a name="ln751">	ino_t* rootID)</a>
+<a name="ln752">{</a>
+<a name="ln753">printf(&quot;FUSEVolume::Mount()\n&quot;);</a>
+<a name="ln754">	status_t error = _FileSystem()-&gt;InitClientFS(parameters);</a>
+<a name="ln755">	if (error != B_OK)</a>
+<a name="ln756">		RETURN_ERROR(error);</a>
+<a name="ln757"> </a>
+<a name="ln758">	fFS = _FileSystem()-&gt;GetFS();</a>
+<a name="ln759">	_FileSystem()-&gt;GetVolumeCapabilities(fCapabilities);</a>
+<a name="ln760"> </a>
+<a name="ln761">	const fuse_config&amp; config = _FileSystem()-&gt;GetFUSEConfig();</a>
+<a name="ln762">	fUseNodeIDs = config.use_ino;</a>
+<a name="ln763"> </a>
+<a name="ln764">	// update the fuse_context::private_data field before calling into the FS</a>
+<a name="ln765">	fuse_context* context = (fuse_context*)RequestThread::GetCurrentThread()</a>
+<a name="ln766">		-&gt;GetContext()-&gt;GetFSData();</a>
+<a name="ln767">	context-&gt;private_data = fFS-&gt;userData;</a>
+<a name="ln768"> </a>
+<a name="ln769">	// get the root node</a>
+<a name="ln770">	struct stat st;</a>
+<a name="ln771">	int fuseError = fuse_fs_getattr(fFS, &quot;/&quot;, &amp;st);</a>
+<a name="ln772">	if (fuseError != 0)</a>
+<a name="ln773">		RETURN_ERROR(fuseError);</a>
+<a name="ln774"> </a>
+<a name="ln775">	if (!fUseNodeIDs)</a>
+<a name="ln776">		st.st_ino = FUSE_ROOT_ID;</a>
+<a name="ln777"> </a>
+<a name="ln778">	// create a node and an entry object for the root node</a>
+<a name="ln779">	AutoLocker&lt;Locker&gt; _(fLock);</a>
+<a name="ln780">	FUSENode* node = new(std::nothrow) FUSENode(st.st_ino, st.st_mode &amp; S_IFMT);</a>
+<a name="ln781">	FUSEEntry* entry = node != NULL ? FUSEEntry::Create(node, &quot;/&quot;, node) : NULL;</a>
+<a name="ln782">	if (node == NULL || entry == NULL) {</a>
+<a name="ln783">		delete node;</a>
+<a name="ln784">		delete entry;</a>
+<a name="ln785">		_FileSystem()-&gt;ExitClientFS(B_NO_MEMORY);</a>
+<a name="ln786">		RETURN_ERROR(B_NO_MEMORY);</a>
+<a name="ln787">	}</a>
+<a name="ln788"> </a>
+<a name="ln789">	node-&gt;refCount++;	// for the entry</a>
+<a name="ln790">	node-&gt;entries.Add(entry);</a>
+<a name="ln791">	fRootNode = node;</a>
+<a name="ln792"> </a>
+<a name="ln793">	// insert the node and the entry</a>
+<a name="ln794">	fNodes.Insert(node);</a>
+<a name="ln795">	fEntries.Insert(entry);</a>
+<a name="ln796"> </a>
+<a name="ln797">	// init the volume name</a>
+<a name="ln798">	snprintf(fName, sizeof(fName), &quot;%s Volume&quot;, _FileSystem()-&gt;GetName());</a>
+<a name="ln799"> </a>
+<a name="ln800">	// publish the root node</a>
+<a name="ln801">	error = UserlandFS::KernelEmu::publish_vnode(fID, node-&gt;id, node,</a>
+<a name="ln802">		node-&gt;type, 0, _FileSystem()-&gt;GetNodeCapabilities());</a>
+<a name="ln803">	if (error != B_OK) {</a>
+<a name="ln804">		_FileSystem()-&gt;ExitClientFS(B_NO_MEMORY);</a>
+<a name="ln805">		RETURN_ERROR(error);</a>
+<a name="ln806">	}</a>
+<a name="ln807"> </a>
+<a name="ln808">	*rootID = node-&gt;id;</a>
+<a name="ln809"> </a>
+<a name="ln810">	return B_OK;</a>
+<a name="ln811">}</a>
+<a name="ln812"> </a>
+<a name="ln813"> </a>
+<a name="ln814">status_t</a>
+<a name="ln815">FUSEVolume::Unmount()</a>
+<a name="ln816">{</a>
+<a name="ln817">printf(&quot;FUSEVolume::Unmount()\n&quot;);</a>
+<a name="ln818">	_FileSystem()-&gt;ExitClientFS(B_OK);</a>
+<a name="ln819">	return B_OK;</a>
+<a name="ln820">}</a>
+<a name="ln821"> </a>
+<a name="ln822"> </a>
+<a name="ln823">status_t</a>
+<a name="ln824">FUSEVolume::Sync()</a>
+<a name="ln825">{</a>
+<a name="ln826">	PRINT((&quot;FUSEVolume::Sync()\n&quot;));</a>
+<a name="ln827"> </a>
+<a name="ln828">	// There's no FUSE hook for sync'ing the whole FS. We need to individually</a>
+<a name="ln829">	// fsync all nodes that have been marked dirty. To keep things simple, we</a>
+<a name="ln830">	// hold the volume lock the whole time. That's a concurrency killer, but</a>
+<a name="ln831">	// usually sync isn't invoked that often.</a>
+<a name="ln832"> </a>
+<a name="ln833">	AutoLocker&lt;Locker&gt; _(fLock);</a>
+<a name="ln834"> </a>
+<a name="ln835">	// iterate through all nodes</a>
+<a name="ln836">	FUSENodeTable::Iterator it = fNodes.GetIterator();</a>
+<a name="ln837">	while (FUSENode* node = it.Next()) {</a>
+<a name="ln838">		if (!node-&gt;dirty)</a>
+<a name="ln839">			continue;</a>
+<a name="ln840"> </a>
+<a name="ln841">		// node is dirty -- we have to sync it</a>
+<a name="ln842"> </a>
+<a name="ln843">		// get a path for the node</a>
+<a name="ln844">		char path[B_PATH_NAME_LENGTH];</a>
+<a name="ln845">		size_t pathLen;</a>
+<a name="ln846">		status_t error = _BuildPath(node, path, pathLen);</a>
+<a name="ln847">		if (error != B_OK)</a>
+<a name="ln848">			continue;</a>
+<a name="ln849"> </a>
+<a name="ln850">		// open, sync, and close the node</a>
+<a name="ln851">		FileCookie cookie(O_RDONLY);</a>
+<a name="ln852">		int fuseError = fuse_fs_open(fFS, path, &amp;cookie);</a>
+<a name="ln853">		if (fuseError == 0) {</a>
+<a name="ln854">			fuseError = fuse_fs_fsync(fFS, path, 0, &amp;cookie);</a>
+<a name="ln855">				// full sync, not only data</a>
+<a name="ln856">			fuse_fs_flush(fFS, path, &amp;cookie);</a>
+<a name="ln857">			fuse_fs_release(fFS, path, &amp;cookie);</a>
+<a name="ln858">		}</a>
+<a name="ln859"> </a>
+<a name="ln860">		if (fuseError == 0) {</a>
+<a name="ln861">			// sync'ing successful -- mark the node not dirty</a>
+<a name="ln862">			node-&gt;dirty = false;</a>
+<a name="ln863">		}</a>
+<a name="ln864">	}</a>
+<a name="ln865"> </a>
+<a name="ln866">	return B_OK;</a>
+<a name="ln867">}</a>
+<a name="ln868"> </a>
+<a name="ln869"> </a>
+<a name="ln870">status_t</a>
+<a name="ln871">FUSEVolume::ReadFSInfo(fs_info* info)</a>
+<a name="ln872">{</a>
+<a name="ln873">	if (gHasHaikuFuseExtensions == 1 &amp;&amp; fFS-&gt;ops.get_fs_info != NULL) {</a>
+<a name="ln874">		int fuseError = fuse_fs_get_fs_info(fFS, info);</a>
+<a name="ln875">		if (fuseError != 0)</a>
+<a name="ln876">			return fuseError;</a>
+<a name="ln877">		return B_OK;</a>
+<a name="ln878">	}</a>
+<a name="ln879"> </a>
+<a name="ln880">	// No Haiku FUSE extensions, so our knowledge is limited: use some values</a>
+<a name="ln881">	// from statfs and make reasonable guesses for the rest of them.</a>
+<a name="ln882">	if (fFS-&gt;ops.statfs == NULL)</a>
+<a name="ln883">		return B_UNSUPPORTED;</a>
+<a name="ln884"> </a>
+<a name="ln885">	struct statvfs st;</a>
+<a name="ln886">	int fuseError = fuse_fs_statfs(fFS, &quot;/&quot;, &amp;st);</a>
+<a name="ln887">	if (fuseError != 0)</a>
+<a name="ln888">		return fuseError;</a>
+<a name="ln889"> </a>
+<a name="ln890">	memset(info, 0, sizeof(*info));</a>
+<a name="ln891">	info-&gt;flags = B_FS_IS_PERSISTENT;	// assume the FS is persistent</a>
+<a name="ln892">	info-&gt;block_size = st.f_bsize;</a>
+<a name="ln893">	info-&gt;io_size = 64 * 1024;			// some value</a>
+<a name="ln894">	info-&gt;total_blocks = st.f_blocks;</a>
+<a name="ln895">	info-&gt;free_blocks = st.f_bfree;</a>
+<a name="ln896">	info-&gt;total_nodes = st.f_files;</a>
+<a name="ln897">	info-&gt;free_nodes = 100;				// st.f_favail is ignored by statfs()</a>
+<a name="ln898">	strlcpy(info-&gt;volume_name, fName, sizeof(info-&gt;volume_name));</a>
+<a name="ln899">		// no way to get the real name (if any)</a>
+<a name="ln900"> </a>
+<a name="ln901">	return B_OK;</a>
+<a name="ln902">}</a>
+<a name="ln903"> </a>
+<a name="ln904"> </a>
+<a name="ln905">// #pragma mark - vnodes</a>
+<a name="ln906"> </a>
+<a name="ln907"> </a>
+<a name="ln908">status_t</a>
+<a name="ln909">FUSEVolume::Lookup(void* _dir, const char* entryName, ino_t* vnid)</a>
+<a name="ln910">{</a>
+<a name="ln911">	FUSENode* dir = (FUSENode*)_dir;</a>
+<a name="ln912"> </a>
+<a name="ln913">	// lock the directory</a>
+<a name="ln914">	NodeReadLocker nodeLocker(this, dir, false);</a>
+<a name="ln915">	if (nodeLocker.Status() != B_OK)</a>
+<a name="ln916">		RETURN_ERROR(nodeLocker.Status());</a>
+<a name="ln917"> </a>
+<a name="ln918">	// look the node up</a>
+<a name="ln919">	FUSENode* node;</a>
+<a name="ln920">	status_t error = _GetNode(dir, entryName, &amp;node);</a>
+<a name="ln921">	if (error != B_OK)</a>
+<a name="ln922">		return error;</a>
+<a name="ln923"> </a>
+<a name="ln924">	*vnid = node-&gt;id;</a>
+<a name="ln925"> </a>
+<a name="ln926">	return B_OK;</a>
+<a name="ln927">}</a>
+<a name="ln928"> </a>
+<a name="ln929"> </a>
+<a name="ln930">status_t</a>
+<a name="ln931">FUSEVolume::GetVNodeName(void* _node, char* buffer, size_t bufferSize)</a>
+<a name="ln932">{</a>
+<a name="ln933">	FUSENode* node = (FUSENode*)_node;</a>
+<a name="ln934"> </a>
+<a name="ln935">	AutoLocker&lt;Locker&gt; _(fLock);</a>
+<a name="ln936"> </a>
+<a name="ln937">	// get one of the node's entries and return its name</a>
+<a name="ln938">	FUSEEntry* entry = node-&gt;entries.Head();</a>
+<a name="ln939">	if (entry == NULL)</a>
+<a name="ln940">		RETURN_ERROR(B_ENTRY_NOT_FOUND);</a>
+<a name="ln941"> </a>
+<a name="ln942">	if (strlcpy(buffer, entry-&gt;name, bufferSize) &gt;= bufferSize)</a>
+<a name="ln943">		RETURN_ERROR(B_NAME_TOO_LONG);</a>
+<a name="ln944"> </a>
+<a name="ln945">	return B_OK;</a>
+<a name="ln946">}</a>
+<a name="ln947"> </a>
+<a name="ln948"> </a>
+<a name="ln949">status_t</a>
+<a name="ln950">FUSEVolume::ReadVNode(ino_t vnid, bool reenter, void** _node, int* type,</a>
+<a name="ln951">	uint32* flags, FSVNodeCapabilities* _capabilities)</a>
+<a name="ln952">{</a>
+<a name="ln953">	AutoLocker&lt;Locker&gt; _(fLock);</a>
+<a name="ln954"> </a>
+<a name="ln955">	FUSENode* node = fNodes.Lookup(vnid);</a>
+<a name="ln956">	if (node == NULL)</a>
+<a name="ln957">		RETURN_ERROR(B_ENTRY_NOT_FOUND);</a>
+<a name="ln958"> </a>
+<a name="ln959">	node-&gt;refCount++;</a>
+<a name="ln960"> </a>
+<a name="ln961">	*_node = node;</a>
+<a name="ln962">	*type = node-&gt;type;</a>
+<a name="ln963">	*flags = 0;</a>
+<a name="ln964">	*_capabilities = _FileSystem()-&gt;GetNodeCapabilities();</a>
+<a name="ln965"> </a>
+<a name="ln966">	return B_OK;</a>
+<a name="ln967">}</a>
+<a name="ln968"> </a>
+<a name="ln969"> </a>
+<a name="ln970">status_t</a>
+<a name="ln971">FUSEVolume::WriteVNode(void* _node, bool reenter)</a>
+<a name="ln972">{</a>
+<a name="ln973">	FUSENode* node = (FUSENode*)_node;</a>
+<a name="ln974"> </a>
+<a name="ln975">	AutoLocker&lt;Locker&gt; _(fLock);</a>
+<a name="ln976"> </a>
+<a name="ln977">	_PutNode(node);</a>
+<a name="ln978"> </a>
+<a name="ln979">	return B_OK;</a>
+<a name="ln980">}</a>
+<a name="ln981"> </a>
+<a name="ln982"> </a>
+<a name="ln983">status_t</a>
+<a name="ln984">FUSEVolume::RemoveVNode(void* node, bool reenter)</a>
+<a name="ln985">{</a>
+<a name="ln986">	// TODO: Implement for real!</a>
+<a name="ln987">	return WriteVNode(node, reenter);</a>
+<a name="ln988">}</a>
+<a name="ln989"> </a>
+<a name="ln990"> </a>
+<a name="ln991">// #pragma mark - nodes</a>
+<a name="ln992"> </a>
+<a name="ln993"> </a>
+<a name="ln994">status_t</a>
+<a name="ln995">FUSEVolume::SetFlags(void* _node, void* _cookie, int flags)</a>
+<a name="ln996">{</a>
+<a name="ln997">	FileCookie* cookie = (FileCookie*)_cookie;</a>
+<a name="ln998"> </a>
+<a name="ln999">	RWLockableWriteLocker cookieLocker(this, cookie);</a>
+<a name="ln1000"> </a>
+<a name="ln1001">	const int settableFlags = O_APPEND | O_NONBLOCK | O_SYNC | O_RSYNC</a>
+<a name="ln1002">		| O_DSYNC | O_DIRECT;</a>
+<a name="ln1003"> </a>
+<a name="ln1004">	cookie-&gt;flags = (cookie-&gt;flags &amp; ~settableFlags) | (flags &amp; settableFlags);</a>
+<a name="ln1005"> </a>
+<a name="ln1006">	return B_OK;</a>
+<a name="ln1007">}</a>
+<a name="ln1008"> </a>
+<a name="ln1009"> </a>
+<a name="ln1010">status_t</a>
+<a name="ln1011">FUSEVolume::FSync(void* _node)</a>
+<a name="ln1012">{</a>
+<a name="ln1013">	FUSENode* node = (FUSENode*)_node;</a>
+<a name="ln1014"> </a>
+<a name="ln1015">	// lock the directory</a>
+<a name="ln1016">	NodeReadLocker nodeLocker(this, node, true);</a>
+<a name="ln1017">	if (nodeLocker.Status() != B_OK)</a>
+<a name="ln1018">		RETURN_ERROR(nodeLocker.Status());</a>
+<a name="ln1019"> </a>
+<a name="ln1020">	AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln1021"> </a>
+<a name="ln1022">	// get a path for the node</a>
+<a name="ln1023">	char path[B_PATH_NAME_LENGTH];</a>
+<a name="ln1024">	size_t pathLen;</a>
+<a name="ln1025">	status_t error = _BuildPath(node, path, pathLen);</a>
+<a name="ln1026">	if (error != B_OK)</a>
+<a name="ln1027">		RETURN_ERROR(error);</a>
+<a name="ln1028"> </a>
+<a name="ln1029">	// mark the node not dirty</a>
+<a name="ln1030">	bool dirty = node-&gt;dirty;</a>
+<a name="ln1031">	node-&gt;dirty = false;</a>
+<a name="ln1032"> </a>
+<a name="ln1033">	locker.Unlock();</a>
+<a name="ln1034"> </a>
+<a name="ln1035">	// open, sync, and close the node</a>
+<a name="ln1036">	FileCookie cookie(O_RDONLY);</a>
+<a name="ln1037">	int fuseError = fuse_fs_open(fFS, path, &amp;cookie);</a>
+<a name="ln1038">	if (fuseError == 0) {</a>
+<a name="ln1039">		fuseError = fuse_fs_fsync(fFS, path, 0, &amp;cookie);</a>
+<a name="ln1040">			// full sync, not only data</a>
+<a name="ln1041">		fuse_fs_flush(fFS, path, &amp;cookie);</a>
+<a name="ln1042">		fuse_fs_release(fFS, path, &amp;cookie);</a>
+<a name="ln1043">	}</a>
+<a name="ln1044"> </a>
+<a name="ln1045">	if (fuseError != 0) {</a>
+<a name="ln1046">		// sync'ing failed -- mark the node dirty again</a>
+<a name="ln1047">		locker.Lock();</a>
+<a name="ln1048">		node-&gt;dirty |= dirty;</a>
+<a name="ln1049">		RETURN_ERROR(fuseError);</a>
+<a name="ln1050">	}</a>
+<a name="ln1051"> </a>
+<a name="ln1052">	return B_OK;</a>
+<a name="ln1053">}</a>
+<a name="ln1054"> </a>
+<a name="ln1055"> </a>
+<a name="ln1056">status_t</a>
+<a name="ln1057">FUSEVolume::ReadSymlink(void* _node, char* buffer, size_t bufferSize,</a>
+<a name="ln1058">	size_t* _bytesRead)</a>
+<a name="ln1059">{</a>
+<a name="ln1060">	FUSENode* node = (FUSENode*)_node;</a>
+<a name="ln1061"> </a>
+<a name="ln1062">	// lock the directory</a>
+<a name="ln1063">	NodeReadLocker nodeLocker(this, node, true);</a>
+<a name="ln1064">	if (nodeLocker.Status() != B_OK)</a>
+<a name="ln1065">		RETURN_ERROR(nodeLocker.Status());</a>
+<a name="ln1066"> </a>
+<a name="ln1067">	AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln1068"> </a>
+<a name="ln1069">	// get a path for the node</a>
+<a name="ln1070">	char path[B_PATH_NAME_LENGTH];</a>
+<a name="ln1071">	size_t pathLen;</a>
+<a name="ln1072">	status_t error = _BuildPath(node, path, pathLen);</a>
+<a name="ln1073">	if (error != B_OK)</a>
+<a name="ln1074">		RETURN_ERROR(error);</a>
+<a name="ln1075"> </a>
+<a name="ln1076">	locker.Unlock();</a>
+<a name="ln1077"> </a>
+<a name="ln1078">	// read the symlink</a>
+<a name="ln1079">	int fuseError = fuse_fs_readlink(fFS, path, buffer, bufferSize);</a>
+<a name="ln1080">	if (fuseError != 0) {</a>
+<a name="ln1081">		*_bytesRead = 0;</a>
+<a name="ln1082">		return fuseError;</a>
+<a name="ln1083">	}</a>
+<a name="ln1084"> </a>
+<a name="ln1085">	// fuse_fs_readlink() is supposed to return a NULL-terminated string, which</a>
+<a name="ln1086">	// the Haiku interface doesn't require. We have to return the string length,</a>
+<a name="ln1087">	// though.</a>
+<a name="ln1088">	*_bytesRead = strnlen(buffer, bufferSize);</a>
+<a name="ln1089"> </a>
+<a name="ln1090">	return B_OK;</a>
+<a name="ln1091">}</a>
+<a name="ln1092"> </a>
+<a name="ln1093"> </a>
+<a name="ln1094">status_t</a>
+<a name="ln1095">FUSEVolume::CreateSymlink(void* _dir, const char* name, const char* target,</a>
+<a name="ln1096">	int mode)</a>
+<a name="ln1097">{</a>
+<a name="ln1098">	FUSENode* dir = (FUSENode*)_dir;</a>
+<a name="ln1099">	PRINT((&quot;FUSEVolume::CreateSymlink(%p (%&quot; B_PRId64 &quot;), \&quot;%s\&quot; -&gt; \&quot;%s\&quot;, &quot;</a>
+<a name="ln1100">		&quot;%#x)\n&quot;, dir, dir-&gt;id, name, target, mode));</a>
+<a name="ln1101"> </a>
+<a name="ln1102">	// lock the directory</a>
+<a name="ln1103">	NodeWriteLocker nodeLocker(this, dir, false);</a>
+<a name="ln1104">	if (nodeLocker.Status() != B_OK)</a>
+<a name="ln1105">		RETURN_ERROR(nodeLocker.Status());</a>
+<a name="ln1106"> </a>
+<a name="ln1107">	AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln1108"> </a>
+<a name="ln1109">	// get a path for the entry</a>
+<a name="ln1110">	char path[B_PATH_NAME_LENGTH];</a>
+<a name="ln1111">	size_t pathLen;</a>
+<a name="ln1112">	status_t error = _BuildPath(dir, name, path, pathLen);</a>
+<a name="ln1113">	if (error != B_OK)</a>
+<a name="ln1114">		RETURN_ERROR(error);</a>
+<a name="ln1115"> </a>
+<a name="ln1116">	locker.Unlock();</a>
+<a name="ln1117"> </a>
+<a name="ln1118">	// create the symlink</a>
+<a name="ln1119">	int fuseError = fuse_fs_symlink(fFS, target, path);</a>
+<a name="ln1120">	if (fuseError != 0)</a>
+<a name="ln1121">		RETURN_ERROR(fuseError);</a>
+<a name="ln1122"> </a>
+<a name="ln1123">	// TODO: Set the mode?!</a>
+<a name="ln1124"> </a>
+<a name="ln1125">	// mark the dir dirty</a>
+<a name="ln1126">	locker.Lock();</a>
+<a name="ln1127">	dir-&gt;dirty = true;</a>
+<a name="ln1128">	locker.Unlock();</a>
+<a name="ln1129"> </a>
+<a name="ln1130">	// send node monitoring message</a>
+<a name="ln1131">	ino_t nodeID;</a>
+<a name="ln1132">	if (_GetNodeID(dir, name, &amp;nodeID)) {</a>
+<a name="ln1133">		UserlandFS::KernelEmu::notify_listener(B_ENTRY_CREATED, 0, fID, 0,</a>
+<a name="ln1134">			dir-&gt;id, nodeID, NULL, name);</a>
+<a name="ln1135">	}</a>
+<a name="ln1136"> </a>
+<a name="ln1137">	return B_OK;</a>
+<a name="ln1138">}</a>
+<a name="ln1139"> </a>
+<a name="ln1140"> </a>
+<a name="ln1141">status_t</a>
+<a name="ln1142">FUSEVolume::Link(void* _dir, const char* name, void* _node)</a>
+<a name="ln1143">{</a>
+<a name="ln1144">	FUSENode* dir = (FUSENode*)_dir;</a>
+<a name="ln1145">	FUSENode* node = (FUSENode*)_node;</a>
+<a name="ln1146">	PRINT((&quot;FUSEVolume::Link(%p (%&quot; B_PRId64 &quot;), \&quot;%s\&quot; -&gt; %p (%&quot; B_PRId64</a>
+<a name="ln1147">		&quot;))\n&quot;, dir, dir-&gt;id, name, node, node-&gt;id));</a>
+<a name="ln1148"> </a>
+<a name="ln1149">	// lock the directories -- the target directory for writing, the node's</a>
+<a name="ln1150">	// parent for reading</a>
+<a name="ln1151">	MultiNodeLocker nodeLocker(this, dir, false, true, node, true, false);</a>
+<a name="ln1152">	if (nodeLocker.Status() != B_OK)</a>
+<a name="ln1153">		RETURN_ERROR(nodeLocker.Status());</a>
+<a name="ln1154"> </a>
+<a name="ln1155">	AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln1156"> </a>
+<a name="ln1157">	// get a path for the entries</a>
+<a name="ln1158">	char oldPath[B_PATH_NAME_LENGTH];</a>
+<a name="ln1159">	size_t oldPathLen;</a>
+<a name="ln1160">	status_t error = _BuildPath(node, oldPath, oldPathLen);</a>
+<a name="ln1161">	if (error != B_OK)</a>
+<a name="ln1162">		RETURN_ERROR(error);</a>
+<a name="ln1163"> </a>
+<a name="ln1164">	char newPath[B_PATH_NAME_LENGTH];</a>
+<a name="ln1165">	size_t newPathLen;</a>
+<a name="ln1166">	error = _BuildPath(dir, name, newPath, newPathLen);</a>
+<a name="ln1167">	if (error != B_OK)</a>
+<a name="ln1168">		RETURN_ERROR(error);</a>
+<a name="ln1169"> </a>
+<a name="ln1170">	locker.Unlock();</a>
+<a name="ln1171"> </a>
+<a name="ln1172">	// link</a>
+<a name="ln1173">	int fuseError = fuse_fs_link(fFS, oldPath, newPath);</a>
+<a name="ln1174">	if (fuseError != 0)</a>
+<a name="ln1175">		RETURN_ERROR(fuseError);</a>
+<a name="ln1176"> </a>
+<a name="ln1177">	// mark the dir and the node dirty</a>
+<a name="ln1178">	locker.Lock();</a>
+<a name="ln1179">	dir-&gt;dirty = true;</a>
+<a name="ln1180">	node-&gt;dirty = true;</a>
+<a name="ln1181">	locker.Unlock();</a>
+<a name="ln1182"> </a>
+<a name="ln1183">	// send node monitoring message</a>
+<a name="ln1184">	UserlandFS::KernelEmu::notify_listener(B_ENTRY_CREATED, 0, fID, 0, dir-&gt;id,</a>
+<a name="ln1185">		node-&gt;id, NULL, name);</a>
+<a name="ln1186"> </a>
+<a name="ln1187">	return B_OK;</a>
+<a name="ln1188">}</a>
+<a name="ln1189"> </a>
+<a name="ln1190"> </a>
+<a name="ln1191">status_t</a>
+<a name="ln1192">FUSEVolume::Unlink(void* _dir, const char* name)</a>
+<a name="ln1193">{</a>
+<a name="ln1194">	FUSENode* dir = (FUSENode*)_dir;</a>
+<a name="ln1195">	PRINT((&quot;FUSEVolume::Unlink(%p (%&quot; B_PRId64 &quot;), \&quot;%s\&quot;)\n&quot;, dir, dir-&gt;id,</a>
+<a name="ln1196">		name));</a>
+<a name="ln1197"> </a>
+<a name="ln1198">	// lock the directory</a>
+<a name="ln1199">	NodeWriteLocker nodeLocker(this, dir, false);</a>
+<a name="ln1200">	if (nodeLocker.Status() != B_OK)</a>
+<a name="ln1201">		RETURN_ERROR(nodeLocker.Status());</a>
+<a name="ln1202"> </a>
+<a name="ln1203">	// get the node ID (for the node monitoring message)</a>
+<a name="ln1204">	ino_t nodeID;</a>
+<a name="ln1205">	bool doNodeMonitoring = _GetNodeID(dir, name, &amp;nodeID);</a>
+<a name="ln1206"> </a>
+<a name="ln1207">	AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln1208"> </a>
+<a name="ln1209">	// get a path for the entry</a>
+<a name="ln1210">	char path[B_PATH_NAME_LENGTH];</a>
+<a name="ln1211">	size_t pathLen;</a>
+<a name="ln1212">	status_t error = _BuildPath(dir, name, path, pathLen);</a>
+<a name="ln1213">	if (error != B_OK)</a>
+<a name="ln1214">		RETURN_ERROR(error);</a>
+<a name="ln1215"> </a>
+<a name="ln1216">	locker.Unlock();</a>
+<a name="ln1217"> </a>
+<a name="ln1218">	// unlink</a>
+<a name="ln1219">	int fuseError = fuse_fs_unlink(fFS, path);</a>
+<a name="ln1220">	if (fuseError != 0)</a>
+<a name="ln1221">		RETURN_ERROR(fuseError);</a>
+<a name="ln1222"> </a>
+<a name="ln1223">	// remove the entry</a>
+<a name="ln1224">	locker.Lock();</a>
+<a name="ln1225">	_RemoveEntry(dir, name);</a>
+<a name="ln1226"> </a>
+<a name="ln1227">	// mark the dir dirty</a>
+<a name="ln1228">	dir-&gt;dirty = true;</a>
+<a name="ln1229">	locker.Unlock();</a>
+<a name="ln1230"> </a>
+<a name="ln1231">	// send node monitoring message</a>
+<a name="ln1232">	if (doNodeMonitoring) {</a>
+<a name="ln1233">		UserlandFS::KernelEmu::notify_listener(B_ENTRY_REMOVED, 0, fID, 0,</a>
+<a name="ln1234">			dir-&gt;id, nodeID, NULL, name);</a>
+<a name="ln1235">	}</a>
+<a name="ln1236"> </a>
+<a name="ln1237">	return B_OK;</a>
+<a name="ln1238">}</a>
+<a name="ln1239"> </a>
+<a name="ln1240"> </a>
+<a name="ln1241">status_t</a>
+<a name="ln1242">FUSEVolume::Rename(void* _oldDir, const char* oldName, void* _newDir,</a>
+<a name="ln1243">	const char* newName)</a>
+<a name="ln1244">{</a>
+<a name="ln1245">	FUSENode* oldDir = (FUSENode*)_oldDir;</a>
+<a name="ln1246">	FUSENode* newDir = (FUSENode*)_newDir;</a>
+<a name="ln1247">	PRINT((&quot;FUSEVolume::Rename(%p (%&quot; B_PRId64 &quot;), \&quot;%s\&quot;, %p (%&quot; B_PRId64</a>
+<a name="ln1248">		&quot;), \&quot;%s\&quot;)\n&quot;, oldDir, oldDir-&gt;id, oldName, newDir, newDir-&gt;id,</a>
+<a name="ln1249">		newName));</a>
+<a name="ln1250"> </a>
+<a name="ln1251">	// lock the directories</a>
+<a name="ln1252">	MultiNodeLocker nodeLocker(this, oldDir, false, true, newDir, false, true);</a>
+<a name="ln1253">	if (nodeLocker.Status() != B_OK)</a>
+<a name="ln1254">		RETURN_ERROR(nodeLocker.Status());</a>
+<a name="ln1255"> </a>
+<a name="ln1256">	AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln1257"> </a>
+<a name="ln1258">	// get a path for the entries</a>
+<a name="ln1259">	char oldPath[B_PATH_NAME_LENGTH];</a>
+<a name="ln1260">	size_t oldPathLen;</a>
+<a name="ln1261">	status_t error = _BuildPath(oldDir, oldName, oldPath, oldPathLen);</a>
+<a name="ln1262">	if (error != B_OK)</a>
+<a name="ln1263">		RETURN_ERROR(error);</a>
+<a name="ln1264"> </a>
+<a name="ln1265">	char newPath[B_PATH_NAME_LENGTH];</a>
+<a name="ln1266">	size_t newPathLen;</a>
+<a name="ln1267">	error = _BuildPath(newDir, newName, newPath, newPathLen);</a>
+<a name="ln1268">	if (error != B_OK)</a>
+<a name="ln1269">		RETURN_ERROR(error);</a>
+<a name="ln1270"> </a>
+<a name="ln1271">	locker.Unlock();</a>
+<a name="ln1272"> </a>
+<a name="ln1273">	// rename</a>
+<a name="ln1274">	int fuseError = fuse_fs_rename(fFS, oldPath, newPath);</a>
+<a name="ln1275">	if (fuseError != 0)</a>
+<a name="ln1276">		RETURN_ERROR(fuseError);</a>
+<a name="ln1277"> </a>
+<a name="ln1278">	// rename the entry</a>
+<a name="ln1279">	locker.Lock();</a>
+<a name="ln1280">	_RenameEntry(oldDir, oldName, newDir, newName);</a>
+<a name="ln1281"> </a>
+<a name="ln1282">	// mark the dirs dirty</a>
+<a name="ln1283">	oldDir-&gt;dirty = true;</a>
+<a name="ln1284">	newDir-&gt;dirty = true;</a>
+<a name="ln1285"> </a>
+<a name="ln1286">	// send node monitoring message</a>
+<a name="ln1287">	ino_t nodeID;</a>
+<a name="ln1288">	if (_GetNodeID(newDir, newName, &amp;nodeID)) {</a>
+<a name="ln1289">		UserlandFS::KernelEmu::notify_listener(B_ENTRY_MOVED, 0, fID,</a>
+<a name="ln1290">			oldDir-&gt;id, newDir-&gt;id, nodeID, oldName, newName);</a>
+<a name="ln1291">	}</a>
+<a name="ln1292"> </a>
+<a name="ln1293">	return B_OK;</a>
+<a name="ln1294">}</a>
+<a name="ln1295"> </a>
+<a name="ln1296"> </a>
+<a name="ln1297">status_t</a>
+<a name="ln1298">FUSEVolume::Access(void* _node, int mode)</a>
+<a name="ln1299">{</a>
+<a name="ln1300">	FUSENode* node = (FUSENode*)_node;</a>
+<a name="ln1301"> </a>
+<a name="ln1302">	// lock the directory</a>
+<a name="ln1303">	NodeReadLocker nodeLocker(this, node, true);</a>
+<a name="ln1304">	if (nodeLocker.Status() != B_OK)</a>
+<a name="ln1305">		RETURN_ERROR(nodeLocker.Status());</a>
+<a name="ln1306"> </a>
+<a name="ln1307">	AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln1308"> </a>
+<a name="ln1309">	// get a path for the node</a>
+<a name="ln1310">	char path[B_PATH_NAME_LENGTH];</a>
+<a name="ln1311">	size_t pathLen;</a>
+<a name="ln1312">	status_t error = _BuildPath(node, path, pathLen);</a>
+<a name="ln1313">	if (error != B_OK)</a>
+<a name="ln1314">		RETURN_ERROR(error);</a>
+<a name="ln1315"> </a>
+<a name="ln1316">	locker.Unlock();</a>
+<a name="ln1317"> </a>
+<a name="ln1318">	// call the access hook on the path</a>
+<a name="ln1319">	int fuseError = fuse_fs_access(fFS, path, mode);</a>
+<a name="ln1320">	if (fuseError != 0)</a>
+<a name="ln1321">		return fuseError;</a>
+<a name="ln1322"> </a>
+<a name="ln1323">	return B_OK;</a>
+<a name="ln1324">}</a>
+<a name="ln1325"> </a>
+<a name="ln1326"> </a>
+<a name="ln1327">status_t</a>
+<a name="ln1328">FUSEVolume::ReadStat(void* _node, struct stat* st)</a>
+<a name="ln1329">{</a>
+<a name="ln1330">	FUSENode* node = (FUSENode*)_node;</a>
+<a name="ln1331">	PRINT((&quot;FUSEVolume::ReadStat(%p (%&quot; B_PRId64 &quot;), %p)\n&quot;, node, node-&gt;id,</a>
+<a name="ln1332">		st));</a>
+<a name="ln1333"> </a>
+<a name="ln1334">	// lock the directory</a>
+<a name="ln1335">	NodeReadLocker nodeLocker(this, node, true);</a>
+<a name="ln1336">	if (nodeLocker.Status() != B_OK)</a>
+<a name="ln1337">		RETURN_ERROR(nodeLocker.Status());</a>
+<a name="ln1338"> </a>
+<a name="ln1339">	AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln1340"> </a>
+<a name="ln1341">	// get a path for the node</a>
+<a name="ln1342">	char path[B_PATH_NAME_LENGTH];</a>
+<a name="ln1343">	size_t pathLen;</a>
+<a name="ln1344">	status_t error = _BuildPath(node, path, pathLen);</a>
+<a name="ln1345">	if (error != B_OK)</a>
+<a name="ln1346">		RETURN_ERROR(error);</a>
+<a name="ln1347"> </a>
+<a name="ln1348">	locker.Unlock();</a>
+<a name="ln1349"> </a>
+<a name="ln1350">	st-&gt;st_dev = GetID();</a>
+<a name="ln1351">	st-&gt;st_ino = node-&gt;id;</a>
+<a name="ln1352">	st-&gt;st_blksize = 2048;</a>
+<a name="ln1353">	st-&gt;st_type = 0;</a>
+<a name="ln1354"> </a>
+<a name="ln1355">	// stat the path</a>
+<a name="ln1356">	int fuseError = fuse_fs_getattr(fFS, path, st);</a>
+<a name="ln1357">	if (fuseError != 0)</a>
+<a name="ln1358">		return fuseError;</a>
+<a name="ln1359"> </a>
+<a name="ln1360">	return B_OK;</a>
+<a name="ln1361">}</a>
+<a name="ln1362"> </a>
+<a name="ln1363"> </a>
+<a name="ln1364">status_t</a>
+<a name="ln1365">FUSEVolume::WriteStat(void* _node, const struct stat* st, uint32 mask)</a>
+<a name="ln1366">{</a>
+<a name="ln1367">	FUSENode* node = (FUSENode*)_node;</a>
+<a name="ln1368">	PRINT((&quot;FUSEVolume::WriteStat(%p (%&quot; B_PRId64 &quot;), %p, %#&quot; B_PRIx32 &quot;)\n&quot;,</a>
+<a name="ln1369">		node, node-&gt;id, st, mask));</a>
+<a name="ln1370"> </a>
+<a name="ln1371">	// lock the directory</a>
+<a name="ln1372">	NodeReadLocker nodeLocker(this, node, true);</a>
+<a name="ln1373">	if (nodeLocker.Status() != B_OK)</a>
+<a name="ln1374">		RETURN_ERROR(nodeLocker.Status());</a>
+<a name="ln1375"> </a>
+<a name="ln1376">	AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln1377"> </a>
+<a name="ln1378">	// get a path for the node</a>
+<a name="ln1379">	char path[B_PATH_NAME_LENGTH];</a>
+<a name="ln1380">	size_t pathLen;</a>
+<a name="ln1381">	status_t error = _BuildPath(node, path, pathLen);</a>
+<a name="ln1382">	if (error != B_OK)</a>
+<a name="ln1383">		RETURN_ERROR(error);</a>
+<a name="ln1384"> </a>
+<a name="ln1385">	locker.Unlock();</a>
+<a name="ln1386"> </a>
+<a name="ln1387">	// permissions</a>
+<a name="ln1388">	if ((mask &amp; B_STAT_MODE) != 0) {</a>
+<a name="ln1389">		int fuseError = fuse_fs_chmod(fFS, path, st-&gt;st_mode);</a>
+<a name="ln1390">		if (fuseError != 0)</a>
+<a name="ln1391">			RETURN_ERROR(fuseError);</a>
+<a name="ln1392">	}</a>
+<a name="ln1393"> </a>
+<a name="ln1394">	// owner</a>
+<a name="ln1395">	if ((mask &amp; (B_STAT_UID | B_STAT_GID)) != 0) {</a>
+<a name="ln1396">		uid_t uid = (mask &amp; B_STAT_UID) != 0 ? st-&gt;st_uid : (uid_t)-1;</a>
+<a name="ln1397">		gid_t gid = (mask &amp; B_STAT_GID) != 0 ? st-&gt;st_gid : (gid_t)-1;</a>
+<a name="ln1398">		int fuseError = fuse_fs_chown(fFS, path, uid, gid);</a>
+<a name="ln1399">		if (fuseError != 0)</a>
+<a name="ln1400">			RETURN_ERROR(fuseError);</a>
+<a name="ln1401">	}</a>
+<a name="ln1402"> </a>
+<a name="ln1403">	// size</a>
+<a name="ln1404">	if ((mask &amp; B_STAT_SIZE) != 0) {</a>
+<a name="ln1405">		// truncate</a>
+<a name="ln1406">		int fuseError = fuse_fs_truncate(fFS, path, st-&gt;st_size);</a>
+<a name="ln1407">		if (fuseError != 0)</a>
+<a name="ln1408">			RETURN_ERROR(fuseError);</a>
+<a name="ln1409">	}</a>
+<a name="ln1410"> </a>
+<a name="ln1411">	// access/modification time</a>
+<a name="ln1412">	if ((mask &amp; (B_STAT_ACCESS_TIME | B_STAT_MODIFICATION_TIME)) != 0) {</a>
+<a name="ln1413">		timespec tv[2] = {</a>
+<a name="ln1414">			{st-&gt;st_atime, 0},</a>
+<a name="ln1415">			{st-&gt;st_mtime, 0}</a>
+<a name="ln1416">		};</a>
+<a name="ln1417"> </a>
+<a name="ln1418">		// If either time is not specified, we need to stat the file to get the</a>
+<a name="ln1419">		// current value.</a>
+<a name="ln1420">		if ((mask &amp; (B_STAT_ACCESS_TIME | B_STAT_MODIFICATION_TIME))</a>
+<a name="ln1421">				!= (B_STAT_ACCESS_TIME | B_STAT_MODIFICATION_TIME)) {</a>
+<a name="ln1422">			struct stat currentStat;</a>
+<a name="ln1423">			int fuseError = fuse_fs_getattr(fFS, path, &amp;currentStat);</a>
+<a name="ln1424">			if (fuseError != 0)</a>
+<a name="ln1425">				RETURN_ERROR(fuseError);</a>
+<a name="ln1426"> </a>
+<a name="ln1427">			if ((mask &amp; B_STAT_ACCESS_TIME) == 0)</a>
+<a name="ln1428">				tv[0].tv_sec = currentStat.st_atime;</a>
+<a name="ln1429">			else</a>
+<a name="ln1430">				tv[1].tv_sec = currentStat.st_mtime;</a>
+<a name="ln1431">		}</a>
+<a name="ln1432"> </a>
+<a name="ln1433">		int fuseError = fuse_fs_utimens(fFS, path, tv);</a>
+<a name="ln1434">		if (fuseError != 0)</a>
+<a name="ln1435">			RETURN_ERROR(fuseError);</a>
+<a name="ln1436">	}</a>
+<a name="ln1437"> </a>
+<a name="ln1438">	// mark the node dirty</a>
+<a name="ln1439">	locker.Lock();</a>
+<a name="ln1440">	node-&gt;dirty = true;</a>
+<a name="ln1441"> </a>
+<a name="ln1442">	// send node monitoring message</a>
+<a name="ln1443">	uint32 changedFields = mask &amp;</a>
+<a name="ln1444">		(B_STAT_MODE | B_STAT_UID | B_STAT_GID | B_STAT_SIZE</a>
+<a name="ln1445">		| B_STAT_ACCESS_TIME | B_STAT_MODIFICATION_TIME);</a>
+<a name="ln1446"> </a>
+<a name="ln1447">	if (changedFields != 0) {</a>
+<a name="ln1448">		UserlandFS::KernelEmu::notify_listener(B_STAT_CHANGED, changedFields,</a>
+<a name="ln1449">			fID, 0, 0, node-&gt;id, NULL, NULL);</a>
+<a name="ln1450">	}</a>
+<a name="ln1451"> </a>
+<a name="ln1452">	return B_OK;</a>
+<a name="ln1453">}</a>
+<a name="ln1454"> </a>
+<a name="ln1455"> </a>
+<a name="ln1456">// #pragma mark - files</a>
+<a name="ln1457"> </a>
+<a name="ln1458"> </a>
+<a name="ln1459">status_t</a>
+<a name="ln1460">FUSEVolume::Create(void* _dir, const char* name, int openMode, int mode,</a>
+<a name="ln1461">	void** _cookie, ino_t* _vnid)</a>
+<a name="ln1462">{</a>
+<a name="ln1463">	FUSENode* dir = (FUSENode*)_dir;</a>
+<a name="ln1464">	PRINT((&quot;FUSEVolume::Create(%p (%&quot; B_PRId64 &quot;), \&quot;%s\&quot;, %#x, %#x)\n&quot;, dir,</a>
+<a name="ln1465">		dir-&gt;id, name, openMode, mode));</a>
+<a name="ln1466"> </a>
+<a name="ln1467">	// lock the directory</a>
+<a name="ln1468">	NodeWriteLocker nodeLocker(this, dir, false);</a>
+<a name="ln1469">	if (nodeLocker.Status() != B_OK)</a>
+<a name="ln1470">		RETURN_ERROR(nodeLocker.Status());</a>
+<a name="ln1471"> </a>
+<a name="ln1472">	// allocate a file cookie</a>
+<a name="ln1473">	FileCookie* cookie = new(std::nothrow) FileCookie(openMode);</a>
+<a name="ln1474">	if (cookie == NULL)</a>
+<a name="ln1475">		RETURN_ERROR(B_NO_MEMORY);</a>
+<a name="ln1476">	ObjectDeleter&lt;FileCookie&gt; cookieDeleter(cookie);</a>
+<a name="ln1477"> </a>
+<a name="ln1478">	AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln1479"> </a>
+<a name="ln1480">	// get a path for the node</a>
+<a name="ln1481">	char path[B_PATH_NAME_LENGTH];</a>
+<a name="ln1482">	size_t pathLen;</a>
+<a name="ln1483">	status_t error = _BuildPath(dir, name, path, pathLen);</a>
+<a name="ln1484">	if (error != B_OK)</a>
+<a name="ln1485">		RETURN_ERROR(error);</a>
+<a name="ln1486"> </a>
+<a name="ln1487">	locker.Unlock();</a>
+<a name="ln1488"> </a>
+<a name="ln1489">	// create the file</a>
+<a name="ln1490">	int fuseError = fuse_fs_create(fFS, path, mode, cookie);</a>
+<a name="ln1491">	if (fuseError != 0)</a>
+<a name="ln1492">		RETURN_ERROR(fuseError);</a>
+<a name="ln1493"> </a>
+<a name="ln1494">	// get the node</a>
+<a name="ln1495">	FUSENode* node;</a>
+<a name="ln1496">	error = _GetNode(dir, name, &amp;node);</a>
+<a name="ln1497">	if (error != B_OK) {</a>
+<a name="ln1498">		// This is bad. We've create the file successfully, but couldn't get</a>
+<a name="ln1499">		// the node. Close the file and delete the entry.</a>
+<a name="ln1500">		fuse_fs_flush(fFS, path, cookie);</a>
+<a name="ln1501">		fuse_fs_release(fFS, path, cookie);</a>
+<a name="ln1502">		fuse_fs_unlink(fFS, path);</a>
+<a name="ln1503">		RETURN_ERROR(error);</a>
+<a name="ln1504">	}</a>
+<a name="ln1505"> </a>
+<a name="ln1506">	// mark the dir and the node dirty</a>
+<a name="ln1507">	locker.Lock();</a>
+<a name="ln1508">	dir-&gt;dirty = true;</a>
+<a name="ln1509">	node-&gt;dirty = true;</a>
+<a name="ln1510">	locker.Unlock();</a>
+<a name="ln1511"> </a>
+<a name="ln1512">	// send node monitoring message</a>
+<a name="ln1513">	UserlandFS::KernelEmu::notify_listener(B_ENTRY_CREATED, 0, fID, 0, dir-&gt;id,</a>
+<a name="ln1514">		node-&gt;id, NULL, name);</a>
+<a name="ln1515"> </a>
+<a name="ln1516">	cookieDeleter.Detach();</a>
+<a name="ln1517">	*_cookie = cookie;</a>
+<a name="ln1518">	*_vnid = node-&gt;id;</a>
+<a name="ln1519"> </a>
+<a name="ln1520">	return B_OK;</a>
+<a name="ln1521">}</a>
+<a name="ln1522"> </a>
+<a name="ln1523"> </a>
+<a name="ln1524">status_t</a>
+<a name="ln1525">FUSEVolume::Open(void* _node, int openMode, void** _cookie)</a>
+<a name="ln1526">{</a>
+<a name="ln1527">	FUSENode* node = (FUSENode*)_node;</a>
+<a name="ln1528">	PRINT((&quot;FUSEVolume::Open(%p (%&quot; B_PRId64 &quot;), %#x)\n&quot;, node, node-&gt;id,</a>
+<a name="ln1529">		openMode));</a>
+<a name="ln1530"> </a>
+<a name="ln1531">	// lock the directory</a>
+<a name="ln1532">	NodeReadLocker nodeLocker(this, node, true);</a>
+<a name="ln1533">	if (nodeLocker.Status() != B_OK)</a>
+<a name="ln1534">		RETURN_ERROR(nodeLocker.Status());</a>
+<a name="ln1535"> </a>
+<a name="ln1536">	bool truncate = (openMode &amp; O_TRUNC) != 0;</a>
+<a name="ln1537">	openMode &amp;= ~O_TRUNC;</a>
+<a name="ln1538"> </a>
+<a name="ln1539">	// allocate a file cookie</a>
+<a name="ln1540">	FileCookie* cookie = new(std::nothrow) FileCookie(openMode);</a>
+<a name="ln1541">	if (cookie == NULL)</a>
+<a name="ln1542">		RETURN_ERROR(B_NO_MEMORY);</a>
+<a name="ln1543">	ObjectDeleter&lt;FileCookie&gt; cookieDeleter(cookie);</a>
+<a name="ln1544"> </a>
+<a name="ln1545">	AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln1546"> </a>
+<a name="ln1547">	// get a path for the node</a>
+<a name="ln1548">	char path[B_PATH_NAME_LENGTH];</a>
+<a name="ln1549">	size_t pathLen;</a>
+<a name="ln1550">	status_t error = _BuildPath(node, path, pathLen);</a>
+<a name="ln1551">	if (error != B_OK)</a>
+<a name="ln1552">		RETURN_ERROR(error);</a>
+<a name="ln1553"> </a>
+<a name="ln1554">	locker.Unlock();</a>
+<a name="ln1555"> </a>
+<a name="ln1556">	// open the file</a>
+<a name="ln1557">	int fuseError = fuse_fs_open(fFS, path, cookie);</a>
+<a name="ln1558">	if (fuseError != 0)</a>
+<a name="ln1559">		RETURN_ERROR(fuseError);</a>
+<a name="ln1560"> </a>
+<a name="ln1561">	// truncate the file, if requested</a>
+<a name="ln1562">	if (truncate) {</a>
+<a name="ln1563">		fuseError = fuse_fs_ftruncate(fFS, path, 0, cookie);</a>
+<a name="ln1564">		if (fuseError == ENOSYS) {</a>
+<a name="ln1565">			// Fallback to truncate if ftruncate is not implemented</a>
+<a name="ln1566">			fuseError = fuse_fs_truncate(fFS, path, 0);</a>
+<a name="ln1567">		}</a>
+<a name="ln1568">		if (fuseError != 0) {</a>
+<a name="ln1569">			fuse_fs_flush(fFS, path, cookie);</a>
+<a name="ln1570">			fuse_fs_release(fFS, path, cookie);</a>
+<a name="ln1571">			RETURN_ERROR(fuseError);</a>
+<a name="ln1572">		}</a>
+<a name="ln1573"> </a>
+<a name="ln1574">		// mark the node dirty</a>
+<a name="ln1575">		locker.Lock();</a>
+<a name="ln1576">		node-&gt;dirty = true;</a>
+<a name="ln1577"> </a>
+<a name="ln1578">		// send node monitoring message</a>
+<a name="ln1579">		UserlandFS::KernelEmu::notify_listener(B_STAT_CHANGED,</a>
+<a name="ln1580">			B_STAT_SIZE | B_STAT_MODIFICATION_TIME, fID, 0, 0, node-&gt;id, NULL,</a>
+<a name="ln1581">			NULL);</a>
+<a name="ln1582">	}</a>
+<a name="ln1583"> </a>
+<a name="ln1584">	cookieDeleter.Detach();</a>
+<a name="ln1585">	*_cookie = cookie;</a>
+<a name="ln1586"> </a>
+<a name="ln1587">	return B_OK;</a>
+<a name="ln1588">}</a>
+<a name="ln1589"> </a>
+<a name="ln1590"> </a>
+<a name="ln1591">status_t</a>
+<a name="ln1592">FUSEVolume::Close(void* _node, void* _cookie)</a>
+<a name="ln1593">{</a>
+<a name="ln1594">	FUSENode* node = (FUSENode*)_node;</a>
+<a name="ln1595">	FileCookie* cookie = (FileCookie*)_cookie;</a>
+<a name="ln1596"> </a>
+<a name="ln1597">	RWLockableReadLocker cookieLocker(this, cookie);</a>
+<a name="ln1598"> </a>
+<a name="ln1599">	// lock the directory</a>
+<a name="ln1600">	NodeReadLocker nodeLocker(this, node, true);</a>
+<a name="ln1601">	if (nodeLocker.Status() != B_OK)</a>
+<a name="ln1602">		RETURN_ERROR(nodeLocker.Status());</a>
+<a name="ln1603"> </a>
+<a name="ln1604">	AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln1605"> </a>
+<a name="ln1606">	// get a path for the node</a>
+<a name="ln1607">	char path[B_PATH_NAME_LENGTH];</a>
+<a name="ln1608">	size_t pathLen;</a>
+<a name="ln1609">	status_t error = _BuildPath(node, path, pathLen);</a>
+<a name="ln1610">	if (error != B_OK)</a>
+<a name="ln1611">		RETURN_ERROR(error);</a>
+<a name="ln1612"> </a>
+<a name="ln1613">	locker.Unlock();</a>
+<a name="ln1614"> </a>
+<a name="ln1615">	// flush the file</a>
+<a name="ln1616">	int fuseError = fuse_fs_flush(fFS, path, cookie);</a>
+<a name="ln1617">	if (fuseError != 0)</a>
+<a name="ln1618">		return fuseError;</a>
+<a name="ln1619"> </a>
+<a name="ln1620">	return B_OK;</a>
+<a name="ln1621">}</a>
+<a name="ln1622"> </a>
+<a name="ln1623"> </a>
+<a name="ln1624">status_t</a>
+<a name="ln1625">FUSEVolume::FreeCookie(void* _node, void* _cookie)</a>
+<a name="ln1626">{</a>
+<a name="ln1627">	FUSENode* node = (FUSENode*)_node;</a>
+<a name="ln1628">	FileCookie* cookie = (FileCookie*)_cookie;</a>
+<a name="ln1629"> </a>
+<a name="ln1630">	// no need to lock the cookie here, as no-one else uses it anymore</a>
+<a name="ln1631"> </a>
+<a name="ln1632">	// lock the directory</a>
+<a name="ln1633">	NodeReadLocker nodeLocker(this, node, true);</a>
+<a name="ln1634">	if (nodeLocker.Status() != B_OK)</a>
+<a name="ln1635">		RETURN_ERROR(nodeLocker.Status());</a>
+<a name="ln1636"> </a>
+<a name="ln1637">	ObjectDeleter&lt;FileCookie&gt; cookieDeleter(cookie);</a>
+<a name="ln1638"> </a>
+<a name="ln1639">	AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln1640"> </a>
+<a name="ln1641">	// get a path for the node</a>
+<a name="ln1642">	char path[B_PATH_NAME_LENGTH];</a>
+<a name="ln1643">	size_t pathLen;</a>
+<a name="ln1644">	status_t error = _BuildPath(node, path, pathLen);</a>
+<a name="ln1645">	if (error != B_OK)</a>
+<a name="ln1646">		RETURN_ERROR(error);</a>
+<a name="ln1647"> </a>
+<a name="ln1648">	locker.Unlock();</a>
+<a name="ln1649"> </a>
+<a name="ln1650">	// release the file</a>
+<a name="ln1651">	int fuseError = fuse_fs_release(fFS, path, cookie);</a>
+<a name="ln1652">	if (fuseError != 0)</a>
+<a name="ln1653">		return fuseError;</a>
+<a name="ln1654"> </a>
+<a name="ln1655">	return B_OK;</a>
+<a name="ln1656">}</a>
+<a name="ln1657"> </a>
+<a name="ln1658"> </a>
+<a name="ln1659">status_t</a>
+<a name="ln1660">FUSEVolume::Read(void* _node, void* _cookie, off_t pos, void* buffer,</a>
+<a name="ln1661">	size_t bufferSize, size_t* _bytesRead)</a>
+<a name="ln1662">{</a>
+<a name="ln1663">	FUSENode* node = (FUSENode*)_node;</a>
+<a name="ln1664">	FileCookie* cookie = (FileCookie*)_cookie;</a>
+<a name="ln1665"> </a>
+<a name="ln1666">	RWLockableReadLocker cookieLocker(this, cookie);</a>
+<a name="ln1667"> </a>
+<a name="ln1668">	*_bytesRead = 0;</a>
+<a name="ln1669"> </a>
+<a name="ln1670">	// lock the directory</a>
+<a name="ln1671">	NodeReadLocker nodeLocker(this, node, true);</a>
+<a name="ln1672">	if (nodeLocker.Status() != B_OK)</a>
+<a name="ln1673">		RETURN_ERROR(nodeLocker.Status());</a>
+<a name="ln1674"> </a>
+<a name="ln1675">	AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln1676"> </a>
+<a name="ln1677">	// get a path for the node</a>
+<a name="ln1678">	char path[B_PATH_NAME_LENGTH];</a>
+<a name="ln1679">	size_t pathLen;</a>
+<a name="ln1680">	status_t error = _BuildPath(node, path, pathLen);</a>
+<a name="ln1681">	if (error != B_OK)</a>
+<a name="ln1682">		RETURN_ERROR(error);</a>
+<a name="ln1683"> </a>
+<a name="ln1684">	locker.Unlock();</a>
+<a name="ln1685"> </a>
+<a name="ln1686">	// read the file</a>
+<a name="ln1687">	int bytesRead = fuse_fs_read(fFS, path, (char*)buffer, bufferSize, pos,</a>
+<a name="ln1688">		cookie);</a>
+<a name="ln1689">	if (bytesRead &lt; 0)</a>
+<a name="ln1690">		return bytesRead;</a>
+<a name="ln1691"> </a>
+<a name="ln1692">	*_bytesRead = bytesRead;</a>
+<a name="ln1693">	return B_OK;</a>
+<a name="ln1694">}</a>
+<a name="ln1695"> </a>
+<a name="ln1696"> </a>
+<a name="ln1697">status_t</a>
+<a name="ln1698">FUSEVolume::Write(void* _node, void* _cookie, off_t pos, const void* buffer,</a>
+<a name="ln1699">	size_t bufferSize, size_t* _bytesWritten)</a>
+<a name="ln1700">{</a>
+<a name="ln1701">	FUSENode* node = (FUSENode*)_node;</a>
+<a name="ln1702">	FileCookie* cookie = (FileCookie*)_cookie;</a>
+<a name="ln1703"> </a>
+<a name="ln1704">	RWLockableReadLocker cookieLocker(this, cookie);</a>
+<a name="ln1705"> </a>
+<a name="ln1706">	*_bytesWritten = 0;</a>
+<a name="ln1707"> </a>
+<a name="ln1708">	// lock the directory</a>
+<a name="ln1709">	NodeReadLocker nodeLocker(this, node, true);</a>
+<a name="ln1710">	if (nodeLocker.Status() != B_OK)</a>
+<a name="ln1711">		RETURN_ERROR(nodeLocker.Status());</a>
+<a name="ln1712"> </a>
+<a name="ln1713">	AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln1714"> </a>
+<a name="ln1715">	// get a path for the node</a>
+<a name="ln1716">	char path[B_PATH_NAME_LENGTH];</a>
+<a name="ln1717">	size_t pathLen;</a>
+<a name="ln1718">	status_t error = _BuildPath(node, path, pathLen);</a>
+<a name="ln1719">	if (error != B_OK)</a>
+<a name="ln1720">		RETURN_ERROR(error);</a>
+<a name="ln1721"> </a>
+<a name="ln1722">	locker.Unlock();</a>
+<a name="ln1723"> </a>
+<a name="ln1724">	// write the file</a>
+<a name="ln1725">	int bytesWritten = fuse_fs_write(fFS, path, (const char*)buffer, bufferSize,</a>
+<a name="ln1726">		pos, cookie);</a>
+<a name="ln1727">	if (bytesWritten &lt; 0)</a>
+<a name="ln1728">		return bytesWritten;</a>
+<a name="ln1729"> </a>
+<a name="ln1730">	// mark the node dirty</a>
+<a name="ln1731">	locker.Lock();</a>
+<a name="ln1732">	node-&gt;dirty = true;</a>
+<a name="ln1733"> </a>
+<a name="ln1734">	// send node monitoring message</a>
+<a name="ln1735">	UserlandFS::KernelEmu::notify_listener(B_STAT_CHANGED,</a>
+<a name="ln1736">		B_STAT_SIZE | B_STAT_MODIFICATION_TIME, fID, 0, 0, node-&gt;id, NULL,</a>
+<a name="ln1737">		NULL);</a>
+<a name="ln1738">		// TODO: The size possibly doesn't change.</a>
+<a name="ln1739">		// TODO: Avoid message flooding -- use a timeout and set the</a>
+<a name="ln1740">		// B_STAT_INTERIM_UPDATE flag.</a>
+<a name="ln1741"> </a>
+<a name="ln1742">	*_bytesWritten = bytesWritten;</a>
+<a name="ln1743">	return B_OK;</a>
+<a name="ln1744">}</a>
+<a name="ln1745"> </a>
+<a name="ln1746"> </a>
+<a name="ln1747">// #pragma mark - directories</a>
+<a name="ln1748"> </a>
+<a name="ln1749"> </a>
+<a name="ln1750">status_t</a>
+<a name="ln1751">FUSEVolume::CreateDir(void* _dir, const char* name, int mode)</a>
+<a name="ln1752">{</a>
+<a name="ln1753">	FUSENode* dir = (FUSENode*)_dir;</a>
+<a name="ln1754">	PRINT((&quot;FUSEVolume::CreateDir(%p (%&quot; B_PRId64 &quot;), \&quot;%s\&quot;, %#x)\n&quot;, dir,</a>
+<a name="ln1755">		dir-&gt;id, name, mode));</a>
+<a name="ln1756"> </a>
+<a name="ln1757">	// lock the directory</a>
+<a name="ln1758">	NodeWriteLocker nodeLocker(this, dir, false);</a>
+<a name="ln1759">	if (nodeLocker.Status() != B_OK)</a>
+<a name="ln1760">		RETURN_ERROR(nodeLocker.Status());</a>
+<a name="ln1761"> </a>
+<a name="ln1762">	AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln1763"> </a>
+<a name="ln1764">	// get a path for the entry</a>
+<a name="ln1765">	char path[B_PATH_NAME_LENGTH];</a>
+<a name="ln1766">	size_t pathLen;</a>
+<a name="ln1767">	status_t error = _BuildPath(dir, name, path, pathLen);</a>
+<a name="ln1768">	if (error != B_OK)</a>
+<a name="ln1769">		RETURN_ERROR(error);</a>
+<a name="ln1770"> </a>
+<a name="ln1771">	locker.Unlock();</a>
+<a name="ln1772"> </a>
+<a name="ln1773">	// create the dir</a>
+<a name="ln1774">	int fuseError = fuse_fs_mkdir(fFS, path, mode);</a>
+<a name="ln1775">	if (fuseError != 0)</a>
+<a name="ln1776">		RETURN_ERROR(fuseError);</a>
+<a name="ln1777"> </a>
+<a name="ln1778">	// mark the dir dirty</a>
+<a name="ln1779">	locker.Lock();</a>
+<a name="ln1780">	dir-&gt;dirty = true;</a>
+<a name="ln1781"> </a>
+<a name="ln1782">	// send node monitoring message</a>
+<a name="ln1783">	ino_t nodeID;</a>
+<a name="ln1784">	if (_GetNodeID(dir, name, &amp;nodeID)) {</a>
+<a name="ln1785">		UserlandFS::KernelEmu::notify_listener(B_ENTRY_CREATED, 0, fID, 0,</a>
+<a name="ln1786">			dir-&gt;id, nodeID, NULL, name);</a>
+<a name="ln1787">	}</a>
+<a name="ln1788"> </a>
+<a name="ln1789">	return B_OK;</a>
+<a name="ln1790">}</a>
+<a name="ln1791"> </a>
+<a name="ln1792"> </a>
+<a name="ln1793">status_t</a>
+<a name="ln1794">FUSEVolume::RemoveDir(void* _dir, const char* name)</a>
+<a name="ln1795">{</a>
+<a name="ln1796">	FUSENode* dir = (FUSENode*)_dir;</a>
+<a name="ln1797">	PRINT((&quot;FUSEVolume::RemoveDir(%p (%&quot; B_PRId64 &quot;), \&quot;%s\&quot;)\n&quot;, dir, dir-&gt;id,</a>
+<a name="ln1798">		name));</a>
+<a name="ln1799"> </a>
+<a name="ln1800">	// lock the directory</a>
+<a name="ln1801">	NodeWriteLocker nodeLocker(this, dir, false);</a>
+<a name="ln1802">	if (nodeLocker.Status() != B_OK)</a>
+<a name="ln1803">		RETURN_ERROR(nodeLocker.Status());</a>
+<a name="ln1804"> </a>
+<a name="ln1805">	// get the node ID (for the node monitoring message)</a>
+<a name="ln1806">	ino_t nodeID;</a>
+<a name="ln1807">	bool doNodeMonitoring = _GetNodeID(dir, name, &amp;nodeID);</a>
+<a name="ln1808"> </a>
+<a name="ln1809">	AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln1810"> </a>
+<a name="ln1811">	// get a path for the entry</a>
+<a name="ln1812">	char path[B_PATH_NAME_LENGTH];</a>
+<a name="ln1813">	size_t pathLen;</a>
+<a name="ln1814">	status_t error = _BuildPath(dir, name, path, pathLen);</a>
+<a name="ln1815">	if (error != B_OK)</a>
+<a name="ln1816">		RETURN_ERROR(error);</a>
+<a name="ln1817"> </a>
+<a name="ln1818">	locker.Unlock();</a>
+<a name="ln1819"> </a>
+<a name="ln1820">	// remove the dir</a>
+<a name="ln1821">	int fuseError = fuse_fs_rmdir(fFS, path);</a>
+<a name="ln1822">	if (fuseError != 0)</a>
+<a name="ln1823">		RETURN_ERROR(fuseError);</a>
+<a name="ln1824"> </a>
+<a name="ln1825">	// remove the entry</a>
+<a name="ln1826">	locker.Lock();</a>
+<a name="ln1827">	_RemoveEntry(dir, name);</a>
+<a name="ln1828"> </a>
+<a name="ln1829">	// mark the parent dir dirty</a>
+<a name="ln1830">	dir-&gt;dirty = true;</a>
+<a name="ln1831"> </a>
+<a name="ln1832">	// send node monitoring message</a>
+<a name="ln1833">	if (doNodeMonitoring) {</a>
+<a name="ln1834">		UserlandFS::KernelEmu::notify_listener(B_ENTRY_REMOVED, 0, fID, 0,</a>
+<a name="ln1835">			dir-&gt;id, nodeID, NULL, name);</a>
+<a name="ln1836">	}</a>
+<a name="ln1837"> </a>
+<a name="ln1838">	return B_OK;</a>
+<a name="ln1839">}</a>
+<a name="ln1840"> </a>
+<a name="ln1841"> </a>
+<a name="ln1842">status_t</a>
+<a name="ln1843">FUSEVolume::OpenDir(void* _node, void** _cookie)</a>
+<a name="ln1844">{</a>
+<a name="ln1845">	FUSENode* node = (FUSENode*)_node;</a>
+<a name="ln1846">	PRINT((&quot;FUSEVolume::OpenDir(%p (%&quot; B_PRId64 &quot;), %p)\n&quot;, node, node-&gt;id,</a>
+<a name="ln1847">		_cookie));</a>
+<a name="ln1848"> </a>
+<a name="ln1849">	// lock the parent directory</a>
+<a name="ln1850">	NodeReadLocker nodeLocker(this, node, true);</a>
+<a name="ln1851">	if (nodeLocker.Status() != B_OK)</a>
+<a name="ln1852">		RETURN_ERROR(nodeLocker.Status());</a>
+<a name="ln1853"> </a>
+<a name="ln1854">	// allocate a dir cookie</a>
+<a name="ln1855">	DirCookie* cookie = new(std::nothrow) DirCookie;</a>
+<a name="ln1856">	if (cookie == NULL)</a>
+<a name="ln1857">		RETURN_ERROR(B_NO_MEMORY);</a>
+<a name="ln1858">	ObjectDeleter&lt;DirCookie&gt; cookieDeleter(cookie);</a>
+<a name="ln1859"> </a>
+<a name="ln1860">	AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln1861"> </a>
+<a name="ln1862">	// get a path for the node</a>
+<a name="ln1863">	char path[B_PATH_NAME_LENGTH];</a>
+<a name="ln1864">	size_t pathLen;</a>
+<a name="ln1865">	status_t error = _BuildPath(node, path, pathLen);</a>
+<a name="ln1866">	if (error != B_OK)</a>
+<a name="ln1867">		RETURN_ERROR(error);</a>
+<a name="ln1868"> </a>
+<a name="ln1869">	locker.Unlock();</a>
+<a name="ln1870"> </a>
+<a name="ln1871">	if (fFS-&gt;ops.readdir == NULL &amp;&amp; fFS-&gt;ops.getdir != NULL) {</a>
+<a name="ln1872">		// no open call -- the FS only supports the deprecated getdir()</a>
+<a name="ln1873">		// interface</a>
+<a name="ln1874">		cookie-&gt;getdirInterface = true;</a>
+<a name="ln1875">	} else {</a>
+<a name="ln1876">		// open the dir</a>
+<a name="ln1877">		int fuseError = fuse_fs_opendir(fFS, path, cookie);</a>
+<a name="ln1878">		if (fuseError != 0)</a>
+<a name="ln1879">			return fuseError;</a>
+<a name="ln1880">	}</a>
+<a name="ln1881"> </a>
+<a name="ln1882">	cookieDeleter.Detach();</a>
+<a name="ln1883">	*_cookie = cookie;</a>
+<a name="ln1884"> </a>
+<a name="ln1885">	return B_OK;</a>
+<a name="ln1886">}</a>
+<a name="ln1887"> </a>
+<a name="ln1888"> </a>
+<a name="ln1889">status_t</a>
+<a name="ln1890">FUSEVolume::CloseDir(void* node, void* _cookie)</a>
+<a name="ln1891">{</a>
+<a name="ln1892">	return B_OK;</a>
+<a name="ln1893">}</a>
+<a name="ln1894"> </a>
+<a name="ln1895"> </a>
+<a name="ln1896">status_t</a>
+<a name="ln1897">FUSEVolume::FreeDirCookie(void* _node, void* _cookie)</a>
+<a name="ln1898">{</a>
+<a name="ln1899">	FUSENode* node = (FUSENode*)_node;</a>
+<a name="ln1900">	DirCookie* cookie = (DirCookie*)_cookie;</a>
+<a name="ln1901"> </a>
+<a name="ln1902">	// lock the parent directory</a>
+<a name="ln1903">	NodeReadLocker nodeLocker(this, node, true);</a>
+<a name="ln1904">	if (nodeLocker.Status() != B_OK)</a>
+<a name="ln1905">		RETURN_ERROR(nodeLocker.Status());</a>
+<a name="ln1906"> </a>
+<a name="ln1907">	ObjectDeleter&lt;DirCookie&gt; cookieDeleter(cookie);</a>
+<a name="ln1908"> </a>
+<a name="ln1909">	if (cookie-&gt;getdirInterface)</a>
+<a name="ln1910">		return B_OK;</a>
+<a name="ln1911"> </a>
+<a name="ln1912">	AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln1913"> </a>
+<a name="ln1914">	// get a path for the node</a>
+<a name="ln1915">	char path[B_PATH_NAME_LENGTH];</a>
+<a name="ln1916">	size_t pathLen;</a>
+<a name="ln1917">	status_t error = _BuildPath(node, path, pathLen);</a>
+<a name="ln1918">	if (error != B_OK)</a>
+<a name="ln1919">		RETURN_ERROR(error);</a>
+<a name="ln1920"> </a>
+<a name="ln1921">	locker.Unlock();</a>
+<a name="ln1922"> </a>
+<a name="ln1923">	// release the dir</a>
+<a name="ln1924">	int fuseError = fuse_fs_releasedir(fFS, path, cookie);</a>
+<a name="ln1925">	if (fuseError != 0)</a>
+<a name="ln1926">		return fuseError;</a>
+<a name="ln1927"> </a>
+<a name="ln1928">	return B_OK;</a>
+<a name="ln1929">}</a>
+<a name="ln1930"> </a>
+<a name="ln1931"> </a>
+<a name="ln1932">status_t</a>
+<a name="ln1933">FUSEVolume::ReadDir(void* _node, void* _cookie, void* buffer, size_t bufferSize,</a>
+<a name="ln1934">	uint32 count, uint32* _countRead)</a>
+<a name="ln1935">{</a>
+<a name="ln1936">	PRINT((&quot;FUSEVolume::ReadDir(%p, %p, %p, %&quot; B_PRIuSIZE &quot;, %&quot; B_PRId32 &quot;)\n&quot;,</a>
+<a name="ln1937">		_node, _cookie, buffer, bufferSize, count));</a>
+<a name="ln1938">	*_countRead = 0;</a>
+<a name="ln1939"> </a>
+<a name="ln1940">	FUSENode* node = (FUSENode*)_node;</a>
+<a name="ln1941">	DirCookie* cookie = (DirCookie*)_cookie;</a>
+<a name="ln1942"> </a>
+<a name="ln1943">	RWLockableWriteLocker cookieLocker(this, cookie);</a>
+<a name="ln1944"> </a>
+<a name="ln1945">	uint32 countRead = 0;</a>
+<a name="ln1946">	status_t readDirError = B_OK;</a>
+<a name="ln1947"> </a>
+<a name="ln1948">	AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln1949"> </a>
+<a name="ln1950">	if (cookie-&gt;entryCache == NULL) {</a>
+<a name="ln1951">		// We don't have an entry cache (yet), so we need to ask the client</a>
+<a name="ln1952">		// file system to read the directory.</a>
+<a name="ln1953"> </a>
+<a name="ln1954">		locker.Unlock();</a>
+<a name="ln1955"> </a>
+<a name="ln1956">		// lock the directory</a>
+<a name="ln1957">		NodeReadLocker nodeLocker(this, node, false);</a>
+<a name="ln1958">		if (nodeLocker.Status() != B_OK)</a>
+<a name="ln1959">			RETURN_ERROR(nodeLocker.Status());</a>
+<a name="ln1960"> </a>
+<a name="ln1961">		locker.Lock();</a>
+<a name="ln1962"> </a>
+<a name="ln1963">		ReadDirBuffer readDirBuffer(this, node, cookie, buffer, bufferSize,</a>
+<a name="ln1964">			count);</a>
+<a name="ln1965"> </a>
+<a name="ln1966">		// get a path for the node</a>
+<a name="ln1967">		char path[B_PATH_NAME_LENGTH];</a>
+<a name="ln1968">		size_t pathLen;</a>
+<a name="ln1969">		status_t error = _BuildPath(node, path, pathLen);</a>
+<a name="ln1970">		if (error != B_OK)</a>
+<a name="ln1971">			RETURN_ERROR(error);</a>
+<a name="ln1972"> </a>
+<a name="ln1973">		off_t offset = cookie-&gt;currentEntryOffset;</a>
+<a name="ln1974"> </a>
+<a name="ln1975">		locker.Unlock();</a>
+<a name="ln1976"> </a>
+<a name="ln1977">		// read the dir</a>
+<a name="ln1978">		int fuseError;</a>
+<a name="ln1979">		if (cookie-&gt;getdirInterface) {</a>
+<a name="ln1980">PRINT((&quot;  using getdir() interface\n&quot;));</a>
+<a name="ln1981">			fuseError = fFS-&gt;ops.getdir(path, (fuse_dirh_t)&amp;readDirBuffer,</a>
+<a name="ln1982">				&amp;_AddReadDirEntryGetDir);</a>
+<a name="ln1983">		} else {</a>
+<a name="ln1984">PRINT((&quot;  using readdir() interface\n&quot;));</a>
+<a name="ln1985">			fuseError = fuse_fs_readdir(fFS, path, &amp;readDirBuffer,</a>
+<a name="ln1986">				&amp;_AddReadDirEntry, offset, cookie);</a>
+<a name="ln1987">		}</a>
+<a name="ln1988">		if (fuseError != 0)</a>
+<a name="ln1989">			return fuseError;</a>
+<a name="ln1990"> </a>
+<a name="ln1991">		locker.Lock();</a>
+<a name="ln1992"> </a>
+<a name="ln1993">		countRead = readDirBuffer.entriesRead;</a>
+<a name="ln1994">		readDirError = readDirBuffer.error;</a>
+<a name="ln1995">	}</a>
+<a name="ln1996"> </a>
+<a name="ln1997">	if (cookie-&gt;entryCache != NULL) {</a>
+<a name="ln1998">		// we're using an entry cache -- read into the buffer what we can</a>
+<a name="ln1999">		dirent* entryBuffer = (dirent*)buffer;</a>
+<a name="ln2000">		while (countRead &lt; count</a>
+<a name="ln2001">			&amp;&amp; cookie-&gt;entryCache-&gt;ReadDirent(cookie-&gt;currentEntryIndex, fID,</a>
+<a name="ln2002">				countRead + 1 &lt; count, entryBuffer, bufferSize)) {</a>
+<a name="ln2003">			countRead++;</a>
+<a name="ln2004">			cookie-&gt;currentEntryIndex++;</a>
+<a name="ln2005">			bufferSize -= entryBuffer-&gt;d_reclen;</a>
+<a name="ln2006">			entryBuffer</a>
+<a name="ln2007">				= (dirent*)((uint8*)entryBuffer + entryBuffer-&gt;d_reclen);</a>
+<a name="ln2008">		}</a>
+<a name="ln2009">	}</a>
+<a name="ln2010"> </a>
+<a name="ln2011">	*_countRead = countRead;</a>
+<a name="ln2012">	return countRead &gt; 0 ? B_OK : readDirError;</a>
+<a name="ln2013">}</a>
+<a name="ln2014"> </a>
+<a name="ln2015"> </a>
+<a name="ln2016">status_t</a>
+<a name="ln2017">FUSEVolume::RewindDir(void* _node, void* _cookie)</a>
+<a name="ln2018">{</a>
+<a name="ln2019">PRINT((&quot;FUSEVolume::RewindDir(%p, %p)\n&quot;, _node, _cookie));</a>
+<a name="ln2020">	DirCookie* cookie = (DirCookie*)_cookie;</a>
+<a name="ln2021"> </a>
+<a name="ln2022">	RWLockableWriteLocker cookieLocker(this, cookie);</a>
+<a name="ln2023"> </a>
+<a name="ln2024">	if (cookie-&gt;getdirInterface) {</a>
+<a name="ln2025">		delete cookie-&gt;entryCache;</a>
+<a name="ln2026">		cookie-&gt;entryCache = NULL;</a>
+<a name="ln2027">		cookie-&gt;currentEntryIndex = 0;</a>
+<a name="ln2028">	} else {</a>
+<a name="ln2029">		cookie-&gt;currentEntryOffset = 0;</a>
+<a name="ln2030">	}</a>
+<a name="ln2031"> </a>
+<a name="ln2032">	return B_OK;</a>
+<a name="ln2033">}</a>
+<a name="ln2034"> </a>
+<a name="ln2035"> </a>
+<a name="ln2036">// #pragma mark - attribute directories</a>
+<a name="ln2037"> </a>
+<a name="ln2038"> </a>
+<a name="ln2039">// OpenAttrDir</a>
+<a name="ln2040">status_t</a>
+<a name="ln2041">FUSEVolume::OpenAttrDir(void* _node, void** _cookie)</a>
+<a name="ln2042">{</a>
+<a name="ln2043">	// allocate an attribute directory cookie</a>
+<a name="ln2044">	AttrDirCookie* cookie = new(std::nothrow) AttrDirCookie;</a>
+<a name="ln2045">	if (cookie == NULL)</a>
+<a name="ln2046">		RETURN_ERROR(B_NO_MEMORY);</a>
+<a name="ln2047"> </a>
+<a name="ln2048">	*_cookie = cookie;</a>
+<a name="ln2049"> </a>
+<a name="ln2050">	return B_OK;</a>
+<a name="ln2051">}</a>
+<a name="ln2052"> </a>
+<a name="ln2053"> </a>
+<a name="ln2054">// CloseAttrDir</a>
+<a name="ln2055">status_t</a>
+<a name="ln2056">FUSEVolume::CloseAttrDir(void* node, void* cookie)</a>
+<a name="ln2057">{</a>
+<a name="ln2058">	return B_OK;</a>
+<a name="ln2059">}</a>
+<a name="ln2060"> </a>
+<a name="ln2061"> </a>
+<a name="ln2062">// FreeAttrDirCookie</a>
+<a name="ln2063">status_t</a>
+<a name="ln2064">FUSEVolume::FreeAttrDirCookie(void* _node, void* _cookie)</a>
+<a name="ln2065">{</a>
+<a name="ln2066">	delete (AttrDirCookie*)_cookie;</a>
+<a name="ln2067">	return B_OK;</a>
+<a name="ln2068">}</a>
+<a name="ln2069"> </a>
+<a name="ln2070"> </a>
+<a name="ln2071">// ReadAttrDir</a>
+<a name="ln2072">status_t</a>
+<a name="ln2073">FUSEVolume::ReadAttrDir(void* _node, void* _cookie, void* buffer,</a>
+<a name="ln2074">	size_t bufferSize, uint32 count, uint32* _countRead)</a>
+<a name="ln2075">{</a>
+<a name="ln2076">	FUSENode* node = (FUSENode*)_node;</a>
+<a name="ln2077">	AttrDirCookie* cookie = (AttrDirCookie*)_cookie;</a>
+<a name="ln2078"> </a>
+<a name="ln2079">	RWLockableWriteLocker cookieLocker(this, cookie);</a>
+<a name="ln2080"> </a>
+<a name="ln2081">	*_countRead = 0;</a>
+<a name="ln2082"> </a>
+<a name="ln2083">	// lock the directory</a>
+<a name="ln2084">	NodeReadLocker nodeLocker(this, node, true);</a>
+<a name="ln2085">	if (nodeLocker.Status() != B_OK)</a>
+<a name="ln2086">		RETURN_ERROR(nodeLocker.Status());</a>
+<a name="ln2087"> </a>
+<a name="ln2088">	AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln2089"> </a>
+<a name="ln2090">	// get a path for the node</a>
+<a name="ln2091">	char path[B_PATH_NAME_LENGTH];</a>
+<a name="ln2092">	size_t pathLen;</a>
+<a name="ln2093">	status_t error = _BuildPath(node, path, pathLen);</a>
+<a name="ln2094">	if (error != B_OK)</a>
+<a name="ln2095">		RETURN_ERROR(error);</a>
+<a name="ln2096"> </a>
+<a name="ln2097">	locker.Unlock();</a>
+<a name="ln2098"> </a>
+<a name="ln2099">	if (!cookie-&gt;IsValid()) {</a>
+<a name="ln2100">		// cookie not yet valid -- get the length of the list</a>
+<a name="ln2101">		int listSize = fuse_fs_listxattr(fFS, path, NULL, 0);</a>
+<a name="ln2102">		if (listSize &lt; 0)</a>
+<a name="ln2103">			RETURN_ERROR(listSize);</a>
+<a name="ln2104"> </a>
+<a name="ln2105">		while (true) {</a>
+<a name="ln2106">			// allocate space for the listing</a>
+<a name="ln2107">			error = cookie-&gt;Allocate(listSize);</a>
+<a name="ln2108">			if (error != B_OK)</a>
+<a name="ln2109">				RETURN_ERROR(error);</a>
+<a name="ln2110"> </a>
+<a name="ln2111">			// read the listing</a>
+<a name="ln2112">			int bytesRead = fuse_fs_listxattr(fFS, path,</a>
+<a name="ln2113">				cookie-&gt;AttributesBuffer(), listSize);</a>
+<a name="ln2114">			if (bytesRead &lt; 0)</a>
+<a name="ln2115">				RETURN_ERROR(bytesRead);</a>
+<a name="ln2116"> </a>
+<a name="ln2117">			if (bytesRead == listSize)</a>
+<a name="ln2118">				break;</a>
+<a name="ln2119"> </a>
+<a name="ln2120">			// attributes listing changed -- reread it</a>
+<a name="ln2121">			listSize = bytesRead;</a>
+<a name="ln2122">		}</a>
+<a name="ln2123"> </a>
+<a name="ln2124">		cookie-&gt;SetValid(true);</a>
+<a name="ln2125">	}</a>
+<a name="ln2126"> </a>
+<a name="ln2127">	// we have a valid cookie now -- get the next entries from the cookie</a>
+<a name="ln2128">	uint32 countRead = 0;</a>
+<a name="ln2129">	dirent* entryBuffer = (dirent*)buffer;</a>
+<a name="ln2130">	while (countRead &lt; count</a>
+<a name="ln2131">		&amp;&amp; cookie-&gt;ReadNextEntry(fID, node-&gt;id, countRead + 1 &lt; count,</a>
+<a name="ln2132">			entryBuffer, bufferSize)) {</a>
+<a name="ln2133">		countRead++;</a>
+<a name="ln2134">		bufferSize -= entryBuffer-&gt;d_reclen;</a>
+<a name="ln2135">		entryBuffer = (dirent*)((uint8*)entryBuffer + entryBuffer-&gt;d_reclen);</a>
+<a name="ln2136">	}</a>
+<a name="ln2137"> </a>
+<a name="ln2138">	*_countRead = countRead;</a>
+<a name="ln2139">	return B_OK;</a>
+<a name="ln2140">}</a>
+<a name="ln2141"> </a>
+<a name="ln2142"> </a>
+<a name="ln2143">// RewindAttrDir</a>
+<a name="ln2144">status_t</a>
+<a name="ln2145">FUSEVolume::RewindAttrDir(void* _node, void* _cookie)</a>
+<a name="ln2146">{</a>
+<a name="ln2147">	AttrDirCookie* cookie = (AttrDirCookie*)_cookie;</a>
+<a name="ln2148"> </a>
+<a name="ln2149">	RWLockableWriteLocker cookieLocker(this, cookie);</a>
+<a name="ln2150"> </a>
+<a name="ln2151">	cookie-&gt;Clear();</a>
+<a name="ln2152"> </a>
+<a name="ln2153">	return B_OK;</a>
+<a name="ln2154">}</a>
+<a name="ln2155"> </a>
+<a name="ln2156"> </a>
+<a name="ln2157">// #pragma mark - attributes</a>
+<a name="ln2158"> </a>
+<a name="ln2159"> </a>
+<a name="ln2160">status_t</a>
+<a name="ln2161">FUSEVolume::OpenAttr(void* _node, const char* name, int openMode,</a>
+<a name="ln2162">	void** _cookie)</a>
+<a name="ln2163">{</a>
+<a name="ln2164">	FUSENode* node = (FUSENode*)_node;</a>
+<a name="ln2165"> </a>
+<a name="ln2166">	// lock the node</a>
+<a name="ln2167">	NodeReadLocker nodeLocker(this, node, true);</a>
+<a name="ln2168">	if (nodeLocker.Status() != B_OK)</a>
+<a name="ln2169">		RETURN_ERROR(nodeLocker.Status());</a>
+<a name="ln2170"> </a>
+<a name="ln2171">	if (openMode != O_RDONLY) {</a>
+<a name="ln2172">		// Write support currently not implemented</a>
+<a name="ln2173">		RETURN_ERROR(B_UNSUPPORTED);</a>
+<a name="ln2174">	}</a>
+<a name="ln2175"> </a>
+<a name="ln2176">	AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln2177"> </a>
+<a name="ln2178">	// get a path for the node</a>
+<a name="ln2179">	char path[B_PATH_NAME_LENGTH];</a>
+<a name="ln2180">	size_t pathLen;</a>
+<a name="ln2181">	status_t error = _BuildPath(node, path, pathLen);</a>
+<a name="ln2182">	if (error != B_OK)</a>
+<a name="ln2183">		RETURN_ERROR(error);</a>
+<a name="ln2184"> </a>
+<a name="ln2185">	locker.Unlock();</a>
+<a name="ln2186"> </a>
+<a name="ln2187">	int attrSize = fuse_fs_getxattr(fFS, path, name, NULL, 0);</a>
+<a name="ln2188">	if (attrSize &lt; 0) {</a>
+<a name="ln2189">		if (strcmp(name, kAttrMimeTypeName) == 0) {</a>
+<a name="ln2190">			// Return a fake MIME type attribute based on the file extension</a>
+<a name="ln2191">			const char* mimeType = NULL;</a>
+<a name="ln2192">			error = set_mime(&amp;mimeType, S_ISDIR(node-&gt;type) ? NULL : &amp;path[0]);</a>
+<a name="ln2193">			if (error != B_OK)</a>
+<a name="ln2194">				return error;</a>
+<a name="ln2195">			*_cookie = new(std::nothrow)AttrCookie(name, mimeType);</a>
+<a name="ln2196">			return B_OK;</a>
+<a name="ln2197">		}</a>
+<a name="ln2198"> </a>
+<a name="ln2199">		// Reading attribute failed</a>
+<a name="ln2200">		return attrSize;</a>
+<a name="ln2201">	}</a>
+<a name="ln2202"> </a>
+<a name="ln2203">	AttrCookie* cookie = new(std::nothrow)AttrCookie(name);</a>
+<a name="ln2204">	if (cookie == NULL)</a>
+<a name="ln2205">		RETURN_ERROR(B_NO_MEMORY);</a>
+<a name="ln2206">	error = cookie-&gt;Allocate(attrSize);</a>
+<a name="ln2207">	if (error != B_OK) {</a>
+<a name="ln2208">		delete cookie;</a>
+<a name="ln2209">		RETURN_ERROR(error);</a>
+<a name="ln2210">	}</a>
+<a name="ln2211"> </a>
+<a name="ln2212">	int bytesRead = fuse_fs_getxattr(fFS, path, name, cookie-&gt;Buffer(),</a>
+<a name="ln2213">		attrSize);</a>
+<a name="ln2214">	if (bytesRead &lt; 0)</a>
+<a name="ln2215">		return bytesRead;</a>
+<a name="ln2216"> </a>
+<a name="ln2217">	*_cookie = cookie;</a>
+<a name="ln2218"> </a>
+<a name="ln2219">	return B_OK;</a>
+<a name="ln2220">}</a>
+<a name="ln2221"> </a>
+<a name="ln2222"> </a>
+<a name="ln2223">status_t</a>
+<a name="ln2224">FUSEVolume::CloseAttr(void* _node, void* _cookie)</a>
+<a name="ln2225">{</a>
+<a name="ln2226">	return B_OK;</a>
+<a name="ln2227">}</a>
+<a name="ln2228"> </a>
+<a name="ln2229"> </a>
+<a name="ln2230">status_t</a>
+<a name="ln2231">FUSEVolume::FreeAttrCookie(void* _node, void* _cookie)</a>
+<a name="ln2232">{</a>
+<a name="ln2233">	delete (AttrCookie*)_cookie;</a>
+<a name="ln2234">	return B_OK;</a>
+<a name="ln2235">}</a>
+<a name="ln2236"> </a>
+<a name="ln2237"> </a>
+<a name="ln2238">status_t</a>
+<a name="ln2239">FUSEVolume::ReadAttr(void* _node, void* _cookie, off_t pos, void* buffer,</a>
+<a name="ln2240">	size_t bufferSize, size_t* bytesRead)</a>
+<a name="ln2241">{</a>
+<a name="ln2242">	AttrCookie* cookie = (AttrCookie*)_cookie;</a>
+<a name="ln2243"> </a>
+<a name="ln2244">	RWLockableWriteLocker cookieLocker(this, cookie);</a>
+<a name="ln2245"> </a>
+<a name="ln2246">	if (!cookie-&gt;IsValid())</a>
+<a name="ln2247">		RETURN_ERROR(B_BAD_VALUE);</a>
+<a name="ln2248"> </a>
+<a name="ln2249">	cookie-&gt;Read(buffer, bufferSize, pos, bytesRead);</a>
+<a name="ln2250"> </a>
+<a name="ln2251">	return B_OK;</a>
+<a name="ln2252">}</a>
+<a name="ln2253"> </a>
+<a name="ln2254"> </a>
+<a name="ln2255">status_t</a>
+<a name="ln2256">FUSEVolume::ReadAttrStat(void* _node, void* _cookie, struct stat* st)</a>
+<a name="ln2257">{</a>
+<a name="ln2258">	AttrCookie* cookie = (AttrCookie*)_cookie;</a>
+<a name="ln2259"> </a>
+<a name="ln2260">	RWLockableWriteLocker cookieLocker(this, cookie);</a>
+<a name="ln2261"> </a>
+<a name="ln2262">	if (!cookie-&gt;IsValid())</a>
+<a name="ln2263">		RETURN_ERROR(B_BAD_VALUE);</a>
+<a name="ln2264"> </a>
+<a name="ln2265">	st-&gt;st_size = cookie-&gt;Size();</a>
+<a name="ln2266">	st-&gt;st_type = cookie-&gt;Type();</a>
+<a name="ln2267"> </a>
+<a name="ln2268">	return B_OK;</a>
+<a name="ln2269">}</a>
+<a name="ln2270"> </a>
+<a name="ln2271"> </a>
+<a name="ln2272">// #pragma mark -</a>
+<a name="ln2273"> </a>
+<a name="ln2274"> </a>
+<a name="ln2275">ino_t</a>
+<a name="ln2276">FUSEVolume::_GenerateNodeID()</a>
+<a name="ln2277">{</a>
+<a name="ln2278">	ino_t id;</a>
+<a name="ln2279">	do {</a>
+<a name="ln2280">		id = fNextNodeID++;</a>
+<a name="ln2281">	} while (fNodes.Lookup(id) != NULL);</a>
+<a name="ln2282"> </a>
+<a name="ln2283">	return id;</a>
+<a name="ln2284">}</a>
+<a name="ln2285"> </a>
+<a name="ln2286"> </a>
+<a name="ln2287">/*!	Gets the ID of the node the entry specified by \a dir and \a entryName</a>
+<a name="ln2288">	refers to. The ID is returned via \a _nodeID. The caller doesn't get a</a>
+<a name="ln2289">	reference to the node.</a>
+<a name="ln2290">*/</a>
+<a name="ln2291">bool</a>
+<a name="ln2292">FUSEVolume::_GetNodeID(FUSENode* dir, const char* entryName, ino_t* _nodeID)</a>
+<a name="ln2293">{</a>
+<a name="ln2294">	while (true) {</a>
+<a name="ln2295">		AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln2296"> </a>
+<a name="ln2297">		FUSENode* node;</a>
+<a name="ln2298">		status_t error = _InternalGetNode(dir, entryName, &amp;node, locker);</a>
+<a name="ln2299">		if (error != B_OK)</a>
+<a name="ln2300">			return false;</a>
+<a name="ln2301"> </a>
+<a name="ln2302">		if (node == NULL)</a>
+<a name="ln2303">			continue;</a>
+<a name="ln2304"> </a>
+<a name="ln2305">		*_nodeID = node-&gt;id;</a>
+<a name="ln2306">		_PutNode(node);</a>
+<a name="ln2307"> </a>
+<a name="ln2308">		return true;</a>
+<a name="ln2309">	}</a>
+<a name="ln2310">}</a>
+<a name="ln2311"> </a>
+<a name="ln2312"> </a>
+<a name="ln2313">/*!	Gets the node the entry specified by \a dir and \a entryName refers to. The</a>
+<a name="ln2314">	found node is returned via \a _node. The caller gets a reference to the node</a>
+<a name="ln2315">	as well as a vnode reference.</a>
+<a name="ln2316">*/</a>
+<a name="ln2317">status_t</a>
+<a name="ln2318">FUSEVolume::_GetNode(FUSENode* dir, const char* entryName, FUSENode** _node)</a>
+<a name="ln2319">{</a>
+<a name="ln2320">	while (true) {</a>
+<a name="ln2321">		AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln2322"> </a>
+<a name="ln2323">		FUSENode* node;</a>
+<a name="ln2324">		status_t error = _InternalGetNode(dir, entryName, &amp;node, locker);</a>
+<a name="ln2325">		if (error != B_OK)</a>
+<a name="ln2326">			return error;</a>
+<a name="ln2327"> </a>
+<a name="ln2328">		if (node == NULL)</a>
+<a name="ln2329">			continue;</a>
+<a name="ln2330"> </a>
+<a name="ln2331">		ino_t nodeID = node-&gt;id;</a>
+<a name="ln2332"> </a>
+<a name="ln2333">		locker.Unlock();</a>
+<a name="ln2334"> </a>
+<a name="ln2335">		// get a reference for the caller</a>
+<a name="ln2336">		void* privateNode;</a>
+<a name="ln2337">		error = UserlandFS::KernelEmu::get_vnode(fID, nodeID, &amp;privateNode);</a>
+<a name="ln2338">		if (error != B_OK)</a>
+<a name="ln2339">			RETURN_ERROR(error);</a>
+<a name="ln2340"> </a>
+<a name="ln2341">		locker.Lock();</a>
+<a name="ln2342"> </a>
+<a name="ln2343">		if (privateNode != node) {</a>
+<a name="ln2344">			// weird, the node changed!</a>
+<a name="ln2345">			ERROR((&quot;FUSEVolume::_GetNode(): cookie for node %&quot; B_PRId64</a>
+<a name="ln2346">				&quot; changed: expected: %p, got: %p\n&quot;, nodeID, node,</a>
+<a name="ln2347">				privateNode));</a>
+<a name="ln2348">			UserlandFS::KernelEmu::put_vnode(fID, nodeID);</a>
+<a name="ln2349">			_PutNode(node);</a>
+<a name="ln2350">			continue;</a>
+<a name="ln2351">		}</a>
+<a name="ln2352"> </a>
+<a name="ln2353">		// Put the node reference we got from _InternalGetNode. We've now got</a>
+<a name="ln2354">		// a reference from get_vnode().</a>
+<a name="ln2355">		_PutNode(node);</a>
+<a name="ln2356"> </a>
+<a name="ln2357">		*_node = node;</a>
+<a name="ln2358">		return B_OK;</a>
+<a name="ln2359">	}</a>
+<a name="ln2360">}</a>
+<a name="ln2361"> </a>
+<a name="ln2362"> </a>
+<a name="ln2363">status_t</a>
+<a name="ln2364">FUSEVolume::_InternalGetNode(FUSENode* dir, const char* entryName,</a>
+<a name="ln2365">	FUSENode** _node, AutoLocker&lt;Locker&gt;&amp; locker)</a>
+<a name="ln2366">{</a>
+<a name="ln2367">	// handle special cases</a>
+<a name="ln2368">	if (strcmp(entryName, &quot;.&quot;) == 0) {</a>
+<a name="ln2369">		// same directory</a>
+<a name="ln2370">		if (!S_ISDIR(dir-&gt;type))</a>
+<a name="ln2371">			RETURN_ERROR(B_NOT_A_DIRECTORY);</a>
+<a name="ln2372"> </a>
+<a name="ln2373">		dir-&gt;refCount++;</a>
+<a name="ln2374">		*_node = dir;</a>
+<a name="ln2375">		return B_OK;</a>
+<a name="ln2376">	}</a>
+<a name="ln2377"> </a>
+<a name="ln2378">	if (strcmp(entryName, &quot;..&quot;) == 0) {</a>
+<a name="ln2379">		// parent directory</a>
+<a name="ln2380">		if (!S_ISDIR(dir-&gt;type))</a>
+<a name="ln2381">			RETURN_ERROR(B_NOT_A_DIRECTORY);</a>
+<a name="ln2382"> </a>
+<a name="ln2383">		FUSEEntry* entry = dir-&gt;entries.Head();</a>
+<a name="ln2384">		if (entry == NULL)</a>
+<a name="ln2385">			RETURN_ERROR(B_ENTRY_NOT_FOUND);</a>
+<a name="ln2386"> </a>
+<a name="ln2387">		entry-&gt;parent-&gt;refCount++;</a>
+<a name="ln2388">		*_node = entry-&gt;parent;</a>
+<a name="ln2389">		return B_OK;</a>
+<a name="ln2390">	}</a>
+<a name="ln2391"> </a>
+<a name="ln2392">	// lookup the entry in the table</a>
+<a name="ln2393">	FUSEEntry* entry = fEntries.Lookup(FUSEEntryRef(dir-&gt;id, entryName));</a>
+<a name="ln2394">	if (entry != NULL) {</a>
+<a name="ln2395">		entry-&gt;node-&gt;refCount++;</a>
+<a name="ln2396">		*_node = entry-&gt;node;</a>
+<a name="ln2397">		return B_OK;</a>
+<a name="ln2398">	}</a>
+<a name="ln2399"> </a>
+<a name="ln2400">	// construct a path for the entry</a>
+<a name="ln2401">	char path[B_PATH_NAME_LENGTH];</a>
+<a name="ln2402">	size_t pathLen = 0;</a>
+<a name="ln2403">	status_t error = _BuildPath(dir, entryName, path, pathLen);</a>
+<a name="ln2404">	if (error != B_OK)</a>
+<a name="ln2405">		return error;</a>
+<a name="ln2406"> </a>
+<a name="ln2407">	locker.Unlock();</a>
+<a name="ln2408"> </a>
+<a name="ln2409">	// stat the path</a>
+<a name="ln2410">	struct stat st;</a>
+<a name="ln2411">	int fuseError = fuse_fs_getattr(fFS, path, &amp;st);</a>
+<a name="ln2412">	if (fuseError != 0)</a>
+<a name="ln2413">		return fuseError;</a>
+<a name="ln2414"> </a>
+<a name="ln2415">	locker.Lock();</a>
+<a name="ln2416"> </a>
+<a name="ln2417">	// lookup the entry in the table again</a>
+<a name="ln2418">	entry = fEntries.Lookup(FUSEEntryRef(dir-&gt;id, entryName));</a>
+<a name="ln2419">	if (entry != NULL) {</a>
+<a name="ln2420">		// check whether the node still matches</a>
+<a name="ln2421">		if (entry-&gt;node-&gt;id == st.st_ino) {</a>
+<a name="ln2422">			entry-&gt;node-&gt;refCount++;</a>
+<a name="ln2423">			*_node = entry-&gt;node;</a>
+<a name="ln2424">		} else {</a>
+<a name="ln2425">			// nope, something changed -- return a NULL node and let the caller</a>
+<a name="ln2426">			// call us again</a>
+<a name="ln2427">			*_node = NULL;</a>
+<a name="ln2428">		}</a>
+<a name="ln2429"> </a>
+<a name="ln2430">		return B_OK;</a>
+<a name="ln2431">	}</a>
+<a name="ln2432"> </a>
+<a name="ln2433">	// lookup the node in the table</a>
+<a name="ln2434">	FUSENode* node = NULL;</a>
+<a name="ln2435">	if (fUseNodeIDs)</a>
+<a name="ln2436">		node = fNodes.Lookup(st.st_ino);</a>
+<a name="ln2437">	else</a>
+<a name="ln2438">		st.st_ino = _GenerateNodeID();</a>
+<a name="ln2439"> </a>
+<a name="ln2440">	if (node == NULL) {</a>
+<a name="ln2441">		// no node yet -- create one</a>
+<a name="ln2442">		node = new(std::nothrow) FUSENode(st.st_ino, st.st_mode &amp; S_IFMT);</a>
+<a name="ln2443">		if (node == NULL)</a>
+<a name="ln2444">			RETURN_ERROR(B_NO_MEMORY);</a>
+<a name="ln2445"> </a>
+<a name="ln2446">		fNodes.Insert(node);</a>
+<a name="ln2447">	} else {</a>
+<a name="ln2448">		// get a node reference for the entry</a>
+<a name="ln2449">		node-&gt;refCount++;</a>
+<a name="ln2450">	}</a>
+<a name="ln2451"> </a>
+<a name="ln2452">	// create the entry</a>
+<a name="ln2453">	entry = FUSEEntry::Create(dir, entryName, node);</a>
+<a name="ln2454">	if (entry == NULL) {</a>
+<a name="ln2455">		_PutNode(node);</a>
+<a name="ln2456">		RETURN_ERROR(B_NO_MEMORY);</a>
+<a name="ln2457">	}</a>
+<a name="ln2458"> </a>
+<a name="ln2459">	dir-&gt;refCount++;</a>
+<a name="ln2460">		// dir reference for the entry</a>
+<a name="ln2461"> </a>
+<a name="ln2462">	fEntries.Insert(entry);</a>
+<a name="ln2463">	node-&gt;entries.Add(entry);</a>
+<a name="ln2464"> </a>
+<a name="ln2465">	locker.Unlock();</a>
+<a name="ln2466"> </a>
+<a name="ln2467">	// get a reference for the caller</a>
+<a name="ln2468">	node-&gt;refCount++;</a>
+<a name="ln2469"> </a>
+<a name="ln2470">	*_node = node;</a>
+<a name="ln2471">	return B_OK;</a>
+<a name="ln2472">}</a>
+<a name="ln2473"> </a>
+<a name="ln2474"> </a>
+<a name="ln2475">void</a>
+<a name="ln2476">FUSEVolume::_PutNode(FUSENode* node)</a>
+<a name="ln2477">{</a>
+<a name="ln2478">	if (--node-&gt;refCount == 0) {</a>
+<a name="ln2479">		fNodes.Remove(node);</a>
+<a name="ln2480">		delete node;</a>
+<a name="ln2481">	}</a>
+<a name="ln2482">}</a>
+<a name="ln2483"> </a>
+<a name="ln2484"> </a>
+<a name="ln2485">void</a>
+<a name="ln2486">FUSEVolume::_PutNodes(FUSENode* const* nodes, int32 count)</a>
+<a name="ln2487">{</a>
+<a name="ln2488">	for (int32 i = 0; i &lt; count; i++)</a>
+<a name="ln2489">		_PutNode(nodes[i]);</a>
+<a name="ln2490">}</a>
+<a name="ln2491"> </a>
+<a name="ln2492"> </a>
+<a name="ln2493">/*!	Volume must be locked. The entry's directory must be write locked.</a>
+<a name="ln2494"> */</a>
+<a name="ln2495">void</a>
+<a name="ln2496">FUSEVolume::_RemoveEntry(FUSEEntry* entry)</a>
+<a name="ln2497">{</a>
+<a name="ln2498">	fEntries.Remove(entry);</a>
+<a name="ln2499">	entry-&gt;node-&gt;entries.Remove(entry);</a>
+<a name="ln2500">	_PutNode(entry-&gt;node);</a>
+<a name="ln2501">	_PutNode(entry-&gt;parent);</a>
+<a name="ln2502">	delete entry;</a>
+<a name="ln2503">}</a>
+<a name="ln2504"> </a>
+<a name="ln2505"> </a>
+<a name="ln2506">/*!	Volume must be locked. The directory must be write locked.</a>
+<a name="ln2507"> */</a>
+<a name="ln2508">status_t</a>
+<a name="ln2509">FUSEVolume::_RemoveEntry(FUSENode* dir, const char* name)</a>
+<a name="ln2510">{</a>
+<a name="ln2511">	FUSEEntry* entry = fEntries.Lookup(FUSEEntryRef(dir-&gt;id, name));</a>
+<a name="ln2512">	if (entry == NULL)</a>
+<a name="ln2513">		return B_ENTRY_NOT_FOUND;</a>
+<a name="ln2514"> </a>
+<a name="ln2515">	_RemoveEntry(entry);</a>
+<a name="ln2516">	return B_OK;</a>
+<a name="ln2517">}</a>
+<a name="ln2518"> </a>
+<a name="ln2519"> </a>
+<a name="ln2520">/*!	Volume must be locked. The directories must be write locked.</a>
+<a name="ln2521"> */</a>
+<a name="ln2522">status_t</a>
+<a name="ln2523">FUSEVolume::_RenameEntry(FUSENode* oldDir, const char* oldName,</a>
+<a name="ln2524">	FUSENode* newDir, const char* newName)</a>
+<a name="ln2525">{</a>
+<a name="ln2526">	FUSEEntry* entry = fEntries.Lookup(FUSEEntryRef(oldDir-&gt;id, oldName));</a>
+<a name="ln2527">	if (entry == NULL)</a>
+<a name="ln2528">		return B_ENTRY_NOT_FOUND;</a>
+<a name="ln2529"> </a>
+<a name="ln2530">	// get a node reference for the new entry</a>
+<a name="ln2531">	FUSENode* node = entry-&gt;node;</a>
+<a name="ln2532">	node-&gt;refCount++;</a>
+<a name="ln2533"> </a>
+<a name="ln2534">	// remove the old entry</a>
+<a name="ln2535">	_RemoveEntry(entry);</a>
+<a name="ln2536"> </a>
+<a name="ln2537">	// make sure there's no entry in our way</a>
+<a name="ln2538">	_RemoveEntry(newDir, newName);</a>
+<a name="ln2539"> </a>
+<a name="ln2540">	// create a new entry</a>
+<a name="ln2541">	entry = FUSEEntry::Create(newDir, newName, node);</a>
+<a name="ln2542">	if (entry == NULL) {</a>
+<a name="ln2543">		_PutNode(node);</a>
+<a name="ln2544">		RETURN_ERROR(B_NO_MEMORY);</a>
+<a name="ln2545">	}</a>
+<a name="ln2546"> </a>
+<a name="ln2547">	newDir-&gt;refCount++;</a>
+<a name="ln2548">		// dir reference for the entry</a>
+<a name="ln2549"> </a>
+<a name="ln2550">	fEntries.Insert(entry);</a>
+<a name="ln2551">	node-&gt;entries.Add(entry);</a>
+<a name="ln2552"> </a>
+<a name="ln2553">	return B_OK;</a>
+<a name="ln2554">}</a>
+<a name="ln2555"> </a>
+<a name="ln2556"> </a>
+<a name="ln2557">/*!	Locks the given node and all of its ancestors up to the root. The given</a>
+<a name="ln2558">	node is write-locked, if \a writeLock is \c true, read-locked otherwise. All</a>
+<a name="ln2559">	ancestors are always read-locked in either case.</a>
+<a name="ln2560"> </a>
+<a name="ln2561">	If \a lockParent is \c true, the given node itself is ignored, but locking</a>
+<a name="ln2562">	starts with the parent node of the given node (\a writeLock applies to the</a>
+<a name="ln2563">	parent node then).</a>
+<a name="ln2564"> </a>
+<a name="ln2565">	If the method fails, none of the nodes is locked.</a>
+<a name="ln2566"> </a>
+<a name="ln2567">	The volume lock must not be held.</a>
+<a name="ln2568">*/</a>
+<a name="ln2569">status_t</a>
+<a name="ln2570">FUSEVolume::_LockNodeChain(FUSENode* node, bool lockParent, bool writeLock)</a>
+<a name="ln2571">{</a>
+<a name="ln2572">	AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln2573"> </a>
+<a name="ln2574">	FUSENode* originalNode = node;</a>
+<a name="ln2575"> </a>
+<a name="ln2576">	if (lockParent &amp;&amp; node != NULL)</a>
+<a name="ln2577">		node = node-&gt;Parent();</a>
+<a name="ln2578"> </a>
+<a name="ln2579">	if (node == NULL)</a>
+<a name="ln2580">		RETURN_ERROR(B_ENTRY_NOT_FOUND);</a>
+<a name="ln2581"> </a>
+<a name="ln2582">	LockIterator iterator(this, node, writeLock, NULL);</a>
+<a name="ln2583"> </a>
+<a name="ln2584">	bool done;</a>
+<a name="ln2585">	do {</a>
+<a name="ln2586">		bool volumeUnlocked;</a>
+<a name="ln2587">		status_t error = iterator.LockNext(&amp;done, &amp;volumeUnlocked);</a>
+<a name="ln2588">		if (error != B_OK)</a>
+<a name="ln2589">			RETURN_ERROR(error);</a>
+<a name="ln2590"> </a>
+<a name="ln2591">		if (volumeUnlocked) {</a>
+<a name="ln2592">			// check whether we're still locking the right node</a>
+<a name="ln2593">			if (lockParent &amp;&amp; originalNode-&gt;Parent() != node) {</a>
+<a name="ln2594">				// We don't -- unlock everything and try again.</a>
+<a name="ln2595">				node = originalNode-&gt;Parent();</a>
+<a name="ln2596">				iterator.SetTo(this, node, writeLock, NULL);</a>
+<a name="ln2597">			}</a>
+<a name="ln2598">		}</a>
+<a name="ln2599">	} while (!done);</a>
+<a name="ln2600"> </a>
+<a name="ln2601">	// Fail, if we couldn't lock all nodes up to the root.</a>
+<a name="ln2602">	if (iterator.lastLockedNode != fRootNode)</a>
+<a name="ln2603">		RETURN_ERROR(B_ENTRY_NOT_FOUND);</a>
+<a name="ln2604"> </a>
+<a name="ln2605">	iterator.Detach();</a>
+<a name="ln2606">	return B_OK;</a>
+<a name="ln2607">}</a>
+<a name="ln2608"> </a>
+<a name="ln2609"> </a>
+<a name="ln2610">void</a>
+<a name="ln2611">FUSEVolume::_UnlockNodeChain(FUSENode* node, bool parent, bool writeLock)</a>
+<a name="ln2612">{</a>
+<a name="ln2613">	AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln2614"> </a>
+<a name="ln2615">	if (parent &amp;&amp; node != NULL)</a>
+<a name="ln2616">		node = node-&gt;Parent();</a>
+<a name="ln2617"> </a>
+<a name="ln2618">	_UnlockNodeChainInternal(node, writeLock, NULL, NULL);</a>
+<a name="ln2619">}</a>
+<a name="ln2620"> </a>
+<a name="ln2621"> </a>
+<a name="ln2622">/*!	Unlocks all nodes from \a node up to (and including) \a stopNode (if</a>
+<a name="ln2623">	\c NULL, it is ignored). If \a stopBeforeNode is given, the method stops</a>
+<a name="ln2624">	before unlocking that node.</a>
+<a name="ln2625">	The volume lock must be held.</a>
+<a name="ln2626"> */</a>
+<a name="ln2627">void</a>
+<a name="ln2628">FUSEVolume::_UnlockNodeChainInternal(FUSENode* node, bool writeLock,</a>
+<a name="ln2629">	FUSENode* stopNode, FUSENode* stopBeforeNode)</a>
+<a name="ln2630">{</a>
+<a name="ln2631">	FUSENode* originalNode = node;</a>
+<a name="ln2632"> </a>
+<a name="ln2633">	while (node != NULL &amp;&amp; node != stopBeforeNode) {</a>
+<a name="ln2634">		FUSENode* parent = node-&gt;Parent();</a>
+<a name="ln2635"> </a>
+<a name="ln2636">		fLockManager.GenericUnlock(node == originalNode &amp;&amp; writeLock, node);</a>
+<a name="ln2637">		_PutNode(node);</a>
+<a name="ln2638"> </a>
+<a name="ln2639">		if (node == stopNode || parent == node)</a>
+<a name="ln2640">			break;</a>
+<a name="ln2641"> </a>
+<a name="ln2642">		node = parent;</a>
+<a name="ln2643">	}</a>
+<a name="ln2644">}</a>
+<a name="ln2645"> </a>
+<a name="ln2646"> </a>
+<a name="ln2647">status_t</a>
+<a name="ln2648">FUSEVolume::_LockNodeChains(FUSENode* node1, bool lockParent1, bool writeLock1,</a>
+<a name="ln2649">	FUSENode* node2, bool lockParent2, bool writeLock2)</a>
+<a name="ln2650">{</a>
+<a name="ln2651">	// Since in this case locking is more complicated, we use a helper method.</a>
+<a name="ln2652">	// It does the main work, but simply returns telling us to retry when the</a>
+<a name="ln2653">	// node hierarchy changes.</a>
+<a name="ln2654">	bool retry;</a>
+<a name="ln2655">	do {</a>
+<a name="ln2656">		status_t error = _LockNodeChainsInternal(node1, lockParent1, writeLock1,</a>
+<a name="ln2657">			node2, lockParent2, writeLock2, &amp;retry);</a>
+<a name="ln2658">		if (error != B_OK)</a>
+<a name="ln2659">			return error;</a>
+<a name="ln2660">	} while (retry);</a>
+<a name="ln2661"> </a>
+<a name="ln2662">	return B_OK;</a>
+<a name="ln2663">}</a>
+<a name="ln2664"> </a>
+<a name="ln2665"> </a>
+<a name="ln2666">status_t</a>
+<a name="ln2667">FUSEVolume::_LockNodeChainsInternal(FUSENode* node1, bool lockParent1,</a>
+<a name="ln2668">	bool writeLock1, FUSENode* node2, bool lockParent2, bool writeLock2,</a>
+<a name="ln2669">	bool* _retry)</a>
+<a name="ln2670">{</a>
+<a name="ln2671">	// Locking order:</a>
+<a name="ln2672">	// * A child of a node has to be locked before its parent.</a>
+<a name="ln2673">	// * Sibling nodes have to be locked in ascending node ID order.</a>
+<a name="ln2674">	//</a>
+<a name="ln2675">	// This implies the following locking algorithm:</a>
+<a name="ln2676">	// * We find the closest common ancestor of the two given nodes (might even</a>
+<a name="ln2677">	//   be one of the given nodes).</a>
+<a name="ln2678">	// * We lock all ancestors on one branch (the one with the lower common</a>
+<a name="ln2679">	//   ancestor child node ID), but not including the common ancestor.</a>
+<a name="ln2680">	// * We lock all ancestors on the other branch, not including the common</a>
+<a name="ln2681">	//   ancestor.</a>
+<a name="ln2682">	// * We lock the common ancestor and all of its ancestors up to the root</a>
+<a name="ln2683">	//   node.</a>
+<a name="ln2684">	//</a>
+<a name="ln2685">	// When the hierarchy changes while we're waiting for a lock, we recheck the</a>
+<a name="ln2686">	// conditions and in doubt have to be restarted.</a>
+<a name="ln2687"> </a>
+<a name="ln2688">	AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln2689"> </a>
+<a name="ln2690">	FUSENode* originalNode1 = node1;</a>
+<a name="ln2691">	FUSENode* originalNode2 = node2;</a>
+<a name="ln2692"> </a>
+<a name="ln2693">	if (lockParent1 &amp;&amp; node1 != NULL)</a>
+<a name="ln2694">		node1 = node1-&gt;Parent();</a>
+<a name="ln2695"> </a>
+<a name="ln2696">	if (lockParent2 &amp;&amp; node2 != NULL)</a>
+<a name="ln2697">		node2 = node2-&gt;Parent();</a>
+<a name="ln2698"> </a>
+<a name="ln2699">	if (node1 == NULL || node2 == NULL)</a>
+<a name="ln2700">		RETURN_ERROR(B_ENTRY_NOT_FOUND);</a>
+<a name="ln2701"> </a>
+<a name="ln2702">	// find the first common ancestor</a>
+<a name="ln2703">	FUSENode* commonAncestor;</a>
+<a name="ln2704">	bool inverseLockingOrder;</a>
+<a name="ln2705">	if (!_FindCommonAncestor(node1, node2, &amp;commonAncestor,</a>
+<a name="ln2706">			&amp;inverseLockingOrder)) {</a>
+<a name="ln2707">		RETURN_ERROR(B_ENTRY_NOT_FOUND);</a>
+<a name="ln2708">	}</a>
+<a name="ln2709"> </a>
+<a name="ln2710">	// lock the both node chains up to (but not including) the common ancestor</a>
+<a name="ln2711">	LockIterator iterator1(this, node1, writeLock1, commonAncestor);</a>
+<a name="ln2712">	LockIterator iterator2(this, node2, writeLock2, commonAncestor);</a>
+<a name="ln2713"> </a>
+<a name="ln2714">	for (int i = 0; i &lt; 2; i++) {</a>
+<a name="ln2715">		LockIterator&amp; iterator = (i == 0) != inverseLockingOrder</a>
+<a name="ln2716">			? iterator1 : iterator2;</a>
+<a name="ln2717"> </a>
+<a name="ln2718">		// If the node is the common ancestor, don't enter the &quot;do&quot; loop, since</a>
+<a name="ln2719">		// we don't have to lock anything here.</a>
+<a name="ln2720">		if (iterator.firstNode == commonAncestor)</a>
+<a name="ln2721">			continue;</a>
+<a name="ln2722"> </a>
+<a name="ln2723">		bool done;</a>
+<a name="ln2724">		do {</a>
+<a name="ln2725">			bool volumeUnlocked;</a>
+<a name="ln2726">			status_t error = iterator.LockNext(&amp;done, &amp;volumeUnlocked);</a>
+<a name="ln2727">			if (error != B_OK)</a>
+<a name="ln2728">				RETURN_ERROR(error);</a>
+<a name="ln2729"> </a>
+<a name="ln2730">			if (volumeUnlocked) {</a>
+<a name="ln2731">				// check whether we're still locking the right nodes</a>
+<a name="ln2732">				if ((lockParent1 &amp;&amp; originalNode1-&gt;Parent() != node1)</a>
+<a name="ln2733">					|| (lockParent2 &amp;&amp; originalNode2-&gt;Parent() != node2)) {</a>
+<a name="ln2734">					// We don't -- unlock everything and retry.</a>
+<a name="ln2735">					*_retry = true;</a>
+<a name="ln2736">					return B_OK;</a>
+<a name="ln2737">				}</a>
+<a name="ln2738"> </a>
+<a name="ln2739">				// also recheck the common ancestor</a>
+<a name="ln2740">				FUSENode* newCommonParent;</a>
+<a name="ln2741">				bool newInverseLockingOrder;</a>
+<a name="ln2742">				if (!_FindCommonAncestor(node1, node2, &amp;newCommonParent,</a>
+<a name="ln2743">						&amp;newInverseLockingOrder)) {</a>
+<a name="ln2744">					RETURN_ERROR(B_ENTRY_NOT_FOUND);</a>
+<a name="ln2745">				}</a>
+<a name="ln2746"> </a>
+<a name="ln2747">				if (newCommonParent != commonAncestor</a>
+<a name="ln2748">					|| inverseLockingOrder != newInverseLockingOrder) {</a>
+<a name="ln2749">					// Something changed -- unlock everything and retry.</a>
+<a name="ln2750">					*_retry = true;</a>
+<a name="ln2751">					return B_OK;</a>
+<a name="ln2752">				}</a>
+<a name="ln2753">			}</a>
+<a name="ln2754">		} while (!done);</a>
+<a name="ln2755">	}</a>
+<a name="ln2756"> </a>
+<a name="ln2757">	// Continue locking from the common ancestor to the root. If one of the</a>
+<a name="ln2758">	// given nodes is the common ancestor and shall be write locked, we need to</a>
+<a name="ln2759">	// use the respective iterator.</a>
+<a name="ln2760">	LockIterator&amp; iterator = node2 == commonAncestor &amp;&amp; writeLock2</a>
+<a name="ln2761">		? iterator2 : iterator1;</a>
+<a name="ln2762">	iterator.SetStopBeforeNode(NULL);</a>
+<a name="ln2763"> </a>
+<a name="ln2764">	bool done;</a>
+<a name="ln2765">	do {</a>
+<a name="ln2766">		bool volumeUnlocked;</a>
+<a name="ln2767">		status_t error = iterator.LockNext(&amp;done, &amp;volumeUnlocked);</a>
+<a name="ln2768">		if (error != B_OK)</a>
+<a name="ln2769">			RETURN_ERROR(error);</a>
+<a name="ln2770"> </a>
+<a name="ln2771">		if (volumeUnlocked) {</a>
+<a name="ln2772">			// check whether we're still locking the right nodes</a>
+<a name="ln2773">			if ((lockParent1 &amp;&amp; originalNode1-&gt;Parent() != node1)</a>
+<a name="ln2774">				|| (lockParent2 &amp;&amp; originalNode2-&gt;Parent() != node2)) {</a>
+<a name="ln2775">				// We don't -- unlock everything and retry.</a>
+<a name="ln2776">				*_retry = true;</a>
+<a name="ln2777">				return B_OK;</a>
+<a name="ln2778">			}</a>
+<a name="ln2779"> </a>
+<a name="ln2780">			// Also recheck the common ancestor, if we have just locked it.</a>
+<a name="ln2781">			// Otherwise we can just continue to lock, since nothing below the</a>
+<a name="ln2782">			// previously locked node can have changed.</a>
+<a name="ln2783">			if (iterator.lastLockedNode == commonAncestor) {</a>
+<a name="ln2784">				FUSENode* newCommonParent;</a>
+<a name="ln2785">				bool newInverseLockingOrder;</a>
+<a name="ln2786">				if (!_FindCommonAncestor(node1, node2, &amp;newCommonParent,</a>
+<a name="ln2787">						&amp;newInverseLockingOrder)) {</a>
+<a name="ln2788">					RETURN_ERROR(B_ENTRY_NOT_FOUND);</a>
+<a name="ln2789">				}</a>
+<a name="ln2790"> </a>
+<a name="ln2791">				if (newCommonParent != commonAncestor</a>
+<a name="ln2792">					|| inverseLockingOrder != newInverseLockingOrder) {</a>
+<a name="ln2793">					// Something changed -- unlock everything and retry.</a>
+<a name="ln2794">					*_retry = true;</a>
+<a name="ln2795">					return B_OK;</a>
+<a name="ln2796">				}</a>
+<a name="ln2797">			}</a>
+<a name="ln2798">		}</a>
+<a name="ln2799">	} while (!done);</a>
+<a name="ln2800"> </a>
+<a name="ln2801">	// Fail, if we couldn't lock all nodes up to the root.</a>
+<a name="ln2802">	if (iterator.lastLockedNode != fRootNode)</a>
+<a name="ln2803">		RETURN_ERROR(B_ENTRY_NOT_FOUND);</a>
+<a name="ln2804"> </a>
+<a name="ln2805">	// everything went fine</a>
+<a name="ln2806">	iterator1.Detach();</a>
+<a name="ln2807">	iterator2.Detach();</a>
+<a name="ln2808"> </a>
+<a name="ln2809">	*_retry = false;</a>
+<a name="ln2810">	return B_OK;</a>
+<a name="ln2811">}</a>
+<a name="ln2812"> </a>
+<a name="ln2813"> </a>
+<a name="ln2814">void</a>
+<a name="ln2815">FUSEVolume::_UnlockNodeChains(FUSENode* node1, bool lockParent1,</a>
+<a name="ln2816">	bool writeLock1, FUSENode* node2, bool lockParent2, bool writeLock2)</a>
+<a name="ln2817">{</a>
+<a name="ln2818">	AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln2819"> </a>
+<a name="ln2820">	if (lockParent1 &amp;&amp; node1 != NULL)</a>
+<a name="ln2821">		node1 = node1-&gt;Parent();</a>
+<a name="ln2822"> </a>
+<a name="ln2823">	if (lockParent2 &amp;&amp; node2 != NULL)</a>
+<a name="ln2824">		node2 = node2-&gt;Parent();</a>
+<a name="ln2825"> </a>
+<a name="ln2826">	if (node1 == NULL || node2 == NULL)</a>
+<a name="ln2827">		return;</a>
+<a name="ln2828"> </a>
+<a name="ln2829">	// find the common ancestor</a>
+<a name="ln2830">	FUSENode* commonAncestor;</a>
+<a name="ln2831">	bool inverseLockingOrder;</a>
+<a name="ln2832">	if (!_FindCommonAncestor(node1, node2, &amp;commonAncestor,</a>
+<a name="ln2833">			&amp;inverseLockingOrder)) {</a>
+<a name="ln2834">		return;</a>
+<a name="ln2835">	}</a>
+<a name="ln2836"> </a>
+<a name="ln2837">	// Unlock one branch up to the common ancestor and then the complete other</a>
+<a name="ln2838">	// branch up to the root. If one of the given nodes is the common ancestor,</a>
+<a name="ln2839">	// we need to make sure, we write-unlock it, if requested.</a>
+<a name="ln2840">	if (node2 == commonAncestor &amp;&amp; writeLock2) {</a>
+<a name="ln2841">		_UnlockNodeChainInternal(node1, writeLock1, NULL, commonAncestor);</a>
+<a name="ln2842">		_UnlockNodeChainInternal(node2, writeLock2, NULL, NULL);</a>
+<a name="ln2843">	} else {</a>
+<a name="ln2844">		_UnlockNodeChainInternal(node2, writeLock2, NULL, commonAncestor);</a>
+<a name="ln2845">		_UnlockNodeChainInternal(node1, writeLock1, NULL, NULL);</a>
+<a name="ln2846">	}</a>
+<a name="ln2847">}</a>
+<a name="ln2848"> </a>
+<a name="ln2849"> </a>
+<a name="ln2850">bool</a>
+<a name="ln2851">FUSEVolume::_FindCommonAncestor(FUSENode* node1, FUSENode* node2,</a>
+<a name="ln2852">	FUSENode** _commonAncestor, bool* _inverseLockingOrder)</a>
+<a name="ln2853">{</a>
+<a name="ln2854">	// handle trivial special case -- both nodes are the same</a>
+<a name="ln2855">	if (node1 == node2) {</a>
+<a name="ln2856">		*_commonAncestor = node1;</a>
+<a name="ln2857">		*_inverseLockingOrder = false;</a>
+<a name="ln2858">		return true;</a>
+<a name="ln2859">	}</a>
+<a name="ln2860"> </a>
+<a name="ln2861">	// get the ancestors of both nodes</a>
+<a name="ln2862">	FUSENode* ancestors1[kMaxNodeTreeDepth];</a>
+<a name="ln2863">	FUSENode* ancestors2[kMaxNodeTreeDepth];</a>
+<a name="ln2864">	uint32 count1;</a>
+<a name="ln2865">	uint32 count2;</a>
+<a name="ln2866"> </a>
+<a name="ln2867">	if (!_GetNodeAncestors(node1, ancestors1, &amp;count1)</a>
+<a name="ln2868">		|| !_GetNodeAncestors(node2, ancestors2, &amp;count2)) {</a>
+<a name="ln2869">		return false;</a>
+<a name="ln2870">	}</a>
+<a name="ln2871"> </a>
+<a name="ln2872">	// find the first ancestor not common to both nodes</a>
+<a name="ln2873">	uint32 index = 0;</a>
+<a name="ln2874">	for (; index &lt; count1 &amp;&amp; index &lt; count2; index++) {</a>
+<a name="ln2875">		FUSENode* ancestor1 = ancestors1[count1 - index - 1];</a>
+<a name="ln2876">		FUSENode* ancestor2 = ancestors2[count2 - index - 1];</a>
+<a name="ln2877">		if (ancestor1 != ancestor2) {</a>
+<a name="ln2878">			*_commonAncestor = ancestors1[count1 - index];</a>
+<a name="ln2879">			*_inverseLockingOrder = ancestor1-&gt;id &gt; ancestor2-&gt;id;</a>
+<a name="ln2880">			return true;</a>
+<a name="ln2881">		}</a>
+<a name="ln2882">	}</a>
+<a name="ln2883"> </a>
+<a name="ln2884">	// one node is an ancestor of the other</a>
+<a name="ln2885">	*_commonAncestor = ancestors1[count1 - index];</a>
+<a name="ln2886">	*_inverseLockingOrder = index == count1;</a>
+<a name="ln2887">	return true;</a>
+<a name="ln2888">}</a>
+<a name="ln2889"> </a>
+<a name="ln2890"> </a>
+<a name="ln2891">bool</a>
+<a name="ln2892">FUSEVolume::_GetNodeAncestors(FUSENode* node, FUSENode** ancestors,</a>
+<a name="ln2893">	uint32* _count)</a>
+<a name="ln2894">{</a>
+<a name="ln2895">	uint32 count = 0;</a>
+<a name="ln2896">	while (node != NULL &amp;&amp; count &lt; kMaxNodeTreeDepth) {</a>
+<a name="ln2897">		ancestors[count++] = node;</a>
+<a name="ln2898"> </a>
+<a name="ln2899">		if (node == fRootNode) {</a>
+<a name="ln2900">			*_count = count;</a>
+<a name="ln2901">			return true;</a>
+<a name="ln2902">		}</a>
+<a name="ln2903"> </a>
+<a name="ln2904">		node = node-&gt;Parent();</a>
+<a name="ln2905">	}</a>
+<a name="ln2906"> </a>
+<a name="ln2907">	// Either the node is not in the tree or we hit the array limit.</a>
+<a name="ln2908">	return false;</a>
+<a name="ln2909">}</a>
+<a name="ln2910"> </a>
+<a name="ln2911"> </a>
+<a name="ln2912">status_t</a>
+<a name="ln2913">FUSEVolume::_BuildPath(FUSENode* dir, const char* entryName, char* path,</a>
+<a name="ln2914">	size_t&amp; pathLen)</a>
+<a name="ln2915">{</a>
+<a name="ln2916">	// get the directory path</a>
+<a name="ln2917">	status_t error = _BuildPath(dir, path, pathLen);</a>
+<a name="ln2918">	if (error != B_OK)</a>
+<a name="ln2919">		return error;</a>
+<a name="ln2920"> </a>
+<a name="ln2921">	if (path[pathLen - 1] != '/') {</a>
+<a name="ln2922">		path[pathLen++] = '/';</a>
+<a name="ln2923">		if (pathLen == B_PATH_NAME_LENGTH)</a>
+<a name="ln2924">			RETURN_ERROR(B_NAME_TOO_LONG);</a>
+<a name="ln2925">	}</a>
+<a name="ln2926"> </a>
+<a name="ln2927">	// append the entry name</a>
+<a name="ln2928">	size_t len = strlen(entryName);</a>
+<a name="ln2929">	if (pathLen + len &gt;= B_PATH_NAME_LENGTH)</a>
+<a name="ln2930">		RETURN_ERROR(B_NAME_TOO_LONG);</a>
+<a name="ln2931"> </a>
+<a name="ln2932">	memcpy(path + pathLen, entryName, len + 1);</a>
+<a name="ln2933">	pathLen += len;</a>
+<a name="ln2934"> </a>
+<a name="ln2935">	return B_OK;</a>
+<a name="ln2936">}</a>
+<a name="ln2937"> </a>
+<a name="ln2938"> </a>
+<a name="ln2939">status_t</a>
+<a name="ln2940">FUSEVolume::_BuildPath(FUSENode* node, char* path, size_t&amp; pathLen)</a>
+<a name="ln2941">{</a>
+<a name="ln2942">	if (node == fRootNode) {</a>
+<a name="ln2943">		// we hit the root</a>
+<a name="ln2944">		strcpy(path, &quot;/&quot;);</a>
+<a name="ln2945">		pathLen = 1;</a>
+<a name="ln2946">		return B_OK;</a>
+<a name="ln2947">	}</a>
+<a name="ln2948"> </a>
+<a name="ln2949">	// get an entry for the node and get its path</a>
+<a name="ln2950">	FUSEEntry* entry = node-&gt;entries.Head();</a>
+<a name="ln2951">	if (entry == NULL)</a>
+<a name="ln2952">		RETURN_ERROR(B_ENTRY_NOT_FOUND);</a>
+<a name="ln2953"> </a>
+<a name="ln2954">	return _BuildPath(entry-&gt;parent, entry-&gt;name, path, pathLen);</a>
+<a name="ln2955">}</a>
+<a name="ln2956"> </a>
+<a name="ln2957"> </a>
+<a name="ln2958">/*static*/ int</a>
+<a name="ln2959">FUSEVolume::_AddReadDirEntry(void* _buffer, const char* name,</a>
+<a name="ln2960">	const struct stat* st, off_t offset)</a>
+<a name="ln2961">{</a>
+<a name="ln2962">	ReadDirBuffer* buffer = (ReadDirBuffer*)_buffer;</a>
+<a name="ln2963"> </a>
+<a name="ln2964">	ino_t nodeID = st != NULL ? st-&gt;st_ino : 0;</a>
+<a name="ln2965">	int type = st != NULL ? st-&gt;st_mode &amp; S_IFMT : 0;</a>
+<a name="ln2966">	return buffer-&gt;volume-&gt;_AddReadDirEntry(buffer, name, type, nodeID, offset);</a>
+<a name="ln2967">}</a>
+<a name="ln2968"> </a>
+<a name="ln2969"> </a>
+<a name="ln2970">/*static*/ int</a>
+<a name="ln2971">FUSEVolume::_AddReadDirEntryGetDir(fuse_dirh_t handle, const char* name,</a>
+<a name="ln2972">	int type, ino_t nodeID)</a>
+<a name="ln2973">{</a>
+<a name="ln2974">	ReadDirBuffer* buffer = (ReadDirBuffer*)handle;</a>
+<a name="ln2975">	return buffer-&gt;volume-&gt;_AddReadDirEntry(buffer, name, type &lt;&lt; 12, nodeID,</a>
+<a name="ln2976">		0);</a>
+<a name="ln2977">}</a>
+<a name="ln2978"> </a>
+<a name="ln2979"> </a>
+<a name="ln2980">int</a>
+<a name="ln2981">FUSEVolume::_AddReadDirEntry(ReadDirBuffer* buffer, const char* name, int type,</a>
+<a name="ln2982">	ino_t nodeID, off_t offset)</a>
+<a name="ln2983">{</a>
+<a name="ln2984">	PRINT((&quot;FUSEVolume::_AddReadDirEntry(%p, \&quot;%s\&quot;, %#x, %&quot; B_PRId64 &quot;, %&quot;</a>
+<a name="ln2985">		B_PRId64 &quot;\n&quot;, buffer, name, type, nodeID, offset));</a>
+<a name="ln2986"> </a>
+<a name="ln2987">	AutoLocker&lt;Locker&gt; locker(fLock);</a>
+<a name="ln2988"> </a>
+<a name="ln2989">	size_t entryLen = 0;</a>
+<a name="ln2990">	if (offset != 0) {</a>
+<a name="ln2991">		// does the caller want more entries?</a>
+<a name="ln2992">		if (buffer-&gt;entriesRead == buffer-&gt;maxEntries)</a>
+<a name="ln2993">			return 1;</a>
+<a name="ln2994"> </a>
+<a name="ln2995">		// compute the entry length and check whether the entry still fits</a>
+<a name="ln2996">		entryLen = sizeof(dirent) + strlen(name);</a>
+<a name="ln2997">		if (buffer-&gt;usedSize + entryLen &gt; buffer-&gt;bufferSize)</a>
+<a name="ln2998">			return 1;</a>
+<a name="ln2999">	}</a>
+<a name="ln3000"> </a>
+<a name="ln3001">	// create a node and an entry, if necessary</a>
+<a name="ln3002">	ino_t dirID = buffer-&gt;directory-&gt;id;</a>
+<a name="ln3003">	FUSEEntry* entry;</a>
+<a name="ln3004">	if (strcmp(name, &quot;.&quot;) == 0) {</a>
+<a name="ln3005">		// current dir entry</a>
+<a name="ln3006">		nodeID = dirID;</a>
+<a name="ln3007">		type = S_IFDIR;</a>
+<a name="ln3008">	} else if (strcmp(name, &quot;..&quot;) == 0) {</a>
+<a name="ln3009">		// parent dir entry</a>
+<a name="ln3010">		FUSEEntry* parentEntry = buffer-&gt;directory-&gt;entries.Head();</a>
+<a name="ln3011">		if (parentEntry == NULL) {</a>
+<a name="ln3012">			ERROR((&quot;FUSEVolume::_AddReadDirEntry(): dir %&quot; B_PRId64</a>
+<a name="ln3013">				&quot; has no entry!\n&quot;, dirID));</a>
+<a name="ln3014">			return 0;</a>
+<a name="ln3015">		}</a>
+<a name="ln3016">		nodeID = parentEntry-&gt;parent-&gt;id;</a>
+<a name="ln3017">		type = S_IFDIR;</a>
+<a name="ln3018">	} else if ((entry = fEntries.Lookup(FUSEEntryRef(dirID, name))) == NULL) {</a>
+<a name="ln3019">		// get the node</a>
+<a name="ln3020">		FUSENode* node = NULL;</a>
+<a name="ln3021">		if (fUseNodeIDs)</a>
+<a name="ln3022">			node = fNodes.Lookup(nodeID);</a>
+<a name="ln3023">		else</a>
+<a name="ln3024">			nodeID = _GenerateNodeID();</a>
+<a name="ln3025"> </a>
+<a name="ln3026">		if (node == NULL) {</a>
+<a name="ln3027">			// no node yet -- create one</a>
+<a name="ln3028"> </a>
+<a name="ln3029">			// If we don't have a valid type, we need to stat the node first.</a>
+<a name="ln3030">			if (type == 0) {</a>
+<a name="ln3031">				char path[B_PATH_NAME_LENGTH];</a>
+<a name="ln3032">				size_t pathLen;</a>
+<a name="ln3033">				status_t error = _BuildPath(buffer-&gt;directory, name, path,</a>
+<a name="ln3034">					pathLen);</a>
+<a name="ln3035">				if (error != B_OK) {</a>
+<a name="ln3036">					buffer-&gt;error = error;</a>
+<a name="ln3037">					return 0;</a>
+<a name="ln3038">				}</a>
+<a name="ln3039"> </a>
+<a name="ln3040">				locker.Unlock();</a>
+<a name="ln3041"> </a>
+<a name="ln3042">				// stat the path</a>
+<a name="ln3043">				struct stat st;</a>
+<a name="ln3044">				int fuseError = fuse_fs_getattr(fFS, path, &amp;st);</a>
+<a name="ln3045"> </a>
+<a name="ln3046">				locker.Lock();</a>
+<a name="ln3047"> </a>
+<a name="ln3048">				if (fuseError != 0) {</a>
+<a name="ln3049">					buffer-&gt;error = fuseError;</a>
+<a name="ln3050">					return 0;</a>
+<a name="ln3051">				}</a>
+<a name="ln3052"> </a>
+<a name="ln3053">				type = st.st_mode &amp; S_IFMT;</a>
+<a name="ln3054">			}</a>
+<a name="ln3055"> </a>
+<a name="ln3056">			node = new(std::nothrow) FUSENode(nodeID, type);</a>
+<a name="ln3057">			if (node == NULL) {</a>
+<a name="ln3058">				buffer-&gt;error = B_NO_MEMORY;</a>
+<a name="ln3059">				return 1;</a>
+<a name="ln3060">			}</a>
+<a name="ln3061">			PRINT((&quot;  -&gt; create node: %p, id: %&quot; B_PRId64 &quot;\n&quot;, node, nodeID));</a>
+<a name="ln3062"> </a>
+<a name="ln3063">			fNodes.Insert(node);</a>
+<a name="ln3064">		} else {</a>
+<a name="ln3065">			// get a node reference for the entry</a>
+<a name="ln3066">			node-&gt;refCount++;</a>
+<a name="ln3067">		}</a>
+<a name="ln3068"> </a>
+<a name="ln3069">		// create the entry</a>
+<a name="ln3070">		entry = FUSEEntry::Create(buffer-&gt;directory, name, node);</a>
+<a name="ln3071">		if (entry == NULL) {</a>
+<a name="ln3072">			_PutNode(node);</a>
+<a name="ln3073">			buffer-&gt;error = B_NO_MEMORY;</a>
+<a name="ln3074">			return 1;</a>
+<a name="ln3075">		}</a>
+<a name="ln3076"> </a>
+<a name="ln3077">		buffer-&gt;directory-&gt;refCount++;</a>
+<a name="ln3078">			// dir reference for the entry</a>
+<a name="ln3079"> </a>
+<a name="ln3080">		fEntries.Insert(entry);</a>
+<a name="ln3081">		node-&gt;entries.Add(entry);</a>
+<a name="ln3082">	} else {</a>
+<a name="ln3083">		// TODO: Check whether the node's ID matches the one we got (if any)!</a>
+<a name="ln3084">		nodeID = entry-&gt;node-&gt;id;</a>
+<a name="ln3085">		type = entry-&gt;node-&gt;type;</a>
+<a name="ln3086">	}</a>
+<a name="ln3087"> </a>
+<a name="ln3088">	if (offset == 0) {</a>
+<a name="ln3089">		// cache the entry</a>
+<a name="ln3090">		if (buffer-&gt;cookie-&gt;entryCache == NULL) {</a>
+<a name="ln3091">			// no cache yet -- create it</a>
+<a name="ln3092">			buffer-&gt;cookie-&gt;entryCache = new(std::nothrow) DirEntryCache;</a>
+<a name="ln3093">			if (buffer-&gt;cookie-&gt;entryCache == NULL) {</a>
+<a name="ln3094">				buffer-&gt;error = B_NO_MEMORY;</a>
+<a name="ln3095">				return 1;</a>
+<a name="ln3096">			}</a>
+<a name="ln3097">		}</a>
+<a name="ln3098"> </a>
+<a name="ln3099">		status_t error = buffer-&gt;cookie-&gt;entryCache-&gt;AddEntry(nodeID, name);</a>
+<a name="ln3100">		if (error != B_OK) {</a>
+<a name="ln3101">			buffer-&gt;error = error;</a>
+<a name="ln3102">			return 1;</a>
+<a name="ln3103">		}</a>
+<a name="ln3104">	} else {</a>
+<a name="ln3105">		// fill in the dirent</a>
+<a name="ln3106">		dirent* dirEntry = (dirent*)((uint8*)buffer-&gt;buffer + buffer-&gt;usedSize);</a>
+<a name="ln3107">		dirEntry-&gt;d_dev = fID;</a>
+<a name="ln3108">		dirEntry-&gt;d_ino = nodeID;</a>
+<a name="ln3109">		strcpy(dirEntry-&gt;d_name, name);</a>
+<a name="ln3110"> </a>
+<a name="ln3111">		if (buffer-&gt;entriesRead + 1 &lt; buffer-&gt;maxEntries) {</a>
+<a name="ln3112">			// align the entry length, so the next dirent will be aligned</a>
+<a name="ln3113">			entryLen = (entryLen + 7) / 8 * 8;</a>
+<a name="ln3114">			entryLen = std::min(entryLen,</a>
+<a name="ln3115">				buffer-&gt;bufferSize - buffer-&gt;usedSize);</a>
+<a name="ln3116">		}</a>
+<a name="ln3117"> </a>
+<a name="ln3118">		dirEntry-&gt;d_reclen = entryLen;</a>
+<a name="ln3119"> </a>
+<a name="ln3120">		// update the buffer</a>
+<a name="ln3121">		buffer-&gt;usedSize += entryLen;</a>
+<a name="ln3122">		buffer-&gt;entriesRead++;</a>
+<a name="ln3123">		buffer-&gt;cookie-&gt;currentEntryOffset = offset;</a>
+<a name="ln3124">	}</a>
+<a name="ln3125"> </a>
+<a name="ln3126">	return 0;</a>
+<a name="ln3127">}</a>
+
+</code></pre>
+<div class="balloon" rel="2215"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v773/" target="_blank">V773</a> The function was exited without releasing the 'cookie' pointer. A memory leak is possible.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,807 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>wacom.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2005-2008, Haiku, Inc. All Rights Reserved.</a>
+<a name="ln3"> * Distributed under the terms of the MIT License.</a>
+<a name="ln4"> *</a>
+<a name="ln5"> * Authors:</a>
+<a name="ln6"> *		Stephan Aßmus &lt;superstippi@gmx.de&gt;</a>
+<a name="ln7"> *</a>
+<a name="ln8"> * Portions of this code are based on Be Sample Code released under the</a>
+<a name="ln9"> * Be Sample Code license. (USB sound device driver sample code IIRC.)</a>
+<a name="ln10"> */</a>
+<a name="ln11"> </a>
+<a name="ln12">#include &lt;stdio.h&gt;</a>
+<a name="ln13">#include &lt;stdlib.h&gt;</a>
+<a name="ln14">#include &lt;string.h&gt;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &lt;Drivers.h&gt;</a>
+<a name="ln17">#include &lt;KernelExport.h&gt;</a>
+<a name="ln18">#include &lt;OS.h&gt;</a>
+<a name="ln19">#include &lt;USB3.h&gt;</a>
+<a name="ln20"> </a>
+<a name="ln21">int32 api_version = B_CUR_DRIVER_API_VERSION;</a>
+<a name="ln22"> </a>
+<a name="ln23">#define DEBUG_DRIVER 0</a>
+<a name="ln24"> </a>
+<a name="ln25">#if DEBUG_DRIVER</a>
+<a name="ln26">#	define DPRINTF_INFO(x) dprintf x;</a>
+<a name="ln27">#	define DPRINTF_ERR(x) dprintf x;</a>
+<a name="ln28">#else</a>
+<a name="ln29">#	define DPRINTF_INFO(x)</a>
+<a name="ln30">#	define DPRINTF_ERR(x) dprintf x;</a>
+<a name="ln31">#endif</a>
+<a name="ln32"> </a>
+<a name="ln33">typedef struct wacom_device wacom_device;</a>
+<a name="ln34"> </a>
+<a name="ln35">struct wacom_device {</a>
+<a name="ln36">	wacom_device*		next;</a>
+<a name="ln37"> </a>
+<a name="ln38">	int					open;</a>
+<a name="ln39">	int					number;</a>
+<a name="ln40"> </a>
+<a name="ln41">	usb_device			dev;</a>
+<a name="ln42"> </a>
+<a name="ln43">	usb_pipe			pipe;</a>
+<a name="ln44">	char*				data;</a>
+<a name="ln45">	size_t				max_packet_size;</a>
+<a name="ln46">	size_t				length;</a>
+<a name="ln47"> </a>
+<a name="ln48">	uint16				vendor;</a>
+<a name="ln49">	uint16				product;</a>
+<a name="ln50"> </a>
+<a name="ln51">	sem_id				notify_lock;</a>
+<a name="ln52">	uint32				status;</a>
+<a name="ln53">};</a>
+<a name="ln54"> </a>
+<a name="ln55">// handy strings for referring to ourself</a>
+<a name="ln56">#define ID &quot;wacom: &quot;</a>
+<a name="ln57">static const char* kDriverName = &quot;wacom&quot;;</a>
+<a name="ln58">static const char* kBasePublishPath = &quot;input/wacom/usb/&quot;;</a>
+<a name="ln59"> </a>
+<a name="ln60">// list of device instances and names for publishing</a>
+<a name="ln61">static wacom_device* sDeviceList = NULL;</a>
+<a name="ln62">static sem_id sDeviceListLock = -1;</a>
+<a name="ln63">static int sDeviceCount = 0;</a>
+<a name="ln64"> </a>
+<a name="ln65">static char** sDeviceNames = NULL;</a>
+<a name="ln66"> </a>
+<a name="ln67">// handle for the USB bus manager</a>
+<a name="ln68">static usb_module_info* usb;</a>
+<a name="ln69"> </a>
+<a name="ln70">// These rather inelegant routines are used to assign numbers to</a>
+<a name="ln71">// device instances so that they have unique names in devfs.</a>
+<a name="ln72"> </a>
+<a name="ln73">static uint32 sDeviceNumbers = 0;</a>
+<a name="ln74"> </a>
+<a name="ln75">// get_number</a>
+<a name="ln76">static int</a>
+<a name="ln77">get_number()</a>
+<a name="ln78">{</a>
+<a name="ln79">	int num;</a>
+<a name="ln80"> </a>
+<a name="ln81">	for (num = 0; num &lt; 32; num++) {</a>
+<a name="ln82">		if (!(sDeviceNumbers &amp; (1 &lt;&lt; num))) {</a>
+<a name="ln83">			sDeviceNumbers |= (1 &lt;&lt; num);</a>
+<a name="ln84">			return num;</a>
+<a name="ln85">		}</a>
+<a name="ln86">	}</a>
+<a name="ln87"> </a>
+<a name="ln88">	return -1;</a>
+<a name="ln89">}</a>
+<a name="ln90"> </a>
+<a name="ln91">// put_number</a>
+<a name="ln92">static void</a>
+<a name="ln93">put_number(int num)</a>
+<a name="ln94">{</a>
+<a name="ln95">	sDeviceNumbers &amp;= ~(1 &lt;&lt; num);</a>
+<a name="ln96">}</a>
+<a name="ln97"> </a>
+<a name="ln98">// #pragma mark - Device addition and removal</a>
+<a name="ln99">//</a>
+<a name="ln100">// add_device() and remove_device() are used to create and tear down</a>
+<a name="ln101">// device instances.  They are used from the callbacks device_added()</a>
+<a name="ln102">// and device_removed() which are invoked by the USB bus manager.</a>
+<a name="ln103"> </a>
+<a name="ln104">// add_device</a>
+<a name="ln105">static wacom_device*</a>
+<a name="ln106">add_device(usb_device dev)</a>
+<a name="ln107">{</a>
+<a name="ln108">	wacom_device *device = NULL;</a>
+<a name="ln109">	int num, ifc, alt;</a>
+<a name="ln110">	const usb_interface_info *ii;</a>
+<a name="ln111">	status_t st;</a>
+<a name="ln112">	const usb_device_descriptor* udd;</a>
+<a name="ln113">	const usb_configuration_info *conf;</a>
+<a name="ln114">	bool setConfiguration = false;</a>
+<a name="ln115"> </a>
+<a name="ln116">	// we need these four for a Wacom tablet</a>
+<a name="ln117">	size_t controlTransferLength;</a>
+<a name="ln118">	int tryCount;</a>
+<a name="ln119">	char repData[2] = { 0x02, 0x02 };</a>
+<a name="ln120">	char retData[2] = { 0x00, 0x00 };</a>
+<a name="ln121"> </a>
+<a name="ln122">	conf = usb-&gt;get_configuration(dev);</a>
+<a name="ln123">	DPRINTF_INFO((ID &quot;add_device(%ld, %p)\n&quot;, dev, conf));</a>
+<a name="ln124"> </a>
+<a name="ln125">	if ((num = get_number()) &lt; 0)</a>
+<a name="ln126">		return NULL;</a>
+<a name="ln127"> </a>
+<a name="ln128">	udd = usb-&gt;get_device_descriptor(dev);</a>
+<a name="ln129">	// only pick up wacom tablets</a>
+<a name="ln130">	if (udd &amp;&amp; udd-&gt;vendor_id == 0x056a) {</a>
+<a name="ln131"> </a>
+<a name="ln132">		DPRINTF_ERR((ID &quot;add_device() - wacom detected\n&quot;));</a>
+<a name="ln133"> </a>
+<a name="ln134">		// see if the device has been configured already</a>
+<a name="ln135">		if (!conf) {</a>
+<a name="ln136">			conf = usb-&gt;get_nth_configuration(dev, 0);</a>
+<a name="ln137">			setConfiguration = true;</a>
+<a name="ln138">		}</a>
+<a name="ln139"> </a>
+<a name="ln140">		if (!conf)</a>
+<a name="ln141">			goto fail;</a>
+<a name="ln142"> </a>
+<a name="ln143">		for (ifc = 0; ifc &lt; conf-&gt;interface_count; ifc++) {</a>
+<a name="ln144">			DPRINTF_INFO((ID &quot;add_device() - examining interface: %d\n&quot;, ifc));</a>
+<a name="ln145">			for (alt = 0; alt &lt; conf-&gt;interface[ifc].alt_count; alt++) {</a>
+<a name="ln146">				ii = &amp;conf-&gt;interface[ifc].alt[alt];</a>
+<a name="ln147">				DPRINTF_INFO((ID &quot;add_device() - examining alt interface: &quot;</a>
+<a name="ln148">					&quot;%d\n&quot;, alt));</a>
+<a name="ln149"> </a>
+<a name="ln150"> </a>
+<a name="ln151">				// does it have the correct type of interface?</a>
+<a name="ln152">				if (ii-&gt;descr-&gt;interface_class != 3) continue;</a>
+<a name="ln153">				if (ii-&gt;descr-&gt;interface_subclass != 1) continue;</a>
+<a name="ln154">				if (ii-&gt;endpoint_count != 1) continue;</a>
+<a name="ln155"> </a>
+<a name="ln156">				// only accept input endpoints</a>
+<a name="ln157">				if (ii-&gt;endpoint[0].descr-&gt;endpoint_address &amp; 0x80) {</a>
+<a name="ln158">					DPRINTF_INFO((ID &quot;add_device() - found input endpoint\n&quot;));</a>
+<a name="ln159">					goto got_one;</a>
+<a name="ln160">				}</a>
+<a name="ln161">			}</a>
+<a name="ln162">		}</a>
+<a name="ln163">	} else</a>
+<a name="ln164">		goto fail;</a>
+<a name="ln165"> </a>
+<a name="ln166">fail:</a>
+<a name="ln167">	put_number(num);</a>
+<a name="ln168">	if (device) {</a>
+<a name="ln169">		free(device-&gt;data);</a>
+<a name="ln170">		free(device);</a>
+<a name="ln171">	}</a>
+<a name="ln172">	return NULL;</a>
+<a name="ln173"> </a>
+<a name="ln174">got_one:</a>
+<a name="ln175">	if ((device = (wacom_device *) malloc(sizeof(wacom_device))) == NULL)</a>
+<a name="ln176">		goto fail;</a>
+<a name="ln177"> </a>
+<a name="ln178">	device-&gt;dev = dev;</a>
+<a name="ln179">	device-&gt;number = num;</a>
+<a name="ln180">	device-&gt;open = 1;</a>
+<a name="ln181">	device-&gt;notify_lock = -1;</a>
+<a name="ln182">	device-&gt;data = NULL;</a>
+<a name="ln183"> </a>
+<a name="ln184">//	if (setConfiguration) {</a>
+<a name="ln185">		// the configuration has to be set yet (was not the current one)</a>
+<a name="ln186">		DPRINTF_INFO((ID &quot;add_device() - setting configuration...\n&quot;));</a>
+<a name="ln187">		if ((st = usb-&gt;set_configuration(dev, conf)) != B_OK) {</a>
+<a name="ln188">			dprintf(ID &quot;add_device() -&gt; set_configuration() returns %ld\n&quot;, st);</a>
+<a name="ln189">			goto fail;</a>
+<a name="ln190">		} else</a>
+<a name="ln191">			DPRINTF_ERR((ID &quot; ... success!\n&quot;));</a>
+<a name="ln192"> </a>
+<a name="ln193">		if (conf-&gt;interface[ifc].active != ii) {</a>
+<a name="ln194">			// the interface we found is not the active one and has to be set</a>
+<a name="ln195">			DPRINTF_INFO((ID &quot;add_device() - setting interface: %p...\n&quot;, ii));</a>
+<a name="ln196">			if ((st = usb-&gt;set_alt_interface(dev, ii)) != B_OK) {</a>
+<a name="ln197">				dprintf(ID &quot;add_device() -&gt; set_alt_interface() returns %ld\n&quot;,</a>
+<a name="ln198">					st);</a>
+<a name="ln199">				goto fail;</a>
+<a name="ln200">			} else</a>
+<a name="ln201">				DPRINTF_ERR((ID &quot; ... success!\n&quot;));</a>
+<a name="ln202">		}</a>
+<a name="ln203">		// see if the device is a Wacom tablet and needs some special treatment</a>
+<a name="ln204">		// let's hope Wacom doesn't produce normal mice any time soon, or this</a>
+<a name="ln205">		// check will have to be more specific about product_id...hehe</a>
+<a name="ln206">		if (udd-&gt;vendor_id == 0x056a) {</a>
+<a name="ln207">			// do the control transfers to set up absolute mode (default is HID</a>
+<a name="ln208">			// mode)</a>
+<a name="ln209"> </a>
+<a name="ln210">			// see 'Device Class Definition for HID 1.11' (HID1_11.pdf),</a>
+<a name="ln211">			// par. 7.2 (available at www.usb.org/developers/hidpage)</a>
+<a name="ln212"> </a>
+<a name="ln213">			// set protocol mode to 'report' (instead of 'boot')</a>
+<a name="ln214">			controlTransferLength = 0;</a>
+<a name="ln215">			// HID Class-Specific Request, Host to device (=0x21):</a>
+<a name="ln216">			// SET_PROTOCOL (=0x0b) to Report Protocol (=1)</a>
+<a name="ln217">			// of Interface #0 (=0)</a>
+<a name="ln218">			st = usb-&gt;send_request(dev, 0x21, 0x0b, 1, 0, 0, 0,</a>
+<a name="ln219">				&amp;controlTransferLength);</a>
+<a name="ln220"> </a>
+<a name="ln221">			if (st &lt; B_OK) {</a>
+<a name="ln222">				dprintf(ID &quot;add_device() - control transfer 1 failed: %ld\n&quot;,</a>
+<a name="ln223">					st);</a>
+<a name="ln224">			}</a>
+<a name="ln225"> </a>
+<a name="ln226">			// try up to five times to set the tablet to 'Wacom'-mode (enabling</a>
+<a name="ln227">			// absolute mode, pressure data, etc.)</a>
+<a name="ln228">			controlTransferLength = 2;</a>
+<a name="ln229"> </a>
+<a name="ln230">			for (tryCount = 0; tryCount &lt; 5; tryCount++) {</a>
+<a name="ln231">				// HID Class-Specific Request, Host to device (=0x21):</a>
+<a name="ln232">				// SET_REPORT (=0x09) type Feature (=3) with ID 2 (=2) of</a>
+<a name="ln233">				// Interface #0 (=0) to repData (== { 0x02, 0x02 })</a>
+<a name="ln234">				st = usb-&gt;send_request(dev, 0x21, 0x09, (3 &lt;&lt; 8) + 2, 0, 2,</a>
+<a name="ln235">					repData, &amp;controlTransferLength);</a>
+<a name="ln236"> </a>
+<a name="ln237">				if (st &lt; B_OK) {</a>
+<a name="ln238">					dprintf(ID &quot;add_device() - control transfer 2 failed: %ld&quot;</a>
+<a name="ln239">						&quot;\n&quot;, st);</a>
+<a name="ln240">				}</a>
+<a name="ln241"> </a>
+<a name="ln242">				// check if registers are set correctly</a>
+<a name="ln243"> </a>
+<a name="ln244">				// HID Class-Specific Request, Device to host (=0xA1):</a>
+<a name="ln245">				// GET_REPORT (=0x01) type Feature (=3) with ID 2 (=2) of</a>
+<a name="ln246">				// Interface #0 (=0) to retData</a>
+<a name="ln247">				st = usb-&gt;send_request(dev, 0xA1, 0x01, (3 &lt;&lt; 8) + 2, 0, 2,</a>
+<a name="ln248">					retData, &amp;controlTransferLength);</a>
+<a name="ln249"> </a>
+<a name="ln250">				if (st &lt; B_OK) {</a>
+<a name="ln251">					dprintf(ID &quot;add_device() - control transfer 3 failed: %ld&quot;</a>
+<a name="ln252">						&quot;\n&quot;, st);</a>
+<a name="ln253">				}</a>
+<a name="ln254"> </a>
+<a name="ln255">				DPRINTF_INFO((ID &quot;add_device() - retData: %u - %u\n&quot;,</a>
+<a name="ln256">					retData[0], retData[1]));</a>
+<a name="ln257"> </a>
+<a name="ln258">				if (retData[0] == repData[0] &amp;&amp; retData[1] == repData[1]) {</a>
+<a name="ln259">					DPRINTF_INFO((ID &quot;add_device() - successfully set &quot;</a>
+<a name="ln260">						&quot;'Wacom'-mode\n&quot;));</a>
+<a name="ln261">					break;</a>
+<a name="ln262">				}</a>
+<a name="ln263">			}</a>
+<a name="ln264"> </a>
+<a name="ln265">			DPRINTF_INFO((ID &quot;add_device() - number of tries: %u\n&quot;,</a>
+<a name="ln266">				tryCount + 1));</a>
+<a name="ln267"> </a>
+<a name="ln268">			if (tryCount &gt; 4) {</a>
+<a name="ln269">				dprintf(ID &quot;add_device() - set 'Wacom'-mode failed\n&quot;);</a>
+<a name="ln270">			}</a>
+<a name="ln271">		}</a>
+<a name="ln272">//	}</a>
+<a name="ln273"> </a>
+<a name="ln274">	// configure the rest of the wacom_device</a>
+<a name="ln275">	device-&gt;pipe = ii-&gt;endpoint[0].handle;</a>
+<a name="ln276">//DPRINTF_INFO((ID &quot;add_device() - pipe id = %ld\n&quot;, device-&gt;pipe));</a>
+<a name="ln277">	device-&gt;length = 0;</a>
+<a name="ln278">	device-&gt;max_packet_size = ii-&gt;endpoint[0].descr-&gt;max_packet_size;</a>
+<a name="ln279">	device-&gt;data = (char*)malloc(device-&gt;max_packet_size);</a>
+<a name="ln280">	if (device-&gt;data == NULL)</a>
+<a name="ln281">		goto fail;</a>
+<a name="ln282">//DPRINTF_INFO((ID &quot;add_device() - max packet length = %ld\n&quot;,</a>
+<a name="ln283">//	device-&gt;max_packet_size));</a>
+<a name="ln284">	device-&gt;status = 0;//B_USB_STATUS_SUCCESS;</a>
+<a name="ln285">	device-&gt;vendor = udd-&gt;vendor_id;</a>
+<a name="ln286">	device-&gt;product = udd-&gt;product_id;</a>
+<a name="ln287"> </a>
+<a name="ln288">	DPRINTF_INFO((ID &quot;add_device() - added %p (/dev/%s%d)\n&quot;, device,</a>
+<a name="ln289">		kBasePublishPath, num));</a>
+<a name="ln290"> </a>
+<a name="ln291">	// add it to the list of devices so it will be published, etc</a>
+<a name="ln292">	acquire_sem(sDeviceListLock);</a>
+<a name="ln293">	device-&gt;next = sDeviceList;</a>
+<a name="ln294">	sDeviceList = device;</a>
+<a name="ln295">	sDeviceCount++;</a>
+<a name="ln296">	release_sem(sDeviceListLock);</a>
+<a name="ln297"> </a>
+<a name="ln298">	return device;</a>
+<a name="ln299">}</a>
+<a name="ln300"> </a>
+<a name="ln301">// remove_device</a>
+<a name="ln302">static void</a>
+<a name="ln303">remove_device(wacom_device *device)</a>
+<a name="ln304">{</a>
+<a name="ln305">	put_number(device-&gt;number);</a>
+<a name="ln306"> </a>
+<a name="ln307">	usb-&gt;cancel_queued_transfers(device-&gt;pipe);</a>
+<a name="ln308"> </a>
+<a name="ln309">	delete_sem(device-&gt;notify_lock);</a>
+<a name="ln310">	if (device-&gt;data)</a>
+<a name="ln311">		free(device-&gt;data);</a>
+<a name="ln312">	free(device);</a>
+<a name="ln313">}</a>
+<a name="ln314"> </a>
+<a name="ln315">// device_added</a>
+<a name="ln316">static status_t</a>
+<a name="ln317">device_added(usb_device dev, void** cookie)</a>
+<a name="ln318">{</a>
+<a name="ln319">	wacom_device* device;</a>
+<a name="ln320"> </a>
+<a name="ln321">	DPRINTF_INFO((ID &quot;device_added(%ld,...)\n&quot;, dev));</a>
+<a name="ln322"> </a>
+<a name="ln323">	// first see, if this device is already added</a>
+<a name="ln324">	acquire_sem(sDeviceListLock);</a>
+<a name="ln325">	for (device = sDeviceList; device; device = device-&gt;next) {</a>
+<a name="ln326">		DPRINTF_ERR((ID &quot;device_added() - old device: %ld\n&quot;, device-&gt;dev));</a>
+<a name="ln327">		if (device-&gt;dev == dev) {</a>
+<a name="ln328">			DPRINTF_ERR((ID &quot;device_added() - already added - done!\n&quot;));</a>
+<a name="ln329">			*cookie = (void*)device;</a>
+<a name="ln330">			release_sem(sDeviceListLock);</a>
+<a name="ln331">			return B_OK;</a>
+<a name="ln332">		}</a>
+<a name="ln333">	}</a>
+<a name="ln334">	release_sem(sDeviceListLock);</a>
+<a name="ln335"> </a>
+<a name="ln336">	if ((device = add_device(dev)) != NULL) {</a>
+<a name="ln337">		*cookie = (void*)device;</a>
+<a name="ln338">		DPRINTF_INFO((ID &quot;device_added() - done!\n&quot;));</a>
+<a name="ln339">		return B_OK;</a>
+<a name="ln340">	} else</a>
+<a name="ln341">		DPRINTF_INFO((ID &quot;device_added() - failed to add device!\n&quot;));</a>
+<a name="ln342"> </a>
+<a name="ln343">	return B_ERROR;</a>
+<a name="ln344">}</a>
+<a name="ln345"> </a>
+<a name="ln346">// device_removed</a>
+<a name="ln347">static status_t</a>
+<a name="ln348">device_removed(void *cookie)</a>
+<a name="ln349">{</a>
+<a name="ln350">	wacom_device *device = (wacom_device *) cookie;</a>
+<a name="ln351"> </a>
+<a name="ln352">	DPRINTF_INFO((ID &quot;device_removed(%p)\n&quot;, device));</a>
+<a name="ln353"> </a>
+<a name="ln354">	if (device) {</a>
+<a name="ln355"> </a>
+<a name="ln356">		acquire_sem(sDeviceListLock);</a>
+<a name="ln357"> </a>
+<a name="ln358">		// remove it from the list of devices</a>
+<a name="ln359">		if (device == sDeviceList) {</a>
+<a name="ln360">			sDeviceList = device-&gt;next;</a>
+<a name="ln361">		} else {</a>
+<a name="ln362">			wacom_device *n;</a>
+<a name="ln363">			for (n = sDeviceList; n; n = n-&gt;next) {</a>
+<a name="ln364">				if (n-&gt;next == device) {</a>
+<a name="ln365">					n-&gt;next = device-&gt;next;</a>
+<a name="ln366">					break;</a>
+<a name="ln367">				}</a>
+<a name="ln368">			}</a>
+<a name="ln369">		}</a>
+<a name="ln370">		sDeviceCount--;</a>
+<a name="ln371"> </a>
+<a name="ln372">		// tear it down if it's not open --</a>
+<a name="ln373">		// otherwise the last device_free() will handle it</a>
+<a name="ln374"> </a>
+<a name="ln375">		device-&gt;open--;</a>
+<a name="ln376"> </a>
+<a name="ln377">		DPRINTF_ERR((ID &quot;device_removed() open: %d\n&quot;, device-&gt;open));</a>
+<a name="ln378"> </a>
+<a name="ln379">		if (device-&gt;open == 0) {</a>
+<a name="ln380">			remove_device(device);</a>
+<a name="ln381">		} else {</a>
+<a name="ln382">			dprintf(ID &quot;device /dev/%s%d still open -- marked for removal\n&quot;,</a>
+<a name="ln383">				kBasePublishPath, device-&gt;number);</a>
+<a name="ln384">		}</a>
+<a name="ln385"> </a>
+<a name="ln386">		release_sem(sDeviceListLock);</a>
+<a name="ln387">	}</a>
+<a name="ln388"> </a>
+<a name="ln389">	return B_OK;</a>
+<a name="ln390">}</a>
+<a name="ln391"> </a>
+<a name="ln392">// #pragma mark - Device Hooks</a>
+<a name="ln393">//</a>
+<a name="ln394">// Here we implement the posixy driver hooks (open/close/read/write/ioctl)</a>
+<a name="ln395"> </a>
+<a name="ln396">// device_open</a>
+<a name="ln397">static status_t</a>
+<a name="ln398">device_open(const char *dname, uint32 flags, void** cookie)</a>
+<a name="ln399">{</a>
+<a name="ln400">	wacom_device *device;</a>
+<a name="ln401">	int n;</a>
+<a name="ln402">	status_t ret = B_ERROR;</a>
+<a name="ln403"> </a>
+<a name="ln404">	char controlDevicePath[1024];</a>
+<a name="ln405">	sprintf(controlDevicePath, &quot;%s%s&quot;, kBasePublishPath, &quot;control&quot;);</a>
+<a name="ln406">	if (strcmp(dname, controlDevicePath) == 0) {</a>
+<a name="ln407">		dprintf(ID &quot;device_open() -&gt; refuse to open control device\n&quot;);</a>
+<a name="ln408">		return B_ERROR;</a>
+<a name="ln409">	}</a>
+<a name="ln410"> </a>
+<a name="ln411">	n = atoi(dname + strlen(kBasePublishPath));</a>
+<a name="ln412"> </a>
+<a name="ln413">	DPRINTF_INFO((ID &quot;device_open(\&quot;%s\&quot;,%d,...)\n&quot;, dname, flags));</a>
+<a name="ln414"> </a>
+<a name="ln415">	acquire_sem(sDeviceListLock);</a>
+<a name="ln416">	for (device = sDeviceList; device; device = device-&gt;next) {</a>
+<a name="ln417">		if (device-&gt;number == n) {</a>
+<a name="ln418">//			if (device-&gt;open &lt;= 1) {</a>
+<a name="ln419">				device-&gt;open++;</a>
+<a name="ln420">				*cookie = device;</a>
+<a name="ln421">				DPRINTF_ERR((ID &quot;device_open() open: %d\n&quot;, device-&gt;open));</a>
+<a name="ln422"> </a>
+<a name="ln423">				if (device-&gt;notify_lock &lt; 0) {</a>
+<a name="ln424">					device-&gt;notify_lock = create_sem(0, &quot;notify_lock&quot;);</a>
+<a name="ln425">					if (device-&gt;notify_lock &lt; 0) {</a>
+<a name="ln426">						ret = device-&gt;notify_lock;</a>
+<a name="ln427">						device-&gt;open--;</a>
+<a name="ln428">						*cookie = NULL;</a>
+<a name="ln429">						dprintf(ID &quot;device_open() -&gt; create_sem() returns %ld\n&quot;,</a>
+<a name="ln430">							ret);</a>
+<a name="ln431">					} else {</a>
+<a name="ln432">						ret = B_OK;</a>
+<a name="ln433">					}</a>
+<a name="ln434">				}</a>
+<a name="ln435">				release_sem(sDeviceListLock);</a>
+<a name="ln436">				return ret;</a>
+<a name="ln437">//			} else {</a>
+<a name="ln438">//				dprintf(ID &quot;device_open() -&gt; device is already open %ld\n&quot;, ret);</a>
+<a name="ln439">//				release_sem(sDeviceListLock);</a>
+<a name="ln440">//				return B_ERROR;</a>
+<a name="ln441">//			}</a>
+<a name="ln442">		}</a>
+<a name="ln443">	}</a>
+<a name="ln444">	release_sem(sDeviceListLock);</a>
+<a name="ln445">	return ret;</a>
+<a name="ln446">}</a>
+<a name="ln447"> </a>
+<a name="ln448">// device_close</a>
+<a name="ln449">static status_t</a>
+<a name="ln450">device_close (void *cookie)</a>
+<a name="ln451">{</a>
+<a name="ln452">#if DEBUG_DRIVER</a>
+<a name="ln453">	wacom_device *device = (wacom_device*) cookie;</a>
+<a name="ln454">	DPRINTF_ERR((ID &quot;device_close() name = \&quot;%s%d\&quot;\n&quot;, kBasePublishPath,</a>
+<a name="ln455">		device-&gt;number));</a>
+<a name="ln456">#endif</a>
+<a name="ln457">	return B_OK;</a>
+<a name="ln458">}</a>
+<a name="ln459"> </a>
+<a name="ln460">// device_free</a>
+<a name="ln461">static status_t</a>
+<a name="ln462">device_free(void *cookie)</a>
+<a name="ln463">{</a>
+<a name="ln464">	wacom_device *device = (wacom_device *)cookie;</a>
+<a name="ln465"> </a>
+<a name="ln466">	DPRINTF_INFO((ID &quot;device_free() name = \&quot;%s%d\&quot;\n&quot;, kBasePublishPath,</a>
+<a name="ln467">		device-&gt;number));</a>
+<a name="ln468"> </a>
+<a name="ln469">	acquire_sem(sDeviceListLock);</a>
+<a name="ln470"> </a>
+<a name="ln471">	device-&gt;open--;</a>
+<a name="ln472"> </a>
+<a name="ln473">	DPRINTF_INFO((ID &quot;device_free() open: %ld\n&quot;, device-&gt;open));</a>
+<a name="ln474"> </a>
+<a name="ln475">	if (device-&gt;open == 0) {</a>
+<a name="ln476">		remove_device(device);</a>
+<a name="ln477">	}</a>
+<a name="ln478">	release_sem(sDeviceListLock);</a>
+<a name="ln479"> </a>
+<a name="ln480">	return B_OK;</a>
+<a name="ln481">}</a>
+<a name="ln482"> </a>
+<a name="ln483">// device_interupt_callback</a>
+<a name="ln484">static void</a>
+<a name="ln485">device_interupt_callback(void* cookie, status_t status, void* data,</a>
+<a name="ln486">	uint32 actualLength)</a>
+<a name="ln487">{</a>
+<a name="ln488">	wacom_device* device = (wacom_device*)cookie;</a>
+<a name="ln489">	uint32 length = min_c(actualLength, device-&gt;max_packet_size);</a>
+<a name="ln490"> </a>
+<a name="ln491">	DPRINTF_INFO((ID &quot;device_interupt_callback(%p) name = \&quot;%s%d\&quot; -&gt; &quot;</a>
+<a name="ln492">		&quot;status: %ld, length: %ld\n&quot;, cookie, kBasePublishPath, device-&gt;number,</a>
+<a name="ln493">		status, actualLength));</a>
+<a name="ln494"> </a>
+<a name="ln495">	device-&gt;status = status;</a>
+<a name="ln496">	if (device-&gt;notify_lock &gt;= 0) {</a>
+<a name="ln497">		if (status == B_OK) {</a>
+<a name="ln498">			memcpy(device-&gt;data, data, length);</a>
+<a name="ln499">			device-&gt;length = length;</a>
+<a name="ln500">		} else {</a>
+<a name="ln501">			device-&gt;length = 0;</a>
+<a name="ln502">		}</a>
+<a name="ln503">		release_sem(device-&gt;notify_lock);</a>
+<a name="ln504">	}</a>
+<a name="ln505"> </a>
+<a name="ln506">	DPRINTF_INFO((ID &quot;device_interupt_callback() - done\n&quot;));</a>
+<a name="ln507">}</a>
+<a name="ln508"> </a>
+<a name="ln509">// read_header</a>
+<a name="ln510">static void</a>
+<a name="ln511">read_header(const wacom_device* device, void* buffer)</a>
+<a name="ln512">{</a>
+<a name="ln513">	uint16* ids = (uint16*)buffer;</a>
+<a name="ln514">	uint32* size = (uint32*)buffer;</a>
+<a name="ln515"> </a>
+<a name="ln516">	ids[0] = device-&gt;vendor;</a>
+<a name="ln517">	ids[1] = device-&gt;product;</a>
+<a name="ln518">	size[1] = device-&gt;max_packet_size;</a>
+<a name="ln519">}</a>
+<a name="ln520"> </a>
+<a name="ln521">// device_read</a>
+<a name="ln522">static status_t</a>
+<a name="ln523">device_read(void* cookie, off_t pos, void* buf, size_t* count)</a>
+<a name="ln524">{</a>
+<a name="ln525">	wacom_device* device = (wacom_device*) cookie;</a>
+<a name="ln526">	status_t ret = B_BAD_VALUE;</a>
+<a name="ln527">	uint8* buffer = (uint8*)buf;</a>
+<a name="ln528">	uint32 dataLength;</a>
+<a name="ln529"> </a>
+<a name="ln530">	if (!device)</a>
+<a name="ln531">		return ret;</a>
+<a name="ln532"> </a>
+<a name="ln533">	ret = device-&gt;notify_lock;</a>
+<a name="ln534"> </a>
+<a name="ln535">	DPRINTF_INFO((ID &quot;device_read(%p,%Ld,0x%x,%d) name = \&quot;%s%d\&quot;\n&quot;,</a>
+<a name="ln536">			 cookie, pos, buf, *count, kBasePublishPath, device-&gt;number));</a>
+<a name="ln537"> </a>
+<a name="ln538">	if (ret &gt;= B_OK) {</a>
+<a name="ln539">		// what the client &quot;reads&quot; is decided depending on how much bytes are</a>
+<a name="ln540">		// provided 8 bytes are needed to &quot;read&quot; vendor id, product id and max</a>
+<a name="ln541">		// packet size in case the client wants to read more than 8 bytes, a usb</a>
+<a name="ln542">		// interupt transfer is scheduled, and an error report is returned as</a>
+<a name="ln543">		// appropriate</a>
+<a name="ln544">		if (*count &gt; 8) {</a>
+<a name="ln545">			// queue the interrupt transfer</a>
+<a name="ln546">			ret = usb-&gt;queue_interrupt(device-&gt;pipe, device-&gt;data,</a>
+<a name="ln547">				device-&gt;max_packet_size, device_interupt_callback, device);</a>
+<a name="ln548">			if (ret &gt;= B_OK) {</a>
+<a name="ln549">				// we will block here until the interrupt transfer has been done</a>
+<a name="ln550">				ret = acquire_sem_etc(device-&gt;notify_lock, 1,</a>
+<a name="ln551">					B_RELATIVE_TIMEOUT, 500 * 1000);</a>
+<a name="ln552">				// handle time out</a>
+<a name="ln553">				if (ret &lt; B_OK) {</a>
+<a name="ln554">					usb-&gt;cancel_queued_transfers(device-&gt;pipe);</a>
+<a name="ln555">					acquire_sem(device-&gt;notify_lock);</a>
+<a name="ln556">						// collect the sem released by the cancel</a>
+<a name="ln557"> </a>
+<a name="ln558">					if (ret == B_TIMED_OUT) {</a>
+<a name="ln559">						// a time_out is ok, since it only means that the device</a>
+<a name="ln560">						// had nothing to report (ie mouse/pen was not moved)</a>
+<a name="ln561">						// within the given time interval</a>
+<a name="ln562">						DPRINTF_INFO((ID &quot;device_read(%p) name = \&quot;%s%d\&quot; -&gt; &quot;</a>
+<a name="ln563">							&quot;B_TIMED_OUT\n&quot;, cookie, kBasePublishPath,</a>
+<a name="ln564">							device-&gt;number));</a>
+<a name="ln565">						*count = 8;</a>
+<a name="ln566">						read_header(device, buffer);</a>
+<a name="ln567">						ret = B_OK;</a>
+<a name="ln568">					} else {</a>
+<a name="ln569">						// any other error trying to acquire the semaphore</a>
+<a name="ln570">						*count = 0;</a>
+<a name="ln571">					}</a>
+<a name="ln572">				} else {</a>
+<a name="ln573">					if (device-&gt;status == 0/*B_USBD_SUCCESS*/) {</a>
+<a name="ln574">						DPRINTF_INFO((ID &quot;interrupt transfer - success\n&quot;));</a>
+<a name="ln575">						// copy the data from the buffer</a>
+<a name="ln576">						dataLength = min_c(device-&gt;length, *count - 8);</a>
+<a name="ln577">						*count = dataLength + 8;</a>
+<a name="ln578">						read_header(device, buffer);</a>
+<a name="ln579">						memcpy(buffer + 8, device-&gt;data, dataLength);</a>
+<a name="ln580">					} else {</a>
+<a name="ln581">						// an error happened during the interrupt transfer</a>
+<a name="ln582">						*count = 0;</a>
+<a name="ln583">						dprintf(ID &quot;interrupt transfer - failure: %ld\n&quot;,</a>
+<a name="ln584">							device-&gt;status);</a>
+<a name="ln585">						ret = B_ERROR;</a>
+<a name="ln586">					}</a>
+<a name="ln587">				}</a>
+<a name="ln588">			} else {</a>
+<a name="ln589">				*count = 0;</a>
+<a name="ln590">				dprintf(ID &quot;device_read(%p) name = \&quot;%s%d\&quot; -&gt; error queuing &quot;</a>
+<a name="ln591">					&quot;interrupt: %ld\n&quot;, cookie, kBasePublishPath,</a>
+<a name="ln592">					device-&gt;number, ret);</a>
+<a name="ln593">			}</a>
+<a name="ln594">		} else if (*count == 8) {</a>
+<a name="ln595">			read_header(device, buffer);</a>
+<a name="ln596">			ret = B_OK;</a>
+<a name="ln597">		} else {</a>
+<a name="ln598">			dprintf(ID &quot;device_read(%p) name = \&quot;%s%d\&quot; -&gt; buffer size must be &quot;</a>
+<a name="ln599">				&quot;at least 8 bytes!\n&quot;, cookie, kBasePublishPath,</a>
+<a name="ln600">				device-&gt;number);</a>
+<a name="ln601">			*count = 0;</a>
+<a name="ln602">			ret = B_BAD_VALUE;</a>
+<a name="ln603">		}</a>
+<a name="ln604">	}</a>
+<a name="ln605"> </a>
+<a name="ln606">	return ret;</a>
+<a name="ln607">}</a>
+<a name="ln608"> </a>
+<a name="ln609">// device_write</a>
+<a name="ln610">static status_t</a>
+<a name="ln611">device_write(void *cookie, off_t pos, const void *buf, size_t *count)</a>
+<a name="ln612">{</a>
+<a name="ln613">	return B_ERROR;</a>
+<a name="ln614">}</a>
+<a name="ln615"> </a>
+<a name="ln616">// device_control</a>
+<a name="ln617">static status_t</a>
+<a name="ln618">device_control (void *cookie, uint32 msg, void *arg1, size_t len)</a>
+<a name="ln619">{</a>
+<a name="ln620">	return B_ERROR;</a>
+<a name="ln621">}</a>
+<a name="ln622"> </a>
+<a name="ln623">// #pragma mark - Driver Hooks</a>
+<a name="ln624">//</a>
+<a name="ln625">// These functions provide the glue used by DevFS to load/unload</a>
+<a name="ln626">// the driver and also handle registering with the USB bus manager</a>
+<a name="ln627">// to receive device added and removed events</a>
+<a name="ln628"> </a>
+<a name="ln629">static usb_notify_hooks notify_hooks =</a>
+<a name="ln630">{</a>
+<a name="ln631">	&amp;device_added,</a>
+<a name="ln632">	&amp;device_removed</a>
+<a name="ln633">};</a>
+<a name="ln634"> </a>
+<a name="ln635">static const usb_support_descriptor kSupportedDevices[] =</a>
+<a name="ln636">{</a>
+<a name="ln637">	{ 3, 1, 2, 0, 0 }</a>
+<a name="ln638">};</a>
+<a name="ln639"> </a>
+<a name="ln640">// init_hardware</a>
+<a name="ln641">status_t</a>
+<a name="ln642">init_hardware(void)</a>
+<a name="ln643">{</a>
+<a name="ln644">	return B_OK;</a>
+<a name="ln645">}</a>
+<a name="ln646"> </a>
+<a name="ln647">// init_driver</a>
+<a name="ln648">status_t</a>
+<a name="ln649">init_driver(void)</a>
+<a name="ln650">{</a>
+<a name="ln651">	DPRINTF_INFO((ID &quot;init_driver(), built %s %s\n&quot;, __DATE__, __TIME__));</a>
+<a name="ln652"> </a>
+<a name="ln653">#if DEBUG_DRIVER &amp;&amp; !defined(__HAIKU__)</a>
+<a name="ln654">	if (load_driver_symbols(kDriverName) == B_OK) {</a>
+<a name="ln655">		DPRINTF_INFO((ID &quot;loaded symbols\n&quot;));</a>
+<a name="ln656">	} else {</a>
+<a name="ln657">		DPRINTF_ERR((ID &quot;no driver symbols loaded!\n&quot;));</a>
+<a name="ln658">	}</a>
+<a name="ln659">#endif</a>
+<a name="ln660"> </a>
+<a name="ln661">	if (get_module(B_USB_MODULE_NAME, (module_info**) &amp;usb) != B_OK) {</a>
+<a name="ln662">		DPRINTF_ERR((ID &quot;cannot get module \&quot;%s\&quot;\n&quot;, B_USB_MODULE_NAME));</a>
+<a name="ln663">		return B_ERROR;</a>
+<a name="ln664">	}</a>
+<a name="ln665"> </a>
+<a name="ln666">	if ((sDeviceListLock = create_sem(1,&quot;sDeviceListLock&quot;)) &lt; 0) {</a>
+<a name="ln667">		put_module(B_USB_MODULE_NAME);</a>
+<a name="ln668">		return sDeviceListLock;</a>
+<a name="ln669">	}</a>
+<a name="ln670"> </a>
+<a name="ln671">	usb-&gt;register_driver(kDriverName, kSupportedDevices, 1, NULL);</a>
+<a name="ln672">	usb-&gt;install_notify(kDriverName, &amp;notify_hooks);</a>
+<a name="ln673"> </a>
+<a name="ln674">	return B_OK;</a>
+<a name="ln675">}</a>
+<a name="ln676"> </a>
+<a name="ln677">// uninit_driver</a>
+<a name="ln678">void</a>
+<a name="ln679">uninit_driver(void)</a>
+<a name="ln680">{</a>
+<a name="ln681">	int i;</a>
+<a name="ln682"> </a>
+<a name="ln683">	DPRINTF_INFO((ID &quot;uninit_driver()\n&quot;));</a>
+<a name="ln684"> </a>
+<a name="ln685">	usb-&gt;uninstall_notify(kDriverName);</a>
+<a name="ln686"> </a>
+<a name="ln687">	delete_sem(sDeviceListLock);</a>
+<a name="ln688"> </a>
+<a name="ln689">	put_module(B_USB_MODULE_NAME);</a>
+<a name="ln690"> </a>
+<a name="ln691">	if (sDeviceNames) {</a>
+<a name="ln692">		for (i = 0; sDeviceNames[i]; i++)</a>
+<a name="ln693">			free(sDeviceNames[i]);</a>
+<a name="ln694">		free(sDeviceNames);</a>
+<a name="ln695">	}</a>
+<a name="ln696"> </a>
+<a name="ln697">	DPRINTF_INFO((ID &quot;uninit_driver() done\n&quot;));</a>
+<a name="ln698">}</a>
+<a name="ln699"> </a>
+<a name="ln700">// publish_devices</a>
+<a name="ln701">const char**</a>
+<a name="ln702">publish_devices()</a>
+<a name="ln703">{</a>
+<a name="ln704">	wacom_device *device;</a>
+<a name="ln705">	int i;</a>
+<a name="ln706"> </a>
+<a name="ln707">	DPRINTF_INFO((ID &quot;publish_devices()\n&quot;));</a>
+<a name="ln708"> </a>
+<a name="ln709">	if (sDeviceNames) {</a>
+<a name="ln710">		for (i = 0; sDeviceNames[i]; i++)</a>
+<a name="ln711">			free((char *) sDeviceNames[i]);</a>
+<a name="ln712">		free(sDeviceNames);</a>
+<a name="ln713">	}</a>
+<a name="ln714"> </a>
+<a name="ln715">	acquire_sem(sDeviceListLock);</a>
+<a name="ln716">	sDeviceNames = (char**)malloc(sizeof(char*) * (sDeviceCount + 2));</a>
+<a name="ln717">	if (sDeviceNames) {</a>
+<a name="ln718">		for (i = 0, device = sDeviceList; device; device = device-&gt;next) {</a>
+<a name="ln719">			sDeviceNames[i] = (char*)malloc(strlen(kBasePublishPath) + 4);</a>
+<a name="ln720">			if (sDeviceNames[i]) {</a>
+<a name="ln721">				sprintf(sDeviceNames[i],&quot;%s%d&quot;,kBasePublishPath,device-&gt;number);</a>
+<a name="ln722">				DPRINTF_INFO((ID &quot;publishing: \&quot;/dev/%s\&quot;\n&quot;,sDeviceNames[i]));</a>
+<a name="ln723">				i++;</a>
+<a name="ln724">			}</a>
+<a name="ln725">		}</a>
+<a name="ln726">		// publish the currently fake control device</a>
+<a name="ln727">		sDeviceNames[i] = (char*)malloc(strlen(kBasePublishPath) + 8);</a>
+<a name="ln728">		if (sDeviceNames[i])</a>
+<a name="ln729">			sprintf(sDeviceNames[i], &quot;%s%s&quot;, kBasePublishPath, &quot;control&quot;);</a>
+<a name="ln730"> </a>
+<a name="ln731">		sDeviceNames[i + 1] = NULL;</a>
+<a name="ln732">	}</a>
+<a name="ln733"> </a>
+<a name="ln734">	release_sem(sDeviceListLock);</a>
+<a name="ln735"> </a>
+<a name="ln736">	return (const char**)sDeviceNames;</a>
+<a name="ln737">}</a>
+<a name="ln738"> </a>
+<a name="ln739">static device_hooks sDeviceHooks = {</a>
+<a name="ln740">	device_open,</a>
+<a name="ln741">	device_close,</a>
+<a name="ln742">	device_free,</a>
+<a name="ln743">	device_control,</a>
+<a name="ln744">	device_read,</a>
+<a name="ln745">	device_write</a>
+<a name="ln746">};</a>
+<a name="ln747"> </a>
+<a name="ln748">// find_device</a>
+<a name="ln749">device_hooks*</a>
+<a name="ln750">find_device(const char* name)</a>
+<a name="ln751">{</a>
+<a name="ln752">	return &amp;sDeviceHooks;</a>
+<a name="ln753">}</a>
+
+</code></pre>
+<div class="balloon" rel="590"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the fifth actual argument of the 'dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="583"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="429"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="326"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="251"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="238"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="197"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="222"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'dprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="188"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the second actual argument of the 'dprintf' function. The memsize type argument is expected.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

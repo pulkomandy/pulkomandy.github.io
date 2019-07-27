@@ -1,0 +1,699 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>smp.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2008, Dustin Howett, dustin.howett@gmail.com. All rights reserved.</a>
+<a name="ln3"> * Copyright 2004-2010, Axel Dörfler, axeld@pinc-software.de.</a>
+<a name="ln4"> * Distributed under the terms of the MIT License.</a>
+<a name="ln5"> *</a>
+<a name="ln6"> * Copyright 2001, Travis Geiselbrecht. All rights reserved.</a>
+<a name="ln7"> * Distributed under the terms of the NewOS License.</a>
+<a name="ln8">*/</a>
+<a name="ln9"> </a>
+<a name="ln10"> </a>
+<a name="ln11">#include &quot;smp.h&quot;</a>
+<a name="ln12"> </a>
+<a name="ln13">#include &lt;string.h&gt;</a>
+<a name="ln14"> </a>
+<a name="ln15">#include &lt;KernelExport.h&gt;</a>
+<a name="ln16"> </a>
+<a name="ln17">#include &lt;kernel.h&gt;</a>
+<a name="ln18">#include &lt;safemode.h&gt;</a>
+<a name="ln19">#include &lt;boot/stage2.h&gt;</a>
+<a name="ln20">#include &lt;boot/menu.h&gt;</a>
+<a name="ln21">#include &lt;arch/x86/apic.h&gt;</a>
+<a name="ln22">#include &lt;arch/x86/arch_acpi.h&gt;</a>
+<a name="ln23">#include &lt;arch/x86/arch_cpu.h&gt;</a>
+<a name="ln24">#include &lt;arch/x86/arch_smp.h&gt;</a>
+<a name="ln25">#include &lt;arch/x86/arch_system_info.h&gt;</a>
+<a name="ln26">#include &lt;arch/x86/descriptors.h&gt;</a>
+<a name="ln27"> </a>
+<a name="ln28">#include &quot;mmu.h&quot;</a>
+<a name="ln29">#include &quot;acpi.h&quot;</a>
+<a name="ln30"> </a>
+<a name="ln31"> </a>
+<a name="ln32">#define NO_SMP 0</a>
+<a name="ln33"> </a>
+<a name="ln34">#define TRACE_SMP</a>
+<a name="ln35">#ifdef TRACE_SMP</a>
+<a name="ln36">#	define TRACE(x) dprintf x</a>
+<a name="ln37">#else</a>
+<a name="ln38">#	define TRACE(x) ;</a>
+<a name="ln39">#endif</a>
+<a name="ln40"> </a>
+<a name="ln41"> </a>
+<a name="ln42">static struct scan_spots_struct smp_scan_spots[] = {</a>
+<a name="ln43">	{ 0x9fc00, 0xa0000, 0xa0000 - 0x9fc00 },</a>
+<a name="ln44">	{ 0xf0000, 0x100000, 0x100000 - 0xf0000 },</a>
+<a name="ln45">	{ 0, 0, 0 }</a>
+<a name="ln46">};</a>
+<a name="ln47"> </a>
+<a name="ln48">extern &quot;C&quot; void execute_n_instructions(int count);</a>
+<a name="ln49"> </a>
+<a name="ln50">extern &quot;C&quot; void smp_trampoline(void);</a>
+<a name="ln51">extern &quot;C&quot; void smp_trampoline_end(void);</a>
+<a name="ln52"> </a>
+<a name="ln53"> </a>
+<a name="ln54">static uint32</a>
+<a name="ln55">apic_read(uint32 offset)</a>
+<a name="ln56">{</a>
+<a name="ln57">	return *(volatile uint32 *)((addr_t)(void *)gKernelArgs.arch_args.apic + offset);</a>
+<a name="ln58">}</a>
+<a name="ln59"> </a>
+<a name="ln60"> </a>
+<a name="ln61">static void</a>
+<a name="ln62">apic_write(uint32 offset, uint32 data)</a>
+<a name="ln63">{</a>
+<a name="ln64">	*(volatile uint32 *)((addr_t)(void *)gKernelArgs.arch_args.apic + offset) = data;</a>
+<a name="ln65">}</a>
+<a name="ln66"> </a>
+<a name="ln67"> </a>
+<a name="ln68">static mp_floating_struct *</a>
+<a name="ln69">smp_mp_probe(uint32 base, uint32 limit)</a>
+<a name="ln70">{</a>
+<a name="ln71">	TRACE((&quot;smp_mp_probe: entry base 0x%lx, limit 0x%lx\n&quot;, base, limit));</a>
+<a name="ln72">	for (uint32 *pointer = (uint32 *)base; (uint32)pointer &lt; limit; pointer++) {</a>
+<a name="ln73">		if (*pointer == MP_FLOATING_SIGNATURE) {</a>
+<a name="ln74">			TRACE((&quot;smp_mp_probe: found floating pointer structure at %p\n&quot;,</a>
+<a name="ln75">				pointer));</a>
+<a name="ln76">			return (mp_floating_struct *)pointer;</a>
+<a name="ln77">		}</a>
+<a name="ln78">	}</a>
+<a name="ln79"> </a>
+<a name="ln80">	return NULL;</a>
+<a name="ln81">}</a>
+<a name="ln82"> </a>
+<a name="ln83"> </a>
+<a name="ln84">static status_t</a>
+<a name="ln85">smp_do_mp_config(mp_floating_struct *floatingStruct)</a>
+<a name="ln86">{</a>
+<a name="ln87">	if (floatingStruct-&gt;config_length != 1) {</a>
+<a name="ln88">		TRACE((&quot;smp: unsupported structure length of %&quot; B_PRIu8 &quot; units\n&quot;,</a>
+<a name="ln89">			floatingStruct-&gt;config_length));</a>
+<a name="ln90">		return B_UNSUPPORTED;</a>
+<a name="ln91">	}</a>
+<a name="ln92"> </a>
+<a name="ln93">	TRACE((&quot;smp: intel mp version %s, %s&quot;,</a>
+<a name="ln94">		(floatingStruct-&gt;spec_revision == 1) ? &quot;1.1&quot; : &quot;1.4&quot;,</a>
+<a name="ln95">		(floatingStruct-&gt;mp_feature_2 &amp; 0x80)</a>
+<a name="ln96">			? &quot;imcr and pic compatibility mode.\n&quot;</a>
+<a name="ln97">			: &quot;virtual wire compatibility mode.\n&quot;));</a>
+<a name="ln98"> </a>
+<a name="ln99">	if (floatingStruct-&gt;config_table == NULL) {</a>
+<a name="ln100">#if 1</a>
+<a name="ln101">		// TODO: need to implement</a>
+<a name="ln102">		TRACE((&quot;smp: standard configuration %d unimplemented\n&quot;,</a>
+<a name="ln103">			floatingStruct-&gt;mp_feature_1));</a>
+<a name="ln104">		gKernelArgs.num_cpus = 1;</a>
+<a name="ln105">		return B_OK;</a>
+<a name="ln106">#else</a>
+<a name="ln107">		// this system conforms to one of the default configurations</a>
+<a name="ln108">		TRACE((&quot;smp: standard configuration %d\n&quot;, floatingStruct-&gt;mp_feature_1));</a>
+<a name="ln109">		gKernelArgs.num_cpus = 2;</a>
+<a name="ln110">		gKernelArgs.cpu_apic_id[0] = 0;</a>
+<a name="ln111">		gKernelArgs.cpu_apic_id[1] = 1;</a>
+<a name="ln112">		apic_phys = (unsigned int *)0xfee00000;</a>
+<a name="ln113">		ioapic_phys = (unsigned int *)0xfec00000;</a>
+<a name="ln114">		dprintf(&quot;smp: WARNING: standard configuration code is untested&quot;);</a>
+<a name="ln115">		return B_OK;</a>
+<a name="ln116">#endif</a>
+<a name="ln117">	}</a>
+<a name="ln118"> </a>
+<a name="ln119">	// We are not running in standard configuration, so we have to look through</a>
+<a name="ln120">	// all of the mp configuration table crap to figure out how many processors</a>
+<a name="ln121">	// we have, where our apics are, etc.</a>
+<a name="ln122"> </a>
+<a name="ln123">	mp_config_table *config = floatingStruct-&gt;config_table;</a>
+<a name="ln124">	gKernelArgs.num_cpus = 0;</a>
+<a name="ln125"> </a>
+<a name="ln126">	if (config-&gt;signature != MP_CONFIG_TABLE_SIGNATURE) {</a>
+<a name="ln127">		TRACE((&quot;smp: invalid config table signature, aborting\n&quot;));</a>
+<a name="ln128">		return B_ERROR;</a>
+<a name="ln129">	}</a>
+<a name="ln130"> </a>
+<a name="ln131">	if (config-&gt;base_table_length &lt; sizeof(mp_config_table)) {</a>
+<a name="ln132">		TRACE((&quot;smp: config table length %&quot; B_PRIu16</a>
+<a name="ln133">			&quot; too short for structure, aborting\n&quot;,</a>
+<a name="ln134">			config-&gt;base_table_length));</a>
+<a name="ln135">		return B_ERROR;</a>
+<a name="ln136">	}</a>
+<a name="ln137"> </a>
+<a name="ln138">	// print our new found configuration.</a>
+<a name="ln139">	TRACE((&quot;smp: oem id: %.8s product id: %.12s\n&quot;, config-&gt;oem,</a>
+<a name="ln140">		config-&gt;product));</a>
+<a name="ln141">	TRACE((&quot;smp: base table has %d entries, extended section %d bytes\n&quot;,</a>
+<a name="ln142">		config-&gt;num_base_entries, config-&gt;ext_length));</a>
+<a name="ln143"> </a>
+<a name="ln144">	gKernelArgs.arch_args.apic_phys = (uint32)config-&gt;apic;</a>
+<a name="ln145">	if ((gKernelArgs.arch_args.apic_phys % 4096) != 0) {</a>
+<a name="ln146">		// MP specs mandate a 4K alignment for the local APIC(s)</a>
+<a name="ln147">		TRACE((&quot;smp: local apic %p has bad alignment, aborting\n&quot;,</a>
+<a name="ln148">			(void *)gKernelArgs.arch_args.apic_phys));</a>
+<a name="ln149">		return B_ERROR;</a>
+<a name="ln150">	}</a>
+<a name="ln151"> </a>
+<a name="ln152">	char *pointer = (char *)((uint32)config + sizeof(struct mp_config_table));</a>
+<a name="ln153">	for (int32 i = 0; i &lt; config-&gt;num_base_entries; i++) {</a>
+<a name="ln154">		switch (*pointer) {</a>
+<a name="ln155">			case MP_BASE_PROCESSOR:</a>
+<a name="ln156">			{</a>
+<a name="ln157">				struct mp_base_processor *processor</a>
+<a name="ln158">					= (struct mp_base_processor *)pointer;</a>
+<a name="ln159">				pointer += sizeof(struct mp_base_processor);</a>
+<a name="ln160"> </a>
+<a name="ln161">				if (gKernelArgs.num_cpus == SMP_MAX_CPUS) {</a>
+<a name="ln162">					TRACE((&quot;smp: already reached maximum CPUs (%d)\n&quot;,</a>
+<a name="ln163">						SMP_MAX_CPUS));</a>
+<a name="ln164">					continue;</a>
+<a name="ln165">				}</a>
+<a name="ln166"> </a>
+<a name="ln167">				// skip if the processor is not enabled.</a>
+<a name="ln168">				if (!(processor-&gt;cpu_flags &amp; 0x1)) {</a>
+<a name="ln169">					TRACE((&quot;smp: skip apic id %d: disabled\n&quot;,</a>
+<a name="ln170">						processor-&gt;apic_id));</a>
+<a name="ln171">					continue;</a>
+<a name="ln172">				}</a>
+<a name="ln173"> </a>
+<a name="ln174">				gKernelArgs.arch_args.cpu_apic_id[gKernelArgs.num_cpus]</a>
+<a name="ln175">					= processor-&gt;apic_id;</a>
+<a name="ln176">				gKernelArgs.arch_args.cpu_apic_version[gKernelArgs.num_cpus]</a>
+<a name="ln177">					= processor-&gt;apic_version;</a>
+<a name="ln178"> </a>
+<a name="ln179">#ifdef TRACE_SMP</a>
+<a name="ln180">				const char *cpuFamily[] = { &quot;&quot;, &quot;&quot;, &quot;&quot;, &quot;&quot;, &quot;Intel 486&quot;,</a>
+<a name="ln181">					&quot;Intel Pentium&quot;, &quot;Intel Pentium Pro&quot;, &quot;Intel Pentium II&quot; };</a>
+<a name="ln182">#endif</a>
+<a name="ln183">				TRACE((&quot;smp: cpu#%ld: %s, apic id %d, version %d%s\n&quot;,</a>
+<a name="ln184">					gKernelArgs.num_cpus,</a>
+<a name="ln185">					cpuFamily[(processor-&gt;signature &amp; 0xf00) &gt;&gt; 8],</a>
+<a name="ln186">					processor-&gt;apic_id, processor-&gt;apic_version,</a>
+<a name="ln187">					(processor-&gt;cpu_flags &amp; 0x2) ? &quot;, BSP&quot; : &quot;&quot;));</a>
+<a name="ln188"> </a>
+<a name="ln189">				gKernelArgs.num_cpus++;</a>
+<a name="ln190">				break;</a>
+<a name="ln191">			}</a>
+<a name="ln192">			case MP_BASE_BUS:</a>
+<a name="ln193">			{</a>
+<a name="ln194">				struct mp_base_bus *bus = (struct mp_base_bus *)pointer;</a>
+<a name="ln195">				pointer += sizeof(struct mp_base_bus);</a>
+<a name="ln196"> </a>
+<a name="ln197">				TRACE((&quot;smp: bus %d: %c%c%c%c%c%c\n&quot;, bus-&gt;bus_id,</a>
+<a name="ln198">					bus-&gt;name[0], bus-&gt;name[1], bus-&gt;name[2], bus-&gt;name[3],</a>
+<a name="ln199">					bus-&gt;name[4], bus-&gt;name[5]));</a>
+<a name="ln200"> </a>
+<a name="ln201">				break;</a>
+<a name="ln202">			}</a>
+<a name="ln203">			case MP_BASE_IO_APIC:</a>
+<a name="ln204">			{</a>
+<a name="ln205">				struct mp_base_ioapic *io = (struct mp_base_ioapic *)pointer;</a>
+<a name="ln206">				pointer += sizeof(struct mp_base_ioapic);</a>
+<a name="ln207"> </a>
+<a name="ln208">				if (gKernelArgs.arch_args.ioapic_phys == 0) {</a>
+<a name="ln209">					gKernelArgs.arch_args.ioapic_phys = (uint32)io-&gt;addr;</a>
+<a name="ln210">					if (gKernelArgs.arch_args.ioapic_phys % 1024) {</a>
+<a name="ln211">						// MP specs mandate a 1K alignment for the IO-APICs</a>
+<a name="ln212">						TRACE((&quot;smp: io apic %p has bad alignment, aborting\n&quot;,</a>
+<a name="ln213">							(void *)gKernelArgs.arch_args.ioapic_phys));</a>
+<a name="ln214">						return B_ERROR;</a>
+<a name="ln215">					}</a>
+<a name="ln216">				}</a>
+<a name="ln217"> </a>
+<a name="ln218">				TRACE((&quot;smp: found io apic with apic id %d, version %d\n&quot;,</a>
+<a name="ln219">					io-&gt;ioapic_id, io-&gt;ioapic_version));</a>
+<a name="ln220"> </a>
+<a name="ln221">				break;</a>
+<a name="ln222">			}</a>
+<a name="ln223">			case MP_BASE_IO_INTR:</a>
+<a name="ln224">			case MP_BASE_LOCAL_INTR:</a>
+<a name="ln225">			{</a>
+<a name="ln226">				struct mp_base_interrupt *interrupt</a>
+<a name="ln227">					= (struct mp_base_interrupt *)pointer;</a>
+<a name="ln228">				pointer += sizeof(struct mp_base_interrupt);</a>
+<a name="ln229"> </a>
+<a name="ln230">				dprintf(&quot;smp: %s int: type %d, source bus %d, irq %3d, dest &quot;</a>
+<a name="ln231">					&quot;apic %d, int %3d, polarity %d, trigger mode %d\n&quot;,</a>
+<a name="ln232">					interrupt-&gt;type == MP_BASE_IO_INTR ? &quot;I/O&quot; : &quot;local&quot;,</a>
+<a name="ln233">					interrupt-&gt;interrupt_type, interrupt-&gt;source_bus_id,</a>
+<a name="ln234">					interrupt-&gt;source_bus_irq, interrupt-&gt;dest_apic_id,</a>
+<a name="ln235">					interrupt-&gt;dest_apic_int, interrupt-&gt;polarity,</a>
+<a name="ln236">					interrupt-&gt;trigger_mode);</a>
+<a name="ln237">				break;</a>
+<a name="ln238">			}</a>
+<a name="ln239">		}</a>
+<a name="ln240">	}</a>
+<a name="ln241"> </a>
+<a name="ln242">	if (gKernelArgs.num_cpus == 0) {</a>
+<a name="ln243">		TRACE((&quot;smp: didn't find any processors, aborting\n&quot;));</a>
+<a name="ln244">		return B_ERROR;</a>
+<a name="ln245">	}</a>
+<a name="ln246"> </a>
+<a name="ln247">	dprintf(&quot;smp: apic @ %p, i/o apic @ %p, total %ld processors detected\n&quot;,</a>
+<a name="ln248">		(void *)gKernelArgs.arch_args.apic_phys,</a>
+<a name="ln249">		(void *)gKernelArgs.arch_args.ioapic_phys,</a>
+<a name="ln250">		gKernelArgs.num_cpus);</a>
+<a name="ln251"> </a>
+<a name="ln252">	return B_OK;</a>
+<a name="ln253">}</a>
+<a name="ln254"> </a>
+<a name="ln255"> </a>
+<a name="ln256">static status_t</a>
+<a name="ln257">smp_do_acpi_config(void)</a>
+<a name="ln258">{</a>
+<a name="ln259">	TRACE((&quot;smp: using ACPI to detect MP configuration\n&quot;));</a>
+<a name="ln260"> </a>
+<a name="ln261">	// reset CPU count</a>
+<a name="ln262">	gKernelArgs.num_cpus = 0;</a>
+<a name="ln263"> </a>
+<a name="ln264">	acpi_madt *madt = (acpi_madt *)acpi_find_table(ACPI_MADT_SIGNATURE);</a>
+<a name="ln265"> </a>
+<a name="ln266">	if (madt == NULL) {</a>
+<a name="ln267">		TRACE((&quot;smp: Failed to find MADT!\n&quot;));</a>
+<a name="ln268">		return B_ERROR;</a>
+<a name="ln269">	}</a>
+<a name="ln270"> </a>
+<a name="ln271">	gKernelArgs.arch_args.apic_phys = madt-&gt;local_apic_address;</a>
+<a name="ln272">	TRACE((&quot;smp: local apic address is 0x%lx\n&quot;, madt-&gt;local_apic_address));</a>
+<a name="ln273"> </a>
+<a name="ln274">	acpi_apic *apic = (acpi_apic *)((uint8 *)madt + sizeof(acpi_madt));</a>
+<a name="ln275">	acpi_apic *end = (acpi_apic *)((uint8 *)madt + madt-&gt;header.length);</a>
+<a name="ln276">	while (apic &lt; end) {</a>
+<a name="ln277">		switch (apic-&gt;type) {</a>
+<a name="ln278">			case ACPI_MADT_LOCAL_APIC:</a>
+<a name="ln279">			{</a>
+<a name="ln280">				if (gKernelArgs.num_cpus == SMP_MAX_CPUS) {</a>
+<a name="ln281">					TRACE((&quot;smp: already reached maximum CPUs (%d)\n&quot;,</a>
+<a name="ln282">						SMP_MAX_CPUS));</a>
+<a name="ln283">					break;</a>
+<a name="ln284">				}</a>
+<a name="ln285"> </a>
+<a name="ln286">				acpi_local_apic *localApic = (acpi_local_apic *)apic;</a>
+<a name="ln287">				TRACE((&quot;smp: found local APIC with id %u\n&quot;,</a>
+<a name="ln288">					localApic-&gt;apic_id));</a>
+<a name="ln289">				if ((localApic-&gt;flags &amp; ACPI_LOCAL_APIC_ENABLED) == 0) {</a>
+<a name="ln290">					TRACE((&quot;smp: APIC is disabled and will not be used\n&quot;));</a>
+<a name="ln291">					break;</a>
+<a name="ln292">				}</a>
+<a name="ln293"> </a>
+<a name="ln294">				gKernelArgs.arch_args.cpu_apic_id[gKernelArgs.num_cpus]</a>
+<a name="ln295">					= localApic-&gt;apic_id;</a>
+<a name="ln296">				// TODO: how to find out? putting 0x10 in to indicate a local apic</a>
+<a name="ln297">				gKernelArgs.arch_args.cpu_apic_version[gKernelArgs.num_cpus]</a>
+<a name="ln298">					= 0x10;</a>
+<a name="ln299">				gKernelArgs.num_cpus++;</a>
+<a name="ln300">				break;</a>
+<a name="ln301">			}</a>
+<a name="ln302"> </a>
+<a name="ln303">			case ACPI_MADT_IO_APIC: {</a>
+<a name="ln304">				acpi_io_apic *ioApic = (acpi_io_apic *)apic;</a>
+<a name="ln305">				TRACE((&quot;smp: found io APIC with id %u and address 0x%lx\n&quot;,</a>
+<a name="ln306">					ioApic-&gt;io_apic_id, ioApic-&gt;io_apic_address));</a>
+<a name="ln307">				if (gKernelArgs.arch_args.ioapic_phys == 0)</a>
+<a name="ln308">					gKernelArgs.arch_args.ioapic_phys = ioApic-&gt;io_apic_address;</a>
+<a name="ln309">				break;</a>
+<a name="ln310">			}</a>
+<a name="ln311">			default:</a>
+<a name="ln312">				break;</a>
+<a name="ln313">		}</a>
+<a name="ln314"> </a>
+<a name="ln315">		apic = (acpi_apic *)((uint8 *)apic + apic-&gt;length);</a>
+<a name="ln316">	}</a>
+<a name="ln317"> </a>
+<a name="ln318">	return gKernelArgs.num_cpus &gt; 0 ? B_OK : B_ERROR;</a>
+<a name="ln319">}</a>
+<a name="ln320"> </a>
+<a name="ln321"> </a>
+<a name="ln322">static void</a>
+<a name="ln323">calculate_apic_timer_conversion_factor(void)</a>
+<a name="ln324">{</a>
+<a name="ln325">	int64 t1, t2;</a>
+<a name="ln326">	uint32 config;</a>
+<a name="ln327">	uint32 count;</a>
+<a name="ln328"> </a>
+<a name="ln329">	// setup the timer</a>
+<a name="ln330">	config = apic_read(APIC_LVT_TIMER);</a>
+<a name="ln331">	config = (config &amp; APIC_LVT_TIMER_MASK) + APIC_LVT_MASKED;</a>
+<a name="ln332">		// timer masked, vector 0</a>
+<a name="ln333">	apic_write(APIC_LVT_TIMER, config);</a>
+<a name="ln334"> </a>
+<a name="ln335">	config = (apic_read(APIC_TIMER_DIVIDE_CONFIG) &amp; ~0x0000000f);</a>
+<a name="ln336">	apic_write(APIC_TIMER_DIVIDE_CONFIG, config | APIC_TIMER_DIVIDE_CONFIG_1);</a>
+<a name="ln337">		// divide clock by one</a>
+<a name="ln338"> </a>
+<a name="ln339">	t1 = system_time();</a>
+<a name="ln340">	apic_write(APIC_INITIAL_TIMER_COUNT, 0xffffffff); // start the counter</a>
+<a name="ln341"> </a>
+<a name="ln342">	execute_n_instructions(128 * 20000);</a>
+<a name="ln343"> </a>
+<a name="ln344">	count = apic_read(APIC_CURRENT_TIMER_COUNT);</a>
+<a name="ln345">	t2 = system_time();</a>
+<a name="ln346"> </a>
+<a name="ln347">	count = 0xffffffff - count;</a>
+<a name="ln348"> </a>
+<a name="ln349">	gKernelArgs.arch_args.apic_time_cv_factor</a>
+<a name="ln350">		= (uint32)((1000000.0/(t2 - t1)) * count);</a>
+<a name="ln351"> </a>
+<a name="ln352">	TRACE((&quot;APIC ticks/sec = %ld\n&quot;,</a>
+<a name="ln353">		gKernelArgs.arch_args.apic_time_cv_factor));</a>
+<a name="ln354">}</a>
+<a name="ln355"> </a>
+<a name="ln356"> </a>
+<a name="ln357">//	#pragma mark -</a>
+<a name="ln358"> </a>
+<a name="ln359"> </a>
+<a name="ln360">int</a>
+<a name="ln361">smp_get_current_cpu(void)</a>
+<a name="ln362">{</a>
+<a name="ln363">	if (gKernelArgs.arch_args.apic == NULL)</a>
+<a name="ln364">		return 0;</a>
+<a name="ln365"> </a>
+<a name="ln366">	uint8 apicID = apic_read(APIC_ID) &gt;&gt; 24;</a>
+<a name="ln367">	for (uint32 i = 0; i &lt; gKernelArgs.num_cpus; i++) {</a>
+<a name="ln368">		if (gKernelArgs.arch_args.cpu_apic_id[i] == apicID)</a>
+<a name="ln369">			return i;</a>
+<a name="ln370">	}</a>
+<a name="ln371"> </a>
+<a name="ln372">	return 0;</a>
+<a name="ln373">}</a>
+<a name="ln374"> </a>
+<a name="ln375"> </a>
+<a name="ln376">void</a>
+<a name="ln377">smp_init_other_cpus(void)</a>
+<a name="ln378">{</a>
+<a name="ln379">	if (get_safemode_boolean(B_SAFEMODE_DISABLE_SMP, false)) {</a>
+<a name="ln380">		// SMP has been disabled!</a>
+<a name="ln381">		TRACE((&quot;smp disabled per safemode setting\n&quot;));</a>
+<a name="ln382">		gKernelArgs.num_cpus = 1;</a>
+<a name="ln383">	}</a>
+<a name="ln384"> </a>
+<a name="ln385">	if (get_safemode_boolean(B_SAFEMODE_DISABLE_APIC, false)) {</a>
+<a name="ln386">		TRACE((&quot;local apic disabled per safemode setting, disabling smp\n&quot;));</a>
+<a name="ln387">		gKernelArgs.arch_args.apic_phys = 0;</a>
+<a name="ln388">		gKernelArgs.num_cpus = 1;</a>
+<a name="ln389">	}</a>
+<a name="ln390"> </a>
+<a name="ln391">	if (gKernelArgs.arch_args.apic_phys == 0)</a>
+<a name="ln392">		return;</a>
+<a name="ln393"> </a>
+<a name="ln394">	TRACE((&quot;smp: found %ld cpu%s\n&quot;, gKernelArgs.num_cpus,</a>
+<a name="ln395">		gKernelArgs.num_cpus != 1 ? &quot;s&quot; : &quot;&quot;));</a>
+<a name="ln396">	TRACE((&quot;smp: apic_phys = %p\n&quot;, (void *)gKernelArgs.arch_args.apic_phys));</a>
+<a name="ln397">	TRACE((&quot;smp: ioapic_phys = %p\n&quot;,</a>
+<a name="ln398">		(void *)gKernelArgs.arch_args.ioapic_phys));</a>
+<a name="ln399"> </a>
+<a name="ln400">	// map in the apic</a>
+<a name="ln401">	gKernelArgs.arch_args.apic = (void *)mmu_map_physical_memory(</a>
+<a name="ln402">		gKernelArgs.arch_args.apic_phys, B_PAGE_SIZE, kDefaultPageFlags);</a>
+<a name="ln403"> </a>
+<a name="ln404">	TRACE((&quot;smp: apic (mapped) = %p\n&quot;, (void *)gKernelArgs.arch_args.apic));</a>
+<a name="ln405"> </a>
+<a name="ln406">	// calculate how fast the apic timer is</a>
+<a name="ln407">	calculate_apic_timer_conversion_factor();</a>
+<a name="ln408"> </a>
+<a name="ln409">	if (gKernelArgs.num_cpus &lt; 2)</a>
+<a name="ln410">		return;</a>
+<a name="ln411"> </a>
+<a name="ln412">	for (uint32 i = 1; i &lt; gKernelArgs.num_cpus; i++) {</a>
+<a name="ln413">		// create a final stack the trampoline code will put the ap processor on</a>
+<a name="ln414">		gKernelArgs.cpu_kstack[i].start = (addr_t)mmu_allocate(NULL,</a>
+<a name="ln415">			KERNEL_STACK_SIZE + KERNEL_STACK_GUARD_PAGES * B_PAGE_SIZE);</a>
+<a name="ln416">		gKernelArgs.cpu_kstack[i].size = KERNEL_STACK_SIZE</a>
+<a name="ln417">			+ KERNEL_STACK_GUARD_PAGES * B_PAGE_SIZE;</a>
+<a name="ln418">	}</a>
+<a name="ln419">}</a>
+<a name="ln420"> </a>
+<a name="ln421"> </a>
+<a name="ln422">void</a>
+<a name="ln423">smp_boot_other_cpus(void (*entryFunc)(void))</a>
+<a name="ln424">{</a>
+<a name="ln425">	if (gKernelArgs.num_cpus &lt; 2)</a>
+<a name="ln426">		return;</a>
+<a name="ln427"> </a>
+<a name="ln428">	TRACE((&quot;trampolining other cpus\n&quot;));</a>
+<a name="ln429"> </a>
+<a name="ln430">	// The first 8 MB are identity mapped, either 0x9e000-0x9ffff is reserved</a>
+<a name="ln431">	// for this, or when PXE services are used 0x8b000-0x8cfff.</a>
+<a name="ln432"> </a>
+<a name="ln433">	// allocate a stack and a code area for the smp trampoline</a>
+<a name="ln434">	// (these have to be &lt; 1M physical, 0xa0000-0xfffff is reserved by the BIOS,</a>
+<a name="ln435">	// and when PXE services are used, the 0x8d000-0x9ffff is also reserved)</a>
+<a name="ln436">#ifdef _PXE_ENV</a>
+<a name="ln437">	uint32 trampolineCode = 0x8b000;</a>
+<a name="ln438">	uint32 trampolineStack = 0x8c000;</a>
+<a name="ln439">#else</a>
+<a name="ln440">	uint32 trampolineCode = 0x9f000;</a>
+<a name="ln441">	uint32 trampolineStack = 0x9e000;</a>
+<a name="ln442">#endif</a>
+<a name="ln443"> </a>
+<a name="ln444">	// copy the trampoline code over</a>
+<a name="ln445">	memcpy((char *)trampolineCode, (const void*)&amp;smp_trampoline,</a>
+<a name="ln446">		(uint32)&amp;smp_trampoline_end - (uint32)&amp;smp_trampoline);</a>
+<a name="ln447"> </a>
+<a name="ln448">	// boot the cpus</a>
+<a name="ln449">	for (uint32 i = 1; i &lt; gKernelArgs.num_cpus; i++) {</a>
+<a name="ln450">		uint32 *finalStack;</a>
+<a name="ln451">		uint32 *tempStack;</a>
+<a name="ln452">		uint32 config;</a>
+<a name="ln453">		uint32 numStartups;</a>
+<a name="ln454">		uint32 j;</a>
+<a name="ln455"> </a>
+<a name="ln456">		// set this stack up</a>
+<a name="ln457">		finalStack = (uint32 *)gKernelArgs.cpu_kstack[i].start;</a>
+<a name="ln458">		memset((uint8*)finalStack + KERNEL_STACK_GUARD_PAGES * B_PAGE_SIZE, 0,</a>
+<a name="ln459">			KERNEL_STACK_SIZE);</a>
+<a name="ln460">		tempStack = (finalStack</a>
+<a name="ln461">			+ (KERNEL_STACK_SIZE + KERNEL_STACK_GUARD_PAGES * B_PAGE_SIZE)</a>
+<a name="ln462">				/ sizeof(uint32)) - 1;</a>
+<a name="ln463">		*tempStack = (uint32)entryFunc;</a>
+<a name="ln464"> </a>
+<a name="ln465">		// set the trampoline stack up</a>
+<a name="ln466">		tempStack = (uint32 *)(trampolineStack + B_PAGE_SIZE - 4);</a>
+<a name="ln467">		// final location of the stack</a>
+<a name="ln468">		*tempStack = ((uint32)finalStack) + KERNEL_STACK_SIZE</a>
+<a name="ln469">			+ KERNEL_STACK_GUARD_PAGES * B_PAGE_SIZE - sizeof(uint32);</a>
+<a name="ln470">		tempStack--;</a>
+<a name="ln471">		// page dir</a>
+<a name="ln472">		*tempStack = x86_read_cr3() &amp; 0xfffff000;</a>
+<a name="ln473"> </a>
+<a name="ln474">		// put a gdt descriptor at the bottom of the stack</a>
+<a name="ln475">		*((uint16 *)trampolineStack) = 0x18 - 1; // LIMIT</a>
+<a name="ln476">		*((uint32 *)(trampolineStack + 2)) = trampolineStack + 8;</a>
+<a name="ln477"> </a>
+<a name="ln478">		// construct a temporary gdt at the bottom</a>
+<a name="ln479">		segment_descriptor* tempGDT</a>
+<a name="ln480">			= (segment_descriptor*)&amp;((uint32 *)trampolineStack)[2];</a>
+<a name="ln481">		clear_segment_descriptor(&amp;tempGDT[0]);</a>
+<a name="ln482">		set_segment_descriptor(&amp;tempGDT[1], 0, 0xffffffff, DT_CODE_READABLE,</a>
+<a name="ln483">			DPL_KERNEL);</a>
+<a name="ln484">		set_segment_descriptor(&amp;tempGDT[2], 0, 0xffffffff, DT_DATA_WRITEABLE,</a>
+<a name="ln485">			DPL_KERNEL);</a>
+<a name="ln486"> </a>
+<a name="ln487">		/* clear apic errors */</a>
+<a name="ln488">		if (gKernelArgs.arch_args.cpu_apic_version[i] &amp; 0xf0) {</a>
+<a name="ln489">			apic_write(APIC_ERROR_STATUS, 0);</a>
+<a name="ln490">			apic_read(APIC_ERROR_STATUS);</a>
+<a name="ln491">		}</a>
+<a name="ln492"> </a>
+<a name="ln493">//dprintf(&quot;assert INIT\n&quot;);</a>
+<a name="ln494">		/* send (aka assert) INIT IPI */</a>
+<a name="ln495">		config = (apic_read(APIC_INTR_COMMAND_2) &amp; APIC_INTR_COMMAND_2_MASK)</a>
+<a name="ln496">			| (gKernelArgs.arch_args.cpu_apic_id[i] &lt;&lt; 24);</a>
+<a name="ln497">		apic_write(APIC_INTR_COMMAND_2, config); /* set target pe */</a>
+<a name="ln498">		config = (apic_read(APIC_INTR_COMMAND_1) &amp; 0xfff00000)</a>
+<a name="ln499">			| APIC_TRIGGER_MODE_LEVEL | APIC_INTR_COMMAND_1_ASSERT</a>
+<a name="ln500">			| APIC_DELIVERY_MODE_INIT;</a>
+<a name="ln501">		apic_write(APIC_INTR_COMMAND_1, config);</a>
+<a name="ln502"> </a>
+<a name="ln503">dprintf(&quot;wait for delivery\n&quot;);</a>
+<a name="ln504">		// wait for pending to end</a>
+<a name="ln505">		while ((apic_read(APIC_INTR_COMMAND_1) &amp; APIC_DELIVERY_STATUS) != 0)</a>
+<a name="ln506">			asm volatile (&quot;pause;&quot;);</a>
+<a name="ln507"> </a>
+<a name="ln508">dprintf(&quot;deassert INIT\n&quot;);</a>
+<a name="ln509">		/* deassert INIT */</a>
+<a name="ln510">		config = (apic_read(APIC_INTR_COMMAND_2) &amp; APIC_INTR_COMMAND_2_MASK)</a>
+<a name="ln511">			| (gKernelArgs.arch_args.cpu_apic_id[i] &lt;&lt; 24);</a>
+<a name="ln512">		apic_write(APIC_INTR_COMMAND_2, config);</a>
+<a name="ln513">		config = (apic_read(APIC_INTR_COMMAND_1) &amp; 0xfff00000)</a>
+<a name="ln514">			| APIC_TRIGGER_MODE_LEVEL | APIC_DELIVERY_MODE_INIT;</a>
+<a name="ln515">		apic_write(APIC_INTR_COMMAND_1, config);</a>
+<a name="ln516"> </a>
+<a name="ln517">dprintf(&quot;wait for delivery\n&quot;);</a>
+<a name="ln518">		// wait for pending to end</a>
+<a name="ln519">		while ((apic_read(APIC_INTR_COMMAND_1) &amp; APIC_DELIVERY_STATUS) != 0)</a>
+<a name="ln520">			asm volatile (&quot;pause;&quot;);</a>
+<a name="ln521"> </a>
+<a name="ln522">		/* wait 10ms */</a>
+<a name="ln523">		spin(10000);</a>
+<a name="ln524"> </a>
+<a name="ln525">		/* is this a local apic or an 82489dx ? */</a>
+<a name="ln526">		numStartups = (gKernelArgs.arch_args.cpu_apic_version[i] &amp; 0xf0)</a>
+<a name="ln527">			? 2 : 0;</a>
+<a name="ln528">dprintf(&quot;num startups = %ld\n&quot;, numStartups);</a>
+<a name="ln529">		for (j = 0; j &lt; numStartups; j++) {</a>
+<a name="ln530">			/* it's a local apic, so send STARTUP IPIs */</a>
+<a name="ln531">dprintf(&quot;send STARTUP\n&quot;);</a>
+<a name="ln532">			apic_write(APIC_ERROR_STATUS, 0);</a>
+<a name="ln533"> </a>
+<a name="ln534">			/* set target pe */</a>
+<a name="ln535">			config = (apic_read(APIC_INTR_COMMAND_2) &amp; APIC_INTR_COMMAND_2_MASK)</a>
+<a name="ln536">				| (gKernelArgs.arch_args.cpu_apic_id[i] &lt;&lt; 24);</a>
+<a name="ln537">			apic_write(APIC_INTR_COMMAND_2, config);</a>
+<a name="ln538"> </a>
+<a name="ln539">			/* send the IPI */</a>
+<a name="ln540">			config = (apic_read(APIC_INTR_COMMAND_1) &amp; 0xfff0f800)</a>
+<a name="ln541">				| APIC_DELIVERY_MODE_STARTUP | (trampolineCode &gt;&gt; 12);</a>
+<a name="ln542">			apic_write(APIC_INTR_COMMAND_1, config);</a>
+<a name="ln543"> </a>
+<a name="ln544">			/* wait */</a>
+<a name="ln545">			spin(200);</a>
+<a name="ln546"> </a>
+<a name="ln547">dprintf(&quot;wait for delivery\n&quot;);</a>
+<a name="ln548">			while ((apic_read(APIC_INTR_COMMAND_1) &amp; APIC_DELIVERY_STATUS) != 0)</a>
+<a name="ln549">				asm volatile (&quot;pause;&quot;);</a>
+<a name="ln550">		}</a>
+<a name="ln551"> </a>
+<a name="ln552">		// Wait for the trampoline code to clear the final stack location.</a>
+<a name="ln553">		// This serves as a notification for us that it has loaded the address</a>
+<a name="ln554">		// and it is safe for us to overwrite it to trampoline the next CPU.</a>
+<a name="ln555">		tempStack++;</a>
+<a name="ln556">		while (*tempStack != 0)</a>
+<a name="ln557">			spin(1000);</a>
+<a name="ln558">	}</a>
+<a name="ln559"> </a>
+<a name="ln560">	TRACE((&quot;done trampolining\n&quot;));</a>
+<a name="ln561">}</a>
+<a name="ln562"> </a>
+<a name="ln563"> </a>
+<a name="ln564">void</a>
+<a name="ln565">smp_add_safemode_menus(Menu *menu)</a>
+<a name="ln566">{</a>
+<a name="ln567">	MenuItem *item;</a>
+<a name="ln568"> </a>
+<a name="ln569">	if (gKernelArgs.arch_args.ioapic_phys != 0) {</a>
+<a name="ln570">		menu-&gt;AddItem(item = new(nothrow) MenuItem(&quot;Disable IO-APIC&quot;));</a>
+<a name="ln571">		item-&gt;SetType(MENU_ITEM_MARKABLE);</a>
+<a name="ln572">		item-&gt;SetData(B_SAFEMODE_DISABLE_IOAPIC);</a>
+<a name="ln573">		item-&gt;SetHelpText(&quot;Disables using the IO APIC for interrupt routing, &quot;</a>
+<a name="ln574">			&quot;forcing the use of the legacy PIC instead.&quot;);</a>
+<a name="ln575">	}</a>
+<a name="ln576"> </a>
+<a name="ln577">	if (gKernelArgs.arch_args.apic_phys != 0) {</a>
+<a name="ln578">		menu-&gt;AddItem(item = new(nothrow) MenuItem(&quot;Disable local APIC&quot;));</a>
+<a name="ln579">		item-&gt;SetType(MENU_ITEM_MARKABLE);</a>
+<a name="ln580">		item-&gt;SetData(B_SAFEMODE_DISABLE_APIC);</a>
+<a name="ln581">		item-&gt;SetHelpText(&quot;Disables using the local APIC, also disables SMP.&quot;);</a>
+<a name="ln582"> </a>
+<a name="ln583">		cpuid_info info;</a>
+<a name="ln584">		if (get_current_cpuid(&amp;info, 1, 0) == B_OK</a>
+<a name="ln585">				&amp;&amp; (info.regs.ecx &amp; IA32_FEATURE_EXT_X2APIC) != 0) {</a>
+<a name="ln586">			menu-&gt;AddItem(item = new(nothrow) MenuItem(&quot;Disable X2APIC&quot;));</a>
+<a name="ln587">			item-&gt;SetType(MENU_ITEM_MARKABLE);</a>
+<a name="ln588">			item-&gt;SetData(B_SAFEMODE_DISABLE_X2APIC);</a>
+<a name="ln589">			item-&gt;SetHelpText(&quot;Disables using X2APIC.&quot;);</a>
+<a name="ln590">		}</a>
+<a name="ln591"> </a>
+<a name="ln592">		if (get_current_cpuid(&amp;info, 7, 0) == B_OK</a>
+<a name="ln593">				&amp;&amp; (info.regs.ebx &amp; (IA32_FEATURE_SMEP</a>
+<a name="ln594">					| IA32_FEATURE_SMAP)) != 0) {</a>
+<a name="ln595">			menu-&gt;AddItem(item = new(nothrow) MenuItem(</a>
+<a name="ln596">				&quot;Disable SMEP and SMAP&quot;));</a>
+<a name="ln597">			item-&gt;SetType(MENU_ITEM_MARKABLE);</a>
+<a name="ln598">			item-&gt;SetData(B_SAFEMODE_DISABLE_SMEP_SMAP);</a>
+<a name="ln599">			item-&gt;SetHelpText(&quot;Disables using SMEP and SMAP.&quot;);</a>
+<a name="ln600">		}</a>
+<a name="ln601"> </a>
+<a name="ln602">	}</a>
+<a name="ln603"> </a>
+<a name="ln604">	if (gKernelArgs.num_cpus &lt; 2)</a>
+<a name="ln605">		return;</a>
+<a name="ln606"> </a>
+<a name="ln607">	item = new(nothrow) MenuItem(&quot;Disable SMP&quot;);</a>
+<a name="ln608">	menu-&gt;AddItem(item);</a>
+<a name="ln609">	item-&gt;SetData(B_SAFEMODE_DISABLE_SMP);</a>
+<a name="ln610">	item-&gt;SetType(MENU_ITEM_MARKABLE);</a>
+<a name="ln611">	item-&gt;SetHelpText(&quot;Disables all but one CPU core.&quot;);</a>
+<a name="ln612">}</a>
+<a name="ln613"> </a>
+<a name="ln614"> </a>
+<a name="ln615">void</a>
+<a name="ln616">smp_init(void)</a>
+<a name="ln617">{</a>
+<a name="ln618">#if NO_SMP</a>
+<a name="ln619">	gKernelArgs.num_cpus = 1;</a>
+<a name="ln620">	return;</a>
+<a name="ln621">#endif</a>
+<a name="ln622"> </a>
+<a name="ln623">	cpuid_info info;</a>
+<a name="ln624">	if (get_current_cpuid(&amp;info, 1, 0) != B_OK)</a>
+<a name="ln625">		return;</a>
+<a name="ln626"> </a>
+<a name="ln627">	if ((info.eax_1.features &amp; IA32_FEATURE_APIC) == 0) {</a>
+<a name="ln628">		// Local APICs aren't present; As they form the basis for all inter CPU</a>
+<a name="ln629">		// communication and therefore SMP, we don't need to go any further.</a>
+<a name="ln630">		dprintf(&quot;no local APIC present, not attempting SMP init\n&quot;);</a>
+<a name="ln631">		return;</a>
+<a name="ln632">	}</a>
+<a name="ln633"> </a>
+<a name="ln634">	// first try to find ACPI tables to get MP configuration as it handles</a>
+<a name="ln635">	// physical as well as logical MP configurations as in multiple cpus,</a>
+<a name="ln636">	// multiple cores or hyper threading.</a>
+<a name="ln637">	if (smp_do_acpi_config() == B_OK)</a>
+<a name="ln638">		return;</a>
+<a name="ln639"> </a>
+<a name="ln640">	// then try to find MPS tables and do configuration based on them</a>
+<a name="ln641">	for (int32 i = 0; smp_scan_spots[i].length &gt; 0; i++) {</a>
+<a name="ln642">		mp_floating_struct *floatingStruct = smp_mp_probe(</a>
+<a name="ln643">			smp_scan_spots[i].start, smp_scan_spots[i].stop);</a>
+<a name="ln644">		if (floatingStruct != NULL &amp;&amp; smp_do_mp_config(floatingStruct) == B_OK)</a>
+<a name="ln645">			return;</a>
+<a name="ln646">	}</a>
+<a name="ln647"> </a>
+<a name="ln648">	// Everything failed or we are not running an SMP system, reset anything</a>
+<a name="ln649">	// that might have been set through an incomplete configuration attempt.</a>
+<a name="ln650">	gKernelArgs.arch_args.apic_phys = 0;</a>
+<a name="ln651">	gKernelArgs.arch_args.ioapic_phys = 0;</a>
+<a name="ln652">	gKernelArgs.num_cpus = 1;</a>
+<a name="ln653">}</a>
+
+</code></pre>
+<div class="balloon" rel="458"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v512/" target="_blank">V512</a> A call of the 'memset' function will lead to overflow of the buffer '(uint8 *) finalStack + 1 * 4096'.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

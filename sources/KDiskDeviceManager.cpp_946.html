@@ -1,0 +1,1619 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>KDiskDeviceManager.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2004-2018, Haiku, Inc.</a>
+<a name="ln3"> * Copyright 2003-2004, Ingo Weinhold, bonefish@cs.tu-berlin.de.</a>
+<a name="ln4"> * All rights reserved. Distributed under the terms of the MIT License.</a>
+<a name="ln5"> */</a>
+<a name="ln6"> </a>
+<a name="ln7"> </a>
+<a name="ln8">#include &quot;KDiskDevice.h&quot;</a>
+<a name="ln9">#include &quot;KDiskDeviceManager.h&quot;</a>
+<a name="ln10">#include &quot;KDiskDeviceUtils.h&quot;</a>
+<a name="ln11">#include &quot;KDiskSystem.h&quot;</a>
+<a name="ln12">#include &quot;KFileDiskDevice.h&quot;</a>
+<a name="ln13">#include &quot;KFileSystem.h&quot;</a>
+<a name="ln14">#include &quot;KPartition.h&quot;</a>
+<a name="ln15">#include &quot;KPartitioningSystem.h&quot;</a>
+<a name="ln16">#include &quot;KPartitionVisitor.h&quot;</a>
+<a name="ln17">#include &quot;KPath.h&quot;</a>
+<a name="ln18"> </a>
+<a name="ln19">#include &lt;VectorMap.h&gt;</a>
+<a name="ln20">#include &lt;VectorSet.h&gt;</a>
+<a name="ln21"> </a>
+<a name="ln22">#include &lt;DiskDeviceRoster.h&gt;</a>
+<a name="ln23">#include &lt;KernelExport.h&gt;</a>
+<a name="ln24">#include &lt;NodeMonitor.h&gt;</a>
+<a name="ln25"> </a>
+<a name="ln26">#include &lt;boot_device.h&gt;</a>
+<a name="ln27">#include &lt;kmodule.h&gt;</a>
+<a name="ln28">#include &lt;node_monitor.h&gt;</a>
+<a name="ln29">#include &lt;Notifications.h&gt;</a>
+<a name="ln30">#include &lt;util/kernel_cpp.h&gt;</a>
+<a name="ln31">#include &lt;vfs.h&gt;</a>
+<a name="ln32"> </a>
+<a name="ln33">#include &lt;dirent.h&gt;</a>
+<a name="ln34">#include &lt;errno.h&gt;</a>
+<a name="ln35">#include &lt;module.h&gt;</a>
+<a name="ln36">#include &lt;stdio.h&gt;</a>
+<a name="ln37">#include &lt;stdlib.h&gt;</a>
+<a name="ln38">#include &lt;string.h&gt;</a>
+<a name="ln39">#include &lt;sys/stat.h&gt;</a>
+<a name="ln40"> </a>
+<a name="ln41">// debugging</a>
+<a name="ln42">//#define DBG(x)</a>
+<a name="ln43">#define DBG(x) x</a>
+<a name="ln44">#define OUT dprintf</a>
+<a name="ln45"> </a>
+<a name="ln46"> </a>
+<a name="ln47">// directories for partitioning and file system modules</a>
+<a name="ln48">static const char* kPartitioningSystemPrefix = &quot;partitioning_systems&quot;;</a>
+<a name="ln49">static const char* kFileSystemPrefix = &quot;file_systems&quot;;</a>
+<a name="ln50"> </a>
+<a name="ln51"> </a>
+<a name="ln52">// singleton instance</a>
+<a name="ln53">KDiskDeviceManager* KDiskDeviceManager::sDefaultManager = NULL;</a>
+<a name="ln54"> </a>
+<a name="ln55"> </a>
+<a name="ln56">struct device_event {</a>
+<a name="ln57">	int32					opcode;</a>
+<a name="ln58">	const char*				name;</a>
+<a name="ln59">	dev_t					device;</a>
+<a name="ln60">	ino_t					directory;</a>
+<a name="ln61">	ino_t					node;</a>
+<a name="ln62">};</a>
+<a name="ln63"> </a>
+<a name="ln64"> </a>
+<a name="ln65">struct GetPartitionID {</a>
+<a name="ln66">	inline partition_id operator()(const KPartition* partition) const</a>
+<a name="ln67">	{</a>
+<a name="ln68">		return partition-&gt;ID();</a>
+<a name="ln69">	}</a>
+<a name="ln70">};</a>
+<a name="ln71"> </a>
+<a name="ln72"> </a>
+<a name="ln73">struct GetDiskSystemID {</a>
+<a name="ln74">	inline disk_system_id operator()(const KDiskSystem* system) const</a>
+<a name="ln75">	{</a>
+<a name="ln76">		return system-&gt;ID();</a>
+<a name="ln77">	}</a>
+<a name="ln78">};</a>
+<a name="ln79"> </a>
+<a name="ln80"> </a>
+<a name="ln81">struct KDiskDeviceManager::PartitionMap : VectorMap&lt;partition_id, KPartition*,</a>
+<a name="ln82">	VectorMapEntryStrategy::ImplicitKey&lt;partition_id, KPartition*,</a>
+<a name="ln83">		GetPartitionID&gt; &gt; {</a>
+<a name="ln84">};</a>
+<a name="ln85"> </a>
+<a name="ln86"> </a>
+<a name="ln87">struct KDiskDeviceManager::DeviceMap : VectorMap&lt;partition_id, KDiskDevice*,</a>
+<a name="ln88">	VectorMapEntryStrategy::ImplicitKey&lt;partition_id, KDiskDevice*,</a>
+<a name="ln89">		GetPartitionID&gt; &gt; {</a>
+<a name="ln90">};</a>
+<a name="ln91"> </a>
+<a name="ln92"> </a>
+<a name="ln93">struct KDiskDeviceManager::DiskSystemMap : VectorMap&lt;disk_system_id,</a>
+<a name="ln94">	KDiskSystem*,</a>
+<a name="ln95">	VectorMapEntryStrategy::ImplicitKey&lt;disk_system_id, KDiskSystem*,</a>
+<a name="ln96">		GetDiskSystemID&gt; &gt; {</a>
+<a name="ln97">};</a>
+<a name="ln98"> </a>
+<a name="ln99"> </a>
+<a name="ln100">struct KDiskDeviceManager::PartitionSet : VectorSet&lt;KPartition*&gt; {</a>
+<a name="ln101">};</a>
+<a name="ln102"> </a>
+<a name="ln103"> </a>
+<a name="ln104">class KDiskDeviceManager::DiskSystemWatcher : public NotificationListener {</a>
+<a name="ln105">public:</a>
+<a name="ln106">	DiskSystemWatcher(KDiskDeviceManager* manager)</a>
+<a name="ln107">		:</a>
+<a name="ln108">		fManager(manager)</a>
+<a name="ln109">	{</a>
+<a name="ln110">	}</a>
+<a name="ln111"> </a>
+<a name="ln112">	virtual ~DiskSystemWatcher()</a>
+<a name="ln113">	{</a>
+<a name="ln114">	}</a>
+<a name="ln115"> </a>
+<a name="ln116">	virtual void EventOccurred(NotificationService&amp; service,</a>
+<a name="ln117">		const KMessage* event)</a>
+<a name="ln118">	{</a>
+<a name="ln119">		if (event-&gt;GetInt32(&quot;opcode&quot;, -1) != B_ENTRY_REMOVED)</a>
+<a name="ln120">			fManager-&gt;RescanDiskSystems();</a>
+<a name="ln121">	}</a>
+<a name="ln122"> </a>
+<a name="ln123">private:</a>
+<a name="ln124">	KDiskDeviceManager* fManager;</a>
+<a name="ln125">};</a>
+<a name="ln126"> </a>
+<a name="ln127"> </a>
+<a name="ln128">class KDiskDeviceManager::DeviceWatcher : public NotificationListener {</a>
+<a name="ln129">public:</a>
+<a name="ln130">	DeviceWatcher()</a>
+<a name="ln131">	{</a>
+<a name="ln132">	}</a>
+<a name="ln133"> </a>
+<a name="ln134">	virtual ~DeviceWatcher()</a>
+<a name="ln135">	{</a>
+<a name="ln136">	}</a>
+<a name="ln137"> </a>
+<a name="ln138">	virtual void EventOccurred(NotificationService&amp; service,</a>
+<a name="ln139">		const KMessage* event)</a>
+<a name="ln140">	{</a>
+<a name="ln141">		int32 opcode = event-&gt;GetInt32(&quot;opcode&quot;, -1);</a>
+<a name="ln142">		switch (opcode) {</a>
+<a name="ln143">			case B_ENTRY_CREATED:</a>
+<a name="ln144">			case B_ENTRY_REMOVED:</a>
+<a name="ln145">			{</a>
+<a name="ln146">				device_event* deviceEvent = new(std::nothrow) device_event;</a>
+<a name="ln147">				if (deviceEvent == NULL)</a>
+<a name="ln148">					break;</a>
+<a name="ln149"> </a>
+<a name="ln150">				const char* name = event-&gt;GetString(&quot;name&quot;, NULL);</a>
+<a name="ln151">				if (name != NULL)</a>
+<a name="ln152">					deviceEvent-&gt;name = strdup(name);</a>
+<a name="ln153">				else</a>
+<a name="ln154">					deviceEvent-&gt;name = NULL;</a>
+<a name="ln155"> </a>
+<a name="ln156">				deviceEvent-&gt;opcode = opcode;</a>
+<a name="ln157">				deviceEvent-&gt;device = event-&gt;GetInt32(&quot;device&quot;, -1);</a>
+<a name="ln158">				deviceEvent-&gt;directory = event-&gt;GetInt64(&quot;directory&quot;, -1);</a>
+<a name="ln159">				deviceEvent-&gt;node = event-&gt;GetInt64(&quot;node&quot;, -1);</a>
+<a name="ln160"> </a>
+<a name="ln161">				struct stat stat;</a>
+<a name="ln162">				if (vfs_stat_node_ref(deviceEvent-&gt;device,  deviceEvent-&gt;node,</a>
+<a name="ln163">						&amp;stat) != 0) {</a>
+<a name="ln164">					delete deviceEvent;</a>
+<a name="ln165">					break;</a>
+<a name="ln166">				}</a>
+<a name="ln167">				if (S_ISDIR(stat.st_mode)) {</a>
+<a name="ln168">					if (opcode == B_ENTRY_CREATED) {</a>
+<a name="ln169">						add_node_listener(deviceEvent-&gt;device,</a>
+<a name="ln170">							deviceEvent-&gt;node, B_WATCH_DIRECTORY, *this);</a>
+<a name="ln171">					} else {</a>
+<a name="ln172">						remove_node_listener(deviceEvent-&gt;device,</a>
+<a name="ln173">							deviceEvent-&gt;node, *this);</a>
+<a name="ln174">					}</a>
+<a name="ln175">					delete deviceEvent;</a>
+<a name="ln176">					break;</a>
+<a name="ln177">				}</a>
+<a name="ln178"> </a>
+<a name="ln179">				// TODO: a real in-kernel DPC mechanism would be preferred...</a>
+<a name="ln180">				thread_id thread = spawn_kernel_thread(_HandleDeviceEvent,</a>
+<a name="ln181">					&quot;device event&quot;, B_NORMAL_PRIORITY, deviceEvent);</a>
+<a name="ln182">				if (thread &lt; 0)</a>
+<a name="ln183">					delete deviceEvent;</a>
+<a name="ln184">				else</a>
+<a name="ln185">					resume_thread(thread);</a>
+<a name="ln186">				break;</a>
+<a name="ln187">			}</a>
+<a name="ln188"> </a>
+<a name="ln189">			default:</a>
+<a name="ln190">				break;</a>
+<a name="ln191">		}</a>
+<a name="ln192">	}</a>
+<a name="ln193"> </a>
+<a name="ln194">	static status_t _HandleDeviceEvent(void* _event)</a>
+<a name="ln195">	{</a>
+<a name="ln196">		device_event* event = (device_event*)_event;</a>
+<a name="ln197"> </a>
+<a name="ln198">		if (strcmp(event-&gt;name, &quot;raw&quot;) == 0) {</a>
+<a name="ln199">			// a new raw device was added/removed</a>
+<a name="ln200">			KPath path(B_PATH_NAME_LENGTH + 1);</a>
+<a name="ln201">			if (path.InitCheck() != B_OK</a>
+<a name="ln202">				|| vfs_entry_ref_to_path(event-&gt;device, event-&gt;directory,</a>
+<a name="ln203">					event-&gt;name, true, path.LockBuffer(),</a>
+<a name="ln204">					path.BufferSize()) != B_OK) {</a>
+<a name="ln205">				delete event;</a>
+<a name="ln206">				return B_ERROR;</a>
+<a name="ln207">			}</a>
+<a name="ln208"> </a>
+<a name="ln209">			path.UnlockBuffer();</a>
+<a name="ln210">			if (event-&gt;opcode == B_ENTRY_CREATED)</a>
+<a name="ln211">				KDiskDeviceManager::Default()-&gt;CreateDevice(path.Path());</a>
+<a name="ln212">			else</a>
+<a name="ln213">				KDiskDeviceManager::Default()-&gt;DeleteDevice(path.Path());</a>
+<a name="ln214">		}</a>
+<a name="ln215"> </a>
+<a name="ln216">		delete event;</a>
+<a name="ln217">		return B_OK;</a>
+<a name="ln218">	}</a>
+<a name="ln219">};</a>
+<a name="ln220"> </a>
+<a name="ln221"> </a>
+<a name="ln222">class KDiskDeviceManager::DiskNotifications</a>
+<a name="ln223">	: public DefaultUserNotificationService {</a>
+<a name="ln224">public:</a>
+<a name="ln225">	DiskNotifications()</a>
+<a name="ln226">		: DefaultUserNotificationService(&quot;disk devices&quot;)</a>
+<a name="ln227">	{</a>
+<a name="ln228">	}</a>
+<a name="ln229"> </a>
+<a name="ln230">	virtual ~DiskNotifications()</a>
+<a name="ln231">	{</a>
+<a name="ln232">	}</a>
+<a name="ln233">};</a>
+<a name="ln234"> </a>
+<a name="ln235"> </a>
+<a name="ln236">//	#pragma mark -</a>
+<a name="ln237"> </a>
+<a name="ln238"> </a>
+<a name="ln239">KDiskDeviceManager::KDiskDeviceManager()</a>
+<a name="ln240">	:</a>
+<a name="ln241">	fDevices(new(nothrow) DeviceMap),</a>
+<a name="ln242">	fPartitions(new(nothrow) PartitionMap),</a>
+<a name="ln243">	fDiskSystems(new(nothrow) DiskSystemMap),</a>
+<a name="ln244">	fObsoletePartitions(new(nothrow) PartitionSet),</a>
+<a name="ln245">	fMediaChecker(-1),</a>
+<a name="ln246">	fTerminating(false),</a>
+<a name="ln247">	fDiskSystemWatcher(NULL),</a>
+<a name="ln248">	fDeviceWatcher(new(nothrow) DeviceWatcher()),</a>
+<a name="ln249">	fNotifications(new(nothrow) DiskNotifications)</a>
+<a name="ln250">{</a>
+<a name="ln251">	recursive_lock_init(&amp;fLock, &quot;disk device manager&quot;);</a>
+<a name="ln252"> </a>
+<a name="ln253">	if (InitCheck() != B_OK)</a>
+<a name="ln254">		return;</a>
+<a name="ln255"> </a>
+<a name="ln256">	fNotifications-&gt;Register();</a>
+<a name="ln257"> </a>
+<a name="ln258">	RescanDiskSystems();</a>
+<a name="ln259"> </a>
+<a name="ln260">	fMediaChecker = spawn_kernel_thread(_CheckMediaStatusDaemon,</a>
+<a name="ln261">		&quot;media checker&quot;, B_NORMAL_PRIORITY, this);</a>
+<a name="ln262">	if (fMediaChecker &gt;= 0)</a>
+<a name="ln263">		resume_thread(fMediaChecker);</a>
+<a name="ln264"> </a>
+<a name="ln265">	DBG(OUT(&quot;number of disk systems: %&quot; B_PRId32 &quot;\n&quot;, CountDiskSystems()));</a>
+<a name="ln266">	// TODO: Watch the disk systems and the relevant directories.</a>
+<a name="ln267">}</a>
+<a name="ln268"> </a>
+<a name="ln269"> </a>
+<a name="ln270">KDiskDeviceManager::~KDiskDeviceManager()</a>
+<a name="ln271">{</a>
+<a name="ln272">	fTerminating = true;</a>
+<a name="ln273"> </a>
+<a name="ln274">	status_t result;</a>
+<a name="ln275">	wait_for_thread(fMediaChecker, &amp;result);</a>
+<a name="ln276"> </a>
+<a name="ln277">	// stop all node monitoring</a>
+<a name="ln278">	_AddRemoveMonitoring(&quot;/dev/disk&quot;, false);</a>
+<a name="ln279">	delete fDeviceWatcher;</a>
+<a name="ln280"> </a>
+<a name="ln281">	// remove all devices</a>
+<a name="ln282">	for (int32 cookie = 0; KDiskDevice* device = NextDevice(&amp;cookie);) {</a>
+<a name="ln283">		PartitionRegistrar _(device);</a>
+<a name="ln284">		_RemoveDevice(device);</a>
+<a name="ln285">	}</a>
+<a name="ln286"> </a>
+<a name="ln287">	// some sanity checks</a>
+<a name="ln288">	if (fPartitions-&gt;Count() &gt; 0) {</a>
+<a name="ln289">		DBG(OUT(&quot;WARNING: There are still %&quot; B_PRId32 &quot; unremoved partitions!\n&quot;,</a>
+<a name="ln290">			fPartitions-&gt;Count()));</a>
+<a name="ln291">		for (PartitionMap::Iterator it = fPartitions-&gt;Begin();</a>
+<a name="ln292">				it != fPartitions-&gt;End(); ++it) {</a>
+<a name="ln293">			DBG(OUT(&quot;         partition: %&quot; B_PRId32 &quot;\n&quot;, it-&gt;Value()-&gt;ID()));</a>
+<a name="ln294">		}</a>
+<a name="ln295">	}</a>
+<a name="ln296">	if (fObsoletePartitions-&gt;Count() &gt; 0) {</a>
+<a name="ln297">		DBG(OUT(&quot;WARNING: There are still %&quot; B_PRId32 &quot; obsolete partitions!\n&quot;,</a>
+<a name="ln298">				fObsoletePartitions-&gt;Count()));</a>
+<a name="ln299">		for (PartitionSet::Iterator it = fObsoletePartitions-&gt;Begin();</a>
+<a name="ln300">				it != fObsoletePartitions-&gt;End(); ++it) {</a>
+<a name="ln301">			DBG(OUT(&quot;         partition: %&quot; B_PRId32 &quot;\n&quot;, (*it)-&gt;ID()));</a>
+<a name="ln302">		}</a>
+<a name="ln303">	}</a>
+<a name="ln304">	// remove all disk systems</a>
+<a name="ln305">	for (int32 cookie = 0; KDiskSystem* diskSystem = NextDiskSystem(&amp;cookie);) {</a>
+<a name="ln306">		fDiskSystems-&gt;Remove(diskSystem-&gt;ID());</a>
+<a name="ln307">		if (diskSystem-&gt;IsLoaded()) {</a>
+<a name="ln308">			DBG(OUT(&quot;WARNING: Disk system `%s' (%&quot; B_PRId32 &quot;) is still loaded!\n&quot;,</a>
+<a name="ln309">				diskSystem-&gt;Name(), diskSystem-&gt;ID()));</a>
+<a name="ln310">		} else</a>
+<a name="ln311">			delete diskSystem;</a>
+<a name="ln312">	}</a>
+<a name="ln313"> </a>
+<a name="ln314">	fNotifications-&gt;Unregister();</a>
+<a name="ln315"> </a>
+<a name="ln316">	// delete the containers</a>
+<a name="ln317">	delete fPartitions;</a>
+<a name="ln318">	delete fDevices;</a>
+<a name="ln319">	delete fDiskSystems;</a>
+<a name="ln320">	delete fObsoletePartitions;</a>
+<a name="ln321">}</a>
+<a name="ln322"> </a>
+<a name="ln323"> </a>
+<a name="ln324">status_t</a>
+<a name="ln325">KDiskDeviceManager::InitCheck() const</a>
+<a name="ln326">{</a>
+<a name="ln327">	if (fPartitions == NULL || fDevices == NULL || fDiskSystems == NULL</a>
+<a name="ln328">		|| fObsoletePartitions == NULL || fNotifications == NULL)</a>
+<a name="ln329">		return B_NO_MEMORY;</a>
+<a name="ln330"> </a>
+<a name="ln331">	return B_OK;</a>
+<a name="ln332">}</a>
+<a name="ln333"> </a>
+<a name="ln334"> </a>
+<a name="ln335">/*!	This creates the system's default DiskDeviceManager.</a>
+<a name="ln336">	The creation is not thread-safe, and shouldn't be done more than once.</a>
+<a name="ln337">*/</a>
+<a name="ln338">status_t</a>
+<a name="ln339">KDiskDeviceManager::CreateDefault()</a>
+<a name="ln340">{</a>
+<a name="ln341">	if (sDefaultManager != NULL)</a>
+<a name="ln342">		return B_OK;</a>
+<a name="ln343"> </a>
+<a name="ln344">	sDefaultManager = new(nothrow) KDiskDeviceManager;</a>
+<a name="ln345">	if (sDefaultManager == NULL)</a>
+<a name="ln346">		return B_NO_MEMORY;</a>
+<a name="ln347"> </a>
+<a name="ln348">	return sDefaultManager-&gt;InitCheck();</a>
+<a name="ln349">}</a>
+<a name="ln350"> </a>
+<a name="ln351"> </a>
+<a name="ln352">/*!	This deletes the default DiskDeviceManager. The deletion is not</a>
+<a name="ln353">	thread-safe either, you should make sure that it's called only once.</a>
+<a name="ln354">*/</a>
+<a name="ln355">void</a>
+<a name="ln356">KDiskDeviceManager::DeleteDefault()</a>
+<a name="ln357">{</a>
+<a name="ln358">	delete sDefaultManager;</a>
+<a name="ln359">	sDefaultManager = NULL;</a>
+<a name="ln360">}</a>
+<a name="ln361"> </a>
+<a name="ln362"> </a>
+<a name="ln363">KDiskDeviceManager*</a>
+<a name="ln364">KDiskDeviceManager::Default()</a>
+<a name="ln365">{</a>
+<a name="ln366">	return sDefaultManager;</a>
+<a name="ln367">}</a>
+<a name="ln368"> </a>
+<a name="ln369"> </a>
+<a name="ln370">bool</a>
+<a name="ln371">KDiskDeviceManager::Lock()</a>
+<a name="ln372">{</a>
+<a name="ln373">	return recursive_lock_lock(&amp;fLock) == B_OK;</a>
+<a name="ln374">}</a>
+<a name="ln375"> </a>
+<a name="ln376"> </a>
+<a name="ln377">void</a>
+<a name="ln378">KDiskDeviceManager::Unlock()</a>
+<a name="ln379">{</a>
+<a name="ln380">	recursive_lock_unlock(&amp;fLock);</a>
+<a name="ln381">}</a>
+<a name="ln382"> </a>
+<a name="ln383"> </a>
+<a name="ln384">DefaultUserNotificationService&amp;</a>
+<a name="ln385">KDiskDeviceManager::Notifications()</a>
+<a name="ln386">{</a>
+<a name="ln387">	return *fNotifications;</a>
+<a name="ln388">}</a>
+<a name="ln389"> </a>
+<a name="ln390"> </a>
+<a name="ln391">void</a>
+<a name="ln392">KDiskDeviceManager::Notify(const KMessage&amp; event, uint32 eventMask)</a>
+<a name="ln393">{</a>
+<a name="ln394">	fNotifications-&gt;Notify(event, eventMask);</a>
+<a name="ln395">}</a>
+<a name="ln396"> </a>
+<a name="ln397"> </a>
+<a name="ln398">KDiskDevice*</a>
+<a name="ln399">KDiskDeviceManager::FindDevice(const char* path)</a>
+<a name="ln400">{</a>
+<a name="ln401">	for (int32 cookie = 0; KDiskDevice* device = NextDevice(&amp;cookie); ) {</a>
+<a name="ln402">		if (device-&gt;Path() &amp;&amp; !strcmp(path, device-&gt;Path()))</a>
+<a name="ln403">			return device;</a>
+<a name="ln404">	}</a>
+<a name="ln405">	return NULL;</a>
+<a name="ln406">}</a>
+<a name="ln407"> </a>
+<a name="ln408"> </a>
+<a name="ln409">KDiskDevice*</a>
+<a name="ln410">KDiskDeviceManager::FindDevice(partition_id id, bool deviceOnly)</a>
+<a name="ln411">{</a>
+<a name="ln412">	if (KPartition* partition = FindPartition(id)) {</a>
+<a name="ln413">		KDiskDevice* device = partition-&gt;Device();</a>
+<a name="ln414">		if (!deviceOnly || id == device-&gt;ID())</a>
+<a name="ln415">			return device;</a>
+<a name="ln416">	}</a>
+<a name="ln417">	return NULL;</a>
+<a name="ln418">}</a>
+<a name="ln419"> </a>
+<a name="ln420"> </a>
+<a name="ln421">KPartition*</a>
+<a name="ln422">KDiskDeviceManager::FindPartition(const char* path)</a>
+<a name="ln423">{</a>
+<a name="ln424">	// TODO: Optimize!</a>
+<a name="ln425">	KPath partitionPath;</a>
+<a name="ln426">	if (partitionPath.InitCheck() != B_OK)</a>
+<a name="ln427">		return NULL;</a>
+<a name="ln428"> </a>
+<a name="ln429">	for (PartitionMap::Iterator iterator = fPartitions-&gt;Begin();</a>
+<a name="ln430">			iterator != fPartitions-&gt;End(); ++iterator) {</a>
+<a name="ln431">		KPartition* partition = iterator-&gt;Value();</a>
+<a name="ln432">		if (partition-&gt;GetPath(&amp;partitionPath) == B_OK</a>
+<a name="ln433">			&amp;&amp; partitionPath == path) {</a>
+<a name="ln434">			return partition;</a>
+<a name="ln435">		}</a>
+<a name="ln436">	}</a>
+<a name="ln437"> </a>
+<a name="ln438">	return NULL;</a>
+<a name="ln439">}</a>
+<a name="ln440"> </a>
+<a name="ln441"> </a>
+<a name="ln442">KPartition*</a>
+<a name="ln443">KDiskDeviceManager::FindPartition(partition_id id)</a>
+<a name="ln444">{</a>
+<a name="ln445">	PartitionMap::Iterator iterator = fPartitions-&gt;Find(id);</a>
+<a name="ln446">	if (iterator != fPartitions-&gt;End())</a>
+<a name="ln447">		return iterator-&gt;Value();</a>
+<a name="ln448"> </a>
+<a name="ln449">	return NULL;</a>
+<a name="ln450">}</a>
+<a name="ln451"> </a>
+<a name="ln452"> </a>
+<a name="ln453">KFileDiskDevice*</a>
+<a name="ln454">KDiskDeviceManager::FindFileDevice(const char* filePath)</a>
+<a name="ln455">{</a>
+<a name="ln456">	for (int32 cookie = 0; KDiskDevice* device = NextDevice(&amp;cookie); ) {</a>
+<a name="ln457">		KFileDiskDevice* fileDevice = dynamic_cast&lt;KFileDiskDevice*&gt;(device);</a>
+<a name="ln458">		if (fileDevice &amp;&amp; fileDevice-&gt;FilePath()</a>
+<a name="ln459">			&amp;&amp; !strcmp(filePath, fileDevice-&gt;FilePath())) {</a>
+<a name="ln460">			return fileDevice;</a>
+<a name="ln461">		}</a>
+<a name="ln462">	}</a>
+<a name="ln463">	return NULL;</a>
+<a name="ln464">}</a>
+<a name="ln465"> </a>
+<a name="ln466"> </a>
+<a name="ln467">KDiskDevice*</a>
+<a name="ln468">KDiskDeviceManager::RegisterDevice(const char* path)</a>
+<a name="ln469">{</a>
+<a name="ln470">	if (ManagerLocker locker = this) {</a>
+<a name="ln471">		for (int32 i = 0; i &lt; 2; i++) {</a>
+<a name="ln472">			if (KDiskDevice* device = FindDevice(path)) {</a>
+<a name="ln473">				device-&gt;Register();</a>
+<a name="ln474">				return device;</a>
+<a name="ln475">			}</a>
+<a name="ln476"> </a>
+<a name="ln477">			// if the device is not known yet, create it and try again</a>
+<a name="ln478">			const char* leaf = strrchr(path, '/');</a>
+<a name="ln479">			if (i == 0 &amp;&amp; !strncmp(path, &quot;/dev/disk&quot;, 9)</a>
+<a name="ln480">				&amp;&amp; !strcmp(leaf + 1, &quot;raw&quot;) &amp;&amp; CreateDevice(path) &lt; B_OK)</a>
+<a name="ln481">				break;</a>
+<a name="ln482">		}</a>
+<a name="ln483">	}</a>
+<a name="ln484">	return NULL;</a>
+<a name="ln485">}</a>
+<a name="ln486"> </a>
+<a name="ln487"> </a>
+<a name="ln488">KDiskDevice*</a>
+<a name="ln489">KDiskDeviceManager::RegisterDevice(partition_id id, bool deviceOnly)</a>
+<a name="ln490">{</a>
+<a name="ln491">	if (ManagerLocker locker = this) {</a>
+<a name="ln492">		if (KDiskDevice* device = FindDevice(id, deviceOnly)) {</a>
+<a name="ln493">			device-&gt;Register();</a>
+<a name="ln494">			return device;</a>
+<a name="ln495">		}</a>
+<a name="ln496">	}</a>
+<a name="ln497">	return NULL;</a>
+<a name="ln498">}</a>
+<a name="ln499"> </a>
+<a name="ln500"> </a>
+<a name="ln501">KDiskDevice*</a>
+<a name="ln502">KDiskDeviceManager::RegisterNextDevice(int32* cookie)</a>
+<a name="ln503">{</a>
+<a name="ln504">	if (!cookie)</a>
+<a name="ln505">		return NULL;</a>
+<a name="ln506"> </a>
+<a name="ln507">	if (ManagerLocker locker = this) {</a>
+<a name="ln508">		if (KDiskDevice* device = NextDevice(cookie)) {</a>
+<a name="ln509">			device-&gt;Register();</a>
+<a name="ln510">			return device;</a>
+<a name="ln511">		}</a>
+<a name="ln512">	}</a>
+<a name="ln513">	return NULL;</a>
+<a name="ln514">}</a>
+<a name="ln515"> </a>
+<a name="ln516"> </a>
+<a name="ln517">KPartition*</a>
+<a name="ln518">KDiskDeviceManager::RegisterPartition(const char* path)</a>
+<a name="ln519">{</a>
+<a name="ln520">	if (ManagerLocker locker = this) {</a>
+<a name="ln521">		for (int32 i = 0; i &lt; 2; i++) {</a>
+<a name="ln522">			if (KPartition* partition = FindPartition(path)) {</a>
+<a name="ln523">				partition-&gt;Register();</a>
+<a name="ln524">				return partition;</a>
+<a name="ln525">			}</a>
+<a name="ln526"> </a>
+<a name="ln527">			// if the device is not known yet, create it and try again</a>
+<a name="ln528">			const char* leaf = strrchr(path, '/');</a>
+<a name="ln529">			if (i == 0 &amp;&amp; !strncmp(path, &quot;/dev/disk&quot;, 9)</a>
+<a name="ln530">				&amp;&amp; !strcmp(leaf + 1, &quot;raw&quot;) &amp;&amp; CreateDevice(path) &lt; B_OK)</a>
+<a name="ln531">				break;</a>
+<a name="ln532">		}</a>
+<a name="ln533">	}</a>
+<a name="ln534">	return NULL;</a>
+<a name="ln535">}</a>
+<a name="ln536"> </a>
+<a name="ln537"> </a>
+<a name="ln538">KPartition*</a>
+<a name="ln539">KDiskDeviceManager::RegisterPartition(partition_id id)</a>
+<a name="ln540">{</a>
+<a name="ln541">	if (ManagerLocker locker = this) {</a>
+<a name="ln542">		if (KPartition* partition = FindPartition(id)) {</a>
+<a name="ln543">			partition-&gt;Register();</a>
+<a name="ln544">			return partition;</a>
+<a name="ln545">		}</a>
+<a name="ln546">	}</a>
+<a name="ln547">	return NULL;</a>
+<a name="ln548">}</a>
+<a name="ln549"> </a>
+<a name="ln550"> </a>
+<a name="ln551">KFileDiskDevice*</a>
+<a name="ln552">KDiskDeviceManager::RegisterFileDevice(const char* filePath)</a>
+<a name="ln553">{</a>
+<a name="ln554">	if (ManagerLocker locker = this) {</a>
+<a name="ln555">		if (KFileDiskDevice* device = FindFileDevice(filePath)) {</a>
+<a name="ln556">			device-&gt;Register();</a>
+<a name="ln557">			return device;</a>
+<a name="ln558">		}</a>
+<a name="ln559">	}</a>
+<a name="ln560">	return NULL;</a>
+<a name="ln561">}</a>
+<a name="ln562"> </a>
+<a name="ln563"> </a>
+<a name="ln564">KDiskDevice*</a>
+<a name="ln565">KDiskDeviceManager::ReadLockDevice(partition_id id, bool deviceOnly)</a>
+<a name="ln566">{</a>
+<a name="ln567">	// register device</a>
+<a name="ln568">	KDiskDevice* device = RegisterDevice(id, deviceOnly);</a>
+<a name="ln569">	if (!device)</a>
+<a name="ln570">		return NULL;</a>
+<a name="ln571">	// lock device</a>
+<a name="ln572">	if (device-&gt;ReadLock())</a>
+<a name="ln573">		return device;</a>
+<a name="ln574">	device-&gt;Unregister();</a>
+<a name="ln575">	return NULL;</a>
+<a name="ln576">}</a>
+<a name="ln577"> </a>
+<a name="ln578"> </a>
+<a name="ln579">KDiskDevice*</a>
+<a name="ln580">KDiskDeviceManager::WriteLockDevice(partition_id id, bool deviceOnly)</a>
+<a name="ln581">{</a>
+<a name="ln582">	// register device</a>
+<a name="ln583">	KDiskDevice* device = RegisterDevice(id, deviceOnly);</a>
+<a name="ln584">	if (!device)</a>
+<a name="ln585">		return NULL;</a>
+<a name="ln586">	// lock device</a>
+<a name="ln587">	if (device-&gt;WriteLock())</a>
+<a name="ln588">		return device;</a>
+<a name="ln589">	device-&gt;Unregister();</a>
+<a name="ln590">	return NULL;</a>
+<a name="ln591">}</a>
+<a name="ln592"> </a>
+<a name="ln593"> </a>
+<a name="ln594">KPartition*</a>
+<a name="ln595">KDiskDeviceManager::ReadLockPartition(partition_id id)</a>
+<a name="ln596">{</a>
+<a name="ln597">	// register partition</a>
+<a name="ln598">	KPartition* partition = RegisterPartition(id);</a>
+<a name="ln599">	if (!partition)</a>
+<a name="ln600">		return NULL;</a>
+<a name="ln601">	// get and register the device</a>
+<a name="ln602">	KDiskDevice* device = NULL;</a>
+<a name="ln603">	if (ManagerLocker locker = this) {</a>
+<a name="ln604">		device = partition-&gt;Device();</a>
+<a name="ln605">		if (device)</a>
+<a name="ln606">			device-&gt;Register();</a>
+<a name="ln607">	}</a>
+<a name="ln608">	// lock the device</a>
+<a name="ln609">	if (device &amp;&amp; device-&gt;ReadLock()) {</a>
+<a name="ln610">		// final check, if the partition still belongs to the device</a>
+<a name="ln611">		if (partition-&gt;Device() == device)</a>
+<a name="ln612">			return partition;</a>
+<a name="ln613">		device-&gt;ReadUnlock();</a>
+<a name="ln614">	}</a>
+<a name="ln615">	// cleanup on failure</a>
+<a name="ln616">	if (device)</a>
+<a name="ln617">		device-&gt;Unregister();</a>
+<a name="ln618">	partition-&gt;Unregister();</a>
+<a name="ln619">	return NULL;</a>
+<a name="ln620">}</a>
+<a name="ln621"> </a>
+<a name="ln622"> </a>
+<a name="ln623">KPartition*</a>
+<a name="ln624">KDiskDeviceManager::WriteLockPartition(partition_id id)</a>
+<a name="ln625">{</a>
+<a name="ln626">	// register partition</a>
+<a name="ln627">	KPartition* partition = RegisterPartition(id);</a>
+<a name="ln628">	if (!partition)</a>
+<a name="ln629">		return NULL;</a>
+<a name="ln630">	// get and register the device</a>
+<a name="ln631">	KDiskDevice* device = NULL;</a>
+<a name="ln632">	if (ManagerLocker locker = this) {</a>
+<a name="ln633">		device = partition-&gt;Device();</a>
+<a name="ln634">		if (device)</a>
+<a name="ln635">			device-&gt;Register();</a>
+<a name="ln636">	}</a>
+<a name="ln637">	// lock the device</a>
+<a name="ln638">	if (device &amp;&amp; device-&gt;WriteLock()) {</a>
+<a name="ln639">		// final check, if the partition still belongs to the device</a>
+<a name="ln640">		if (partition-&gt;Device() == device)</a>
+<a name="ln641">			return partition;</a>
+<a name="ln642">		device-&gt;WriteUnlock();</a>
+<a name="ln643">	}</a>
+<a name="ln644">	// cleanup on failure</a>
+<a name="ln645">	if (device)</a>
+<a name="ln646">		device-&gt;Unregister();</a>
+<a name="ln647">	partition-&gt;Unregister();</a>
+<a name="ln648">	return NULL;</a>
+<a name="ln649">}</a>
+<a name="ln650"> </a>
+<a name="ln651"> </a>
+<a name="ln652">status_t</a>
+<a name="ln653">KDiskDeviceManager::ScanPartition(KPartition* partition)</a>
+<a name="ln654">{</a>
+<a name="ln655">// TODO: This won't do. Locking the DDM while scanning the partition is not a</a>
+<a name="ln656">// good idea. Even locking the device doesn't feel right. Marking the partition</a>
+<a name="ln657">// busy and passing the disk system a temporary clone of the partition_data</a>
+<a name="ln658">// should work as well.</a>
+<a name="ln659">	if (DeviceWriteLocker deviceLocker = partition-&gt;Device()) {</a>
+<a name="ln660">		if (ManagerLocker locker = this)</a>
+<a name="ln661">			return _ScanPartition(partition, false);</a>
+<a name="ln662">	}</a>
+<a name="ln663"> </a>
+<a name="ln664">	return B_ERROR;</a>
+<a name="ln665">}</a>
+<a name="ln666"> </a>
+<a name="ln667"> </a>
+<a name="ln668">partition_id</a>
+<a name="ln669">KDiskDeviceManager::CreateDevice(const char* path, bool* newlyCreated)</a>
+<a name="ln670">{</a>
+<a name="ln671">	if (!path)</a>
+<a name="ln672">		return B_BAD_VALUE;</a>
+<a name="ln673"> </a>
+<a name="ln674">	status_t error = B_ERROR;</a>
+<a name="ln675">	if (ManagerLocker locker = this) {</a>
+<a name="ln676">		KDiskDevice* device = FindDevice(path);</a>
+<a name="ln677">		if (device != NULL) {</a>
+<a name="ln678">			// we already know this device</a>
+<a name="ln679">			if (newlyCreated)</a>
+<a name="ln680">				*newlyCreated = false;</a>
+<a name="ln681"> </a>
+<a name="ln682">			return device-&gt;ID();</a>
+<a name="ln683">		}</a>
+<a name="ln684"> </a>
+<a name="ln685">		// create a KDiskDevice for it</a>
+<a name="ln686">		device = new(nothrow) KDiskDevice;</a>
+<a name="ln687">		if (!device)</a>
+<a name="ln688">			return B_NO_MEMORY;</a>
+<a name="ln689"> </a>
+<a name="ln690">		// initialize and add the device</a>
+<a name="ln691">		error = device-&gt;SetTo(path);</a>
+<a name="ln692"> </a>
+<a name="ln693">		// Note: Here we are allowed to lock a device although already having</a>
+<a name="ln694">		// the manager locked, since it is not yet added to the manager.</a>
+<a name="ln695">		DeviceWriteLocker deviceLocker(device);</a>
+<a name="ln696">		if (error == B_OK &amp;&amp; !deviceLocker.IsLocked())</a>
+<a name="ln697">			error = B_ERROR;</a>
+<a name="ln698">		if (error == B_OK &amp;&amp; !_AddDevice(device))</a>
+<a name="ln699">			error = B_NO_MEMORY;</a>
+<a name="ln700"> </a>
+<a name="ln701">		// cleanup on error</a>
+<a name="ln702">		if (error != B_OK) {</a>
+<a name="ln703">			deviceLocker.Unlock();</a>
+<a name="ln704">			delete device;</a>
+<a name="ln705">			return error;</a>
+<a name="ln706">		}</a>
+<a name="ln707"> </a>
+<a name="ln708">		if (error == B_OK) {</a>
+<a name="ln709">			// scan for partitions</a>
+<a name="ln710">			_ScanPartition(device, false);</a>
+<a name="ln711">			device-&gt;UnmarkBusy(true);</a>
+<a name="ln712"> </a>
+<a name="ln713">			_NotifyDeviceEvent(device, B_DEVICE_ADDED,</a>
+<a name="ln714">				B_DEVICE_REQUEST_DEVICE_LIST);</a>
+<a name="ln715"> </a>
+<a name="ln716">			if (newlyCreated)</a>
+<a name="ln717">				*newlyCreated = true;</a>
+<a name="ln718"> </a>
+<a name="ln719">			return device-&gt;ID();</a>
+<a name="ln720">		}</a>
+<a name="ln721">	}</a>
+<a name="ln722"> </a>
+<a name="ln723">	return error;</a>
+<a name="ln724">}</a>
+<a name="ln725"> </a>
+<a name="ln726"> </a>
+<a name="ln727">status_t</a>
+<a name="ln728">KDiskDeviceManager::DeleteDevice(const char* path)</a>
+<a name="ln729">{</a>
+<a name="ln730">	KDiskDevice* device = FindDevice(path);</a>
+<a name="ln731">	if (device == NULL)</a>
+<a name="ln732">		return B_ENTRY_NOT_FOUND;</a>
+<a name="ln733"> </a>
+<a name="ln734">	PartitionRegistrar _(device, false);</a>
+<a name="ln735">	if (DeviceWriteLocker locker = device) {</a>
+<a name="ln736">		if (_RemoveDevice(device))</a>
+<a name="ln737">			return B_OK;</a>
+<a name="ln738">	}</a>
+<a name="ln739"> </a>
+<a name="ln740">	return B_ERROR;</a>
+<a name="ln741">}</a>
+<a name="ln742"> </a>
+<a name="ln743"> </a>
+<a name="ln744">partition_id</a>
+<a name="ln745">KDiskDeviceManager::CreateFileDevice(const char* filePath, bool* newlyCreated)</a>
+<a name="ln746">{</a>
+<a name="ln747">	if (!filePath)</a>
+<a name="ln748">		return B_BAD_VALUE;</a>
+<a name="ln749"> </a>
+<a name="ln750">	// normalize the file path</a>
+<a name="ln751">	KPath normalizedFilePath;</a>
+<a name="ln752">	status_t error = normalizedFilePath.SetTo(filePath, KPath::NORMALIZE);</a>
+<a name="ln753">	if (error != B_OK)</a>
+<a name="ln754">		return error;</a>
+<a name="ln755">	filePath = normalizedFilePath.Path();</a>
+<a name="ln756"> </a>
+<a name="ln757">	KFileDiskDevice* device = NULL;</a>
+<a name="ln758">	if (ManagerLocker locker = this) {</a>
+<a name="ln759">		// check, if the device does already exist</a>
+<a name="ln760">		if ((device = FindFileDevice(filePath))) {</a>
+<a name="ln761">			if (newlyCreated)</a>
+<a name="ln762">				*newlyCreated = false;</a>
+<a name="ln763"> </a>
+<a name="ln764">			return device-&gt;ID();</a>
+<a name="ln765">		}</a>
+<a name="ln766"> </a>
+<a name="ln767">		// allocate a KFileDiskDevice</a>
+<a name="ln768">		device = new(nothrow) KFileDiskDevice;</a>
+<a name="ln769">		if (!device)</a>
+<a name="ln770">			return B_NO_MEMORY;</a>
+<a name="ln771"> </a>
+<a name="ln772">		// initialize and add the device</a>
+<a name="ln773">		error = device-&gt;SetTo(filePath);</a>
+<a name="ln774"> </a>
+<a name="ln775">		// Note: Here we are allowed to lock a device although already having</a>
+<a name="ln776">		// the manager locked, since it is not yet added to the manager.</a>
+<a name="ln777">		DeviceWriteLocker deviceLocker(device);</a>
+<a name="ln778">		if (error == B_OK &amp;&amp; !deviceLocker.IsLocked())</a>
+<a name="ln779">			error = B_ERROR;</a>
+<a name="ln780">		if (error == B_OK &amp;&amp; !_AddDevice(device))</a>
+<a name="ln781">			error = B_NO_MEMORY;</a>
+<a name="ln782"> </a>
+<a name="ln783">		// scan device</a>
+<a name="ln784">		if (error == B_OK) {</a>
+<a name="ln785">			_ScanPartition(device, false);</a>
+<a name="ln786">			device-&gt;UnmarkBusy(true);</a>
+<a name="ln787"> </a>
+<a name="ln788">			_NotifyDeviceEvent(device, B_DEVICE_ADDED,</a>
+<a name="ln789">				B_DEVICE_REQUEST_DEVICE_LIST);</a>
+<a name="ln790"> </a>
+<a name="ln791">			if (newlyCreated)</a>
+<a name="ln792">				*newlyCreated = true;</a>
+<a name="ln793"> </a>
+<a name="ln794">			return device-&gt;ID();</a>
+<a name="ln795">		}</a>
+<a name="ln796"> </a>
+<a name="ln797">		// cleanup on failure</a>
+<a name="ln798">		deviceLocker.Unlock();</a>
+<a name="ln799">		delete device;</a>
+<a name="ln800">	} else</a>
+<a name="ln801">		error = B_ERROR;</a>
+<a name="ln802">	return error;</a>
+<a name="ln803">}</a>
+<a name="ln804"> </a>
+<a name="ln805"> </a>
+<a name="ln806">status_t</a>
+<a name="ln807">KDiskDeviceManager::DeleteFileDevice(const char* filePath)</a>
+<a name="ln808">{</a>
+<a name="ln809">	if (KFileDiskDevice* device = RegisterFileDevice(filePath)) {</a>
+<a name="ln810">		PartitionRegistrar _(device, true);</a>
+<a name="ln811">		if (DeviceWriteLocker locker = device) {</a>
+<a name="ln812">			if (_RemoveDevice(device))</a>
+<a name="ln813">				return B_OK;</a>
+<a name="ln814">		}</a>
+<a name="ln815">	}</a>
+<a name="ln816">	return B_ERROR;</a>
+<a name="ln817">}</a>
+<a name="ln818"> </a>
+<a name="ln819"> </a>
+<a name="ln820">status_t</a>
+<a name="ln821">KDiskDeviceManager::DeleteFileDevice(partition_id id)</a>
+<a name="ln822">{</a>
+<a name="ln823">	if (KDiskDevice* device = RegisterDevice(id)) {</a>
+<a name="ln824">		PartitionRegistrar _(device, true);</a>
+<a name="ln825">		if (!dynamic_cast&lt;KFileDiskDevice*&gt;(device) || id != device-&gt;ID())</a>
+<a name="ln826">			return B_ENTRY_NOT_FOUND;</a>
+<a name="ln827">		if (DeviceWriteLocker locker = device) {</a>
+<a name="ln828">			if (_RemoveDevice(device))</a>
+<a name="ln829">				return B_OK;</a>
+<a name="ln830">		}</a>
+<a name="ln831">	}</a>
+<a name="ln832">	return B_ERROR;</a>
+<a name="ln833">}</a>
+<a name="ln834"> </a>
+<a name="ln835"> </a>
+<a name="ln836">int32</a>
+<a name="ln837">KDiskDeviceManager::CountDevices()</a>
+<a name="ln838">{</a>
+<a name="ln839">	return fDevices-&gt;Count();</a>
+<a name="ln840">}</a>
+<a name="ln841"> </a>
+<a name="ln842"> </a>
+<a name="ln843">KDiskDevice*</a>
+<a name="ln844">KDiskDeviceManager::NextDevice(int32* cookie)</a>
+<a name="ln845">{</a>
+<a name="ln846">	if (!cookie)</a>
+<a name="ln847">		return NULL;</a>
+<a name="ln848"> </a>
+<a name="ln849">	DeviceMap::Iterator it = fDevices-&gt;FindClose(*cookie, false);</a>
+<a name="ln850">	if (it != fDevices-&gt;End()) {</a>
+<a name="ln851">		KDiskDevice* device = it-&gt;Value();</a>
+<a name="ln852">		*cookie = device-&gt;ID() + 1;</a>
+<a name="ln853">		return device;</a>
+<a name="ln854">	}</a>
+<a name="ln855">	return NULL;</a>
+<a name="ln856">}</a>
+<a name="ln857"> </a>
+<a name="ln858"> </a>
+<a name="ln859">bool</a>
+<a name="ln860">KDiskDeviceManager::PartitionAdded(KPartition* partition)</a>
+<a name="ln861">{</a>
+<a name="ln862">	return partition &amp;&amp; fPartitions-&gt;Put(partition-&gt;ID(), partition) == B_OK;</a>
+<a name="ln863">}</a>
+<a name="ln864"> </a>
+<a name="ln865"> </a>
+<a name="ln866">bool</a>
+<a name="ln867">KDiskDeviceManager::PartitionRemoved(KPartition* partition)</a>
+<a name="ln868">{</a>
+<a name="ln869">	if (partition &amp;&amp; partition-&gt;PrepareForRemoval()</a>
+<a name="ln870">		&amp;&amp; fPartitions-&gt;Remove(partition-&gt;ID())) {</a>
+<a name="ln871">		// TODO: If adding the partition to the obsolete list fails (due to lack</a>
+<a name="ln872">		// of memory), we can't do anything about it. We will leak memory then.</a>
+<a name="ln873">		fObsoletePartitions-&gt;Insert(partition);</a>
+<a name="ln874">		partition-&gt;MarkObsolete();</a>
+<a name="ln875">		return true;</a>
+<a name="ln876">	}</a>
+<a name="ln877">	return false;</a>
+<a name="ln878">}</a>
+<a name="ln879"> </a>
+<a name="ln880"> </a>
+<a name="ln881">bool</a>
+<a name="ln882">KDiskDeviceManager::DeletePartition(KPartition* partition)</a>
+<a name="ln883">{</a>
+<a name="ln884">	if (partition &amp;&amp; partition-&gt;IsObsolete()</a>
+<a name="ln885">		&amp;&amp; partition-&gt;CountReferences() == 0</a>
+<a name="ln886">		&amp;&amp; partition-&gt;PrepareForDeletion()</a>
+<a name="ln887">		&amp;&amp; fObsoletePartitions-&gt;Remove(partition)) {</a>
+<a name="ln888">		delete partition;</a>
+<a name="ln889">		return true;</a>
+<a name="ln890">	}</a>
+<a name="ln891">	return false;</a>
+<a name="ln892">}</a>
+<a name="ln893"> </a>
+<a name="ln894"> </a>
+<a name="ln895">KDiskSystem*</a>
+<a name="ln896">KDiskDeviceManager::FindDiskSystem(const char* name, bool byPrettyName)</a>
+<a name="ln897">{</a>
+<a name="ln898">	for (int32 cookie = 0; KDiskSystem* diskSystem = NextDiskSystem(&amp;cookie);) {</a>
+<a name="ln899">		if (byPrettyName) {</a>
+<a name="ln900">			if (strcmp(name, diskSystem-&gt;PrettyName()) == 0)</a>
+<a name="ln901">				return diskSystem;</a>
+<a name="ln902">		} else {</a>
+<a name="ln903">			if (strcmp(name, diskSystem-&gt;Name()) == 0)</a>
+<a name="ln904">				return diskSystem;</a>
+<a name="ln905">		}</a>
+<a name="ln906">	}</a>
+<a name="ln907">	return NULL;</a>
+<a name="ln908">}</a>
+<a name="ln909"> </a>
+<a name="ln910"> </a>
+<a name="ln911">KDiskSystem*</a>
+<a name="ln912">KDiskDeviceManager::FindDiskSystem(disk_system_id id)</a>
+<a name="ln913">{</a>
+<a name="ln914">	DiskSystemMap::Iterator it = fDiskSystems-&gt;Find(id);</a>
+<a name="ln915">	if (it != fDiskSystems-&gt;End())</a>
+<a name="ln916">		return it-&gt;Value();</a>
+<a name="ln917">	return NULL;</a>
+<a name="ln918">}</a>
+<a name="ln919"> </a>
+<a name="ln920"> </a>
+<a name="ln921">int32</a>
+<a name="ln922">KDiskDeviceManager::CountDiskSystems()</a>
+<a name="ln923">{</a>
+<a name="ln924">	return fDiskSystems-&gt;Count();</a>
+<a name="ln925">}</a>
+<a name="ln926"> </a>
+<a name="ln927"> </a>
+<a name="ln928">KDiskSystem*</a>
+<a name="ln929">KDiskDeviceManager::NextDiskSystem(int32* cookie)</a>
+<a name="ln930">{</a>
+<a name="ln931">	if (!cookie)</a>
+<a name="ln932">		return NULL;</a>
+<a name="ln933"> </a>
+<a name="ln934">	DiskSystemMap::Iterator it = fDiskSystems-&gt;FindClose(*cookie, false);</a>
+<a name="ln935">	if (it != fDiskSystems-&gt;End()) {</a>
+<a name="ln936">		KDiskSystem* diskSystem = it-&gt;Value();</a>
+<a name="ln937">		*cookie = diskSystem-&gt;ID() + 1;</a>
+<a name="ln938">		return diskSystem;</a>
+<a name="ln939">	}</a>
+<a name="ln940">	return NULL;</a>
+<a name="ln941">}</a>
+<a name="ln942"> </a>
+<a name="ln943"> </a>
+<a name="ln944">KDiskSystem*</a>
+<a name="ln945">KDiskDeviceManager::LoadDiskSystem(const char* name, bool byPrettyName)</a>
+<a name="ln946">{</a>
+<a name="ln947">	KDiskSystem* diskSystem = NULL;</a>
+<a name="ln948">	if (ManagerLocker locker = this) {</a>
+<a name="ln949">		diskSystem = FindDiskSystem(name, byPrettyName);</a>
+<a name="ln950">		if (diskSystem &amp;&amp; diskSystem-&gt;Load() != B_OK)</a>
+<a name="ln951">			diskSystem = NULL;</a>
+<a name="ln952">	}</a>
+<a name="ln953">	return diskSystem;</a>
+<a name="ln954">}</a>
+<a name="ln955"> </a>
+<a name="ln956"> </a>
+<a name="ln957">KDiskSystem*</a>
+<a name="ln958">KDiskDeviceManager::LoadDiskSystem(disk_system_id id)</a>
+<a name="ln959">{</a>
+<a name="ln960">	KDiskSystem* diskSystem = NULL;</a>
+<a name="ln961">	if (ManagerLocker locker = this) {</a>
+<a name="ln962">		diskSystem = FindDiskSystem(id);</a>
+<a name="ln963">		if (diskSystem &amp;&amp; diskSystem-&gt;Load() != B_OK)</a>
+<a name="ln964">			diskSystem = NULL;</a>
+<a name="ln965">	}</a>
+<a name="ln966">	return diskSystem;</a>
+<a name="ln967">}</a>
+<a name="ln968"> </a>
+<a name="ln969"> </a>
+<a name="ln970">KDiskSystem*</a>
+<a name="ln971">KDiskDeviceManager::LoadNextDiskSystem(int32* cookie)</a>
+<a name="ln972">{</a>
+<a name="ln973">	if (!cookie)</a>
+<a name="ln974">		return NULL;</a>
+<a name="ln975"> </a>
+<a name="ln976">	if (ManagerLocker locker = this) {</a>
+<a name="ln977">		if (KDiskSystem* diskSystem = NextDiskSystem(cookie)) {</a>
+<a name="ln978">			if (diskSystem-&gt;Load() == B_OK) {</a>
+<a name="ln979">				*cookie = diskSystem-&gt;ID() + 1;</a>
+<a name="ln980">				return diskSystem;</a>
+<a name="ln981">			}</a>
+<a name="ln982">		}</a>
+<a name="ln983">	}</a>
+<a name="ln984">	return NULL;</a>
+<a name="ln985">}</a>
+<a name="ln986"> </a>
+<a name="ln987"> </a>
+<a name="ln988">status_t</a>
+<a name="ln989">KDiskDeviceManager::InitialDeviceScan()</a>
+<a name="ln990">{</a>
+<a name="ln991">	status_t error = B_ERROR;</a>
+<a name="ln992"> </a>
+<a name="ln993">	// scan for devices</a>
+<a name="ln994">	if (ManagerLocker locker = this) {</a>
+<a name="ln995">		error = _Scan(&quot;/dev/disk&quot;);</a>
+<a name="ln996">		if (error != B_OK)</a>
+<a name="ln997">			return error;</a>
+<a name="ln998">	}</a>
+<a name="ln999"> </a>
+<a name="ln1000">	// scan the devices for partitions</a>
+<a name="ln1001">	int32 cookie = 0;</a>
+<a name="ln1002">	while (KDiskDevice* device = RegisterNextDevice(&amp;cookie)) {</a>
+<a name="ln1003">		PartitionRegistrar _(device, true);</a>
+<a name="ln1004">		if (DeviceWriteLocker deviceLocker = device) {</a>
+<a name="ln1005">			if (ManagerLocker locker = this) {</a>
+<a name="ln1006">				error = _ScanPartition(device, false);</a>
+<a name="ln1007">				device-&gt;UnmarkBusy(true);</a>
+<a name="ln1008">				if (error != B_OK)</a>
+<a name="ln1009">					break;</a>
+<a name="ln1010">			} else</a>
+<a name="ln1011">				return B_ERROR;</a>
+<a name="ln1012">		} else</a>
+<a name="ln1013">			return B_ERROR;</a>
+<a name="ln1014">	}</a>
+<a name="ln1015">	return error;</a>
+<a name="ln1016">}</a>
+<a name="ln1017"> </a>
+<a name="ln1018"> </a>
+<a name="ln1019">status_t</a>
+<a name="ln1020">KDiskDeviceManager::StartMonitoring()</a>
+<a name="ln1021">{</a>
+<a name="ln1022">	// do another scan, this will populate the devfs directories</a>
+<a name="ln1023">	InitialDeviceScan();</a>
+<a name="ln1024"> </a>
+<a name="ln1025">	// start monitoring the disk systems</a>
+<a name="ln1026">	fDiskSystemWatcher = new(std::nothrow) DiskSystemWatcher(this);</a>
+<a name="ln1027">	if (fDiskSystemWatcher != NULL) {</a>
+<a name="ln1028">		start_watching_modules(kFileSystemPrefix, *fDiskSystemWatcher);</a>
+<a name="ln1029">		start_watching_modules(kPartitioningSystemPrefix,</a>
+<a name="ln1030">			*fDiskSystemWatcher);</a>
+<a name="ln1031">	}</a>
+<a name="ln1032"> </a>
+<a name="ln1033">	// start monitoring all dirs under /dev/disk</a>
+<a name="ln1034">	return _AddRemoveMonitoring(&quot;/dev/disk&quot;, true);</a>
+<a name="ln1035">}</a>
+<a name="ln1036"> </a>
+<a name="ln1037"> </a>
+<a name="ln1038">status_t</a>
+<a name="ln1039">KDiskDeviceManager::_RescanDiskSystems(DiskSystemMap&amp; addedSystems,</a>
+<a name="ln1040">	bool fileSystems)</a>
+<a name="ln1041">{</a>
+<a name="ln1042">	void* cookie = open_module_list(fileSystems</a>
+<a name="ln1043">		? kFileSystemPrefix : kPartitioningSystemPrefix);</a>
+<a name="ln1044">	if (cookie == NULL)</a>
+<a name="ln1045">		return B_NO_MEMORY;</a>
+<a name="ln1046"> </a>
+<a name="ln1047">	while (true) {</a>
+<a name="ln1048">		KPath name;</a>
+<a name="ln1049">		if (name.InitCheck() != B_OK)</a>
+<a name="ln1050">			break;</a>
+<a name="ln1051">		size_t nameLength = name.BufferSize();</a>
+<a name="ln1052">		if (read_next_module_name(cookie, name.LockBuffer(),</a>
+<a name="ln1053">				&amp;nameLength) != B_OK) {</a>
+<a name="ln1054">			break;</a>
+<a name="ln1055">		}</a>
+<a name="ln1056">		name.UnlockBuffer();</a>
+<a name="ln1057"> </a>
+<a name="ln1058">		if (FindDiskSystem(name.Path()))</a>
+<a name="ln1059">			continue;</a>
+<a name="ln1060"> </a>
+<a name="ln1061">		if (fileSystems) {</a>
+<a name="ln1062">			DBG(OUT(&quot;file system: %s\n&quot;, name.Path()));</a>
+<a name="ln1063">			_AddFileSystem(name.Path());</a>
+<a name="ln1064">		} else {</a>
+<a name="ln1065">			DBG(OUT(&quot;partitioning system: %s\n&quot;, name.Path()));</a>
+<a name="ln1066">			_AddPartitioningSystem(name.Path());</a>
+<a name="ln1067">		}</a>
+<a name="ln1068"> </a>
+<a name="ln1069">		if (KDiskSystem* system = FindDiskSystem(name.Path()))</a>
+<a name="ln1070">			addedSystems.Put(system-&gt;ID(), system);</a>
+<a name="ln1071">	}</a>
+<a name="ln1072"> </a>
+<a name="ln1073">	close_module_list(cookie);</a>
+<a name="ln1074">	return B_OK;</a>
+<a name="ln1075">}</a>
+<a name="ln1076"> </a>
+<a name="ln1077"> </a>
+<a name="ln1078">/*!	Rescan the existing disk systems. This is called after the boot device</a>
+<a name="ln1079">	has become available.</a>
+<a name="ln1080">*/</a>
+<a name="ln1081">status_t</a>
+<a name="ln1082">KDiskDeviceManager::RescanDiskSystems()</a>
+<a name="ln1083">{</a>
+<a name="ln1084">	DiskSystemMap addedSystems;</a>
+<a name="ln1085"> </a>
+<a name="ln1086">	Lock();</a>
+<a name="ln1087"> </a>
+<a name="ln1088">	// rescan for partitioning and file systems</a>
+<a name="ln1089">	_RescanDiskSystems(addedSystems, false);</a>
+<a name="ln1090">	_RescanDiskSystems(addedSystems, true);</a>
+<a name="ln1091"> </a>
+<a name="ln1092">	Unlock();</a>
+<a name="ln1093"> </a>
+<a name="ln1094">	// rescan existing devices with the new disk systems</a>
+<a name="ln1095">	int32 cookie = 0;</a>
+<a name="ln1096">	while (KDiskDevice* device = RegisterNextDevice(&amp;cookie)) {</a>
+<a name="ln1097">		PartitionRegistrar _(device, true);</a>
+<a name="ln1098">		if (DeviceWriteLocker deviceLocker = device) {</a>
+<a name="ln1099">			if (ManagerLocker locker = this) {</a>
+<a name="ln1100">				status_t status = _ScanPartition(device, false, &amp;addedSystems);</a>
+<a name="ln1101">				device-&gt;UnmarkBusy(true);</a>
+<a name="ln1102">				if (status != B_OK)</a>
+<a name="ln1103">					break;</a>
+<a name="ln1104">			} else</a>
+<a name="ln1105">				return B_ERROR;</a>
+<a name="ln1106">		} else</a>
+<a name="ln1107">			return B_ERROR;</a>
+<a name="ln1108">	}</a>
+<a name="ln1109"> </a>
+<a name="ln1110">	return B_OK;</a>
+<a name="ln1111">}</a>
+<a name="ln1112"> </a>
+<a name="ln1113"> </a>
+<a name="ln1114">status_t</a>
+<a name="ln1115">KDiskDeviceManager::_AddPartitioningSystem(const char* name)</a>
+<a name="ln1116">{</a>
+<a name="ln1117">	if (!name)</a>
+<a name="ln1118">		return B_BAD_VALUE;</a>
+<a name="ln1119"> </a>
+<a name="ln1120">	KDiskSystem* diskSystem = new(nothrow) KPartitioningSystem(name);</a>
+<a name="ln1121">	if (!diskSystem)</a>
+<a name="ln1122">		return B_NO_MEMORY;</a>
+<a name="ln1123">	return _AddDiskSystem(diskSystem);</a>
+<a name="ln1124">}</a>
+<a name="ln1125"> </a>
+<a name="ln1126"> </a>
+<a name="ln1127">status_t</a>
+<a name="ln1128">KDiskDeviceManager::_AddFileSystem(const char* name)</a>
+<a name="ln1129">{</a>
+<a name="ln1130">	if (!name)</a>
+<a name="ln1131">		return B_BAD_VALUE;</a>
+<a name="ln1132"> </a>
+<a name="ln1133">	KDiskSystem* diskSystem = new(nothrow) KFileSystem(name);</a>
+<a name="ln1134">	if (!diskSystem)</a>
+<a name="ln1135">		return B_NO_MEMORY;</a>
+<a name="ln1136"> </a>
+<a name="ln1137">	return _AddDiskSystem(diskSystem);</a>
+<a name="ln1138">}</a>
+<a name="ln1139"> </a>
+<a name="ln1140"> </a>
+<a name="ln1141">status_t</a>
+<a name="ln1142">KDiskDeviceManager::_AddDiskSystem(KDiskSystem* diskSystem)</a>
+<a name="ln1143">{</a>
+<a name="ln1144">	if (!diskSystem)</a>
+<a name="ln1145">		return B_BAD_VALUE;</a>
+<a name="ln1146">	DBG(OUT(&quot;KDiskDeviceManager::_AddDiskSystem(%s)\n&quot;, diskSystem-&gt;Name()));</a>
+<a name="ln1147">	status_t error = diskSystem-&gt;Init();</a>
+<a name="ln1148">	DBG(if (error != B_OK)</a>
+<a name="ln1149">		OUT(&quot;  initialization failed: %s\n&quot;, strerror(error)));</a>
+<a name="ln1150">	if (error == B_OK)</a>
+<a name="ln1151">		error = fDiskSystems-&gt;Put(diskSystem-&gt;ID(), diskSystem);</a>
+<a name="ln1152">	if (error != B_OK)</a>
+<a name="ln1153">		delete diskSystem;</a>
+<a name="ln1154">	DBG(OUT(&quot;KDiskDeviceManager::_AddDiskSystem() done: %s\n&quot;,</a>
+<a name="ln1155">		strerror(error)));</a>
+<a name="ln1156">	return error;</a>
+<a name="ln1157">}</a>
+<a name="ln1158"> </a>
+<a name="ln1159"> </a>
+<a name="ln1160">bool</a>
+<a name="ln1161">KDiskDeviceManager::_AddDevice(KDiskDevice* device)</a>
+<a name="ln1162">{</a>
+<a name="ln1163">	if (!device || !PartitionAdded(device))</a>
+<a name="ln1164">		return false;</a>
+<a name="ln1165">	if (fDevices-&gt;Put(device-&gt;ID(), device) == B_OK)</a>
+<a name="ln1166">		return true;</a>
+<a name="ln1167">	PartitionRemoved(device);</a>
+<a name="ln1168">	return false;</a>
+<a name="ln1169">}</a>
+<a name="ln1170"> </a>
+<a name="ln1171"> </a>
+<a name="ln1172">bool</a>
+<a name="ln1173">KDiskDeviceManager::_RemoveDevice(KDiskDevice* device)</a>
+<a name="ln1174">{</a>
+<a name="ln1175">	if (device != NULL &amp;&amp; fDevices-&gt;Remove(device-&gt;ID())</a>
+<a name="ln1176">		&amp;&amp; PartitionRemoved(device)) {</a>
+<a name="ln1177">		_NotifyDeviceEvent(device, B_DEVICE_REMOVED,</a>
+<a name="ln1178">			B_DEVICE_REQUEST_DEVICE_LIST);</a>
+<a name="ln1179">		return true;</a>
+<a name="ln1180">	}</a>
+<a name="ln1181"> </a>
+<a name="ln1182">	return false;</a>
+<a name="ln1183">}</a>
+<a name="ln1184"> </a>
+<a name="ln1185"> </a>
+<a name="ln1186">#if 0</a>
+<a name="ln1187">/*!</a>
+<a name="ln1188">	The device must be write locked, the manager must be locked.</a>
+<a name="ln1189">*/</a>
+<a name="ln1190">status_t</a>
+<a name="ln1191">KDiskDeviceManager::_UpdateBusyPartitions(KDiskDevice *device)</a>
+<a name="ln1192">{</a>
+<a name="ln1193">	if (!device)</a>
+<a name="ln1194">		return B_BAD_VALUE;</a>
+<a name="ln1195">	// mark all partitions un-busy</a>
+<a name="ln1196">	struct UnmarkBusyVisitor : KPartitionVisitor {</a>
+<a name="ln1197">		virtual bool VisitPre(KPartition *partition)</a>
+<a name="ln1198">		{</a>
+<a name="ln1199">			partition-&gt;ClearFlags(B_PARTITION_BUSY</a>
+<a name="ln1200">								  | B_PARTITION_DESCENDANT_BUSY);</a>
+<a name="ln1201">			return false;</a>
+<a name="ln1202">		}</a>
+<a name="ln1203">	} visitor;</a>
+<a name="ln1204">	device-&gt;VisitEachDescendant(&amp;visitor);</a>
+<a name="ln1205">	// Iterate through all job queues and all jobs scheduled or in</a>
+<a name="ln1206">	// progress and mark their scope busy.</a>
+<a name="ln1207">	for (int32 cookie = 0;</a>
+<a name="ln1208">		 KDiskDeviceJobQueue *jobQueue = NextJobQueue(&amp;cookie); ) {</a>
+<a name="ln1209">		if (jobQueue-&gt;Device() != device)</a>
+<a name="ln1210">			continue;</a>
+<a name="ln1211">		for (int32 i = jobQueue-&gt;ActiveJobIndex();</a>
+<a name="ln1212">			 KDiskDeviceJob *job = jobQueue-&gt;JobAt(i); i++) {</a>
+<a name="ln1213">			if (job-&gt;Status() != B_DISK_DEVICE_JOB_IN_PROGRESS</a>
+<a name="ln1214">				&amp;&amp; job-&gt;Status() != B_DISK_DEVICE_JOB_SCHEDULED) {</a>
+<a name="ln1215">				continue;</a>
+<a name="ln1216">			}</a>
+<a name="ln1217">			KPartition *partition = FindPartition(job-&gt;ScopeID());</a>
+<a name="ln1218">			if (!partition || partition-&gt;Device() != device)</a>
+<a name="ln1219">				continue;</a>
+<a name="ln1220">			partition-&gt;AddFlags(B_PARTITION_BUSY);</a>
+<a name="ln1221">		}</a>
+<a name="ln1222">	}</a>
+<a name="ln1223">	// mark all anscestors of busy partitions descendant busy and all</a>
+<a name="ln1224">	// descendants busy</a>
+<a name="ln1225">	struct MarkBusyVisitor : KPartitionVisitor {</a>
+<a name="ln1226">		virtual bool VisitPre(KPartition *partition)</a>
+<a name="ln1227">		{</a>
+<a name="ln1228">			// parent busy =&gt; child busy</a>
+<a name="ln1229">			if (partition-&gt;Parent() &amp;&amp; partition-&gt;Parent()-&gt;IsBusy())</a>
+<a name="ln1230">				partition-&gt;AddFlags(B_PARTITION_BUSY);</a>
+<a name="ln1231">			return false;</a>
+<a name="ln1232">		}</a>
+<a name="ln1233"> </a>
+<a name="ln1234">		virtual bool VisitPost(KPartition *partition)</a>
+<a name="ln1235">		{</a>
+<a name="ln1236">			// child [descendant] busy =&gt; parent descendant busy</a>
+<a name="ln1237">			if ((partition-&gt;IsBusy() || partition-&gt;IsDescendantBusy())</a>
+<a name="ln1238">				&amp;&amp; partition-&gt;Parent()) {</a>
+<a name="ln1239">				partition-&gt;Parent()-&gt;AddFlags(B_PARTITION_DESCENDANT_BUSY);</a>
+<a name="ln1240">			}</a>
+<a name="ln1241">			return false;</a>
+<a name="ln1242">		}</a>
+<a name="ln1243">	} visitor2;</a>
+<a name="ln1244">	device-&gt;VisitEachDescendant(&amp;visitor2);</a>
+<a name="ln1245">	return B_OK;</a>
+<a name="ln1246">}</a>
+<a name="ln1247">#endif</a>
+<a name="ln1248"> </a>
+<a name="ln1249"> </a>
+<a name="ln1250">status_t</a>
+<a name="ln1251">KDiskDeviceManager::_Scan(const char* path)</a>
+<a name="ln1252">{</a>
+<a name="ln1253">	DBG(OUT(&quot;KDiskDeviceManager::_Scan(%s)\n&quot;, path));</a>
+<a name="ln1254">	status_t error = B_ENTRY_NOT_FOUND;</a>
+<a name="ln1255">	struct stat st;</a>
+<a name="ln1256">	if (lstat(path, &amp;st) &lt; 0) {</a>
+<a name="ln1257">		return errno;</a>
+<a name="ln1258">	}</a>
+<a name="ln1259">	if (S_ISDIR(st.st_mode)) {</a>
+<a name="ln1260">		// a directory: iterate through its contents</a>
+<a name="ln1261">		DIR* dir = opendir(path);</a>
+<a name="ln1262">		if (!dir)</a>
+<a name="ln1263">			return errno;</a>
+<a name="ln1264">		while (dirent* entry = readdir(dir)) {</a>
+<a name="ln1265">			// skip &quot;.&quot; and &quot;..&quot;</a>
+<a name="ln1266">			if (!strcmp(entry-&gt;d_name, &quot;.&quot;) || !strcmp(entry-&gt;d_name, &quot;..&quot;))</a>
+<a name="ln1267">				continue;</a>
+<a name="ln1268">			KPath entryPath;</a>
+<a name="ln1269">			if (entryPath.SetPath(path) != B_OK</a>
+<a name="ln1270">				|| entryPath.Append(entry-&gt;d_name) != B_OK) {</a>
+<a name="ln1271">				continue;</a>
+<a name="ln1272">			}</a>
+<a name="ln1273">			if (_Scan(entryPath.Path()) == B_OK)</a>
+<a name="ln1274">				error = B_OK;</a>
+<a name="ln1275">		}</a>
+<a name="ln1276">		closedir(dir);</a>
+<a name="ln1277">	} else {</a>
+<a name="ln1278">		// not a directory</a>
+<a name="ln1279">		// check, if it is named &quot;raw&quot;</a>
+<a name="ln1280">		int32 len = strlen(path);</a>
+<a name="ln1281">		int32 leafLen = strlen(&quot;/raw&quot;);</a>
+<a name="ln1282">		if (len &lt;= leafLen || strcmp(path + len - leafLen, &quot;/raw&quot;))</a>
+<a name="ln1283">			return B_ERROR;</a>
+<a name="ln1284">		if (FindDevice(path) != NULL) {</a>
+<a name="ln1285">			// we already know this device</a>
+<a name="ln1286">			return B_OK;</a>
+<a name="ln1287">		}</a>
+<a name="ln1288"> </a>
+<a name="ln1289">		DBG(OUT(&quot;  found device: %s\n&quot;, path));</a>
+<a name="ln1290">		// create a KDiskDevice for it</a>
+<a name="ln1291">		KDiskDevice* device = new(nothrow) KDiskDevice;</a>
+<a name="ln1292">		if (!device)</a>
+<a name="ln1293">			return B_NO_MEMORY;</a>
+<a name="ln1294"> </a>
+<a name="ln1295">		// init the KDiskDevice</a>
+<a name="ln1296">		error = device-&gt;SetTo(path);</a>
+<a name="ln1297">		// add the device</a>
+<a name="ln1298">		if (error == B_OK &amp;&amp; !_AddDevice(device))</a>
+<a name="ln1299">			error = B_NO_MEMORY;</a>
+<a name="ln1300">		// cleanup on error</a>
+<a name="ln1301">		if (error != B_OK)</a>
+<a name="ln1302">			delete device;</a>
+<a name="ln1303">	}</a>
+<a name="ln1304">	return error;</a>
+<a name="ln1305">}</a>
+<a name="ln1306"> </a>
+<a name="ln1307"> </a>
+<a name="ln1308">/*!</a>
+<a name="ln1309">	The device must be write locked, the manager must be locked.</a>
+<a name="ln1310">*/</a>
+<a name="ln1311">status_t</a>
+<a name="ln1312">KDiskDeviceManager::_ScanPartition(KPartition* partition, bool async,</a>
+<a name="ln1313">	DiskSystemMap* restrictScan)</a>
+<a name="ln1314">{</a>
+<a name="ln1315">// TODO: There's no reason why the manager needs to be locked anymore.</a>
+<a name="ln1316">	if (!partition)</a>
+<a name="ln1317">		return B_BAD_VALUE;</a>
+<a name="ln1318"> </a>
+<a name="ln1319">// TODO: Reimplement asynchronous scanning, if we really need it.</a>
+<a name="ln1320">#if 0</a>
+<a name="ln1321">	if (async) {</a>
+<a name="ln1322">		// create a new job queue for the device</a>
+<a name="ln1323">		KDiskDeviceJobQueue *jobQueue = new(nothrow) KDiskDeviceJobQueue;</a>
+<a name="ln1324">		if (!jobQueue)</a>
+<a name="ln1325">			return B_NO_MEMORY;</a>
+<a name="ln1326">		jobQueue-&gt;SetDevice(partition-&gt;Device());</a>
+<a name="ln1327"> </a>
+<a name="ln1328">		// create a job for scanning the device and add it to the job queue</a>
+<a name="ln1329">		KDiskDeviceJob *job = fJobFactory-&gt;CreateScanPartitionJob(partition-&gt;ID());</a>
+<a name="ln1330">		if (!job) {</a>
+<a name="ln1331">			delete jobQueue;</a>
+<a name="ln1332">			return B_NO_MEMORY;</a>
+<a name="ln1333">		}</a>
+<a name="ln1334"> </a>
+<a name="ln1335">		if (!jobQueue-&gt;AddJob(job)) {</a>
+<a name="ln1336">			delete jobQueue;</a>
+<a name="ln1337">			delete job;</a>
+<a name="ln1338">			return B_NO_MEMORY;</a>
+<a name="ln1339">		}</a>
+<a name="ln1340"> </a>
+<a name="ln1341">		// add the job queue</a>
+<a name="ln1342">		status_t error = AddJobQueue(jobQueue);</a>
+<a name="ln1343">		if (error != B_OK)</a>
+<a name="ln1344">			delete jobQueue;</a>
+<a name="ln1345"> </a>
+<a name="ln1346">		return error;</a>
+<a name="ln1347">	}</a>
+<a name="ln1348">#endif</a>
+<a name="ln1349"> </a>
+<a name="ln1350">	// scan synchronously</a>
+<a name="ln1351"> </a>
+<a name="ln1352">	return _ScanPartition(partition, restrictScan);</a>
+<a name="ln1353">}</a>
+<a name="ln1354"> </a>
+<a name="ln1355"> </a>
+<a name="ln1356">status_t</a>
+<a name="ln1357">KDiskDeviceManager::_ScanPartition(KPartition* partition,</a>
+<a name="ln1358">	DiskSystemMap* restrictScan)</a>
+<a name="ln1359">{</a>
+<a name="ln1360">	// the partition's device must be write-locked</a>
+<a name="ln1361">	if (partition == NULL)</a>
+<a name="ln1362">		return B_BAD_VALUE;</a>
+<a name="ln1363">	if (!partition-&gt;Device()-&gt;HasMedia() || partition-&gt;IsMounted())</a>
+<a name="ln1364">		return B_OK;</a>
+<a name="ln1365"> </a>
+<a name="ln1366">	if (partition-&gt;CountChildren() &gt; 0) {</a>
+<a name="ln1367">		// Since this partition has already children, we don't scan it</a>
+<a name="ln1368">		// again, but only its children.</a>
+<a name="ln1369">		for (int32 i = 0; KPartition* child = partition-&gt;ChildAt(i); i++) {</a>
+<a name="ln1370">			_ScanPartition(child, restrictScan);</a>
+<a name="ln1371">		}</a>
+<a name="ln1372">		return B_OK;</a>
+<a name="ln1373">	}</a>
+<a name="ln1374"> </a>
+<a name="ln1375">	KPath partitionPath;</a>
+<a name="ln1376">	partition-&gt;GetPath(&amp;partitionPath);</a>
+<a name="ln1377"> </a>
+<a name="ln1378">	// This happens with some copy protected CDs or eventually other issues.</a>
+<a name="ln1379">	// Just ignore the partition...</a>
+<a name="ln1380">	if (partition-&gt;Offset() &lt; 0 || partition-&gt;BlockSize() == 0</a>
+<a name="ln1381">		|| partition-&gt;Size() &lt;= 0) {</a>
+<a name="ln1382">		OUT(&quot;Partition %s has invalid parameters, ignoring it.\n&quot;,</a>
+<a name="ln1383">			partitionPath.Path());</a>
+<a name="ln1384">		return B_BAD_DATA;</a>
+<a name="ln1385">	}</a>
+<a name="ln1386"> </a>
+<a name="ln1387">	DBG(</a>
+<a name="ln1388">		OUT(&quot;KDiskDeviceManager::_ScanPartition(%s)\n&quot;, partitionPath.Path());</a>
+<a name="ln1389">	)</a>
+<a name="ln1390"> </a>
+<a name="ln1391">	// publish the partition</a>
+<a name="ln1392">	status_t error = B_OK;</a>
+<a name="ln1393">	if (!partition-&gt;IsPublished()) {</a>
+<a name="ln1394">		error = partition-&gt;PublishDevice();</a>
+<a name="ln1395">		if (error != B_OK)</a>
+<a name="ln1396">			return error;</a>
+<a name="ln1397">	}</a>
+<a name="ln1398"> </a>
+<a name="ln1399">	DiskSystemMap* diskSystems = restrictScan;</a>
+<a name="ln1400">	if (diskSystems == NULL)</a>
+<a name="ln1401">		diskSystems = fDiskSystems;</a>
+<a name="ln1402"> </a>
+<a name="ln1403">	// find the disk system that returns the best priority for this partition</a>
+<a name="ln1404">	float bestPriority = partition-&gt;DiskSystemPriority();</a>
+<a name="ln1405">	KDiskSystem* bestDiskSystem = NULL;</a>
+<a name="ln1406">	void* bestCookie = NULL;</a>
+<a name="ln1407">	for (DiskSystemMap::Iterator iterator = diskSystems-&gt;Begin();</a>
+<a name="ln1408">			iterator != diskSystems-&gt;End(); iterator++) {</a>
+<a name="ln1409">		KDiskSystem* diskSystem = iterator-&gt;Value();</a>
+<a name="ln1410">		if (diskSystem-&gt;Load() != B_OK)</a>
+<a name="ln1411">			continue;</a>
+<a name="ln1412"> </a>
+<a name="ln1413">		DBG(OUT(&quot;  trying: %s\n&quot;, diskSystem-&gt;Name()));</a>
+<a name="ln1414"> </a>
+<a name="ln1415">		void* cookie = NULL;</a>
+<a name="ln1416">		float priority = diskSystem-&gt;Identify(partition, &amp;cookie);</a>
+<a name="ln1417"> </a>
+<a name="ln1418">		DBG(OUT(&quot;  returned: %g\n&quot;, priority));</a>
+<a name="ln1419"> </a>
+<a name="ln1420">		if (priority &gt;= 0 &amp;&amp; priority &gt; bestPriority) {</a>
+<a name="ln1421">			// new best disk system</a>
+<a name="ln1422">			if (bestDiskSystem != NULL) {</a>
+<a name="ln1423">				bestDiskSystem-&gt;FreeIdentifyCookie(partition, bestCookie);</a>
+<a name="ln1424">				bestDiskSystem-&gt;Unload();</a>
+<a name="ln1425">			}</a>
+<a name="ln1426">			bestPriority = priority;</a>
+<a name="ln1427">			bestDiskSystem = diskSystem;</a>
+<a name="ln1428">			bestCookie = cookie;</a>
+<a name="ln1429">		} else {</a>
+<a name="ln1430">			// disk system doesn't identify the partition or worse than our</a>
+<a name="ln1431">			// current favorite</a>
+<a name="ln1432">			if (priority &gt;= 0)</a>
+<a name="ln1433">				diskSystem-&gt;FreeIdentifyCookie(partition, cookie);</a>
+<a name="ln1434">			diskSystem-&gt;Unload();</a>
+<a name="ln1435">		}</a>
+<a name="ln1436">	}</a>
+<a name="ln1437"> </a>
+<a name="ln1438">	// now, if we have found a disk system, let it scan the partition</a>
+<a name="ln1439">	if (bestDiskSystem != NULL) {</a>
+<a name="ln1440">		DBG(OUT(&quot;  scanning with: %s\n&quot;, bestDiskSystem-&gt;Name()));</a>
+<a name="ln1441">		error = bestDiskSystem-&gt;Scan(partition, bestCookie);</a>
+<a name="ln1442">		bestDiskSystem-&gt;FreeIdentifyCookie(partition, bestCookie);</a>
+<a name="ln1443">		if (error == B_OK) {</a>
+<a name="ln1444">			partition-&gt;SetDiskSystem(bestDiskSystem, bestPriority);</a>
+<a name="ln1445">			for (int32 i = 0; KPartition* child = partition-&gt;ChildAt(i); i++)</a>
+<a name="ln1446">				_ScanPartition(child, restrictScan);</a>
+<a name="ln1447">		} else {</a>
+<a name="ln1448">			// TODO: Handle the error.</a>
+<a name="ln1449">			DBG(OUT(&quot;  scanning failed: %s\n&quot;, strerror(error)));</a>
+<a name="ln1450">		}</a>
+<a name="ln1451"> </a>
+<a name="ln1452">		// now we can safely unload the disk system -- it has been loaded by</a>
+<a name="ln1453">		// the partition(s) and thus will not really be unloaded</a>
+<a name="ln1454">		bestDiskSystem-&gt;Unload();</a>
+<a name="ln1455">	} else {</a>
+<a name="ln1456">		// contents not recognized</a>
+<a name="ln1457">		// nothing to be done -- partitions are created as unrecognized</a>
+<a name="ln1458">	}</a>
+<a name="ln1459"> </a>
+<a name="ln1460">	return error;</a>
+<a name="ln1461">}</a>
+<a name="ln1462"> </a>
+<a name="ln1463"> </a>
+<a name="ln1464">status_t</a>
+<a name="ln1465">KDiskDeviceManager::_AddRemoveMonitoring(const char* path, bool add)</a>
+<a name="ln1466">{</a>
+<a name="ln1467">	struct stat st;</a>
+<a name="ln1468">	if (lstat(path, &amp;st) &lt; 0)</a>
+<a name="ln1469">		return errno;</a>
+<a name="ln1470"> </a>
+<a name="ln1471">	status_t error = B_ENTRY_NOT_FOUND;</a>
+<a name="ln1472">	if (S_ISDIR(st.st_mode)) {</a>
+<a name="ln1473">		if (add) {</a>
+<a name="ln1474">			error = add_node_listener(st.st_dev, st.st_ino, B_WATCH_DIRECTORY,</a>
+<a name="ln1475">				*fDeviceWatcher);</a>
+<a name="ln1476">		} else {</a>
+<a name="ln1477">			error = remove_node_listener(st.st_dev, st.st_ino,</a>
+<a name="ln1478">				*fDeviceWatcher);</a>
+<a name="ln1479">		}</a>
+<a name="ln1480">		if (error != B_OK)</a>
+<a name="ln1481">			return error;</a>
+<a name="ln1482"> </a>
+<a name="ln1483">		DIR* dir = opendir(path);</a>
+<a name="ln1484">		if (!dir)</a>
+<a name="ln1485">			return errno;</a>
+<a name="ln1486"> </a>
+<a name="ln1487">		while (dirent* entry = readdir(dir)) {</a>
+<a name="ln1488">			// skip &quot;.&quot; and &quot;..&quot;</a>
+<a name="ln1489">			if (!strcmp(entry-&gt;d_name, &quot;.&quot;) || !strcmp(entry-&gt;d_name, &quot;..&quot;))</a>
+<a name="ln1490">				continue;</a>
+<a name="ln1491"> </a>
+<a name="ln1492">			KPath entryPath;</a>
+<a name="ln1493">			if (entryPath.SetPath(path) != B_OK</a>
+<a name="ln1494">				|| entryPath.Append(entry-&gt;d_name) != B_OK) {</a>
+<a name="ln1495">				continue;</a>
+<a name="ln1496">			}</a>
+<a name="ln1497"> </a>
+<a name="ln1498">			if (_AddRemoveMonitoring(entryPath.Path(), add) == B_OK)</a>
+<a name="ln1499">				error = B_OK;</a>
+<a name="ln1500">		}</a>
+<a name="ln1501">		closedir(dir);</a>
+<a name="ln1502">	}</a>
+<a name="ln1503"> </a>
+<a name="ln1504">	return error;</a>
+<a name="ln1505">}</a>
+<a name="ln1506"> </a>
+<a name="ln1507"> </a>
+<a name="ln1508">status_t</a>
+<a name="ln1509">KDiskDeviceManager::_CheckMediaStatus()</a>
+<a name="ln1510">{</a>
+<a name="ln1511">	while (!fTerminating) {</a>
+<a name="ln1512">		int32 cookie = 0;</a>
+<a name="ln1513">		while (KDiskDevice* device = RegisterNextDevice(&amp;cookie)) {</a>
+<a name="ln1514">			PartitionRegistrar _(device, true);</a>
+<a name="ln1515">			DeviceWriteLocker locker(device);</a>
+<a name="ln1516"> </a>
+<a name="ln1517">			if (device-&gt;IsBusy(true))</a>
+<a name="ln1518">				continue;</a>
+<a name="ln1519"> </a>
+<a name="ln1520">			bool hadMedia = device-&gt;HasMedia();</a>
+<a name="ln1521">			bool changedMedia = device-&gt;MediaChanged();</a>
+<a name="ln1522">			device-&gt;UpdateMediaStatusIfNeeded();</a>
+<a name="ln1523"> </a>
+<a name="ln1524">			// Detect if there was any status change since last check.</a>
+<a name="ln1525">			if ((!device-&gt;MediaChanged() &amp;&amp; (device-&gt;HasMedia() || !hadMedia))</a>
+<a name="ln1526">				|| !(hadMedia != device-&gt;HasMedia()</a>
+<a name="ln1527">					|| changedMedia != device-&gt;MediaChanged()))</a>
+<a name="ln1528">				continue;</a>
+<a name="ln1529"> </a>
+<a name="ln1530">			device-&gt;MarkBusy(true);</a>
+<a name="ln1531">			device-&gt;UninitializeMedia();</a>
+<a name="ln1532"> </a>
+<a name="ln1533">			if (device-&gt;MediaChanged()) {</a>
+<a name="ln1534">				dprintf(&quot;Media changed from %s\n&quot;, device-&gt;Path());</a>
+<a name="ln1535">				device-&gt;UpdateGeometry();</a>
+<a name="ln1536">				_ScanPartition(device, false);</a>
+<a name="ln1537">				_NotifyDeviceEvent(device, B_DEVICE_MEDIA_CHANGED,</a>
+<a name="ln1538">					B_DEVICE_REQUEST_DEVICE);</a>
+<a name="ln1539">			} else if (!device-&gt;HasMedia() &amp;&amp; hadMedia) {</a>
+<a name="ln1540">				dprintf(&quot;Media removed from %s\n&quot;, device-&gt;Path());</a>
+<a name="ln1541">			}</a>
+<a name="ln1542"> </a>
+<a name="ln1543">			device-&gt;UnmarkBusy(true);</a>
+<a name="ln1544">		}</a>
+<a name="ln1545"> </a>
+<a name="ln1546">		snooze(1000000);</a>
+<a name="ln1547">	}</a>
+<a name="ln1548"> </a>
+<a name="ln1549">	return 0;</a>
+<a name="ln1550">}</a>
+<a name="ln1551"> </a>
+<a name="ln1552"> </a>
+<a name="ln1553">status_t</a>
+<a name="ln1554">KDiskDeviceManager::_CheckMediaStatusDaemon(void* self)</a>
+<a name="ln1555">{</a>
+<a name="ln1556">	return ((KDiskDeviceManager*)self)-&gt;_CheckMediaStatus();</a>
+<a name="ln1557">}</a>
+<a name="ln1558"> </a>
+<a name="ln1559"> </a>
+<a name="ln1560">void</a>
+<a name="ln1561">KDiskDeviceManager::_NotifyDeviceEvent(KDiskDevice* device, int32 event,</a>
+<a name="ln1562">	uint32 mask)</a>
+<a name="ln1563">{</a>
+<a name="ln1564">	char messageBuffer[512];</a>
+<a name="ln1565">	KMessage message;</a>
+<a name="ln1566">	message.SetTo(messageBuffer, sizeof(messageBuffer), B_DEVICE_UPDATE);</a>
+<a name="ln1567">	message.AddInt32(&quot;event&quot;, event);</a>
+<a name="ln1568">	message.AddInt32(&quot;id&quot;, device-&gt;ID());</a>
+<a name="ln1569">	message.AddString(&quot;device&quot;, device-&gt;Path());</a>
+<a name="ln1570"> </a>
+<a name="ln1571">	fNotifications-&gt;Notify(message, mask);</a>
+<a name="ln1572">}</a>
+<a name="ln1573"> </a>
+
+</code></pre>
+<div class="balloon" rel="708"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v547/" target="_blank">V547</a> Expression 'error == ((int) 0)' is always true.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

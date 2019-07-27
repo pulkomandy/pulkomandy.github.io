@@ -1,0 +1,421 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=windows-1250" />
+  <title>RPCCallbackServer.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2012-2013 Haiku, Inc. All rights reserved.</a>
+<a name="ln3"> * Distributed under the terms of the MIT License.</a>
+<a name="ln4"> *</a>
+<a name="ln5"> * Authors:</a>
+<a name="ln6"> *		Paweł Dziepak, pdziepak@quarnos.org</a>
+<a name="ln7"> */</a>
+<a name="ln8"> </a>
+<a name="ln9"> </a>
+<a name="ln10">#include &quot;RPCCallbackServer.h&quot;</a>
+<a name="ln11"> </a>
+<a name="ln12">#include &quot;NFS4Defs.h&quot;</a>
+<a name="ln13">#include &quot;RPCCallback.h&quot;</a>
+<a name="ln14">#include &quot;RPCCallbackReply.h&quot;</a>
+<a name="ln15">#include &quot;RPCCallbackRequest.h&quot;</a>
+<a name="ln16">#include &quot;RPCServer.h&quot;</a>
+<a name="ln17"> </a>
+<a name="ln18"> </a>
+<a name="ln19">using namespace RPC;</a>
+<a name="ln20"> </a>
+<a name="ln21"> </a>
+<a name="ln22">CallbackServer* gRPCCallbackServer		= NULL;</a>
+<a name="ln23">CallbackServer* gRPCCallbackServer6		= NULL;</a>
+<a name="ln24"> </a>
+<a name="ln25"> </a>
+<a name="ln26">CallbackServer::CallbackServer(int networkFamily)</a>
+<a name="ln27">	:</a>
+<a name="ln28">	fConnectionList(NULL),</a>
+<a name="ln29">	fListener(NULL),</a>
+<a name="ln30">	fThreadRunning(false),</a>
+<a name="ln31">	fCallbackArray(NULL),</a>
+<a name="ln32">	fArraySize(0),</a>
+<a name="ln33">	fFreeSlot(-1),</a>
+<a name="ln34">	fNetworkFamily(networkFamily)</a>
+<a name="ln35">{</a>
+<a name="ln36">	mutex_init(&amp;fConnectionLock, NULL);</a>
+<a name="ln37">	mutex_init(&amp;fThreadLock, NULL);</a>
+<a name="ln38">	rw_lock_init(&amp;fArrayLock, NULL);</a>
+<a name="ln39">}</a>
+<a name="ln40"> </a>
+<a name="ln41"> </a>
+<a name="ln42">CallbackServer::~CallbackServer()</a>
+<a name="ln43">{</a>
+<a name="ln44">	StopServer();</a>
+<a name="ln45"> </a>
+<a name="ln46">	free(fCallbackArray);</a>
+<a name="ln47">	rw_lock_destroy(&amp;fArrayLock);</a>
+<a name="ln48">	mutex_destroy(&amp;fThreadLock);</a>
+<a name="ln49">	mutex_destroy(&amp;fConnectionLock);</a>
+<a name="ln50">}</a>
+<a name="ln51"> </a>
+<a name="ln52"> </a>
+<a name="ln53">CallbackServer*</a>
+<a name="ln54">CallbackServer::Get(Server* server)</a>
+<a name="ln55">{</a>
+<a name="ln56">	ASSERT(server != NULL);</a>
+<a name="ln57"> </a>
+<a name="ln58">	int family = server-&gt;ID().Family();</a>
+<a name="ln59">	ASSERT(family == AF_INET || family == AF_INET6);</a>
+<a name="ln60"> </a>
+<a name="ln61">	int idx;</a>
+<a name="ln62">	switch (family) {</a>
+<a name="ln63">		case AF_INET:</a>
+<a name="ln64">			idx = 0;</a>
+<a name="ln65">			break;</a>
+<a name="ln66">		case AF_INET6:</a>
+<a name="ln67">			idx = 1;</a>
+<a name="ln68">			break;</a>
+<a name="ln69">		default:</a>
+<a name="ln70">			return NULL;</a>
+<a name="ln71">	}</a>
+<a name="ln72"> </a>
+<a name="ln73">	MutexLocker _(fServerCreationLock);</a>
+<a name="ln74">	if (fServers[idx] == NULL)</a>
+<a name="ln75">		fServers[idx] = new CallbackServer(family);</a>
+<a name="ln76">	return fServers[idx];</a>
+<a name="ln77">}</a>
+<a name="ln78"> </a>
+<a name="ln79"> </a>
+<a name="ln80">void</a>
+<a name="ln81">CallbackServer::ShutdownAll()</a>
+<a name="ln82">{</a>
+<a name="ln83">	MutexLocker _(fServerCreationLock);</a>
+<a name="ln84">	for (unsigned int i = 0; i &lt; sizeof(fServers) / sizeof(fServers[0]); i++)</a>
+<a name="ln85">		delete fServers[i];</a>
+<a name="ln86">	memset(&amp;fServers, 0, sizeof(fServers));</a>
+<a name="ln87">}</a>
+<a name="ln88"> </a>
+<a name="ln89"> </a>
+<a name="ln90">mutex			CallbackServer::fServerCreationLock = MUTEX_INITIALIZER(NULL);</a>
+<a name="ln91">CallbackServer*	CallbackServer::fServers[2] = { NULL, NULL };</a>
+<a name="ln92"> </a>
+<a name="ln93"> </a>
+<a name="ln94">status_t</a>
+<a name="ln95">CallbackServer::RegisterCallback(Callback* callback)</a>
+<a name="ln96">{</a>
+<a name="ln97">	ASSERT(callback != NULL);</a>
+<a name="ln98"> </a>
+<a name="ln99">	status_t result = StartServer();</a>
+<a name="ln100">	if (result != B_OK)</a>
+<a name="ln101">		return result;</a>
+<a name="ln102"> </a>
+<a name="ln103">	WriteLocker _(fArrayLock);</a>
+<a name="ln104">	if (fFreeSlot == -1) {</a>
+<a name="ln105">		uint32 newSize = max_c(fArraySize * 2, 4);</a>
+<a name="ln106">		uint32 size = newSize * sizeof(CallbackSlot);</a>
+<a name="ln107">		CallbackSlot* array	= reinterpret_cast&lt;CallbackSlot*&gt;(malloc(size));</a>
+<a name="ln108">		if (array == NULL)</a>
+<a name="ln109">			return B_NO_MEMORY;</a>
+<a name="ln110"> </a>
+<a name="ln111">		if (fCallbackArray != NULL)</a>
+<a name="ln112">			memcpy(array, fCallbackArray, fArraySize * sizeof(CallbackSlot));</a>
+<a name="ln113"> </a>
+<a name="ln114">		for (uint32 i = fArraySize; i &lt; newSize; i++)</a>
+<a name="ln115">			array[i].fNext = i + 1;</a>
+<a name="ln116"> </a>
+<a name="ln117">		array[newSize - 1].fNext = -1;</a>
+<a name="ln118"> </a>
+<a name="ln119">		fCallbackArray = array;</a>
+<a name="ln120">		fFreeSlot = fArraySize;</a>
+<a name="ln121">		fArraySize = newSize;</a>
+<a name="ln122">	}</a>
+<a name="ln123"> </a>
+<a name="ln124">	int32 id = fFreeSlot;</a>
+<a name="ln125">	fFreeSlot = fCallbackArray[id].fNext;</a>
+<a name="ln126"> </a>
+<a name="ln127">	fCallbackArray[id].fCallback = callback;</a>
+<a name="ln128">	callback-&gt;SetID(id);</a>
+<a name="ln129">	callback-&gt;SetCBServer(this);</a>
+<a name="ln130"> </a>
+<a name="ln131">	return B_OK;</a>
+<a name="ln132">}</a>
+<a name="ln133"> </a>
+<a name="ln134"> </a>
+<a name="ln135">status_t</a>
+<a name="ln136">CallbackServer::UnregisterCallback(Callback* callback)</a>
+<a name="ln137">{</a>
+<a name="ln138">	ASSERT(callback != NULL);</a>
+<a name="ln139">	ASSERT(callback-&gt;CBServer() == this);</a>
+<a name="ln140"> </a>
+<a name="ln141">	int32 id = callback-&gt;ID();</a>
+<a name="ln142"> </a>
+<a name="ln143">	WriteLocker _(fArrayLock);</a>
+<a name="ln144">	fCallbackArray[id].fNext = fFreeSlot;</a>
+<a name="ln145">	fFreeSlot = id;</a>
+<a name="ln146"> </a>
+<a name="ln147">	callback-&gt;SetCBServer(NULL);</a>
+<a name="ln148">	return B_OK;</a>
+<a name="ln149">}</a>
+<a name="ln150"> </a>
+<a name="ln151"> </a>
+<a name="ln152">status_t</a>
+<a name="ln153">CallbackServer::StartServer()</a>
+<a name="ln154">{</a>
+<a name="ln155">	MutexLocker _(fThreadLock);</a>
+<a name="ln156">	if (fThreadRunning)</a>
+<a name="ln157">		return B_OK;</a>
+<a name="ln158"> </a>
+<a name="ln159">	status_t result = ConnectionListener::Listen(&amp;fListener, fNetworkFamily);</a>
+<a name="ln160">	if (result != B_OK)</a>
+<a name="ln161">		return result;</a>
+<a name="ln162"> </a>
+<a name="ln163">	fThread = spawn_kernel_thread(&amp;CallbackServer::ListenerThreadLauncher,</a>
+<a name="ln164">		&quot;NFSv4 Callback Listener&quot;, B_NORMAL_PRIORITY, this);</a>
+<a name="ln165">	if (fThread &lt; B_OK)</a>
+<a name="ln166">		return fThread;</a>
+<a name="ln167"> </a>
+<a name="ln168">	fThreadRunning = true;</a>
+<a name="ln169"> </a>
+<a name="ln170">	result = resume_thread(fThread);</a>
+<a name="ln171">	if (result != B_OK) {</a>
+<a name="ln172">		kill_thread(fThread);</a>
+<a name="ln173">		fThreadRunning = false;</a>
+<a name="ln174">		return result;</a>
+<a name="ln175">	}</a>
+<a name="ln176"> </a>
+<a name="ln177">	return B_OK;</a>
+<a name="ln178">}</a>
+<a name="ln179"> </a>
+<a name="ln180"> </a>
+<a name="ln181">status_t</a>
+<a name="ln182">CallbackServer::StopServer()</a>
+<a name="ln183">{</a>
+<a name="ln184">	MutexLocker _(&amp;fThreadLock);</a>
+<a name="ln185">	if (!fThreadRunning)</a>
+<a name="ln186">		return B_OK;</a>
+<a name="ln187"> </a>
+<a name="ln188">	fListener-&gt;Disconnect();</a>
+<a name="ln189">	status_t result;</a>
+<a name="ln190">	wait_for_thread(fThread, &amp;result);</a>
+<a name="ln191"> </a>
+<a name="ln192">	MutexLocker locker(fConnectionLock);</a>
+<a name="ln193">	while (fConnectionList != NULL) {</a>
+<a name="ln194">		ConnectionEntry* entry = fConnectionList;</a>
+<a name="ln195">		fConnectionList = entry-&gt;fNext;</a>
+<a name="ln196">		entry-&gt;fConnection-&gt;Disconnect();</a>
+<a name="ln197"> </a>
+<a name="ln198">		status_t result;</a>
+<a name="ln199">		wait_for_thread(entry-&gt;fThread, &amp;result);</a>
+<a name="ln200"> </a>
+<a name="ln201">		delete entry-&gt;fConnection;</a>
+<a name="ln202">		delete entry;</a>
+<a name="ln203">	}</a>
+<a name="ln204"> </a>
+<a name="ln205">	delete fListener;</a>
+<a name="ln206"> </a>
+<a name="ln207">	fThreadRunning = false;</a>
+<a name="ln208">	return B_OK;</a>
+<a name="ln209">}</a>
+<a name="ln210"> </a>
+<a name="ln211"> </a>
+<a name="ln212">status_t</a>
+<a name="ln213">CallbackServer::NewConnection(Connection* connection)</a>
+<a name="ln214">{</a>
+<a name="ln215">	ASSERT(connection != NULL);</a>
+<a name="ln216"> </a>
+<a name="ln217">	ConnectionEntry* entry = new ConnectionEntry;</a>
+<a name="ln218">	entry-&gt;fConnection = connection;</a>
+<a name="ln219">	entry-&gt;fPrev = NULL;</a>
+<a name="ln220"> </a>
+<a name="ln221">	MutexLocker locker(fConnectionLock);</a>
+<a name="ln222">	entry-&gt;fNext = fConnectionList;</a>
+<a name="ln223">	if (fConnectionList != NULL)</a>
+<a name="ln224">		fConnectionList-&gt;fPrev = entry;</a>
+<a name="ln225">	fConnectionList = entry;</a>
+<a name="ln226">	locker.Unlock();</a>
+<a name="ln227"> </a>
+<a name="ln228">	void** arguments = reinterpret_cast&lt;void**&gt;(malloc(sizeof(void*) * 2));</a>
+<a name="ln229">	if (arguments == NULL)</a>
+<a name="ln230">		return B_NO_MEMORY;</a>
+<a name="ln231"> </a>
+<a name="ln232">	arguments[0] = this;</a>
+<a name="ln233">	arguments[1] = entry;</a>
+<a name="ln234"> </a>
+<a name="ln235">	thread_id thread;</a>
+<a name="ln236">	thread = spawn_kernel_thread(&amp;CallbackServer::ConnectionThreadLauncher,</a>
+<a name="ln237">		&quot;NFSv4 Callback Connection&quot;, B_NORMAL_PRIORITY, arguments);</a>
+<a name="ln238">	if (thread &lt; B_OK) {</a>
+<a name="ln239">		ReleaseConnection(entry);</a>
+<a name="ln240">		free(arguments);</a>
+<a name="ln241">		return thread;</a>
+<a name="ln242">	}</a>
+<a name="ln243"> </a>
+<a name="ln244">	entry-&gt;fThread = thread;</a>
+<a name="ln245"> </a>
+<a name="ln246">	status_t result = resume_thread(thread);</a>
+<a name="ln247">	if (result != B_OK) {</a>
+<a name="ln248">		kill_thread(thread);</a>
+<a name="ln249">		ReleaseConnection(entry);</a>
+<a name="ln250">		free(arguments);</a>
+<a name="ln251">		return result;</a>
+<a name="ln252">	}</a>
+<a name="ln253"> </a>
+<a name="ln254">	return B_OK;</a>
+<a name="ln255">}</a>
+<a name="ln256"> </a>
+<a name="ln257"> </a>
+<a name="ln258">status_t</a>
+<a name="ln259">CallbackServer::ReleaseConnection(ConnectionEntry* entry)</a>
+<a name="ln260">{</a>
+<a name="ln261">	ASSERT(entry != NULL);</a>
+<a name="ln262"> </a>
+<a name="ln263">	MutexLocker _(fConnectionLock);</a>
+<a name="ln264">	if (entry-&gt;fNext != NULL)</a>
+<a name="ln265">		entry-&gt;fNext-&gt;fPrev = entry-&gt;fPrev;</a>
+<a name="ln266">	if (entry-&gt;fPrev != NULL)</a>
+<a name="ln267">		entry-&gt;fPrev-&gt;fNext = entry-&gt;fNext;</a>
+<a name="ln268">	else</a>
+<a name="ln269">		fConnectionList = entry-&gt;fNext;</a>
+<a name="ln270"> </a>
+<a name="ln271">	delete entry-&gt;fConnection;</a>
+<a name="ln272">	delete entry;</a>
+<a name="ln273">	return B_OK;</a>
+<a name="ln274">}</a>
+<a name="ln275"> </a>
+<a name="ln276"> </a>
+<a name="ln277">status_t</a>
+<a name="ln278">CallbackServer::ConnectionThreadLauncher(void* object)</a>
+<a name="ln279">{</a>
+<a name="ln280">	ASSERT(object != NULL);</a>
+<a name="ln281"> </a>
+<a name="ln282">	void** objects = reinterpret_cast&lt;void**&gt;(object);</a>
+<a name="ln283">	CallbackServer* server = reinterpret_cast&lt;CallbackServer*&gt;(objects[0]);</a>
+<a name="ln284">	ConnectionEntry* entry = reinterpret_cast&lt;ConnectionEntry*&gt;(objects[1]);</a>
+<a name="ln285">	free(objects);</a>
+<a name="ln286"> </a>
+<a name="ln287">	return server-&gt;ConnectionThread(entry);</a>
+<a name="ln288">}</a>
+<a name="ln289"> </a>
+<a name="ln290"> </a>
+<a name="ln291">status_t</a>
+<a name="ln292">CallbackServer::ConnectionThread(ConnectionEntry* entry)</a>
+<a name="ln293">{</a>
+<a name="ln294">	ASSERT(entry != NULL);</a>
+<a name="ln295"> </a>
+<a name="ln296">	Connection* connection = entry-&gt;fConnection;</a>
+<a name="ln297">	CallbackReply* reply;</a>
+<a name="ln298"> </a>
+<a name="ln299">	while (fThreadRunning) {</a>
+<a name="ln300">		uint32 size;</a>
+<a name="ln301">		void* buffer;</a>
+<a name="ln302">		status_t result = connection-&gt;Receive(&amp;buffer, &amp;size);</a>
+<a name="ln303">		if (result != B_OK) {</a>
+<a name="ln304">			if (result != ECONNABORTED)</a>
+<a name="ln305">				ReleaseConnection(entry);</a>
+<a name="ln306">			return result;</a>
+<a name="ln307">		}</a>
+<a name="ln308"> </a>
+<a name="ln309">		CallbackRequest* request</a>
+<a name="ln310">			= new(std::nothrow) CallbackRequest(buffer, size);</a>
+<a name="ln311">		if (request == NULL) {</a>
+<a name="ln312">			free(buffer);</a>
+<a name="ln313">			continue;	</a>
+<a name="ln314">		} else if (request-&gt;Error() != B_OK) {</a>
+<a name="ln315">			reply = CallbackReply::Create(request-&gt;XID(), request-&gt;RPCError());</a>
+<a name="ln316">			if (reply != NULL) {</a>
+<a name="ln317">				connection-&gt;Send(reply-&gt;Stream().Buffer(),</a>
+<a name="ln318">					reply-&gt;Stream().Size());</a>
+<a name="ln319">				delete reply;</a>
+<a name="ln320">			}</a>
+<a name="ln321">			delete request;</a>
+<a name="ln322">			continue;</a>
+<a name="ln323">		}</a>
+<a name="ln324"> </a>
+<a name="ln325">		switch (request-&gt;Procedure()) {</a>
+<a name="ln326">			case CallbackProcCompound:</a>
+<a name="ln327">				GetCallback(request-&gt;ID())-&gt;EnqueueRequest(request, connection);</a>
+<a name="ln328">				break;</a>
+<a name="ln329"> </a>
+<a name="ln330">			case CallbackProcNull:</a>
+<a name="ln331">				reply = CallbackReply::Create(request-&gt;XID());</a>
+<a name="ln332">				if (reply != NULL) {</a>
+<a name="ln333">					connection-&gt;Send(reply-&gt;Stream().Buffer(),</a>
+<a name="ln334">						reply-&gt;Stream().Size());</a>
+<a name="ln335">					delete reply;</a>
+<a name="ln336">				}</a>
+<a name="ln337"> </a>
+<a name="ln338">			default:</a>
+<a name="ln339">				delete request;</a>
+<a name="ln340">		}</a>
+<a name="ln341">	}</a>
+<a name="ln342"> </a>
+<a name="ln343">	return B_OK;</a>
+<a name="ln344">}</a>
+<a name="ln345"> </a>
+<a name="ln346"> </a>
+<a name="ln347">status_t</a>
+<a name="ln348">CallbackServer::ListenerThreadLauncher(void* object)</a>
+<a name="ln349">{</a>
+<a name="ln350">	ASSERT(object != NULL);</a>
+<a name="ln351"> </a>
+<a name="ln352">	CallbackServer* server = reinterpret_cast&lt;CallbackServer*&gt;(object);</a>
+<a name="ln353">	return server-&gt;ListenerThread();</a>
+<a name="ln354">}</a>
+<a name="ln355"> </a>
+<a name="ln356"> </a>
+<a name="ln357">status_t</a>
+<a name="ln358">CallbackServer::ListenerThread()</a>
+<a name="ln359">{</a>
+<a name="ln360">	while (fThreadRunning) {</a>
+<a name="ln361">		Connection* connection;</a>
+<a name="ln362"> </a>
+<a name="ln363">		status_t result = fListener-&gt;AcceptConnection(&amp;connection);</a>
+<a name="ln364">		if (result != B_OK) {</a>
+<a name="ln365">			fThreadRunning = false;</a>
+<a name="ln366">			return result;</a>
+<a name="ln367">		}</a>
+<a name="ln368">		result = NewConnection(connection);</a>
+<a name="ln369">		if (result != B_OK)</a>
+<a name="ln370">			delete connection;</a>
+<a name="ln371">	}</a>
+<a name="ln372"> </a>
+<a name="ln373">	return B_OK;</a>
+<a name="ln374">}</a>
+<a name="ln375"> </a>
+
+</code></pre>
+<div class="balloon" rel="26"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fThread.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

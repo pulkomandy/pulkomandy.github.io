@@ -1,0 +1,823 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>BreakpointManager.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2009, Ingo Weinhold, ingo_weinhold@gmx.de.</a>
+<a name="ln3"> * Distributed under the terms of the MIT License.</a>
+<a name="ln4"> */</a>
+<a name="ln5"> </a>
+<a name="ln6">#include &quot;BreakpointManager.h&quot;</a>
+<a name="ln7"> </a>
+<a name="ln8">#include &lt;algorithm&gt;</a>
+<a name="ln9"> </a>
+<a name="ln10">#include &lt;AutoDeleter.h&gt;</a>
+<a name="ln11"> </a>
+<a name="ln12">#include &lt;kernel.h&gt;</a>
+<a name="ln13">#include &lt;util/AutoLock.h&gt;</a>
+<a name="ln14">#include &lt;vm/vm.h&gt;</a>
+<a name="ln15"> </a>
+<a name="ln16"> </a>
+<a name="ln17">//#define TRACE_BREAKPOINT_MANAGER</a>
+<a name="ln18">#ifdef TRACE_BREAKPOINT_MANAGER</a>
+<a name="ln19">#	define TRACE(x...) dprintf(x)</a>
+<a name="ln20">#else</a>
+<a name="ln21">#	define TRACE(x...) do {} while (false)</a>
+<a name="ln22">#endif</a>
+<a name="ln23"> </a>
+<a name="ln24"> </a>
+<a name="ln25">// soft limit for the number of breakpoints</a>
+<a name="ln26">const int32 kMaxBreakpointCount = 10240;</a>
+<a name="ln27"> </a>
+<a name="ln28"> </a>
+<a name="ln29">BreakpointManager::InstalledBreakpoint::InstalledBreakpoint(addr_t address)</a>
+<a name="ln30">	:</a>
+<a name="ln31">	breakpoint(NULL),</a>
+<a name="ln32">	address(address)</a>
+<a name="ln33">{</a>
+<a name="ln34">}</a>
+<a name="ln35"> </a>
+<a name="ln36"> </a>
+<a name="ln37">// #pragma mark -</a>
+<a name="ln38"> </a>
+<a name="ln39"> </a>
+<a name="ln40">BreakpointManager::BreakpointManager()</a>
+<a name="ln41">	:</a>
+<a name="ln42">	fBreakpointCount(0),</a>
+<a name="ln43">	fWatchpointCount(0)</a>
+<a name="ln44">{</a>
+<a name="ln45">	rw_lock_init(&amp;fLock, &quot;breakpoint manager&quot;);</a>
+<a name="ln46">}</a>
+<a name="ln47"> </a>
+<a name="ln48"> </a>
+<a name="ln49">BreakpointManager::~BreakpointManager()</a>
+<a name="ln50">{</a>
+<a name="ln51">	WriteLocker locker(fLock);</a>
+<a name="ln52"> </a>
+<a name="ln53">	// delete the installed breakpoint objects</a>
+<a name="ln54">	BreakpointTree::Iterator it = fBreakpoints.GetIterator();</a>
+<a name="ln55">	while (InstalledBreakpoint* installedBreakpoint = it.Next()) {</a>
+<a name="ln56">		it.Remove();</a>
+<a name="ln57"> </a>
+<a name="ln58">		// delete underlying software breakpoint</a>
+<a name="ln59">		if (installedBreakpoint-&gt;breakpoint-&gt;software)</a>
+<a name="ln60">			delete installedBreakpoint-&gt;breakpoint;</a>
+<a name="ln61"> </a>
+<a name="ln62">		delete installedBreakpoint;</a>
+<a name="ln63">	}</a>
+<a name="ln64"> </a>
+<a name="ln65">	// delete the watchpoints</a>
+<a name="ln66">	while (InstalledWatchpoint* watchpoint = fWatchpoints.RemoveHead())</a>
+<a name="ln67">		delete watchpoint;</a>
+<a name="ln68"> </a>
+<a name="ln69">	// delete the hardware breakpoint objects</a>
+<a name="ln70">	while (Breakpoint* breakpoint = fHardwareBreakpoints.RemoveHead())</a>
+<a name="ln71">		delete breakpoint;</a>
+<a name="ln72"> </a>
+<a name="ln73">	rw_lock_destroy(&amp;fLock);</a>
+<a name="ln74">}</a>
+<a name="ln75"> </a>
+<a name="ln76"> </a>
+<a name="ln77">status_t</a>
+<a name="ln78">BreakpointManager::Init()</a>
+<a name="ln79">{</a>
+<a name="ln80">	// create objects for the hardware breakpoints</a>
+<a name="ln81">	for (int32 i = 0; i &lt; DEBUG_MAX_BREAKPOINTS; i++) {</a>
+<a name="ln82">		Breakpoint* breakpoint = new(std::nothrow) Breakpoint;</a>
+<a name="ln83">		if (breakpoint == NULL)</a>
+<a name="ln84">			return B_NO_MEMORY;</a>
+<a name="ln85"> </a>
+<a name="ln86">		breakpoint-&gt;address = 0;</a>
+<a name="ln87">		breakpoint-&gt;installedBreakpoint = NULL;</a>
+<a name="ln88">		breakpoint-&gt;used = false;</a>
+<a name="ln89">		breakpoint-&gt;software = false;</a>
+<a name="ln90"> </a>
+<a name="ln91">		fHardwareBreakpoints.Add(breakpoint);</a>
+<a name="ln92">	}</a>
+<a name="ln93"> </a>
+<a name="ln94">	return B_OK;</a>
+<a name="ln95">}</a>
+<a name="ln96"> </a>
+<a name="ln97"> </a>
+<a name="ln98">status_t</a>
+<a name="ln99">BreakpointManager::InstallBreakpoint(void* _address)</a>
+<a name="ln100">{</a>
+<a name="ln101">	const addr_t address = (addr_t)_address;</a>
+<a name="ln102"> </a>
+<a name="ln103">	WriteLocker locker(fLock);</a>
+<a name="ln104"> </a>
+<a name="ln105">	if (fBreakpointCount &gt;= kMaxBreakpointCount)</a>
+<a name="ln106">		return B_BUSY;</a>
+<a name="ln107"> </a>
+<a name="ln108">	// check whether there's already a breakpoint at the address</a>
+<a name="ln109">	InstalledBreakpoint* installed = fBreakpoints.Lookup(address);</a>
+<a name="ln110">	if (installed != NULL)</a>
+<a name="ln111">		return B_BAD_VALUE;</a>
+<a name="ln112"> </a>
+<a name="ln113">	// create the breakpoint object</a>
+<a name="ln114">	installed = new(std::nothrow) InstalledBreakpoint(address);</a>
+<a name="ln115">	if (installed == NULL)</a>
+<a name="ln116">		return B_NO_MEMORY;</a>
+<a name="ln117">	ObjectDeleter&lt;InstalledBreakpoint&gt; installedDeleter(installed);</a>
+<a name="ln118"> </a>
+<a name="ln119">	// If we still have enough hardware breakpoints left, install a hardware</a>
+<a name="ln120">	// breakpoint.</a>
+<a name="ln121">	Breakpoint* breakpoint = _GetUnusedHardwareBreakpoint(false);</a>
+<a name="ln122">	if (breakpoint != NULL) {</a>
+<a name="ln123">		status_t error = _InstallHardwareBreakpoint(breakpoint, address);</a>
+<a name="ln124">		if (error != B_OK)</a>
+<a name="ln125">			return error;</a>
+<a name="ln126"> </a>
+<a name="ln127">		breakpoint-&gt;installedBreakpoint = installed;</a>
+<a name="ln128">		installed-&gt;breakpoint = breakpoint;</a>
+<a name="ln129">	} else {</a>
+<a name="ln130">		// install a software breakpoint</a>
+<a name="ln131">		status_t error = _InstallSoftwareBreakpoint(installed, address);</a>
+<a name="ln132">		if (error != B_OK)</a>
+<a name="ln133">			return error;</a>
+<a name="ln134">	}</a>
+<a name="ln135"> </a>
+<a name="ln136">	fBreakpoints.Insert(installed);</a>
+<a name="ln137">	installedDeleter.Detach();</a>
+<a name="ln138">	fBreakpointCount++;</a>
+<a name="ln139"> </a>
+<a name="ln140">	return B_OK;</a>
+<a name="ln141">}</a>
+<a name="ln142"> </a>
+<a name="ln143"> </a>
+<a name="ln144">status_t</a>
+<a name="ln145">BreakpointManager::UninstallBreakpoint(void* _address)</a>
+<a name="ln146">{</a>
+<a name="ln147">	const addr_t address = (addr_t)_address;</a>
+<a name="ln148"> </a>
+<a name="ln149">	WriteLocker locker(fLock);</a>
+<a name="ln150"> </a>
+<a name="ln151">	InstalledBreakpoint* installed = fBreakpoints.Lookup(address);</a>
+<a name="ln152">	if (installed == NULL)</a>
+<a name="ln153">		return B_BAD_VALUE;</a>
+<a name="ln154"> </a>
+<a name="ln155">	if (installed-&gt;breakpoint-&gt;software)</a>
+<a name="ln156">		_UninstallSoftwareBreakpoint(installed-&gt;breakpoint);</a>
+<a name="ln157">	else</a>
+<a name="ln158">		_UninstallHardwareBreakpoint(installed-&gt;breakpoint);</a>
+<a name="ln159"> </a>
+<a name="ln160">	fBreakpoints.Remove(installed);</a>
+<a name="ln161">	delete installed;</a>
+<a name="ln162">	fBreakpointCount--;</a>
+<a name="ln163"> </a>
+<a name="ln164">	return B_OK;</a>
+<a name="ln165">}</a>
+<a name="ln166"> </a>
+<a name="ln167"> </a>
+<a name="ln168">status_t</a>
+<a name="ln169">BreakpointManager::InstallWatchpoint(void* _address, uint32 type, int32 length)</a>
+<a name="ln170">{</a>
+<a name="ln171">	const addr_t address = (addr_t)_address;</a>
+<a name="ln172"> </a>
+<a name="ln173">	WriteLocker locker(fLock);</a>
+<a name="ln174"> </a>
+<a name="ln175">	InstalledWatchpoint* watchpoint = _FindWatchpoint(address);</a>
+<a name="ln176">	if (watchpoint != NULL)</a>
+<a name="ln177">		return B_BAD_VALUE;</a>
+<a name="ln178"> </a>
+<a name="ln179">#if DEBUG_SHARED_BREAK_AND_WATCHPOINTS</a>
+<a name="ln180">	// We need at least one hardware breakpoint for our breakpoint management.</a>
+<a name="ln181">	if (fWatchpointCount + 1 &gt;= DEBUG_MAX_WATCHPOINTS)</a>
+<a name="ln182">		return B_BUSY;</a>
+<a name="ln183">#else</a>
+<a name="ln184">	if (fWatchpointCount &gt;= DEBUG_MAX_WATCHPOINTS)</a>
+<a name="ln185">		return B_BUSY;</a>
+<a name="ln186">#endif</a>
+<a name="ln187"> </a>
+<a name="ln188">	watchpoint = new(std::nothrow) InstalledWatchpoint;</a>
+<a name="ln189">	if (watchpoint == NULL)</a>
+<a name="ln190">		return B_NO_MEMORY;</a>
+<a name="ln191">	ObjectDeleter&lt;InstalledWatchpoint&gt; watchpointDeleter(watchpoint);</a>
+<a name="ln192"> </a>
+<a name="ln193">	status_t error = _InstallWatchpoint(watchpoint, address, type, length);</a>
+<a name="ln194">	if (error != B_OK)</a>
+<a name="ln195">		return error;</a>
+<a name="ln196"> </a>
+<a name="ln197">	fWatchpoints.Add(watchpointDeleter.Detach());</a>
+<a name="ln198">	fWatchpointCount++;</a>
+<a name="ln199">	return B_OK;</a>
+<a name="ln200">}</a>
+<a name="ln201"> </a>
+<a name="ln202"> </a>
+<a name="ln203">status_t</a>
+<a name="ln204">BreakpointManager::UninstallWatchpoint(void* address)</a>
+<a name="ln205">{</a>
+<a name="ln206">	WriteLocker locker(fLock);</a>
+<a name="ln207"> </a>
+<a name="ln208">	InstalledWatchpoint* watchpoint = _FindWatchpoint((addr_t)address);</a>
+<a name="ln209">	if (watchpoint == NULL)</a>
+<a name="ln210">		return B_BAD_VALUE;</a>
+<a name="ln211"> </a>
+<a name="ln212">	ObjectDeleter&lt;InstalledWatchpoint&gt; deleter(watchpoint);</a>
+<a name="ln213">	fWatchpoints.Remove(watchpoint);</a>
+<a name="ln214">	fWatchpointCount--;</a>
+<a name="ln215"> </a>
+<a name="ln216">	return _UninstallWatchpoint(watchpoint);</a>
+<a name="ln217">}</a>
+<a name="ln218"> </a>
+<a name="ln219"> </a>
+<a name="ln220">void</a>
+<a name="ln221">BreakpointManager::RemoveAllBreakpoints()</a>
+<a name="ln222">{</a>
+<a name="ln223">	WriteLocker locker(fLock);</a>
+<a name="ln224"> </a>
+<a name="ln225">	// remove the breakpoints</a>
+<a name="ln226">	BreakpointTree::Iterator it = fBreakpoints.GetIterator();</a>
+<a name="ln227">	while (InstalledBreakpoint* installedBreakpoint = it.Next()) {</a>
+<a name="ln228">		it.Remove();</a>
+<a name="ln229"> </a>
+<a name="ln230">		// uninstall underlying hard/software breakpoint</a>
+<a name="ln231">		if (installedBreakpoint-&gt;breakpoint-&gt;software)</a>
+<a name="ln232">			_UninstallSoftwareBreakpoint(installedBreakpoint-&gt;breakpoint);</a>
+<a name="ln233">		else</a>
+<a name="ln234">			_UninstallHardwareBreakpoint(installedBreakpoint-&gt;breakpoint);</a>
+<a name="ln235"> </a>
+<a name="ln236">		delete installedBreakpoint;</a>
+<a name="ln237">	}</a>
+<a name="ln238"> </a>
+<a name="ln239">	// remove the watchpoints</a>
+<a name="ln240">	while (InstalledWatchpoint* watchpoint = fWatchpoints.RemoveHead()) {</a>
+<a name="ln241">		_UninstallWatchpoint(watchpoint);</a>
+<a name="ln242">		delete watchpoint;</a>
+<a name="ln243">	}</a>
+<a name="ln244">}</a>
+<a name="ln245"> </a>
+<a name="ln246"> </a>
+<a name="ln247">/*!	\brief Returns whether the given address can be accessed in principle.</a>
+<a name="ln248">	No check whether there's an actually accessible area is performed, though.</a>
+<a name="ln249">*/</a>
+<a name="ln250">/*static*/ bool</a>
+<a name="ln251">BreakpointManager::CanAccessAddress(const void* _address, bool write)</a>
+<a name="ln252">{</a>
+<a name="ln253">	const addr_t address = (addr_t)_address;</a>
+<a name="ln254"> </a>
+<a name="ln255">	// user addresses are always fine</a>
+<a name="ln256">	if (IS_USER_ADDRESS(address))</a>
+<a name="ln257">		return true;</a>
+<a name="ln258"> </a>
+<a name="ln259">	return false;</a>
+<a name="ln260">}</a>
+<a name="ln261"> </a>
+<a name="ln262"> </a>
+<a name="ln263">/*!	\brief Reads data from user memory.</a>
+<a name="ln264"> </a>
+<a name="ln265">	Tries to read \a size bytes of data from user memory address \a address</a>
+<a name="ln266">	into the supplied buffer \a buffer. If only a part could be read the</a>
+<a name="ln267">	function won't fail. The number of bytes actually read is return through</a>
+<a name="ln268">	\a bytesRead.</a>
+<a name="ln269"> </a>
+<a name="ln270">	\param address The user memory address from which to read.</a>
+<a name="ln271">	\param buffer The buffer into which to write.</a>
+<a name="ln272">	\param size The number of bytes to read.</a>
+<a name="ln273">	\param bytesRead Will be set to the number of bytes actually read.</a>
+<a name="ln274">	\return \c B_OK, if reading went fine. Then \a bytesRead will be set to</a>
+<a name="ln275">			the amount of data actually read. An error indicates that nothing</a>
+<a name="ln276">			has been read.</a>
+<a name="ln277">*/</a>
+<a name="ln278">status_t</a>
+<a name="ln279">BreakpointManager::ReadMemory(const void* _address, void* buffer, size_t size,</a>
+<a name="ln280">	size_t&amp; bytesRead)</a>
+<a name="ln281">{</a>
+<a name="ln282">	const addr_t address = (addr_t)_address;</a>
+<a name="ln283"> </a>
+<a name="ln284">	ReadLocker locker(fLock);</a>
+<a name="ln285"> </a>
+<a name="ln286">	status_t error = _ReadMemory(address, buffer, size, bytesRead);</a>
+<a name="ln287">	if (error != B_OK)</a>
+<a name="ln288">		return error;</a>
+<a name="ln289"> </a>
+<a name="ln290">	// If we have software breakpoints installed, fix the buffer not to contain</a>
+<a name="ln291">	// any of them.</a>
+<a name="ln292"> </a>
+<a name="ln293">	// address of the first possibly intersecting software breakpoint</a>
+<a name="ln294">	const addr_t startAddress</a>
+<a name="ln295">		= std::max(address, (addr_t)DEBUG_SOFTWARE_BREAKPOINT_SIZE - 1)</a>
+<a name="ln296">			- (DEBUG_SOFTWARE_BREAKPOINT_SIZE - 1);</a>
+<a name="ln297"> </a>
+<a name="ln298">	BreakpointTree::Iterator it = fBreakpoints.GetIterator(startAddress, true,</a>
+<a name="ln299">		true);</a>
+<a name="ln300">	while (InstalledBreakpoint* installed = it.Next()) {</a>
+<a name="ln301">		Breakpoint* breakpoint = installed-&gt;breakpoint;</a>
+<a name="ln302">		if (breakpoint-&gt;address &gt;= address + size)</a>
+<a name="ln303">			break;</a>
+<a name="ln304"> </a>
+<a name="ln305">		if (breakpoint-&gt;software) {</a>
+<a name="ln306">			// Software breakpoint intersects -- replace the read data with</a>
+<a name="ln307">			// the data saved in the breakpoint object.</a>
+<a name="ln308">			addr_t minAddress = std::max(breakpoint-&gt;address, address);</a>
+<a name="ln309">			size_t toCopy = std::min(address + size,</a>
+<a name="ln310">					breakpoint-&gt;address + DEBUG_SOFTWARE_BREAKPOINT_SIZE)</a>
+<a name="ln311">				- minAddress;</a>
+<a name="ln312">			memcpy((uint8*)buffer + (minAddress - address),</a>
+<a name="ln313">				breakpoint-&gt;softwareData + (minAddress - breakpoint-&gt;address),</a>
+<a name="ln314">				toCopy);</a>
+<a name="ln315">		}</a>
+<a name="ln316">	}</a>
+<a name="ln317"> </a>
+<a name="ln318">	return B_OK;</a>
+<a name="ln319">}</a>
+<a name="ln320"> </a>
+<a name="ln321"> </a>
+<a name="ln322">status_t</a>
+<a name="ln323">BreakpointManager::WriteMemory(void* _address, const void* _buffer, size_t size,</a>
+<a name="ln324">	size_t&amp; bytesWritten)</a>
+<a name="ln325">{</a>
+<a name="ln326">	bytesWritten = 0;</a>
+<a name="ln327"> </a>
+<a name="ln328">	if (size == 0)</a>
+<a name="ln329">		return B_OK;</a>
+<a name="ln330"> </a>
+<a name="ln331">	addr_t address = (addr_t)_address;</a>
+<a name="ln332">	const uint8* buffer = (uint8*)_buffer;</a>
+<a name="ln333"> </a>
+<a name="ln334">	WriteLocker locker(fLock);</a>
+<a name="ln335"> </a>
+<a name="ln336">	// We don't want to overwrite software breakpoints, so things are a bit more</a>
+<a name="ln337">	// complicated. We iterate through the intersecting software breakpoints,</a>
+<a name="ln338">	// writing the memory between them normally, but skipping the breakpoints</a>
+<a name="ln339">	// itself. We write into their softwareData instead.</a>
+<a name="ln340"> </a>
+<a name="ln341">	// Get the first breakpoint -- if it starts before the address, we'll</a>
+<a name="ln342">	// handle it separately to make things in the main loop simpler.</a>
+<a name="ln343">	const addr_t startAddress</a>
+<a name="ln344">		= std::max(address, (addr_t)DEBUG_SOFTWARE_BREAKPOINT_SIZE - 1)</a>
+<a name="ln345">			- (DEBUG_SOFTWARE_BREAKPOINT_SIZE - 1);</a>
+<a name="ln346"> </a>
+<a name="ln347">	BreakpointTree::Iterator it = fBreakpoints.GetIterator(startAddress, true,</a>
+<a name="ln348">		true);</a>
+<a name="ln349">	InstalledBreakpoint* installed = it.Next();</a>
+<a name="ln350">	while (installed != NULL) {</a>
+<a name="ln351">		Breakpoint* breakpoint = installed-&gt;breakpoint;</a>
+<a name="ln352">		if (breakpoint-&gt;address &gt;= address)</a>
+<a name="ln353">			break;</a>
+<a name="ln354"> </a>
+<a name="ln355">		if (breakpoint-&gt;software) {</a>
+<a name="ln356">			// We've got a breakpoint that is partially intersecting with the</a>
+<a name="ln357">			// beginning of the address range to write.</a>
+<a name="ln358">			size_t toCopy = std::min(address + size,</a>
+<a name="ln359">					breakpoint-&gt;address + DEBUG_SOFTWARE_BREAKPOINT_SIZE)</a>
+<a name="ln360">				- address;</a>
+<a name="ln361">			memcpy(breakpoint-&gt;softwareData + (address - breakpoint-&gt;address),</a>
+<a name="ln362">				buffer, toCopy);</a>
+<a name="ln363"> </a>
+<a name="ln364">			address += toCopy;</a>
+<a name="ln365">			size -= toCopy;</a>
+<a name="ln366">			bytesWritten += toCopy;</a>
+<a name="ln367">			buffer += toCopy;</a>
+<a name="ln368">		}</a>
+<a name="ln369"> </a>
+<a name="ln370">		installed = it.Next();</a>
+<a name="ln371">	}</a>
+<a name="ln372"> </a>
+<a name="ln373">	// loop through the breakpoints intersecting with the range</a>
+<a name="ln374">	while (installed != NULL) {</a>
+<a name="ln375">		Breakpoint* breakpoint = installed-&gt;breakpoint;</a>
+<a name="ln376">		if (breakpoint-&gt;address &gt;= address + size)</a>
+<a name="ln377">			break;</a>
+<a name="ln378"> </a>
+<a name="ln379">		if (breakpoint-&gt;software) {</a>
+<a name="ln380">			// write the data up to the breakpoint (if any)</a>
+<a name="ln381">			size_t toCopy = breakpoint-&gt;address - address;</a>
+<a name="ln382">			if (toCopy &gt; 0) {</a>
+<a name="ln383">				size_t chunkWritten;</a>
+<a name="ln384">				status_t error = _WriteMemory(address, buffer, toCopy,</a>
+<a name="ln385">					chunkWritten);</a>
+<a name="ln386">				if (error != B_OK)</a>
+<a name="ln387">					return bytesWritten &gt; 0 ? B_OK : error;</a>
+<a name="ln388"> </a>
+<a name="ln389">				address += chunkWritten;</a>
+<a name="ln390">				size -= chunkWritten;</a>
+<a name="ln391">				bytesWritten += chunkWritten;</a>
+<a name="ln392">				buffer += chunkWritten;</a>
+<a name="ln393"> </a>
+<a name="ln394">				if (chunkWritten &lt; toCopy)</a>
+<a name="ln395">					return B_OK;</a>
+<a name="ln396">			}</a>
+<a name="ln397"> </a>
+<a name="ln398">			// write to the breakpoint data</a>
+<a name="ln399">			toCopy = std::min(size, (size_t)DEBUG_SOFTWARE_BREAKPOINT_SIZE);</a>
+<a name="ln400">			memcpy(breakpoint-&gt;softwareData, buffer, toCopy);</a>
+<a name="ln401"> </a>
+<a name="ln402">			address += toCopy;</a>
+<a name="ln403">			size -= toCopy;</a>
+<a name="ln404">			bytesWritten += toCopy;</a>
+<a name="ln405">			buffer += toCopy;</a>
+<a name="ln406">		}</a>
+<a name="ln407"> </a>
+<a name="ln408">		installed = it.Next();</a>
+<a name="ln409">	}</a>
+<a name="ln410"> </a>
+<a name="ln411">	// write remaining data</a>
+<a name="ln412">	if (size &gt; 0) {</a>
+<a name="ln413">		size_t chunkWritten;</a>
+<a name="ln414">		status_t error = _WriteMemory(address, buffer, size, chunkWritten);</a>
+<a name="ln415">		if (error != B_OK)</a>
+<a name="ln416">			return bytesWritten &gt; 0 ? B_OK : error;</a>
+<a name="ln417"> </a>
+<a name="ln418">		bytesWritten += chunkWritten;</a>
+<a name="ln419">	}</a>
+<a name="ln420"> </a>
+<a name="ln421">	return B_OK;</a>
+<a name="ln422">}</a>
+<a name="ln423"> </a>
+<a name="ln424"> </a>
+<a name="ln425">void</a>
+<a name="ln426">BreakpointManager::PrepareToContinue(void* _address)</a>
+<a name="ln427">{</a>
+<a name="ln428">	const addr_t address = (addr_t)_address;</a>
+<a name="ln429"> </a>
+<a name="ln430">	WriteLocker locker(fLock);</a>
+<a name="ln431"> </a>
+<a name="ln432">	// Check whether there's a software breakpoint at the continuation address.</a>
+<a name="ln433">	InstalledBreakpoint* installed = fBreakpoints.Lookup(address);</a>
+<a name="ln434">	if (installed == NULL || !installed-&gt;breakpoint-&gt;software)</a>
+<a name="ln435">		return;</a>
+<a name="ln436"> </a>
+<a name="ln437">	// We need to replace the software breakpoint by a hardware one, or</a>
+<a name="ln438">	// we can't continue the thread.</a>
+<a name="ln439">	Breakpoint* breakpoint = _GetUnusedHardwareBreakpoint(true);</a>
+<a name="ln440">	if (breakpoint == NULL) {</a>
+<a name="ln441">		dprintf(&quot;Failed to allocate a hardware breakpoint.\n&quot;);</a>
+<a name="ln442">		return;</a>
+<a name="ln443">	}</a>
+<a name="ln444"> </a>
+<a name="ln445">	status_t error = _InstallHardwareBreakpoint(breakpoint, address);</a>
+<a name="ln446">	if (error != B_OK)</a>
+<a name="ln447">		return;</a>
+<a name="ln448"> </a>
+<a name="ln449">	_UninstallSoftwareBreakpoint(installed-&gt;breakpoint);</a>
+<a name="ln450"> </a>
+<a name="ln451">	breakpoint-&gt;installedBreakpoint = installed;</a>
+<a name="ln452">	installed-&gt;breakpoint = breakpoint;</a>
+<a name="ln453">}</a>
+<a name="ln454"> </a>
+<a name="ln455"> </a>
+<a name="ln456">BreakpointManager::Breakpoint*</a>
+<a name="ln457">BreakpointManager::_GetUnusedHardwareBreakpoint(bool force)</a>
+<a name="ln458">{</a>
+<a name="ln459">	// try to find a free one first</a>
+<a name="ln460">	for (BreakpointList::Iterator it = fHardwareBreakpoints.GetIterator();</a>
+<a name="ln461">			Breakpoint* breakpoint = it.Next();) {</a>
+<a name="ln462">		if (!breakpoint-&gt;used)</a>
+<a name="ln463">			return breakpoint;</a>
+<a name="ln464">	}</a>
+<a name="ln465"> </a>
+<a name="ln466">	if (!force)</a>
+<a name="ln467">		return NULL;</a>
+<a name="ln468"> </a>
+<a name="ln469">	// replace one by a software breakpoint</a>
+<a name="ln470">	for (BreakpointList::Iterator it = fHardwareBreakpoints.GetIterator();</a>
+<a name="ln471">			Breakpoint* breakpoint = it.Next();) {</a>
+<a name="ln472">		if (breakpoint-&gt;installedBreakpoint == NULL)</a>
+<a name="ln473">			continue;</a>
+<a name="ln474"> </a>
+<a name="ln475">		status_t error = _InstallSoftwareBreakpoint(</a>
+<a name="ln476">			breakpoint-&gt;installedBreakpoint, breakpoint-&gt;address);</a>
+<a name="ln477">		if (error != B_OK)</a>
+<a name="ln478">			continue;</a>
+<a name="ln479"> </a>
+<a name="ln480">		if (_UninstallHardwareBreakpoint(breakpoint) == B_OK)</a>
+<a name="ln481">			return breakpoint;</a>
+<a name="ln482">	}</a>
+<a name="ln483"> </a>
+<a name="ln484">	return NULL;</a>
+<a name="ln485">}</a>
+<a name="ln486"> </a>
+<a name="ln487"> </a>
+<a name="ln488">status_t</a>
+<a name="ln489">BreakpointManager::_InstallSoftwareBreakpoint(InstalledBreakpoint* installed,</a>
+<a name="ln490">	addr_t address)</a>
+<a name="ln491">{</a>
+<a name="ln492">	Breakpoint* breakpoint = new(std::nothrow) Breakpoint;</a>
+<a name="ln493">	if (breakpoint == NULL)</a>
+<a name="ln494">		return B_NO_MEMORY;</a>
+<a name="ln495">	ObjectDeleter&lt;Breakpoint&gt; breakpointDeleter(breakpoint);</a>
+<a name="ln496"> </a>
+<a name="ln497">	breakpoint-&gt;address = address;</a>
+<a name="ln498">	breakpoint-&gt;installedBreakpoint = installed;</a>
+<a name="ln499">	breakpoint-&gt;used = true;</a>
+<a name="ln500">	breakpoint-&gt;software = true;</a>
+<a name="ln501"> </a>
+<a name="ln502">	// save the memory where the software breakpoint shall be installed</a>
+<a name="ln503">	size_t bytesTransferred;</a>
+<a name="ln504">	status_t error = _ReadMemory(address, breakpoint-&gt;softwareData,</a>
+<a name="ln505">		DEBUG_SOFTWARE_BREAKPOINT_SIZE, bytesTransferred);</a>
+<a name="ln506">	if (error != B_OK)</a>
+<a name="ln507">		return error;</a>
+<a name="ln508">	if (bytesTransferred != DEBUG_SOFTWARE_BREAKPOINT_SIZE)</a>
+<a name="ln509">		return B_BAD_ADDRESS;</a>
+<a name="ln510"> </a>
+<a name="ln511">	// write the breakpoint code</a>
+<a name="ln512">	error = _WriteMemory(address, DEBUG_SOFTWARE_BREAKPOINT,</a>
+<a name="ln513">		DEBUG_SOFTWARE_BREAKPOINT_SIZE, bytesTransferred);</a>
+<a name="ln514">	if (error != B_OK)</a>
+<a name="ln515">		return error;</a>
+<a name="ln516"> </a>
+<a name="ln517">	if (bytesTransferred &lt; DEBUG_SOFTWARE_BREAKPOINT_SIZE) {</a>
+<a name="ln518">		// breakpoint written partially only -- undo the written part</a>
+<a name="ln519">		if (bytesTransferred &gt; 0) {</a>
+<a name="ln520">			size_t dummy;</a>
+<a name="ln521">			_WriteMemory(address, breakpoint-&gt;softwareData, bytesTransferred,</a>
+<a name="ln522">				dummy);</a>
+<a name="ln523">		}</a>
+<a name="ln524">		return B_BAD_ADDRESS;</a>
+<a name="ln525">	}</a>
+<a name="ln526"> </a>
+<a name="ln527">	installed-&gt;breakpoint = breakpoint;</a>
+<a name="ln528">	breakpointDeleter.Detach();</a>
+<a name="ln529"> </a>
+<a name="ln530">	TRACE(&quot;installed software breakpoint at %#lx\n&quot;, address);</a>
+<a name="ln531"> </a>
+<a name="ln532">	return B_OK;</a>
+<a name="ln533">}</a>
+<a name="ln534"> </a>
+<a name="ln535"> </a>
+<a name="ln536">status_t</a>
+<a name="ln537">BreakpointManager::_UninstallSoftwareBreakpoint(Breakpoint* breakpoint)</a>
+<a name="ln538">{</a>
+<a name="ln539">	size_t bytesWritten;</a>
+<a name="ln540">	_WriteMemory(breakpoint-&gt;address, breakpoint-&gt;softwareData,</a>
+<a name="ln541">		DEBUG_SOFTWARE_BREAKPOINT_SIZE, bytesWritten);</a>
+<a name="ln542"> </a>
+<a name="ln543">	TRACE(&quot;uninstalled software breakpoint at %#lx\n&quot;, breakpoint-&gt;address);</a>
+<a name="ln544"> </a>
+<a name="ln545">	delete breakpoint;</a>
+<a name="ln546">	return B_OK;</a>
+<a name="ln547">}</a>
+<a name="ln548"> </a>
+<a name="ln549"> </a>
+<a name="ln550">status_t</a>
+<a name="ln551">BreakpointManager::_InstallHardwareBreakpoint(Breakpoint* breakpoint,</a>
+<a name="ln552">	addr_t address)</a>
+<a name="ln553">{</a>
+<a name="ln554">	status_t error = arch_set_breakpoint((void*)address);</a>
+<a name="ln555">	if (error != B_OK)</a>
+<a name="ln556">		return error;</a>
+<a name="ln557"> </a>
+<a name="ln558">	// move to the tail of the list</a>
+<a name="ln559">	fHardwareBreakpoints.Remove(breakpoint);</a>
+<a name="ln560">	fHardwareBreakpoints.Add(breakpoint);</a>
+<a name="ln561"> </a>
+<a name="ln562">	TRACE(&quot;installed hardware breakpoint at %#lx\n&quot;, address);</a>
+<a name="ln563"> </a>
+<a name="ln564">	breakpoint-&gt;address = address;</a>
+<a name="ln565">	breakpoint-&gt;used = true;</a>
+<a name="ln566">	return B_OK;</a>
+<a name="ln567">}</a>
+<a name="ln568"> </a>
+<a name="ln569"> </a>
+<a name="ln570">status_t</a>
+<a name="ln571">BreakpointManager::_UninstallHardwareBreakpoint(Breakpoint* breakpoint)</a>
+<a name="ln572">{</a>
+<a name="ln573">	status_t error = arch_clear_breakpoint((void*)breakpoint-&gt;address);</a>
+<a name="ln574">	if (error != B_OK)</a>
+<a name="ln575">		return error;</a>
+<a name="ln576"> </a>
+<a name="ln577">	TRACE(&quot;uninstalled hardware breakpoint at %#lx\n&quot;, breakpoint-&gt;address);</a>
+<a name="ln578"> </a>
+<a name="ln579">	breakpoint-&gt;used = false;</a>
+<a name="ln580">	breakpoint-&gt;installedBreakpoint = NULL;</a>
+<a name="ln581">	return B_OK;</a>
+<a name="ln582">}</a>
+<a name="ln583"> </a>
+<a name="ln584"> </a>
+<a name="ln585">BreakpointManager::InstalledWatchpoint*</a>
+<a name="ln586">BreakpointManager::_FindWatchpoint(addr_t address) const</a>
+<a name="ln587">{</a>
+<a name="ln588">	for (InstalledWatchpointList::ConstIterator it = fWatchpoints.GetIterator();</a>
+<a name="ln589">		InstalledWatchpoint* watchpoint = it.Next();) {</a>
+<a name="ln590">		if (address == watchpoint-&gt;address)</a>
+<a name="ln591">			return watchpoint;</a>
+<a name="ln592">	}</a>
+<a name="ln593"> </a>
+<a name="ln594">	return NULL;</a>
+<a name="ln595">}</a>
+<a name="ln596"> </a>
+<a name="ln597"> </a>
+<a name="ln598">status_t</a>
+<a name="ln599">BreakpointManager::_InstallWatchpoint(InstalledWatchpoint* watchpoint,</a>
+<a name="ln600">	addr_t address, uint32 type, int32 length)</a>
+<a name="ln601">{</a>
+<a name="ln602">#if DEBUG_SHARED_BREAK_AND_WATCHPOINTS</a>
+<a name="ln603">	// We need a hardware breakpoint.</a>
+<a name="ln604">	watchpoint-&gt;breakpoint = _GetUnusedHardwareBreakpoint(true);</a>
+<a name="ln605">	if (watchpoint-&gt;breakpoint == NULL) {</a>
+<a name="ln606">		dprintf(&quot;Failed to allocate a hardware breakpoint for watchpoint.\n&quot;);</a>
+<a name="ln607">		return B_BUSY;</a>
+<a name="ln608">	}</a>
+<a name="ln609">#endif</a>
+<a name="ln610"> </a>
+<a name="ln611">	status_t error = arch_set_watchpoint((void*)address, type, length);</a>
+<a name="ln612">	if (error != B_OK)</a>
+<a name="ln613">		return error;</a>
+<a name="ln614"> </a>
+<a name="ln615">	watchpoint-&gt;address = address;</a>
+<a name="ln616"> </a>
+<a name="ln617">#if DEBUG_SHARED_BREAK_AND_WATCHPOINTS</a>
+<a name="ln618">	watchpoint-&gt;breakpoint-&gt;used = true;</a>
+<a name="ln619">#endif</a>
+<a name="ln620"> </a>
+<a name="ln621">	return B_OK;</a>
+<a name="ln622">}</a>
+<a name="ln623"> </a>
+<a name="ln624"> </a>
+<a name="ln625">status_t</a>
+<a name="ln626">BreakpointManager::_UninstallWatchpoint(InstalledWatchpoint* watchpoint)</a>
+<a name="ln627">{</a>
+<a name="ln628">#if DEBUG_SHARED_BREAK_AND_WATCHPOINTS</a>
+<a name="ln629">	watchpoint-&gt;breakpoint-&gt;used = false;</a>
+<a name="ln630">#endif</a>
+<a name="ln631"> </a>
+<a name="ln632">	return arch_clear_watchpoint((void*)watchpoint-&gt;address);</a>
+<a name="ln633">}</a>
+<a name="ln634"> </a>
+<a name="ln635"> </a>
+<a name="ln636">status_t</a>
+<a name="ln637">BreakpointManager::_ReadMemory(const addr_t _address, void* _buffer,</a>
+<a name="ln638">	size_t size, size_t&amp; bytesRead)</a>
+<a name="ln639">{</a>
+<a name="ln640">	const uint8* address = (const uint8*)_address;</a>
+<a name="ln641">	uint8* buffer = (uint8*)_buffer;</a>
+<a name="ln642"> </a>
+<a name="ln643">	// check the parameters</a>
+<a name="ln644">	if (!CanAccessAddress(address, false))</a>
+<a name="ln645">		return B_BAD_ADDRESS;</a>
+<a name="ln646">	if (size &lt;= 0)</a>
+<a name="ln647">		return B_BAD_VALUE;</a>
+<a name="ln648"> </a>
+<a name="ln649">	// If the region to be read crosses page boundaries, we split it up into</a>
+<a name="ln650">	// smaller chunks.</a>
+<a name="ln651">	status_t error = B_OK;</a>
+<a name="ln652">	bytesRead = 0;</a>
+<a name="ln653">	while (size &gt; 0) {</a>
+<a name="ln654">		// check whether we're still in user address space</a>
+<a name="ln655">		if (!CanAccessAddress(address, false)) {</a>
+<a name="ln656">			error = B_BAD_ADDRESS;</a>
+<a name="ln657">			break;</a>
+<a name="ln658">		}</a>
+<a name="ln659"> </a>
+<a name="ln660">		// don't cross page boundaries in a single read</a>
+<a name="ln661">		int32 toRead = size;</a>
+<a name="ln662">		int32 maxRead = B_PAGE_SIZE - (addr_t)address % B_PAGE_SIZE;</a>
+<a name="ln663">		if (toRead &gt; maxRead)</a>
+<a name="ln664">			toRead = maxRead;</a>
+<a name="ln665"> </a>
+<a name="ln666">		error = user_memcpy(buffer, address, toRead);</a>
+<a name="ln667">		if (error != B_OK)</a>
+<a name="ln668">			break;</a>
+<a name="ln669"> </a>
+<a name="ln670">		bytesRead += toRead;</a>
+<a name="ln671">		address += toRead;</a>
+<a name="ln672">		buffer += toRead;</a>
+<a name="ln673">		size -= toRead;</a>
+<a name="ln674">	}</a>
+<a name="ln675"> </a>
+<a name="ln676">	// If reading fails, we only fail, if we haven't read anything yet.</a>
+<a name="ln677">	if (error != B_OK) {</a>
+<a name="ln678">		if (bytesRead &gt; 0)</a>
+<a name="ln679">			return B_OK;</a>
+<a name="ln680">		return error;</a>
+<a name="ln681">	}</a>
+<a name="ln682"> </a>
+<a name="ln683">	return B_OK;</a>
+<a name="ln684">}</a>
+<a name="ln685"> </a>
+<a name="ln686"> </a>
+<a name="ln687">status_t</a>
+<a name="ln688">BreakpointManager::_WriteMemory(addr_t _address, const void* _buffer,</a>
+<a name="ln689">	size_t size, size_t&amp; bytesWritten)</a>
+<a name="ln690">{</a>
+<a name="ln691">	uint8* address = (uint8*)_address;</a>
+<a name="ln692">	const uint8* buffer = (const uint8*)_buffer;</a>
+<a name="ln693"> </a>
+<a name="ln694">	// check the parameters</a>
+<a name="ln695">	if (!CanAccessAddress(address, true))</a>
+<a name="ln696">		return B_BAD_ADDRESS;</a>
+<a name="ln697">	if (size &lt;= 0)</a>
+<a name="ln698">		return B_BAD_VALUE;</a>
+<a name="ln699"> </a>
+<a name="ln700">	// If the region to be written crosses area boundaries, we split it up into</a>
+<a name="ln701">	// smaller chunks.</a>
+<a name="ln702">	status_t error = B_OK;</a>
+<a name="ln703">	bytesWritten = 0;</a>
+<a name="ln704">	while (size &gt; 0) {</a>
+<a name="ln705">		// check whether we're still in user address space</a>
+<a name="ln706">		if (!CanAccessAddress(address, true)) {</a>
+<a name="ln707">			error = B_BAD_ADDRESS;</a>
+<a name="ln708">			break;</a>
+<a name="ln709">		}</a>
+<a name="ln710"> </a>
+<a name="ln711">		// get the area for the address (we need to use _user_area_for(), since</a>
+<a name="ln712">		// we're looking for a user area)</a>
+<a name="ln713">		area_id area = _user_area_for(address);</a>
+<a name="ln714">		if (area &lt; 0) {</a>
+<a name="ln715">			TRACE(&quot;BreakpointManager::_WriteMemory(): area not found for &quot;</a>
+<a name="ln716">				&quot;address: %p: %lx\n&quot;, address, area);</a>
+<a name="ln717">			error = area;</a>
+<a name="ln718">			break;</a>
+<a name="ln719">		}</a>
+<a name="ln720"> </a>
+<a name="ln721">		area_info areaInfo;</a>
+<a name="ln722">		status_t error = get_area_info(area, &amp;areaInfo);</a>
+<a name="ln723">		if (error != B_OK) {</a>
+<a name="ln724">			TRACE(&quot;BreakpointManager::_WriteMemory(): failed to get info for &quot;</a>
+<a name="ln725">				&quot;area %ld: %lx\n&quot;, area, error);</a>
+<a name="ln726">			error = B_BAD_ADDRESS;</a>
+<a name="ln727">			break;</a>
+<a name="ln728">		}</a>
+<a name="ln729"> </a>
+<a name="ln730">		// restrict this round of writing to the found area</a>
+<a name="ln731">		int32 toWrite = size;</a>
+<a name="ln732">		int32 maxWrite = (uint8*)areaInfo.address + areaInfo.size - address;</a>
+<a name="ln733">		if (toWrite &gt; maxWrite)</a>
+<a name="ln734">			toWrite = maxWrite;</a>
+<a name="ln735"> </a>
+<a name="ln736">		// if the area is read-only, we temporarily need to make it writable</a>
+<a name="ln737">		bool protectionChanged = false;</a>
+<a name="ln738">		if (!(areaInfo.protection &amp; (B_WRITE_AREA | B_KERNEL_WRITE_AREA))) {</a>
+<a name="ln739">			error = set_area_protection(area,</a>
+<a name="ln740">				areaInfo.protection | B_WRITE_AREA);</a>
+<a name="ln741">			if (error != B_OK) {</a>
+<a name="ln742">				TRACE(&quot;BreakpointManager::_WriteMemory(): failed to set new &quot;</a>
+<a name="ln743">					&quot;protection for area %ld: %lx\n&quot;, area, error);</a>
+<a name="ln744">				break;</a>
+<a name="ln745">			}</a>
+<a name="ln746">			protectionChanged = true;</a>
+<a name="ln747">		}</a>
+<a name="ln748"> </a>
+<a name="ln749">		// copy the memory</a>
+<a name="ln750">		error = user_memcpy(address, buffer, toWrite);</a>
+<a name="ln751"> </a>
+<a name="ln752">		// reset the area protection</a>
+<a name="ln753">		if (protectionChanged)</a>
+<a name="ln754">			set_area_protection(area, areaInfo.protection);</a>
+<a name="ln755"> </a>
+<a name="ln756">		if (error != B_OK) {</a>
+<a name="ln757">			TRACE(&quot;BreakpointManager::_WriteMemory(): user_memcpy() failed: &quot;</a>
+<a name="ln758">				&quot;%lx\n&quot;, error);</a>
+<a name="ln759">			break;</a>
+<a name="ln760">		}</a>
+<a name="ln761"> </a>
+<a name="ln762">		bytesWritten += toWrite;</a>
+<a name="ln763">		address += toWrite;</a>
+<a name="ln764">		buffer += toWrite;</a>
+<a name="ln765">		size -= toWrite;</a>
+<a name="ln766">	}</a>
+<a name="ln767"> </a>
+<a name="ln768">	// If writing fails, we only fail, if we haven't written anything yet.</a>
+<a name="ln769">	if (error != B_OK) {</a>
+<a name="ln770">		if (bytesWritten &gt; 0)</a>
+<a name="ln771">			return B_OK;</a>
+<a name="ln772">		return error;</a>
+<a name="ln773">	}</a>
+<a name="ln774"> </a>
+<a name="ln775">	return B_OK;</a>
+<a name="ln776">}</a>
+
+</code></pre>
+<div class="balloon" rel="519"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v547/" target="_blank">V547</a> Expression 'bytesTransferred > 0' is always false.</p></div>
+<div class="balloon" rel="29"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: splayNext.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

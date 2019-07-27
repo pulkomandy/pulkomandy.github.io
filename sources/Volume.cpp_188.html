@@ -1,0 +1,564 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>Volume.cpp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright 2008-2010, Axel Dörfler, axeld@pinc-software.de.</a>
+<a name="ln3"> * Copyright 2011-2019, Jérôme Duval, jerome.duval@gmail.com.</a>
+<a name="ln4"> * Copyright 2014 Haiku, Inc. All rights reserved.</a>
+<a name="ln5"> *</a>
+<a name="ln6"> * Distributed under the terms of the MIT License.</a>
+<a name="ln7"> *</a>
+<a name="ln8"> * Authors:</a>
+<a name="ln9"> *		Axel Dörfler, axeld@pinc-software.de</a>
+<a name="ln10"> *		Jérôme Duval, korli@users.berlios.de</a>
+<a name="ln11"> *		John Scipione, jscipione@gmail.com</a>
+<a name="ln12"> */</a>
+<a name="ln13"> </a>
+<a name="ln14"> </a>
+<a name="ln15">//! Superblock, mounting, etc.</a>
+<a name="ln16"> </a>
+<a name="ln17"> </a>
+<a name="ln18">#include &quot;Volume.h&quot;</a>
+<a name="ln19"> </a>
+<a name="ln20">#include &lt;errno.h&gt;</a>
+<a name="ln21">#include &lt;unistd.h&gt;</a>
+<a name="ln22">#include &lt;new&gt;</a>
+<a name="ln23">#include &lt;stdio.h&gt;</a>
+<a name="ln24">#include &lt;stdlib.h&gt;</a>
+<a name="ln25">#include &lt;string.h&gt;</a>
+<a name="ln26"> </a>
+<a name="ln27">#include &lt;fs_cache.h&gt;</a>
+<a name="ln28">#include &lt;fs_volume.h&gt;</a>
+<a name="ln29"> </a>
+<a name="ln30">#include &lt;util/AutoLock.h&gt;</a>
+<a name="ln31"> </a>
+<a name="ln32">#include &quot;CachedBlock.h&quot;</a>
+<a name="ln33">#include &quot;Inode.h&quot;</a>
+<a name="ln34">#include &quot;Utility.h&quot;</a>
+<a name="ln35"> </a>
+<a name="ln36"> </a>
+<a name="ln37">//#define TRACE_EXFAT</a>
+<a name="ln38">#ifdef TRACE_EXFAT</a>
+<a name="ln39">#	define TRACE(x...) dprintf(&quot;\33[34mexfat:\33[0m &quot; x)</a>
+<a name="ln40">#else</a>
+<a name="ln41">#	define TRACE(x...) ;</a>
+<a name="ln42">#endif</a>
+<a name="ln43">#	define ERROR(x...) dprintf(&quot;\33[34mexfat:\33[0m &quot; x)</a>
+<a name="ln44"> </a>
+<a name="ln45"> </a>
+<a name="ln46">class DeviceOpener {</a>
+<a name="ln47">public:</a>
+<a name="ln48">								DeviceOpener(int fd, int mode);</a>
+<a name="ln49">								DeviceOpener(const char* device, int mode);</a>
+<a name="ln50">								~DeviceOpener();</a>
+<a name="ln51"> </a>
+<a name="ln52">			int					Open(const char* device, int mode);</a>
+<a name="ln53">			int					Open(int fd, int mode);</a>
+<a name="ln54">			void*				InitCache(off_t numBlocks, uint32 blockSize);</a>
+<a name="ln55">			void				RemoveCache(bool allowWrites);</a>
+<a name="ln56"> </a>
+<a name="ln57">			void				Keep();</a>
+<a name="ln58"> </a>
+<a name="ln59">			int					Device() const { return fDevice; }</a>
+<a name="ln60">			int					Mode() const { return fMode; }</a>
+<a name="ln61">			bool				IsReadOnly() const</a>
+<a name="ln62">									{ return _IsReadOnly(fMode); }</a>
+<a name="ln63"> </a>
+<a name="ln64">			status_t			GetSize(off_t* _size,</a>
+<a name="ln65">									uint32* _blockSize = NULL);</a>
+<a name="ln66"> </a>
+<a name="ln67">private:</a>
+<a name="ln68">	static	bool				_IsReadOnly(int mode)</a>
+<a name="ln69">									{ return (mode &amp; O_RWMASK) == O_RDONLY;}</a>
+<a name="ln70">	static	bool				_IsReadWrite(int mode)</a>
+<a name="ln71">									{ return (mode &amp; O_RWMASK) == O_RDWR;}</a>
+<a name="ln72"> </a>
+<a name="ln73">			int					fDevice;</a>
+<a name="ln74">			int					fMode;</a>
+<a name="ln75">			void*				fBlockCache;</a>
+<a name="ln76">};</a>
+<a name="ln77"> </a>
+<a name="ln78"> </a>
+<a name="ln79">//	#pragma mark - DeviceOpener</a>
+<a name="ln80"> </a>
+<a name="ln81"> </a>
+<a name="ln82">DeviceOpener::DeviceOpener(const char* device, int mode)</a>
+<a name="ln83">	:</a>
+<a name="ln84">	fBlockCache(NULL)</a>
+<a name="ln85">{</a>
+<a name="ln86">	Open(device, mode);</a>
+<a name="ln87">}</a>
+<a name="ln88"> </a>
+<a name="ln89"> </a>
+<a name="ln90">DeviceOpener::DeviceOpener(int fd, int mode)</a>
+<a name="ln91">	:</a>
+<a name="ln92">	fBlockCache(NULL)</a>
+<a name="ln93">{</a>
+<a name="ln94">	Open(fd, mode);</a>
+<a name="ln95">}</a>
+<a name="ln96"> </a>
+<a name="ln97"> </a>
+<a name="ln98">DeviceOpener::~DeviceOpener()</a>
+<a name="ln99">{</a>
+<a name="ln100">	if (fDevice &gt;= 0) {</a>
+<a name="ln101">		RemoveCache(false);</a>
+<a name="ln102">		close(fDevice);</a>
+<a name="ln103">	}</a>
+<a name="ln104">}</a>
+<a name="ln105"> </a>
+<a name="ln106"> </a>
+<a name="ln107">int</a>
+<a name="ln108">DeviceOpener::Open(const char* device, int mode)</a>
+<a name="ln109">{</a>
+<a name="ln110">	fDevice = open(device, mode | O_NOCACHE);</a>
+<a name="ln111">	if (fDevice &lt; 0)</a>
+<a name="ln112">		fDevice = errno;</a>
+<a name="ln113"> </a>
+<a name="ln114">	if (fDevice &lt; 0 &amp;&amp; _IsReadWrite(mode)) {</a>
+<a name="ln115">		// try again to open read-only (don't rely on a specific error code)</a>
+<a name="ln116">		return Open(device, O_RDONLY | O_NOCACHE);</a>
+<a name="ln117">	}</a>
+<a name="ln118"> </a>
+<a name="ln119">	if (fDevice &gt;= 0) {</a>
+<a name="ln120">		// opening succeeded</a>
+<a name="ln121">		fMode = mode;</a>
+<a name="ln122">		if (_IsReadWrite(mode)) {</a>
+<a name="ln123">			// check out if the device really allows for read/write access</a>
+<a name="ln124">			device_geometry geometry;</a>
+<a name="ln125">			if (!ioctl(fDevice, B_GET_GEOMETRY, &amp;geometry)) {</a>
+<a name="ln126">				if (geometry.read_only) {</a>
+<a name="ln127">					// reopen device read-only</a>
+<a name="ln128">					close(fDevice);</a>
+<a name="ln129">					return Open(device, O_RDONLY | O_NOCACHE);</a>
+<a name="ln130">				}</a>
+<a name="ln131">			}</a>
+<a name="ln132">		}</a>
+<a name="ln133">	}</a>
+<a name="ln134"> </a>
+<a name="ln135">	return fDevice;</a>
+<a name="ln136">}</a>
+<a name="ln137"> </a>
+<a name="ln138"> </a>
+<a name="ln139">int</a>
+<a name="ln140">DeviceOpener::Open(int fd, int mode)</a>
+<a name="ln141">{</a>
+<a name="ln142">	fDevice = dup(fd);</a>
+<a name="ln143">	if (fDevice &lt; 0)</a>
+<a name="ln144">		return errno;</a>
+<a name="ln145"> </a>
+<a name="ln146">	fMode = mode;</a>
+<a name="ln147"> </a>
+<a name="ln148">	return fDevice;</a>
+<a name="ln149">}</a>
+<a name="ln150"> </a>
+<a name="ln151"> </a>
+<a name="ln152">void*</a>
+<a name="ln153">DeviceOpener::InitCache(off_t numBlocks, uint32 blockSize)</a>
+<a name="ln154">{</a>
+<a name="ln155">	return fBlockCache = block_cache_create(fDevice, numBlocks, blockSize,</a>
+<a name="ln156">		IsReadOnly());</a>
+<a name="ln157">}</a>
+<a name="ln158"> </a>
+<a name="ln159"> </a>
+<a name="ln160">void</a>
+<a name="ln161">DeviceOpener::RemoveCache(bool allowWrites)</a>
+<a name="ln162">{</a>
+<a name="ln163">	if (fBlockCache == NULL)</a>
+<a name="ln164">		return;</a>
+<a name="ln165"> </a>
+<a name="ln166">	block_cache_delete(fBlockCache, allowWrites);</a>
+<a name="ln167">	fBlockCache = NULL;</a>
+<a name="ln168">}</a>
+<a name="ln169"> </a>
+<a name="ln170"> </a>
+<a name="ln171">void</a>
+<a name="ln172">DeviceOpener::Keep()</a>
+<a name="ln173">{</a>
+<a name="ln174">	fDevice = -1;</a>
+<a name="ln175">}</a>
+<a name="ln176"> </a>
+<a name="ln177"> </a>
+<a name="ln178">/*!	Returns the size of the device in bytes. It uses B_GET_GEOMETRY</a>
+<a name="ln179">	to compute the size, or fstat() if that failed.</a>
+<a name="ln180">*/</a>
+<a name="ln181">status_t</a>
+<a name="ln182">DeviceOpener::GetSize(off_t* _size, uint32* _blockSize)</a>
+<a name="ln183">{</a>
+<a name="ln184">	device_geometry geometry;</a>
+<a name="ln185">	if (ioctl(fDevice, B_GET_GEOMETRY, &amp;geometry) &lt; 0) {</a>
+<a name="ln186">		// maybe it's just a file</a>
+<a name="ln187">		struct stat stat;</a>
+<a name="ln188">		if (fstat(fDevice, &amp;stat) &lt; 0)</a>
+<a name="ln189">			return B_ERROR;</a>
+<a name="ln190"> </a>
+<a name="ln191">		if (_size)</a>
+<a name="ln192">			*_size = stat.st_size;</a>
+<a name="ln193">		if (_blockSize)	// that shouldn't cause us any problems</a>
+<a name="ln194">			*_blockSize = 512;</a>
+<a name="ln195"> </a>
+<a name="ln196">		return B_OK;</a>
+<a name="ln197">	}</a>
+<a name="ln198"> </a>
+<a name="ln199">	if (_size) {</a>
+<a name="ln200">		*_size = 1ULL * geometry.head_count * geometry.cylinder_count</a>
+<a name="ln201">			* geometry.sectors_per_track * geometry.bytes_per_sector;</a>
+<a name="ln202">	}</a>
+<a name="ln203">	if (_blockSize)</a>
+<a name="ln204">		*_blockSize = geometry.bytes_per_sector;</a>
+<a name="ln205"> </a>
+<a name="ln206">	return B_OK;</a>
+<a name="ln207">}</a>
+<a name="ln208"> </a>
+<a name="ln209"> </a>
+<a name="ln210">//	#pragma mark - LabelVisitor</a>
+<a name="ln211"> </a>
+<a name="ln212"> </a>
+<a name="ln213">class LabelVisitor : public EntryVisitor {</a>
+<a name="ln214">public:</a>
+<a name="ln215">								LabelVisitor(Volume* volume);</a>
+<a name="ln216">			bool				VisitLabel(struct exfat_entry*);</a>
+<a name="ln217">private:</a>
+<a name="ln218">			Volume*				fVolume;</a>
+<a name="ln219">};</a>
+<a name="ln220"> </a>
+<a name="ln221"> </a>
+<a name="ln222">LabelVisitor::LabelVisitor(Volume* volume)</a>
+<a name="ln223">	:</a>
+<a name="ln224">	fVolume(volume)</a>
+<a name="ln225">{</a>
+<a name="ln226">}</a>
+<a name="ln227"> </a>
+<a name="ln228"> </a>
+<a name="ln229">bool</a>
+<a name="ln230">LabelVisitor::VisitLabel(struct exfat_entry* entry)</a>
+<a name="ln231">{</a>
+<a name="ln232">	TRACE(&quot;LabelVisitor::VisitLabel()\n&quot;);</a>
+<a name="ln233">	char name[B_FILE_NAME_LENGTH];</a>
+<a name="ln234">	status_t result = get_volume_name(entry, name, sizeof(name));</a>
+<a name="ln235">	if (result != B_OK)</a>
+<a name="ln236">		return false;</a>
+<a name="ln237"> </a>
+<a name="ln238">	fVolume-&gt;SetName(name);</a>
+<a name="ln239">	return true;</a>
+<a name="ln240">}</a>
+<a name="ln241"> </a>
+<a name="ln242"> </a>
+<a name="ln243">//	#pragma mark - exfat_super_block::IsValid()</a>
+<a name="ln244"> </a>
+<a name="ln245"> </a>
+<a name="ln246">bool</a>
+<a name="ln247">exfat_super_block::IsValid()</a>
+<a name="ln248">{</a>
+<a name="ln249">	// TODO: check some more values!</a>
+<a name="ln250">	if (strncmp(filesystem, EXFAT_SUPER_BLOCK_MAGIC, sizeof(filesystem)) != 0)</a>
+<a name="ln251">		return false;</a>
+<a name="ln252">	if (signature != 0xaa55)</a>
+<a name="ln253">		return false;</a>
+<a name="ln254">	if (jump_boot[0] != 0xeb || jump_boot[1] != 0x76 || jump_boot[2] != 0x90)</a>
+<a name="ln255">		return false;</a>
+<a name="ln256">	if (version_minor != 0 || version_major != 1)</a>
+<a name="ln257">		return false;</a>
+<a name="ln258">	</a>
+<a name="ln259">	return true;</a>
+<a name="ln260">}</a>
+<a name="ln261"> </a>
+<a name="ln262"> </a>
+<a name="ln263">//	#pragma mark - Volume</a>
+<a name="ln264"> </a>
+<a name="ln265"> </a>
+<a name="ln266">Volume::Volume(fs_volume* volume)</a>
+<a name="ln267">	:</a>
+<a name="ln268">	fFSVolume(volume),</a>
+<a name="ln269">	fFlags(0),</a>
+<a name="ln270">	fRootNode(NULL),</a>
+<a name="ln271">	fNextId(1)</a>
+<a name="ln272">{</a>
+<a name="ln273">	mutex_init(&amp;fLock, &quot;exfat volume&quot;);</a>
+<a name="ln274">	fInodesClusterTree = new InodesClusterTree;</a>
+<a name="ln275">	fInodesInoTree = new InodesInoTree;</a>
+<a name="ln276">	memset(fName, 0, sizeof(fName));</a>
+<a name="ln277">}</a>
+<a name="ln278"> </a>
+<a name="ln279"> </a>
+<a name="ln280">Volume::~Volume()</a>
+<a name="ln281">{</a>
+<a name="ln282">	TRACE(&quot;Volume destructor.\n&quot;);</a>
+<a name="ln283">	delete fInodesClusterTree;</a>
+<a name="ln284">	delete fInodesInoTree;</a>
+<a name="ln285">}</a>
+<a name="ln286"> </a>
+<a name="ln287"> </a>
+<a name="ln288">bool</a>
+<a name="ln289">Volume::IsValidSuperBlock()</a>
+<a name="ln290">{</a>
+<a name="ln291">	return fSuperBlock.IsValid();</a>
+<a name="ln292">}</a>
+<a name="ln293"> </a>
+<a name="ln294"> </a>
+<a name="ln295">const char*</a>
+<a name="ln296">Volume::Name() const</a>
+<a name="ln297">{</a>
+<a name="ln298">	return fName;</a>
+<a name="ln299">}</a>
+<a name="ln300"> </a>
+<a name="ln301"> </a>
+<a name="ln302">status_t</a>
+<a name="ln303">Volume::Mount(const char* deviceName, uint32 flags)</a>
+<a name="ln304">{</a>
+<a name="ln305">	flags |= B_MOUNT_READ_ONLY;</a>
+<a name="ln306">		// we only support read-only for now</a>
+<a name="ln307"> </a>
+<a name="ln308">	if ((flags &amp; B_MOUNT_READ_ONLY) != 0) {</a>
+<a name="ln309">		TRACE(&quot;Volume::Mount(): Read only\n&quot;);</a>
+<a name="ln310">	} else {</a>
+<a name="ln311">		TRACE(&quot;Volume::Mount(): Read write\n&quot;);</a>
+<a name="ln312">	}</a>
+<a name="ln313"> </a>
+<a name="ln314">	DeviceOpener opener(deviceName, (flags &amp; B_MOUNT_READ_ONLY) != 0</a>
+<a name="ln315">		? O_RDONLY : O_RDWR);</a>
+<a name="ln316">	fDevice = opener.Device();</a>
+<a name="ln317">	if (fDevice &lt; B_OK) {</a>
+<a name="ln318">		ERROR(&quot;Volume::Mount(): couldn't open device\n&quot;);</a>
+<a name="ln319">		return fDevice;</a>
+<a name="ln320">	}</a>
+<a name="ln321"> </a>
+<a name="ln322">	if (opener.IsReadOnly())</a>
+<a name="ln323">		fFlags |= VOLUME_READ_ONLY;</a>
+<a name="ln324"> </a>
+<a name="ln325">	// read the superblock</a>
+<a name="ln326">	status_t status = Identify(fDevice, &amp;fSuperBlock);</a>
+<a name="ln327">	if (status != B_OK) {</a>
+<a name="ln328">		ERROR(&quot;Volume::Mount(): Identify() failed\n&quot;);</a>
+<a name="ln329">		return status;</a>
+<a name="ln330">	}</a>
+<a name="ln331"> </a>
+<a name="ln332">	fBlockSize = 1 &lt;&lt; fSuperBlock.BlockShift();</a>
+<a name="ln333">	TRACE(&quot;block size %&quot; B_PRIu32 &quot;\n&quot;, fBlockSize);</a>
+<a name="ln334">	fEntriesPerBlock = (fBlockSize / sizeof(struct exfat_entry));</a>
+<a name="ln335"> </a>
+<a name="ln336">	// check that the device is large enough to hold the partition</a>
+<a name="ln337">	off_t deviceSize;</a>
+<a name="ln338">	status = opener.GetSize(&amp;deviceSize);</a>
+<a name="ln339">	if (status != B_OK)</a>
+<a name="ln340">		return status;</a>
+<a name="ln341"> </a>
+<a name="ln342">	off_t partitionSize = (off_t)fSuperBlock.NumBlocks()</a>
+<a name="ln343">		&lt;&lt; fSuperBlock.BlockShift();</a>
+<a name="ln344">	if (deviceSize &lt; partitionSize)</a>
+<a name="ln345">		return B_BAD_VALUE;</a>
+<a name="ln346"> </a>
+<a name="ln347">	fBlockCache = opener.InitCache(fSuperBlock.NumBlocks(), fBlockSize);</a>
+<a name="ln348">	if (fBlockCache == NULL)</a>
+<a name="ln349">		return B_ERROR;</a>
+<a name="ln350"> </a>
+<a name="ln351">	TRACE(&quot;Volume::Mount(): Initialized block cache: %p\n&quot;, fBlockCache);</a>
+<a name="ln352"> </a>
+<a name="ln353">	ino_t rootIno;</a>
+<a name="ln354">	// ready</a>
+<a name="ln355">	{</a>
+<a name="ln356">		Inode rootNode(this, fSuperBlock.RootDirCluster(), 0);</a>
+<a name="ln357">		rootIno = rootNode.ID();</a>
+<a name="ln358">	}</a>
+<a name="ln359"> </a>
+<a name="ln360">	status = get_vnode(fFSVolume, rootIno, (void**)&amp;fRootNode);</a>
+<a name="ln361">	if (status != B_OK) {</a>
+<a name="ln362">		ERROR(&quot;could not create root node: get_vnode() failed!\n&quot;);</a>
+<a name="ln363">		return status;</a>
+<a name="ln364">	}</a>
+<a name="ln365"> </a>
+<a name="ln366">	TRACE(&quot;Volume::Mount(): Found root node: %&quot; B_PRIdINO &quot; (%s)\n&quot;,</a>
+<a name="ln367">		fRootNode-&gt;ID(), strerror(fRootNode-&gt;InitCheck()));</a>
+<a name="ln368"> </a>
+<a name="ln369">	// all went fine</a>
+<a name="ln370">	opener.Keep();</a>
+<a name="ln371"> </a>
+<a name="ln372">	DirectoryIterator iterator(fRootNode);</a>
+<a name="ln373">	LabelVisitor visitor(this);</a>
+<a name="ln374">	iterator.Iterate(visitor);</a>
+<a name="ln375"> </a>
+<a name="ln376">	if (fName[0] == '\0')</a>
+<a name="ln377">		get_default_volume_name(partitionSize, fName, sizeof(fName));</a>
+<a name="ln378"> </a>
+<a name="ln379">	return B_OK;</a>
+<a name="ln380">}</a>
+<a name="ln381"> </a>
+<a name="ln382"> </a>
+<a name="ln383">status_t</a>
+<a name="ln384">Volume::Unmount()</a>
+<a name="ln385">{</a>
+<a name="ln386">	TRACE(&quot;Volume::Unmount()\n&quot;);</a>
+<a name="ln387"> </a>
+<a name="ln388">	TRACE(&quot;Volume::Unmount(): Putting root node\n&quot;);</a>
+<a name="ln389">	put_vnode(fFSVolume, RootNode()-&gt;ID());</a>
+<a name="ln390">	TRACE(&quot;Volume::Unmount(): Deleting the block cache\n&quot;);</a>
+<a name="ln391">	block_cache_delete(fBlockCache, !IsReadOnly());</a>
+<a name="ln392">	TRACE(&quot;Volume::Unmount(): Closing device\n&quot;);</a>
+<a name="ln393">	close(fDevice);</a>
+<a name="ln394"> </a>
+<a name="ln395">	TRACE(&quot;Volume::Unmount(): Done\n&quot;);</a>
+<a name="ln396">	return B_OK;</a>
+<a name="ln397">}</a>
+<a name="ln398"> </a>
+<a name="ln399"> </a>
+<a name="ln400">status_t</a>
+<a name="ln401">Volume::LoadSuperBlock()</a>
+<a name="ln402">{</a>
+<a name="ln403">	CachedBlock cached(this);</a>
+<a name="ln404">	const uint8* block = cached.SetTo(EXFAT_SUPER_BLOCK_OFFSET / fBlockSize);</a>
+<a name="ln405"> </a>
+<a name="ln406">	if (block == NULL)</a>
+<a name="ln407">		return B_IO_ERROR;</a>
+<a name="ln408"> </a>
+<a name="ln409">	memcpy(&amp;fSuperBlock, block + EXFAT_SUPER_BLOCK_OFFSET % fBlockSize,</a>
+<a name="ln410">		sizeof(fSuperBlock));</a>
+<a name="ln411"> </a>
+<a name="ln412">	return B_OK;</a>
+<a name="ln413">}</a>
+<a name="ln414"> </a>
+<a name="ln415"> </a>
+<a name="ln416">status_t</a>
+<a name="ln417">Volume::ClusterToBlock(cluster_t cluster, fsblock_t &amp;block)</a>
+<a name="ln418">{</a>
+<a name="ln419">	if ((cluster - EXFAT_FIRST_DATA_CLUSTER) &gt;= SuperBlock().ClusterCount()</a>
+<a name="ln420">		|| cluster &lt; EXFAT_FIRST_DATA_CLUSTER) {</a>
+<a name="ln421">		return B_BAD_VALUE;</a>
+<a name="ln422">	}</a>
+<a name="ln423">	block = ((fsblock_t)(cluster - EXFAT_FIRST_DATA_CLUSTER)</a>
+<a name="ln424">		&lt;&lt; SuperBlock().BlocksPerClusterShift())</a>
+<a name="ln425">		+ SuperBlock().FirstDataBlock();</a>
+<a name="ln426">	TRACE(&quot;Volume::ClusterToBlock() cluster %&quot; B_PRIu32 &quot; %u %&quot; B_PRIu32 &quot;: %&quot;</a>
+<a name="ln427">		B_PRIu64 &quot;, %&quot; B_PRIu32 &quot;\n&quot;, cluster,</a>
+<a name="ln428">		SuperBlock().BlocksPerClusterShift(), SuperBlock().FirstDataBlock(),</a>
+<a name="ln429">		block, SuperBlock().FirstFatBlock());</a>
+<a name="ln430">	return B_OK;</a>
+<a name="ln431">}</a>
+<a name="ln432"> </a>
+<a name="ln433"> </a>
+<a name="ln434">cluster_t</a>
+<a name="ln435">Volume::NextCluster(cluster_t _cluster)</a>
+<a name="ln436">{</a>
+<a name="ln437">	uint32 clusterPerBlock = fBlockSize / sizeof(cluster_t);</a>
+<a name="ln438">	CachedBlock block(this);</a>
+<a name="ln439">	fsblock_t blockNum = SuperBlock().FirstFatBlock()</a>
+<a name="ln440">		+ _cluster / clusterPerBlock;</a>
+<a name="ln441">	cluster_t *cluster = (cluster_t *)block.SetTo(blockNum);</a>
+<a name="ln442">	cluster += _cluster % clusterPerBlock;</a>
+<a name="ln443">	TRACE(&quot;Volume::NextCluster() cluster %&quot; B_PRIu32 &quot; next %&quot; B_PRIu32 &quot;\n&quot;,</a>
+<a name="ln444">		_cluster, *cluster);</a>
+<a name="ln445">	return *cluster;</a>
+<a name="ln446">}</a>
+<a name="ln447"> </a>
+<a name="ln448"> </a>
+<a name="ln449">Inode*</a>
+<a name="ln450">Volume::FindInode(ino_t id)</a>
+<a name="ln451">{</a>
+<a name="ln452">	return fInodesInoTree-&gt;Lookup(id);</a>
+<a name="ln453">}</a>
+<a name="ln454"> </a>
+<a name="ln455"> </a>
+<a name="ln456">Inode*</a>
+<a name="ln457">Volume::FindInode(cluster_t cluster)</a>
+<a name="ln458">{</a>
+<a name="ln459">	return fInodesClusterTree-&gt;Lookup(cluster);</a>
+<a name="ln460">}</a>
+<a name="ln461"> </a>
+<a name="ln462"> </a>
+<a name="ln463">ino_t</a>
+<a name="ln464">Volume::GetIno(cluster_t cluster, uint32 offset, ino_t parent)</a>
+<a name="ln465">{</a>
+<a name="ln466">	struct node_key key;</a>
+<a name="ln467">	key.cluster = cluster;</a>
+<a name="ln468">	key.offset = offset;</a>
+<a name="ln469"> </a>
+<a name="ln470">	MutexLocker locker(fLock);</a>
+<a name="ln471">	struct node* node = fNodeTree.Lookup(key);</a>
+<a name="ln472">	if (node != NULL) {</a>
+<a name="ln473">		TRACE(&quot;Volume::GetIno() cached cluster %&quot; B_PRIu32 &quot; offset %&quot; B_PRIu32</a>
+<a name="ln474">			&quot; ino %&quot; B_PRIdINO &quot;\n&quot;, cluster, offset, node-&gt;ino);</a>
+<a name="ln475">		return node-&gt;ino;</a>
+<a name="ln476">	}</a>
+<a name="ln477">	node = new struct node();</a>
+<a name="ln478">	node-&gt;key = key;</a>
+<a name="ln479">	node-&gt;ino = _NextID();</a>
+<a name="ln480">	node-&gt;parent = parent;</a>
+<a name="ln481">	fNodeTree.Insert(node);</a>
+<a name="ln482">	fInoTree.Insert(node);</a>
+<a name="ln483">	TRACE(&quot;Volume::GetIno() new cluster %&quot; B_PRIu32 &quot; offset %&quot; B_PRIu32 </a>
+<a name="ln484">		&quot; ino %&quot; B_PRIdINO &quot;\n&quot;, cluster, offset, node-&gt;ino);</a>
+<a name="ln485">	return node-&gt;ino;</a>
+<a name="ln486">}</a>
+<a name="ln487"> </a>
+<a name="ln488"> </a>
+<a name="ln489">struct node_key*</a>
+<a name="ln490">Volume::GetNode(ino_t ino, ino_t &amp;parent)</a>
+<a name="ln491">{</a>
+<a name="ln492">	MutexLocker locker(fLock);</a>
+<a name="ln493">	struct node* node = fInoTree.Lookup(ino);</a>
+<a name="ln494">	if (node != NULL) {</a>
+<a name="ln495">		parent = node-&gt;parent;</a>
+<a name="ln496">		return &amp;node-&gt;key;</a>
+<a name="ln497">	}</a>
+<a name="ln498">	return NULL;</a>
+<a name="ln499">}</a>
+<a name="ln500"> </a>
+<a name="ln501"> </a>
+<a name="ln502">//	#pragma mark - Disk scanning and initialization</a>
+<a name="ln503"> </a>
+<a name="ln504"> </a>
+<a name="ln505">/*static*/ status_t</a>
+<a name="ln506">Volume::Identify(int fd, exfat_super_block* superBlock)</a>
+<a name="ln507">{</a>
+<a name="ln508">	if (read_pos(fd, EXFAT_SUPER_BLOCK_OFFSET, superBlock,</a>
+<a name="ln509">			sizeof(exfat_super_block)) != sizeof(exfat_super_block))</a>
+<a name="ln510">		return B_IO_ERROR;</a>
+<a name="ln511"> </a>
+<a name="ln512">	if (!superBlock-&gt;IsValid()) {</a>
+<a name="ln513">		ERROR(&quot;invalid superblock!\n&quot;);</a>
+<a name="ln514">		return B_BAD_VALUE;</a>
+<a name="ln515">	}</a>
+<a name="ln516"> </a>
+<a name="ln517">	return B_OK;</a>
+<a name="ln518">}</a>
+
+</code></pre>
+<div class="balloon" rel="266"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: fDevice, fSuperBlock, fBlockSize, fEntriesPerBlock, fBlockCache.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>
